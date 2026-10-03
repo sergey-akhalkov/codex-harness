@@ -1379,7 +1379,48 @@ fn decision(
     close: bool,
     defer: Option<&str>,
 ) -> std::process::Output {
-    let mut args = vec![
+    let args = decision_arguments(
+        item,
+        experiment,
+        outcome,
+        quality,
+        candidate_seconds,
+        close,
+        defer,
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    board.feedback(&args)
+}
+
+/// The same published decision with one named binding emptied, to prove the
+/// real entry point refuses a decision that omits it.
+fn decision_with_absent_binding(
+    board: &Board,
+    item: &str,
+    experiment: &str,
+    flag: &str,
+) -> std::process::Output {
+    let mut args = decision_arguments(item, experiment, "adopt", "unchanged", "96", false, None);
+    let position = args
+        .iter()
+        .position(|value| value == flag)
+        .expect("the binding flag is part of every decision");
+    args[position + 1] = String::new();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    board.feedback(&args)
+}
+
+/// The argument vector behind [`decision`].
+fn decision_arguments(
+    item: &str,
+    experiment: &str,
+    outcome: &str,
+    quality: &str,
+    candidate_seconds: &str,
+    close: bool,
+    defer: Option<&str>,
+) -> Vec<String> {
+    let mut args: Vec<String> = [
         "hypothesis-decision",
         "--item",
         item,
@@ -1417,16 +1458,19 @@ fn decision(
         "lane-contention",
         "--detail",
         "paired synthetic task",
-    ];
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     if close {
-        args.push("--close");
-        args.push("yes");
+        args.push("--close".to_owned());
+        args.push("yes".to_owned());
     }
     if let Some(until) = defer {
-        args.push("--defer");
-        args.push(until);
+        args.push("--defer".to_owned());
+        args.push(until.to_owned());
     }
-    board.feedback(&args)
+    args
 }
 
 /// Records one scoped user removal decision through the real entry point.
@@ -1661,7 +1705,18 @@ fn hypothesis_decision_publication_is_idempotent_and_evidence_bound() {
     assert!(ledger.status.success(), "{text}");
     assert!(text.contains("default=adopted"), "{text}");
     assert!(text.contains("supported=yes"), "{text}");
-    assert!(text.contains("experiment=exp-1"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {h}: binding: experiment=exp-1 revisions=base001..cand002 acceptance=evidence-9 coverage=time+rounds scope=task:synthetic reason=lane-contention"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={h} outcome=adopt quality=unchanged experiment=exp-1 revisions=base001..cand002 acceptance=evidence-9 coverage=time+rounds scope=task:synthetic reason=lane-contention"
+        )),
+        "{text}"
+    );
 
     // A retried publication confirms the recorded decision with no new
     // comment and no second apparent experiment.
@@ -1692,6 +1747,13 @@ fn hypothesis_decision_publication_is_idempotent_and_evidence_bound() {
         text.contains("is not supported by its own comparison"),
         "{text}"
     );
+
+    // A faster candidate whose measured quality regressed is equally unable
+    // to authorize an adoption.
+    let contradicted = decision(&board, &h, "exp-2", "adopt", "regressed", "96", false, None);
+    let text = output_text(&contradicted);
+    assert!(!contradicted.status.success(), "{text}");
+    assert!(text.contains("quality regressed"), "{text}");
 
     let same_revision = board.feedback(&[
         "hypothesis-decision",
@@ -1734,46 +1796,21 @@ fn hypothesis_decision_publication_is_idempotent_and_evidence_bound() {
     assert!(!same_revision.status.success(), "{text}");
     assert!(text.contains("identical"), "{text}");
 
-    let missing = board.feedback(&[
-        "hypothesis-decision",
-        "--item",
-        &h,
-        "--experiment",
-        "exp-4",
-        "--outcome",
-        "adopt",
-        "--quality",
-        "unchanged",
-        "--matched",
-        "2",
-        "--tolerance-percent",
-        "10",
-        "--baseline-seconds",
-        "100",
-        "--candidate-seconds",
-        "96",
-        "--baseline-arm",
-        "direct",
-        "--candidate-arm",
-        "lane",
-        "--accounting",
-        "check",
-        "--baseline-revision",
-        "base001",
-        "--candidate-revision",
-        "cand002",
-        "--acceptance",
-        "",
-        "--coverage",
-        "time",
-        "--scope",
-        "task:synthetic",
-        "--reason",
-        "lane-contention",
-    ]);
-    let text = output_text(&missing);
-    assert!(!missing.status.success(), "{text}");
-    assert!(text.contains("acceptance is required"), "{text}");
+    // Every binding is required before an adoption can publish: an omitted
+    // experiment, acceptance evidence, metric coverage, scope or reason is
+    // refused and writes nothing.
+    for (flag, phrase) in [
+        ("--experiment", "experiment is required"),
+        ("--acceptance", "acceptance is required"),
+        ("--coverage", "coverage is required"),
+        ("--scope", "scope is required"),
+        ("--reason", "reason is required"),
+    ] {
+        let refused = decision_with_absent_binding(&board, &h, "exp-4", flag);
+        let text = output_text(&refused);
+        assert!(!refused.status.success(), "{flag}: {text}");
+        assert!(text.contains(phrase), "{flag}: {text}");
+    }
 
     assert_eq!(
         board.comment_texts(&h).len(),
@@ -1781,6 +1818,99 @@ fn hypothesis_decision_publication_is_idempotent_and_evidence_bound() {
         "refused publications write nothing"
     );
     assert_no_votes(&board, &h);
+    board.drop();
+}
+
+/// A newer incomplete, malformed or contradictory v2 record supersedes an
+/// earlier supported adoption on the real board read path: the item stays
+/// unadopted, the limitations name the missing or contradicting evidence, and
+/// the earlier decision remains visible in the recorded history.
+#[test]
+fn newer_incomplete_records_never_revive_an_earlier_adoption() {
+    let board = Board::new("decision-supersession");
+    let h = admit(&board, "m-supersede", "c-synthetic", "basis-2");
+    let adopted = decision(
+        &board,
+        &h,
+        "exp-10",
+        "adopt",
+        "unchanged",
+        "96",
+        false,
+        None,
+    );
+    let text = output_text(&adopted);
+    assert!(adopted.status.success(), "{text}");
+    let ledger = board.feedback(&["ledger", "--item", &h]);
+    let text = output_text(&ledger);
+    assert!(text.contains("default=adopted"), "{text}");
+
+    // The newer record omits its acceptance evidence, scope and reason: it is
+    // retained as the latest decision and cannot authorize the adoption.
+    comment(
+        &board,
+        &h,
+        &format!(
+            "benefit-gate v2 item={h} experiment=exp-11 revisions=base001..cand003 coverage=time outcome=adopt quality=unchanged matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=96.0 regression_percent=-4.0 baseline=direct candidate=lane accounting=check detail=incomplete binding"
+        ),
+    );
+    let ledger = board.feedback(&["ledger", "--item", &h]);
+    let text = output_text(&ledger);
+    assert!(text.contains("across 2 attributable record(s)"), "{text}");
+    assert!(text.contains("default=unadopted"), "{text}");
+    assert!(!text.contains("default=adopted"), "{text}");
+    assert!(
+        text.contains(
+            "limitations: acceptance evidence reference missing; decision scope missing; decision reason missing"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={h} outcome=adopt quality=unchanged experiment=exp-10"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={h} outcome=adopt quality=unchanged experiment=exp-11"
+        )),
+        "{text}"
+    );
+
+    // A newer record contradicting its own measured quality supersedes the
+    // earlier adoption without rewriting it.
+    comment(
+        &board,
+        &h,
+        &format!(
+            "benefit-gate v2 item={h} experiment=exp-12 revisions=base001..cand004 acceptance=evidence-10 coverage=time scope=task:synthetic reason=lane outcome=adopt quality=regressed matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=140.0 regression_percent=40.0 baseline=direct candidate=lane accounting=check detail=regressed"
+        ),
+    );
+    let ledger = board.feedback(&["ledger", "--item", &h]);
+    let text = output_text(&ledger);
+    assert!(text.contains("across 3 attributable record(s)"), "{text}");
+    assert!(
+        text.contains("limitations: quality regressed; regression beyond the declared tolerance"),
+        "{text}"
+    );
+    assert!(!text.contains("default=adopted"), "{text}");
+
+    // A newer malformed record stays unreadable: it supersedes the adoption
+    // instead of being skipped in favor of the older supported record.
+    comment(
+        &board,
+        &h,
+        &format!("benefit-gate v2 item={h} outcome=adopt"),
+    );
+    let ledger = board.feedback(&["ledger", "--item", &h]);
+    let text = output_text(&ledger);
+    assert!(text.contains("across 4 attributable record(s)"), "{text}");
+    assert!(
+        text.contains("limitations: experiment reference missing"),
+        "{text}"
+    );
+    assert!(!text.contains("default=adopted"), "{text}");
     board.drop();
 }
 
