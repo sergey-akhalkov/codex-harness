@@ -1354,6 +1354,180 @@ fn select_cycle_reports_consumed_identity_without_source_change_rebuild_or_model
     assert_eq!(build_files(&candidate_build), before_files.1);
 }
 
+/// The declared directed-measurement scope: the hypothesis's own targeted
+/// measurement, bound to a section of its own OpenSpec change.
+fn measurement_scope_json() -> Value {
+    json!({
+        "observed_problem": "identical repeated reads waste accepted-task time",
+        "investigation_scope": "the reader's repeated reads at one frozen source revision",
+        "measurement_question": "how much accepted-task time do identical repeated reads cost?",
+        "workload": {
+            "operation": "cargo build -p example-reader",
+            "contract": "openspec/changes/add-synthetic/proposal.md#Measurement",
+        },
+        "evidence_references": ["retained outcome record: repeated reads"],
+        "limits": "one local machine and one frozen source revision",
+        "declaration_artifact": "proposal.md",
+        "declaration_heading": "## Measurement",
+    })
+}
+
+/// A recorded block is cleared the way operator-driven recovery leaves it
+/// before an explicit resume re-evaluates the gate.
+fn clear_recorded_block(fixture: &Fixture) {
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    fixture.write_cursor(&cursor);
+}
+
+/// `improve status` (text and `--json`) surfaces the directed-measurement
+/// gate state from recorded run state only: the declared measurement-scope
+/// file (present/missing), the retained receipt path and the bounded blocking
+/// reason while the gate holds the run.
+#[test]
+fn status_surfaces_the_directed_measurement_gate_state() {
+    let fixture = Fixture::new("measurement-status");
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    fs::create_dir_all(state.join("builds/ha-build")).unwrap();
+    fs::write(state.join("owner"), "codex-harness-native-state-v1\n").unwrap();
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[
+            (
+                "runner",
+                json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+            ),
+            (
+                "local_runner",
+                json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+            ),
+            ("qualification", json!(qualification)),
+            (
+                "comparison",
+                comparison_inputs(
+                    &fixture,
+                    &state,
+                    &upstream,
+                    &policy,
+                    &request,
+                    &request_sha,
+                    &head,
+                ),
+            ),
+        ],
+        None,
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    // No declared scope: the gate holds the run, and status reports the exact
+    // artifact, the absent receipt and the bounded reason.
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "blocked", "{report}");
+    assert_eq!(
+        report["measurement"]["scope"]["status"], "missing",
+        "{report}"
+    );
+    assert!(
+        report["measurement"]["scope"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("measurement-scope.json"),
+        "{report}"
+    );
+    assert!(report["measurement"]["receipt"].is_null(), "{report}");
+    assert_eq!(
+        report["candidate"]["measurement_receipt"],
+        Value::Null,
+        "{report}"
+    );
+    let reason = report["measurement"]["blocked_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("no hypothesis measurement scope is declared"),
+        "{report}"
+    );
+    let printed = text(&fixture.improve(&["status", "--run", fixture.run.to_str().unwrap()]));
+    assert!(printed.contains("measurement: declared scope"), "{printed}");
+    assert!(printed.contains("missing"), "{printed}");
+    assert!(printed.contains("measurement blocked:"), "{printed}");
+
+    // A declared scope whose own change does not state the section keeps the
+    // receipt unretained and reports the gate's exact reason.
+    fs::write(
+        fixture.run.join("measurement-scope.json"),
+        serde_json::to_vec_pretty(&measurement_scope_json()).unwrap(),
+    )
+    .unwrap();
+    clear_recorded_block(&fixture);
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(
+        report["measurement"]["scope"]["status"], "present",
+        "{report}"
+    );
+    assert!(report["measurement"]["receipt"].is_null(), "{report}");
+    let reason = report["measurement"]["blocked_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("missing or empty measurement scope section"),
+        "{report}"
+    );
+
+    // Once the hypothesis's own change states the section, the gate retains
+    // the receipt before the measured-pair owner is engaged, and status
+    // surfaces that exact retained path.
+    let proposal = fixture
+        .proj
+        .join("openspec/changes/add-synthetic/proposal.md");
+    let mut content = fs::read_to_string(&proposal).unwrap();
+    content.push_str("\n## Measurement\n\nObserved problem: identical repeated reads waste accepted-task time. Investigation scope: reads at one frozen source revision. Measurement question: how much accepted-task time do they cost? Workload: the existing cargo build operation linked from this change. Evidence: the retained outcome record. Limits: one local machine and one frozen source revision.\n");
+    fs::write(&proposal, content).unwrap();
+    clear_recorded_block(&fixture);
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(
+        report["measurement"]["scope"]["status"], "present",
+        "{report}"
+    );
+    let receipt = report["measurement"]["receipt"].as_str().unwrap();
+    assert!(receipt.ends_with("measurement-receipt.json"), "{report}");
+    assert!(Path::new(receipt).is_file(), "{report}");
+    assert_eq!(
+        report["candidate"]["measurement_receipt"], receipt,
+        "{report}"
+    );
+}
+
 #[test]
 fn concurrent_starts_create_exactly_one_owner() {
     let fixture = Fixture::new("concurrent-start");

@@ -90,9 +90,11 @@ leaves the baseline unchanged.
 status prints the recoverable phase cursor: current phase and condition, the
 hypothesis card, the qualified planning change, the effective runner binding,
 the evidence root, the consumed intake outcomes, the selected candidate with
-its branch/base/revision, the dispatch gate, the removal gate, every attempt
-with its receipt, the selected prepared variant and the phases still pending.
-It performs no model call. --json prints the same report as JSON.
+its branch/base/revision, the dispatch gate, the removal gate, the
+directed-measurement gate state (the declared measurement-scope file and the
+retained measurement receipt), every attempt with its receipt, the selected
+prepared variant and the phases still pending. It performs no model call.
+--json prints the same report as JSON.
 
 select activates an already prepared baseline/candidate variant through the
 shared runtime-selection primitive, records the identity it actually consumed
@@ -645,6 +647,66 @@ fn removal_text(gate: &Option<RemovalGate>) -> String {
     }
 }
 
+/// The declared measurement scope is explicit local run data beside the
+/// frozen spec; the workflow owner's directed-measurement gate consumes the
+/// same file name before it may direct the baseline attempt.
+const MEASUREMENT_SCOPE_FILE: &str = "measurement-scope.json";
+/// Bound of one reported reason in the status surface: the recorded
+/// condition already carries the exact artifact, and the report never lets
+/// one long text dominate the output.
+const MAX_REPORTED_REASON_BYTES: usize = 512;
+
+/// The directed-measurement gate state one status report surfaces: the
+/// declared scope artifact, the retained receipt and the currently recorded
+/// blocking reason. This is reporting only; nothing here gates a run.
+struct MeasurementState {
+    scope_path: PathBuf,
+    scope_present: bool,
+    receipt: Option<PathBuf>,
+    blocked_reason: Option<String>,
+}
+
+fn measurement_state(run: &Run) -> MeasurementState {
+    let scope_path = run.store.root().join(MEASUREMENT_SCOPE_FILE);
+    MeasurementState {
+        scope_present: scope_path.is_file(),
+        scope_path,
+        receipt: run
+            .cursor
+            .candidate
+            .as_ref()
+            .and_then(|candidate| candidate.measurement_receipt.clone()),
+        blocked_reason: run
+            .cursor
+            .condition
+            .as_deref()
+            .filter(|_| run.cursor.phase == Phase::Blocked)
+            .map(bounded_reason),
+    }
+}
+
+fn bounded_reason(reason: &str) -> String {
+    if reason.len() <= MAX_REPORTED_REASON_BYTES {
+        return reason.to_owned();
+    }
+    let mut cut = MAX_REPORTED_REASON_BYTES;
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &reason[..cut])
+}
+
+fn measurement_json(state: &MeasurementState) -> serde_json::Value {
+    json!({
+        "scope": {
+            "path": state.scope_path.display().to_string(),
+            "status": if state.scope_present { "present" } else { "missing" },
+        },
+        "receipt": state.receipt.as_ref().map(|path| path.display().to_string()),
+        "blocked_reason": state.blocked_reason.as_deref(),
+    })
+}
+
 fn run_report(run: &Run) -> io::Result<serde_json::Value> {
     let stage = stage_role(&run.cursor);
     let facts = dispatch_facts_for(run, stage)?;
@@ -652,6 +714,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
     let removal = facts.removal.clone();
     let planning = run.store.planning()?;
     let variants = run.store.variants_path();
+    let measurement = measurement_state(run);
     Ok(json!({
         "schema": 1,
         "run": run.spec.run,
@@ -683,6 +746,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
             None => json!({"declared": false}),
             Some(gate) => json!({"declared": true, "gate": removal_text(&Some(gate.clone()))}),
         },
+        "measurement": measurement_json(&measurement),
         "attempts": run.cursor.attempts.iter().map(|attempt| json!({
             "id": attempt.id,
             "role": attempt.role.as_str(),
@@ -752,6 +816,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
             "base": candidate.worktree.as_ref().map(|checkout| checkout.base.clone()),
             "worktree": candidate.worktree.as_ref().map(|checkout| checkout.path.display().to_string()),
             "planning_receipt": candidate.planning_receipt.as_ref().map(|path| path.display().to_string()),
+            "measurement_receipt": candidate.measurement_receipt.as_ref().map(|path| path.display().to_string()),
             "planner_attempt": candidate.planner_attempt,
             "implementer_attempt": candidate.implementer_attempt,
             "revision": candidate.revision,
@@ -827,6 +892,24 @@ fn print_report(run: &Run) -> io::Result<()> {
     match &run.spec.evidence_root {
         Some(root) => println!("evidence root: {}", root.display()),
         None => println!("evidence root: none declared (run-retained attempt evidence only)"),
+    }
+    let measurement = measurement_state(run);
+    println!(
+        "measurement: declared scope {} {}; retained receipt {}",
+        measurement.scope_path.display(),
+        if measurement.scope_present {
+            "present"
+        } else {
+            "missing"
+        },
+        measurement
+            .receipt
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_owned())
+    );
+    if let Some(reason) = &measurement.blocked_reason {
+        println!("measurement blocked: {reason}");
     }
     match &run.cursor.intake {
         Some(intake) => println!(
