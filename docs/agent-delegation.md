@@ -283,6 +283,23 @@ the executor stopped: use its receipt/watch result before choosing recovery.
 Installing a relay fix applies to new hosts; already running hosts keep their
 loaded binary and should not be interrupted merely to update presentation.
 
+Control observations wait for socket readiness and read without blocking. Idle
+and partial-frame waits preserve the connection and do not replay requests;
+actual disconnects remain failures. This replaces repeated Windows blocking
+receive timeouts, which [Microsoft documents](https://learn.microsoft.com/en-us/windows/win32/winsock/sol-socket-socket-options)
+as leaving the connection indeterminate. Retained executor failures reported
+I/O error 997, but its exact OS trigger was not reproduced in the short local
+test. The confirmed regression was an 80 ms observation taking 549 ms while
+a frame trickled in; the corrected transport passes that deadline case and
+128 idle/partial-frame cycles, heartbeat, disconnect and backpressure checks
+(`cargo test -p harness-core --lib task_control::tests --locked`). A transport
+failure is not evidence against the executor's model or implementation approach.
+The affected `executor_control`, `executor_message`, `executor_observation`,
+`executor_stop` and `executor_warning` integration targets passed, as did the
+opt-in model-free app-server binding check with Codex 0.159.3 and workspace
+clippy with warnings denied. These checks do not establish a recurrence rate
+for 997 in long model-backed sessions.
+
 Wait through the record, never model polling or rollout searches:
 
 ```powershell

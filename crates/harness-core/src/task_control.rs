@@ -53,41 +53,84 @@ impl ControlConnection {
             .map_err(protocol_error)
     }
 
-    /// Returns None for an observation timeout, preserving the connection and
+    /// Returns None for an observation deadline, preserving the connection and
     /// any partial WebSocket frame. No request is replayed when called again.
     pub fn receive(&mut self, timeout: Duration) -> io::Result<Option<Value>> {
-        self.socket.get_mut().set_read_timeout(Some(timeout))?;
-        self.read_message()
+        self.read_message(timeout)
     }
 
-    fn read_message(&mut self) -> io::Result<Option<Value>> {
-        match self.socket.read() {
-            Ok(Message::Text(text)) => serde_json::from_str(&text).map(Some).map_err(Into::into),
-            Ok(Message::Ping(_) | Message::Pong(_)) => {
-                self.socket.flush().map_err(protocol_error)?;
-                Ok(None)
+    fn read_message(&mut self, timeout: Duration) -> io::Result<Option<Value>> {
+        let started = std::time::Instant::now();
+        loop {
+            // SO_RCVTIMEO expiry leaves a Windows connection indeterminate.
+            // Probe without starting a blocking receive, then wait for socket
+            // readiness. Tungstenite retains incomplete frames on WouldBlock.
+            self.socket.get_mut().set_nonblocking(true)?;
+            let result = self.socket.read();
+            // Reads can queue heartbeat writes. Restore the existing bounded
+            // blocking send/flush behavior on every outcome, including errors.
+            let restored = self.socket.get_mut().set_nonblocking(false);
+            match result {
+                Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                    restored?;
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() || !wait_readable(self.socket.get_ref(), remaining)? {
+                        return Ok(None);
+                    }
+                }
+                Err(tungstenite::Error::Io(error)) => return Err(error),
+                Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed)
+                | Ok(Message::Close(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "control connection closed; reconcile task state",
+                    ));
+                }
+                Err(error) => return Err(protocol_error(error)),
+                Ok(message) => {
+                    restored?;
+                    return match message {
+                        Message::Text(text) => {
+                            serde_json::from_str(&text).map(Some).map_err(Into::into)
+                        }
+                        Message::Ping(_) | Message::Pong(_) => {
+                            self.socket.flush().map_err(protocol_error)?;
+                            Ok(None)
+                        }
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "expected JSON text control record",
+                        )),
+                    };
+                }
             }
-            Ok(Message::Close(_))
-            | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "control connection closed; reconcile task state",
-                ))
-            }
-            Err(tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(protocol_error(error)),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected JSON text control record",
-            )),
         }
+    }
+}
+
+/// A readiness timeout starts no receive operation and leaves the socket usable.
+/// Error/hangup readiness is consumed by the next read, preserving its cause.
+fn wait_readable(stream: &TcpStream, timeout: Duration) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+
+    let mut descriptor = WSAPOLLFD {
+        fd: stream.as_raw_socket() as _,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    // Round sub-millisecond waits up; never convert a large bound to -1
+    // (Winsock's infinite wait). The caller accounts for elapsed time.
+    let millis = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+    // SAFETY: the descriptor points to one live socket borrowed for this call.
+    let ready = unsafe { WSAPoll(&mut descriptor, 1, millis) };
+    if ready == SOCKET_ERROR {
+        // Read Winsock's error immediately, not a stale Win32 last error.
+        Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+    } else {
+        Ok(ready > 0)
     }
 }
 
@@ -234,4 +277,145 @@ fn caption_loaded(caption: &str, title: &str) -> bool {
     matches!(chars.next(), Some('\u{2800}'..='\u{28ff}'))
         && chars.next() == Some(' ')
         && chars.as_str().starts_with(&expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::{io::Write, net::TcpListener, thread, time::Instant};
+
+    const WAIT: Duration = Duration::from_secs(2);
+
+    fn connected() -> (ControlConnection, WebSocket<TcpStream>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+            stream.set_write_timeout(Some(WAIT)).unwrap();
+            tungstenite::accept(stream).unwrap()
+        });
+        let client = ControlConnection::connect(port, &"a".repeat(32), WAIT).unwrap();
+        (client, server.join().unwrap())
+    }
+
+    #[test]
+    fn repeated_idle_and_partial_frames_keep_the_connection_and_order() {
+        let (mut client, mut server) = connected();
+        let started = Instant::now();
+        for sequence in 0..128 {
+            for _ in 0..4 {
+                assert_eq!(
+                    client.receive(Duration::from_millis(1)).unwrap(),
+                    None,
+                    "idle before event {sequence}"
+                );
+            }
+            let expected = json!({"event": sequence});
+            let text = expected.to_string();
+            let frame = [vec![0x81, text.len() as u8], text.into_bytes()].concat();
+            server.get_mut().write_all(&frame[..3]).unwrap();
+            assert_eq!(client.receive(Duration::from_millis(1)).unwrap(), None);
+            server.get_mut().write_all(&frame[3..]).unwrap();
+            let next = json!({"next": sequence});
+            server.send(Message::Text(next.to_string().into())).unwrap();
+            assert_eq!(client.receive(WAIT).unwrap(), Some(expected));
+            assert_eq!(client.receive(WAIT).unwrap(), Some(next));
+            let reply = json!({"ack": sequence});
+            client.send(&reply, WAIT).unwrap();
+            assert_eq!(
+                server.read().unwrap().into_text().unwrap(),
+                reply.to_string()
+            );
+            assert!(started.elapsed() < Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn a_trickling_frame_cannot_extend_the_observation_deadline() {
+        let (mut client, mut server) = connected();
+        let expected = json!({"message": "a deliberately fragmented control record"});
+        let text = expected.to_string();
+        let frame = [vec![0x81, text.len() as u8], text.into_bytes()].concat();
+        server.get_mut().write_all(&frame[..3]).unwrap();
+        let writer = thread::spawn(move || {
+            for byte in &frame[3..] {
+                thread::sleep(Duration::from_millis(10));
+                server.get_mut().write_all(&[*byte]).unwrap();
+            }
+            server
+        });
+        let started = Instant::now();
+        let observed = client.receive(Duration::from_millis(80));
+        let elapsed = started.elapsed();
+        let server = writer.join().unwrap();
+        assert_eq!(observed.unwrap(), None, "elapsed: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(300), "elapsed: {elapsed:?}");
+        assert_eq!(client.receive(WAIT).unwrap(), Some(expected));
+        drop(server);
+    }
+
+    #[test]
+    fn heartbeat_and_buffered_events_survive_observation_deadlines() {
+        let (mut client, mut server) = connected();
+        assert_eq!(client.receive(Duration::from_millis(1)).unwrap(), None);
+        server.send(Message::Ping(vec![1, 2, 3].into())).unwrap();
+        server
+            .send(Message::Text(json!({"event": 1}).to_string().into()))
+            .unwrap();
+        server
+            .send(Message::Text(json!({"event": 2}).to_string().into()))
+            .unwrap();
+        assert_eq!(client.receive(WAIT).unwrap(), None);
+        assert_eq!(server.read().unwrap(), Message::Pong(vec![1, 2, 3].into()));
+        assert_eq!(client.receive(WAIT).unwrap(), Some(json!({"event": 1})));
+        assert_eq!(client.receive(WAIT).unwrap(), Some(json!({"event": 2})));
+    }
+
+    #[test]
+    fn invalid_messages_and_disconnects_are_not_idle_observations() {
+        let (mut client, mut server) = connected();
+        assert_eq!(client.receive(Duration::from_millis(1)).unwrap(), None);
+        server.send(Message::Text("{invalid JSON".into())).unwrap();
+        assert_eq!(
+            client.receive(WAIT).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        server.close(None).unwrap();
+        assert_eq!(
+            client.receive(WAIT).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let (mut client, mut server) = connected();
+        // A peer disappearing halfway through a frame must not look idle.
+        server.get_mut().write_all(&[0x81, 20, b'{']).unwrap();
+        assert_eq!(client.receive(Duration::from_millis(1)).unwrap(), None);
+        drop(server);
+        assert!(client.receive(WAIT).is_err());
+    }
+
+    #[test]
+    fn a_send_after_an_idle_read_waits_for_backpressure_without_replay() {
+        let (mut client, mut server) = connected();
+        assert_eq!(client.receive(Duration::from_millis(1)).unwrap(), None);
+        let message = json!({"payload": "x".repeat(4 * 1024 * 1024)});
+        let expected = message.to_string();
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            let text = server.read().unwrap().into_text().unwrap();
+            assert_eq!(text, expected);
+            server
+                .send(Message::Text(json!({"accepted": 1}).to_string().into()))
+                .unwrap();
+            server
+        });
+        client.send(&message, WAIT).unwrap();
+        assert_eq!(client.receive(WAIT).unwrap(), Some(json!({"accepted": 1})));
+        let mut server = reader.join().unwrap();
+        server.get_mut().set_nonblocking(true).unwrap();
+        assert!(matches!(server.read(), Err(tungstenite::Error::Io(error))
+            if error.kind() == io::ErrorKind::WouldBlock));
+    }
 }
