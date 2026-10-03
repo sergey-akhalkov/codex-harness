@@ -47,9 +47,23 @@ pub const MAX_CURSOR_BYTES: u64 = 1024 * 1024;
 /// counted loss) instead of growing without limit. Durable evidence lives on
 /// the board and in the retained run files, not in this history.
 pub const MAX_EFFECTS: usize = 256;
+/// The bound on retained attempt records. Settled, unreferenced records are
+/// released oldest-first with a counted loss; the bound never becomes a
+/// service lifetime cap because only protected records can refuse growth.
 pub const MAX_ATTEMPTS: usize = 64;
 pub const MAX_SCOPE_ENTRIES: usize = 32;
 pub const MAX_OWNER_BYTES: usize = 64;
+/// Installed defaults for the configured bounded dispatch retry: one second,
+/// doubling per consecutive refusal before any model request, capped at one
+/// minute. A run may declare its own values beside the runner profile.
+pub const DEFAULT_RETRY_INITIAL_MS: u64 = 1_000;
+pub const DEFAULT_RETRY_FACTOR_PERCENT: u32 = 200;
+pub const DEFAULT_RETRY_MAX_MS: u64 = 60_000;
+pub const MIN_RETRY_INITIAL_MS: u64 = 100;
+pub const MAX_RETRY_INITIAL_MS: u64 = 60 * 60 * 1_000;
+pub const MIN_RETRY_FACTOR_PERCENT: u32 = 100;
+pub const MAX_RETRY_FACTOR_PERCENT: u32 = 6_400;
+pub const MAX_RETRY_MS: u64 = 24 * 60 * 60 * 1_000;
 /// The bounded intake summary the cursor retains for one consumed investigator
 /// result. The board owns the admitted cards and their conclusions; this is
 /// recovery data only.
@@ -218,6 +232,79 @@ pub struct BoardInputs {
     pub project: PathBuf,
 }
 
+/// The configured bounded recovery schedule for dispatches that failed before
+/// any model request was made (a conversation that could not be opened, for
+/// example an unavailable local endpoint). A single refusal keeps the
+/// documented immediate explicit-retry path; from the second consecutive
+/// refusal the delay grows by `factor_percent` and never exceeds `max_ms`. The
+/// schedule bounds the retry rate of a persistent failure, never the lifetime
+/// of the service or the number of experiments. A refused dispatch makes no
+/// model request and is the only retriable failure; a settled model attempt is
+/// never replayed.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetryPolicy {
+    /// The delay before the first retry, in milliseconds.
+    pub initial_ms: u64,
+    /// Growth per consecutive refusal in percent: 200 doubles the delay, 100
+    /// keeps it constant.
+    pub factor_percent: u32,
+    /// The upper bound for one retry delay, in milliseconds.
+    pub max_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            initial_ms: DEFAULT_RETRY_INITIAL_MS,
+            factor_percent: DEFAULT_RETRY_FACTOR_PERCENT,
+            max_ms: DEFAULT_RETRY_MAX_MS,
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub fn validate(&self, source: &str) -> io::Result<()> {
+        if !(MIN_RETRY_INITIAL_MS..=MAX_RETRY_INITIAL_MS).contains(&self.initial_ms) {
+            return Err(invalid(format!(
+                "{source}: initial_ms must be within {MIN_RETRY_INITIAL_MS}..={MAX_RETRY_INITIAL_MS}"
+            )));
+        }
+        if !(MIN_RETRY_FACTOR_PERCENT..=MAX_RETRY_FACTOR_PERCENT).contains(&self.factor_percent) {
+            return Err(invalid(format!(
+                "{source}: factor_percent must be within {MIN_RETRY_FACTOR_PERCENT}..={MAX_RETRY_FACTOR_PERCENT}"
+            )));
+        }
+        if self.max_ms < self.initial_ms || self.max_ms > MAX_RETRY_MS {
+            return Err(invalid(format!(
+                "{source}: max_ms must be at least initial_ms and at most {MAX_RETRY_MS}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The bounded delay before the retry that follows `failures` consecutive
+    /// refusals. The first refusal is the documented immediate explicit-retry
+    /// case; from the second refusal the delay grows by `factor_percent` and
+    /// never exceeds `max_ms`.
+    pub fn delay_ms(&self, failures: u32) -> u64 {
+        if failures <= 1 {
+            return 0;
+        }
+        if self.factor_percent <= MIN_RETRY_FACTOR_PERCENT {
+            return self.initial_ms.min(self.max_ms);
+        }
+        let mut delay = u128::from(self.initial_ms);
+        for _ in 2..failures {
+            delay = delay.saturating_mul(u128::from(self.factor_percent)) / 100;
+            if delay >= u128::from(self.max_ms) {
+                return self.max_ms;
+            }
+        }
+        delay.min(u128::from(self.max_ms)) as u64
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerInputs {
@@ -228,6 +315,11 @@ pub struct RunnerInputs {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// The configured bounded dispatch-retry schedule. Absent uses the
+    /// documented installed defaults; the schedule is frozen with the run at
+    /// start, so changing it requires a new run decision.
+    #[serde(default)]
+    pub retry: Option<RetryPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -560,6 +652,9 @@ impl RunSpec {
             if let Some(effort) = &runner.reasoning_effort {
                 line("runner reasoning effort", effort, MAX_TOKEN)?;
             }
+            if let Some(retry) = &runner.retry {
+                retry.validate("runner retry policy")?;
+            }
         }
         if self.local_runner.is_some() && self.qualification.is_none() {
             return Err(invalid(
@@ -618,6 +713,16 @@ impl RunSpec {
     pub fn digest(&self) -> io::Result<String> {
         let bytes = serde_json::to_vec(self)?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    /// The configured bounded dispatch-retry schedule: the declared runner
+    /// policy or the documented installed defaults. It bounds the retry rate
+    /// after a dispatch that made no model request; it is not a lifetime cap.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.runner
+            .as_ref()
+            .and_then(|runner| runner.retry)
+            .unwrap_or_default()
     }
 
     pub fn permits(&self, stage: PublicationStage) -> bool {
@@ -1127,6 +1232,131 @@ pub struct RetainedEvidence {
     pub retained_ms: u64,
 }
 
+/// One unavailable artifact of a retained evidence snapshot. Missing and
+/// changed stay distinct so a consumer can name exactly what is unsupported
+/// instead of reconstructing a favorable result from a summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedEvidenceFault {
+    /// The retained artifact is no longer present (released, deleted or never
+    /// copied).
+    Missing {
+        artifact: &'static str,
+        path: PathBuf,
+    },
+    /// The retained artifact changed after retention.
+    Changed {
+        artifact: &'static str,
+        path: PathBuf,
+    },
+    /// The retained artifact exists but cannot be read within its bound.
+    Unreadable {
+        artifact: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
+}
+
+impl RetainedEvidenceFault {
+    /// The explicit unsupported-evidence reason naming the exact artifact.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Missing { artifact, path } => format!(
+                "the retained {artifact} snapshot at {} is no longer available (missing or released); any claim resting on it stays unsupported",
+                path.display()
+            ),
+            Self::Changed { artifact, path } => format!(
+                "the retained {artifact} snapshot at {} changed after retention; the recorded digest no longer binds it and any claim resting on it stays unsupported",
+                path.display()
+            ),
+            Self::Unreadable {
+                artifact,
+                path,
+                reason,
+            } => format!(
+                "the retained {artifact} snapshot at {} is unreadable: {reason}",
+                path.display()
+            ),
+        }
+    }
+}
+
+fn verify_retained_artifact(
+    artifact: &'static str,
+    path: &Path,
+    expected_sha256: &str,
+    limit: u64,
+) -> Result<(), RetainedEvidenceFault> {
+    let bytes = match bounded_read(path, limit) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(RetainedEvidenceFault::Missing {
+                artifact,
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) => {
+            return Err(RetainedEvidenceFault::Unreadable {
+                artifact,
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            });
+        }
+    };
+    if digest_bytes(&bytes) != expected_sha256 {
+        return Err(RetainedEvidenceFault::Changed {
+            artifact,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+impl RetainedEvidence {
+    /// Re-verifies the retained snapshot against its recorded digests. A
+    /// missing, released, changed or unreadable artifact is reported
+    /// explicitly; it is never silently treated as the retained result.
+    pub fn verify(&self) -> Result<(), RetainedEvidenceFault> {
+        if self.result.is_some() != self.result_sha256.is_some() {
+            return Err(RetainedEvidenceFault::Unreadable {
+                artifact: "result",
+                path: self
+                    .result
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("<unrecorded>")),
+                reason:
+                    "the retained result record carries only one of its artifact path and digest"
+                        .to_owned(),
+            });
+        }
+        verify_retained_artifact(
+            "receipt",
+            &self.receipt,
+            &self.receipt_sha256,
+            MAX_RETAINED_RECEIPT_BYTES,
+        )?;
+        if let (Some(path), Some(sha256)) = (&self.result, &self.result_sha256) {
+            verify_retained_artifact("result", path, sha256, MAX_RETAINED_RESULT_BYTES)?;
+        }
+        Ok(())
+    }
+
+    /// The explicit unsupported-evidence reason, when the snapshot cannot
+    /// support a claim: a missing/changed/unreadable artifact, or a result
+    /// that was never retained with its recorded cause. `None` means the
+    /// retained evidence is available as recorded.
+    pub fn unsupported_reason(&self) -> Option<String> {
+        if let Err(fault) = self.verify() {
+            return Some(fault.reason());
+        }
+        if self.result.is_none() {
+            return self.note.as_ref().map(|note| {
+                format!("the retained terminal result of this attempt is unavailable: {note}")
+            });
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Attempt {
@@ -1166,6 +1396,35 @@ pub struct Attempt {
 }
 
 impl Attempt {
+    /// A dispatch that failed before submission: no dispatch identity was
+    /// accepted, so no model request was made. The documented recovery for
+    /// this case is a fresh attempt under the configured bounded retry; an
+    /// attempt that accepted a dispatch (or settled a model effect) is never
+    /// replayed.
+    pub fn failed_before_submission(&self) -> bool {
+        self.state == AttemptState::Failed && self.binding.is_none()
+    }
+
+    /// The explicit unsupported-evidence result for this attempt, naming the
+    /// exact missing, changed or unretained artifact. `None` means the
+    /// attempt recorded no claim against unavailable evidence (for example a
+    /// refusal that made no model request owns no terminal evidence).
+    pub fn unsupported_evidence(&self) -> Option<String> {
+        if let Some(retained) = &self.retained {
+            return retained
+                .unsupported_reason()
+                .map(|reason| format!("attempt {}: {reason}", self.id));
+        }
+        if self.receipt.is_some() && self.state.is_terminal() {
+            return Some(format!(
+                "attempt {}: the terminal evidence was not retained ({}); any claim resting on it stays unsupported",
+                self.id,
+                self.reason.as_deref().unwrap_or("no recorded reason")
+            ));
+        }
+        None
+    }
+
     pub fn settle(&mut self, outcome: ObservedOutcome, at_ms: u64) {
         let (state, reason) = match outcome {
             ObservedOutcome::Completed => (AttemptState::Completed, None),
@@ -1237,6 +1496,10 @@ pub enum EffectKind {
     OwnershipTaken,
     Resumed,
     Reconciled,
+    /// One settled, unreferenced attempt record was released from the bounded
+    /// cursor history; the loss stays counted and durable evidence keeps its
+    /// own owner.
+    AttemptsReleased,
     RemeasurementRequired,
     /// A missing declared runtime was published by the existing native build
     /// owner. The frozen run spec is not rewritten; the published path is
@@ -1532,6 +1795,19 @@ pub struct Cursor {
     /// evidence, this counter keeps the loss visible.
     #[serde(default)]
     pub effects_dropped: u64,
+    /// Attempt records released from the bounded history; the durable owners
+    /// keep the effects and retained evidence, this counter keeps the loss
+    /// visible. Retention never becomes a service lifetime cap: settled,
+    /// unreferenced records are released oldest-first while active attempts,
+    /// unresolved outcomes and the referenced comparison/candidate evidence
+    /// stay protected.
+    #[serde(default)]
+    pub attempts_dropped: u64,
+    /// The configured bounded dispatch-retry schedule, captured from the
+    /// declared runner policy at start. A later spec change does not rewrite
+    /// it; changed run inputs require a new run decision.
+    #[serde(default)]
+    pub retry: RetryPolicy,
     pub selected_variant: Option<String>,
     pub selected_runtime: Option<PathBuf>,
     pub selected_identity: Option<String>,
@@ -1563,6 +1839,8 @@ impl Cursor {
             attempts: Vec::new(),
             effects: Vec::new(),
             effects_dropped: 0,
+            attempts_dropped: 0,
+            retry: RetryPolicy::default(),
             selected_variant: None,
             selected_runtime: None,
             selected_identity: None,
@@ -1694,11 +1972,105 @@ impl Cursor {
             .collect()
     }
 
+    /// The attempts bounded retention may never release: in-flight or
+    /// unresolved outcomes (pending recovery) and the exact attempts the
+    /// candidate and comparison state reference (implementation and measured
+    /// baseline/candidate provenance).
+    fn protected_attempt_ids(&self) -> std::collections::BTreeSet<&str> {
+        let mut protected = std::collections::BTreeSet::new();
+        for attempt in &self.attempts {
+            if attempt.state.is_in_flight() || attempt.state == AttemptState::Unknown {
+                protected.insert(attempt.id.as_str());
+            }
+        }
+        if let Some(candidate) = &self.candidate {
+            for id in [
+                candidate.planner_attempt.as_deref(),
+                candidate.implementer_attempt.as_deref(),
+            ] {
+                if let Some(id) = id {
+                    protected.insert(id);
+                }
+            }
+        }
+        if let Some(comparison) = &self.comparison {
+            for arm in [&comparison.baseline, &comparison.candidate] {
+                if let Some(id) = arm.attempt.as_deref() {
+                    protected.insert(id);
+                }
+            }
+        }
+        protected
+    }
+
+    /// The bounded wait the configured retry policy imposes before the next
+    /// dispatch of `role`, after one or more attempts that failed before any
+    /// model request was made. A single refusal keeps the documented immediate
+    /// explicit-retry path; from the second consecutive refusal the configured
+    /// schedule rate-limits the next attempt. A settled model attempt ends the
+    /// chain: it is never replayed, so it imposes no retry. `None` means no
+    /// retry is pending at `now_ms`.
+    pub fn dispatch_backoff(&self, role: AttemptRole, now_ms: u64) -> Option<DispatchBackoff> {
+        let mut failures = 0u32;
+        let mut latest: Option<&Attempt> = None;
+        for attempt in self.attempts.iter().rev() {
+            if attempt.role != role {
+                continue;
+            }
+            if !attempt.failed_before_submission() {
+                break;
+            }
+            failures += 1;
+            if latest.is_none() {
+                latest = Some(attempt);
+            }
+        }
+        let latest = latest?;
+        let delay_ms = self.retry.delay_ms(failures);
+        let ready_at_ms = latest.updated_ms.saturating_add(delay_ms);
+        (now_ms < ready_at_ms).then(|| DispatchBackoff {
+            attempt: latest.id.clone(),
+            failures,
+            delay_ms,
+            ready_at_ms,
+            cause: latest.reason.clone(),
+        })
+    }
+
+    /// Explicit unsupported-evidence results for retained attempts whose
+    /// terminal evidence is missing, changed or was never retained. An empty
+    /// result means every retained attempt that owns evidence still verifies.
+    pub fn unsupported_evidence(&self) -> Vec<String> {
+        self.attempts
+            .iter()
+            .filter_map(Attempt::unsupported_evidence)
+            .collect()
+    }
+
     pub fn push_attempt(&mut self, attempt: Attempt) -> io::Result<()> {
         if self.attempts.len() >= MAX_ATTEMPTS {
-            return Err(invalid(format!(
-                "the run already recorded {MAX_ATTEMPTS} attempts; retention is bounded and the cursor refuses further growth"
-            )));
+            let protected = self.protected_attempt_ids();
+            let releasable = self
+                .attempts
+                .iter()
+                .position(|attempt| !protected.contains(attempt.id.as_str()));
+            let Some(index) = releasable else {
+                return Err(invalid(format!(
+                    "the run already recorded {MAX_ATTEMPTS} attempts and every record is active, unresolved or referenced as comparison/candidate evidence; bounded retention releases settled unreferenced records first and refuses further growth only while every record is protected"
+                )));
+            };
+            let released = self.attempts.remove(index);
+            self.attempts_dropped += 1;
+            self.effect(
+                EffectKind::AttemptsReleased,
+                format!(
+                    "released attempt {} role={} state={}; attempts_dropped={}",
+                    released.id,
+                    released.role.as_str(),
+                    released.state.as_str(),
+                    self.attempts_dropped
+                ),
+            );
         }
         self.attempts.push(attempt);
         self.updated_ms = now_ms();
@@ -1933,12 +2305,14 @@ impl RunStore {
         }
         fs::create_dir_all(self.root.join(ASSIGNMENTS_DIR))?;
         write_json_atomic(&self.spec_path(), spec)?;
-        self.save_cursor(&Cursor::new(
+        let mut cursor = Cursor::new(
             &spec.run,
             spec_digest.to_owned(),
             change_root.to_path_buf(),
             &spec.hypothesis_item,
-        ))
+        );
+        cursor.retry = spec.retry_policy();
+        self.save_cursor(&cursor)
     }
 
     pub fn open(root: &Path) -> io::Result<Self> {
@@ -2270,6 +2644,24 @@ pub enum DispatchGate {
     Blocked { reason: String },
 }
 
+/// The bounded wait the configured retry policy imposes before the next
+/// dispatch of one role, after attempts that failed before any model request
+/// was made. It bounds the retry rate; it is never a lifetime cap and it never
+/// substitutes another provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchBackoff {
+    /// The most recent refused attempt.
+    pub attempt: String,
+    /// Consecutive refusals of this role, most recent first.
+    pub failures: u32,
+    /// The bounded delay before the next attempt.
+    pub delay_ms: u64,
+    /// The earliest time (Unix milliseconds) the next attempt may start.
+    pub ready_at_ms: u64,
+    /// The recorded refusal cause, when one exists.
+    pub cause: Option<String>,
+}
+
 /// Inputs the gate needs that the cursor cannot know by itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DispatchFacts {
@@ -2378,6 +2770,36 @@ pub fn dispatch_gate(cursor: &Cursor, role: AttemptRole, facts: &DispatchFacts) 
                 };
             }
         }
+    }
+    if let Some(backoff) = cursor.dispatch_backoff(role, now_ms()) {
+        // A persistent endpoint availability failure keeps its exact cause
+        // visible; completed work is preserved, the retry rate is bounded by
+        // the configured schedule and no different provider or route is used.
+        let cause = backoff
+            .cause
+            .as_deref()
+            .map(|cause| {
+                cause
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(MAX_TOKEN)
+                    .collect::<String>()
+            })
+            .filter(|cause| !cause.is_empty())
+            .unwrap_or_else(|| "no cause recorded".to_owned());
+        return DispatchGate::Blocked {
+            reason: format!(
+                "endpoint backoff: the {} dispatch failed before any model request {} time(s) (attempt {}: {cause}); bounded recovery waits {} ms until t={}; completed work is preserved, no other provider or route is substituted, and another attempt may start after that time",
+                role.as_str(),
+                backoff.failures,
+                backoff.attempt,
+                backoff.delay_ms,
+                backoff.ready_at_ms
+            ),
+        };
     }
     DispatchGate::Ready
 }

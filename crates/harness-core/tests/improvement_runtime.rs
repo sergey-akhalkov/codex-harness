@@ -1137,6 +1137,17 @@ fn refusals_guard_overlap_missing_inputs_and_partial_state() {
     let error = refused(&request);
     assert!(error.contains("overlay"), "{error}");
 
+    // A local endpoint carrying credentials is refused before any arm is
+    // prepared: route credentials belong in explicit private inputs, never in
+    // the declared endpoint record or the retained client configuration.
+    let mut request = fixture.request.clone();
+    let mut credentialed = local_client(&present_catalogue, None);
+    credentialed.runner.endpoint = "http://user:secret@127.0.0.1:45999/v1".to_owned();
+    request.client = Some(credentialed);
+    let error = refused(&request);
+    assert!(error.contains("credential-free"), "{error}");
+    assert!(not_installed(&fixture.request.home));
+
     // A declared setting the arm's own kit profile would override at launch is
     // refused instead of being recorded as consumed.
     let mut request = fixture.request.clone();
