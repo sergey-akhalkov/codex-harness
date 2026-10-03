@@ -1591,13 +1591,20 @@ conditions, not repeatability of every future task. Native coverage lives in
 `harness-core::outcome_qualification` and the `outcome_run` integration tests.
 
 `outcome-prepare`, `outcome-oracle`, `outcome-discover` and `outcome-arm`
-cover the five local controlled cases, independent oracles, model-free
-discovery and both skill comparison modes. `tools/outcome_native_pairs.py` is
-the explicit opt-in driver for one native baseline/candidate pair per local
-case; it spends ChatGPT quota only with `--run-model-probes` and keeps
-evidence in a private temporary root. One such pair later ran for each local
-case on hooks-off Astra/xhigh. Benefit remains unproven. Two-consumer
-quantitative comparison is out of this change's acceptance (2026-09-18).
+cover the eight local controlled cases, independent oracles, model-free
+discovery and both skill comparison modes. Every measured arm requires the
+prepared case's frozen `case_contract` digest and a passing preparation
+receipt: the digest binds the case kind, declared source state, exact prompt
+and immutable input hashes, and a changed input, missing receipt or
+mismatched digest refuses before publication. Native discovery also runs its
+app-server child without inherited Git repository, work-tree or object-store
+redirection, so an exported `GIT_DIR`/`GIT_WORK_TREE` cannot point the child
+at sibling history. `tools/outcome_native_pairs.py` is the explicit opt-in
+driver for one native baseline/candidate pair per local case; it spends
+ChatGPT quota only with `--run-model-probes` and keeps evidence in a private
+temporary root. One such pair later ran for each local case on hooks-off
+Astra/xhigh. Benefit remains unproven. Two-consumer quantitative comparison
+is out of this change's acceptance (2026-09-18).
 Verification-skill global lifecycle is delivered. Build the
 workspace binaries first (`cargo build -p codex-harness --bins`): the legacy
 pair driver's independent process oracle now runs commands through native
