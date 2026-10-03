@@ -24,7 +24,7 @@ use crate::benefit_gate;
 use crate::board_cli::{json_ok_actor, string_field};
 use crate::board_feedback;
 use serde_json::Value;
-use std::{io, path::Path};
+use std::{io, path::Path, process::Command};
 
 /// The label marking a durable hypothesis card.
 pub const HYPOTHESIS_LABEL: &str = "hypothesis";
@@ -794,6 +794,9 @@ pub fn record_implementation(
 /// the independent oracle and acceptance references - so reading it back
 /// cannot hand a solution to a fresh executor. A missing oracle, acceptance or
 /// replay reference is refused: no summary substitutes for retained evidence.
+/// [`record_retention`] additionally resolves the frozen git tree object id
+/// from the retained replay copy and records it, so a later run can rebuild
+/// the task verifiably from the board alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionDraft {
     pub case_id: String,
@@ -845,9 +848,9 @@ impl BoundedRetention {
         })
     }
 
-    fn comment(&self, item: &str) -> String {
+    fn comment(&self, item: &str, tree_object: &str) -> String {
         let mut text = format!(
-            "{RETENTION_PREFIX} item={item} case={} experiment={} mechanism={} conditions={} revision={} frozen={} tree={} oracle={} acceptance={} replay={}",
+            "{RETENTION_PREFIX} item={item} case={} experiment={} mechanism={} conditions={} revision={} frozen={} tree={} tree_object={} oracle={} acceptance={} replay={}",
             self.case_id,
             self.experiment,
             self.mechanism,
@@ -855,6 +858,7 @@ impl BoundedRetention {
             self.revision,
             self.frozen,
             self.tree,
+            tree_object,
             self.oracle,
             self.acceptance,
             self.replay
@@ -877,7 +881,11 @@ pub struct RetentionRecord {
 
 /// Records the retained replayable identity of one completed real task on the
 /// card that already owns it. The card must exist: retention never creates a
-/// card, a synthetic task or a second task store.
+/// card, a synthetic task or a second task store. The frozen git tree object
+/// id is resolved from the retained replay copy and recorded with the bounded
+/// references; a retention whose frozen identity cannot be resolved is refused
+/// and not recorded, so a later run never reads an identity the retained
+/// artifact cannot support.
 pub fn record_retention(
     bd: &Path,
     project: &Path,
@@ -885,7 +893,8 @@ pub fn record_retention(
     retention: &BoundedRetention,
 ) -> io::Result<RetentionRecord> {
     require_hypothesis_card(bd, project, item)?;
-    let text = retention.comment(item);
+    let tree_object = frozen_tree_object(&retention.replay, &retention.frozen)?;
+    let text = retention.comment(item, &tree_object);
     let comments = board_feedback::list_comments(bd, project, item)?;
     let already = comments.iter().any(|comment| comment == &text);
     if !already {
@@ -895,6 +904,45 @@ pub fn record_retention(
         case_id: retention.case_id.clone(),
         recorded: !already,
     })
+}
+
+/// Resolve the frozen git tree object id recorded for a retained replay copy:
+/// the recorded frozen root commit must exist in the retained repository and
+/// record exactly this tree. A missing or unreadable artifact refuses the
+/// retention instead of recording an identity a later run cannot rebuild.
+fn frozen_tree_object(replay: &str, frozen: &str) -> io::Result<String> {
+    let path = Path::new(replay);
+    if !path.is_dir() {
+        return Err(invalid(format!(
+            "the retained replay copy {replay} is missing; its frozen tree object id cannot be resolved and the retention is not recorded"
+        )));
+    }
+    let out = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{frozen}^{{tree}}"),
+        ])
+        .current_dir(path)
+        .output()
+        .map_err(|error| {
+            invalid(format!(
+                "the retained replay copy {replay} could not be read for its frozen tree object id: {error}"
+            ))
+        })?;
+    let object = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if !out.status.success()
+        || !(40..=64).contains(&object.len())
+        || !object
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(invalid(format!(
+            "the retained replay copy {replay} does not contain frozen commit {frozen}; its frozen tree object id cannot be resolved and the retention is not recorded"
+        )));
+    }
+    Ok(object)
 }
 
 /// One reviewable removal proposal recorded before the user's decision.
@@ -1668,7 +1716,8 @@ fn parse_reconsideration(comment: &str) -> Option<ReconsiderationComment> {
 
 /// One recorded retention of a completed real task, as read back from its
 /// owning card. The fields are references: no solution, patch, answer or
-/// acceptance content can be carried here.
+/// acceptance content can be carried here. `tree_object` is the frozen git
+/// tree object id; records written before it was retained carry `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedRetention {
     pub item: String,
@@ -1678,7 +1727,10 @@ pub struct RecordedRetention {
     pub conditions: String,
     pub revision: String,
     pub frozen: String,
+    /// Content digest over the frozen tree entries.
     pub tree: String,
+    /// The frozen git tree object id when the record carries it.
+    pub tree_object: Option<String>,
     pub oracle: String,
     pub acceptance: String,
     pub replay: String,
@@ -1706,6 +1758,7 @@ fn parse_retention(comment: &str) -> Option<RecordedRetention> {
     let mut revision = None;
     let mut frozen = None;
     let mut tree = None;
+    let mut tree_object = None;
     let mut oracle = None;
     let mut acceptance = None;
     let mut replay = None;
@@ -1722,6 +1775,7 @@ fn parse_retention(comment: &str) -> Option<RecordedRetention> {
             "revision" => revision = non_none(value),
             "frozen" => frozen = non_none(value),
             "tree" => tree = non_none(value),
+            "tree_object" => tree_object = non_none(value),
             "oracle" => oracle = non_none(value),
             "acceptance" => acceptance = non_none(value),
             "replay" => replay = non_none(value),
@@ -1737,6 +1791,7 @@ fn parse_retention(comment: &str) -> Option<RecordedRetention> {
         revision: revision?,
         frozen: frozen?,
         tree: tree?,
+        tree_object,
         oracle: oracle?,
         acceptance: acceptance?,
         replay: replay?,
@@ -2337,10 +2392,11 @@ mod tests {
             ..retention_components()
         })
         .unwrap();
-        let comment = retention.comment("bdct-h1");
+        let tree_object = "bb11cc22dd33ee44ff55aa66bb77cc88dd99ee00";
+        let comment = retention.comment("bdct-h1", tree_object);
         assert_eq!(
             comment,
-            r"hypothesis-retention v1 item=bdct-h1 case=case-b experiment=exp-1 mechanism=bounded-output conditions=local-tool-runs revision=0b960b4c87f21a38f5ade8b8d27e374bacb81b8a frozen=aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00 tree=d1g3e5s7t9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9 oracle=oracle-7 acceptance=acceptance/run-9 replay=C:\state\replay-1 detail=accepted completed real task"
+            r"hypothesis-retention v1 item=bdct-h1 case=case-b experiment=exp-1 mechanism=bounded-output conditions=local-tool-runs revision=0b960b4c87f21a38f5ade8b8d27e374bacb81b8a frozen=aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00 tree=d1g3e5s7t9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9 tree_object=bb11cc22dd33ee44ff55aa66bb77cc88dd99ee00 oracle=oracle-7 acceptance=acceptance/run-9 replay=C:\state\replay-1 detail=accepted completed real task"
         );
         let parsed = parse_retention(&comment).unwrap();
         assert_eq!(parsed.item, "bdct-h1");
@@ -2349,6 +2405,7 @@ mod tests {
         assert_eq!(parsed.mechanism, "bounded-output");
         assert_eq!(parsed.conditions, "local-tool-runs");
         assert_eq!(parsed.frozen, "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00");
+        assert_eq!(parsed.tree_object.as_deref(), Some(tree_object));
         assert_eq!(parsed.oracle, "oracle-7");
         assert_eq!(parsed.acceptance, "acceptance/run-9");
         assert_eq!(parsed.replay, r"C:\state\replay-1");
@@ -2356,6 +2413,13 @@ mod tests {
             parsed.detail.as_deref(),
             Some("accepted completed real task")
         );
+
+        // A record written before the frozen tree object id was retained
+        // stays readable with no object identity to rebuild from.
+        let legacy = comment.replace(&format!(" tree_object={tree_object}"), "");
+        let legacy = parse_retention(&legacy).unwrap();
+        assert_eq!(legacy.case_id, "case-b");
+        assert_eq!(legacy.tree_object, None);
 
         // Absent evidence is not a retention: a summary cannot stand in for
         // the oracle, the acceptance reference or the frozen replay identity.
