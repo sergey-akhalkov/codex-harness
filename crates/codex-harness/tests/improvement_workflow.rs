@@ -2937,3 +2937,598 @@ fn continuous_start_idles_without_a_model_call() {
         "an idle continuous loop writes no assignment"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Directed measurement: the declared scope gates the baseline direction.
+// ---------------------------------------------------------------------------
+
+/// One declared measurement scope: the hypothesis's existing targeted
+/// measurement, stated in its own OpenSpec change under `## Measurement`. The
+/// workload is an existing operation linked from that same change, never a
+/// second hypothesis or change.
+fn measurement_scope_value() -> Value {
+    json!({
+        "observed_problem": "identical repeated reads waste accepted-task time",
+        "investigation_scope": "the reader's repeated reads at one frozen source revision",
+        "measurement_question": "how much accepted-task time do identical repeated reads cost?",
+        "workload": {
+            "operation": "cargo build -p example-reader",
+            "contract": "openspec/changes/add-synthetic/proposal.md#Measurement",
+        },
+        "evidence_references": ["retained outcome record: repeated reads"],
+        "limits": "one local machine and one frozen source revision",
+        "declaration_artifact": "proposal.md",
+        "declaration_heading": "## Measurement",
+    })
+}
+
+/// The declared scope is explicit local run data beside the frozen spec.
+fn write_measurement_scope(fixture: &Fixture, scope: &Value) {
+    fs::create_dir_all(&fixture.run).unwrap();
+    fs::write(
+        fixture.run.join("measurement-scope.json"),
+        serde_json::to_vec_pretty(scope).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The minimal comparison declaration a measurement-gate fixture needs. It
+/// passes the frozen run-input validation; real preparation then refuses the
+/// missing policy before any measured dispatch, which keeps the gate isolated
+/// from a full prepared pair.
+fn comparison_declaration(fixture: &Fixture) -> Value {
+    let upstream = fixture.root.join("upstream-client.exe");
+    fs::write(&upstream, "synthetic client").unwrap();
+    let state = fixture.root.join("runtime-state");
+    fs::create_dir_all(&state).unwrap();
+    let acceptance = fixture.root.join("acceptance-request.json");
+    fs::write(&acceptance, "{}").unwrap();
+    json!({
+        "schema": 1,
+        "specification": {
+            "project": fixture.proj,
+            "change": "add-workload",
+            "store": Value::Null,
+            "planning_root": fixture.proj,
+        },
+        "contract": {
+            "acceptance_artifact": "specs/synthetic/spec.md",
+            "acceptance_heading": "#### Scenario: Synthetic case",
+            "mechanism": "bounded-output",
+            "counterexample": "diagnostics vanish",
+            "applicability": "local tool runs",
+            "independent_acceptance": "the oracle checker executes",
+            "meaningful_effect": "fewer repeated loads",
+            "operating_conditions": "cold context",
+            "comparison_policy": "matched pairs",
+            "stopping_rule": "two repeats",
+        },
+        "workload_card": "bdcw-workload-card",
+        "task": {
+            "source": fixture.proj,
+            "revision": git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+            "name": "workload-synthetic",
+            "writable_scope": ["crates/one"],
+        },
+        "runtimes": {
+            "state": state,
+            "baseline_build": state.join("baseline-build"),
+            "candidate_build": state.join("candidate-build"),
+            "baseline_label": "H",
+            "candidate_label": "H-A",
+            "upstream": upstream,
+            "client": {
+                "runner": {
+                    "endpoint": "http://127.0.0.1:45999/v1",
+                    "model": "fixture-glyph-1",
+                },
+            },
+        },
+        "policy": fixture.run.join("comparison-policy.json"),
+        "acceptance": {
+            "request": acceptance,
+            "request_sha256": "a".repeat(64),
+        },
+        "observation_inputs": [],
+    })
+}
+
+/// One investigator report proposing a simplification (a removal treatment).
+/// Grounded intake admits a new card for it and the dependent implementation
+/// stays behind the user's informed removal decision.
+fn simplification_report(locator: &str) -> Value {
+    json!({
+        "schema": 1,
+        "candidates": [{
+            "mechanism": "retire-unused-capability",
+            "conditions": "owned-local-tool-runs",
+            "observation": locator,
+            "predicted": "less catalogue and instruction exposure",
+            "counterexample": "a rare recovery use disappears",
+            "acceptance": "the independent oracle passes",
+            "spec": "openspec/changes/add-synthetic",
+            "basis": locator,
+            "treatment": {
+                "simplification": {
+                    "removal": {
+                        "target": "capability-x",
+                        "basis": {
+                            "coverage": {
+                                "interval": "90 days",
+                                "tasks": "every owned local task",
+                                "gaps": "none observed",
+                                "lost_uses": "rare manual recovery",
+                                "restoration": "restore from the pinned revision",
+                            },
+                        },
+                    },
+                },
+            },
+            "evidence": [{"locator": locator, "kind": "observed"}],
+            "next_check": null,
+        }],
+        "idle_reason": null,
+    })
+}
+
+/// The change directories of one project, excluding the archive.
+fn change_dirs(project: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(project.join("openspec/changes"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir() && entry.file_name() != "archive")
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The latest recorded dispatch refusal of one cursor.
+fn last_refusal(cursor: &Value) -> String {
+    cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|effect| effect["kind"] == "dispatch-refused")
+        .filter_map(|effect| effect["detail"].as_str())
+        .last()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Rewrites the candidate's own change so its proposal states (or no longer
+/// states) the declared measurement scope section, committed on the candidate
+/// branch.
+fn commit_measurement_section(worktree: &Path, change: &str, section: &str) {
+    fs::write(
+        worktree.join(format!("openspec/changes/{change}/proposal.md")),
+        format!("## Why\n\nSynthetic.\n\n{section}"),
+    )
+    .unwrap();
+    commit_all(worktree, "state the declared measurement scope");
+}
+
+const MEASUREMENT_SECTION: &str = "## Measurement\n\nObserved problem: identical repeated reads waste accepted-task time. Investigation scope: reads at one frozen source revision. Measurement question: how much accepted-task time do they cost? Workload: the existing cargo build operation linked from this change. Evidence: the retained outcome record. Limits: one local machine and one frozen source revision.\n";
+
+#[test]
+fn a_declared_measurement_scope_gates_the_baseline_direction_and_rebinds_on_resume() {
+    let fixture = Fixture::new("measured-gate");
+    let (root, locator) = write_evidence_root(&fixture);
+    write_measurement_scope(&fixture, &measurement_scope_value());
+    fixture.write_spec(&[
+        ("evidence_root", json!(root)),
+        (
+            "local_runner",
+            json!({
+                "endpoint": "http://127.0.0.1:45999/v1",
+                "model": "fixture-glyph-1",
+            }),
+        ),
+        (
+            "qualification",
+            json!(fixture.root.join("qualification.json")),
+        ),
+        ("comparison", comparison_declaration(&fixture)),
+    ]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let worktree = fixture.candidate_worktree(&fixture.card);
+    assert!(worktree.is_dir(), "candidate worktree exists");
+
+    // Simulate the implementation conversation: a detached slot worktree of
+    // the candidate branch with a committed, in-scope implementation.
+    let slot = fixture.root.join("gate-slot");
+    slot_worktree(&worktree, &slot, &head(&worktree));
+    fs::write(
+        slot.join("crates/one/src/lib.rs"),
+        "// implemented before the measured pair\n",
+    )
+    .unwrap();
+    commit_all(&slot, "implement the bounded output");
+    let revision = head(&slot);
+    let receipt = fixture.run.join("gate-implementer-receipt.json");
+    seed_bound_receipt(
+        &receipt,
+        "workflow-fixture-implementer-1",
+        "gen-1",
+        "completed",
+        Some(0),
+    );
+    push_attempt(
+        &fixture,
+        attempt_json(
+            "implementer-1",
+            "implementer",
+            "workflow-fixture-implementer-1",
+            "gen-1",
+            &receipt,
+            None,
+            Some(&slot),
+            "started",
+        ),
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "candidate-ready", "{report}");
+    assert_eq!(report["candidate"]["revision"], revision, "{report}");
+
+    // The declared scope is not yet stated in the hypothesis's own change:
+    // directing the baseline measurement is refused with the exact artifact.
+    let measurement_receipt = fixture.run.join("measurement-receipt.json");
+    assert!(
+        !measurement_receipt.exists(),
+        "no receipt exists before the gate runs"
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_ne!(report["phase"], "baseline-attempt", "{report}");
+    assert!(
+        report["comparison"].is_null(),
+        "the comparison owner was engaged before the gate: {report}"
+    );
+    assert!(
+        report["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["role"] != "baseline"),
+        "no baseline attempt is dispatched from an unstated scope: {report}"
+    );
+    assert_eq!(
+        report["candidate"]["measurement_receipt"],
+        Value::Null,
+        "{report}"
+    );
+    assert!(!measurement_receipt.exists());
+    let refusal = last_refusal(&fixture.cursor());
+    assert!(
+        refusal
+            .contains("missing or empty measurement scope section in the linked OpenSpec artifact"),
+        "{refusal}"
+    );
+    // The workload stays linked from the hypothesis's own change: no second
+    // hypothesis or change is created for it.
+    assert_eq!(
+        change_dirs(&fixture.proj),
+        vec![fixture.change.clone()],
+        "the measurement workload forced a second change"
+    );
+
+    // The change now states the declared scope. The gate retains the receipt
+    // before the measured-pair owner is engaged at all.
+    commit_measurement_section(&worktree, &fixture.change, MEASUREMENT_SECTION);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let output = text(&resume);
+    assert!(
+        output.contains("measurement: change add-synthetic states the declared measurement scope"),
+        "{output}"
+    );
+    assert!(
+        output.contains("the predeclared comparison policy is unusable"),
+        "the comparison owner was never engaged after the gate: {output}"
+    );
+    assert!(measurement_receipt.is_file(), "the receipt is retained");
+    let cursor = fixture.cursor();
+    let retained_path = cursor["candidate"]["measurement_receipt"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(
+        PathBuf::from(retained_path),
+        measurement_receipt,
+        "{cursor}"
+    );
+    let retained: Value = serde_json::from_slice(&fs::read(&measurement_receipt).unwrap()).unwrap();
+    assert_eq!(
+        retained["scope"]["workload"]["operation"], "cargo build -p example-reader",
+        "{retained}"
+    );
+    assert_eq!(
+        retained["specification"]["change"], "add-synthetic",
+        "{retained}"
+    );
+    assert!(
+        retained["artifacts"].as_object().unwrap().len() >= 2,
+        "{retained}"
+    );
+
+    // Resume revalidates the retained receipt against the unchanged change
+    // and never rewrites it.
+    let before = fs::read(&measurement_receipt).unwrap();
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        text(&resume).contains("measurement: the retained receipt rebinds to change add-synthetic"),
+        "{}",
+        text(&resume)
+    );
+    assert_eq!(
+        fs::read(&measurement_receipt).unwrap(),
+        before,
+        "revalidation rewrote the retained receipt"
+    );
+
+    // A changed declared scope blocks reuse of the retained measurement.
+    let mut changed = measurement_scope_value();
+    changed["measurement_question"] = json!("a different declared question");
+    write_measurement_scope(&fixture, &changed);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        text(&resume).contains(
+            "the declared measurement scope changed after the directed-measurement receipt was retained"
+        ),
+        "{}",
+        text(&resume)
+    );
+    assert_eq!(
+        fs::read(&measurement_receipt).unwrap(),
+        before,
+        "a changed declaration rewrote the retained receipt"
+    );
+    write_measurement_scope(&fixture, &measurement_scope_value());
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        text(&resume).contains("the retained receipt rebinds"),
+        "{}",
+        text(&resume)
+    );
+
+    // A change that no longer states the declared scope blocks reuse as well,
+    // and restoring it rebinds the same retained receipt.
+    commit_measurement_section(&worktree, &fixture.change, "");
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let output = text(&resume);
+    assert!(
+        output.contains("no longer rebinds to the hypothesis's own change"),
+        "{output}"
+    );
+    assert!(output.contains("measurement scope section"), "{output}");
+    assert_eq!(
+        fs::read(&measurement_receipt).unwrap(),
+        before,
+        "drift rewrote the retained receipt"
+    );
+    commit_measurement_section(&worktree, &fixture.change, MEASUREMENT_SECTION);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        text(&resume).contains("the retained receipt rebinds"),
+        "{}",
+        text(&resume)
+    );
+}
+
+#[test]
+fn a_scaffolded_candidate_receives_the_declared_measurement_scope_in_its_planner_brief() {
+    let fixture = Fixture::new("planner-scope");
+    let (root, locator) = write_evidence_root(&fixture);
+    write_measurement_scope(&fixture, &measurement_scope_value());
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    fixture.start();
+    seed_investigator_report(&fixture, &missing_change_report(&locator));
+    fake_launcher(&fixture);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    let candidate = status["candidate"]["hypothesis"]
+        .as_str()
+        .expect("a new candidate card was admitted")
+        .to_owned();
+    assert_ne!(candidate, fixture.card, "{status}");
+    assert_eq!(
+        status["candidate"]["change"], "add-narrow-context",
+        "{status}"
+    );
+
+    // The bounded planning brief carries the declared scope: the exact
+    // declaration locator, the observed problem, question, limits, evidence
+    // and the workload link, without inventing a second hypothesis or change
+    // for the measurement workload.
+    let assignment = fixture.run.join("assignments/planner-1.json");
+    assert!(
+        assignment.is_file(),
+        "the planning dispatch wrote its brief"
+    );
+    let document: Value = serde_json::from_slice(&fs::read(&assignment).unwrap()).unwrap();
+    let invariants: Vec<&str> = document["invariants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    for needle in [
+        "the initial change states the declared measurement scope under the exact heading '## Measurement' in proposal.md",
+        "declared observed problem: identical repeated reads waste accepted-task time",
+        "declared measurement question: how much accepted-task time do identical repeated reads cost?",
+        "declared limits: one local machine and one frozen source revision",
+        "declared workload operation: cargo build -p example-reader",
+        "declared workload contract link: openspec/changes/add-synthetic/proposal.md#Measurement",
+        "do not create a second hypothesis, card or OpenSpec change for the workload",
+        "declared evidence reference: retained outcome record: repeated reads",
+    ] {
+        assert!(
+            invariants.iter().any(|item| item.contains(needle)),
+            "{needle}: {document}"
+        );
+    }
+    assert!(
+        document["acceptance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value
+                .as_str()
+                .unwrap()
+                .contains("states the declared measurement scope section '## Measurement'")),
+        "{document}"
+    );
+
+    // The generated brief passes the same native structured contract a
+    // dispatch uses, with the scaffold revision as the registered slot base.
+    let candidate_worktree = fixture.candidate_worktree(&candidate);
+    let scaffold_revision = head(&candidate_worktree);
+    slot_worktree(
+        &candidate_worktree,
+        &fixture.root.join("proj-planner-scope-wt1"),
+        &scaffold_revision,
+    );
+    let check = fixture.assignment_check(1, &assignment);
+    assert!(check.status.success(), "{}", text(&check));
+    assert!(
+        text(&check).contains("executor assignment valid"),
+        "{}",
+        text(&check)
+    );
+}
+
+#[test]
+fn an_admitted_simplification_waits_for_the_informed_decision_before_implementation() {
+    let fixture = Fixture::new("admitted-simplification");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    fake_launcher(&fixture);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    // Replace the failed start conversation with the completed investigator
+    // report whose candidate is a simplification treatment.
+    let result = fixture.run.join("investigator-result.json");
+    fs::write(
+        &result,
+        serde_json::to_vec_pretty(&simplification_report(&locator)).unwrap(),
+    )
+    .unwrap();
+    let receipt = fixture.run.join("investigator-receipt.json");
+    seed_bound_receipt(
+        &receipt,
+        "workflow-fixture-investigator-1",
+        "gen-1",
+        "completed",
+        Some(0),
+    );
+    replace_attempt(
+        &fixture,
+        attempt_json(
+            "investigator-1",
+            "investigator",
+            "workflow-fixture-investigator-1",
+            "gen-1",
+            &receipt,
+            Some(&result),
+            None,
+            "started",
+        ),
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(
+        status["intake"]["outcomes"][0]["outcome"], "admitted",
+        "{status}"
+    );
+    let candidate = status["candidate"]["hypothesis"]
+        .as_str()
+        .expect("the admitted card is selected")
+        .to_owned();
+    assert_ne!(candidate, fixture.card, "{status}");
+    assert_eq!(status["candidate"]["removal_required"], true, "{status}");
+    assert_eq!(
+        status["candidate"]["implementer_attempt"],
+        Value::Null,
+        "no implementation conversation precedes the informed decision: {status}"
+    );
+    assert_eq!(status["dispatch"]["state"], "blocked", "{status}");
+    assert!(
+        status["dispatch"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("removal"),
+        "{status}"
+    );
+
+    // A reviewable proposal alone does not authorize the removal effect.
+    let proposed = fixture.feedback(&[
+        "removal-propose",
+        "--item",
+        &candidate,
+        "--proposal",
+        "proposal-simplify",
+        "--target",
+        "capability-x",
+        "--evidence",
+        "evidence-1",
+        "--loss",
+        "synthetic-loss",
+        "--preview",
+        "preview-1",
+    ]);
+    assert!(proposed.status.success(), "{}", text(&proposed));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(
+        status["candidate"]["implementer_attempt"],
+        Value::Null,
+        "{status}"
+    );
+    assert!(
+        status["dispatch"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no removal decision"),
+        "{status}"
+    );
+
+    // The informed decision covers the experiment treatment; the dependent
+    // implementation then reaches the dispatch owner.
+    let decided = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &candidate,
+        "--decision",
+        "approve",
+        "--proposal",
+        "proposal-simplify",
+        "--target",
+        "capability-x",
+        "--actions",
+        "experiment",
+        "--loss",
+        "synthetic-loss",
+    ]);
+    assert!(decided.status.success(), "{}", text(&decided));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert!(
+        status["candidate"]["implementer_attempt"].is_string(),
+        "the approved simplification dispatches its implementation: {status}"
+    );
+}
