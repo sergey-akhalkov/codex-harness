@@ -37,7 +37,9 @@ use harness_core::improvement_loop::{
     CandidateState, IntakeState, OutcomeRecord, candidate_change_dir, candidate_change_name,
     changed_paths_within_scope, frozen_candidate_removal_digest,
 };
-use harness_core::improvement_spec::{OpenSpec, PlanningReceipt, Specification};
+use harness_core::improvement_spec::{
+    MeasurementReceipt, MeasurementScope, OpenSpec, PlanningReceipt, Specification,
+};
 use harness_core::task_worktree::{self, CandidateCheckout, WorktreeReuse};
 use std::fs;
 use std::process::Command;
@@ -45,6 +47,20 @@ use std::process::Command;
 /// The run-local qualified receipt of the selected candidate's own OpenSpec
 /// change. The run's declared `planning.json` stays the frozen anchor receipt.
 const CANDIDATE_PLANNING_FILE: &str = "candidate-planning.json";
+/// The run's declared measurement scope: explicit local run data the
+/// hypothesis's own OpenSpec change must state before any directed baseline
+/// measurement. The operator places this `MeasurementScope` JSON in the run
+/// directory beside the frozen spec, like every other declared local input.
+const MEASUREMENT_SCOPE_FILE: &str = "measurement-scope.json";
+/// The retained directed-measurement receipt written before the measured-pair
+/// owner may direct the baseline attempt and revalidated on later passes.
+const MEASUREMENT_RECEIPT_FILE: &str = "measurement-receipt.json";
+/// Bounds for transferring the declared scope into the bounded planning
+/// assignment: each text field, each evidence reference and the declared
+/// reference count stay inside one native structured assignment.
+const MAX_MEASUREMENT_FIELD_BYTES: usize = 1024;
+const MAX_MEASUREMENT_EVIDENCE: usize = 8;
+const MAX_MEASUREMENT_REFERENCE_BYTES: usize = 512;
 /// Bounds for the deterministic evidence index the controller builds from the
 /// declared local evidence root and its own retained attempt evidence.
 const MAX_EVIDENCE_ROOT_FILES: usize = 24;
@@ -66,7 +82,7 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
         if candidate.is_ready() {
             retain_candidate_ready(run, &candidate, &mut notes)?;
             if run.spec.comparison.is_some() {
-                super::improvement_comparison::advance(run, &mut notes)?;
+                advance_comparison(run, &mut notes)?;
             }
             return Ok(notes);
         }
@@ -80,7 +96,7 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
         } else {
             retain_candidate_ready(run, &candidate, &mut notes)?;
             if run.spec.comparison.is_some() {
-                super::improvement_comparison::advance(run, &mut notes)?;
+                advance_comparison(run, &mut notes)?;
             }
         }
     }
@@ -115,6 +131,239 @@ fn retain_candidate_ready(
         candidate.revision.as_deref().unwrap_or("unknown")
     ));
     Ok(())
+}
+
+/// Engages the measured-pair owner only after the hypothesis's own OpenSpec
+/// change states the run's declared measurement scope. The directed-measurement
+/// receipt is retained before any baseline direction and revalidated against
+/// the current change on every later pass, so a missing, incomplete or changed
+/// declared scope can never direct `Phase::BaselineAttempt`.
+fn advance_comparison(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
+    if !ensure_measurement_qualified(run, notes)? {
+        return Ok(());
+    }
+    super::improvement_comparison::advance(run, notes)
+}
+
+/// The measurement gate in front of the measured-pair owner. Returns whether
+/// the comparison owner may be engaged; every refusal records the exact
+/// missing artifact as the run's blocking condition.
+fn ensure_measurement_qualified(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
+    // Mirrors the comparison owner's own phase gate: only these phases can
+    // direct the baseline attempt, so the gate runs at exactly those points.
+    if run.spec.comparison.is_none()
+        || !matches!(
+            run.cursor.phase,
+            Phase::CandidateReady
+                | Phase::BaselineAttempt
+                | Phase::CandidateAttempt
+                | Phase::Acceptance
+                | Phase::Blocked
+        )
+    {
+        return Ok(true);
+    }
+    let Some(candidate) = run.cursor.candidate.clone() else {
+        return Ok(true);
+    };
+    if !candidate.is_ready() {
+        return Ok(true);
+    }
+    let scope_path = run.store.root().join(MEASUREMENT_SCOPE_FILE);
+    let scope = match declared_measurement_scope(run) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => {
+            block(
+                run,
+                notes,
+                format!(
+                    "no hypothesis measurement scope is declared: {} is missing; no directed baseline measurement is eligible - declare the MeasurementScope JSON there and resume",
+                    scope_path.display()
+                ),
+            )?;
+            return Ok(false);
+        }
+        Err(error) => {
+            block(run, notes, error.to_string())?;
+            return Ok(false);
+        }
+    };
+    let openspec = OpenSpec::default();
+    if let Some(path) = candidate.measurement_receipt.clone() {
+        return revalidate_measurement_receipt(run, notes, &candidate, &openspec, &path, &scope);
+    }
+    let Some(checkout) = candidate.worktree.clone() else {
+        block(
+            run,
+            notes,
+            "the candidate allocation is missing, so the hypothesis's own OpenSpec change cannot be re-resolved; no directed baseline measurement is eligible"
+                .to_owned(),
+        )?;
+        return Ok(false);
+    };
+    let target = candidate_specification(run, &checkout, &candidate);
+    match openspec.begin_measurement(&target, &scope) {
+        Ok(receipt) => {
+            let path = run.store.root().join(MEASUREMENT_RECEIPT_FILE);
+            write_json_atomic(&path, &receipt)?;
+            let scope_digest = receipt.scope_digest.clone();
+            if let Some(retained) = run.cursor.candidate.as_mut() {
+                retained.measurement_receipt = Some(path.clone());
+            }
+            run.cursor.effect(
+                EffectKind::MeasurementQualified,
+                format!(
+                    "candidate={} change={} artifact={} heading={} scope_digest={}",
+                    candidate.hypothesis,
+                    candidate.change,
+                    scope.declaration_artifact.display(),
+                    scope.declaration_heading,
+                    &scope_digest[..16.min(scope_digest.len())]
+                ),
+            );
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(format!(
+                "measurement: change {} states the declared measurement scope ({} resolved artifact(s)); the receipt is retained before any baseline direction",
+                candidate.change,
+                receipt.artifacts.len()
+            ));
+            Ok(true)
+        }
+        Err(error) => {
+            block(
+                run,
+                notes,
+                format!(
+                    "the hypothesis's own OpenSpec change {} does not state the declared measurement scope: {error}; no directed baseline measurement is eligible",
+                    candidate.change
+                ),
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+/// Rebinds one retained directed-measurement receipt. The declared scope must
+/// still be exactly the retained one and the hypothesis's own change must
+/// still resolve to the same identity with its scope section stated; the
+/// retained receipt is never rewritten by a revalidation.
+fn revalidate_measurement_receipt(
+    run: &mut Run,
+    notes: &mut Vec<String>,
+    candidate: &CandidateState,
+    openspec: &OpenSpec,
+    path: &Path,
+    scope: &MeasurementScope,
+) -> io::Result<bool> {
+    if !path.is_file() {
+        block(
+            run,
+            notes,
+            format!(
+                "the retained directed-measurement receipt at {} is missing; no directed baseline measurement is eligible before the hypothesis's own change is re-resolved",
+                path.display()
+            ),
+        )?;
+        return Ok(false);
+    }
+    let receipt: MeasurementReceipt = match read_json(path, MAX_RUN_SPEC_BYTES) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            block(
+                run,
+                notes,
+                format!(
+                    "the retained directed-measurement receipt at {} is unreadable: {error}; no directed baseline measurement is eligible",
+                    path.display()
+                ),
+            )?;
+            return Ok(false);
+        }
+    };
+    if &receipt.scope != scope {
+        block(
+            run,
+            notes,
+            format!(
+                "the declared measurement scope changed after the directed-measurement receipt was retained for change {}; the retained baseline cannot be reused and no directed baseline measurement is eligible without a fresh declaration",
+                candidate.change
+            ),
+        )?;
+        return Ok(false);
+    }
+    match openspec.revalidate_measurement(&receipt) {
+        Ok(()) => {
+            notes.push(format!(
+                "measurement: the retained receipt rebinds to change {} as it currently stands",
+                candidate.change
+            ));
+            Ok(true)
+        }
+        Err(error) => {
+            block(
+                run,
+                notes,
+                format!(
+                    "the retained directed-measurement receipt no longer rebinds to the hypothesis's own change {}: {error}; no directed baseline measurement is eligible",
+                    candidate.change
+                ),
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+/// Reads the run's declared measurement scope. `Ok(None)` means the operator
+/// declared none; an unreadable, incomplete or oversized declaration is an
+/// explicit refusal naming the exact field.
+fn declared_measurement_scope(run: &Run) -> io::Result<Option<MeasurementScope>> {
+    let path = run.store.root().join(MEASUREMENT_SCOPE_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let scope: MeasurementScope = read_json(&path, MAX_RUN_SPEC_BYTES).map_err(|error| {
+        invalid(format!(
+            "the declared measurement scope at {} is unusable: {error}",
+            path.display()
+        ))
+    })?;
+    scope.validate().map_err(|error| {
+        invalid(format!(
+            "the declared measurement scope at {} is incomplete: {error}",
+            path.display()
+        ))
+    })?;
+    for (name, value) in [
+        ("observed_problem", &scope.observed_problem),
+        ("investigation_scope", &scope.investigation_scope),
+        ("measurement_question", &scope.measurement_question),
+        ("workload.operation", &scope.workload.operation),
+        ("workload.contract", &scope.workload.contract),
+        ("limits", &scope.limits),
+    ] {
+        if value.len() > MAX_MEASUREMENT_FIELD_BYTES {
+            return Err(invalid(format!(
+                "the declared measurement scope field {name} is {} bytes; the bounded planning transfer accepts at most {MAX_MEASUREMENT_FIELD_BYTES}",
+                value.len()
+            )));
+        }
+    }
+    if scope.evidence_references.len() > MAX_MEASUREMENT_EVIDENCE {
+        return Err(invalid(format!(
+            "the declared measurement scope carries {} evidence references; the bounded planning transfer accepts at most {MAX_MEASUREMENT_EVIDENCE}",
+            scope.evidence_references.len()
+        )));
+    }
+    for reference in &scope.evidence_references {
+        if reference.len() > MAX_MEASUREMENT_REFERENCE_BYTES {
+            return Err(invalid(format!(
+                "the declared measurement scope evidence reference {} is {} bytes; the bounded planning transfer accepts at most {MAX_MEASUREMENT_REFERENCE_BYTES}",
+                reference,
+                reference.len()
+            )));
+        }
+    }
+    Ok(Some(scope))
 }
 
 // ---------------------------------------------------------------------------
@@ -1939,7 +2188,19 @@ fn dispatch_planner(
     };
     let change_dir = host.checkout.join(candidate_change_dir(&candidate.change));
     let inputs = relative_files(&host.checkout, &change_dir)?;
-    let assignment = planner_assignment(run, candidate, inputs);
+    // A declared measurement scope the planner cannot read stays omitted from
+    // the brief; the baseline gate refuses that run with the exact cause
+    // instead of letting an unstated scope direct a measurement.
+    let declared = match declared_measurement_scope(run) {
+        Ok(scope) => scope,
+        Err(error) => {
+            notes.push(format!(
+                "measurement: the declared scope is not usable yet ({error}); the planning brief omits it and no directed baseline measurement is eligible until it is declared"
+            ));
+            None
+        }
+    };
+    let assignment = planner_assignment(run, candidate, inputs, declared.as_ref());
     let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Planner);
     candidate.planner_attempt = Some(attempt_id.clone());
     dispatch_bound_assignment(
@@ -1958,6 +2219,7 @@ fn planner_assignment(
     run: &Run,
     candidate: &CandidateState,
     inputs: Vec<String>,
+    declared: Option<&MeasurementScope>,
 ) -> serde_json::Value {
     let acceptance_artifact = run.spec.experiment.acceptance_artifact.clone();
     let acceptance_heading = run.spec.experiment.acceptance_heading.clone();
@@ -1984,29 +2246,105 @@ fn planner_assignment(
             acceptance_artifact.display()
         ),
     ];
+    let mut invariants = vec![
+        "only the candidate's own OpenSpec change directory is written; product source stays untouched".to_owned(),
+        "the installed OpenSpec workflow definitions and schemas are never edited".to_owned(),
+        "the authored change is committed in this checkout and the tree is left without uncommitted or untracked files".to_owned(),
+        format!("the implementation conversation that follows must find a strictly valid change for {}", candidate.change),
+        card_read,
+        card_project,
+        format!("the run's predeclared acceptance section is titled '{acceptance_heading}'"),
+        format!("the predeclared acceptance section must appear at {} under the change", acceptance_artifact.display()),
+    ];
+    let mut acceptance = vec![
+        format!(
+            "`openspec validate {} --strict --no-interactive` passes inside this checkout",
+            candidate.change
+        ),
+        format!(
+            "the change contains proposal, requirements, design and tasks plus the predeclared acceptance section '{}'",
+            acceptance_heading
+        ),
+        "one committed revision contains exactly the authored change and the working tree is clean"
+            .to_owned(),
+    ];
+    if let Some(scope) = declared {
+        invariants.push(format!(
+            "the initial change states the declared measurement scope under the exact heading '{}' in {}",
+            scope.declaration_heading,
+            scope.declaration_artifact.display()
+        ));
+        measurement_items(
+            "declared observed problem: ",
+            &scope.observed_problem,
+            &mut invariants,
+        );
+        measurement_items(
+            "declared investigation scope: ",
+            &scope.investigation_scope,
+            &mut invariants,
+        );
+        measurement_items(
+            "declared measurement question: ",
+            &scope.measurement_question,
+            &mut invariants,
+        );
+        measurement_items("declared limits: ", &scope.limits, &mut invariants);
+        invariants.push(
+            "the targeted measurement runs one existing operation whose contract is linked from this same change; do not create a second hypothesis, card or OpenSpec change for the workload".to_owned(),
+        );
+        measurement_items(
+            "declared workload operation: ",
+            &scope.workload.operation,
+            &mut invariants,
+        );
+        measurement_items(
+            "declared workload contract link: ",
+            &scope.workload.contract,
+            &mut invariants,
+        );
+        for reference in &scope.evidence_references {
+            measurement_items("declared evidence reference: ", reference, &mut invariants);
+        }
+        acceptance.push(format!(
+            "the change states the declared measurement scope section '{}' in {}; the controller re-resolves it through the installed OpenSpec CLI before any directed baseline measurement",
+            scope.declaration_heading,
+            scope.declaration_artifact.display()
+        ));
+    }
     json!({
         "schema": 1,
         "objective": objective,
         "inputs": inputs,
         "outputs": outputs,
-        "invariants": [
-            "only the candidate's own OpenSpec change directory is written; product source stays untouched",
-            "the installed OpenSpec workflow definitions and schemas are never edited",
-            "the authored change is committed in this checkout and the tree is left without uncommitted or untracked files",
-            format!("the implementation conversation that follows must find a strictly valid change for {}", candidate.change),
-            card_read,
-            card_project,
-            format!("the run's predeclared acceptance section is titled '{acceptance_heading}'"),
-            format!("the predeclared acceptance section must appear at {} under the change", acceptance_artifact.display()),
-        ],
-        "acceptance": [
-            format!("`openspec validate {} --strict --no-interactive` passes inside this checkout", candidate.change),
-            format!("the change contains proposal, requirements, design and tasks plus the predeclared acceptance section '{}'", acceptance_heading),
-            "one committed revision contains exactly the authored change and the working tree is clean",
-        ],
+        "invariants": invariants,
+        "acceptance": acceptance,
         "consumer": "the improvement controller (codex-harness improve)",
         "escalate": [],
     })
+}
+
+/// Renders one declared scope text into bounded invariant items. Long prose is
+/// split at character boundaries so every item stays inside the native
+/// structured assignment item limit and no declared text is shortened.
+fn measurement_items(prefix: &str, text: &str, items: &mut Vec<String>) {
+    let limit = crate::executor_assignment::MAX_ITEM_BYTES;
+    let mut rest = text;
+    let mut head = prefix;
+    while !rest.is_empty() {
+        let room = limit.saturating_sub(head.len()).max(1);
+        let mut end = rest.len().min(room);
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            break;
+        }
+        let (chunk, tail) = rest.split_at(end);
+        items.push(format!("{head}{chunk}"));
+        rest = tail;
+        head = "(continued) ";
+    }
 }
 
 /// The declared writable scope as bounded invariant items. Every entry stays
@@ -2897,7 +3235,7 @@ mod assignment_tests {
         // Planner: the complete planning reference stays visible.
         let inputs = vec![format!("{}/proposal.md", candidate_change_dir(LONG_CHANGE))];
         let brief = native_brief(
-            &planner_assignment(&run, &candidate, inputs.clone()),
+            &planner_assignment(&run, &candidate, inputs.clone(), None),
             &checkout,
             "planner",
         );
@@ -2919,6 +3257,65 @@ mod assignment_tests {
         }
         assert!(brief.contains(" show bdcw-card --json"), "{brief}");
         assert!(brief.contains("the oracle checker executes"), "{brief}");
+    }
+
+    #[test]
+    fn a_declared_measurement_scope_reaches_the_planner_within_the_native_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let (run, candidate, _evidence) = fixture(temp.path());
+        fs::write(
+            run.store.root().join(MEASUREMENT_SCOPE_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "observed_problem": "identical repeated reads waste accepted-task time",
+                "investigation_scope": "the reader's repeated reads at one frozen revision",
+                "measurement_question": "how much accepted-task time do they cost?",
+                "workload": {
+                    "operation": "cargo build -p example-reader",
+                    "contract": "openspec/changes/add-synthetic/proposal.md#Measurement",
+                },
+                "evidence_references": ["retained outcome record: repeated reads"],
+                "limits": "one local machine and one frozen source revision",
+                "declaration_artifact": "proposal.md",
+                "declaration_heading": "## Measurement",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let declared = declared_measurement_scope(&run)
+            .unwrap()
+            .expect("the declared scope reads");
+        let inputs = vec![format!("{}/proposal.md", candidate_change_dir(LONG_CHANGE))];
+        let brief = native_brief(
+            &planner_assignment(&run, &candidate, inputs, Some(&declared)),
+            &run.spec.project,
+            "planner-measurement",
+        );
+        for needle in [
+            "## Measurement",
+            "declared measurement question: how much accepted-task time do they cost?",
+            "declared workload operation: cargo build -p example-reader",
+            "do not create a second hypothesis",
+            "retained outcome record: repeated reads",
+        ] {
+            assert!(brief.contains(needle), "{needle}: {brief}");
+        }
+        // An oversized declaration is refused by name instead of being
+        // silently shortened in the bounded brief.
+        let mut oversized = serde_json::to_value(&declared).unwrap();
+        oversized["limits"] = serde_json::json!("x".repeat(MAX_MEASUREMENT_FIELD_BYTES + 1));
+        fs::write(
+            run.store.root().join(MEASUREMENT_SCOPE_FILE),
+            serde_json::to_vec(&oversized).unwrap(),
+        )
+        .unwrap();
+        let error = declared_measurement_scope(&run).unwrap_err();
+        assert!(error.to_string().contains("limits"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&MAX_MEASUREMENT_FIELD_BYTES.to_string()),
+            "{error}"
+        );
     }
 
     #[test]

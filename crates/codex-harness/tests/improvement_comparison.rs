@@ -952,7 +952,17 @@ impl Fixture {
 fn write_change(project: &Path, change: &str, group: &str, scenario: &str) {
     let dir = project.join("openspec/changes").join(change);
     fs::create_dir_all(dir.join("specs").join(group)).unwrap();
-    fs::write(dir.join("proposal.md"), format!("## Why\n\n{scenario}.\n")).unwrap();
+    fs::write(
+        dir.join("proposal.md"),
+        format!(
+            "## Why\n\n{scenario}.\n\n## Measurement\n\nObserved problem: the {scenario} flow \
+             repeats measurable work. Investigation scope: one frozen workload revision on this \
+             fixture. Measurement question: how much accepted time does the repeated work cost? \
+             Workload: the existing comparison operation linked from this change. Evidence: the \
+             retained outcome record. Limits: one local fixture and one frozen revision.\n"
+        ),
+    )
+    .unwrap();
     fs::write(
         dir.join("design.md"),
         format!("## Context\n\n{scenario}.\n"),
@@ -1076,6 +1086,27 @@ impl Fixture {
             object.remove(key);
         }
         fs::write(&self.spec, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        // The directed-measurement gate requires the declared scope beside the
+        // frozen spec and the matching section in the hypothesis change.
+        let scope = json!({
+            "observed_problem": "the synthetic flow repeats measurable work",
+            "investigation_scope": "one frozen workload revision on this fixture",
+            "measurement_question": "how much accepted time does the repeated work cost?",
+            "workload": {
+                "operation": "comparison workload-b",
+                "contract": "openspec/changes/add-synthetic/proposal.md#Measurement",
+            },
+            "evidence_references": ["retained outcome record: synthetic comparison"],
+            "limits": "one local fixture and one frozen revision",
+            "declaration_artifact": "proposal.md",
+            "declaration_heading": "## Measurement",
+        });
+        fs::create_dir_all(&self.run).unwrap();
+        fs::write(
+            self.run.join("measurement-scope.json"),
+            serde_json::to_vec_pretty(&scope).unwrap(),
+        )
+        .unwrap();
     }
 
     /// Allocate the ready candidate's owned worktree before the run starts and
@@ -1718,6 +1749,7 @@ fn a_forged_candidate_result_is_rejected_and_never_integrated() {
             bindings: &bindings,
             evaluation: &reject_evaluation,
             experiment,
+            removal_required: false,
             frozen_removal: None,
             mainline: fixture.proj.clone(),
             check: harness_core::improvement_activation::CheckSpec {
@@ -1838,7 +1870,7 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     let output = text(&resume);
     assert!(resume.status.success(), "{output}");
     assert!(
-        output.contains("declined"),
+        output.contains("removal authority: refused by the user"),
         "the refusal is visible and unbypassable: {output}"
     );
     assert_eq!(
@@ -1869,6 +1901,11 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
         "synthetic-loss",
     ]);
     assert!(approved.status.success(), "{}", text(&approved));
+    // The recorded refusal keeps the phase blocked until a resume boundary
+    // resolves it against the new approval: this resume clears the recorded
+    // block, and the next advances to the approved measured conversation.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
     let resume = fixture.resume();
     assert!(resume.status.success(), "{}", text(&resume));
     let candidate_attempts = fixture.cursor()["attempts"]
@@ -1877,7 +1914,12 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
         .iter()
         .filter(|attempt| attempt["role"] == "candidate")
         .count();
-    assert_eq!(candidate_attempts, 1, "the approved treatment dispatches");
+    assert_eq!(
+        candidate_attempts,
+        1,
+        "the approved treatment dispatches: {}",
+        text(&resume)
+    );
 
     // The candidate solves the workload and is measurably faster.
     let session = session_id("adopt-candidate");
@@ -1913,7 +1955,72 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     // it re-derives the expected record from the exact raw revisions and the
     // binding acceptance, so the comparison-produced decision must match it
     // byte-for-field, and the declared combined-tree check then fast-forwards
-    // the exact evaluated revision into the accepted mainline.
+    // the exact evaluated revision into the accepted mainline. The frozen
+    // candidate state declares this treatment a removal, so the effect owner
+    // refuses integration while the approval covers only the isolated
+    // experiment.
+    let expected_answer = fixture.root.join("answer-expected.txt");
+    fs::write(&expected_answer, "integrated\n").unwrap();
+    fs::create_dir_all(fixture.root.join("integration-evidence")).unwrap();
+    let bindings: harness_core::improvement_experiment::ExperimentBindings =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/bindings.json")).unwrap())
+            .unwrap();
+    let evaluation: harness_core::improvement_policy::PolicyEvaluation =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
+            .unwrap();
+    let spec: harness_core::improvement_loop::RunSpec =
+        serde_json::from_slice(&fs::read(fixture.run.join("spec.json")).unwrap()).unwrap();
+    let experiment = fixture.cursor()["experiment"].as_str().unwrap().to_owned();
+    let removal_required = fixture.cursor()["candidate"]["removal_required"]
+        .as_bool()
+        .expect("the frozen candidate state declares whether the treatment is a removal");
+    assert!(
+        removal_required,
+        "the run's candidate is a declared removal treatment: {}",
+        fixture.cursor()
+    );
+    let frozen_removal = fixture.cursor()["removal_frozen"]
+        .as_str()
+        .map(str::to_owned);
+    let check = harness_core::improvement_activation::CheckSpec {
+        program: PathBuf::from(env!("CARGO_BIN_EXE_harness-improvement-fixture")),
+        args: vec![
+            "check".into(),
+            checkout.path.as_os_str().to_owned(),
+            expected_answer.as_os_str().to_owned(),
+        ],
+        timeout: std::time::Duration::from_secs(120),
+    };
+    let removal_blocked = harness_core::improvement_activation::integrate(
+        &harness_core::improvement_activation::IntegrationRequest {
+            spec: &spec,
+            bindings: &bindings,
+            evaluation: &evaluation,
+            experiment: experiment.clone(),
+            removal_required,
+            frozen_removal: frozen_removal.clone(),
+            mainline: fixture.proj.clone(),
+            check: check.clone(),
+            evidence: fixture.root.join("integration-evidence"),
+            prior: None,
+        },
+    )
+    .unwrap();
+    let harness_core::improvement_activation::IntegrationOutcome::Blocked(blocked) =
+        &removal_blocked
+    else {
+        panic!(
+            "a declared removal must not integrate before its covering approval: {removal_blocked:?}"
+        );
+    };
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(blocked.reason.contains("not covered"), "{}", blocked.reason);
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        base,
+        "the experiment-only approval never moves the accepted mainline"
+    );
+
     let integration_approval = fixture.feedback(&[
         "removal-decide",
         "--item",
@@ -1934,38 +2041,16 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
         "{}",
         text(&integration_approval)
     );
-    let expected_answer = fixture.root.join("answer-expected.txt");
-    fs::write(&expected_answer, "integrated\n").unwrap();
-    fs::create_dir_all(fixture.root.join("integration-evidence")).unwrap();
-    let bindings: harness_core::improvement_experiment::ExperimentBindings =
-        serde_json::from_slice(&fs::read(fixture.run.join("comparison/bindings.json")).unwrap())
-            .unwrap();
-    let evaluation: harness_core::improvement_policy::PolicyEvaluation =
-        serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
-            .unwrap();
-    let spec: harness_core::improvement_loop::RunSpec =
-        serde_json::from_slice(&fs::read(fixture.run.join("spec.json")).unwrap()).unwrap();
-    let experiment = fixture.cursor()["experiment"].as_str().unwrap().to_owned();
-    let frozen_removal = fixture.cursor()["removal_frozen"]
-        .as_str()
-        .map(str::to_owned);
     let outcome = harness_core::improvement_activation::integrate(
         &harness_core::improvement_activation::IntegrationRequest {
             spec: &spec,
             bindings: &bindings,
             evaluation: &evaluation,
             experiment,
+            removal_required,
             frozen_removal,
             mainline: fixture.proj.clone(),
-            check: harness_core::improvement_activation::CheckSpec {
-                program: PathBuf::from(env!("CARGO_BIN_EXE_harness-improvement-fixture")),
-                args: vec![
-                    "check".into(),
-                    checkout.path.as_os_str().to_owned(),
-                    expected_answer.as_os_str().to_owned(),
-                ],
-                timeout: std::time::Duration::from_secs(120),
-            },
+            check,
             evidence: fixture.root.join("integration-evidence"),
             prior: None,
         },

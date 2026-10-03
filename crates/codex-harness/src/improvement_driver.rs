@@ -1224,6 +1224,11 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
         spec: &run.spec,
         bindings: &bindings,
         evaluation: &evaluation,
+        removal_required: run
+            .cursor
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.removal_required),
         experiment: run.cursor.experiment.clone(),
         frozen_removal: run.cursor.removal_frozen.clone(),
         mainline: run.spec.project.clone(),
@@ -1319,6 +1324,11 @@ fn activate_integrated(
         bindings,
         evaluation,
         experiment: run.cursor.experiment.clone(),
+        removal_required: run
+            .cursor
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.removal_required),
         frozen_removal: run.cursor.removal_frozen.clone(),
         mainline: run.spec.project.clone(),
         integration: integration.clone(),

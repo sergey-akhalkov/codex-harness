@@ -31,7 +31,9 @@
 //!    removal the run declares in its spec and a reviewable removal proposal
 //!    the evaluated hypothesis card records itself resolve through the same
 //!    gate, so an omitted or renamed treatment declaration cannot withdraw a
-//!    capability without the user's scoped decision.
+//!    capability without the user's scoped decision. A run whose frozen
+//!    candidate state declares a removal treatment is refused the same way
+//!    while the evaluated card records no reviewable proposal to decide on.
 //! 3. [`activate`] with the returned [`IntegrationReceipt`], the installed
 //!    candidate [`ArmRuntime`] and the run's owned native state: it re-verifies
 //!    the consumed installation identity, re-reads the same decision and
@@ -181,6 +183,11 @@ pub struct IntegrationRequest<'a> {
     pub evaluation: &'a improvement_policy::PolicyEvaluation,
     /// The experiment identity the decision record names.
     pub experiment: String,
+    /// True when the run's frozen candidate state declares this treatment a
+    /// removal, even though the spec names no removal scope: the effect then
+    /// requires a current reviewable removal proposal on the evaluated card
+    /// plus its covering user decision.
+    pub removal_required: bool,
     /// The removal proposal digest frozen at run start, when the run declares
     /// a removal treatment.
     pub frozen_removal: Option<String>,
@@ -248,6 +255,11 @@ pub struct ActivationRequest<'a> {
     pub evaluation: &'a improvement_policy::PolicyEvaluation,
     /// The experiment identity the decision record names.
     pub experiment: String,
+    /// True when the run's frozen candidate state declares this treatment a
+    /// removal, even though the spec names no removal scope: the effect then
+    /// requires a current reviewable removal proposal on the evaluated card
+    /// plus its covering user decision.
+    pub removal_required: bool,
     /// The removal proposal digest frozen at run start, when the run declares
     /// a removal treatment.
     pub frozen_removal: Option<String>,
@@ -321,6 +333,7 @@ struct FrozenContext<'a> {
     bindings: &'a improvement_experiment::ExperimentBindings,
     evaluation: &'a improvement_policy::PolicyEvaluation,
     experiment: &'a str,
+    removal_required: bool,
     frozen_removal: Option<&'a str>,
 }
 
@@ -331,6 +344,7 @@ impl<'a> IntegrationRequest<'a> {
             bindings: self.bindings,
             evaluation: self.evaluation,
             experiment: &self.experiment,
+            removal_required: self.removal_required,
             frozen_removal: self.frozen_removal.as_deref(),
         }
     }
@@ -343,6 +357,7 @@ impl<'a> ActivationRequest<'a> {
             bindings: self.bindings,
             evaluation: self.evaluation,
             experiment: &self.experiment,
+            removal_required: self.removal_required,
             frozen_removal: self.frozen_removal.as_deref(),
         }
     }
@@ -474,34 +489,41 @@ fn resolve_evidence(context: &FrozenContext<'_>) -> io::Result<Gate<Evidence>> {
         )));
     }
     let decision_sha256 = build_identity::hash_bytes(expected.as_bytes());
-    if let Some(removal) = &spec.removal {
-        if let Err(block) = removal_block(
-            item,
-            &removal.proposal,
-            &removal.target,
-            &comments,
-            context.frozen_removal,
-        ) {
-            return Ok(Gate::blocked(block));
+    let declared = spec
+        .removal
+        .as_ref()
+        .map(|removal| (removal.proposal.clone(), removal.target.clone()));
+    let recorded =
+        evaluated_removal(&comments, item).map(|recorded| (recorded.proposal, recorded.target));
+    match declared.or(recorded) {
+        Some((proposal, target)) => {
+            // The declared run scope binds the effect when it exists.
+            // Otherwise the evaluated hypothesis card itself records a
+            // reviewable removal proposal, so the treatment withdraws an
+            // existing capability (a subtraction, disabling or consolidation
+            // admitted by the decision owner) and the same gate applies: an
+            // omitted or renamed run declaration cannot bypass the user's
+            // decision. A decision that covers only the isolated experiment
+            // still leaves integration and baseline activation pending.
+            if let Err(block) =
+                removal_block(item, &proposal, &target, &comments, context.frozen_removal)
+            {
+                return Ok(Gate::blocked(block));
+            }
         }
-    } else if let Some(recorded) = evaluated_removal(&comments, item) {
-        // The run declares no removal, but the evaluated hypothesis card
-        // itself records a reviewable removal proposal: the treatment
-        // withdraws an existing capability (a subtraction, disabling or
-        // consolidation admitted by the decision owner) and the same gate
-        // applies, so an omitted or renamed run declaration cannot bypass the
-        // user's decision. A decision that covers only the isolated
-        // experiment still leaves integration and baseline activation
-        // pending.
-        if let Err(block) = removal_block(
-            item,
-            &recorded.proposal,
-            &recorded.target,
-            &comments,
-            context.frozen_removal,
-        ) {
-            return Ok(Gate::blocked(block));
+        // The run's frozen candidate state declares a removal treatment, but
+        // the evaluated card records no reviewable proposal at all: nothing
+        // exists for the user to have decided on, so the effect owner refuses
+        // instead of treating the candidate as an ordinary change.
+        None if context.removal_required => {
+            return Ok(Gate::blocked(blocked(
+                true,
+                format!(
+                    "the run declares a removal treatment for {item}, but its evaluated card records no reviewable removal proposal; prepare the proposal and obtain the user's scoped decision before any mainline or baseline effect"
+                ),
+            )));
         }
+        None => {}
     }
     Ok(Gate::Ready(Evidence {
         item: item.clone(),

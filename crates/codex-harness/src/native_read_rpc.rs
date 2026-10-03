@@ -200,6 +200,52 @@ impl Channel {
     }
 }
 
+/// Git variables that change which repository, work tree, common directory or
+/// object store a child resolves. The discovery child runs beside a controlled
+/// case whose isolation depends on resolution following its own working
+/// directory, while this process may itself run inside a linked worktree with
+/// these exported, so the child must not inherit them.
+const GIT_REDIRECTION_VARIABLES: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// Drop every Git variable that can point the child at another repository's
+/// history. Variables such as `GIT_INDEX_FILE`, `GIT_NAMESPACE` or the
+/// discovery bounds do not select another repository or object store, so they
+/// stay untouched.
+fn restrict_git_resolution(command: &mut CommandSpec) {
+    for name in GIT_REDIRECTION_VARIABLES {
+        command.env.insert(name.into(), None);
+    }
+}
+
+/// Build the app-server child command for one discovery exchange. The child
+/// inherits the parent environment except for `CODEX_HOME` and the Git
+/// variables that could redirect repository resolution.
+fn discovery_command(
+    upstream: &Path,
+    working_directory: &Path,
+    home: &Path,
+    extra: &[String],
+) -> CommandSpec {
+    let mut command = CommandSpec::new(upstream);
+    command.args = ["app-server", "--stdio"]
+        .into_iter()
+        .map(OsString::from)
+        .chain(extra.iter().map(OsString::from))
+        .collect();
+    command.current_dir = Some(working_directory.to_owned());
+    command
+        .env
+        .insert("CODEX_HOME".into(), Some(home.as_os_str().into()));
+    restrict_git_resolution(&mut command);
+    command
+}
+
 pub(crate) fn exchange(request: Request<'_>, report: &mut Value) -> io::Result<Value> {
     let Request {
         upstream,
@@ -220,16 +266,7 @@ pub(crate) fn exchange(request: Request<'_>, report: &mut Value) -> io::Result<V
     let stdout = root.join("rpc.jsonl");
     let stderr = root.join("stderr.txt");
     let (input, writer) = pipe()?;
-    let mut command = CommandSpec::new(upstream);
-    command.args = ["app-server", "--stdio"]
-        .into_iter()
-        .map(OsString::from)
-        .chain(extra.iter().map(OsString::from))
-        .collect();
-    command.current_dir = Some(working_directory.to_owned());
-    command
-        .env
-        .insert("CODEX_HOME".into(), Some(home.as_os_str().into()));
+    let mut command = discovery_command(upstream, working_directory, home, extra);
     command.stdin = Some(input);
     command.stdout = Some(create(&stdout)?);
     command.stderr = Some(create(&stderr)?);
@@ -367,4 +404,130 @@ fn exceeded(paths: &[PathBuf], limit: u64) -> bool {
     paths
         .iter()
         .any(|p| fs::metadata(p).is_ok_and(|m| m.len() > limit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_program() -> PathBuf {
+        let output = std::process::Command::new("where.exe")
+            .arg("git")
+            .output()
+            .expect("where.exe is available");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .expect("git is required to probe repository resolution")
+    }
+
+    /// Run `git rev-parse --show-toplevel` the way the discovery child runs:
+    /// through `CommandSpec`, from the isolated case directory, optionally with
+    /// the Git redirection variables added and the production sanitation
+    /// applied. Returns the exit code and the resolved top-level directory.
+    fn probe(
+        git: &Path,
+        root: &Path,
+        case: &Path,
+        redirect: Option<(&Path, &Path)>,
+        sanitize: bool,
+    ) -> (u32, Option<PathBuf>) {
+        let stdout = root.join("probe-stdout.txt");
+        let stderr = root.join("probe-stderr.txt");
+        let mut command = CommandSpec::new(git);
+        command.args = ["rev-parse", "--show-toplevel"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        command.current_dir = Some(case.to_owned());
+        if let Some((git_dir, work_tree)) = redirect {
+            command
+                .env
+                .insert("GIT_DIR".into(), Some(git_dir.as_os_str().into()));
+            command
+                .env
+                .insert("GIT_WORK_TREE".into(), Some(work_tree.as_os_str().into()));
+        }
+        if sanitize {
+            restrict_git_resolution(&mut command);
+        }
+        command.stdout = Some(File::create(&stdout).unwrap());
+        command.stderr = Some(File::create(&stderr).unwrap());
+        let job = Job::new(Limits {
+            memory_bytes: Some(256 * 1024 * 1024),
+            cpu_percent: Some(90.0),
+        })
+        .unwrap();
+        let suspended = job.spawn_suspended(&command).unwrap();
+        let child = suspended.resume().unwrap();
+        let outcome = job
+            .wait(
+                &child,
+                Deadline::after(Duration::from_secs(30)).unwrap(),
+                &Cancellation::default(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let text = fs::read_to_string(&stdout).unwrap_or_default();
+        (
+            outcome.exit_code,
+            PathBuf::from(text.trim()).canonicalize().ok(),
+        )
+    }
+
+    #[test]
+    fn discovery_command_drops_git_redirection_and_keeps_its_owned_context() {
+        let command = discovery_command(
+            Path::new("C:\\owned\\codex.exe"),
+            Path::new("C:\\owned\\case"),
+            Path::new("C:\\owned\\home"),
+            &["--extra".to_owned()],
+        );
+        assert_eq!(
+            command.current_dir.as_deref(),
+            Some(Path::new("C:\\owned\\case"))
+        );
+        assert_eq!(
+            command.args,
+            ["app-server", "--stdio", "--extra"].map(OsString::from)
+        );
+        assert_eq!(
+            command.env.get(&OsString::from("CODEX_HOME")),
+            Some(&Some(OsString::from("C:\\owned\\home")))
+        );
+        for name in GIT_REDIRECTION_VARIABLES {
+            assert_eq!(command.env.get(&OsString::from(name)), Some(&None));
+        }
+        assert_eq!(command.env.len(), GIT_REDIRECTION_VARIABLES.len() + 1);
+    }
+
+    #[test]
+    fn git_redirection_cannot_resolve_sibling_history_after_sanitation() {
+        let git = git_program();
+        let root = tempfile::tempdir().unwrap();
+        let sibling = root.path().join("sibling");
+        let status = std::process::Command::new(&git)
+            .args(["init", "-q"])
+            .arg(&sibling)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed for the sibling fixture");
+        let case = root.path().join("case");
+        fs::create_dir(&case).unwrap();
+        let git_dir = sibling.join(".git");
+        let sibling_top = sibling.canonicalize().unwrap();
+
+        // The redirection is effective without sanitation: the child resolves
+        // sibling history from an isolated case directory.
+        let control = probe(&git, root.path(), &case, Some((&git_dir, &sibling)), false);
+        assert_eq!(control.0, 0);
+        assert_eq!(control.1, Some(sibling_top.clone()));
+
+        // The production sanitation removes the redirection, so the same child
+        // cannot reach the sibling repository.
+        let sanitized = probe(&git, root.path(), &case, Some((&git_dir, &sibling)), true);
+        assert_ne!(sanitized.1, Some(sibling_top));
+    }
 }

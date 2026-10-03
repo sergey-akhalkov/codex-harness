@@ -631,6 +631,7 @@ struct Scenario {
     evaluation: PolicyEvaluation,
     bindings: ExperimentBindings,
     spec: RunSpec,
+    removal_required: bool,
     frozen_removal: Option<String>,
 }
 
@@ -780,6 +781,7 @@ fn fixture_scenario(prefix: &str, fixture: Fixture) -> Scenario {
         evaluation,
         bindings,
         spec,
+        removal_required: false,
         frozen_removal: None,
     }
 }
@@ -950,6 +952,7 @@ fn integration_request<'a>(
         bindings: &scenario.bindings,
         evaluation: &scenario.evaluation,
         experiment: scenario.experiment.clone(),
+        removal_required: scenario.removal_required,
         frozen_removal: scenario.frozen_removal.clone(),
         mainline: scenario.source.clone(),
         check,
@@ -1650,6 +1653,217 @@ fn recorded_removal_proposal_gates_integration_without_a_declared_run_removal() 
     assert_eq!(rev(&scenario.source), scenario.checkout.revision);
 }
 
+/// The run's frozen candidate state can declare the evaluated treatment a
+/// removal while the spec names no removal scope and the card records no
+/// reviewable proposal (for example an intake-admitted withdrawal whose
+/// proposal record is gone). The declaration alone binds the effect owners:
+/// integration and activation refuse until the card carries the proposal and
+/// the user's covering decision exists.
+#[test]
+fn declared_removal_without_a_recorded_proposal_blocks_both_effects() {
+    let mut scenario = fixture_scenario("improvement-activation-declared-removal-", Fixture::Adopt);
+    assert!(scenario.spec.removal.is_none());
+    scenario.removal_required = true;
+    publish(&scenario);
+    let base = rev(&scenario.source);
+
+    let blocked =
+        blocked_of(integrate(&integration_request(&scenario, passing_check(), None)).unwrap());
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(
+        blocked
+            .reason
+            .contains("records no reviewable removal proposal"),
+        "{}",
+        blocked.reason
+    );
+    assert_eq!(rev(&scenario.source), base);
+
+    let state = scenario.root.path().join("state");
+    let runtime = gate_only_runtime(scenario.root.path());
+    let receipt = gate_only_receipt();
+    let blocked = activation_blocked(
+        activate(&activation_request(
+            &scenario, &state, &runtime, &receipt, false,
+        ))
+        .unwrap(),
+    );
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(
+        blocked
+            .reason
+            .contains("records no reviewable removal proposal"),
+        "{}",
+        blocked.reason
+    );
+
+    // Recording the reviewed proposal restores the ordinary gate: the effect
+    // still pends without a decision, and the covering approval opens it.
+    let proposal = BoundedRemovalProposal::try_from_draft(RemovalProposalDraft {
+        proposal: "proposal:fixture".into(),
+        target: "skill:fixture".into(),
+        evidence: "evidence:fixture".into(),
+        loss: "loses-fixture".into(),
+        preview: None,
+        detail: None,
+    })
+    .unwrap();
+    board_hypothesis::record_removal_proposal(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &proposal,
+    )
+    .unwrap();
+    let blocked =
+        blocked_of(integrate(&integration_request(&scenario, passing_check(), None)).unwrap());
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(
+        blocked.reason.contains("missing approval"),
+        "{}",
+        blocked.reason
+    );
+    assert_eq!(rev(&scenario.source), base);
+
+    let bounded = BoundedRemovalDecision::try_from_draft(RemovalDecisionDraft {
+        decision: RemovalDecisionKind::Approve,
+        proposal: proposal.proposal.clone(),
+        target: proposal.target.clone(),
+        actions: vec![RemovalAction::Integration],
+        loss: Some("loses-fixture".into()),
+        basis: Some("basis:fixture".into()),
+        detail: None,
+    })
+    .unwrap();
+    board_hypothesis::record_removal_decision(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &bounded,
+    )
+    .unwrap();
+    let IntegrationOutcome::Integrated(receipt) =
+        integrate(&integration_request(&scenario, passing_check(), None)).unwrap()
+    else {
+        panic!("the covered declared-removal approval must integrate");
+    };
+    assert_eq!(receipt.integrated_revision, scenario.checkout.revision);
+    assert_eq!(rev(&scenario.source), scenario.checkout.revision);
+}
+
+/// A run spec that declares a removal treatment also binds the effect owners:
+/// while the evaluated card records no reviewable proposal there is nothing
+/// the user could have approved, so integration and activation are refused
+/// with the pending decision named and the accepted state unchanged.
+#[test]
+fn declared_spec_removal_without_a_recorded_proposal_blocks_both_effects() {
+    let mut scenario = fixture_scenario("improvement-activation-spec-removal-", Fixture::Adopt);
+    scenario.spec.removal = Some(RemovalScope {
+        proposal: "proposal:fixture".into(),
+        target: "skill:fixture".into(),
+    });
+    publish(&scenario);
+    let base = rev(&scenario.source);
+
+    let blocked =
+        blocked_of(integrate(&integration_request(&scenario, passing_check(), None)).unwrap());
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(
+        blocked.reason.contains("no reviewed removal proposal"),
+        "{}",
+        blocked.reason
+    );
+    assert_eq!(rev(&scenario.source), base);
+
+    let state = scenario.root.path().join("state");
+    let runtime = gate_only_runtime(scenario.root.path());
+    let receipt = gate_only_receipt();
+    let blocked = activation_blocked(
+        activate(&activation_request(
+            &scenario, &state, &runtime, &receipt, false,
+        ))
+        .unwrap(),
+    );
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(
+        blocked.reason.contains("no reviewed removal proposal"),
+        "{}",
+        blocked.reason
+    );
+}
+
+/// An approval that covers only installed publication never authorizes the
+/// integration or baseline-activation effects, and the covering integration
+/// approval stays an integration receipt: publication authority remains a
+/// distinct stage that only its own effect owner may consume.
+#[test]
+fn publication_only_approval_does_not_cover_integration() {
+    let mut scenario = fixture_scenario("improvement-activation-publication-", Fixture::Adopt);
+    let proposal = BoundedRemovalProposal::try_from_draft(RemovalProposalDraft {
+        proposal: "proposal:fixture".into(),
+        target: "skill:fixture".into(),
+        evidence: "evidence:fixture".into(),
+        loss: "loses-fixture".into(),
+        preview: None,
+        detail: None,
+    })
+    .unwrap();
+    scenario.spec.removal = Some(RemovalScope {
+        proposal: proposal.proposal.clone(),
+        target: proposal.target.clone(),
+    });
+    board_hypothesis::record_removal_proposal(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &proposal,
+    )
+    .unwrap();
+    publish(&scenario);
+    let base = rev(&scenario.source);
+    let decide = |kind: RemovalDecisionKind, actions: Vec<RemovalAction>| {
+        let bounded = BoundedRemovalDecision::try_from_draft(RemovalDecisionDraft {
+            decision: kind,
+            proposal: proposal.proposal.clone(),
+            target: proposal.target.clone(),
+            actions,
+            loss: Some("loses-fixture".into()),
+            basis: Some("basis:fixture".into()),
+            detail: None,
+        })
+        .unwrap();
+        board_hypothesis::record_removal_decision(
+            &scenario.bd,
+            &scenario.board,
+            &scenario.item,
+            &bounded,
+        )
+        .unwrap();
+    };
+
+    decide(
+        RemovalDecisionKind::Approve,
+        vec![RemovalAction::Publication],
+    );
+    let blocked =
+        blocked_of(integrate(&integration_request(&scenario, passing_check(), None)).unwrap());
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(blocked.reason.contains("not covered"), "{}", blocked.reason);
+    assert_eq!(rev(&scenario.source), base);
+
+    decide(
+        RemovalDecisionKind::Approve,
+        vec![RemovalAction::Integration],
+    );
+    let IntegrationOutcome::Integrated(receipt) =
+        integrate(&integration_request(&scenario, passing_check(), None)).unwrap()
+    else {
+        panic!("the covered integration approval must integrate");
+    };
+    assert_eq!(receipt.integrated_revision, scenario.checkout.revision);
+    assert_eq!(rev(&scenario.source), scenario.checkout.revision);
+}
+
 /// A capability withdrawal phrased as disabling or consolidation has no
 /// separate treatment verb: the strict intake vocabulary refuses an invented
 /// verb, and the only admitted withdrawal routes (simplification and
@@ -2109,6 +2323,7 @@ fn activation_request<'a>(
         bindings: &scenario.bindings,
         evaluation: &scenario.evaluation,
         experiment: scenario.experiment.clone(),
+        removal_required: scenario.removal_required,
         frozen_removal: scenario.frozen_removal.clone(),
         mainline: scenario.source.clone(),
         integration: integration.clone(),
