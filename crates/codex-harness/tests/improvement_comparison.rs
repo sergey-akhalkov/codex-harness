@@ -1947,9 +1947,30 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
             && fixture.run.join("comparison/evaluation.json").is_file(),
         "the authoritative accounting and evaluation are retained"
     );
-    // The verdict is not an integration or an activation.
+    // The verdict is not an integration or an activation; the recorded
+    // selection is the candidate arm runtime this pair actually consumed.
     assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), base);
-    assert_eq!(status["selected_variant"], Value::Null, "{status}");
+    let candidate_runtime: harness_core::improvement_runtime::ArmRuntime = serde_json::from_slice(
+        &fs::read(fixture.arm_dir("candidate").join("runtime.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["selected_variant"], "candidate", "{status}");
+    assert_eq!(
+        PathBuf::from(status["selected_runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        candidate_runtime.variant.build.canonicalize().unwrap(),
+        "the recorded selection is the consumed candidate runtime: {status}"
+    );
+    assert_eq!(
+        status["selected_identity"],
+        format!(
+            "sha256:{}",
+            &candidate_runtime.variant.source_sha256
+                [..16.min(candidate_runtime.variant.source_sha256.len())]
+        ),
+        "{status}"
+    );
 
     // The published adoption is consumable by the existing integration owner:
     // it re-derives the expected record from the exact raw revisions and the

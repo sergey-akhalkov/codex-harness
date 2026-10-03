@@ -1804,6 +1804,54 @@ fn dispatch_next(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
                 format!("the {} arm is not dispatchable: {reason}", arm.as_str()),
             );
         }
+        // Between attempts the shared runtime-selection owner selects this
+        // arm's prepared runtime and reports the identity the arm home
+        // actually consumes, so the recorded selection is the runtime this
+        // measured attempt begins from. An arm that already is the recorded
+        // selection is not selected again: its own earlier dispatch
+        // legitimately appended the trusted-workspace entry to its
+        // configuration, and the pre-attempt consumption check above stays
+        // authoritative for that case, so a refused dispatch can still be
+        // re-attempted on resume.
+        if !(run.cursor.selected_variant.as_deref() == Some(arm.as_str())
+            && same_file_path(
+                &runtime.variant.build,
+                run.cursor.selected_runtime.as_deref(),
+            ))
+        {
+            let attempt_active = run.cursor.active_attempt().is_some();
+            let selection = match improvement_runtime::select_arm(
+                &comparison.runtimes.state,
+                &runtime,
+                attempt_active,
+            ) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    return block(
+                        run,
+                        notes,
+                        format!(
+                            "the {} prepared runtime was not selected: {error}",
+                            arm.as_str()
+                        ),
+                    );
+                }
+            };
+            let variant = arm.as_str().to_owned();
+            let identity = format!("sha256:{}", sha16(&runtime.variant.source_sha256));
+            run.cursor.selected_variant = Some(variant.clone());
+            run.cursor.selected_runtime = Some(selection.selected.build.clone());
+            run.cursor.selected_identity = Some(identity.clone());
+            run.cursor.effect(
+                EffectKind::VariantSelected,
+                format!(
+                    "variant={variant} runtime={} identity={identity} applied={} (no model call, no build, no source edit)",
+                    selection.selected.build.display(),
+                    selection.applied
+                ),
+            );
+            run.store.save_cursor(&run.cursor)?;
+        }
         return dispatch_arm(run, &comparison, &bindings, arm, &runtime, &profile, notes);
     }
     Ok(())
