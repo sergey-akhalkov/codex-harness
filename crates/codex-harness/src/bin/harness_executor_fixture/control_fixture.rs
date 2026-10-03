@@ -37,6 +37,7 @@ mod control_endpoint;
 
 use control_endpoint::{Answer, Bearer, Server};
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -50,6 +51,8 @@ use std::{
 /// name one.
 const DEFAULT_SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
 const TURN: &str = "fixture-turn-1";
+/// Item id and function-call `call_id`. It is not passed to the heavy command.
+const HEAVY_CALL_ID: &str = "call_heavy_blocked_1";
 const FINAL_MESSAGE: &str = "fixture turn completed; the committed solution is in the bound slot";
 
 /// Serves one `app-server` invocation. Returns the process exit code; the
@@ -162,11 +165,31 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                 if !server.requests_for("turn/start").is_empty() {
                     record_selected_tools();
                     let _ = commit_solution();
-                    let _ = write_rollout(&session, &rollout_model, &rollout_effort);
+                    let heavy = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok();
+                    let command_bound = heavy.then(|| run_owned_heavy(&server, &session));
+                    let message_ms = unix_ms();
+                    let _ = write_rollout(
+                        &session,
+                        &rollout_model,
+                        &rollout_effort,
+                        !heavy,
+                        command_bound,
+                        message_ms,
+                    );
+                    server.push(json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": session.clone(),
+                            "startedAtMs": message_ms,
+                            "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
+                        },
+                    }));
                     server.push(json!({
                         "method": "item/completed",
                         "params": {
                             "threadId": session.clone(),
+                            "startedAtMs": message_ms,
+                            "completedAtMs": message_ms,
                             "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
                         },
                     }));
@@ -255,6 +278,121 @@ fn commit_solution() -> io::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+struct OwnedHeavy {
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    /// Opaque producer process id. This is not the spawned OS pid.
+    process_id: Option<String>,
+}
+
+/// Runs one real heavy command under the controller-supplied account and
+/// evidence environment, and emits the command item the host can correlate.
+/// The item id is the function-call id. It is not supplied as a heavy-command
+/// label. The item's process id is an opaque producer id, not `child.id()`.
+/// The selected app-server route does not put the OS pid in that field, so
+/// the control owner records the private OS link for the process it spawned
+/// while that process is alive instead of seeding the item with a pid.
+fn run_owned_heavy(server: &Server, session: &str) -> OwnedHeavy {
+    let started_at_ms = unix_ms();
+    server.push(json!({
+        "method": "item/started",
+        "params": {
+            "threadId": session,
+            "startedAtMs": started_at_ms,
+            "item": {
+                "id": HEAVY_CALL_ID,
+                "type": "commandExecution",
+                "command": "codex-harness heavy",
+                "status": "inProgress",
+            },
+        },
+    }));
+    // The host polls the control stream. Give it time to record the start
+    // before the admission interval begins.
+    thread::sleep(Duration::from_millis(800));
+    if let Some(marker) = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_MARKER") {
+        let _ = fs::write(marker, b"waiting\n");
+    }
+    let program = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_PROGRAM")
+        .unwrap_or_else(|_| "cmd.exe".to_owned());
+    let cli = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_CLI")
+        .unwrap_or_else(|_| "codex-harness.exe".to_owned());
+    let spawned = Command::new(cli).args(["heavy", "--", &program]).spawn();
+    let (process_id, exit) = match spawned {
+        Ok(child) => {
+            let os_pid = child.id();
+            let opaque = opaque_producer_process_id(os_pid);
+            record_control_os_link(&opaque, os_pid);
+            let waited = child.wait_with_output();
+            (
+                Some(opaque),
+                waited.ok().and_then(|output| output.status.code()),
+            )
+        }
+        Err(_) => (None, None),
+    };
+    let completed_at_ms = unix_ms();
+    server.push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": session,
+            "startedAtMs": started_at_ms,
+            "completedAtMs": completed_at_ms,
+            "item": {
+                "id": HEAVY_CALL_ID,
+                "type": "commandExecution",
+                "command": "codex-harness heavy",
+                "status": if exit == Some(0) { "completed" } else { "failed" },
+                "exitCode": exit,
+                "processId": process_id.clone(),
+                "source": "unified_exec_startup",
+            },
+        },
+    }));
+    OwnedHeavy {
+        started_at_ms,
+        completed_at_ms,
+        process_id,
+    }
+}
+
+/// Records the control owner's private OS link for the command it spawned
+/// while that process is alive. The route reports an opaque producer id, so
+/// only this live association plus the admission's own ancestry can bind the
+/// item. `HARNESS_IMPROVEMENT_FIXTURE_HEAVY_NO_OS_LINK` suppresses it for the
+/// missing-OS-identity negative control.
+fn record_control_os_link(opaque_process_id: &str, os_pid: u32) {
+    if env::var_os("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_NO_OS_LINK").is_some() {
+        return;
+    }
+    let Some(directory) = env::var_os(harness_core::heavy_command_trace::EVIDENCE_ENV) else {
+        return;
+    };
+    let _ = harness_core::heavy_command::record_live_os_link(
+        Path::new(&directory),
+        HEAVY_CALL_ID,
+        opaque_process_id,
+        os_pid,
+    );
+}
+
+/// A numeric producer id that is not the spawned OS pid. The selected route
+/// reports a unified-exec session id in this field.
+fn opaque_producer_process_id(os_pid: u32) -> String {
+    let mut opaque = os_pid.wrapping_add(1_000_003);
+    if opaque == 0 || opaque == os_pid {
+        opaque = 1_000_003;
+    }
+    opaque.to_string()
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Records unqualified command identity from the host-supplied environment.
@@ -397,13 +535,24 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {
 
 /// Writes the native rollout the observation owner reads for this session,
 /// with the installed route (or the explicitly overridden facts).
-fn write_rollout(session: &str, model: &str, effort: &str) -> io::Result<()> {
+///
+/// `wait_call` names a single tool call that is the whole response. It is not
+/// assumed idle: the accounting owner still has to match it to one blocked
+/// admission. Publication time is not written as a request interval.
+fn write_rollout(
+    session: &str,
+    model: &str,
+    effort: &str,
+    include_usage: bool,
+    command_bound: Option<OwnedHeavy>,
+    message_ms: i64,
+) -> io::Result<()> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("the fixture rollout requires CODEX_HOME"))?;
     let sessions = home.join("sessions").join("2026").join("10").join("01");
     fs::create_dir_all(&sessions)?;
-    let lines = [
+    let mut lines = vec![
         json!({
             "type": "session_meta",
             "payload": {"id": session, "base_instructions": "fixture"},
@@ -412,7 +561,60 @@ fn write_rollout(session: &str, model: &str, effort: &str) -> io::Result<()> {
             "type": "turn_context",
             "payload": {"model": model, "effort": effort, "turn_id": TURN},
         }),
-        json!({
+    ];
+    if let Some(command) = command_bound {
+        let mut item = json!({
+            "type": "CommandExecution",
+            "id": HEAVY_CALL_ID
+        });
+        if let Some(process_id) = command.process_id {
+            item["process_id"] = json!(process_id);
+            item["source"] = json!("unified_exec_startup");
+        }
+        lines.push(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": TURN,
+                "started_at_ms": command.started_at_ms,
+                "completed_at_ms": command.completed_at_ms,
+                "item": item
+            }
+        }));
+        lines.push(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": TURN,
+                "started_at_ms": message_ms,
+                "completed_at_ms": message_ms,
+                "item": {"type": "AgentMessage", "id": "message-1"}
+            }
+        }));
+        lines.push(json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": HEAVY_CALL_ID,
+                "name": "exec_command",
+            },
+        }));
+        lines.push(json!({
+            "type": "token_usage_record",
+            "payload": {
+                "response_id": "response-heavy",
+                "turn_id": TURN,
+                "usage": {
+                    "input_tokens": 12,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 2,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 14,
+                },
+            },
+        }));
+    } else if include_usage {
+        lines.push(json!({
             "type": "token_usage_record",
             "payload": {
                 "response_id": "response-1",
@@ -424,8 +626,8 @@ fn write_rollout(session: &str, model: &str, effort: &str) -> io::Result<()> {
                     "total_tokens": 120,
                 },
             },
-        }),
-    ];
+        }));
+    }
     let text = lines
         .iter()
         .map(|line| serde_json::to_string(line).map_err(io::Error::other))

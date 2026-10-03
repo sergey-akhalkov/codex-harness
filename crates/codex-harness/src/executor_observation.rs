@@ -213,6 +213,72 @@ pub(crate) struct RunObservation {
     pub detail: Option<PathBuf>,
     #[serde(default)]
     pub updated_ms: u64,
+    /// Compact QPC facts. Retained after the raw detail file is full.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity: Vec<ActivityMark>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detail_truncated: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub activity_truncated: bool,
+    /// A mark could not be correlated. Not inactivity and not full coverage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub activity_gap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<ObservationClock>,
+}
+
+/// One host-observed activity boundary in the QPC domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActivityMark {
+    pub id: String,
+    pub kind: String,
+    pub phase: String,
+    pub qpc: u64,
+    pub frequency: u64,
+    pub boot: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_ticks: Option<u64>,
+    /// `receipt`: `qpc` is when the host received the notification, an upper
+    /// bound on the phase, not the work instant. Native item events carry no
+    /// producer timestamp in the exec JSONL shape. App-server notifications
+    /// carry `startedAtMs` / `completedAtMs` when the installed server emits
+    /// them; those are recorded and are not invented from receipt time. Absent
+    /// producer fields keep this receipt bound. It is not a poll interval and
+    /// not a scheduling estimate.
+    #[serde(default = "receipt_bound")]
+    pub bound: String,
+    /// Producer start from the notification, when that event carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    /// Producer completion from the notification, when that event carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+}
+
+fn receipt_bound() -> String {
+    "receipt".to_owned()
+}
+
+/// Attempt window in the host's QPC domain. Receipt time is not this window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ObservationClock {
+    pub frequency: u64,
+    pub boot: u64,
+    pub started_qpc: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_qpc: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_span: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_span: Option<u64>,
+    /// Wall sample paired with `started_qpc`. Absent on older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_filetime: Option<u64>,
+    /// Wall sample paired with `ended_qpc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_filetime: Option<u64>,
 }
 
 impl RunObservation {
@@ -235,6 +301,11 @@ impl RunObservation {
             result: Some(result),
             detail: Some(detail),
             updated_ms: now_ms(),
+            activity: Vec::new(),
+            detail_truncated: false,
+            activity_truncated: false,
+            activity_gap: false,
+            clock: None,
         }
     }
 
@@ -258,6 +329,11 @@ impl RunObservation {
             result: None,
             detail: None,
             updated_ms: now_ms(),
+            activity: Vec::new(),
+            detail_truncated: false,
+            activity_truncated: false,
+            activity_gap: false,
+            clock: None,
         }
     }
 
@@ -454,6 +530,7 @@ pub(crate) enum ItemPhase {
 /// ignored, so a newer stream keeps working for the properties we report.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ItemSummary {
+    pub id: Option<String>,
     pub kind: String,
     pub status: Option<String>,
     pub text: Option<String>,
@@ -537,6 +614,7 @@ pub(crate) fn parse_event(line: &str) -> Result<NativeEvent, String> {
             NativeEvent::Item {
                 phase,
                 item: ItemSummary {
+                    id: item.get("id").and_then(Value::as_str).map(str::to_owned),
                     kind: item_kind.to_owned(),
                     status: item
                         .get("status")
@@ -844,6 +922,7 @@ impl RunTracker {
     /// empty or missing message is an output defect, and a failed, interrupted
     /// or deviating run is never reported as a completed one.
     pub(crate) fn finish_control(&mut self, outcome: &ControlOutcome<'_>) -> i32 {
+        end_clock(&mut self.observation);
         let (state, cause, exit) = match (outcome.state, outcome.final_message) {
             (STATE_COMPLETED, Some(FinalMessage::Present)) => (STATE_COMPLETED, None, 0),
             (STATE_COMPLETED, Some(FinalMessage::Empty)) => (
@@ -907,6 +986,7 @@ impl RunTracker {
     /// Derives the terminal state from the stream and the child's exit code
     /// and final-message file. Returns the exit code the host must return.
     pub(crate) fn finish(&mut self, exit_code: i32, result: Option<&Path>) -> i32 {
+        end_clock(&mut self.observation);
         let mut cause = None;
         if exit_code != 0 {
             self.observation.state = STATE_FAILED.into();
@@ -1449,6 +1529,127 @@ pub(crate) fn append_detail(path: &Path, line: &str) -> io::Result<bool> {
     Ok(false)
 }
 
+const MAX_ACTIVITY_MARKS: usize = 256;
+
+/// Samples the attempt window before the child produces events. A failed
+/// sample leaves the window unknown; it is not a zero-length attempt.
+pub(crate) fn begin_clock(observation: &mut RunObservation) {
+    let Ok((frequency, sample)) = harness_core::heavy_command_trace::sample_clock() else {
+        observation.activity_gap = true;
+        return;
+    };
+    let Some(boot) = harness_core::heavy_command_trace::boot_filetime() else {
+        observation.activity_gap = true;
+        return;
+    };
+    observation.clock = Some(ObservationClock {
+        frequency,
+        boot,
+        started_qpc: sample.qpc,
+        ended_qpc: None,
+        started_span: sample.sample_span_ticks,
+        ended_span: None,
+        started_filetime: Some(sample.filetime),
+        ended_filetime: None,
+    });
+}
+
+pub(crate) fn end_clock(observation: &mut RunObservation) {
+    let Some(clock) = observation.clock.as_mut() else {
+        observation.activity_gap = true;
+        return;
+    };
+    let Ok((frequency, sample)) = harness_core::heavy_command_trace::sample_clock() else {
+        observation.activity_gap = true;
+        return;
+    };
+    if frequency != clock.frequency {
+        observation.activity_gap = true;
+        return;
+    }
+    clock.ended_qpc = Some(sample.qpc);
+    clock.ended_span = sample.sample_span_ticks;
+    clock.ended_filetime = Some(sample.filetime);
+}
+
+/// Retains one compact boundary. A full raw detail file does not stop this.
+pub(crate) fn note_activity(observation: &mut RunObservation, id: &str, kind: &str, phase: &str) {
+    note_sourced_activity(observation, id, kind, phase, None, None);
+}
+
+/// Records one activity boundary. Producer milliseconds are kept only when the
+/// notification carried them; receipt QPC is always the delivery sample.
+pub(crate) fn note_sourced_activity(
+    observation: &mut RunObservation,
+    id: &str,
+    kind: &str,
+    phase: &str,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+) {
+    if observation.activity.len() >= MAX_ACTIVITY_MARKS {
+        observation.activity_truncated = true;
+        return;
+    }
+    let Ok(id) = harness_core::heavy_command_trace::validate_token(id) else {
+        observation.activity_gap = true;
+        return;
+    };
+    let Ok(kind) = harness_core::heavy_command_trace::validate_token(kind) else {
+        observation.activity_gap = true;
+        return;
+    };
+    let Ok(phase) = harness_core::heavy_command_trace::validate_token(phase) else {
+        observation.activity_gap = true;
+        return;
+    };
+    let Ok((frequency, sample)) = harness_core::heavy_command_trace::sample_clock() else {
+        observation.activity_gap = true;
+        return;
+    };
+    let Some(boot) = harness_core::heavy_command_trace::boot_filetime() else {
+        observation.activity_gap = true;
+        return;
+    };
+    if observation
+        .clock
+        .as_ref()
+        .is_some_and(|clock| clock.frequency != frequency || clock.boot != boot)
+    {
+        observation.activity_gap = true;
+        return;
+    }
+    observation.activity.push(ActivityMark {
+        id,
+        kind,
+        phase,
+        qpc: sample.qpc,
+        frequency,
+        boot,
+        span_ticks: sample.sample_span_ticks,
+        bound: receipt_bound(),
+        started_at_ms,
+        completed_at_ms,
+    });
+    observation.updated_ms = now_ms();
+}
+
+fn note_parsed_activity(observation: &mut RunObservation, event: &NativeEvent) {
+    let NativeEvent::Item { phase, item } = event else {
+        return;
+    };
+    let Some(id) = item.id.as_deref() else {
+        observation.activity_gap = true;
+        return;
+    };
+    let phase = match phase {
+        ItemPhase::Started => "started",
+        ItemPhase::Updated => "updated",
+        ItemPhase::Completed => "completed",
+    };
+    note_activity(observation, id, &item.kind, phase);
+}
+
 /// Transient spool of the owned child's raw stdout. The child writes here
 /// while the host tails it; it is removed when the run ends, and the retained
 /// bounded detail file is written only by the host.
@@ -1490,6 +1691,7 @@ pub(crate) fn run_observed(
     let detail = tracker.observation.detail.clone();
     tracker.observation.host = Some(host_identity()?);
     tracker.observation.updated_ms = now_ms();
+    begin_clock(&mut tracker.observation);
     let spool = spool_path(receipt);
     if let Some(parent) = spool.parent() {
         fs::create_dir_all(parent)?;
@@ -1767,6 +1969,7 @@ impl TailSink<'_> {
                         Ok(true) => {}
                         Ok(false) if !self.truncation_noted => {
                             self.truncation_noted = true;
+                            self.tracker.observation.detail_truncated = true;
                             writeln!(
                                 self.stdout,
                                 "note: raw event detail reached the {} byte bound; the detail file stops here while the readable surface continues",
@@ -1785,6 +1988,7 @@ impl TailSink<'_> {
                 match parse_event(&line) {
                     Ok(event) => {
                         let changed = self.tracker.apply(&event);
+                        note_parsed_activity(&mut self.tracker.observation, &event);
                         render_event(&event, &mut self.stdout)?;
                         if changed {
                             update_receipt(self.receipt, &self.tracker.observation)?;
@@ -1911,6 +2115,54 @@ mod tests {
             PathBuf::from(r"C:\state\message-1.txt"),
             PathBuf::from(r"C:\state\stream-1.jsonl"),
         )
+    }
+
+    #[test]
+    fn compact_activity_survives_a_full_detail_file() {
+        let root = tempfile::tempdir().unwrap();
+        let detail = root.path().join("stream.jsonl");
+        fs::write(&detail, vec![b'x'; MAX_STREAM_BYTES as usize]).unwrap();
+        assert!(!append_detail(&detail, "later").unwrap());
+        let mut observation = observation();
+        observation.detail_truncated = true;
+        begin_clock(&mut observation);
+        note_activity(
+            &mut observation,
+            "heavy-cmd-1",
+            "commandExecution",
+            "started",
+        );
+        note_activity(
+            &mut observation,
+            "heavy-cmd-1",
+            "commandExecution",
+            "completed",
+        );
+        end_clock(&mut observation);
+        assert!(observation.detail_truncated);
+        assert_eq!(observation.activity.len(), 2, "{:?}", observation.activity);
+        assert!(
+            observation
+                .clock
+                .as_ref()
+                .is_some_and(|clock| clock.ended_qpc.is_some())
+        );
+        assert!(!observation.activity_truncated);
+    }
+
+    #[test]
+    fn activity_receipt_is_not_the_work_instant() {
+        let mut observation =
+            RunObservation::accepted(PathBuf::from("result.txt"), PathBuf::from("detail.jsonl"));
+        let before = harness_core::heavy_command_trace::qpc_now().expect("qpc");
+        std::thread::sleep(Duration::from_millis(30));
+        note_activity(&mut observation, "message-1", "agentMessage", "completed");
+        let mark = &observation.activity[0];
+        assert_eq!(mark.bound, "receipt");
+        assert!(
+            mark.qpc >= before,
+            "the mark must be the receipt sample, not an earlier work instant"
+        );
     }
 
     #[test]

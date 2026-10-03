@@ -106,6 +106,60 @@ fn check_stop(deadline: Deadline, cancellation: &Cancellation) -> io::Result<()>
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const HEAVY_COMMAND_LOCK: &str = "heavy-command.lock";
 
+/// Bracket around the successful `try_lock`. The opted-out path passes `None`
+/// and does not read the clock. `before_qpc` is the sample immediately before
+/// the call; `after_sample` is the clock sample immediately after the call
+/// reports the lock held. The grant happened somewhere in that bracket. A
+/// later sample, or the gap between two samples both taken after the lock, is
+/// not this bound. The poll period is not this bound.
+pub struct AdmissionBracket {
+    pub before_qpc: Option<u64>,
+    pub after_frequency: u64,
+    pub after_sample: Option<crate::heavy_command_trace::ClockSample>,
+    /// Invoked after the lock is held and before the later observation.
+    /// Production leaves this empty. A test uses it to prove a delayed
+    /// observation stays inside the bracket.
+    #[cfg(test)]
+    pub after_held: Option<fn()>,
+}
+
+impl Default for AdmissionBracket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl AdmissionBracket {
+    pub fn new() -> Self {
+        Self {
+            before_qpc: None,
+            after_frequency: 0,
+            after_sample: None,
+            #[cfg(test)]
+            after_held: None,
+        }
+    }
+
+    fn observe_held(&mut self, before: Option<u64>) {
+        #[cfg(test)]
+        if let Some(delay) = self.after_held {
+            delay();
+        }
+        self.before_qpc = before;
+        if let Ok((frequency, sample)) = crate::heavy_command_trace::sample_clock() {
+            self.after_frequency = frequency;
+            self.after_sample = Some(sample);
+        }
+    }
+
+    /// Width from the earlier observation to the later one. `None` when either
+    /// side was not observed. Not a poll period and not a second post-grant sample.
+    pub fn width_ns(&self) -> Option<u64> {
+        let before = self.before_qpc?;
+        let after = self.after_sample.as_ref()?;
+        crate::heavy_command_trace::monotonic_ns(self.after_frequency, before, after.qpc)
+    }
+}
+
 fn note_busy(reported: &mut bool, waiting: &mut impl FnMut(), deadline: Deadline) {
     if !*reported {
         *reported = true;
@@ -184,21 +238,29 @@ impl HeavyAdmission {
             deadline,
             cancellation,
             waiting,
-            || {},
+            |_| {},
+            None,
         )
     }
 
     /// Same lock order and poll as [`Self::acquire`]. `tick` runs once per busy
     /// poll, before the sleep, so a caller can record holder identity without
     /// holding the slot. It does not acquire, release or rewrite a lock.
+    ///
+    /// When `bracket` is present, the successful `try_lock` is bracketed by an
+    /// earlier QPC and a later clock sample. A delay after the lock is held and
+    /// before that later sample is inside the bracket. The poll period is not
+    /// substituted for it.
     pub fn acquire_observing(
         directory: &Path,
         slot_count: u32,
         deadline: Deadline,
         cancellation: &Cancellation,
         mut waiting: impl FnMut(),
-        mut tick: impl FnMut(),
+        mut tick: impl FnMut(Option<u64>),
+        mut bracket: Option<&mut AdmissionBracket>,
     ) -> io::Result<Self> {
+        let measure = bracket.is_some();
         if slot_count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -211,8 +273,12 @@ impl HeavyAdmission {
         if slot_count == 1 {
             loop {
                 check_stop(deadline, cancellation)?;
+                let before = measure.then(crate::heavy_command_trace::qpc_now).flatten();
                 match legacy.file.try_lock() {
                     Ok(()) => {
+                        if let Some(bracket) = bracket.as_mut() {
+                            bracket.observe_held(before);
+                        }
                         return Ok(Self {
                             _slot: None,
                             _legacy: legacy,
@@ -220,7 +286,7 @@ impl HeavyAdmission {
                         });
                     }
                     Err(TryLockError::WouldBlock) => {
-                        tick();
+                        tick(measure.then(crate::heavy_command_trace::qpc_now).flatten());
                         note_busy(&mut reported, &mut waiting, deadline);
                     }
                     Err(TryLockError::Error(error)) => return Err(error),
@@ -234,7 +300,7 @@ impl HeavyAdmission {
             match legacy.file.try_lock_shared() {
                 Ok(()) => {}
                 Err(TryLockError::WouldBlock) => {
-                    tick();
+                    tick(measure.then(crate::heavy_command_trace::qpc_now).flatten());
                     note_busy(&mut reported, &mut waiting, deadline);
                     continue;
                 }
@@ -246,10 +312,13 @@ impl HeavyAdmission {
                 }
             }
             let mut chosen = None;
+            let mut chosen_before = None;
             for index in 0..slot_count {
+                let before = measure.then(crate::heavy_command_trace::qpc_now).flatten();
                 match slots[index as usize].file.try_lock() {
                     Ok(()) => {
                         chosen = Some(index);
+                        chosen_before = before;
                         break;
                     }
                     Err(TryLockError::WouldBlock) => {}
@@ -258,6 +327,9 @@ impl HeavyAdmission {
             }
             if let Some(index) = chosen {
                 let slot = slots.swap_remove(index as usize);
+                if let Some(bracket) = bracket.as_mut() {
+                    bracket.observe_held(chosen_before);
+                }
                 return Ok(Self {
                     _slot: Some(slot),
                     _legacy: legacy,
@@ -268,7 +340,7 @@ impl HeavyAdmission {
             // it before the queue poll keeps a full slot set from blocking a
             // legacy exclusive lock for the whole deadline.
             legacy.file.unlock()?;
-            tick();
+            tick(measure.then(crate::heavy_command_trace::qpc_now).flatten());
             note_busy(&mut reported, &mut waiting, deadline);
         }
     }
@@ -427,6 +499,46 @@ mod tests {
             cancellation,
             waiting,
         )
+    }
+
+    #[test]
+    fn delayed_grant_observation_stays_inside_the_admission_bracket() {
+        let root = tempfile::tempdir().unwrap();
+        let delay = Duration::from_millis(150);
+        let mut bracket = AdmissionBracket {
+            after_held: Some(|| std::thread::sleep(Duration::from_millis(150))),
+            ..AdmissionBracket::new()
+        };
+        let admitted = HeavyAdmission::acquire_observing(
+            root.path(),
+            1,
+            Deadline::after(Duration::from_secs(2)).unwrap(),
+            &Cancellation::default(),
+            || panic!("an idle slot must not wait"),
+            |_| panic!("an idle slot must not poll"),
+            Some(&mut bracket),
+        )
+        .expect("idle admission");
+        drop(admitted);
+        let width = bracket
+            .width_ns()
+            .expect("the successful try_lock has both bracket observations");
+        assert!(
+            width >= delay.as_nanos() as u64 - 40_000_000,
+            "delay after lock acquisition and before the later observation was omitted: {width} ns"
+        );
+        assert_ne!(
+            width,
+            POLL_INTERVAL.as_nanos() as u64,
+            "the poll period is not the admission bound"
+        );
+        assert!(bracket.before_qpc.is_some() && bracket.after_sample.is_some());
+        let after = bracket.after_sample.expect("later observation").qpc;
+        let before = bracket.before_qpc.expect("earlier observation");
+        assert!(
+            after >= before,
+            "the bracket is not two unordered later samples"
+        );
     }
 
     #[test]

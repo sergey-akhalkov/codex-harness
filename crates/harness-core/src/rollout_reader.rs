@@ -50,7 +50,9 @@ pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 /// Any change to recognised events, aggregation or the checkpointed state
 /// shape must bump this value: stored checkpoints that do not match are
 /// discarded and the file is fully parsed again.
-pub const PARSER_VERSION: u32 = 1;
+/// Item lifecycle timestamps are part of the parser state. A checkpoint from
+/// the previous parser cannot be reused or those fields would be missing.
+pub const PARSER_VERSION: u32 = 2;
 
 /// Per-file counters for malformed, unknown or skipped records.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +103,35 @@ pub struct TurnUsage {
     /// Reasoning effort in effect from the recorded turn context, when
     /// identifiable.
     pub effort: Option<String>,
+}
+
+/// One recorded tool call. A missing response identity is not a join key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedCall {
+    pub call_id: String,
+    pub name: String,
+    pub response_id: Option<String>,
+    pub command_id: Option<String>,
+}
+
+/// One item lifecycle from a recorded `item_completed` event.
+///
+/// `started_at_ms` and `completed_at_ms` are the producer fields on that
+/// event. They are not receipt time and they are not inferred. The item id is
+/// the tool-call identity for a command item when a function call's `call_id`
+/// equals it. `turn_id` is the event's recorded turn, not a response join.
+/// `process_id` is set only when the item's process field is a numeric producer
+/// id. On the selected app-server route that value is an opaque unified-exec
+/// session id, not an OS pid.
+/// Command text is not retained.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedLifecycle {
+    pub id: String,
+    pub kind: String,
+    pub turn_id: Option<String>,
+    pub process_id: Option<u32>,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
 }
 
 /// One recorded usage amount with the recorded event timestamp beside it.
@@ -285,6 +316,14 @@ pub struct SessionSummary {
     pub conflicts: BTreeSet<String>,
     /// Open source handle retained for caller-side identity checks.
     pub source: Option<File>,
+    /// Function calls in recorded order. Response identity is present only when
+    /// the item carried one; it is not inferred from a neighbouring usage row.
+    pub calls: Vec<RecordedCall>,
+    /// Response identities that carried a message item. Those responses are
+    /// not structurally a single tool call.
+    pub message_responses: BTreeSet<String>,
+    /// Item lifecycles in recorded order. A missing timestamp stays missing.
+    pub lifecycles: Vec<RecordedLifecycle>,
 }
 
 /// One reader pass over one rollout file.
@@ -416,6 +455,37 @@ fn identifier(value: &Value) -> Option<String> {
     .then(|| text.to_owned())
 }
 
+fn recorded_ms(value: &Value, snake: &str, camel: &str) -> Option<i64> {
+    value
+        .get(snake)
+        .or_else(|| value.get(camel))
+        .and_then(Value::as_i64)
+}
+
+/// Producer process id from a command item. Only a base-10 integer is retained.
+/// It is not an OS pid. A non-numeric connection id stays absent.
+fn numeric_process_id(item: &Value) -> Option<u32> {
+    let text = item
+        .get("process_id")
+        .or_else(|| item.get("processId"))
+        .and_then(Value::as_str)?;
+    let pid = text.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+fn lifecycle_kind(item_type: &str) -> &'static str {
+    match item_type {
+        "commandExecution" | "command_execution" | "CommandExecution" => "command",
+        "agentMessage" | "agent_message" | "AgentMessage" | "userMessage" | "UserMessage" => {
+            "message"
+        }
+        "mcpToolCall" | "mcp_tool_call" | "McpToolCall" | "webSearch" | "web_search"
+        | "WebSearch" | "fileChange" | "file_change" | "FileChange" => "tool",
+        "reasoning" | "Reasoning" => "reasoning",
+        _ => "other",
+    }
+}
+
 /// Extracts recorded text from a string or a list of text parts.
 fn text_parts(value: &Value) -> String {
     if let Some(text) = value.as_str() {
@@ -520,6 +590,12 @@ struct Reader {
     turns: Vec<Value>,
     users: Vec<Value>,
     tool_calls: BTreeMap<String, String>,
+    #[serde(default)]
+    calls: Vec<RecordedCall>,
+    #[serde(default)]
+    message_responses: BTreeSet<String>,
+    #[serde(default)]
+    lifecycles: Vec<RecordedLifecycle>,
     tool_output_bytes: BTreeMap<String, u64>,
     usage: Usage,
     previous: Option<Usage>,
@@ -731,6 +807,12 @@ impl Reader {
             if p["type"] == "function_call" {
                 if let (Some(call), Some(name)) = (p["call_id"].as_str(), p["name"].as_str()) {
                     self.tool_calls.insert(call.to_owned(), name.to_owned());
+                    self.calls.push(RecordedCall {
+                        call_id: call.to_owned(),
+                        name: name.to_owned(),
+                        response_id: identifier(&p["response_id"]),
+                        command_id: identifier(&p["command_id"]),
+                    });
                 }
             } else if p["type"] == "function_call_output" {
                 if let Some(call) = p["call_id"].as_str() {
@@ -743,6 +825,9 @@ impl Reader {
                     *self.tool_output_bytes.entry(name).or_default() += bytes;
                 }
             } else if p["type"] == "message" {
+                if let Some(response) = identifier(&p["response_id"]) {
+                    self.message_responses.insert(response);
+                }
                 let text = message_text(p);
                 if p["role"] == "developer" {
                     self.instructions.developer_bytes = self
@@ -798,6 +883,17 @@ impl Reader {
                     self.children.insert(id);
                 }
             }
+            if let Some(id) = identifier(&p["item"]["id"]) {
+                let item_type = p["item"]["type"].as_str().unwrap_or("other");
+                self.lifecycles.push(RecordedLifecycle {
+                    id,
+                    kind: lifecycle_kind(item_type).to_owned(),
+                    turn_id: identifier(&p["turn_id"]),
+                    process_id: numeric_process_id(&p["item"]),
+                    started_at_ms: recorded_ms(p, "started_at_ms", "startedAtMs"),
+                    completed_at_ms: recorded_ms(p, "completed_at_ms", "completedAtMs"),
+                });
+            }
         }
     }
 
@@ -829,6 +925,7 @@ impl Reader {
             self.cumulative.clear();
             self.unidentified.clear();
             self.conflicts.clear();
+            self.lifecycles.clear();
         }
         if self.parents.len() > 1 {
             self.warn("conflicting_parent_ids");
@@ -924,6 +1021,9 @@ impl Reader {
             unidentified: self.unidentified,
             conflicts: self.conflicts,
             source: None,
+            calls: self.calls,
+            message_responses: self.message_responses,
+            lifecycles: self.lifecycles,
         }
     }
 }
@@ -1294,6 +1394,109 @@ mod tests {
         assert_eq!(session.tool_output_bytes["exec_command"], 10);
         assert!(session.tool_output_bytes.contains_key("unmatched_call"));
         assert!(session.tool_output_bytes["unmatched_call"] > 0);
+    }
+
+    #[test]
+    fn a_response_tool_call_keeps_its_identity_without_inventing_a_join() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "correlated.jsonl",
+            &[
+                meta("thread_calls"),
+                context(),
+                json!({"type":"response_item","payload":{"type":"function_call",
+                    "call_id":"heavy-cmd-1","command_id":"heavy-cmd-1","name":"exec_command",
+                    "response_id":"response-heavy"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "response_id":"response-mixed","content":[{"type":"output_text","text":"task"}]}}),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.calls.len(), 1);
+        assert_eq!(session.calls[0].call_id, "heavy-cmd-1");
+        assert_eq!(session.calls[0].command_id.as_deref(), Some("heavy-cmd-1"));
+        assert_eq!(
+            session.calls[0].response_id.as_deref(),
+            Some("response-heavy")
+        );
+        assert!(session.message_responses.contains("response-mixed"));
+        assert!(!session.message_responses.contains("response-heavy"));
+    }
+
+    #[test]
+    fn item_completed_keeps_producer_timestamps_without_command_text() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "lifecycle.jsonl",
+            &[
+                meta("thread_life"),
+                context(),
+                json!({"type":"event_msg","payload":{
+                    "type":"item_completed",
+                    "started_at_ms": 1_790_000_000_000_i64,
+                    "completed_at_ms": 1_790_000_002_000_i64,
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "call-1",
+                        "command": "secret command text",
+                        "aggregated_output": "secret output"
+                    }
+                }}),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.lifecycles.len(), 1);
+        assert_eq!(session.lifecycles[0].id, "call-1");
+        assert_eq!(session.lifecycles[0].kind, "command");
+        assert_eq!(session.lifecycles[0].started_at_ms, Some(1_790_000_000_000));
+        assert_eq!(
+            session.lifecycles[0].completed_at_ms,
+            Some(1_790_000_002_000)
+        );
+        assert!(!format!("{:?}", session.lifecycles).contains("secret"));
+    }
+
+    #[test]
+    fn command_process_identity_keeps_a_numeric_pid_and_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "process.jsonl",
+            &[
+                meta("thread_process"),
+                context(),
+                json!({"type":"event_msg","payload":{
+                    "type":"item_completed",
+                    "turn_id":"turn-1",
+                    "started_at_ms": 10_i64,
+                    "completed_at_ms": 20_i64,
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "call-1",
+                        "process_id": "4242",
+                        "command": "secret command text"
+                    }
+                }}),
+                json!({"type":"event_msg","payload":{
+                    "type":"item_completed",
+                    "turn_id":"turn-1",
+                    "started_at_ms": 10_i64,
+                    "completed_at_ms": 20_i64,
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "call-2",
+                        "processId": "not-a-pid"
+                    }
+                }}),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.lifecycles[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(session.lifecycles[0].process_id, Some(4242));
+        assert_eq!(session.lifecycles[1].process_id, None);
+        assert!(!format!("{:?}", session.lifecycles).contains("secret"));
     }
 
     #[test]

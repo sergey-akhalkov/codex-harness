@@ -47,6 +47,7 @@ use harness_core::rollout_reader;
 use harness_core::task_worktree;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -80,6 +81,234 @@ fn block(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result<(
     run.store.save_cursor(&run.cursor)?;
     notes.push(format!("comparison: {reason}"));
     Ok(())
+}
+
+#[cfg(test)]
+fn paired_clock(span: Option<u64>, filetime_extra: u64) -> Value {
+    let frequency = 10_000_000_u64;
+    let start_qpc = 1_000_000_u64;
+    let end_qpc = start_qpc + frequency;
+    let start_filetime = 132_000_000_000_000_000_u64;
+    let end_filetime = start_filetime + 10_000_000 + filetime_extra;
+    let mut clock = json!({
+        "startedQpc": start_qpc,
+        "endedQpc": end_qpc,
+        "startedFiletime": start_filetime,
+        "endedFiletime": end_filetime,
+        "frequency": frequency
+    });
+    if let Some(span) = span {
+        clock["startedSpan"] = json!(span);
+        clock["endedSpan"] = json!(span);
+    }
+    clock
+}
+
+#[test]
+fn missing_sample_span_and_clock_jump_are_not_bounds() {
+    assert!(source_mapping(&paired_clock(None, 0), 10_000_000).is_none());
+    assert!(source_mapping(&paired_clock(Some(10), 20_000_000), 10_000_000).is_none());
+    let mapped = source_mapping(&paired_clock(Some(100), 0), 10_000_000).unwrap();
+    assert!(mapped.uncertainty_ns >= PRODUCER_QUANTUM_NS);
+    assert_ne!(mapped.uncertainty_ns, 1_000_000_000);
+    let mut item = json!({"kind": "command", "start_ns": 1, "end_ns": 2});
+    apply_mapped_interval(
+        &mut item,
+        &mapped,
+        mapped.start_qpc,
+        1_700_000_000_000,
+        1_700_000_002_000,
+    );
+    assert_eq!(item["placement"], "source");
+    assert_eq!(item["mapping_uncertainty_ns"], json!(mapped.uncertainty_ns));
+    let start = item["start_ns"].as_u64().unwrap();
+    let end = item["end_ns"].as_u64().unwrap();
+    assert!(
+        end > start,
+        "a command must keep the mapped points, not a pre-shrunk role"
+    );
+    assert!(end - start > mapped.uncertainty_ns);
+}
+
+#[test]
+fn same_millisecond_command_has_no_inner_width() {
+    let mapped = source_mapping(&paired_clock(Some(1), 0), 10_000_000).unwrap();
+    let mut item = json!({"kind": "command"});
+    apply_mapped_interval(
+        &mut item,
+        &mapped,
+        mapped.start_qpc,
+        1_700_000_000_000,
+        1_700_000_000_000,
+    );
+    assert_eq!(item["placement"], "source");
+    assert_eq!(item["start_ns"], item["end_ns"]);
+    assert!(item["mapping_uncertainty_ns"].as_u64().unwrap() >= PRODUCER_QUANTUM_NS);
+}
+
+#[test]
+fn process_correlation_requires_a_verified_os_link_not_a_numeric_process_id() {
+    let root = tempfile::tempdir().unwrap();
+    harness_core::heavy_command_trace::write_process_ancestry(
+        root.path(),
+        "admission-1",
+        &[harness_core::heavy_command_trace::ProcessAncestor {
+            pid: 4242,
+            creation_time: 99,
+        }],
+    )
+    .unwrap();
+    let life =
+        |id: &str, process_id: Option<u32>| harness_core::rollout_reader::RecordedLifecycle {
+            id: id.to_owned(),
+            kind: "command".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+            process_id,
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+        };
+    let calls = vec!["call_heavy_blocked_1".to_owned()];
+    assert!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(4242))],
+            &calls
+        )
+        .is_none(),
+        "a numeric process id equal to an ancestry pid is not OS identity"
+    );
+    harness_core::heavy_command_trace::write_command_process_link(
+        root.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_heavy_blocked_1".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 99,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
+            &calls
+        )
+        .as_deref(),
+        Some("call_heavy_blocked_1")
+    );
+    assert!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(4242))],
+            &calls
+        )
+        .is_none(),
+        "the ancestry pid is not a substitute for the linked producer id"
+    );
+    assert!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[
+                life("call_heavy_blocked_1", Some(10307)),
+                life("call_other", Some(10307))
+            ],
+            &calls
+        )
+        .is_none(),
+        "a repeated producer process id is not a unique command"
+    );
+    assert!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[life("not-a-recorded-call", Some(10307))],
+            &calls
+        )
+        .is_none(),
+        "a link without call_id == item id is not a tool-call join"
+    );
+    harness_core::heavy_command_trace::write_command_process_link(
+        root.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_other".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 99,
+        },
+    )
+    .unwrap();
+    assert!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
+            &calls
+        )
+        .is_none(),
+        "two items claiming one producer id are ambiguous"
+    );
+
+    let reused = tempfile::tempdir().unwrap();
+    harness_core::heavy_command_trace::write_process_ancestry(
+        reused.path(),
+        "admission-1",
+        &[harness_core::heavy_command_trace::ProcessAncestor {
+            pid: 4242,
+            creation_time: 99,
+        }],
+    )
+    .unwrap();
+    harness_core::heavy_command_trace::write_command_process_link(
+        reused.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_heavy_blocked_1".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 100,
+        },
+    )
+    .unwrap();
+    assert!(
+        verified_command_identity(
+            reused.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
+            &calls
+        )
+        .is_none(),
+        "a reused pid with a different creation time is not the admitted process"
+    );
+
+    let invalid = tempfile::tempdir().unwrap();
+    std::fs::write(
+        invalid.path().join("admission-1.ancestry"),
+        r#"{"schema":"codex-harness.heavy-process-ancestry.v1","admission_id":"admission-1","processes":[{"pid":4242,"creation_time":50},{"pid":7,"creation_time":80}]}"#,
+    )
+    .unwrap();
+    harness_core::heavy_command_trace::write_command_process_link(
+        invalid.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_heavy_blocked_1".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 50,
+        },
+    )
+    .unwrap();
+    assert!(
+        verified_command_identity(
+            invalid.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
+            &calls
+        )
+        .is_none(),
+        "a parent created after its child cannot authorize a deduction"
+    );
 }
 
 /// Run one bounded git command with captured output; the controller never
@@ -1663,6 +1892,21 @@ fn dispatch_arm(
         ),
     );
     write_json_atomic(&assignment_path, &assignment)?;
+    let evidence = run
+        .store
+        .comparison_dir()
+        .join("queue-evidence")
+        .join(&attempt_id);
+    fs::create_dir_all(&evidence)?;
+    // The run store owns the evidence directory. A caller-supplied path is not
+    // accepted: candidate writes must not choose the measurement input.
+    // The hosted child inherits this process environment. These two variables
+    // are set only for that inheritance; set_var is unsafe because a concurrent
+    // environment read in another thread would race.
+    unsafe {
+        std::env::set_var(harness_core::heavy_command_trace::EVIDENCE_ENV, &evidence);
+        std::env::set_var(harness_core::heavy_command_trace::ATTEMPT_ENV, &attempt_id);
+    }
     let mut state = run
         .cursor
         .comparison
@@ -2328,6 +2572,7 @@ fn build_row(
         native["usage"] = usage;
     }
     let declaration = comparison.declared_policy()?.policy.declaration();
+    let infrastructure_capture = infrastructure_capture(run, attempt);
     Ok(json!({
         "attempt_id": format!("{}-{}", run.cursor.experiment, attempt.id),
         "case_id": comparison.task.name,
@@ -2356,6 +2601,7 @@ fn build_row(
         "children": [],
         "interventions": [],
         "retry_of": null,
+        "infrastructure_capture": infrastructure_capture,
         "treatment": {
             "label": runtime.label,
             "build": runtime.variant.build.display().to_string(),
@@ -2365,6 +2611,536 @@ fn build_row(
             "components": component_inventory(runtime),
         },
     }))
+}
+
+fn infrastructure_capture(run: &Run, attempt: &Attempt) -> Value {
+    let directory = run
+        .store
+        .comparison_dir()
+        .join("queue-evidence")
+        .join(&attempt.id);
+    let observation = retained_observation(attempt).unwrap_or(Value::Null);
+    let clock = observation.get("clock").cloned().unwrap_or(Value::Null);
+    let frequency = clock.get("frequency").and_then(Value::as_u64).unwrap_or(0);
+    let boot = clock.get("boot").and_then(Value::as_u64).unwrap_or(0);
+    let origin = clock.get("startedQpc").and_then(Value::as_u64);
+    let ended = clock.get("endedQpc").and_then(Value::as_u64);
+    let window = origin.zip(ended).and_then(|(start, end)| {
+        harness_core::heavy_command_trace::monotonic_ns(frequency, start, end)
+            .map(|end_ns| json!({"start_ns": 0, "end_ns": end_ns}))
+    });
+    let relative = |qpc: u64| -> Option<u64> {
+        let origin = origin?;
+        harness_core::heavy_command_trace::monotonic_ns(frequency, origin, qpc)
+    };
+    let tick_ns = (frequency > 0).then(|| (1_000_000_000 / frequency).max(1));
+    let mut admissions = Vec::new();
+    if directory.is_dir()
+        && let Ok(views) = harness_core::heavy_command_trace::read_directory(&directory)
+    {
+        for view in views {
+            admissions.push(admission_capture(
+                &view, frequency, boot, tick_ns, &relative,
+            ));
+        }
+    }
+    bind_verified_commands(&mut admissions, &directory, run, attempt);
+    let activity = activity_capture(&observation, &relative);
+    let activity = place_source_activity(&activity, &observation, run, attempt, frequency, origin);
+    let requests = request_capture(run, attempt);
+    json!({
+        "lineage": harness_core::infrastructure_accounting::MEASUREMENT_LINEAGE,
+        "window": window,
+        "detail_overflow": observation.get("detailTruncated").and_then(Value::as_bool).unwrap_or(false),
+        "activity_overflow": observation.get("activityTruncated").and_then(Value::as_bool).unwrap_or(false)
+            || observation.get("activityGap").and_then(Value::as_bool).unwrap_or(false),
+        "admissions": admissions,
+        "activity": activity,
+        "requests": requests,
+    })
+}
+
+fn admission_capture(
+    view: &harness_core::heavy_command_trace::EvidenceView,
+    frequency: u64,
+    boot: u64,
+    tick_ns: Option<u64>,
+    relative: &impl Fn(u64) -> Option<u64>,
+) -> Value {
+    let harness_core::heavy_command_trace::EvidenceView::Record(document) = view else {
+        return json!({"id": "unreadable", "class": "unknown", "domain_match": false});
+    };
+    let interpreted = harness_core::heavy_command_trace::interpret(view);
+    let class = match &interpreted.delay {
+        harness_core::heavy_command_trace::QueueDelay::MeasuredZero => "measured_zero",
+        harness_core::heavy_command_trace::QueueDelay::UnrelatedWait { .. } => "unrelated_wait",
+        harness_core::heavy_command_trace::QueueDelay::SelfContention { .. } => "self_contention",
+        harness_core::heavy_command_trace::QueueDelay::Inherited => "inherited",
+        harness_core::heavy_command_trace::QueueDelay::FailedAdmission { .. } => "failed",
+        harness_core::heavy_command_trace::QueueDelay::Unknown { .. } => "unknown",
+    };
+    let (endpoint_start, endpoint_end) = document
+        .queue
+        .as_ref()
+        .map(|queue| (queue.endpoint_start_ns, queue.endpoint_end_ns))
+        .unwrap_or((None, None));
+    let start_ns = document.clock.start.and_then(|sample| relative(sample.qpc));
+    let end_ns = document.clock.end.and_then(|sample| relative(sample.qpc));
+    let domain_match = document.clock.frequency == frequency
+        && document.clock.boot == Some(boot)
+        && frequency > 0
+        && boot > 0;
+    let terminal = match document.terminal {
+        harness_core::heavy_command_trace::TerminalKind::Timeout => "timeout",
+        harness_core::heavy_command_trace::TerminalKind::Cancelled => "cancelled",
+        harness_core::heavy_command_trace::TerminalKind::Failure => "failure",
+        harness_core::heavy_command_trace::TerminalKind::WaitedGrant => "waited_grant",
+        harness_core::heavy_command_trace::TerminalKind::ImmediateGrant => "immediate_grant",
+        harness_core::heavy_command_trace::TerminalKind::Inherited => "inherited",
+    };
+    json!({
+        "id": document.admission_id,
+        "parent_id": document.parent_admission_id,
+        "class": class,
+        "domain_match": domain_match,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "endpoint_start_ns": endpoint_start,
+        "endpoint_end_ns": endpoint_end,
+        "tick_ns": tick_ns,
+        // Caller labels are not process ownership. A verified join may set these.
+        "tool_call_id": Value::Null,
+        "command_id": Value::Null,
+        "started": document.post_grant.started,
+        "terminal": terminal,
+    })
+}
+
+fn activity_capture(observation: &Value, relative: &impl Fn(u64) -> Option<u64>) -> Vec<Value> {
+    let Some(marks) = observation.get("activity").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    struct Placed {
+        start: Option<u64>,
+        end: Option<u64>,
+        kind: String,
+        tool: Option<String>,
+        command: Option<String>,
+        bound: String,
+        producer_start: Option<i64>,
+        producer_end: Option<i64>,
+    }
+    let mut by_id: BTreeMap<String, Placed> = BTreeMap::new();
+    for mark in marks {
+        let Some(id) = mark.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let qpc = mark.get("qpc").and_then(Value::as_u64);
+        let ns = qpc.and_then(relative);
+        let kind = mark.get("kind").and_then(Value::as_str).unwrap_or("other");
+        let phase = mark.get("phase").and_then(Value::as_str).unwrap_or("");
+        let bound = mark
+            .get("bound")
+            .and_then(Value::as_str)
+            .unwrap_or("receipt");
+        let entry = by_id.entry(id.to_owned()).or_insert(Placed {
+            start: None,
+            end: None,
+            kind: kind.to_owned(),
+            tool: None,
+            command: None,
+            bound: bound.to_owned(),
+            producer_start: None,
+            producer_end: None,
+        });
+        entry.kind = kind.to_owned();
+        // A receipt bound is the weaker supported bound. Do not upgrade it.
+        if bound == "receipt" || entry.bound != "receipt" && bound != "source" && bound != "exact" {
+            entry.bound = "receipt".to_owned();
+        } else if entry.bound != "receipt" {
+            entry.bound = bound.to_owned();
+        }
+        if phase == "started" {
+            entry.start = ns;
+        } else if phase == "completed" {
+            entry.end = ns;
+        }
+        if let Some(ms) = mark.get("startedAtMs").and_then(Value::as_i64) {
+            entry.producer_start = Some(ms);
+        }
+        if let Some(ms) = mark.get("completedAtMs").and_then(Value::as_i64) {
+            entry.producer_end = Some(ms);
+        }
+        if kind == "commandExecution" || kind == "command_execution" {
+            entry.tool = Some(id.to_owned());
+            entry.command = Some(id.to_owned());
+        }
+    }
+    by_id
+        .into_iter()
+        .map(|(id, placed)| {
+            let kind = match placed.kind.as_str() {
+                "commandExecution" | "command_execution" => "command",
+                "agentMessage" | "agent_message" => "message",
+                "mcpToolCall" | "mcp_tool_call" | "webSearch" | "web_search" | "fileChange"
+                | "file_change" => "tool",
+                other => other,
+            };
+            json!({
+                "id": id,
+                "kind": kind,
+                "placement": placed.bound,
+                "start_ns": placed.start,
+                "end_ns": placed.end,
+                "tool_call_id": placed.tool,
+                "command_id": placed.command,
+                "producer_start_ms": placed.producer_start,
+                "producer_end_ms": placed.producer_end,
+            })
+        })
+        .collect()
+}
+
+/// Replaces a receipt interval with a producer interval when the attempt clock
+/// can map the installed server's timestamps. A missing or jumped mapping
+/// stays a receipt. Command text is not copied from the rollout.
+fn place_source_activity(
+    activity: &[Value],
+    observation: &Value,
+    run: &Run,
+    attempt: &Attempt,
+    frequency: u64,
+    origin: Option<u64>,
+) -> Vec<Value> {
+    let clock = observation.get("clock").cloned().unwrap_or(Value::Null);
+    let Some(origin) = origin else {
+        return activity.to_vec();
+    };
+    let Some(mapping) = source_mapping(&clock, frequency) else {
+        return activity.to_vec();
+    };
+    let mut items = activity.to_vec();
+    for item in &mut items {
+        let start_ms = item.get("producer_start_ms").and_then(Value::as_i64);
+        let end_ms = item.get("producer_end_ms").and_then(Value::as_i64);
+        if let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) {
+            apply_mapped_interval(item, &mapping, origin, start_ms, end_ms);
+        }
+    }
+    if let Ok(sessions) = discovery_sessions(run, attempt) {
+        for path in sessions.paths {
+            let summary = harness_core::rollout_reader::read(&path);
+            for life in &summary.lifecycles {
+                let (Some(start_ms), Some(end_ms)) = (life.started_at_ms, life.completed_at_ms)
+                else {
+                    continue;
+                };
+                if let Some(existing) = items.iter_mut().find(|item| item["id"] == life.id) {
+                    let agrees = existing
+                        .get("producer_start_ms")
+                        .and_then(Value::as_i64)
+                        .is_none_or(|ms| ms == start_ms)
+                        && existing
+                            .get("producer_end_ms")
+                            .and_then(Value::as_i64)
+                            .is_none_or(|ms| ms == end_ms);
+                    if agrees {
+                        apply_mapped_interval(existing, &mapping, origin, start_ms, end_ms);
+                    } else {
+                        existing["placement"] = json!("receipt");
+                        existing["source_conflict"] = json!(true);
+                    }
+                    continue;
+                }
+                let mut item = json!({
+                    "id": life.id,
+                    "kind": life.kind,
+                    "placement": "receipt",
+                    "start_ns": Value::Null,
+                    "end_ns": Value::Null,
+                    "tool_call_id": (life.kind == "command").then(|| life.id.clone()),
+                    "command_id": (life.kind == "command").then(|| life.id.clone()),
+                    "producer_start_ms": start_ms,
+                    "producer_end_ms": end_ms,
+                });
+                apply_mapped_interval(&mut item, &mapping, origin, start_ms, end_ms);
+                items.push(item);
+            }
+        }
+    }
+    items
+}
+
+struct SourceMapping {
+    start_qpc: u64,
+    start_filetime: u64,
+    frequency: u64,
+    uncertainty_ns: u64,
+}
+
+/// Producer item timestamps are integer milliseconds. This is their resolution,
+/// not a sample span and not the wall/QPC jump gate.
+const PRODUCER_QUANTUM_NS: u64 = 1_000_000;
+
+fn source_mapping(clock: &Value, frequency: u64) -> Option<SourceMapping> {
+    let start_qpc = clock.get("startedQpc").and_then(Value::as_u64)?;
+    let end_qpc = clock.get("endedQpc").and_then(Value::as_u64)?;
+    let start_filetime = clock.get("startedFiletime").and_then(Value::as_u64)?;
+    let end_filetime = clock.get("endedFiletime").and_then(Value::as_u64)?;
+    if frequency == 0 || end_qpc < start_qpc || end_filetime < start_filetime {
+        return None;
+    }
+    let qpc_ns = harness_core::heavy_command_trace::monotonic_ns(frequency, start_qpc, end_qpc)?;
+    let filetime_ns =
+        u64::try_from(u128::from(end_filetime.checked_sub(start_filetime)?).checked_mul(100)?)
+            .ok()?;
+    let disagree = qpc_ns.abs_diff(filetime_ns);
+    // The jump gate refuses an inconsistent pair. Passing it is not a
+    // measurement bound and its slack is not the uncertainty.
+    let slack = 1_000_000_000u64.max(qpc_ns / 10);
+    if disagree > slack {
+        return None;
+    }
+    // A missing sample bracket is unknown, not a zero-width sample.
+    let start_span = clock.get("startedSpan").and_then(Value::as_u64)?;
+    let end_span = clock.get("endedSpan").and_then(Value::as_u64)?;
+    let span_ns =
+        harness_core::heavy_command_trace::monotonic_ns(frequency, 0, start_span.max(end_span))?;
+    Some(SourceMapping {
+        start_qpc,
+        start_filetime,
+        frequency,
+        uncertainty_ns: span_ns
+            .saturating_add(PRODUCER_QUANTUM_NS)
+            .saturating_add(disagree),
+    })
+}
+
+fn map_producer_ms(mapping: &SourceMapping, origin: u64, ms: i64) -> Option<u64> {
+    if ms < 0 {
+        return None;
+    }
+    let event_filetime = u64::try_from(ms)
+        .ok()?
+        .checked_mul(10_000)?
+        .checked_add(116_444_736_000_000_000)?;
+    let delta_100ns = event_filetime.checked_sub(mapping.start_filetime)?;
+    let delta_ns = u64::try_from(u128::from(delta_100ns).checked_mul(100)?).ok()?;
+    let ticks = u64::try_from(
+        u128::from(delta_ns)
+            .checked_mul(u128::from(mapping.frequency))?
+            .checked_div(1_000_000_000)?,
+    )
+    .ok()?;
+    let event_qpc = mapping.start_qpc.checked_add(ticks)?;
+    harness_core::heavy_command_trace::monotonic_ns(mapping.frequency, origin, event_qpc)
+}
+
+fn apply_mapped_interval(
+    item: &mut Value,
+    mapping: &SourceMapping,
+    origin: u64,
+    start_ms: i64,
+    end_ms: i64,
+) {
+    if end_ms < start_ms {
+        return;
+    }
+    let Some(start_ns) = map_producer_ms(mapping, origin, start_ms) else {
+        return;
+    };
+    let Some(end_ns) = map_producer_ms(mapping, origin, end_ms) else {
+        return;
+    };
+    if end_ns < start_ns {
+        return;
+    }
+    let uncertainty = mapping.uncertainty_ns;
+    // Keep the mapped points and the uncertainty. Blocking uses the inner
+    // interval and useful coverage the outer interval only after admission
+    // correlation; shrinking every command here hides concurrent overlap.
+    item["placement"] = json!("source");
+    item["start_ns"] = json!(start_ns);
+    item["end_ns"] = json!(end_ns);
+    item["mapping_uncertainty_ns"] = json!(uncertainty);
+}
+
+fn request_capture(run: &Run, attempt: &Attempt) -> Vec<Value> {
+    let Ok(sessions) = discovery_sessions(run, attempt) else {
+        return Vec::new();
+    };
+    let mut requests = Vec::new();
+    for path in sessions.paths {
+        let summary = harness_core::rollout_reader::read(&path);
+        for (index, turn) in summary.turns.iter().enumerate() {
+            let id = turn
+                .response_id
+                .clone()
+                .unwrap_or_else(|| format!("response-{index}"));
+            let usage = &turn.usage;
+            let token = |key: &str| match usage.get(key) {
+                Some(Some(value)) => json!(value),
+                _ => Value::Null,
+            };
+            let response_id = turn.response_id.as_deref();
+            let calls: Vec<_> = summary
+                .calls
+                .iter()
+                .filter(|call| response_id.is_some() && call.response_id.as_deref() == response_id)
+                .collect();
+            let structural = calls.len() == 1
+                && response_id.is_some_and(|id| !summary.message_responses.contains(id));
+            let turn_call = turn_scoped_command(&summary, turn);
+            // A response_id on the call is the direct join. When the client
+            // does not emit one, a single command call in a single-usage turn
+            // joins through call_id == item id. Neither rule invents an interval.
+            let call = if structural {
+                Some(calls[0])
+            } else {
+                turn_call
+            };
+            let structural = call.is_some();
+            // Publication time is not a request interval. wait_only stays unset
+            // until the accounting owner matches this call to one blocked admission.
+            requests.push(json!({
+                "id": id,
+                "wait_only": Value::Null,
+                "structural_single_tool": structural,
+                "tool_call_id": call.map(|call| call.call_id.clone()),
+                // The emitted call identity is call_id. A fixture command_id
+                // field is not required and is not the join key.
+                "command_id": call.map(|call| call.call_id.clone()),
+                "start_ns": Value::Null,
+                "end_ns": Value::Null,
+                "input_tokens": token("input_tokens"),
+                "cached_input_tokens": token("cached_input_tokens"),
+                "output_tokens": token("output_tokens"),
+                "reasoning_output_tokens": token("reasoning_output_tokens"),
+                "total_tokens": token("total_tokens"),
+            }));
+        }
+    }
+    requests
+}
+
+/// The one command call that can be this usage's launch without a response_id
+/// on the call. The real client emits `call_id` and the command item id as the
+/// same token, and `turn_id` on the usage and the item. More than one usage or
+/// command in the turn is not a join.
+fn turn_scoped_command<'a>(
+    summary: &'a harness_core::rollout_reader::SessionSummary,
+    turn: &harness_core::rollout_reader::TurnUsage,
+) -> Option<&'a harness_core::rollout_reader::RecordedCall> {
+    let turn_id = turn.turn_id.as_deref()?;
+    let usages = summary
+        .turns
+        .iter()
+        .filter(|other| other.turn_id.as_deref() == Some(turn_id))
+        .count();
+    if usages != 1 {
+        return None;
+    }
+    let mut matched = summary.calls.iter().filter(|call| {
+        call.response_id.is_none()
+            && summary.lifecycles.iter().any(|life| {
+                life.kind == "command"
+                    && life.id == call.call_id
+                    && life.turn_id.as_deref() == Some(turn_id)
+            })
+    });
+    let call = matched.next()?;
+    matched.next().is_none().then_some(call)
+}
+
+/// Binds an admission to a command item only through a verified OS link.
+/// Caller labels and numeric `process_id` equality are ignored. Two
+/// admissions or two items claiming the same identity bind nothing.
+fn bind_verified_commands(
+    admissions: &mut [Value],
+    directory: &Path,
+    run: &Run,
+    attempt: &Attempt,
+) {
+    let Ok(sessions) = discovery_sessions(run, attempt) else {
+        return;
+    };
+    let mut lifecycles = Vec::new();
+    let mut call_ids = Vec::new();
+    for path in sessions.paths {
+        let summary = harness_core::rollout_reader::read(&path);
+        for call in summary.calls {
+            call_ids.push(call.call_id);
+        }
+        lifecycles.extend(
+            summary
+                .lifecycles
+                .into_iter()
+                .filter(|life| life.kind == "command"),
+        );
+    }
+    let mut chosen = Vec::new();
+    for admission in admissions.iter() {
+        let Some(id) = admission.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(identity) = verified_command_identity(directory, id, &lifecycles, &call_ids) {
+            chosen.push((id.to_owned(), identity));
+        }
+    }
+    for (admission_id, identity) in &chosen {
+        let unique = chosen.iter().filter(|(_, other)| other == identity).count() == 1;
+        if !unique {
+            continue;
+        }
+        if let Some(admission) = admissions
+            .iter_mut()
+            .find(|admission| admission.get("id").and_then(Value::as_str) == Some(admission_id))
+        {
+            admission["tool_call_id"] = json!(identity);
+            admission["command_id"] = json!(identity);
+        }
+    }
+}
+
+/// Binds an admission to one command item only through a control-owner OS
+/// link. The rollout `process_id` is an opaque producer id. Numeric equality
+/// with an ancestry pid is not OS identity. The link's OS pid and creation
+/// time must match exactly one ancestry process, the producer id must be
+/// unique, and the item id must be a recorded function-call `call_id`.
+fn verified_command_identity(
+    directory: &Path,
+    admission_id: &str,
+    lifecycles: &[harness_core::rollout_reader::RecordedLifecycle],
+    call_ids: &[String],
+) -> Option<String> {
+    let ancestry =
+        harness_core::heavy_command_trace::read_process_ancestry(directory, admission_id)?;
+    let links = harness_core::heavy_command_trace::read_command_process_links(directory);
+    let mut matched = lifecycles.iter().filter(|life| {
+        let Some(opaque) = life.process_id.map(|id| id.to_string()) else {
+            return false;
+        };
+        let Some(link) =
+            harness_core::heavy_command_trace::unambiguous_command_link(&links, &life.id, &opaque)
+        else {
+            return false;
+        };
+        ancestry
+            .iter()
+            .filter(|item| item.pid == link.os_pid && item.creation_time == link.creation_time)
+            .count()
+            == 1
+            && lifecycles
+                .iter()
+                .filter(|other| other.process_id.is_some_and(|id| id.to_string() == opaque))
+                .count()
+                == 1
+            && call_ids.iter().any(|call_id| call_id == &life.id)
+            && harness_core::heavy_command_trace::validate_token(&life.id).is_ok()
+            && harness_core::heavy_command_trace::validate_token(&opaque).is_ok()
+    });
+    let life = matched.next()?;
+    matched.next().is_none().then(|| life.id.clone())
 }
 
 fn retained_observation(attempt: &Attempt) -> Option<Value> {

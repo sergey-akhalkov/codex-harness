@@ -2379,7 +2379,7 @@ fn queue_evidence_covers_grant_wait_identity_release_and_ordinary_operation() {
                     delay,
                     QueueDelay::UnrelatedWait { timing }
                         if timing.monotonic_ns > 0
-                            && timing.endpoint == TimingBound::Unknown
+                            && matches!(timing.endpoint, TimingBound::Measured(bound) if bound != timing.configured_poll_ns)
                             && !matches!(
                                 timing.endpoint,
                                 TimingBound::Measured(bound) if bound == timing.configured_poll_ns

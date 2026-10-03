@@ -3860,6 +3860,7 @@ fn host_control_conversation(
     let mut tracker = RunTracker::new(run);
     tracker.observation.host = Some(observation::host_identity()?);
     tracker.observation.updated_ms = observation::now_ms();
+    observation::begin_clock(&mut tracker.observation);
     let detail = tracker.observation.detail.clone();
     if let Some(detail) = &detail {
         if let Some(parent) = detail.parent() {
@@ -4275,6 +4276,16 @@ fn verify_recorded_endpoint(plan: &ControlPlan, conversation: &Conversation) -> 
     Ok(())
 }
 
+/// Producer millisecond from an app-server item notification, when present.
+fn notification_ms(params: &serde_json::Value, names: &[&str]) -> Option<i64> {
+    names.iter().find_map(|name| {
+        params
+            .get(*name)
+            .or_else(|| params.get("item").and_then(|item| item.get(*name)))
+            .and_then(serde_json::Value::as_i64)
+    })
+}
+
 /// Renders every control record of one conversation until the turn's own
 /// status is terminal, keeping the bounded detail file and the receipt's
 /// lifecycle current. Returns the terminal lifecycle state.
@@ -4322,6 +4333,7 @@ fn drive_control(
                     Ok(true) => {}
                     Ok(false) if !truncation_noted => {
                         truncation_noted = true;
+                        tracker.observation.detail_truncated = true;
                         let note = "note: the raw record detail reached its byte bound; the detail file stops here while the readable surface continues";
                         if show_terminal {
                             writeln!(stdout, "{note}")?;
@@ -4338,6 +4350,22 @@ fn drive_control(
                     }
                 }
             }
+            if let Some(method) = event.method.as_deref()
+                && method.starts_with("item/")
+            {
+                let item = &event.raw["params"]["item"];
+                if let (Some(id), Some(kind)) = (item["id"].as_str(), item["type"].as_str()) {
+                    let params = &event.raw["params"];
+                    observation::note_sourced_activity(
+                        &mut tracker.observation,
+                        id,
+                        kind,
+                        method.trim_start_matches("item/"),
+                        notification_ms(params, &["startedAtMs", "started_at_ms"]),
+                        notification_ms(params, &["completedAtMs", "completed_at_ms"]),
+                    );
+                }
+            }
             if show_terminal {
                 event.render(stdout)?;
             }
@@ -4348,7 +4376,11 @@ fn drive_control(
             let completed = (event.method.as_deref() == Some("item/completed"))
                 .then(|| event.raw["params"]["item"]["type"].as_str())
                 .flatten();
-            if tracker.apply_control(state, completed, conversation.thread_id()) {
+            let changed = tracker.apply_control(state, completed, conversation.thread_id());
+            if changed
+                || !tracker.observation.activity.is_empty()
+                || tracker.observation.activity_gap
+            {
                 observation::update_receipt(receipt, &tracker.observation)?;
             }
         }

@@ -415,7 +415,8 @@ Optional queue evidence stays in this admission owner. It is not a second
 journal. `codex-harness heavy --queue-evidence DIRECTORY --attempt LABEL
 --tool-call LABEL --command-id LABEL -- PROGRAM ARGS` writes one JSON document
 per admission into that caller-owned directory. Labels are ascii tokens and
-are not paths. The same inputs can be supplied with
+are not paths. They are not proof that the process is a command item. The same
+inputs can be supplied with
 `CODEX_HARNESS_HEAVY_QUEUE_EVIDENCE`, `CODEX_HARNESS_HEAVY_ATTEMPT`,
 `CODEX_HARNESS_HEAVY_TOOL_CALL` and `CODEX_HARNESS_HEAVY_COMMAND`; explicit
 options take precedence. With no evidence directory from either source,
@@ -423,16 +424,63 @@ ordinary operation writes no evidence. A missing, malformed or partial
 document is unknown, never a measured zero. An immediate grant with a positive
 frequency and equal monotonic and wall
 samples is measured zero. A paired mapping is not exact wall alignment, and the
-configured 20 ms poll is not a bound on late start or late end; unmeasured
-scheduling or sampling error stays unknown. A
-nested heavy command records inherited admission and does not add a queue
+configured 20 ms poll is not a bound on late start or late end. The successful
+`try_lock` is bracketed by an earlier counter sample and the clock sample taken
+immediately after the lock is observed held; a delay between acquisition and
+that later sample is inside the bracket. Two samples taken after the lock, or
+the poll period, are not that bound. Host activity marks are receipt times when
+the notification carries no producer timestamp. Installed app-server item
+notifications carry `startedAtMs` and `completedAtMs` when the server emitted
+them, and a rollout `item_completed` event carries `started_at_ms` and
+`completed_at_ms`. Those fields are mapped through the attempt's paired QPC
+and filetime samples. The mapping keeps the mapped points and a separate
+uncertainty: the sample bracket, the one-millisecond producer resolution, and
+the observed wall/QPC difference. A missing sample span stays unknown and is
+not stored as zero. A wall/QPC jump above the plausibility gate refuses the
+mapping; that gate is not itself the uncertainty. After a verified admission
+join, blocked coverage uses the inner interval and concurrent useful activity,
+including other commands, uses the outer interval. A jumped or missing mapping
+stays a receipt. A receipt is an upper bound on delivery, not the work instant,
+and it cannot prove that
+earlier queue time was idle. A measured endpoint bracket stays a range: the
+shrunk interval is the certain deduction and the bracket remains a possible
+deduction where the task was independently blocked. Unmeasured scheduling or
+sampling error stays unknown. A nested heavy command records inherited
+admission and does not add a queue
 interval. Holder identity is `same_attempt`, `other_attempt` or `unknown`; a
 missing attempt tag stays unknown. The document separates queue time from
 post-grant delay and does not subtract time or tokens. A write failure is
 printed as `heavy: queue evidence was not recorded` and does not change the
 command result. Public documents contain no account paths or foreign command
-text. Interpret the document; a start/end timer or a missing file is not a
+text or pids. A collecting admission also writes a private
+`{admission_id}.ancestry` file with the pid and creation time of that process
+and verified ancestors. A parent created after its child is not part of that
+chain. The selected app-server route reports command `process_id` as an opaque
+unified-exec session id, not an OS pid. `thread/backgroundTerminals/list`
+carries a separate `osPid`, and that route leaves it null while the command
+process is alive. The collector binds an admission only when a control link
+(the private `{item_id}.link` written by the control owner while the named
+process is alive) names that opaque id, a live OS pid, and the creation time
+of one ancestry process, and the item id equals a function-call `call_id`.
+Numeric equality with an ancestry pid, a missing OS pid, a reused pid, or an
+invalid parent lifetime binds nothing.
+Interpret the document; a start/end timer or a missing file is not a
 deduction.
+
+The accounting owner clips verified external waits to the attempt, intersects
+them with independently observed blocked intervals, and removes useful overlap
+before subtracting that duration once from observed elapsed time. Raw time,
+requests, tool operations, token categories, failures and cancellation stay.
+Only a whole request correlated with the wait, contained in that blocked
+interval and structurally wait-only can leave the adjusted usage; mixed and
+unknown requests stay. A full raw detail file is not inactivity: compact QPC
+facts continue through the observation receipt, and overflow stays a gap.
+Adjusted time is not a prediction of an unloaded host. A new comparison that
+uses this view must declare `infrastructure-attribution.v1` in its uncertainty
+policy before either arm, keep `config_identity` comparability, and measure
+both arms again. Reviewed candidate revisions can be reused. Attempts recorded
+before this telemetry are not a measured zero and are not a comparable
+adjusted baseline. The lineage is `infrastructure-attribution.v1`.
 
 ```powershell
 codex-harness heavy --uncapped -- cargo test --locked --jobs 1 -- --test-threads=1

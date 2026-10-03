@@ -57,7 +57,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
-    Foundation::{FILETIME, HANDLE, WAIT_TIMEOUT},
+    Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_TIMEOUT},
     System::{
         Console::SetConsoleCtrlHandler,
         JobObjects::{AssignProcessToJobObject, IsProcessInJob, OpenJobObjectW},
@@ -926,6 +926,8 @@ impl Holder {
         let slot_count = budget.max_concurrent_trees;
         let attempt = observation.correlation.attempt_id.as_deref();
         let mut wait = WaitTrace::default();
+        let mut bracket = crate::resource_admission::AdmissionBracket::new();
+        let collecting = observation.collecting();
         let queue_deadline = match budget.queue_deadline() {
             Ok(deadline) => deadline,
             Err(error) => {
@@ -943,16 +945,26 @@ impl Holder {
             || {
                 eprintln!("{}", queue_diagnostic(account, slot_count));
             },
-            || {
-                if observation.collecting() {
-                    observe_wait(&mut wait, account, slot_count, attempt);
+            |decision| {
+                if collecting {
+                    observe_wait(&mut wait, account, slot_count, attempt, decision);
                 }
             },
+            collecting.then_some(&mut bracket),
         );
-        let ended = observation
-            .collecting()
-            .then(|| heavy_command_trace::sample_clock().ok())
-            .flatten();
+        // The admission owner already bracketed try_lock. The later sample of that
+        // bracket is the grant observation. Measuring from it to a second later
+        // sample would omit the delay between lock acquisition and the first
+        // observation, so that gap is not the endpoint bound.
+        let ended = bracket
+            .after_sample
+            .map(|sample| (bracket.after_frequency, sample));
+        if let (Some(before), Some((frequency, sample))) = (bracket.before_qpc, ended) {
+            wait.endpoint_end_ns = heavy_command_trace::monotonic_ns(frequency, before, sample.qpc);
+            if wait.boot.is_none() {
+                wait.boot = heavy_command_trace::boot_filetime();
+            }
+        }
         let admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
@@ -1464,6 +1476,9 @@ struct WaitTrace {
     first_busy: Option<heavy_command_trace::ClockSample>,
     last_sample: Option<heavy_command_trace::ClockSample>,
     observed_poll_gap_ns: Option<u64>,
+    endpoint_start_ns: Option<u64>,
+    endpoint_end_ns: Option<u64>,
+    boot: Option<u64>,
     holders_last: Vec<heavy_command_trace::HolderFinding>,
     identity_last: Vec<PrivateHolder>,
     gap_findings: Vec<heavy_command_trace::HolderFinding>,
@@ -1521,7 +1536,13 @@ fn parent_admission_from_env() -> Option<String> {
     heavy_command_trace::validate_token(&value).ok()
 }
 
-fn observe_wait(wait: &mut WaitTrace, account: &Path, slot_count: u32, attempt: Option<&str>) {
+fn observe_wait(
+    wait: &mut WaitTrace,
+    account: &Path,
+    slot_count: u32,
+    attempt: Option<&str>,
+    decision_qpc: Option<u64>,
+) {
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering;
@@ -1553,6 +1574,10 @@ fn observe_wait(wait: &mut WaitTrace, account: &Path, slot_count: u32, attempt: 
             }
             if wait.first_busy.is_none() {
                 wait.first_busy = Some(sample);
+                wait.boot = heavy_command_trace::boot_filetime();
+                wait.endpoint_start_ns = decision_qpc.and_then(|decision| {
+                    heavy_command_trace::monotonic_ns(frequency, decision, sample.qpc)
+                });
             }
             wait.last_sample = Some(sample);
         }
@@ -1822,10 +1847,25 @@ fn record_episode(
         holder_changed: wait.changed || wait.observation_gap,
         poll_resolution_ns: POLL_INTERVAL.as_nanos() as u64,
         observed_poll_gap_ns: wait.observed_poll_gap_ns,
+        endpoint_start_ns: wait.endpoint_start_ns,
+        endpoint_end_ns: wait.endpoint_end_ns,
+        boot: wait.boot,
         payload_started,
     };
     if let Err(error) = heavy_command_trace::write_episode(&link.directory, &draft) {
         heavy_command_trace::expose_write(&error);
+    } else {
+        let ancestry = observed_process_ancestry();
+        if ancestry.is_empty() {
+            return;
+        }
+        if let Err(error) = heavy_command_trace::write_process_ancestry(
+            &link.directory,
+            &link.admission_id,
+            &ancestry,
+        ) {
+            heavy_command_trace::expose_write(&error);
+        }
     }
 }
 
@@ -2104,6 +2144,146 @@ fn current_identity() -> io::Result<ProcessIdentity> {
     })
 }
 
+/// This process and the ancestors whose pid and creation time could be read
+/// while the admission was running. A parent that cannot be opened stops the
+/// walk; skipping it would guess a further ancestor. A parent created after
+/// its child is not recorded: that lifetime is a reused pid or a broken
+/// snapshot, and it must not become a join target. The chain is not a command
+/// line and is not written into the public episode document.
+fn observed_process_ancestry() -> Vec<heavy_command_trace::ProcessAncestor> {
+    const MAX_ANCESTORS: usize = 8;
+    let mut found = Vec::new();
+    let Ok(current) = current_identity() else {
+        return found;
+    };
+    if current.pid == 0 || current.creation_time == 0 {
+        return found;
+    }
+    found.push(heavy_command_trace::ProcessAncestor {
+        pid: current.pid,
+        creation_time: current.creation_time,
+    });
+    let table = process_parent_table();
+    let mut pid = parent_pid(&table, current.pid);
+    let mut child_created = current.creation_time;
+    while let Some(parent) = pid {
+        if parent <= 4
+            || found.len() >= MAX_ANCESTORS
+            || found.iter().any(|item| item.pid == parent)
+        {
+            break;
+        }
+        let Some(created) = creation_time_of_pid(parent) else {
+            break;
+        };
+        if !parent_not_after_child(child_created, created) {
+            break;
+        }
+        found.push(heavy_command_trace::ProcessAncestor {
+            pid: parent,
+            creation_time: created,
+        });
+        child_created = created;
+        pid = parent_pid(&table, parent);
+    }
+    found
+}
+
+/// A recorded parent must already have existed when the child was created.
+fn parent_not_after_child(child_created: u64, parent_created: u64) -> bool {
+    parent_created != 0 && parent_created <= child_created
+}
+
+/// Records a control-owner OS link. `os_pid` must be the control `osPid`,
+/// never a parsed producer `processId`. The creation time is read from that
+/// live process; a dead or unopenable pid is not a link.
+pub fn record_live_os_link(
+    directory: &Path,
+    item_id: &str,
+    opaque_process_id: &str,
+    os_pid: u32,
+) -> io::Result<()> {
+    let Some(creation_time) = creation_time_of_pid(os_pid) else {
+        return Err(io::Error::other("OS pid is not a live process"));
+    };
+    if creation_time == 0 {
+        return Err(io::Error::other("OS pid has no creation time"));
+    }
+    heavy_command_trace::write_command_process_link(
+        directory,
+        &heavy_command_trace::CommandProcessLink {
+            item_id: item_id.to_owned(),
+            opaque_process_id: opaque_process_id.to_owned(),
+            os_pid,
+            creation_time,
+        },
+    )
+}
+
+fn creation_time_of_pid(pid: u32) -> Option<u64> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return None;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    creation_time(handle.as_raw_handle())
+}
+
+fn parent_pid(table: &[(u32, u32)], pid: u32) -> Option<u32> {
+    table
+        .iter()
+        .find(|(child, _)| *child == pid)
+        .map(|(_, parent)| *parent)
+}
+
+/// `(pid, parent pid)` from one bounded process snapshot. Image names are not
+/// retained. ToolHelp is declared locally; this crate's selected windows-sys
+/// features do not expose it.
+fn process_parent_table() -> Vec<(u32, u32)> {
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const PROCESS_ENTRY_LIMIT: usize = 20_000;
+    const MAX_PATH: usize = 260;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process: u32) -> *mut core::ffi::c_void;
+        fn Process32FirstW(snapshot: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot as isize == -1 {
+        return Vec::new();
+    }
+    let mut entry: ProcessEntry32W = unsafe { zeroed() };
+    entry.dw_size = u32::try_from(std::mem::size_of::<ProcessEntry32W>()).unwrap_or(0);
+    let mut table = Vec::new();
+    let mut present = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while present != 0 && table.len() < PROCESS_ENTRY_LIMIT {
+        table.push((entry.th32_process_id, entry.th32_parent_process_id));
+        present = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    table
+}
+
 /// Read-only liveness: never grants cleanup authority over the process.
 fn live_process(identity: ProcessIdentity) -> bool {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -2229,6 +2409,25 @@ mod tests {
             .validate("fixture")
             .is_ok()
         );
+    }
+
+    #[test]
+    fn live_os_link_reads_creation_time_and_keeps_the_producer_id_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let os_pid = std::process::id();
+        let opaque = "10307";
+        assert_ne!(opaque, os_pid.to_string());
+        record_live_os_link(root.path(), "call-1", opaque, os_pid).unwrap();
+        let links = heavy_command_trace::read_command_process_links(root.path());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].item_id, "call-1");
+        assert_eq!(links[0].opaque_process_id, opaque);
+        assert_eq!(links[0].os_pid, os_pid);
+        assert_ne!(links[0].creation_time, 0);
+        assert!(record_live_os_link(root.path(), "call-2", "10308", 0).is_err());
+        assert!(!parent_not_after_child(50, 80));
+        assert!(parent_not_after_child(80, 50));
+        assert!(!parent_not_after_child(80, 0));
     }
 
     #[test]

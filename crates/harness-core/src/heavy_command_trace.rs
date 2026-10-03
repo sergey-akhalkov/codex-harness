@@ -23,8 +23,10 @@
 //!   private process identity did not change across the retained samples. It is
 //!   not yet eligible to subtract: the accounting owner must still clip it to
 //!   the attempt, intersect verified task-blocked intervals and remove useful
-//!   overlap. [`WaitTiming`] is what was actually observed. `endpoint: Unknown`
-//!   means late start and late end were not measured. The configured poll, a
+//!   overlap. [`WaitTiming`] is what was actually observed. `endpoint` is the
+//!   sum of the measured start and end observation lateness when both brackets
+//!   were read, and [`TimingBound::Unknown`] when either bracket was not. The
+//!   configured poll, a
 //!   paired mapping, and a small clock disagreement are not substitutes for
 //!   that bound. Do not place the interval on a wall-clock timeline unless
 //!   `endpoint`, `clock_disagreement` and `clock_sample` are all `Measured` and
@@ -57,12 +59,23 @@
 //! An unbound record (`bound_to_attempt: false`) does not prove anything about
 //! an attempt, even when the record itself measured zero. Caller labels are not
 //! provenance. Union episodes by `admission_id`. A shared `command_id` is a
-//! hint, not an episode key.
+//! hint, not an episode key, and it does not prove that this process is the
+//! command item that carries that label.
+//!
+//! When collection is on, the admission owner also writes
+//! `{admission_id}.ancestry`: the pid and creation time of this process and
+//! the ancestors it could verify while the admission ran. That file is private
+//! evidence for a later process/lifecycle join. A parent created after its
+//! child makes the chain unusable. A `{item_id}.link` file is the separate
+//! control-owner association from an opaque producer process id to a live OS
+//! pid and creation time. Neither file is part of the public document, and
+//! `read_directory` does not load them.
 //!
 //! Public documents contain no account paths, command lines, pids or foreign
-//! holder text. Private holder records in the account directory remain the
-//! bounded private evidence. Optional collection does not read holder identity
-//! or the admission clock on the opted-out queue path.
+//! holder text. Private holder records in the account directory, and the
+//! ancestry file above, remain the bounded private evidence. Optional
+//! collection does not read holder identity or the admission clock on the
+//! opted-out queue path.
 #![cfg(windows)]
 
 use serde::{Deserialize, Serialize};
@@ -101,6 +114,56 @@ const JUMP_RATIO: u64 = 10;
 unsafe extern "system" {
     fn QueryPerformanceCounter(lp_performance_count: *mut i64) -> i32;
     fn QueryPerformanceFrequency(lp_frequency: *mut i64) -> i32;
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySystemInformation(
+        class: u32,
+        info: *mut core::ffi::c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+}
+
+/// One QPC read. `None` when the counter cannot be read. Not a poll bound.
+pub fn qpc_now() -> Option<u64> {
+    let mut counter = 0_i64;
+    (unsafe { QueryPerformanceCounter(&mut counter) } != 0 && counter >= 0)
+        .then_some(counter as u64)
+}
+
+/// Boot time in 100-nanosecond ticks since 1601-01-01 UTC. Same value for the
+/// life of this boot; a different value is a different clock domain.
+pub fn boot_filetime() -> Option<u64> {
+    #[repr(C)]
+    struct TimeOfDay {
+        boot_time: i64,
+        current_time: i64,
+        time_zone_bias: i64,
+        time_zone_id: u32,
+        reserved: u32,
+        boot_time_bias: u64,
+        sleep_time_bias: u64,
+    }
+    let mut info = TimeOfDay {
+        boot_time: 0,
+        current_time: 0,
+        time_zone_bias: 0,
+        time_zone_id: 0,
+        reserved: 0,
+        boot_time_bias: 0,
+        sleep_time_bias: 0,
+    };
+    let status = unsafe {
+        NtQuerySystemInformation(
+            3,
+            (&mut info as *mut TimeOfDay).cast(),
+            core::mem::size_of::<TimeOfDay>() as u32,
+            core::ptr::null_mut(),
+        )
+    };
+    (status == 0 && info.boot_time > 0).then_some(info.boot_time as u64)
 }
 
 /// Labels that join this admission to existing attempt evidence.
@@ -214,6 +277,12 @@ pub struct QueueBody {
     /// the gap was not observed, not that it was zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_poll_gap_ns: Option<u64>,
+    /// Measured lateness of the recorded start. Absent means it was not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_start_ns: Option<u64>,
+    /// Measured lateness of the recorded end. Absent means it was not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_end_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +295,8 @@ pub struct PostGrantBody {
 pub struct ClockBody {
     pub source: String,
     pub frequency: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<u64>,
     pub start: Option<ClockSample>,
     pub end: Option<ClockSample>,
     pub mapping: ClockMapping,
@@ -363,6 +434,9 @@ pub struct EpisodeDraft {
     pub holder_changed: bool,
     pub poll_resolution_ns: u64,
     pub observed_poll_gap_ns: Option<u64>,
+    pub endpoint_start_ns: Option<u64>,
+    pub endpoint_end_ns: Option<u64>,
+    pub boot: Option<u64>,
     pub payload_started: Option<bool>,
 }
 
@@ -529,6 +603,236 @@ pub fn write_episode(directory: &Path, draft: &EpisodeDraft) -> io::Result<std::
     }
     replace_file(&temporary, &path)?;
     Ok(path)
+}
+
+/// Private schema for `{admission_id}.ancestry`. A different value is unusable.
+pub const ANCESTRY_SCHEMA: &str = "codex-harness.heavy-process-ancestry.v1";
+const MAX_ANCESTORS: usize = 8;
+
+/// One process verified while this admission was running. A pid without a
+/// creation time is not recorded. This is not a public evidence field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessAncestor {
+    pub pid: u32,
+    pub creation_time: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProcessAncestryDocument {
+    schema: String,
+    admission_id: String,
+    processes: Vec<ProcessAncestor>,
+}
+
+/// Private schema for `{item_id}.link`. A different value is unusable.
+pub const PROCESS_LINK_SCHEMA: &str = "codex-harness.command-process-link.v1";
+
+/// One control-owner association from an opaque producer process id to the OS
+/// process that association named. `os_pid` is the control `osPid`, not a
+/// parse of `processId`. `creation_time` was read from that live process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandProcessLink {
+    pub item_id: String,
+    pub opaque_process_id: String,
+    pub os_pid: u32,
+    pub creation_time: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProcessLinkDocument {
+    schema: String,
+    item_id: String,
+    opaque_process_id: String,
+    os_pid: u32,
+    creation_time: u64,
+}
+
+/// Writes the verified process chain for one admission. The public episode
+/// document is unchanged. An empty or unverified chain is not written as a
+/// zero-pid match. The first record is the admitted process; each later record
+/// is its parent and must not have been created after that child.
+pub fn write_process_ancestry(
+    directory: &Path,
+    admission_id: &str,
+    processes: &[ProcessAncestor],
+) -> io::Result<()> {
+    let admission_id = validate_token(admission_id)
+        .map_err(|_| io::Error::other("admission identity is not a token"))?;
+    if processes.is_empty() || processes.len() > MAX_ANCESTORS {
+        return Err(io::Error::other(
+            "process ancestry must name one to eight verified processes",
+        ));
+    }
+    if !ancestry_lifetime_ok(processes) {
+        return Err(io::Error::other(
+            "process ancestry has a parent created after its child",
+        ));
+    }
+    let document = ProcessAncestryDocument {
+        schema: ANCESTRY_SCHEMA.to_owned(),
+        admission_id: admission_id.clone(),
+        processes: processes.to_vec(),
+    };
+    let path = directory.join(format!("{admission_id}.ancestry"));
+    let temporary = directory.join(format!("{admission_id}.ancestry.tmp"));
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|_| io::Error::other("process ancestry could not be serialized"))?;
+    if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return Err(io::Error::other("process ancestry is too large"));
+    }
+    fs::write(&temporary, bytes)?;
+    replace_file(&temporary, &path)
+}
+
+fn ancestry_lifetime_ok(processes: &[ProcessAncestor]) -> bool {
+    let mut seen = Vec::new();
+    let mut child_created = None;
+    for process in processes {
+        if process.pid == 0
+            || process.creation_time == 0
+            || seen.iter().any(|pid| pid == &process.pid)
+        {
+            return false;
+        }
+        if let Some(created) = child_created
+            && process.creation_time > created
+        {
+            return false;
+        }
+        child_created = Some(process.creation_time);
+        seen.push(process.pid);
+    }
+    true
+}
+
+/// Reads a private ancestry file. Missing, malformed and contradictory files
+/// are absence, not a process match. A parent created after its child makes
+/// the whole chain unusable.
+pub fn read_process_ancestry(directory: &Path, admission_id: &str) -> Option<Vec<ProcessAncestor>> {
+    let admission_id = validate_token(admission_id).ok()?;
+    let path = directory.join(format!("{admission_id}.ancestry"));
+    let bytes = fs::read(&path).ok()?;
+    if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return None;
+    }
+    let document: ProcessAncestryDocument = serde_json::from_slice(&bytes).ok()?;
+    if document.schema != ANCESTRY_SCHEMA || document.admission_id != admission_id {
+        return None;
+    }
+    if document.processes.is_empty()
+        || document.processes.len() > MAX_ANCESTORS
+        || !ancestry_lifetime_ok(&document.processes)
+    {
+        return None;
+    }
+    Some(document.processes)
+}
+
+/// Writes one private command-process link. The file name is the item id.
+/// A second link for the same item replaces nothing: the existing file is an
+/// ambiguous association and is left unchanged.
+pub fn write_command_process_link(directory: &Path, link: &CommandProcessLink) -> io::Result<()> {
+    let item_id = validate_token(&link.item_id)
+        .map_err(|_| io::Error::other("command item id is not a token"))?;
+    let opaque = validate_token(&link.opaque_process_id)
+        .map_err(|_| io::Error::other("producer process id is not a token"))?;
+    if link.os_pid == 0 || link.creation_time == 0 {
+        return Err(io::Error::other("command process link has no OS identity"));
+    }
+    let path = directory.join(format!("{item_id}.link"));
+    if path.exists() {
+        return Err(io::Error::other(
+            "command process link already exists for this item",
+        ));
+    }
+    let document = ProcessLinkDocument {
+        schema: PROCESS_LINK_SCHEMA.to_owned(),
+        item_id,
+        opaque_process_id: opaque,
+        os_pid: link.os_pid,
+        creation_time: link.creation_time,
+    };
+    let temporary = directory.join(format!("{}.link.tmp", link.item_id));
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|_| io::Error::other("command process link could not be serialized"))?;
+    if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return Err(io::Error::other("command process link is too large"));
+    }
+    fs::write(&temporary, bytes)?;
+    replace_file(&temporary, &path)
+}
+
+/// Reads private command-process links. A malformed file is skipped. The
+/// caller must still reject an ambiguous item or producer id.
+pub fn read_command_process_links(directory: &Path) -> Vec<CommandProcessLink> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut links = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("link") {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if let Some(link) = read_one_command_link(&path) {
+            links.push(link);
+        }
+    }
+    links.sort_by(|left, right| left.item_id.cmp(&right.item_id));
+    links
+}
+
+fn read_one_command_link(path: &Path) -> Option<CommandProcessLink> {
+    let name = path.file_stem().and_then(|name| name.to_str())?;
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return None;
+    }
+    let document: ProcessLinkDocument = serde_json::from_slice(&bytes).ok()?;
+    if document.schema != PROCESS_LINK_SCHEMA || document.item_id != name {
+        return None;
+    }
+    if validate_token(&document.item_id).is_err()
+        || validate_token(&document.opaque_process_id).is_err()
+        || document.os_pid == 0
+        || document.creation_time == 0
+    {
+        return None;
+    }
+    Some(CommandProcessLink {
+        item_id: document.item_id,
+        opaque_process_id: document.opaque_process_id,
+        os_pid: document.os_pid,
+        creation_time: document.creation_time,
+    })
+}
+
+/// The one link that names both this item and this producer id. Two claims
+/// for either identity are ambiguous and bind nothing.
+pub fn unambiguous_command_link<'a>(
+    links: &'a [CommandProcessLink],
+    item_id: &str,
+    opaque_process_id: &str,
+) -> Option<&'a CommandProcessLink> {
+    let mut matched = links
+        .iter()
+        .filter(|link| link.item_id == item_id && link.opaque_process_id == opaque_process_id);
+    let link = matched.next()?;
+    if matched.next().is_some() {
+        return None;
+    }
+    let opaque_claims = links
+        .iter()
+        .filter(|link| link.opaque_process_id == opaque_process_id)
+        .count();
+    let item_claims = links.iter().filter(|link| link.item_id == item_id).count();
+    (opaque_claims == 1 && item_claims == 1).then_some(link)
 }
 
 pub fn note_command_started(directory: &Path, admission_id: &str) -> io::Result<()> {
@@ -791,7 +1095,13 @@ fn wait_timing(document: &QueueEvidence, queue: &QueueBody, monotonic_ns: u64) -
         },
         clock_disagreement: clock_disagreement(document),
         clock_sample: clock_sample_uncertainty(document),
-        endpoint: TimingBound::Unknown,
+        endpoint: match (queue.endpoint_start_ns, queue.endpoint_end_ns) {
+            (Some(start), Some(end)) => start
+                .checked_add(end)
+                .map(TimingBound::Measured)
+                .unwrap_or(TimingBound::Unknown),
+            _ => TimingBound::Unknown,
+        },
     }
 }
 
@@ -987,6 +1297,8 @@ fn document_from(draft: &EpisodeDraft) -> QueueEvidence {
             holder_samples: draft.holder_samples,
             poll_resolution_ns: draft.poll_resolution_ns,
             observed_poll_gap_ns: draft.observed_poll_gap_ns,
+            endpoint_start_ns: draft.endpoint_start_ns,
+            endpoint_end_ns: draft.endpoint_end_ns,
         })
     };
     let boundary = if inherited {
@@ -1014,6 +1326,7 @@ fn document_from(draft: &EpisodeDraft) -> QueueEvidence {
         clock: ClockBody {
             source: "qpc+filetime".to_owned(),
             frequency: draft.frequency,
+            boot: draft.boot,
             start,
             end,
             mapping,
@@ -1102,7 +1415,7 @@ fn mapping_of(frequency: u64, start: ClockSample, end: ClockSample) -> ClockMapp
     }
 }
 
-pub(crate) fn monotonic_ns(frequency: u64, start: u64, end: u64) -> Option<u64> {
+pub fn monotonic_ns(frequency: u64, start: u64, end: u64) -> Option<u64> {
     let ticks = end.checked_sub(start)?;
     u64::try_from(elapsed_ns(ticks, frequency)?).ok()
 }
@@ -1199,8 +1512,113 @@ mod tests {
             holder_changed: false,
             poll_resolution_ns: 20_000_000,
             observed_poll_gap_ns: None,
+            endpoint_start_ns: None,
+            endpoint_end_ns: None,
+            boot: None,
             payload_started: Some(false),
         }
+    }
+
+    #[test]
+    fn private_ancestry_is_not_a_public_episode() {
+        let root = tempfile::tempdir().unwrap();
+        write_process_ancestry(
+            root.path(),
+            "admission-1",
+            &[ProcessAncestor {
+                pid: 4242,
+                creation_time: 99,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            read_process_ancestry(root.path(), "admission-1").unwrap(),
+            vec![ProcessAncestor {
+                pid: 4242,
+                creation_time: 99
+            }]
+        );
+        assert!(read_process_ancestry(root.path(), "other-admission").is_none());
+        assert!(
+            write_process_ancestry(
+                root.path(),
+                "admission-1",
+                &[ProcessAncestor {
+                    pid: 0,
+                    creation_time: 1
+                }]
+            )
+            .is_err()
+        );
+        let views = read_directory(root.path()).unwrap();
+        assert!(
+            views.is_empty(),
+            "ancestry must not be loaded as a public episode: {views:?}"
+        );
+    }
+
+    #[test]
+    fn ancestry_rejects_a_parent_created_after_its_child() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            write_process_ancestry(
+                root.path(),
+                "admission-1",
+                &[
+                    ProcessAncestor {
+                        pid: 10,
+                        creation_time: 50,
+                    },
+                    ProcessAncestor {
+                        pid: 11,
+                        creation_time: 80,
+                    },
+                ],
+            )
+            .is_err()
+        );
+        write_process_ancestry(
+            root.path(),
+            "admission-1",
+            &[
+                ProcessAncestor {
+                    pid: 10,
+                    creation_time: 80,
+                },
+                ProcessAncestor {
+                    pid: 11,
+                    creation_time: 50,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            read_process_ancestry(root.path(), "admission-1")
+                .unwrap()
+                .len(),
+            2
+        );
+        fs::write(
+        root.path().join("admission-2.ancestry"),
+        r#"{"schema":"codex-harness.heavy-process-ancestry.v1","admission_id":"admission-2","processes":[{"pid":10,"creation_time":50},{"pid":11,"creation_time":80}]}"#,
+    )
+    .unwrap();
+        assert!(read_process_ancestry(root.path(), "admission-2").is_none());
+        write_command_process_link(
+            root.path(),
+            &CommandProcessLink {
+                item_id: "call-1".to_owned(),
+                opaque_process_id: "10307".to_owned(),
+                os_pid: 10,
+                creation_time: 80,
+            },
+        )
+        .unwrap();
+        let views = read_directory(root.path()).unwrap();
+        assert!(
+            views.is_empty(),
+            "ancestry and process links must not be public episodes: {views:?}"
+        );
     }
 
     #[test]

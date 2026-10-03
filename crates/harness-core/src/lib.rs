@@ -63,6 +63,7 @@ pub mod improvement_loop;
 pub mod improvement_policy;
 pub mod improvement_runtime;
 pub mod improvement_spec;
+pub mod infrastructure_accounting;
 #[cfg(windows)]
 pub mod installation_links;
 pub mod installation_lock;
