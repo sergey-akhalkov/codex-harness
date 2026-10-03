@@ -108,6 +108,19 @@ fn summarize(rows: &[Value], policy: &ComparisonPolicy) -> Value {
     summarize_attempts(&rows).expect("authoritative summary")
 }
 
+/// Declare a subtractive treatment on one authoritative accounting row: the
+/// removed burden is recorded on the arm's treatment block, and its actual
+/// consumption is recorded separately from invocation counts.
+fn subtractive(mut row: Value, status: &str, evidenced: bool) -> Value {
+    row["treatment"] = json!({"kind": "subtraction", "removed": "catalogue-skill"});
+    row["consumption"] = json!({
+        "capability": "catalogue-skill",
+        "status": status,
+        "evidence": if evidenced { "private/consumption.json" } else { "" },
+    });
+    row
+}
+
 #[test]
 fn policy_declaration_is_validated_before_results() {
     let declared = declare(&policy());
@@ -1359,6 +1372,620 @@ fn maintenance_basis_does_not_cover_material_secondary_regression() {
             .reasons
             .iter()
             .any(|reason| reason.contains("does not cover a material regression")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn subtractive_treatments_require_actual_consumption_evidence() {
+    let policy = policy();
+    let declared = declare(&policy);
+
+    // Stale context after removal: the candidate is faster, but it still
+    // records consumption of the removed burden, so the intended context
+    // treatment was never established.
+    let report = summarize(
+        &[
+            subtractive(
+                attempt(
+                    "b1",
+                    "baseline",
+                    "case-b",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "consumed",
+                true,
+            ),
+            subtractive(
+                attempt(
+                    "c1",
+                    "candidate",
+                    "case-b",
+                    200.0,
+                    80.0,
+                    true,
+                    Some(3),
+                    Some(6),
+                    true,
+                ),
+                "consumed",
+                true,
+            ),
+        ],
+        &policy,
+    );
+    let unit = &report["units"][0];
+    assert_eq!(unit["subtractive"], true);
+    assert_eq!(unit["removed_burden"], "catalogue-skill");
+    assert_eq!(unit["applicability"], "unknown");
+    assert_eq!(unit["evidence_complete"], false);
+    assert_eq!(unit["positive_effect"], false);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(evaluation.decision, PolicyDecision::Adopt);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("not established")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Inapplicable workload: neither arm ever consumes the removed burden, so
+    // an apparently faster pair cannot establish a saving and broader
+    // usefulness stays unresolved rather than rejected.
+    let report = summarize(
+        &[
+            subtractive(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-b",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "absent",
+                true,
+            ),
+            subtractive(
+                attempt(
+                    "c2",
+                    "candidate",
+                    "case-b",
+                    200.0,
+                    80.0,
+                    true,
+                    Some(3),
+                    Some(6),
+                    true,
+                ),
+                "absent",
+                true,
+            ),
+        ],
+        &policy,
+    );
+    assert_eq!(report["units"][0]["applicability"], "not_exercised");
+    assert_eq!(report["units"][0]["evidence_complete"], false);
+    assert_eq!(report["units"][0]["positive_effect"], false);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("never exercised")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Zero invocations without a consumption record: invocation counts are
+    // not consumption, and a smaller source tree is not measured context.
+    let report = summarize(
+        &[
+            {
+                let mut row = attempt(
+                    "b3",
+                    "baseline",
+                    "case-b",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(0),
+                    true,
+                );
+                row["treatment"] = json!({"kind": "subtraction", "removed": "catalogue-skill"});
+                row
+            },
+            {
+                let mut row = attempt(
+                    "c3",
+                    "candidate",
+                    "case-b",
+                    200.0,
+                    80.0,
+                    true,
+                    Some(3),
+                    Some(0),
+                    true,
+                );
+                row["treatment"] = json!({"kind": "subtraction", "removed": "catalogue-skill"});
+                row
+            },
+        ],
+        &policy,
+    );
+    assert_eq!(report["units"][0]["applicability"], "unknown");
+    assert!(
+        unit_limitations(&report["units"][0])
+            .iter()
+            .any(|limitation| limitation.contains("zero invocations")),
+        "{:?}",
+        report["units"][0]["limitations"]
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(evaluation.decision, PolicyDecision::Adopt);
+
+    // Positive control: the burden was consumed before removal and the
+    // candidate is observed not to consume it, with retained checks, so the
+    // same accounting can support the scoped saving.
+    let report = summarize(
+        &[
+            subtractive(
+                attempt(
+                    "b4",
+                    "baseline",
+                    "case-b",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "consumed",
+                true,
+            ),
+            subtractive(
+                attempt(
+                    "c4",
+                    "candidate",
+                    "case-b",
+                    200.0,
+                    80.0,
+                    true,
+                    Some(3),
+                    Some(6),
+                    true,
+                ),
+                "absent",
+                true,
+            ),
+        ],
+        &policy,
+    );
+    assert_eq!(report["units"][0]["applicability"], "exercised");
+    assert_eq!(report["units"][0]["evidence_complete"], true);
+    assert_eq!(report["units"][0]["positive_effect"], true);
+    assert_eq!(
+        evaluate(&declared, &report).unwrap().decision,
+        PolicyDecision::Adopt
+    );
+}
+
+fn unit_limitations(unit: &Value) -> Vec<String> {
+    unit["limitations"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn deleted_acceptance_coverage_cannot_support_a_subtractive_adoption() {
+    let policy = policy();
+    let declared = declare(&policy);
+    let baseline = subtractive(
+        attempt(
+            "b1",
+            "baseline",
+            "case-b",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        "consumed",
+        true,
+    );
+
+    // The candidate replaces the baseline's required check with a weaker one
+    // that passes: its own record looks accepted and faster, but it records
+    // fewer required checks than the baseline.
+    let mut candidate = subtractive(
+        attempt(
+            "c1",
+            "candidate",
+            "case-b",
+            200.0,
+            80.0,
+            true,
+            Some(3),
+            Some(6),
+            true,
+        ),
+        "absent",
+        true,
+    );
+    candidate["checks"][0]["id"] = json!("quick-check");
+    let report = summarize(&[baseline.clone(), candidate], &policy);
+    assert_eq!(report["units"][0]["retained_checks"], false);
+    assert_eq!(report["units"][0]["evidence_complete"], false);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("fewer required checks")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Deleting the acceptance check outright leaves the candidate without
+    // independent acceptance, and the faster attempt cannot adopt.
+    let mut candidate = subtractive(
+        attempt(
+            "c2",
+            "candidate",
+            "case-b",
+            200.0,
+            40.0,
+            true,
+            Some(2),
+            Some(3),
+            true,
+        ),
+        "absent",
+        true,
+    );
+    candidate["checks"] = json!([]);
+    let report = summarize(&[baseline, candidate], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("independent acceptance failed")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn subtractive_acceptance_and_repayment_gates_apply_to_removals() {
+    let policy = policy();
+    let declared = declare(&policy);
+    let baseline = subtractive(
+        attempt(
+            "b1",
+            "baseline",
+            "case-b",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        "consumed",
+        true,
+    );
+
+    // A removed wrapper with a supported indirect caller: much faster, but
+    // the retained-behavior acceptance fails.
+    let candidate = subtractive(
+        attempt(
+            "c1",
+            "candidate",
+            "case-b",
+            200.0,
+            40.0,
+            false,
+            Some(2),
+            Some(3),
+            true,
+        ),
+        "absent",
+        true,
+    );
+    let report = summarize(&[baseline.clone(), candidate], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("independent acceptance failed")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Fewer automated steps that shift work into a slower manual fallback do
+    // not repay the declared per-task maintenance over the use horizon.
+    let mut resource = policy.clone();
+    resource.objective = Objective::Resource;
+    resource.meaningful_effect_percent = Some(10.0);
+    resource.overhead.maintenance_seconds_per_task = 10.0;
+    resource.horizon_tasks = 5.0;
+    let declared_resource = declare(&resource);
+    let report = summarize(
+        &[
+            subtractive(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-b",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(10),
+                    true,
+                ),
+                "consumed",
+                true,
+            ),
+            subtractive(
+                attempt(
+                    "c2",
+                    "candidate",
+                    "case-b",
+                    200.0,
+                    100.0,
+                    true,
+                    Some(2),
+                    Some(5),
+                    true,
+                ),
+                "absent",
+                true,
+            ),
+        ],
+        &resource,
+    );
+    assert_eq!(
+        report["units"][0]["net_saving"]["verdict"],
+        "does_not_repay"
+    );
+    let evaluation = evaluate(&declared_resource, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not repay")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A subtractive efficiency result must record how the per-task effect
+    // repays the declared use horizon; without that statement the same
+    // faster pair cannot be adopted on an unstated net effect.
+    let rows = [
+        subtractive(
+            attempt(
+                "b3",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            "consumed",
+            true,
+        ),
+        subtractive(
+            attempt(
+                "c3",
+                "candidate",
+                "case-b",
+                200.0,
+                80.0,
+                true,
+                Some(3),
+                Some(6),
+                true,
+            ),
+            "absent",
+            true,
+        ),
+    ];
+    let mut declaration = policy.declaration();
+    declaration.as_object_mut().unwrap().remove("costs");
+    let recorded: Vec<Value> = rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row["declaration"] = declaration.clone();
+            row
+        })
+        .collect();
+    let report = summarize_attempts(&recorded).unwrap();
+    assert!(report["units"][0]["net_saving"].is_null());
+    assert_eq!(report["units"][0]["evidence_complete"], true);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no repayment")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn maintenance_only_subtraction_requires_the_preagreed_recorded_basis() {
+    let mut maintenance = policy();
+    maintenance.basis = Basis::Maintenance {
+        basis: "user agreed before results: maintainability only, no efficiency claim".into(),
+    };
+    maintenance.meaningful_effect_percent = None;
+    let declared = declare(&maintenance);
+    let rows = [
+        subtractive(
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            "consumed",
+            true,
+        ),
+        subtractive(
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            "absent",
+            true,
+        ),
+    ];
+    let report = summarize(&rows, &maintenance);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Adopt);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("maintenance basis")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Evidence recorded without the pre-agreed basis (or with another one)
+    // cannot become a post-hoc maintenance exemption.
+    let mut declaration = maintenance.declaration();
+    declaration.as_object_mut().unwrap().remove("basis");
+    let recorded: Vec<Value> = rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row["declaration"] = declaration.clone();
+            row
+        })
+        .collect();
+    let report = summarize_attempts(&recorded).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(evaluation.decision, PolicyDecision::Adopt);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("basis")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The same no-effect removal under the default efficiency policy cannot
+    // pass: a maintenance-only claim needs the separate predeclared basis.
+    let efficient = declare(&policy());
+    let report = summarize(&rows, &policy());
+    let evaluation = evaluate(&efficient, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("meaningful threshold")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn size_only_subtractive_results_cannot_pass_the_default_policy() {
+    let policy = policy();
+    let declared = declare(&policy);
+    let mut baseline = subtractive(
+        attempt(
+            "b1",
+            "baseline",
+            "case-b",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        "consumed",
+        true,
+    );
+    let mut candidate = subtractive(
+        attempt(
+            "c1",
+            "candidate",
+            "case-b",
+            200.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        "absent",
+        true,
+    );
+    baseline["size"] = json!({"source_files": 120, "bytes": 90000});
+    candidate["size"] = json!({"source_files": 20, "bytes": 15000});
+    let report = summarize(&[baseline, candidate], &policy);
+    assert_eq!(report["units"][0]["applicability"], "exercised");
+    assert_eq!(report["units"][0]["positive_effect"], false);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("reduced size or an unmeasured benefit")),
         "{:?}",
         evaluation.reasons
     );

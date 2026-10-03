@@ -13,6 +13,14 @@
 //! overlapping or inherited summaries are not double counted. Usage remains
 //! per run: bytes and token totals never become provider cost, billing or
 //! subscription allowance.
+//!
+//! A subtractive candidate additionally records its removed burden and each
+//! arm's actual consumption of that burden ([`finish_attempt`] normalizes both
+//! from the attempt input). The unit analysis then distinguishes an exercised
+//! removal (the baseline consumed the burden, the candidate is observed not
+//! to) from an unexercised, unknown or not-applied one, and refuses to turn
+//! zero invocations, a missing consumption record or a deleted required check
+//! into an accounted saving.
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -105,6 +113,90 @@ fn inherited_child(child: &Value) -> Option<&str> {
         .find_map(|key| child.get(*key).and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// The arm's declared treatment. An absent `treatment` block or an absent
+/// `kind` is the additive default; `subtraction` and `simplification` declare
+/// a subtractive candidate. Any other recorded kind is refused rather than
+/// guessed.
+fn treatment_facts(record: &Value) -> io::Result<Value> {
+    let Some(value) = record.get("treatment") else {
+        return Ok(json!({"kind": "additive", "removed": null}));
+    };
+    if value.is_null() {
+        return Ok(json!({"kind": "additive", "removed": null}));
+    }
+    let object = value.as_object().ok_or_else(invalid)?;
+    let kind = match object.get("kind").and_then(Value::as_str) {
+        None | Some("addition" | "additive") => "additive",
+        Some("subtraction" | "simplification") => "subtractive",
+        Some(_) => return Err(invalid()),
+    };
+    let removed = object
+        .get("removed")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    Ok(json!({"kind": kind, "removed": removed}))
+}
+
+/// One arm's recorded consumption of a subtractive treatment's removed
+/// burden. Invocation counts are a separate measure: a skill or tool can
+/// incur catalogue, instruction or initialization cost without being invoked,
+/// so an absent record or zero invocations never establishes that nothing was
+/// consumed. `consumed` and `absent` are observations only with retained
+/// evidence; an unrecognized status is refused.
+fn consumption_facts(record: &Value) -> io::Result<Value> {
+    let Some(value) = record.get("consumption") else {
+        return Ok(Value::Null);
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    let object = value.as_object().ok_or_else(invalid)?;
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let capability = text("capability").ok_or_else(invalid)?;
+    let status = match text("status") {
+        Some("consumed") => "consumed",
+        Some("absent") => "absent",
+        Some("unknown") => "unknown",
+        _ => return Err(invalid()),
+    };
+    Ok(json!({
+        "capability": capability,
+        "status": status,
+        "evidenced": text("evidence").is_some(),
+    }))
+}
+
+/// The required checks of an attempt's final round that executed with
+/// evidence. A candidate recording fewer of them than the baseline removed
+/// acceptance coverage; its own verdict cannot establish retained behavior.
+fn executed_check_ids(row: &Value) -> io::Result<BTreeSet<String>> {
+    let checks = array(row, "checks")?;
+    let current = checks
+        .iter()
+        .map(round)
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    Ok(checks
+        .iter()
+        .filter(|check| {
+            round(check).ok() == Some(current)
+                && required(check)
+                && truth(&check["executed"])
+                && truth(&check["evidence"])
+        })
+        .filter_map(|check| check["id"].as_str().map(str::to_owned))
+        .collect())
 }
 
 /// The declared experimental unit of an attempt: the pair/block identity when
@@ -324,6 +416,10 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     row["rounds"] = counter_total(native, "rounds");
     row["unit"] = json!(unit_of(record));
     row["excluded_reasons"] = json!(reasons);
+    let treatment = treatment_facts(record)?;
+    row["treatment_kind"] = treatment["kind"].clone();
+    row["removed_burden"] = treatment["removed"].clone();
+    row["consumption_evidence"] = consumption_facts(record)?;
     crate::infrastructure_accounting::attach(&mut row);
     Ok(row)
 }
@@ -383,12 +479,123 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
 struct Declaration {
     task_mix: Option<String>,
     objective: Option<String>,
+    /// The pre-agreed comparison basis; a maintenance-only result is adopted
+    /// only when the recorded declaration carries it.
+    basis: Option<String>,
     effect_percent: Option<f64>,
     nuisance: bool,
     stopping: Option<String>,
     uncertainty: Option<String>,
     horizon_tasks: Option<f64>,
     costs: Option<(f64, f64, f64)>,
+}
+
+/// What one declared unit records about a subtractive treatment: the removed
+/// burden and whether both arms establish that the burden was actually
+/// consumed before removal, separately from invocation counts.
+struct SubtractiveFacts {
+    applicability: &'static str,
+    removed: Option<String>,
+    retained_checks: bool,
+    limitations: Vec<String>,
+}
+
+/// Consume the normalized per-arm treatment and consumption records into the
+/// unit's applicability. `None` means the unit is not subtractive; only `Some`
+/// with `applicability == "exercised"` and retained checks may support a
+/// saving.
+fn subtractive_facts(
+    baseline: Option<&Value>,
+    candidate: Option<&Value>,
+) -> io::Result<Option<SubtractiveFacts>> {
+    let arms = [("baseline", baseline), ("candidate", candidate)];
+    let declared: Vec<bool> = arms
+        .iter()
+        .filter_map(|(_, row)| row.map(|row| row["treatment_kind"] == json!("subtractive")))
+        .collect();
+    if !declared.iter().any(|value| *value) {
+        return Ok(None);
+    }
+    let mut limitations = Vec::new();
+    if declared.len() != 2 || declared.iter().any(|value| !*value) {
+        limitations.push("the subtractive treatment is not declared on both arms".to_owned());
+    }
+    let names: BTreeSet<String> = arms
+        .iter()
+        .filter_map(|(_, row)| {
+            row.and_then(|row| row["removed_burden"].as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    let removed = if names.len() == 1 {
+        names.into_iter().next()
+    } else {
+        if names.len() > 1 {
+            limitations.push(
+                "the subtractive treatment names different removed burdens across the arms"
+                    .to_owned(),
+            );
+        }
+        None
+    };
+    let consumed = |row: Option<&Value>| -> Option<bool> {
+        let row = row?;
+        let record = &row["consumption_evidence"];
+        if record.is_null() || record["evidenced"] != json!(true) {
+            return None;
+        }
+        if removed
+            .as_deref()
+            .is_some_and(|name| record["capability"].as_str() != Some(name))
+        {
+            return None;
+        }
+        match record["status"].as_str() {
+            Some("consumed") => Some(true),
+            Some("absent") => Some(false),
+            _ => None,
+        }
+    };
+    let applicability = match (consumed(baseline), consumed(candidate)) {
+        (Some(true), Some(false)) => "exercised",
+        (Some(false), Some(false)) => {
+            limitations.push(format!(
+                "the workload did not exercise the removed burden {}; removing it cannot establish a useful saving, and unexercised usefulness remains unresolved",
+                removed.as_deref().unwrap_or("(unnamed)")
+            ));
+            "not_exercised"
+        }
+        (Some(true), Some(true)) => {
+            limitations.push(format!(
+                "the candidate arm still records consumption of the removed burden {}; the intended context treatment is not established, and a smaller source tree or zero invocations cannot support a saving",
+                removed.as_deref().unwrap_or("(unnamed)")
+            ));
+            "unknown"
+        }
+        _ => {
+            limitations.push(format!(
+                "actual consumption of the removed burden {} is not recorded with retained evidence on one or both arms; zero invocations or a smaller source tree is not consumption evidence",
+                removed.as_deref().unwrap_or("(unnamed)")
+            ));
+            "unknown"
+        }
+    };
+    let baseline_checks = executed_check_ids(baseline.unwrap_or(&Value::Null))?;
+    let candidate_checks = executed_check_ids(candidate.unwrap_or(&Value::Null))?;
+    let retained_checks =
+        !baseline_checks.is_empty() && baseline_checks.is_subset(&candidate_checks);
+    if !retained_checks {
+        limitations.push(
+            "the candidate arm records fewer required checks than the baseline; removing the check that would expose a regression cannot support adoption"
+                .to_owned(),
+        );
+    }
+    Ok(Some(SubtractiveFacts {
+        applicability,
+        removed,
+        retained_checks,
+        limitations,
+    }))
 }
 
 fn parse_declaration(value: Option<&Value>) -> io::Result<Option<Declaration>> {
@@ -424,6 +631,7 @@ fn parse_declaration(value: Option<&Value>) -> io::Result<Option<Declaration>> {
     Ok(Some(Declaration {
         task_mix: entry("task_mix"),
         objective: entry("objective"),
+        basis: entry("basis"),
         effect_percent: object
             .get("effect_percent")
             .and_then(number)
@@ -738,6 +946,10 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
             }
         }
         let mut limitations = Vec::new();
+        let subtractive = subtractive_facts(baseline_result, candidate_result)?;
+        if let Some(facts) = &subtractive {
+            limitations.extend(facts.limitations.iter().cloned());
+        }
         let declarations: Vec<Value> = participants
             .iter()
             .map(|row| row.get("declaration").cloned().unwrap_or(Value::Null))
@@ -903,11 +1115,24 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 }
                 _ => {}
             }
+            // A subtractive saving exists only when the burden was actually
+            // consumed before removal and the candidate is observed not to
+            // consume it, with the baseline's required checks retained. An
+            // unexercised, unknown or not-applied removal cannot show a
+            // positive effect or complete evidence, whatever the elapsed
+            // difference.
+            if let Some(facts) = &subtractive
+                && (facts.applicability != "exercised" || !facts.retained_checks)
+            {
+                positive_effect = json!(false);
+                evidence_complete = false;
+            }
         }
         let declared = declaration.as_ref().map(|value| {
             json!({
                 "task_mix": value.task_mix,
                 "objective": value.objective,
+                "basis": value.basis,
                 "effect_percent": value.effect_percent,
                 "nuisance": value.nuisance,
                 "stopping": value.stopping,
@@ -920,7 +1145,7 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 })),
             })
         });
-        units.push(json!({
+        let mut unit_value = json!({
             "unit": unit,
             "experiment_id": participants.first().and_then(|row| text(row, "experiment_id")).unwrap_or(""),
             "case_id": participants.first().map_or("", |row| row["case_id"].as_str().unwrap_or("")),
@@ -942,7 +1167,14 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 baseline_result,
                 candidate_result,
             ),
-        }));
+        });
+        if let Some(facts) = &subtractive {
+            unit_value["subtractive"] = json!(true);
+            unit_value["removed_burden"] = json!(facts.removed);
+            unit_value["applicability"] = json!(facts.applicability);
+            unit_value["retained_checks"] = json!(facts.retained_checks);
+        }
+        units.push(unit_value);
     }
 
     // Complete task accounting: a task is one retry chain tip, its cost is
