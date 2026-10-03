@@ -2,7 +2,12 @@
 use harness_core::improvement_spec::{
     ExperimentContract, MeasurementScope, MeasurementWorkload, OpenSpec, Specification,
 };
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn contract() -> ExperimentContract {
     ExperimentContract {
@@ -140,7 +145,17 @@ fn fill_change(root: &Path) {
     fs::write(root.join("specs/repeated-reads/spec.md"), "## ADDED Requirements\n\n### Requirement: Reuse preserves output\nThe reader SHALL preserve correct output when reusing identical inputs.\n\n#### Scenario: Source changes\n- **WHEN** the input content changes\n- **THEN** the next read returns the changed content\n").unwrap();
 }
 
-fn installed_case(store: bool) {
+/// One installed OpenSpec fixture: an isolated configuration home, the
+/// selected repository or registered store, and the target change scaffolded
+/// through the installed CLI. The temporary directory must stay alive for the
+/// fixture to resolve.
+struct Installed {
+    temporary: tempfile::TempDir,
+    target: Specification,
+    api: OpenSpec,
+}
+
+fn installed(store: bool) -> Installed {
     let temporary = tempfile::Builder::new()
         .prefix("improvement-spec-")
         .tempdir()
@@ -217,6 +232,20 @@ fn installed_case(store: bool) {
             .exists()
     );
     api.scaffold(&target).unwrap();
+    Installed {
+        temporary,
+        target,
+        api,
+    }
+}
+
+fn installed_case(store: bool) {
+    let Installed {
+        temporary,
+        target,
+        api,
+    } = installed(store);
+    let planning_root = target.planning_root.clone();
     api.instructions(&target, "proposal").unwrap();
     assert!(
         api.qualify(&target, &contract()).is_err(),
@@ -352,6 +381,142 @@ fn installed_case(store: bool) {
     assert!(api.begin_measurement(&wrong, &measurement_scope()).is_err());
 }
 
+/// Relative paths and bytes of every file under a directory, for proving an
+/// operation wrote nothing or moved content intact. A missing directory is an
+/// empty tree.
+fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &Path, directory: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else if path.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push((relative, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, root, &mut files);
+    files.sort();
+    files
+}
+
+/// Completion reconciliation against the installed CLI: retention reads the
+/// change's actual task state without writing, an unfinished required task
+/// cannot be closed through an experiment outcome, and a completed rejected
+/// change is archived without its unadopted delta reaching the main
+/// specifications.
+fn completion_case(store: bool) {
+    let Installed {
+        temporary: _temporary,
+        target,
+        api,
+    } = installed(store);
+    let root = target
+        .planning_root
+        .join("openspec/changes/improve-repeated-reads");
+    fill_change(&root);
+    let qualified = api.qualify(&target, &contract()).unwrap();
+    assert_eq!(qualified.implementation_state, "ready");
+    let main_specs = target.planning_root.join("openspec/specs");
+    let main_specs_before = tree(&main_specs);
+
+    // Retention reads the change's actual task state and writes nothing; the
+    // change reference and every artifact stay accessible.
+    let change_before = tree(&root);
+    let completion = api.completion(&target).unwrap();
+    assert_eq!(completion.change_root, root.canonicalize().unwrap());
+    assert_eq!(completion.state, "ready");
+    assert_eq!(
+        (completion.total, completion.complete, completion.remaining),
+        (2, 0, 2)
+    );
+    assert!(!completion.is_complete());
+    assert_eq!(completion.artifacts.len(), 4);
+    assert_eq!(
+        tree(&root),
+        change_before,
+        "reading completion must not write"
+    );
+    assert_eq!(
+        tree(&main_specs),
+        main_specs_before,
+        "reading completion must not touch the main specifications"
+    );
+
+    // An unfinished required task cannot be closed through an experiment
+    // outcome: the supported archive refuses and the change is retained.
+    let refused = api.archive_unadopted(&target, &completion).unwrap_err();
+    assert!(
+        refused.to_string().contains("unfinished required task"),
+        "{refused}"
+    );
+    assert_eq!(tree(&root), change_before, "a refusal must not write");
+    assert_eq!(tree(&main_specs), main_specs_before);
+
+    // The change's own artifact is the only thing that makes it completable;
+    // the recorded decision never substitutes for it.
+    fs::write(
+        root.join("tasks.md"),
+        "## Implementation\n- [x] Implement correct read reuse.\n- [x] Verify invalidation and complete the declared comparison.\n",
+    )
+    .unwrap();
+    let completed = api.completion(&target).unwrap();
+    assert!(completed.is_complete());
+    assert_eq!(completed.state, "all_done");
+    assert_eq!(completed.remaining, 0);
+    assert!(completed.unfinished_tasks.is_empty());
+
+    // A stale reconciliation cannot authorize archiving changed artifacts.
+    let stale = api.archive_unadopted(&target, &completion).unwrap_err();
+    assert!(stale.to_string().contains("changed since"), "{stale}");
+    assert!(root.exists(), "a stale refusal must not write");
+
+    // Supported archival of the unadopted change: the artifacts move with the
+    // change and the main specifications keep their exact content.
+    let originals: Vec<(PathBuf, Vec<u8>)> = completed
+        .artifacts
+        .keys()
+        .map(|path| {
+            (
+                path.strip_prefix(&completed.change_root)
+                    .unwrap()
+                    .to_path_buf(),
+                fs::read(path).unwrap(),
+            )
+        })
+        .collect();
+    let archived = api.archive_unadopted(&target, &completed).unwrap();
+    assert!(archived.archived_as.ends_with("-improve-repeated-reads"));
+    assert!(archived.archive_root.is_dir());
+    for (relative, bytes) in &originals {
+        assert_eq!(
+            fs::read(archived.archive_root.join(relative)).unwrap(),
+            *bytes,
+            "{}",
+            relative.display()
+        );
+    }
+    assert!(!root.exists(), "the archived change moved out of changes/");
+    assert_eq!(
+        tree(&main_specs),
+        main_specs_before,
+        "the unadopted delta must not synchronize into the main specifications"
+    );
+    assert_eq!(archived.main_specs_files, main_specs_before.len());
+    // Reconciliation repeats fail against the moved change instead of
+    // re-archiving it.
+    assert!(api.completion(&target).is_err());
+}
+
 #[test]
 #[ignore = "requires installed OpenSpec and owner PowerShell; model-free isolated CLI acceptance"]
 fn installed_repository_gate_rejects_missing_and_changed_planning_inputs() {
@@ -362,4 +527,16 @@ fn installed_repository_gate_rejects_missing_and_changed_planning_inputs() {
 #[ignore = "requires installed OpenSpec; creates a store only in an isolated configuration home"]
 fn installed_registered_store_is_resolved_and_checked_without_retargeting_source() {
     installed_case(true);
+}
+
+#[test]
+#[ignore = "requires installed OpenSpec and owner PowerShell; model-free isolated CLI acceptance"]
+fn installed_completion_reconciliation_retains_and_archives_without_spec_sync() {
+    completion_case(false);
+}
+
+#[test]
+#[ignore = "requires installed OpenSpec; creates a store only in an isolated configuration home"]
+fn installed_completion_reconciliation_resolves_a_registered_store() {
+    completion_case(true);
 }

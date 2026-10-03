@@ -233,11 +233,15 @@ pub fn parse_admission(description: &str) -> Option<HypothesisRecord> {
 /// The latest recorded decision for a card, as read from its benefit-gate
 /// comments. `outcome` is the recorded token; an unreadable record keeps
 /// `None` so the caller can tell "no decision" from "unreadable decision".
+/// `scope` is the decision scope the record binds (for example the task and
+/// model scope), so prior-result search reads back the scope the conclusion
+/// applies to and not just its verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionSummary {
     pub outcome: Option<String>,
     pub quality: Option<String>,
     pub experiment: Option<String>,
+    pub scope: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -377,10 +381,24 @@ fn summarize_decisions(comments: &[String], item: &str) -> (usize, Option<Decisi
             outcome: record.outcome.clone(),
             quality: record.quality.clone(),
             experiment: record.experiment.clone(),
+            scope: record.scope.clone(),
             reason: record.reason.clone(),
         });
     }
     (decisions, latest)
+}
+
+/// The latest recorded decision for one card, or `None` when no readable
+/// benefit-gate record is attributed to it. Callers that reconcile an
+/// unadopted decision with its OpenSpec change read the decision scope and
+/// experiment from here instead of trusting caller-supplied prose.
+pub fn latest_decision(
+    bd: &Path,
+    project: &Path,
+    item: &str,
+) -> io::Result<Option<DecisionSummary>> {
+    let comments = board_feedback::list_comments(bd, project, item)?;
+    Ok(summarize_decisions(&comments, item).1)
 }
 
 /// The outcome of an admission attempt against the existing board.
