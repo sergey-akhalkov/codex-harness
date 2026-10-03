@@ -23,6 +23,39 @@ const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024;
 const MAX_TASK_DESCRIPTION: usize = 240;
 /// Bound on the main-specification files inspected for an accidental sync.
 const MAX_SPEC_FILES: usize = 4096;
+/// Bound on one reviewable removal-proposal clause value.
+const MAX_REMOVAL_CLAUSE_BYTES: usize = 1024;
+
+/// The exact Markdown heading under which a hypothesis's own OpenSpec change
+/// states its reviewable removal proposal. The proposal is authored in the
+/// change before the user's decision is requested and stays unapplied;
+/// OpenSpec remains its artifact owner.
+pub const REMOVAL_PROPOSAL_HEADING: &str = "## Removal proposal";
+
+/// The clause labels a reviewable removal proposal states exactly once, each
+/// non-empty and on one line: the target and source references, the unapplied
+/// preview, evidence and its gaps, measured versus predicted benefit, lost
+/// scenarios, consumer/configuration/installation impact, alternatives,
+/// retained checks and restoration.
+pub const REMOVAL_PROPOSAL_CLAUSES: [&str; 13] = [
+    "Target:",
+    "Source:",
+    "Evidence:",
+    "Gaps:",
+    "Measured:",
+    "Predicted:",
+    "Loss:",
+    "Lost scenarios:",
+    "Impact:",
+    "Alternatives:",
+    "Retained checks:",
+    "Restoration:",
+    "Preview:",
+];
+
+/// What each removal-proposal clause must carry. The planner brief renders
+/// this text; the validator enforces the exact labels above.
+pub const REMOVAL_PROPOSAL_GUIDE: &str = "Target: the named removal target as a single token. Source: the owning change or source reference. Evidence: the retained evidence locator the proposal rests on. Gaps: the evidence gaps, unverified dependencies and uncheckable consumer access, disclosed rather than treated as absent. Measured: the benefit actually measured so far, stated explicitly as not yet measured when none exists - never a prediction presented as a measurement. Predicted: the predicted benefit. Loss: the reviewed behavior-loss label as a single token. Lost scenarios: what users lose and in which scenarios. Impact: the affected callers, configuration and installations. Alternatives: the alternatives considered, including no change. Retained checks: the requirements and checks that remain binding. Restoration: the recovery route that restores the capability. Preview: the locator of the unapplied preview.";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -179,6 +212,59 @@ pub struct PlanningReceipt {
     pub artifacts: BTreeMap<PathBuf, String>,
     pub contract_digest: String,
     pub implementation_state: String,
+}
+
+/// The reviewable removal proposal stated in the hypothesis's own OpenSpec
+/// change before any removal effect. The receipt binds the exact section body
+/// of the change artifact that states it and carries the clause values the
+/// bounded board record and the user's decision mirror; resolving it applies
+/// nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalProposalReceipt {
+    pub specification: Specification,
+    pub change_root: PathBuf,
+    /// The resolved change artifact that states the proposal.
+    pub artifact: PathBuf,
+    pub heading: String,
+    /// Digest of the exact extracted section body, so any later proposal
+    /// change is detectable and needs a fresh decision.
+    pub section_digest: String,
+    pub target: String,
+    pub source: String,
+    pub evidence: String,
+    pub gaps: String,
+    pub measured: String,
+    pub predicted: String,
+    pub loss: String,
+    pub lost_scenarios: String,
+    pub impact: String,
+    pub alternatives: String,
+    pub retained_checks: String,
+    pub restoration: String,
+    pub preview: String,
+}
+
+impl RemovalProposalReceipt {
+    /// One clause value by its exact label, so callers can re-read the
+    /// reviewed content without a second parser.
+    pub fn clause(&self, label: &str) -> Option<&str> {
+        Some(match label {
+            "Target:" => &self.target,
+            "Source:" => &self.source,
+            "Evidence:" => &self.evidence,
+            "Gaps:" => &self.gaps,
+            "Measured:" => &self.measured,
+            "Predicted:" => &self.predicted,
+            "Loss:" => &self.loss,
+            "Lost scenarios:" => &self.lost_scenarios,
+            "Impact:" => &self.impact,
+            "Alternatives:" => &self.alternatives,
+            "Retained checks:" => &self.retained_checks,
+            "Restoration:" => &self.restoration,
+            "Preview:" => &self.preview,
+            _ => return None,
+        })
+    }
 }
 
 /// The change's actual task state, read from the installed CLI and its own
@@ -517,6 +603,90 @@ impl OpenSpec {
         })
     }
 
+    /// Resolves the reviewable removal proposal of an already qualified
+    /// change. The proposal must be stated exactly once under
+    /// [`REMOVAL_PROPOSAL_HEADING`] in one resolved artifact of the change,
+    /// with every declared clause present exactly once; a missing,
+    /// duplicated or empty clause is refused by name. The resolved artifacts
+    /// must still match the receipt, so a proposal is never read from a
+    /// drifted change, and resolving it applies nothing.
+    pub fn removal_proposal(
+        &self,
+        receipt: &PlanningReceipt,
+    ) -> io::Result<RemovalProposalReceipt> {
+        let mut stated: Option<(PathBuf, String)> = None;
+        for (path, digest) in &receipt.artifacts {
+            if !path.starts_with(&receipt.change_root) || path == &receipt.change_root {
+                return Err(invalid("a planning artifact escapes the selected change"));
+            }
+            let relative = path
+                .strip_prefix(&receipt.change_root)
+                .map_err(|_| invalid("a planning artifact escapes the selected change"))?;
+            let bytes = fs::read(path).map_err(|error| {
+                invalid(format!(
+                    "the planning artifact {} is unreadable: {error}",
+                    relative.display()
+                ))
+            })?;
+            if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+                return Err(invalid(format!(
+                    "the planning artifact {} exceeds the bounded planning contract",
+                    relative.display()
+                )));
+            }
+            if digest_bytes(&bytes) != *digest {
+                return Err(invalid(format!(
+                    "the planning artifact {} changed after qualification; re-qualify the change before resolving its removal proposal",
+                    relative.display()
+                )));
+            }
+            let text = String::from_utf8(bytes).map_err(|_| {
+                invalid(format!(
+                    "the planning artifact {} is not UTF-8 text",
+                    relative.display()
+                ))
+            })?;
+            if let Some(section) = extract_section(&text, REMOVAL_PROPOSAL_HEADING) {
+                if let Some((first, _)) = &stated {
+                    let first = first.strip_prefix(&receipt.change_root).unwrap_or(first);
+                    return Err(invalid(format!(
+                        "the removal proposal is stated in more than one resolved artifact ({} and {}); state it exactly once under '{REMOVAL_PROPOSAL_HEADING}'",
+                        first.display(),
+                        relative.display()
+                    )));
+                }
+                stated = Some((path.clone(), section));
+            }
+        }
+        let Some((artifact, section)) = stated else {
+            return Err(invalid(format!(
+                "the change states no reviewable removal proposal: missing the section '{REMOVAL_PROPOSAL_HEADING}' in its resolved artifacts"
+            )));
+        };
+        let clauses = removal_clauses(&section)?;
+        let clause = |label: &str| clauses.get(label).cloned().unwrap_or_default();
+        Ok(RemovalProposalReceipt {
+            specification: receipt.specification.clone(),
+            change_root: receipt.change_root.clone(),
+            artifact,
+            heading: REMOVAL_PROPOSAL_HEADING.to_owned(),
+            section_digest: digest_bytes(section.as_bytes()),
+            target: clause("Target:"),
+            source: clause("Source:"),
+            evidence: clause("Evidence:"),
+            gaps: clause("Gaps:"),
+            measured: clause("Measured:"),
+            predicted: clause("Predicted:"),
+            loss: clause("Loss:"),
+            lost_scenarios: clause("Lost scenarios:"),
+            impact: clause("Impact:"),
+            alternatives: clause("Alternatives:"),
+            retained_checks: clause("Retained checks:"),
+            restoration: clause("Restoration:"),
+            preview: clause("Preview:"),
+        })
+    }
+
     /// Re-resolve stores and validate content before dependent effects. An old
     /// receipt cannot authorize a changed contract or another registered root.
     pub fn revalidate(&self, receipt: &PlanningReceipt) -> io::Result<()> {
@@ -795,19 +965,73 @@ fn validate_heading(field: &str, heading: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// True when the exact Markdown heading exists and its section has content.
-fn section_present(text: &str, heading: &str) -> bool {
+/// Extracts one Markdown section body: the lines after the exact heading line
+/// until the next heading of the same or higher level. A heading deeper than
+/// the section heading stays inside it.
+fn extract_section(text: &str, heading: &str) -> Option<String> {
     let heading = heading.trim();
     let level = heading.bytes().take_while(|byte| *byte == b'#').count();
     let mut lines = text.lines().skip_while(|line| line.trim() != heading);
-    lines.next().is_some()
-        && lines
-            .take_while(|line| {
-                let line = line.trim();
-                let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
-                next_level == 0 || next_level > level || !line[next_level..].starts_with(' ')
-            })
-            .any(|line| !line.trim().is_empty())
+    lines.next()?;
+    let body: Vec<&str> = lines
+        .take_while(|line| {
+            let line = line.trim();
+            let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
+            next_level == 0 || next_level > level || !line[next_level..].starts_with(' ')
+        })
+        .collect();
+    Some(body.join("\n"))
+}
+
+/// True when the exact Markdown heading exists and its section has content.
+fn section_present(text: &str, heading: &str) -> bool {
+    extract_section(text, heading)
+        .is_some_and(|body| body.lines().any(|line| !line.trim().is_empty()))
+}
+
+/// Parses the clause values of one reviewable removal proposal section. Every
+/// declared clause must be stated exactly once, non-empty, on one line and
+/// within the bounded clause size; a clause line may carry a Markdown bullet.
+fn removal_clauses(section: &str) -> io::Result<BTreeMap<&'static str, String>> {
+    let mut clauses: BTreeMap<&'static str, String> = BTreeMap::new();
+    for line in section.lines() {
+        let line = line.trim();
+        let line = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line)
+            .trim_start();
+        for label in REMOVAL_PROPOSAL_CLAUSES {
+            let Some(value) = line.strip_prefix(label) else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(invalid(format!(
+                    "the removal proposal clause {label} is empty"
+                )));
+            }
+            if value.len() > MAX_REMOVAL_CLAUSE_BYTES {
+                return Err(invalid(format!(
+                    "the removal proposal clause {label} exceeds {MAX_REMOVAL_CLAUSE_BYTES} bytes"
+                )));
+            }
+            if clauses.insert(label, value.to_owned()).is_some() {
+                return Err(invalid(format!(
+                    "the removal proposal clause {label} is stated more than once"
+                )));
+            }
+            break;
+        }
+    }
+    for label in REMOVAL_PROPOSAL_CLAUSES {
+        if !clauses.contains_key(label) {
+            return Err(invalid(format!(
+                "the reviewable removal proposal is incomplete: missing the clause {label}"
+            )));
+        }
+    }
+    Ok(clauses)
 }
 
 fn relative_path(field: &str, path: &Path) -> io::Result<()> {

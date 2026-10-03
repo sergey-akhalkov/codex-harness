@@ -689,6 +689,12 @@ fn head(cwd: &Path) -> String {
     git_output(cwd, &["rev-parse", "HEAD"])
 }
 
+/// One source file's content with checkout line endings normalized, so a
+/// preparation check compares actual content instead of Git's CRLF checkout.
+fn source_content(path: &Path) -> String {
+    fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+}
+
 /// One dispatch-recorded attempt must carry the effective identity the
 /// installed profile binding resolves for its conversation and the
 /// deterministic titled surface derived from its own role and ordinal.
@@ -2004,10 +2010,7 @@ fn removal_candidate_waits_for_the_decision_and_blocks_on_withdrawal() {
     assert!(resume.status.success(), "{}", text(&resume));
     let status = fixture.status_json();
     assert_eq!(status["candidate"]["removal_required"], true, "{status}");
-    assert!(
-        status["condition"].as_str().unwrap().contains("removal"),
-        "{status}"
-    );
+    assert_eq!(status["stage"], "planner", "{status}");
     assert_eq!(
         status["candidate"]["implementer_attempt"],
         Value::Null,
@@ -2021,24 +2024,73 @@ fn removal_candidate_waits_for_the_decision_and_blocks_on_withdrawal() {
         "{status}"
     );
 
+    // The complete change states no reviewable proposal yet: the bounded
+    // planning conversation authors it, and no decision is requested and no
+    // removal is applied while it is missing.
+    assert_eq!(
+        status["candidate"]["planning_receipt"],
+        Value::Null,
+        "{status}"
+    );
+    assert!(
+        !fixture
+            .bd_comments(&fixture.card)
+            .contains("removal-proposal v1"),
+        "an unstated proposal is never recorded for a decision"
+    );
+    let candidate_worktree = fixture.candidate_worktree(&fixture.card);
+    let base_source = source_content(&fixture.proj.join("crates/one/src/lib.rs"));
+    assert_eq!(
+        source_content(&candidate_worktree.join("crates/one/src/lib.rs")),
+        base_source,
+        "preparing the proposal applies no removal"
+    );
+
+    // Simulate the planning conversation stating the reviewable proposal; the
+    // controller records it on the card before the decision is requested.
+    author_removal_proposal(
+        &fixture,
+        &fixture.card,
+        &removal_proposal_section("target-beta"),
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert!(
+        status["candidate"]["planning_receipt"].is_string(),
+        "{status}"
+    );
+    assert_eq!(
+        status["candidate"]["implementer_attempt"],
+        Value::Null,
+        "{status}"
+    );
+    let comments = fixture.bd_comments(&fixture.card);
+    for needle in [
+        "removal-proposal v1",
+        "proposal=proposal-alpha",
+        "target=target-beta",
+        "evidence=outcome:cycle-1#task",
+        "loss=rare-manual-recovery",
+        "preview=preview:retained/unapplied-capability.diff",
+    ] {
+        assert!(comments.contains(needle), "{needle}: {comments}");
+    }
+    let request = status["dispatch"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        request.contains("no removal decision")
+            && request.contains("proposal=proposal-alpha")
+            && request.contains("target=target-beta"),
+        "the recorded proposal is available before the decision request: {status}"
+    );
+    assert_eq!(
+        source_content(&candidate_worktree.join("crates/one/src/lib.rs")),
+        base_source,
+        "no removal is applied before the decision"
+    );
+
     // Record the informed decision; the dependent implementation becomes
     // eligible and reaches the dispatch owner.
-    let proposed = fixture.feedback(&[
-        "removal-propose",
-        "--item",
-        &fixture.card,
-        "--proposal",
-        "proposal-alpha",
-        "--target",
-        "target-beta",
-        "--evidence",
-        "evidence-1",
-        "--loss",
-        "synthetic-loss",
-        "--preview",
-        "preview-1",
-    ]);
-    assert!(proposed.status.success(), "{}", text(&proposed));
     let decided = fixture.feedback(&[
         "removal-decide",
         "--item",
@@ -2052,7 +2104,7 @@ fn removal_candidate_waits_for_the_decision_and_blocks_on_withdrawal() {
         "--actions",
         "experiment",
         "--loss",
-        "synthetic-loss",
+        "rare-manual-recovery",
     ]);
     assert!(decided.status.success(), "{}", text(&decided));
     let resume = fixture.resume();
@@ -2069,6 +2121,34 @@ fn removal_candidate_waits_for_the_decision_and_blocks_on_withdrawal() {
         status["candidate"]["implementer_attempt"].is_string(),
         "the approved removal lets the implementation dispatch proceed: {status}"
     );
+    // The unchanged approval covers the later resumes without another
+    // proposal or decision ritual.
+    assert_eq!(
+        fixture
+            .bd_comments(&fixture.card)
+            .matches("removal-proposal v1")
+            .count(),
+        1,
+        "the reviewed proposal is not rewritten on resume"
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert!(
+        status["removal"]["gate"]
+            .as_str()
+            .unwrap()
+            .contains("authorized"),
+        "{status}"
+    );
+    assert_eq!(
+        fixture
+            .bd_comments(&fixture.card)
+            .matches("removal-decision v1")
+            .count(),
+        1,
+        "no repeated approval request for the unchanged scope"
+    );
 
     // Withdrawing the approval blocks the dependent removal effect again.
     let withdrawn = fixture.feedback(&[
@@ -2081,8 +2161,6 @@ fn removal_candidate_waits_for_the_decision_and_blocks_on_withdrawal() {
         "proposal-alpha",
         "--target",
         "target-beta",
-        "--loss",
-        "synthetic-loss",
     ]);
     assert!(withdrawn.status.success(), "{}", text(&withdrawn));
     let resume = fixture.resume();
@@ -3506,6 +3584,75 @@ fn simplification_report(locator: &str) -> Value {
     })
 }
 
+/// The reviewable removal proposal a hypothesis's own change states before the
+/// user's decision: target and source references, the unapplied preview,
+/// evidence and its gaps, measured versus predicted benefit, lost scenarios,
+/// consumer/configuration/installation impact, alternatives, retained checks
+/// and restoration.
+fn removal_proposal_section(target: &str) -> String {
+    [
+        "## Removal proposal",
+        "",
+        &format!("- Target: {target}"),
+        "- Source: openspec/changes/add-synthetic",
+        "- Evidence: outcome:cycle-1#task",
+        "- Gaps: no invocation telemetry covers the rare recovery path",
+        "- Measured: not yet measured; the retained observation records no consumption in either arm",
+        "- Predicted: less catalogue and instruction exposure on every accepted task",
+        "- Loss: rare-manual-recovery",
+        "- Lost scenarios: a manual recovery in a degraded environment loses its documented route",
+        "- Impact: the installed catalogue, the owned configuration and the current installation",
+        "- Alternatives: keep the capability or narrow its exposure instead of removing it",
+        "- Retained checks: the independent oracle stays binding",
+        "- Restoration: restore the capability from the pinned revision",
+        "- Preview: preview:retained/unapplied-capability.diff",
+        "",
+    ]
+    .join("\n")
+}
+
+/// Simulates the bounded planning conversation that states one removal
+/// proposal section in the candidate's own change: a detached slot worktree
+/// gains the section and commits it, and the recorded planner attempt is
+/// replaced with the completed conversation the dispatcher would retain.
+fn author_removal_proposal(fixture: &Fixture, candidate: &str, section: &str) -> String {
+    let candidate_worktree = fixture.candidate_worktree(candidate);
+    let revision = head(&candidate_worktree);
+    let slot = fixture.root.join(format!("removal-planner-{candidate}"));
+    slot_worktree(&candidate_worktree, &slot, &revision);
+    let change = slot.join(format!("openspec/changes/{}", fixture.change));
+    let design = fs::read_to_string(change.join("design.md")).unwrap();
+    fs::write(change.join("design.md"), format!("{design}\n{section}")).unwrap();
+    commit_all(&slot, "state the reviewable removal proposal");
+    let returned = head(&slot);
+    let receipt = fixture
+        .run
+        .join(format!("{candidate}-planner-receipt.json"));
+    seed_bound_receipt(
+        &receipt,
+        "workflow-fixture-planner-1",
+        "gen-1",
+        "completed",
+        Some(0),
+    );
+    let result = fixture.run.join(format!("{candidate}-planner-result.txt"));
+    fs::write(&result, "proposal authored\n").unwrap();
+    replace_attempt(
+        fixture,
+        attempt_json(
+            "planner-1",
+            "planner",
+            "workflow-fixture-planner-1",
+            "gen-1",
+            &receipt,
+            Some(&result),
+            Some(&slot),
+            "started",
+        ),
+    );
+    returned
+}
+
 /// The change directories of one project, excluding the archive.
 fn change_dirs(project: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(project.join("openspec/changes"))
@@ -3899,46 +4046,69 @@ fn an_admitted_simplification_waits_for_the_informed_decision_before_implementat
         Value::Null,
         "no implementation conversation precedes the informed decision: {status}"
     );
-    assert_eq!(status["dispatch"]["state"], "blocked", "{status}");
-    assert!(
-        status["dispatch"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("removal"),
+    // The admitted candidate's complete change states no reviewable proposal
+    // yet: planning stays incomplete, the planning conversation authors it,
+    // and no decision is requested while it is missing.
+    assert_eq!(status["stage"], "planner", "{status}");
+    assert_eq!(
+        status["candidate"]["planning_receipt"],
+        Value::Null,
         "{status}"
     );
+    assert!(
+        !fixture
+            .bd_comments(&candidate)
+            .contains("removal-proposal v1"),
+        "an unstated proposal is never recorded for a decision"
+    );
 
-    // A reviewable proposal alone does not authorize the removal effect.
-    let proposed = fixture.feedback(&[
-        "removal-propose",
-        "--item",
+    // Simulate the planning conversation stating the reviewable proposal; the
+    // controller records it on the card before the decision is requested.
+    author_removal_proposal(
+        &fixture,
         &candidate,
-        "--proposal",
-        "proposal-simplify",
-        "--target",
-        "capability-x",
-        "--evidence",
-        "evidence-1",
-        "--loss",
-        "synthetic-loss",
-        "--preview",
-        "preview-1",
-    ]);
-    assert!(proposed.status.success(), "{}", text(&proposed));
+        &removal_proposal_section("capability-x"),
+    );
     let resume = fixture.resume();
     assert!(resume.status.success(), "{}", text(&resume));
     let status = fixture.status_json();
+    assert!(
+        status["candidate"]["planning_receipt"].is_string(),
+        "{status}"
+    );
     assert_eq!(
         status["candidate"]["implementer_attempt"],
         Value::Null,
         "{status}"
     );
+    let comments = fixture.bd_comments(&candidate);
+    for needle in [
+        "removal-proposal v1",
+        "proposal=openspec/changes/add-synthetic",
+        "target=capability-x",
+        "evidence=outcome:cycle-1#task",
+        "loss=rare-manual-recovery",
+        "preview=preview:retained/unapplied-capability.diff",
+    ] {
+        assert!(comments.contains(needle), "{needle}: {comments}");
+    }
+    // A reviewable proposal alone does not authorize the removal effect: the
+    // decision request names the exact reviewed proposal.
+    let request = status["dispatch"]["reason"].as_str().unwrap_or_default();
     assert!(
-        status["dispatch"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("no removal decision"),
-        "{status}"
+        request.contains("no removal decision")
+            && request.contains("proposal=openspec/changes/add-synthetic")
+            && request.contains("target=capability-x"),
+        "the recorded proposal is available before the decision request: {status}"
+    );
+    assert_eq!(
+        source_content(
+            &fixture
+                .candidate_worktree(&candidate)
+                .join("crates/one/src/lib.rs")
+        ),
+        source_content(&fixture.proj.join("crates/one/src/lib.rs")),
+        "preparing the proposal applies no removal"
     );
 
     // The informed decision covers the experiment treatment; the dependent
@@ -3950,13 +4120,13 @@ fn an_admitted_simplification_waits_for_the_informed_decision_before_implementat
         "--decision",
         "approve",
         "--proposal",
-        "proposal-simplify",
+        "openspec/changes/add-synthetic",
         "--target",
         "capability-x",
         "--actions",
         "experiment",
         "--loss",
-        "synthetic-loss",
+        "rare-manual-recovery",
     ]);
     assert!(decided.status.success(), "{}", text(&decided));
     let resume = fixture.resume();
@@ -3965,5 +4135,125 @@ fn an_admitted_simplification_waits_for_the_informed_decision_before_implementat
     assert!(
         status["candidate"]["implementer_attempt"].is_string(),
         "the approved simplification dispatches its implementation: {status}"
+    );
+    assert!(
+        status["removal"]["gate"]
+            .as_str()
+            .unwrap()
+            .contains("authorized"),
+        "{status}"
+    );
+    // The unchanged approval covers a later resume without another proposal
+    // or decision ritual.
+    let resumes = fixture.resume();
+    assert!(resumes.status.success(), "{}", text(&resumes));
+    let comments = fixture.bd_comments(&candidate);
+    assert_eq!(
+        comments.matches("removal-proposal v1").count(),
+        1,
+        "the reviewed proposal is not rewritten on resume"
+    );
+    assert_eq!(
+        comments.matches("removal-decision v1").count(),
+        1,
+        "no repeated approval request for the unchanged scope"
+    );
+}
+
+#[test]
+fn a_removal_candidate_without_a_complete_proposal_is_not_presented_for_decision() {
+    let fixture = Fixture::new("incomplete-removal-proposal");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    fake_launcher(&fixture);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    // Replace the failed start conversation with the completed investigator
+    // report whose candidate is a simplification treatment.
+    let result = fixture.run.join("investigator-result.json");
+    fs::write(
+        &result,
+        serde_json::to_vec_pretty(&simplification_report(&locator)).unwrap(),
+    )
+    .unwrap();
+    let receipt = fixture.run.join("investigator-receipt.json");
+    seed_bound_receipt(
+        &receipt,
+        "workflow-fixture-investigator-1",
+        "gen-1",
+        "completed",
+        Some(0),
+    );
+    replace_attempt(
+        &fixture,
+        attempt_json(
+            "investigator-1",
+            "investigator",
+            "workflow-fixture-investigator-1",
+            "gen-1",
+            &receipt,
+            Some(&result),
+            None,
+            "started",
+        ),
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    let candidate = status["candidate"]["hypothesis"]
+        .as_str()
+        .expect("the admitted card is selected")
+        .to_owned();
+    assert_eq!(status["candidate"]["removal_required"], true, "{status}");
+
+    // The planning conversation returns a change whose removal proposal is
+    // missing the restoration clause: the reviewable proposal is incomplete,
+    // so it is never recorded and no decision is requested from it.
+    let incomplete = removal_proposal_section("capability-x")
+        .lines()
+        .filter(|line| !line.starts_with("- Restoration:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    author_removal_proposal(&fixture, &candidate, &incomplete);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("does not state a recordable reviewable removal proposal"),
+        "{status}"
+    );
+    assert!(condition.contains("Restoration:"), "{status}");
+    assert_eq!(
+        status["candidate"]["planning_receipt"],
+        Value::Null,
+        "{status}"
+    );
+    assert_eq!(
+        status["candidate"]["implementer_attempt"],
+        Value::Null,
+        "{status}"
+    );
+    assert!(
+        !fixture
+            .bd_comments(&candidate)
+            .contains("removal-proposal v1"),
+        "an incomplete proposal is never recorded for a decision"
+    );
+    assert!(
+        !fixture
+            .bd_comments(&candidate)
+            .contains("removal-decision v1"),
+        "no decision is requested before the proposal is complete"
+    );
+    // The authored work is preserved and a repeated resume performs no new
+    // model work.
+    let attempts = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts,
+        "a repeated resume performs no new model work"
     );
 }
