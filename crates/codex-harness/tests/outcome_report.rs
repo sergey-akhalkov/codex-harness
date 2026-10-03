@@ -77,6 +77,81 @@ fn native_json_markdown_and_incremental_input_preserve_accounting() {
 }
 
 #[test]
+fn acceptance_corrections_batching_and_unknown_counters_survive_the_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("acceptance.json");
+    let mut baseline = attempt("a", "baseline");
+    baseline["native_runs"][0]["ended_at"] = json!(2);
+    baseline["native_runs"][0]["requests"] = json!(4);
+    baseline["native_runs"][0]["rounds"] = json!(3);
+    baseline["native_runs"][0]["tool_calls"] = json!(3);
+    baseline["native_runs"][0]["tool_operations"] = json!(5);
+    baseline["checks"] = json!([
+        {"id":"proof","round":0,"required":true,"executed":true,"exit_code":1,"passed":false,
+            "started_at":2,"ended_at":4,"evidence":"private/first-check"},
+        {"id":"proof","round":1,"required":true,"executed":true,"exit_code":0,"passed":true,
+            "started_at":5,"ended_at":10,"evidence":"private/corrected-check"}
+    ]);
+    let mut candidate = attempt("b", "candidate");
+    // One batched outer call performed the same five operations.
+    candidate["native_runs"][0]["ended_at"] = json!(2);
+    candidate["native_runs"][0]["requests"] = json!(2);
+    candidate["native_runs"][0]["rounds"] = json!(2);
+    candidate["native_runs"][0]["tool_calls"] = json!(1);
+    candidate["native_runs"][0]["tool_operations"] = json!(5);
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline, candidate])).unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Time through the failed check, the correction and the re-check is the
+    // enclosing attempt span, counted once.
+    assert_eq!(report["attempts"][0]["elapsed_seconds"], 10.0);
+    assert_eq!(report["attempts"][0]["status"], "accepted");
+    assert_eq!(report["attempts"][0]["checks"].as_array().unwrap().len(), 2);
+    // Requests, rounds, outer calls and operations stay distinct, and the
+    // lower batched call count alone produces no saving verdict.
+    assert_eq!(report["attempts"][0]["requests"], 4);
+    assert_eq!(report["attempts"][0]["total_requests"], 4);
+    assert_eq!(report["attempts"][0]["total_tool_calls"], 3);
+    assert_eq!(report["attempts"][1]["tool_calls"], 1);
+    assert_eq!(report["attempts"][1]["tool_operations"], 5);
+    assert_eq!(report["units"][0]["positive_effect"], Value::Null);
+    assert_eq!(report["units"][0]["net_saving"], Value::Null);
+    let markdown = run(&input, true);
+    assert!(markdown.status.success());
+    let text = String::from_utf8(markdown.stdout).unwrap();
+    assert!(text.contains("requests=6"), "{text}");
+    assert!(text.contains("tool_calls=4"), "{text}");
+
+    // A counter no run recorded stays unknown instead of becoming zero.
+    let partial_input = root.path().join("partial.json");
+    fs::write(
+        &partial_input,
+        serde_json::to_vec(&json!([attempt("c", "baseline")])).unwrap(),
+    )
+    .unwrap();
+    let output = run(&partial_input, false);
+    assert!(output.status.success());
+    let partial: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(partial["attempts"][0]["requests"].is_null());
+    assert!(partial["attempts"][0]["tool_calls"].is_null());
+    assert!(partial["attempts"][0]["tool_operations"].is_null());
+    assert_eq!(
+        partial["variation"][0]["within_run_events"]["unknown_counters"]["tool_operations"],
+        1
+    );
+}
+
+#[test]
 fn declared_units_classification_and_accounting_survive_the_cli() {
     let root = tempfile::tempdir().unwrap();
     let input = root.path().join("declared.json");

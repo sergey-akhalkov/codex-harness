@@ -18,8 +18,8 @@
 //! crosses two declared units is listed but never counted as evidence for
 //! either, so repeated complete pairs of one task stay one experimental unit
 //! each instead of collapsing into a cross product. Complete paired attempts
-//! are the unit for run-to-run variation; requests, rounds, tool operations and
-//! repeated readings within one task are dependent observations.
+//! are the unit for run-to-run variation; requests, rounds, tool calls, tool
+//! operations and repeated readings within one task are dependent observations.
 //!
 //! A subtractive candidate additionally records its removed burden and each
 //! arm's actual consumption of that burden ([`finish_attempt`] normalizes both
@@ -279,7 +279,8 @@ fn execution_start(row: &Value) -> &Value {
 }
 
 /// Retains all input fields, failed checks and native runs. Only executed final
-/// round acceptance plus completed native work can establish correctness.
+/// round acceptance plus completed native work can establish correctness; a
+/// recorded cancellation that acceptance never resolved keeps its status.
 pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     if !record.is_object() {
         return Err(invalid());
@@ -341,7 +342,7 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     } else {
         record["status"]
             .as_str()
-            .filter(|status| matches!(*status, "failed" | "blocked" | "timeout"))
+            .filter(|status| matches!(*status, "failed" | "blocked" | "timeout" | "cancelled"))
             .unwrap_or("incomplete")
     };
     row["status"] = status.into();
@@ -419,8 +420,15 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     if status != "accepted" {
         reasons.insert(format!("outcome_{status}"));
     }
-    row["tool_operations"] = counter_total(native, "tool_operations");
+    // Model requests, sequential interaction rounds, outer tool calls and the
+    // operations those calls perform stay distinct counters. A batched outer
+    // call can perform several operations, so a lower call count alone is
+    // never a reduced-work measurement. Each counter is summed only over runs
+    // that recorded it; a missing counter stays unknown, never zero.
+    row["requests"] = counter_total(native, "requests");
     row["rounds"] = counter_total(native, "rounds");
+    row["tool_calls"] = counter_total(native, "tool_calls");
+    row["tool_operations"] = counter_total(native, "tool_operations");
     row["unit"] = json!(unit_of(record));
     row["excluded_reasons"] = json!(reasons);
     let treatment = treatment_facts(record)?;
@@ -523,8 +531,14 @@ struct VariationGroup {
     elapsed_effects: Vec<f64>,
     attempts: u64,
     native_runs: u64,
+    requests: u64,
     rounds: u64,
+    tool_calls: u64,
     tool_operations: u64,
+    unknown_requests: u64,
+    unknown_rounds: u64,
+    unknown_tool_calls: u64,
+    unknown_tool_operations: u64,
 }
 
 /// Consume the normalized per-arm treatment and consumption records into the
@@ -764,8 +778,12 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
         };
         let total_tool_operations = chain_counter("tool_operations");
         let total_rounds = chain_counter("rounds");
+        let total_tool_calls = chain_counter("tool_calls");
+        let total_requests = chain_counter("requests");
         rows[index]["total_tool_operations"] = total_tool_operations;
         rows[index]["total_rounds"] = total_rounds;
+        rows[index]["total_tool_calls"] = total_tool_calls;
+        rows[index]["total_requests"] = total_requests;
         rows[index]["task_root"] = if complete {
             rows[*chain.last().unwrap()]["attempt_id"].clone()
         } else {
@@ -1240,8 +1258,27 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
         let group = variation_groups.entry(key).or_default();
         group.attempts += 1;
         group.native_runs += array(row, "native_runs")?.len() as u64;
-        group.rounds += row["rounds"].as_u64().unwrap_or(0);
-        group.tool_operations += row["tool_operations"].as_u64().unwrap_or(0);
+        // A counter no run recorded contributes to the unknown tally instead
+        // of entering the dependent-event sum as an implicit zero.
+        for (key, sum, unknown) in [
+            ("requests", &mut group.requests, &mut group.unknown_requests),
+            ("rounds", &mut group.rounds, &mut group.unknown_rounds),
+            (
+                "tool_calls",
+                &mut group.tool_calls,
+                &mut group.unknown_tool_calls,
+            ),
+            (
+                "tool_operations",
+                &mut group.tool_operations,
+                &mut group.unknown_tool_operations,
+            ),
+        ] {
+            match row[key].as_u64() {
+                Some(value) => *sum += value,
+                None => *unknown += 1,
+            }
+        }
     }
     let variation: Vec<Value> = variation_groups
         .into_iter()
@@ -1272,10 +1309,18 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 "within_run_events": {
                     "attempts": group.attempts,
                     "native_runs": group.native_runs,
+                    "requests": group.requests,
                     "rounds": group.rounds,
+                    "tool_calls": group.tool_calls,
                     "tool_operations": group.tool_operations,
+                    "unknown_counters": {
+                        "requests": group.unknown_requests,
+                        "rounds": group.unknown_rounds,
+                        "tool_calls": group.unknown_tool_calls,
+                        "tool_operations": group.unknown_tool_operations,
+                    },
                 },
-                "basis": "complete one-to-one paired attempts are the experimental unit; requests, rounds, tool operations and repeated readings within one task are dependent observations counted here as events, not replications; a missing variance is unmeasured, never zero; this record assigns no confidence level and establishes no equivalence",
+                "basis": "complete one-to-one paired attempts are the experimental unit; requests, rounds, tool calls, tool operations and repeated readings within one task are dependent observations counted here as events, not replications; a counter no run recorded stays unknown and is counted under unknown_counters instead of becoming zero; a missing variance is unmeasured, never zero; this record assigns no confidence level and establishes no equivalence",
             })
         })
         .collect();
@@ -1493,7 +1538,7 @@ pub fn concise_report(report: &Value) -> io::Result<String> {
             })
             .unwrap_or_else(|| "unmeasured".to_owned());
         lines.push(format!(
-            "variation experiment={} case={} complete_pairs={} run_variation={} observed_elapsed_effect_percent={} within_run_events attempts={} native_runs={} rounds={} tool_operations={}",
+            "variation experiment={} case={} complete_pairs={} run_variation={} observed_elapsed_effect_percent={} within_run_events attempts={} native_runs={} requests={} rounds={} tool_calls={} tool_operations={}",
             group["experiment_id"].as_str().unwrap_or(""),
             group["case_id"]
                 .as_str()
@@ -1505,7 +1550,9 @@ pub fn concise_report(report: &Value) -> io::Result<String> {
             range,
             group["within_run_events"]["attempts"],
             group["within_run_events"]["native_runs"],
+            group["within_run_events"]["requests"],
             group["within_run_events"]["rounds"],
+            group["within_run_events"]["tool_calls"],
             group["within_run_events"]["tool_operations"],
         ));
     }
@@ -1650,6 +1697,130 @@ mod tests {
         let result = summarize_attempts(&[unobserved]).unwrap();
         assert!(result["attempts"][0]["tool_operations"].is_null());
         assert!(result["attempts"][0]["total_tool_operations"].is_null());
+    }
+
+    #[test]
+    fn acceptance_corrections_are_retained_once_in_the_enclosing_span() {
+        let mut row = attempt("a", "baseline", 0.0, 9.0);
+        row["native_runs"][0]["ended_at"] = json!(2.0);
+        row["checks"] = json!([
+            {"id":"acceptance","round":0,"started_at":2.0,"ended_at":4.0,"required":true,
+                "executed":true,"passed":false,"exit_code":1,"evidence":"private/first"},
+            {"id":"acceptance","round":1,"started_at":5.0,"ended_at":9.0,"required":true,
+                "executed":true,"passed":true,"exit_code":0,"evidence":"private/fixed"}
+        ]);
+        let result = summarize_attempts(&[row.clone()]).unwrap();
+        let a = &result["attempts"][0];
+        // The failed check, the correction gap and the re-check are one
+        // enclosing attempt span: 9 seconds, not the 2 + 2 + 4 sum.
+        assert_eq!(a["elapsed_seconds"], 9.0);
+        assert_eq!(a["verified_seconds"], 9.0);
+        // The first executed acceptance result is the first useful signal,
+        // recorded before the correction passes.
+        assert_eq!(a["first_useful_seconds"], 4.0);
+        assert_eq!(a["status"], "accepted");
+        assert_eq!(a["checks"].as_array().unwrap().len(), 2);
+        // A final round that never executed cannot establish acceptance, and
+        // its failure does not discard the retained span.
+        row["checks"][1]["executed"] = json!(false);
+        let unresolved = finish_attempt(&row).unwrap();
+        assert_eq!(unresolved["status"], "incomplete");
+        assert_eq!(unresolved["elapsed_seconds"], 9.0);
+    }
+
+    #[test]
+    fn batched_calls_keep_call_and_operation_counts_distinct() {
+        let mut baseline = attempt("a", "baseline", 0.0, 10.0);
+        baseline["native_runs"][0]["requests"] = json!(4);
+        baseline["native_runs"][0]["rounds"] = json!(3);
+        baseline["native_runs"][0]["tool_calls"] = json!(3);
+        baseline["native_runs"][0]["tool_operations"] = json!(5);
+        let mut candidate = attempt("b", "candidate", 0.0, 10.0);
+        // One batched outer call performed the same five operations.
+        candidate["native_runs"][0]["requests"] = json!(2);
+        candidate["native_runs"][0]["rounds"] = json!(2);
+        candidate["native_runs"][0]["tool_calls"] = json!(1);
+        candidate["native_runs"][0]["tool_operations"] = json!(5);
+        let result = summarize_attempts(&[baseline.clone(), candidate]).unwrap();
+        let a = &result["attempts"][0];
+        assert_eq!(a["requests"], 4);
+        assert_eq!(a["rounds"], 3);
+        assert_eq!(a["tool_calls"], 3);
+        assert_eq!(a["tool_operations"], 5);
+        assert_eq!(a["total_requests"], 4);
+        assert_eq!(a["total_tool_calls"], 3);
+        let b = &result["attempts"][1];
+        assert_eq!(b["tool_calls"], 1);
+        assert_eq!(b["tool_operations"], 5);
+        // Dependent events are not cost: the lower batched call count creates
+        // no saving or acceptance verdict on its own.
+        let unit = &result["units"][0];
+        assert!(unit["net_saving"].is_null());
+        assert!(unit["positive_effect"].is_null());
+        assert_eq!(unit["effect"]["delta_seconds"], 0.0);
+        // A counter no run recorded stays unknown and is disclosed, never
+        // counted as zero.
+        let mut partial = attempt("c", "baseline", 0.0, 10.0);
+        partial["native_runs"][0]["tool_operations"] = json!(5);
+        let result = summarize_attempts(&[partial]).unwrap();
+        assert!(result["attempts"][0]["requests"].is_null());
+        assert!(result["attempts"][0]["total_requests"].is_null());
+        let group = &result["variation"][0];
+        assert_eq!(group["within_run_events"]["requests"], 0);
+        assert_eq!(
+            group["within_run_events"]["unknown_counters"]["requests"],
+            1
+        );
+        assert_eq!(group["within_run_events"]["tool_operations"], 5);
+        assert_eq!(
+            group["within_run_events"]["unknown_counters"]["tool_operations"],
+            0
+        );
+        // Retried work keeps every recorded chain counter once.
+        let mut retry = attempt("d", "baseline", 11.0, 20.0);
+        retry["retry_of"] = "a".into();
+        retry["native_runs"][0]["requests"] = json!(1);
+        retry["native_runs"][0]["rounds"] = json!(1);
+        retry["native_runs"][0]["tool_calls"] = json!(2);
+        retry["native_runs"][0]["tool_operations"] = json!(2);
+        let result = summarize_attempts(&[baseline.clone(), retry]).unwrap();
+        let tip = &result["attempts"][1];
+        assert_eq!(tip["total_requests"], 5);
+        assert_eq!(tip["total_rounds"], 4);
+        assert_eq!(tip["total_tool_calls"], 5);
+        assert_eq!(tip["total_tool_operations"], 7);
+    }
+
+    #[test]
+    fn cancelled_work_keeps_recorded_status_time_and_usage() {
+        let mut row = attempt("a", "baseline", 0.0, 10.0);
+        row["status"] = json!("cancelled");
+        row["checks"] = json!([]);
+        row["native_runs"][0]["usage"] = json!({"thread":"thread-a","total_tokens":17});
+        let result = summarize_attempts(&[row]).unwrap();
+        let a = &result["attempts"][0];
+        assert_eq!(a["status"], "cancelled");
+        assert_eq!(a["correct"], false);
+        // Observed time and usage remain attributed to the cancelled attempt.
+        assert_eq!(a["elapsed_seconds"], 10.0);
+        assert_eq!(a["observed_wall_seconds"], 10.0);
+        assert_eq!(a["usage"]["status"], "per_run");
+        assert_eq!(a["usage"]["runs"][0]["total_tokens"], 17);
+        assert!(
+            a["excluded_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "outcome_cancelled")
+        );
+        // The cancellation stays in the task accounting as unsuccessful work.
+        assert_eq!(result["accounting"]["attempts"], 1);
+        assert_eq!(result["accounting"]["accepted_tasks"], 0);
+        assert_eq!(
+            result["accounting"]["cost_per_accepted_task"]["status"],
+            "undefined"
+        );
+        assert_eq!(result["accounting"]["attributed_seconds"]["seconds"], 10.0);
     }
 
     #[test]
