@@ -20,7 +20,8 @@ use harness_core::improvement_activation::{
 };
 use harness_core::improvement_experiment::{
     Arm, CorroborationRequirement, CorroborationSelection, CorroborationStatus, ExperimentBindings,
-    RetainedTask, TaskRetention, retain_completed_task, select_corroboration,
+    RetainedTask, TaskRetention, retain_completed_task, retained_tasks_from_board,
+    select_corroboration,
 };
 use harness_core::improvement_loop::{
     AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, OwnerRecord, Phase, RunStore,
@@ -1725,14 +1726,6 @@ fn append_retained_task(run: &Run, retained: &RetainedTask) -> io::Result<()> {
     Ok(())
 }
 
-fn read_retained_tasks(run: &Run) -> io::Result<Vec<RetainedTask>> {
-    let path = run.store.root().join(RETAINED_INDEX_FILE);
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-    read_json(&path, MAX_RUN_SPEC_BYTES)
-}
-
 /// Selects the additional independent corroboration units the declared
 /// adoption scope requires, before the outcome is treated as supporting a
 /// broader claim. Selection is identity-only and order-independent; too few
@@ -1795,14 +1788,26 @@ fn select_corroboration_units(run: &mut Run, notes: &mut Vec<String>) -> io::Res
             excluded.push(bindings.case_id.clone());
         }
     }
-    let candidates = match read_retained_tasks(run) {
-        Ok(tasks) => tasks,
+    // Retained units are discovered from their durable Beads owners, so a
+    // later run can corroborate on tasks an earlier run retained. Records
+    // whose artifacts are missing or changed stay unsupported with their
+    // exact reason instead of being reconstructed from a summary.
+    let candidates = match retained_tasks_from_board(&run.spec.board.bd, &run.spec.board.project) {
+        Ok(discovery) => {
+            for unsupported in &discovery.unsupported {
+                notes.push(format!(
+                    "retained unit {} ({}) not selectable: {}",
+                    unsupported.item, unsupported.case_id, unsupported.reason
+                ));
+            }
+            discovery.tasks
+        }
         Err(error) => {
             return unavailable_corroboration(
                 run,
                 notes,
                 additional,
-                format!("the run-local retained-task index is unreadable: {error}"),
+                format!("retained-task discovery through the board is unavailable: {error}"),
             );
         }
     };
