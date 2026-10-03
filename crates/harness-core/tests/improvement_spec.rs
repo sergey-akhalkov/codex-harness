@@ -1,5 +1,7 @@
 //! Installed OpenSpec contract checks, with all configuration writes isolated.
-use harness_core::improvement_spec::{ExperimentContract, OpenSpec, Specification};
+use harness_core::improvement_spec::{
+    ExperimentContract, MeasurementScope, MeasurementWorkload, OpenSpec, Specification,
+};
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 fn contract() -> ExperimentContract {
@@ -18,6 +20,23 @@ fn contract() -> ExperimentContract {
     }
 }
 
+fn measurement_scope() -> MeasurementScope {
+    MeasurementScope {
+        observed_problem: "Identical repeated reads waste accepted-task time".into(),
+        investigation_scope: "The reader's repeated reads at one frozen source revision".into(),
+        measurement_question: "How much accepted-task time do identical repeated reads cost?"
+            .into(),
+        workload: MeasurementWorkload {
+            operation: "cargo build -p example-reader".into(),
+            contract: "proposal.md#measurement".into(),
+        },
+        evidence_references: vec!["retained outcome record: repeated reads".into()],
+        limits: "One local machine and one frozen source revision".into(),
+        declaration_artifact: "proposal.md".into(),
+        declaration_heading: "## Measurement".into(),
+    }
+}
+
 #[test]
 fn absent_acceptance_or_escaping_artifact_is_not_a_planning_contract() {
     let mut value = contract();
@@ -33,6 +52,53 @@ fn absent_acceptance_or_escaping_artifact_is_not_a_planning_contract() {
     value.acceptance_artifact = "../outside.md".into();
     assert!(value.validate().is_err());
     assert!(contract().validate().is_ok());
+}
+
+#[test]
+fn incomplete_measurement_scope_is_not_a_measurement_plan() {
+    assert!(measurement_scope().validate().is_ok());
+    let mut value = measurement_scope();
+    value.measurement_question.clear();
+    assert!(
+        value
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("measurement_question")
+    );
+    let mut value = measurement_scope();
+    value.workload.operation.clear();
+    assert!(
+        value
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("workload.operation")
+    );
+    let mut value = measurement_scope();
+    value.evidence_references.clear();
+    assert!(
+        value
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("evidence_references")
+    );
+    let mut value = measurement_scope();
+    value.limits = "  ".into();
+    assert!(value.validate().is_err());
+    let mut value = measurement_scope();
+    value.declaration_heading = "Measurement".into();
+    assert!(
+        value
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("declaration_heading")
+    );
+    let mut value = measurement_scope();
+    value.declaration_artifact = "../outside.md".into();
+    assert!(value.validate().is_err());
 }
 
 fn native(arguments: &[&str], cwd: &Path, environment: &BTreeMap<String, String>) -> Vec<u8> {
@@ -68,7 +134,7 @@ fn native(arguments: &[&str], cwd: &Path, environment: &BTreeMap<String, String>
 
 fn fill_change(root: &Path) {
     fs::create_dir_all(root.join("specs/repeated-reads")).unwrap();
-    fs::write(root.join("proposal.md"), "## Why\nIdentical reads waste work.\n\n## What Changes\nReuse identical input parsing.\n\n## Capabilities\n\n### New Capabilities\n- `repeated-reads`: Reuse parsing with correct invalidation.\n\n### Modified Capabilities\nNone.\n\n## Impact\nReader and its checks.\n").unwrap();
+    fs::write(root.join("proposal.md"), "## Why\nIdentical reads waste work.\n\n## Measurement\nObserved problem: identical repeated reads waste accepted-task time. Investigation scope: reads at one frozen source revision. Measurement question: how much accepted-task time do they cost? Evidence: retained outcome record. Limits: one local machine. Workload: an existing build operation.\n\n## What Changes\nReuse identical input parsing.\n\n## Capabilities\n\n### New Capabilities\n- `repeated-reads`: Reuse parsing with correct invalidation.\n\n### Modified Capabilities\nNone.\n\n## Impact\nReader and its checks.\n").unwrap();
     fs::write(root.join("design.md"), "## Context\nRepeated source reads.\n\n## Decisions\nKey reuse on content identity.\n\n## Experiment acceptance\nAn unchanged external checker rejects stale output. The pair freezes source, runtime and cache policy; changed source is the counterexample. Require at least 10 percent lower elapsed time with correctness and no resource regression; run the predeclared matched pairs, never stop on a favorable result.\n").unwrap();
     fs::write(root.join("tasks.md"), "## Implementation\n- [ ] Implement correct read reuse.\n- [ ] Verify invalidation and complete the declared comparison.\n").unwrap();
     fs::write(root.join("specs/repeated-reads/spec.md"), "## ADDED Requirements\n\n### Requirement: Reuse preserves output\nThe reader SHALL preserve correct output when reusing identical inputs.\n\n#### Scenario: Source changes\n- **WHEN** the input content changes\n- **THEN** the next read returns the changed content\n").unwrap();
@@ -157,8 +223,85 @@ fn installed_case(store: bool) {
         "empty scaffold must never permit implementation"
     );
     let root = planning_root.join("openspec/changes/improve-repeated-reads");
+    // An empty scaffold states no measurement scope: directed measurement is
+    // blocked until the hypothesis's own change declares one.
+    assert!(
+        api.begin_measurement(&target, &measurement_scope())
+            .is_err(),
+        "an empty scaffold permitted a directed measurement"
+    );
+    // The initial change states the observed problem, investigation scope,
+    // measurement question, evidence, limits and targeted tasks; it does not
+    // invent a solution yet.
+    fs::write(
+        root.join("proposal.md"),
+        "## Why\nIdentical repeated reads waste accepted-task time.\n\n## Measurement\nObserved problem: identical repeated reads waste time. Investigation scope: reads at one frozen source revision. Measurement question: how much accepted-task time do they cost? Evidence: retained outcome record. Limits: one local machine. Workload: an existing build operation.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tasks.md"),
+        "## Measurement\n- [ ] Run the targeted baseline measurement.\n",
+    )
+    .unwrap();
+    let measured = api
+        .begin_measurement(&target, &measurement_scope())
+        .unwrap();
+    assert_eq!(measured.change_root, root.canonicalize().unwrap());
+    assert_eq!(measured.artifacts.len(), 2);
+    assert_eq!(
+        measured.scope.workload.operation,
+        "cargo build -p example-reader"
+    );
+    // A missing measurement question blocks the directed measurement even
+    // though the change exists.
+    let mut incomplete = measurement_scope();
+    incomplete.measurement_question.clear();
+    assert!(api.begin_measurement(&target, &incomplete).is_err());
+    // A one-line candidate instruction cannot skip requirements, design or
+    // experiment acceptance: implementation stays undispatched.
+    assert!(
+        api.qualify(&target, &contract()).is_err(),
+        "a one-line candidate skipped the candidate-implementation prerequisites"
+    );
+    // Removing the tasks artifact blocks the directed measurement.
+    let tasks = fs::read(root.join("tasks.md")).unwrap();
+    fs::remove_file(root.join("tasks.md")).unwrap();
+    assert!(
+        api.begin_measurement(&target, &measurement_scope())
+            .is_err()
+    );
+    fs::write(root.join("tasks.md"), tasks).unwrap();
+    // A change without the declared measurement scope blocks it too.
+    let proposal = fs::read_to_string(root.join("proposal.md")).unwrap();
+    fs::write(
+        root.join("proposal.md"),
+        "## Why\nNo targeted measurement is specified.\n",
+    )
+    .unwrap();
+    assert!(
+        api.begin_measurement(&target, &measurement_scope())
+            .unwrap_err()
+            .to_string()
+            .contains("measurement scope")
+    );
+    fs::write(root.join("proposal.md"), proposal).unwrap();
+    // The workload is the existing build operation linked from this change:
+    // no second hypothesis or change exists for it.
+    let changes = fs::read_dir(planning_root.join("openspec/changes"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir() && entry.file_name() != "archive")
+        .count();
+    assert_eq!(
+        changes, 1,
+        "the measurement workload was forced into a separate change"
+    );
+    // The same change must own the directed measurement and the later
+    // candidate-implementation prerequisite.
     fill_change(&root);
     let qualified = api.qualify(&target, &contract()).unwrap();
+    assert_eq!(qualified.change_root, measured.change_root);
+    api.revalidate_measurement(&measured).unwrap();
     assert_eq!(qualified.implementation_state, "ready");
     assert_eq!(qualified.artifacts.len(), 4);
     api.revalidate(&qualified).unwrap();
@@ -206,6 +349,7 @@ fn installed_case(store: bool) {
     let mut wrong = target;
     wrong.planning_root = temporary.path().to_path_buf();
     assert!(api.qualify(&wrong, &contract()).is_err());
+    assert!(api.begin_measurement(&wrong, &measurement_scope()).is_err());
 }
 
 #[test]

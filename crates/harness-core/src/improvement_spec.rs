@@ -1,8 +1,9 @@
-//! Native OpenSpec prerequisites for improvement candidates and workloads.
+//! Native OpenSpec prerequisites for improvement hypotheses and workloads.
 //!
 //! OpenSpec remains the artifact owner. These receipts bind its actual resolved
-//! files to a declared experiment contract; they do not certify implementation,
-//! task completion, benefit, or user removal authority.
+//! files to a declared initial measurement scope and experiment contract; they
+//! do not certify implementation, task completion, benefit, or user removal
+//! authority.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,18 +47,7 @@ pub struct ExperimentContract {
 
 impl ExperimentContract {
     pub fn validate(&self) -> io::Result<()> {
-        let heading = self.acceptance_heading.trim();
-        let level = heading.bytes().take_while(|byte| *byte == b'#').count();
-        if !(1..=6).contains(&level)
-            || !heading[level..].starts_with(' ')
-            || heading[level..].trim().is_empty()
-            || heading.contains(['\n', '\r'])
-            || heading.len() > 512
-        {
-            return Err(invalid(
-                "acceptance_heading must identify a Markdown section",
-            ));
-        }
+        validate_heading("acceptance_heading", &self.acceptance_heading)?;
         for (name, value) in [
             ("mechanism", &self.mechanism),
             ("counterexample", &self.counterexample),
@@ -74,8 +64,101 @@ impl ExperimentContract {
                 )));
             }
         }
-        relative_path(&self.acceptance_artifact)
+        relative_path("acceptance artifact", &self.acceptance_artifact)
     }
+}
+
+/// The operation selected for one hypothesis's targeted measurement.
+///
+/// An existing build, search or diagnostic operation is linked from the
+/// hypothesis's own change through this declaration; the adapter never creates
+/// or requires a second hypothesis card or change for it. Only an operation
+/// that independently becomes an improvement hypothesis owns its own change.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementWorkload {
+    /// Bounded identity of the operation the measurement runs.
+    pub operation: String,
+    /// Where the operation's existing contract and evidence are linked from.
+    pub contract: String,
+}
+
+/// The declared scope of one hypothesis's targeted initial measurement, stated
+/// in the hypothesis's own OpenSpec change before any measurement is directed.
+/// A hypothesis without a complete declared scope stays undispatched:
+/// [`OpenSpec::begin_measurement`] refuses it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementScope {
+    /// The observed problem or friction that started the investigation.
+    pub observed_problem: String,
+    /// What the targeted measurement covers, including its intended-use horizon.
+    pub investigation_scope: String,
+    /// The measurement question the targeted baseline answers.
+    pub measurement_question: String,
+    /// The selected existing operation and where its contract is linked.
+    pub workload: MeasurementWorkload,
+    /// Retained evidence or authorized real-work references the investigation
+    /// is seeded from.
+    pub evidence_references: Vec<String>,
+    /// Known limits of the evidence basis and the targeted measurement.
+    pub limits: String,
+    /// The change artifact that states this scope, relative to the change root.
+    pub declaration_artifact: PathBuf,
+    /// Exact Markdown heading of the scope section in that artifact.
+    pub declaration_heading: String,
+}
+
+impl MeasurementScope {
+    pub fn validate(&self) -> io::Result<()> {
+        validate_heading("declaration_heading", &self.declaration_heading)?;
+        relative_path("declaration artifact", &self.declaration_artifact)?;
+        for (name, value) in [
+            ("observed_problem", &self.observed_problem),
+            ("investigation_scope", &self.investigation_scope),
+            ("measurement_question", &self.measurement_question),
+            ("workload.operation", &self.workload.operation),
+            ("workload.contract", &self.workload.contract),
+            ("limits", &self.limits),
+        ] {
+            if value.trim().is_empty() || value.len() > 8192 {
+                return Err(invalid(format!(
+                    "missing or oversized measurement field: {name}"
+                )));
+            }
+        }
+        if self.evidence_references.is_empty() || self.evidence_references.len() > 64 {
+            return Err(invalid(
+                "missing or oversized measurement field: evidence_references",
+            ));
+        }
+        for reference in &self.evidence_references {
+            if reference.trim().is_empty() || reference.len() > 8192 {
+                return Err(invalid(
+                    "missing or oversized measurement field: evidence_references",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Proof that the hypothesis's own change resolved through the installed CLI
+/// and stated the declared measurement scope before directed measurement. It
+/// does not certify the later candidate-implementation prerequisites; those
+/// stay with [`OpenSpec::qualify`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementReceipt {
+    pub specification: Specification,
+    pub scope: MeasurementScope,
+    pub change_root: PathBuf,
+    pub schema: String,
+    /// Canonical artifact paths and content digests of the change as it stood
+    /// when the measurement was directed.
+    pub artifacts: BTreeMap<PathBuf, String>,
+    /// Fingerprint of the declared scope the measurement is bound to.
+    pub scope_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -189,6 +272,88 @@ impl OpenSpec {
         )
     }
 
+    /// Resolve the hypothesis's own OpenSpec change before any directed initial
+    /// measurement. The change must state the declared measurement scope and
+    /// carry its tasks; it need not yet invent a solution, so only `status` is
+    /// consulted here. A later [`OpenSpec::qualify`] still gates candidate
+    /// implementation on the complete validated artifacts.
+    pub fn begin_measurement(
+        &self,
+        target: &Specification,
+        scope: &MeasurementScope,
+    ) -> io::Result<MeasurementReceipt> {
+        scope.validate()?;
+        let status = self.json(target, &["status", "--change", &target.change, "--json"])?;
+        let root = PathBuf::from(required(&status["planningHome"], "root")?).canonicalize()?;
+        if root != target.planning_root.canonicalize()? {
+            return Err(invalid(
+                "OpenSpec resolved a different planning root; no directed measurement is eligible",
+            ));
+        }
+        if required(&status, "changeName")? != target.change {
+            return Err(invalid("OpenSpec resolved a different change"));
+        }
+        let change_root = PathBuf::from(required(&status, "changeRoot")?).canonicalize()?;
+        if !change_root.starts_with(&root) || change_root == root {
+            return Err(invalid(
+                "OpenSpec change escapes its declared planning root",
+            ));
+        }
+        let mut artifacts = BTreeMap::new();
+        let absent = Vec::new();
+        for kind in ["proposal", "specs", "design", "tasks"] {
+            let paths = match status["artifactPaths"][kind]["existingOutputPaths"].as_array() {
+                Some(paths) => paths,
+                None => &absent,
+            };
+            if paths.is_empty() && matches!(kind, "proposal" | "tasks") {
+                return Err(invalid(format!(
+                    "missing OpenSpec initial-measurement prerequisite: {kind}"
+                )));
+            }
+            for path in paths {
+                let path = PathBuf::from(
+                    path.as_str()
+                        .ok_or_else(|| invalid("invalid artifact path"))?,
+                )
+                .canonicalize()?;
+                if !path.starts_with(&change_root) || path == change_root {
+                    return Err(invalid("planning artifact escapes the selected change"));
+                }
+                artifacts.insert(path.clone(), digest_artifact(&path)?);
+            }
+        }
+        let declaration = change_root
+            .join(&scope.declaration_artifact)
+            .canonicalize()
+            .map_err(|_| {
+                invalid(
+                    "the measurement scope artifact is missing from the hypothesis's own OpenSpec change",
+                )
+            })?;
+        if !artifacts.contains_key(&declaration) {
+            return Err(invalid(
+                "the measurement scope must be stated in a resolved artifact of the hypothesis's own OpenSpec change",
+            ));
+        }
+        if !section_present(
+            &fs::read_to_string(&declaration)?,
+            &scope.declaration_heading,
+        ) {
+            return Err(invalid(
+                "missing or empty measurement scope section in the linked OpenSpec artifact; no directed measurement is eligible",
+            ));
+        }
+        Ok(MeasurementReceipt {
+            specification: target.clone(),
+            scope: scope.clone(),
+            change_root,
+            schema: required(&status, "schemaName")?.to_owned(),
+            artifacts,
+            scope_digest: digest_bytes(&serde_json::to_vec(scope)?),
+        })
+    }
+
     pub fn qualify(
         &self,
         target: &Specification,
@@ -248,21 +413,10 @@ impl OpenSpec {
                 "experiment acceptance must reference a resolved OpenSpec artifact",
             ));
         }
-        let acceptance_text = fs::read_to_string(&acceptance)?;
-        let heading = contract.acceptance_heading.trim();
-        let level = heading.bytes().take_while(|byte| *byte == b'#').count();
-        let mut lines = acceptance_text
-            .lines()
-            .skip_while(|line| line.trim() != heading);
-        if lines.next().is_none()
-            || !lines
-                .take_while(|line| {
-                    let line = line.trim();
-                    let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
-                    next_level == 0 || next_level > level || !line[next_level..].starts_with(' ')
-                })
-                .any(|line| !line.trim().is_empty())
-        {
+        if !section_present(
+            &fs::read_to_string(&acceptance)?,
+            &contract.acceptance_heading,
+        ) {
             return Err(invalid(
                 "missing or empty experiment acceptance section in the linked OpenSpec artifact",
             ));
@@ -321,6 +475,20 @@ impl OpenSpec {
         }
         Ok(())
     }
+
+    /// Re-resolve the same change and measurement scope before a retained
+    /// baseline is reused. The change may legitimately grow into its complete
+    /// artifacts, but its identity and declared scope must not change; drift
+    /// requires a fresh directed measurement.
+    pub fn revalidate_measurement(&self, receipt: &MeasurementReceipt) -> io::Result<()> {
+        let current = self.begin_measurement(&receipt.specification, &receipt.scope)?;
+        if current.change_root != receipt.change_root || current.schema != receipt.schema {
+            return Err(invalid(
+                "the OpenSpec change identity changed; a retained baseline cannot be reused",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn validate_target(target: &Specification) -> io::Result<()> {
@@ -350,15 +518,44 @@ fn validate_target(target: &Specification) -> io::Result<()> {
     Ok(())
 }
 
-fn relative_path(path: &Path) -> io::Result<()> {
+fn validate_heading(field: &str, heading: &str) -> io::Result<()> {
+    let heading = heading.trim();
+    let level = heading.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level)
+        || !heading[level..].starts_with(' ')
+        || heading[level..].trim().is_empty()
+        || heading.contains(['\n', '\r'])
+        || heading.len() > 512
+    {
+        return Err(invalid(format!("{field} must identify a Markdown section")));
+    }
+    Ok(())
+}
+
+/// True when the exact Markdown heading exists and its section has content.
+fn section_present(text: &str, heading: &str) -> bool {
+    let heading = heading.trim();
+    let level = heading.bytes().take_while(|byte| *byte == b'#').count();
+    let mut lines = text.lines().skip_while(|line| line.trim() != heading);
+    lines.next().is_some()
+        && lines
+            .take_while(|line| {
+                let line = line.trim();
+                let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
+                next_level == 0 || next_level > level || !line[next_level..].starts_with(' ')
+            })
+            .any(|line| !line.trim().is_empty())
+}
+
+fn relative_path(field: &str, path: &Path) -> io::Result<()> {
     if path.as_os_str().is_empty()
         || path
             .components()
             .any(|part| !matches!(part, Component::Normal(_)))
     {
-        Err(invalid(
-            "acceptance artifact must be a nonempty relative path without traversal",
-        ))
+        Err(invalid(format!(
+            "{field} must be a nonempty relative path without traversal"
+        )))
     } else {
         Ok(())
     }
