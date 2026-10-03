@@ -14,6 +14,13 @@
 //! per run: bytes and token totals never become provider cost, billing or
 //! subscription allowance.
 //!
+//! A declared `experiment_id`/`pair_id` scopes comparability: an edge that
+//! crosses two declared units is listed but never counted as evidence for
+//! either, so repeated complete pairs of one task stay one experimental unit
+//! each instead of collapsing into a cross product. Complete paired attempts
+//! are the unit for run-to-run variation; requests, rounds, tool operations and
+//! repeated readings within one task are dependent observations.
+//!
 //! A subtractive candidate additionally records its removed burden and each
 //! arm's actual consumption of that burden ([`finish_attempt`] normalizes both
 //! from the attempt input). The unit analysis then distinguishes an exercised
@@ -436,6 +443,13 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
     {
         reasons.insert("not_opposite_arms".into());
     }
+    // A declared experiment/pair identity scopes the comparison: an edge that
+    // crosses two declared units is not evidence for either of them, while
+    // attempts that declare no finer identity share their experiment/case unit
+    // and keep the repeated-selection handling.
+    if unit_of(left) != unit_of(right) {
+        reasons.insert("different_declared_unit".into());
+    }
     let empty = serde_json::Map::new();
     let a = match left.get("matched") {
         None => &empty,
@@ -498,6 +512,19 @@ struct SubtractiveFacts {
     removed: Option<String>,
     retained_checks: bool,
     limitations: Vec<String>,
+}
+
+/// One (experiment, case) group's complete-pair variation evidence and the
+/// dependent within-run events that are deliberately not replications.
+#[derive(Default)]
+struct VariationGroup {
+    complete_pairs: u64,
+    untimed_pairs: u64,
+    elapsed_effects: Vec<f64>,
+    attempts: u64,
+    native_runs: u64,
+    rounds: u64,
+    tool_operations: u64,
 }
 
 /// Consume the normalized per-arm treatment and consumption records into the
@@ -1177,6 +1204,82 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
         units.push(unit_value);
     }
 
+    // Empirical variation across complete paired attempts, kept separate from
+    // the per-unit measurement/attribution bounds above. Requests, rounds,
+    // tool operations and repeated readings within one task are dependent
+    // observations: they are counted here only to show that they are not
+    // treated as independent replications. A group with fewer than two
+    // complete pairs leaves run-to-run variation unmeasured, never zero.
+    let mut variation_groups: BTreeMap<(String, String), VariationGroup> = BTreeMap::new();
+    for unit in &units {
+        let key = (
+            unit["experiment_id"].as_str().unwrap_or("").to_owned(),
+            unit["case_id"].as_str().unwrap_or("").to_owned(),
+        );
+        let group = variation_groups.entry(key).or_default();
+        if unit["one_to_one"] == json!(true) {
+            group.complete_pairs += 1;
+            match (
+                number(&unit["effect"]["baseline_seconds"]),
+                number(&unit["effect"]["candidate_seconds"]),
+            ) {
+                (Some(baseline), Some(candidate)) if baseline > 0.0 => {
+                    group
+                        .elapsed_effects
+                        .push((baseline - candidate) / baseline * 100.0);
+                }
+                _ => group.untimed_pairs += 1,
+            }
+        }
+    }
+    for row in &rows {
+        let key = (
+            text(row, "experiment_id").unwrap_or("").to_owned(),
+            row["case_id"].as_str().unwrap_or("").to_owned(),
+        );
+        let group = variation_groups.entry(key).or_default();
+        group.attempts += 1;
+        group.native_runs += array(row, "native_runs")?.len() as u64;
+        group.rounds += row["rounds"].as_u64().unwrap_or(0);
+        group.tool_operations += row["tool_operations"].as_u64().unwrap_or(0);
+    }
+    let variation: Vec<Value> = variation_groups
+        .into_iter()
+        .map(|((experiment_id, case_id), group)| {
+            let range = (group.complete_pairs >= 2
+                && group.untimed_pairs == 0
+                && !group.elapsed_effects.is_empty())
+            .then(|| {
+                [
+                    group
+                        .elapsed_effects
+                        .iter()
+                        .copied()
+                        .fold(f64::INFINITY, f64::min),
+                    group
+                        .elapsed_effects
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max),
+                ]
+            });
+            json!({
+                "experiment_id": experiment_id,
+                "case_id": case_id,
+                "complete_pairs": group.complete_pairs,
+                "observed_elapsed_effect_percent": range,
+                "run_variation": if group.complete_pairs >= 2 { "observed-pairs" } else { "unmeasured" },
+                "within_run_events": {
+                    "attempts": group.attempts,
+                    "native_runs": group.native_runs,
+                    "rounds": group.rounds,
+                    "tool_operations": group.tool_operations,
+                },
+                "basis": "complete one-to-one paired attempts are the experimental unit; requests, rounds, tool operations and repeated readings within one task are dependent observations counted here as events, not replications; a missing variance is unmeasured, never zero; this record assigns no confidence level and establishes no equivalence",
+            })
+        })
+        .collect();
+
     // Complete task accounting: a task is one retry chain tip, its cost is
     // every attributable attempt (including failed attempts, workers and
     // rework), and each attempt contributes exactly once. Unknown costs stay
@@ -1279,6 +1382,7 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
         "attempts": rows,
         "comparisons": pairs,
         "units": units,
+        "variation": variation,
         "independent_units": unit_arms.len(),
         "accounting": accounting,
         "benefit_status": "not_evaluated",
@@ -1367,6 +1471,43 @@ pub fn concise_report(report: &Value) -> io::Result<String> {
                 .collect::<Vec<_>>()
                 .join(" | "),
         );
+    }
+    // Empirical variation across complete paired attempts stays visible
+    // beside the measurement bounds; within-run events are listed, never
+    // aggregated into replications or confidence.
+    lines.push(String::new());
+    for group in array(report, "variation")? {
+        let range = group["observed_elapsed_effect_percent"]
+            .as_array()
+            .filter(|values| values.len() == 2)
+            .map(|values| {
+                format!(
+                    "{}..{}",
+                    values[0]
+                        .as_f64()
+                        .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.3}")),
+                    values[1]
+                        .as_f64()
+                        .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.3}")),
+                )
+            })
+            .unwrap_or_else(|| "unmeasured".to_owned());
+        lines.push(format!(
+            "variation experiment={} case={} complete_pairs={} run_variation={} observed_elapsed_effect_percent={} within_run_events attempts={} native_runs={} rounds={} tool_operations={}",
+            group["experiment_id"].as_str().unwrap_or(""),
+            group["case_id"]
+                .as_str()
+                .unwrap_or("")
+                .replace('|', "\\|")
+                .replace('\n', " "),
+            group["complete_pairs"],
+            group["run_variation"].as_str().unwrap_or("unmeasured"),
+            range,
+            group["within_run_events"]["attempts"],
+            group["within_run_events"]["native_runs"],
+            group["within_run_events"]["rounds"],
+            group["within_run_events"]["tool_operations"],
+        ));
     }
     let accounting = &report["accounting"];
     lines.push(String::new());

@@ -248,6 +248,97 @@ fn malformed_oversized_and_duplicate_inputs_fail_privately_without_mutation() {
 }
 
 #[test]
+fn complete_pair_variation_is_not_manufactured_from_within_run_events() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("variation.json");
+    let paired = |id: &str, arm: &str, pair_id: &str, end: f64, events: u64| {
+        let mut row = faster(attempt(id, arm), end);
+        row["experiment_id"] = json!("exp-1");
+        row["pair_id"] = json!(pair_id);
+        row["native_runs"][0]["rounds"] = json!(events);
+        row["native_runs"][0]["tool_operations"] = json!(events);
+        row
+    };
+
+    // One complete pair whose arms each carry a thousand dependent events:
+    // variation stays unmeasured and the events stay events.
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([
+            paired("b1", "baseline", "p1", 10.0, 500),
+            paired("c1", "candidate", "p1", 8.0, 500)
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let group = &report["variation"][0];
+    assert_eq!(group["experiment_id"], "exp-1");
+    assert_eq!(group["complete_pairs"], 1);
+    assert_eq!(group["run_variation"], "unmeasured");
+    assert!(group["observed_elapsed_effect_percent"].is_null());
+    assert_eq!(group["within_run_events"]["attempts"], 2);
+    assert_eq!(group["within_run_events"]["native_runs"], 2);
+    assert_eq!(group["within_run_events"]["rounds"], 1000);
+    assert_eq!(group["within_run_events"]["tool_operations"], 1000);
+    assert!(
+        group["basis"]
+            .as_str()
+            .unwrap()
+            .contains("not replications")
+    );
+
+    // Two complete pairs expose a descriptive observed range only.
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([
+            paired("b1", "baseline", "p1", 10.0, 1),
+            paired("c1", "candidate", "p1", 8.0, 1),
+            paired("b2", "baseline", "p2", 10.0, 1),
+            paired("c2", "candidate", "p2", 9.5, 1)
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let group = &report["variation"][0];
+    assert_eq!(group["complete_pairs"], 2);
+    assert_eq!(group["run_variation"], "observed-pairs");
+    assert_eq!(group["observed_elapsed_effect_percent"], json!([5.0, 20.0]));
+    assert_eq!(group["within_run_events"]["attempts"], 4);
+    assert_eq!(report["units"].as_array().unwrap().len(), 2);
+    // A pair identity scopes comparability: edges crossing the two declared
+    // pairs are listed but excluded, never counted as evidence for either.
+    assert!(
+        report["comparisons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|pair| pair["excluded_reasons"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default())
+            .any(|reason| reason == json!("different_declared_unit")),
+        "{}",
+        report["comparisons"]
+    );
+
+    let markdown = run(&input, true);
+    assert!(markdown.status.success());
+    let text = String::from_utf8(markdown.stdout).unwrap();
+    assert!(text.contains("variation experiment=exp-1"), "{text}");
+    assert!(text.contains("complete_pairs=2"), "{text}");
+}
+
+#[test]
 fn subtractive_consumption_and_retained_checks_survive_the_cli() {
     let root = tempfile::tempdir().unwrap();
     let input = root.path().join("subtractive.json");
