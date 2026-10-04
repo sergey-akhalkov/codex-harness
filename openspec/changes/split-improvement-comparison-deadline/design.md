@@ -8,7 +8,14 @@ Split at a stable module boundary into two targets sharing fixture code through 
 
 ## Experiment selection
 
-Method: paired-implementations. Claim: local-operation. Outcome: workload acceptance wall time. Rationale: the mechanism (per-command runtime above the deadline) manifests deterministically whenever the linked workload's verification runs the full suite; a paired same-task implementation measures the effect on real agent work. Controls: unchanged inputs, one measured attempt per arm, serialized arms, nuisance plan frozen before results. Projection: removes one forced split plus one repeated setup/queue wait per full-suite verification. Baseline: the unsplit target at the same base revision. Stopping: one predeclared matched pair; failures retained.
+Method: paired-implementations
+Claim: local-operation
+Outcome: workload acceptance wall time
+Rationale: the per-command deadline overrun manifests deterministically whenever the workload agent verifies against the full comparison coverage, so a paired same-task implementation measures the effect on real agent work
+Controls: unchanged frozen task inputs and oracle, one measured attempt per arm, serialized arms, nuisance plan frozen before results
+Projection: removes one forced split plus one repeated setup and queue wait per full-suite verification
+Baseline: the unsplit target at the same base revision
+Stopping: one predeclared matched pair, failures retained without retry
 
 ## Risks
 

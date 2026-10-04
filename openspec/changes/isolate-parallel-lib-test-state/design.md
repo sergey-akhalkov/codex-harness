@@ -8,7 +8,14 @@ Reproduce first: run the recorded failing filter in parallel until a failure rec
 
 ## Experiment selection
 
-Method: paired-implementations. Claim: local-operation. Outcome: workload acceptance wall time. Rationale: the workload is a real defect fix whose acceptance is real suite execution; measuring its completion time under both harnesses requires implementing it independently in each arm. Controls: identical frozen task inputs and oracle, one attempt per arm, serialized arms, nuisance plan frozen before results. Projection: none claimed for the harness arms; the comparison measures whether candidate A changes workload completion time. Baseline: unsplit baseline harness. Stopping: one predeclared matched pair; a failed oracle fails the arm without retry.
+Method: paired-implementations
+Claim: local-operation
+Outcome: workload acceptance wall time
+Rationale: the workload is a real defect fix whose acceptance is real suite execution, so measuring its completion time under both harnesses requires implementing it independently in each arm
+Controls: identical frozen task inputs and oracle, one attempt per arm, serialized arms, nuisance plan frozen before results
+Projection: none claimed for the harness arms, the comparison measures whether candidate A changes workload completion time
+Baseline: the unsplit baseline harness at the same base revision
+Stopping: one predeclared matched pair, a failed oracle fails the arm without retry
 
 ## Risks
 
