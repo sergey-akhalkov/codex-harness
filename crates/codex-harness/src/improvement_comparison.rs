@@ -45,6 +45,7 @@ use harness_core::outcome_qualification::{
 use harness_core::outcome_report::{MATCH_FIELDS, summarize_attempts};
 use harness_core::rollout_reader;
 use harness_core::task_worktree;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -60,6 +61,9 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_GIT_OUTPUT: usize = 1024 * 1024;
 const MAX_ORACLE_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_ROLLOUT_ENTRIES: usize = 100_000;
+
+/// The retained frozen supervisor identity of one comparison window.
+const SUPERVISOR_FILE: &str = "supervisor.json";
 
 fn now_seconds() -> f64 {
     SystemTime::now()
@@ -447,6 +451,15 @@ fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
             return Ok(false);
         }
     };
+    // A candidate that can rewrite its own decision policy could weaken the
+    // acceptance it is measured against. The declared policy file must stay
+    // outside the candidate's writable scope, exactly as the run's own
+    // supervisor gate protects the run state, the planning artifacts and the
+    // independent oracle from candidate writes.
+    if let Err(reason) = policy_outside_candidate_reach(run, &comparison) {
+        block(run, notes, reason)?;
+        return Ok(false);
+    }
     let state = match run.cursor.comparison.clone() {
         Some(state) => {
             if state.schema != COMPARISON_STATE_SCHEMA {
@@ -518,6 +531,16 @@ fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
             return Ok(false);
         }
     };
+    // The supervisor that runs the oracle, applies the policy and owns every
+    // effect is frozen for the whole comparison window. A candidate whose
+    // diff touches controller, evaluator, oracle, policy or check components
+    // still runs beneath this exact unchanged supervisor; a changed, missing
+    // or unreadable identity refuses instead of being re-frozen.
+    if let Err(reason) = freeze_or_verify_supervisor(run, &comparison, state.prepared_ms.is_some())
+    {
+        block(run, notes, reason)?;
+        return Ok(false);
+    }
     // Exact build provenance through the existing build/source owners: the
     // baseline runtime must be the frozen base source and the candidate
     // runtime the ready candidate checkout. A swapped, unrelated or
@@ -865,6 +888,37 @@ fn verify_observation_inputs(comparison: &ComparisonInputs) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// The declared comparison policy must stay outside the candidate's writable
+/// scope: a candidate that can rewrite its own decision policy could weaken
+/// the acceptance it is measured against. Mirrors the run's own
+/// `RunSpec::supervisor_gate` overlap semantics for the policy input, which
+/// the gate itself does not cover (it protects the run state, the planning
+/// artifacts and the oracle reference).
+fn policy_outside_candidate_reach(run: &Run, comparison: &ComparisonInputs) -> Result<(), String> {
+    let policy = overlap_path(&comparison.policy);
+    for entry in &run.spec.writable_scope {
+        let scope = overlap_path(&run.spec.project.join(entry));
+        if policy.starts_with(&scope) || scope.starts_with(&policy) {
+            return Err(format!(
+                "the declared comparison policy {} lies inside the candidate's writable scope {entry}; the candidate cannot rewrite its own decision policy, so the policy must be declared outside candidate reach",
+                comparison.policy.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A canonical form for path-overlap checks. Existing components resolve;
+/// missing ones stay absolute so an overlap is still recognized before the
+/// path exists. The Windows verbatim prefix is removed so both sides compare
+/// in the same shape whether or not they already exist.
+fn overlap_path(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let resolved = fs::canonicalize(&absolute).unwrap_or(absolute);
+    let text = resolved.to_string_lossy();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned())
 }
 
 fn verify_consumed_file(
@@ -2535,6 +2589,101 @@ struct Acceptance {
     workspace_preparation: String,
 }
 
+/// The frozen identity of the supervisor process that owns one comparison
+/// window: the executable that runs the independent oracle and applies the
+/// predeclared policy. It is recorded before the first measured dispatch and
+/// verified at every oracle use, so a candidate that changes controller,
+/// evaluator, oracle, policy or check components still runs beneath the
+/// unchanged supervisor that declared the run. The record also binds the
+/// frozen acceptance request digest the supervisor runs the oracle with, so
+/// both frozen identities travel together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SupervisorRecord {
+    schema: u32,
+    executable: PathBuf,
+    executable_sha256: String,
+    acceptance_request_sha256: String,
+    recorded_ms: u64,
+}
+
+fn supervisor_record_path(run: &Run) -> PathBuf {
+    run.store.comparison_dir().join(SUPERVISOR_FILE)
+}
+
+/// The running supervisor's own executable identity.
+fn supervisor_identity() -> Result<(PathBuf, String), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("the supervisor executable is unavailable: {error}"))?;
+    let executable = fs::canonicalize(&executable).unwrap_or(executable);
+    let sha256 = build_identity::hash_file(&executable)
+        .map_err(|error| format!("the supervisor executable is unreadable: {error}"))?;
+    Ok((executable, sha256))
+}
+
+/// Freeze the supervisor identity on the first preparation of the comparison
+/// window and verify it on every later one. `prepared` is true once the
+/// comparison recorded its preparation; a missing record then refuses instead
+/// of being re-frozen, so deleting or replacing the frozen identity cannot
+/// swap the supervisor mid-experiment.
+fn freeze_or_verify_supervisor(
+    run: &Run,
+    comparison: &ComparisonInputs,
+    prepared: bool,
+) -> Result<(), String> {
+    let path = supervisor_record_path(run);
+    if !path.is_file() {
+        if prepared {
+            return Err(format!(
+                "the frozen supervisor identity {} is missing from the prepared comparison; the unchanged supervisor cannot be established and a fresh declaration is required",
+                path.display()
+            ));
+        }
+        let (executable, executable_sha256) = supervisor_identity()?;
+        let record = SupervisorRecord {
+            schema: 1,
+            executable,
+            executable_sha256,
+            acceptance_request_sha256: comparison.acceptance.request_sha256.to_ascii_lowercase(),
+            recorded_ms: now_ms(),
+        };
+        return write_json_atomic(&path, &record).map_err(|error| {
+            format!(
+                "the frozen supervisor identity could not be retained at {}: {error}",
+                path.display()
+            )
+        });
+    }
+    let record: SupervisorRecord = read_json(&path, 64 * 1024)
+        .map_err(|error| format!("the frozen supervisor identity is unreadable: {error}"))?;
+    if record.schema != 1 {
+        return Err(format!(
+            "the frozen supervisor identity declares unsupported schema {}",
+            record.schema
+        ));
+    }
+    let (executable, executable_sha256) = supervisor_identity()?;
+    if !record
+        .executable_sha256
+        .eq_ignore_ascii_case(&executable_sha256)
+        || !same_file_path(&record.executable, Some(executable.as_path()))
+    {
+        return Err(format!(
+            "the supervisor executable changed since the comparison window was frozen (recorded {}, running {}); a controller or evaluation-targeting candidate must run beneath the unchanged supervisor, so no oracle result enters this comparison",
+            sha16(&record.executable_sha256),
+            sha16(&executable_sha256)
+        ));
+    }
+    if record.acceptance_request_sha256 != comparison.acceptance.request_sha256.to_ascii_lowercase()
+    {
+        return Err(
+            "the frozen acceptance request binding changed since the comparison window was frozen; the unchanged supervisor cannot be established and a fresh run is required"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Materialize the committed solution into the frozen acceptance workspace
 /// and run the unchanged supervisor's real-task oracle entry point with the
 /// frozen request bytes. The record is retained before its outcome is used.
@@ -2561,6 +2710,13 @@ fn run_oracle(
             "the prepared acceptance workspace is not the frozen request's case_root".to_owned(),
         );
     }
+    // The unchanged supervisor is verified immediately before the oracle
+    // runs: a candidate whose diff touches controller or evaluation
+    // components is still assessed by the frozen entry point, and a swapped
+    // or missing supervisor identity refuses instead of producing a result.
+    freeze_or_verify_supervisor(run, comparison, true).map_err(|reason| {
+        format!("the unchanged supervisor is required to evaluate this candidate: {reason}")
+    })?;
     let checkout = solution.checkout.to_string_lossy().into_owned();
     git(
         &workspace,
