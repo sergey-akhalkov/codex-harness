@@ -5894,3 +5894,714 @@ fn a_policy_rewrite_after_its_declaration_is_refused() {
         "{output}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// One short real-operation comparison through the controller.
+//
+// The predeclared selection is `method=real-operation` `claim=local-operation`:
+// each measured arm executes the declared operation program through the real
+// heavy-command route inside its own frozen checkout and with its own prepared
+// runtime. The operation itself runs a real build/check cycle (Cargo over a
+// frozen crate, unchanged-input reuse, changed-input invalidation, the built
+// binary's output) and the arm's own runtime emits the workload result the
+// frozen checker verifies independently. No model conversation is opened.
+// ---------------------------------------------------------------------------
+
+/// The declared real operation: one real build/check cycle over the frozen
+/// crate, plus the arm runtime's own workload result. It exits nonzero on a
+/// genuine failure (a build that does not compile, a missing reuse or a wrong
+/// built output); no counter is simulated anywhere in the cycle.
+const SHORT_OPERATION_SOURCE: &str = r##"
+use std::{env, fs, path::{Path, PathBuf}, process::{Command, exit}};
+
+struct BuildReport {
+    compiled: bool,
+    fresh: usize,
+    binaries: usize,
+}
+
+fn build(crate_dir: &Path, target: &Path) -> Option<BuildReport> {
+    let out = Command::new("cargo")
+        .args(["build", "--offline", "--message-format=json"])
+        .current_dir(crate_dir)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        eprintln!("cargo build failed: {}", String::from_utf8_lossy(&out.stderr));
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut compiled = false;
+    let mut fresh = 0usize;
+    let mut binaries = 0usize;
+    for line in stdout.lines() {
+        if !line.contains("compiler-artifact") {
+            continue;
+        }
+        if line.contains("\"fresh\":true") {
+            fresh += 1;
+        } else if line.contains("\"fresh\":false") {
+            compiled = true;
+        }
+        if line.contains("\"executable\":\"") {
+            binaries += 1;
+        }
+    }
+    Some(BuildReport { compiled, fresh, binaries })
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let fail_build = args.iter().any(|arg| arg == "--fail-build");
+    let mut values = args.iter().filter(|arg| *arg != "--fail-build");
+    let workspace = PathBuf::from(values.next().cloned().unwrap_or_default());
+    let runtime = PathBuf::from(values.next().cloned().unwrap_or_default());
+    let target = PathBuf::from(values.next().cloned().unwrap_or_default());
+    let crate_dir = workspace.join("build");
+    let cargo_target = target.join("cargo");
+    if fail_build {
+        fs::write(crate_dir.join("src/main.rs"), "fn main() { this is not rust }\n")
+            .expect("the broken input is written");
+    }
+    let tool = runtime.join("codex-harness.exe");
+    if !tool.is_file() {
+        eprintln!("the arm runtime tool {} is missing", tool.display());
+        exit(5);
+    }
+    let emitted = Command::new(&tool).arg("solution").output().expect("the runtime tool runs");
+    if !emitted.status.success() {
+        eprintln!("the arm runtime tool failed");
+        exit(6);
+    }
+    let solution = String::from_utf8_lossy(&emitted.stdout).trim().to_owned();
+    let Some(first) = build(&crate_dir, &cargo_target) else { exit(7) };
+    if !first.compiled || first.binaries == 0 {
+        eprintln!("the first build compiled nothing");
+        exit(8);
+    }
+    let Some(second) = build(&crate_dir, &cargo_target) else { exit(9) };
+    if second.compiled || second.fresh == 0 {
+        eprintln!(
+            "the unchanged-input build did not reuse the compilation (compiled={} fresh={})",
+            second.compiled, second.fresh
+        );
+        exit(10);
+    }
+    let source = crate_dir.join("src/main.rs");
+    let original = fs::read(&source).expect("the build source is readable");
+    let mut changed = original.clone();
+    changed.extend_from_slice(b"\n// invalidation probe\n");
+    fs::write(&source, &changed).expect("the build source is writable");
+    let Some(third) = build(&crate_dir, &cargo_target) else { exit(11) };
+    let restored = fs::write(&source, &original).is_ok();
+    if !third.compiled || !restored {
+        eprintln!("the changed-input build did not recompile or the source was not restored");
+        exit(12);
+    }
+    let binary = cargo_target.join("debug").join("short-operation-workload.exe");
+    let run = Command::new(&binary).output().expect("the built binary runs");
+    let printed = String::from_utf8_lossy(&run.stdout).trim().to_owned();
+    if printed != "workload-ok" {
+        eprintln!("the built binary printed {printed:?}");
+        exit(13);
+    }
+    fs::write(workspace.join("solution.txt"), format!("{solution}\n"))
+        .expect("the workload result is written");
+    fs::write(
+        target.join("report.json"),
+        format!(
+            "{{\"first_compiled\":{},\"second_compiled\":{},\"second_fresh\":{},\"third_compiled\":{}}}\n",
+            first.compiled, second.compiled, second.fresh, third.compiled
+        ),
+    )
+    .expect("the operation report is written");
+    println!("operation-report written");
+}
+"##;
+
+/// The predeclared comparison policy of the short real-operation fixture.
+fn short_operation_policy() -> Value {
+    use harness_core::improvement_policy::{
+        EffectPath, ExperimentMethod, ExperimentSelection, experiment_selection_clause,
+    };
+    let selection = ExperimentSelection {
+        method: ExperimentMethod::RealOperation,
+        claim: EffectPath::LocalOperation,
+        outcome: "the declared build/check cycle is measured in both variants".to_owned(),
+        rationale: "the chosen unit exercises the claimed local build mechanism".to_owned(),
+        controls: "frozen inputs, one predeclared pair and the accepted baseline conditions"
+            .to_owned(),
+        projection: "one bounded experiment and bounded retention cost".to_owned(),
+        baseline: "the accepted revision excluding the candidate edit".to_owned(),
+        stopping:
+            "stop after the declared attempts and escalate only for a named missing observation"
+                .to_owned(),
+    };
+    json!({
+        "schema": 1,
+        "objective": "time",
+        "basis": "efficiency",
+        "meaningfulEffectPercent": 10.0,
+        "tolerancePercent": 5.0,
+        "requireAcceptance": true,
+        "taskMix": "one frozen build/check workload",
+        "stopping": {"maxAttemptsPerArm": 1, "requiredUnits": 1},
+        "repeatedSelection": "predeclared",
+        "tradeOff": null,
+        "uncertainty": format!(
+            "unknown evidence stays inconclusive; {}",
+            experiment_selection_clause(&selection)
+        ),
+        "horizonTasks": 1.0,
+        "overhead": {
+            "implementationSeconds": 0.0,
+            "evaluationSeconds": 0.0,
+            "maintenanceSecondsPerTask": 0.0,
+        },
+    })
+}
+
+/// One resume that runs the direct operation under an owned isolated heavy
+/// account, so the real admitted build is independent of shared contention.
+fn resume_short_operation(fixture: &Fixture) -> Output {
+    let heavy = fixture
+        .root
+        .join("heavy-account")
+        .to_string_lossy()
+        .into_owned();
+    let cpu = fixture
+        .root
+        .join("cpu-account")
+        .to_string_lossy()
+        .into_owned();
+    fixture.improve_with_env(
+        &["resume", "--run", fixture.run.to_str().unwrap()],
+        &[
+            ("CODEX_HARNESS_HEAVY_ACCOUNT", &heavy),
+            ("CODEX_HARNESS_CPU_ACCOUNT", &cpu),
+        ],
+    )
+}
+
+/// The short real-operation fixture: a frozen build crate, two real arm
+/// runtime tools whose workload results differ, the compiled declared
+/// operation and the predeclared real-operation selection.
+fn short_operation_fixture(
+    name: &str,
+    baseline_solution: &str,
+    candidate_solution: &str,
+    operation_arguments: &[&str],
+) -> (Fixture, task_worktree::CandidateCheckout) {
+    let fixture = Fixture::new(name);
+    // The frozen workload carries a real build/check crate the declared
+    // operation compiles through the real Cargo owner.
+    fs::create_dir_all(fixture.wl.join("build/src")).unwrap();
+    fs::write(
+        fixture.wl.join("build/Cargo.toml"),
+        "[package]\nname = \"short-operation-workload\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.wl.join("build/src/main.rs"),
+        "fn main() {\n    println!(\"workload-ok\");\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.wl.join("build/Cargo.lock"),
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"short-operation-workload\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    git(&fixture.wl, &["add", "."]);
+    git(
+        &fixture.wl,
+        &["commit", "-qm", "add the workload build crate"],
+    );
+    let revision = git_output(&fixture.wl, &["rev-parse", "HEAD"]);
+    let mut spec: Value = load_json(&fixture.spec);
+    // The run keeps its declared local runner (the conversation route's
+    // route); this comparison's direct-operation selection opens no
+    // conversation, so the route is declared but never executed, and the
+    // absent qualification record proves the short path triggers no
+    // unrelated model qualification.
+    spec["comparison"]["task"]["revision"] = json!(revision);
+    spec["qualification"] = json!(fixture.root.join("absent-qualification.json"));
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+
+    // The declared measurement scope names the existing operation; the
+    // executable declaration binds exactly that identity.
+    let operation_identity = "cargo build --offline --manifest-path build/Cargo.toml";
+    let scope = json!({
+        "observed_problem": "the unchanged build repeats compilation",
+        "investigation_scope": "one frozen build/check cycle at this revision",
+        "measurement_question": "does the real cycle reuse unchanged input?",
+        "workload": {
+            "operation": operation_identity,
+            "contract": "openspec/changes/add-workload/proposal.md#Measurement",
+        },
+        "evidence_references": ["retained operation report of the declared build/check cycle"],
+        "limits": "one local fixture and one frozen revision",
+        "declaration_artifact": "proposal.md",
+        "declaration_heading": "## Measurement",
+    });
+    fs::write(
+        fixture.run.join("measurement-scope.json"),
+        serde_json::to_vec_pretty(&scope).unwrap(),
+    )
+    .unwrap();
+
+    let programs_root = fixture.root.join("short-operation-programs");
+    fs::create_dir_all(&programs_root).unwrap();
+    let operation = compile_fixture(&programs_root, "short-operation", SHORT_OPERATION_SOURCE);
+    let baseline_tool = compile_fixture(
+        &programs_root,
+        "baseline-tool",
+        &format!("fn main() {{ println!(\"{baseline_solution}\"); }}"),
+    );
+    let candidate_tool = compile_fixture(
+        &programs_root,
+        "candidate-tool",
+        &format!("fn main() {{ println!(\"{candidate_solution}\"); }}"),
+    );
+    fs::write(
+        fixture.run.join("operation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "identity": operation_identity,
+            "program": operation,
+            "arguments": operation_arguments,
+            "timeout_seconds": 600,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &fixture.policy,
+        serde_json::to_vec_pretty(&short_operation_policy()).unwrap(),
+    )
+    .unwrap();
+
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    let baseline_bytes = fs::read(&baseline_tool).unwrap();
+    let candidate_bytes = fs::read(&candidate_tool).unwrap();
+    fixture.prepare_identity_builds(&checkout, &baseline_bytes, &candidate_bytes);
+    fixture.start_with_ready_candidate(&checkout, false);
+    (fixture, checkout)
+}
+
+fn operation_arguments(extra: &[&str]) -> Vec<String> {
+    ["{workspace}", "{runtime}", "{target}"]
+        .iter()
+        .map(|value| (*value).to_owned())
+        .chain(extra.iter().map(|value| (*value).to_owned()))
+        .collect()
+}
+
+/// The full short path: the directed-measurement gate admits the run, both
+/// arms execute the declared real operation (a genuine build/check cycle
+/// with unchanged-input reuse, changed-input invalidation and a real built
+/// output), the frozen checker independently accepts the baseline and fails
+/// the candidate's wrong workload result, the decision is published and the
+/// rejected candidate leaves the accepted baseline unchanged with every
+/// artifact retained. No model conversation is opened anywhere.
+#[test]
+fn a_short_real_operation_pair_reaches_a_supported_rejection_and_restores_the_baseline() {
+    let _serial = INSTALL.lock().unwrap();
+    let (fixture, checkout) = short_operation_fixture(
+        "short-operation",
+        "solved",
+        "broken",
+        &["{workspace}", "{runtime}", "{target}"],
+    );
+    let head_before = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let resumed = resume_short_operation(&fixture);
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    assert!(
+        output.contains("direct operation completed through the real heavy-command route"),
+        "{output}"
+    );
+    // The directed initial-measurement gate admitted the run before any arm
+    // ran, and its receipt binds the declared operation the arms executed.
+    let measurement = load_json(&fixture.run.join("measurement-receipt.json"));
+    assert_eq!(
+        measurement["scope"]["workload"]["operation"],
+        "cargo build --offline --manifest-path build/Cargo.toml",
+        "{measurement}"
+    );
+    // The declared model qualification record is absent, yet both measured
+    // arms ran: the direct-operation unit performs no model dispatch and
+    // requires no unrelated model qualification.
+    assert!(!fixture.root.join("absent-qualification.json").exists());
+
+    // Both measured arms are real executions with genuine retained outputs.
+    for (arm, expected_exit) in [("baseline", 0), ("candidate", 0)] {
+        let receipt = load_json(&fixture.arm_dir(arm).join("operation-receipt.json"));
+        assert_eq!(receipt["arm"], json!(arm), "{receipt}");
+        assert_eq!(receipt["method"], "real-operation", "{receipt}");
+        assert_eq!(
+            receipt["workspace"].as_str().unwrap_or_default(),
+            fixture
+                .arm_dir(arm)
+                .join("checkout")
+                .to_string_lossy()
+                .as_ref(),
+            "{receipt}"
+        );
+        assert_eq!(receipt["status"], "exited", "{receipt}");
+        assert_eq!(receipt["exit_code"], json!(expected_exit), "{receipt}");
+        assert_eq!(receipt["model_calls"], 0, "{receipt}");
+        assert_eq!(receipt["model_metrics"], "inapplicable", "{receipt}");
+        assert!(
+            receipt["elapsed_seconds"].as_f64().unwrap_or(0.0) > 0.0,
+            "the execution time is the heavy owner's measured wall clock: {receipt}"
+        );
+        assert_eq!(
+            receipt["program_sha256"].as_str().unwrap_or_default().len(),
+            64,
+            "{receipt}"
+        );
+        let stdout = receipt["admitted"]["streams"]["stdout"]["path"]
+            .as_str()
+            .expect("retained stdout");
+        assert!(Path::new(stdout).is_file(), "{receipt}");
+        let report = fs::read_to_string(
+            fixture
+                .arm_dir(arm)
+                .join("operation-target")
+                .join("report.json"),
+        )
+        .expect("the operation's own report is retained");
+        assert!(report.contains("\"second_fresh\":1"), "{arm}: {report}");
+        assert!(
+            report.contains("\"first_compiled\":true"),
+            "{arm}: {report}"
+        );
+        assert!(
+            report.contains("\"third_compiled\":true"),
+            "the changed input genuinely recompiled: {arm}: {report}"
+        );
+    }
+
+    // Independent acceptance through the frozen oracle: the baseline's real
+    // build/check result passes; the candidate's wrong workload result fails.
+    let baseline_oracle = load_json(&fixture.arm_dir("baseline").join("oracle.json"));
+    let candidate_oracle = load_json(&fixture.arm_dir("candidate").join("oracle.json"));
+    assert_eq!(
+        baseline_oracle["checker_executed"], true,
+        "{baseline_oracle}"
+    );
+    assert_eq!(baseline_oracle["passed"], true, "{baseline_oracle}");
+    assert_eq!(
+        candidate_oracle["checker_executed"], true,
+        "{candidate_oracle}"
+    );
+    assert_eq!(candidate_oracle["passed"], false, "{candidate_oracle}");
+    // No duplicate feature implementation: the two arms executed the same
+    // existing operation, no workload implementation was carried, and no
+    // fabricated implementation record was written to either hypothesis card.
+    for card in [&fixture.card, &fixture.workload_card] {
+        let comments =
+            harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, card).unwrap();
+        assert!(
+            comments
+                .iter()
+                .all(|comment| !comment.starts_with("hypothesis-implementation")),
+            "{card}: {comments:?}"
+        );
+    }
+
+    // The comparison decided and the rejection was consumed: the accepted
+    // baseline is unchanged, nothing was integrated or activated, and the
+    // candidate, its failed acceptance and the measured scope stay retained.
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "idle", "{status}\n{output}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("leaves the baseline unchanged"),
+        "{status}"
+    );
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], false,
+        "{status}"
+    );
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        head_before
+    );
+    assert!(
+        checkout.path.is_dir(),
+        "the candidate checkout is preserved"
+    );
+    let lineage = load_json(&fixture.run.join("lineage.json"));
+    assert_eq!(lineage["decision"], "reject", "{lineage}");
+    let reconcile = load_json(&fixture.run.join("reconcile.json"));
+    assert_eq!(reconcile["outcome"], "reject", "{reconcile}");
+    assert!(
+        fixture.proj.join("openspec/changes/add-synthetic").is_dir(),
+        "an unadopted change is never synchronized into the main specs"
+    );
+    assert!(fixture.run.join("comparison/decision.json").is_file());
+    assert!(fixture.run.join("comparison/report.json").is_file());
+    assert!(fixture.run.join("comparison/evaluation.json").is_file());
+
+    // No conversation was opened and no model work ran for any phase.
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["attempts"].as_array().unwrap().is_empty(),
+        "the short path requires no model conversation: {cursor}"
+    );
+    assert!(
+        cursor["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|effect| effect["kind"].as_str().unwrap_or_default() != "dispatch-accepted"),
+        "no conversation is ever dispatched on the direct-operation route: {cursor}"
+    );
+    assert!(
+        cursor["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|effect| effect["kind"].as_str().unwrap_or_default() != "comparison-arm-refused"),
+        "{cursor}"
+    );
+    let baseline_receipt =
+        fs::read(fixture.arm_dir("baseline").join("operation-receipt.json")).unwrap();
+    // A repeated resume reuses the retained executions and publishes nothing
+    // new: unchanged input never replays a completed operation.
+    let again = resume_short_operation(&fixture);
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        fs::read(fixture.arm_dir("baseline").join("operation-receipt.json")).unwrap(),
+        baseline_receipt,
+        "the retained baseline execution is reused, never replayed"
+    );
+    let effects = fixture.cursor()["effects"].as_array().unwrap().clone();
+    let count = |kind: &str| {
+        effects
+            .iter()
+            .filter(|effect| effect["kind"] == kind)
+            .count()
+    };
+    assert_eq!(count("comparison-arm-accepted"), 2, "{effects:?}");
+    assert_eq!(count("comparison-decision-recorded"), 1, "{effects:?}");
+}
+
+/// A settled arm is reused while all declared inputs match, and a rewritten
+/// operation declaration refuses reuse with the exact changed field: the
+/// retained execution is preserved and remeasurement is required rather than
+/// silently reusing evidence that no longer binds the run's declaration.
+#[test]
+fn a_settled_short_operation_is_reused_only_while_its_declared_inputs_match() {
+    let _serial = INSTALL.lock().unwrap();
+    let (fixture, _checkout) = short_operation_fixture(
+        "short-operation-reuse",
+        "solved",
+        "solved",
+        &["{workspace}", "{runtime}", "{target}"],
+    );
+    let first = resume_short_operation(&fixture);
+    assert!(first.status.success(), "{}", text(&first));
+    let baseline_path = fixture.arm_dir("baseline").join("operation-receipt.json");
+    let baseline_receipt = fs::read(&baseline_path).unwrap();
+    assert!(
+        !fixture
+            .arm_dir("candidate")
+            .join("operation-receipt.json")
+            .is_file(),
+        "one arm is executed per advance"
+    );
+
+    // Unchanged inputs: the retained baseline execution is reused and only
+    // the candidate's own operation runs.
+    let second = resume_short_operation(&fixture);
+    assert!(second.status.success(), "{}", text(&second));
+    assert_eq!(
+        fs::read(&baseline_path).unwrap(),
+        baseline_receipt,
+        "unchanged inputs reuse the retained execution"
+    );
+    assert!(
+        fixture
+            .arm_dir("candidate")
+            .join("operation-receipt.json")
+            .is_file()
+    );
+
+    // A rewritten declaration cannot reuse the completed candidate: the
+    // exact changed field is named and the retained result is untouched.
+    let declaration_path = fixture.run.join("operation.json");
+    let original = fs::read(&declaration_path).unwrap();
+    let mut declaration: Value = serde_json::from_slice(&original).unwrap();
+    declaration["arguments"] = json!(operation_arguments(&["--redeclared"]));
+    fs::write(
+        &declaration_path,
+        serde_json::to_vec_pretty(&declaration).unwrap(),
+    )
+    .unwrap();
+    let candidate_path = fixture.arm_dir("candidate").join("operation-receipt.json");
+    let candidate_receipt = fs::read(&candidate_path).unwrap();
+    let third = resume_short_operation(&fixture);
+    let output = text(&third);
+    assert!(third.status.success(), "{output}");
+    assert!(output.contains("cannot be reused"), "{output}");
+    assert!(output.contains("arguments"), "{output}");
+    assert_eq!(
+        fs::read(&candidate_path).unwrap(),
+        candidate_receipt,
+        "the retained execution is preserved, never replayed"
+    );
+    assert!(
+        !fixture
+            .run
+            .join("comparison")
+            .join("decision.json")
+            .is_file(),
+        "changed conditions publish no decision"
+    );
+
+    // Restoring the exact declaration revalidates the retained executions
+    // and the pair settles without remeasurement.
+    fs::write(&declaration_path, &original).unwrap();
+    let fourth = resume_short_operation(&fixture);
+    assert!(fourth.status.success(), "{}", text(&fourth));
+    assert!(fixture.run.join("comparison/decision.json").is_file());
+    assert_eq!(fs::read(&baseline_path).unwrap(), baseline_receipt);
+    assert_eq!(fs::read(&candidate_path).unwrap(), candidate_receipt);
+    // Both arms passed their independent checks, yet the model-free unit
+    // cannot support an adoption: the current outcome accounting only forms a
+    // comparable pair when the model dimensions are known, and this method
+    // reports them as inapplicable rather than as a measured zero. The
+    // resulting verdict is an evidence-bound inconclusive that names the
+    // exact reason; no efficiency adoption is fabricated from a component-only
+    // operation.
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    assert_eq!(
+        decision["decision"], "inconclusive",
+        "{decision}\n{evaluation}"
+    );
+    assert!(
+        evaluation["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .unwrap_or_default()
+                .contains("no matched, independently accepted unit")),
+        "the non-adoption names the exact evaluator limit: {evaluation}"
+    );
+    assert_eq!(
+        evaluation["acceptedTasks"], 2,
+        "both real operations were independently accepted: {evaluation}"
+    );
+    assert_eq!(
+        evaluation["coverage"].as_str().unwrap_or_default(),
+        "none; complete-pairs:0; variation:unmeasured",
+        "the unmeasured model dimensions are visible limits, never measured zero: {evaluation}"
+    );
+    let effects = fixture.cursor()["effects"].as_array().unwrap().clone();
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| effect["kind"] == "comparison-arm-accepted")
+            .count(),
+        2,
+        "exactly one executed settlement per arm: {:?}",
+        fixture.cursor()
+    );
+}
+
+/// A failed real operation is retained with its own exit status and streams,
+/// the comparison stops without a decision, and a resumed pass never replays
+/// the failed execution.
+#[test]
+fn a_failed_short_operation_is_retained_and_never_replayed() {
+    let _serial = INSTALL.lock().unwrap();
+    let (fixture, _checkout) = short_operation_fixture(
+        "short-operation-failure",
+        "solved",
+        "solved",
+        &["{workspace}", "{runtime}", "{target}", "--fail-build"],
+    );
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let first = resume_short_operation(&fixture);
+    let output = text(&first);
+    assert!(first.status.success(), "{output}");
+    assert!(output.contains("did not enter the comparison"), "{output}");
+
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "blocked", "{status}\n{output}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(condition.contains("exit_code"), "{condition}");
+    assert!(
+        status["comparison"]["baseline"]["condition"].is_string(),
+        "{status}"
+    );
+    // The genuine build failure is retained with its own exit status and the
+    // real Cargo failure output; no counter is simulated.
+    let receipt_path = fixture.arm_dir("baseline").join("operation-receipt.json");
+    let receipt = load_json(&receipt_path);
+    assert_eq!(receipt["status"], "exited", "{receipt}");
+    assert_ne!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["model_calls"], 0, "{receipt}");
+    let stderr_path = receipt["admitted"]["streams"]["stderr"]["path"]
+        .as_str()
+        .expect("retained stderr");
+    let stderr = fs::read_to_string(stderr_path).unwrap();
+    assert!(
+        stderr.contains("cargo build failed"),
+        "the failing build's own output is retained: {stderr}"
+    );
+    assert!(!fixture.arm_dir("baseline").join("oracle.json").is_file());
+    assert!(!fixture.run.join("comparison/decision.json").is_file());
+    assert!(
+        fixture.cursor()["attempts"].as_array().unwrap().is_empty(),
+        "{}",
+        fixture.cursor()
+    );
+
+    // A resumed pass re-reads the retained failure instead of replaying it.
+    let receipt_bytes = fs::read(&receipt_path).unwrap();
+    let second = resume_short_operation(&fixture);
+    let output = text(&second);
+    assert!(second.status.success(), "{output}");
+    assert_eq!(status_json_phase(&fixture), "blocked");
+    assert_eq!(
+        fs::read(&receipt_path).unwrap(),
+        receipt_bytes,
+        "the failed execution is never replayed"
+    );
+    assert_eq!(
+        fixture.cursor()["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|effect| effect["kind"] == "comparison-arm-accepted")
+            .count(),
+        0
+    );
+}
+
+fn status_json_phase(fixture: &Fixture) -> String {
+    fixture.status_json()["phase"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
