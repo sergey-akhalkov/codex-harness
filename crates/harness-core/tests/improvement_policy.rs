@@ -4,10 +4,12 @@
 //! claim, a synthetic statistic or a post-hoc threshold.
 use harness_core::improvement_policy::{
     AnalysisMethod, Basis, ClaimScope, ComparisonPolicy, DeclaredComparison, EffectPath,
-    ExperimentMethod, ExperimentSelection, MeasurementStatus, Objective, Overhead,
-    PerSuccessStatus, PolicyDecision, RepeatedSelection, StatisticalClaim, StoppingRule, TradeOff,
-    VariationStatus, evaluate, experiment_selection_clause, parse_experiment_selection,
-    parse_statistical_claim, refuse_cross_task_speed_claim, statistical_clause,
+    ExperimentMethod, ExperimentSelection, FaultRule, InitialState, LoadRule, MeasurementStatus,
+    NuisanceControlPlan, Objective, OrderRule, Overhead, PerSuccessStatus, PolicyDecision,
+    RealizedFirst, RepeatedSelection, RetryRule, SharedState, StatisticalClaim, StoppingRule,
+    TradeOff, VariationStatus, evaluate, experiment_selection_clause, nuisance_control_clause,
+    parse_experiment_selection, parse_nuisance_control, parse_statistical_claim,
+    refuse_cross_task_speed_claim, statistical_clause,
 };
 use harness_core::infrastructure_accounting::{Mechanism, MetricView, binding_clause};
 use harness_core::outcome_report::{
@@ -1143,6 +1145,454 @@ fn shared_costs_and_repeated_edges_count_once_and_drift_is_invalid() {
         "{:?}",
         evaluation.reasons
     );
+}
+
+// ---------------------------------------------------------------------------
+// Frozen nuisance-control plan for paired same-task runs.
+// ---------------------------------------------------------------------------
+
+fn nuisance_plan() -> NuisanceControlPlan {
+    NuisanceControlPlan {
+        initial: InitialState::OwnedCold,
+        recipe: None,
+        shared: SharedState::Unobserved,
+        order: OrderRule::Fixed,
+        seed: None,
+        pairs: None,
+        load: LoadRule::Recorded,
+        faults: FaultRule::ObservedEffect,
+        retries: RetryRule::PolicyStopping,
+    }
+}
+
+fn with_nuisance(mut policy: ComparisonPolicy) -> ComparisonPolicy {
+    policy.uncertainty = format!(
+        "unknown evidence stays inconclusive; {}",
+        nuisance_control_clause(&nuisance_plan())
+    );
+    policy
+}
+
+/// Attach the controller's observed nuisance record to one authoritative arm
+/// row, exactly as a measured arm of a plan-bound comparison carries it.
+fn nuisance_record(mut row: Value, realized: &str) -> Value {
+    let plan = nuisance_plan();
+    row["nuisance"] = json!({
+        "schema": 1,
+        "plan": plan.declaration(),
+        "order": {
+            "planned": realized,
+            "realized": realized,
+            "exposure": "the single pair runs one order; its exposure to time/order drift stays retained",
+        },
+        "initial": {
+            "declared": "owned-cold",
+            "observed": "empty-or-absent-owned-state",
+            "violated": false,
+            "condition_source": "observed-owned-state",
+        },
+        "load": {
+            "rule": "recorded",
+            "observed": {
+                "unrelated_wait": false,
+                "self_contention": false,
+                "admission_evidence": "unobserved",
+            },
+            "uncontrolled": true,
+        },
+        "faults": [],
+    });
+    row
+}
+
+fn plan_pair(baseline_seconds: f64, candidate_seconds: f64) -> Vec<Value> {
+    vec![
+        nuisance_record(
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                baseline_seconds,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            "baseline-first",
+        ),
+        nuisance_record(
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                candidate_seconds,
+                true,
+                Some(3),
+                Some(6),
+                true,
+            ),
+            "baseline-first",
+        ),
+    ]
+}
+
+#[test]
+fn a_nuisance_plan_is_frozen_and_cannot_loosen_its_conditions() {
+    let plan = nuisance_plan();
+    assert_eq!(plan.realized_first(), Some(RealizedFirst::BaselineFirst));
+    let clause = nuisance_control_clause(&plan);
+    let policy = with_nuisance(policy());
+    let declared = declare(&policy);
+    assert_eq!(
+        parse_nuisance_control(&declared.policy.uncertainty)
+            .unwrap()
+            .unwrap(),
+        plan
+    );
+    // The plan is part of the digested declaration: a changed plan cannot
+    // inherit an earlier adoption.
+    let mut changed = policy.clone();
+    changed.uncertainty = format!(
+        "unknown evidence stays inconclusive; {}",
+        nuisance_control_clause(&NuisanceControlPlan {
+            order: OrderRule::Randomized,
+            seed: Some(0),
+            ..plan.clone()
+        })
+    );
+    assert_ne!(declare(&changed).digest, declared.digest);
+    // A recorded attempt carries the frozen plan before results.
+    let declaration = declared.policy.declaration();
+    assert_eq!(declaration["nuisance_plan"]["shared"], json!("unobserved"));
+    assert_eq!(
+        declaration["nuisance_plan"]["realized_first"],
+        json!("baseline-first")
+    );
+    assert_eq!(
+        declaration["nuisance_plan"]["faults"],
+        json!("observed-effect")
+    );
+    assert_eq!(
+        declaration["nuisance_plan"]["retries"],
+        json!("policy-stopping")
+    );
+
+    // Every loosened or invented declaration is refused before results.
+    let refusal = |body: &str, needle: &str| {
+        let mut candidate = policy.clone();
+        candidate.uncertainty = format!("unknown evidence stays inconclusive; {body}");
+        let error = candidate
+            .declare()
+            .expect_err(&format!("{body} must be refused"))
+            .to_string();
+        assert!(error.contains(needle), "{body}: {error}");
+    };
+    refusal(
+        &clause.replace("shared=unobserved", "shared=observed"),
+        "not observed",
+    );
+    refusal(
+        &clause.replace("shared=unobserved", "shared=reset"),
+        "not observed",
+    );
+    refusal(
+        &clause.replace("load=recorded", "load=utilization-adjusted"),
+        "utilization",
+    );
+    refusal(
+        &clause.replace("faults=observed-effect", "faults=deduct-all"),
+        "observed effect",
+    );
+    refusal(
+        &clause.replace("retries=policy-stopping", "retries=best-of"),
+        "stopping rule",
+    );
+    refusal(
+        &clause.replace("; retries=policy-stopping", ""),
+        "incomplete",
+    );
+    refusal(&clause.replace("order=fixed", "order=randomized"), "seed");
+    refusal(
+        &clause.replace("order=fixed", "order=balanced"),
+        "repetition count",
+    );
+    refusal(
+        &clause.replace("order=fixed", "order=fixed; seed=7"),
+        "neither a seed",
+    );
+    refusal(
+        &clause.replace("initial=owned-cold", "initial=owned-prepared"),
+        "recipe token",
+    );
+    refusal(
+        &clause.replace(
+            "initial=owned-cold",
+            "initial=owned-cold; recipe=owner-install/v1",
+        ),
+        "only with an owned-prepared",
+    );
+    refusal(&format!("{clause}; undeclared=value"), "unknown field");
+    // Clause order stays fixed: nuisance-control follows the selection clause
+    // and precedes the infrastructure binding.
+    let selection = experiment_selection_clause(&ExperimentSelection {
+        method: ExperimentMethod::RealOperation,
+        claim: EffectPath::LocalOperation,
+        outcome: "the declared build cycle is measured on both arms".to_owned(),
+        rationale: "the unit exercises the claimed local mechanism".to_owned(),
+        controls: "frozen inputs with the declared nuisance-control plan".to_owned(),
+        projection: "one bounded experiment".to_owned(),
+        baseline: "the accepted revision excluding the candidate edit".to_owned(),
+        stopping: "stop after the declared attempts".to_owned(),
+    });
+    let mut ordered = policy.clone();
+    ordered.uncertainty = format!("{selection}; {}", nuisance_control_clause(&plan));
+    assert!(
+        ordered.declare().is_ok(),
+        "selection then nuisance is valid: {:?}",
+        ordered.declare().err()
+    );
+    let mut misordered = policy.clone();
+    misordered.uncertainty = format!("{}; {selection}", nuisance_control_clause(&plan));
+    assert!(
+        misordered.declare().is_err(),
+        "the nuisance clause must follow the selection clause"
+    );
+    let mut after_binding = policy.clone();
+    after_binding.uncertainty = format!(
+        "{}; {}",
+        binding_clause(MetricView::WorkEfficiency, Mechanism::None),
+        nuisance_control_clause(&plan)
+    );
+    assert!(
+        after_binding.declare().is_err(),
+        "the nuisance clause must precede the infrastructure binding"
+    );
+}
+
+#[test]
+fn a_warmed_second_arm_or_missing_observation_withholds_the_verdict() {
+    let policy = with_nuisance(policy());
+    let declared = declare(&policy);
+
+    // A complete, plan-bound pair may adopt: the plan adds no unavailable
+    // identity prerequisite and does not weaken the acceptance gate.
+    let compliant = summarize(&plan_pair(100.0, 85.0), &policy);
+    let evaluation = evaluate(&declared, &compliant).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.coverage.contains("nuisance-shared-unobserved"),
+        "{}",
+        evaluation.coverage
+    );
+
+    // The second arm started warmer than declared: the comparison is refused
+    // until corrected conditions are exercised, and the retained attempt is
+    // preserved.
+    let mut rows = plan_pair(100.0, 80.0);
+    rows[1]["nuisance"]["initial"]["observed"] = json!("non-empty-owned-scratch");
+    rows[1]["nuisance"]["initial"]["violated"] = json!(true);
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("violated the declared owned-cold initial state")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(report["attempts"].as_array().unwrap().len(), 2);
+
+    // A settled arm without the observed record cannot prove its declared
+    // conditions; the evidence gap withholds the verdict.
+    let mut rows = plan_pair(100.0, 80.0);
+    rows[1].as_object_mut().unwrap().remove("nuisance");
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not record its plan")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A realized order that differs from the predeclared rule is refused.
+    let mut rows = plan_pair(100.0, 80.0);
+    rows[0]["nuisance"]["order"]["realized"] = json!("candidate-first");
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("realized arm order")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn a_changed_trajectory_fault_is_not_repaired_by_elapsed_subtraction() {
+    let policy = with_nuisance(policy());
+    let declared = declare(&policy);
+    let mut rows = plan_pair(100.0, 70.0);
+    rows[1]["nuisance"]["faults"] = json!([{
+        "class": "changed-trajectory",
+        "detail": "a lost response was retried with changed context and work performed",
+    }]);
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("changed or unverified the response, context or work")),
+        "{:?}",
+        evaluation.reasons
+    );
+    // The original attempt, its usage and its failures stay recorded: no
+    // hypothetical fault-free trajectory replaces them.
+    let attempts = report["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[1]["native_runs"].is_array());
+    assert_eq!(
+        report["units"][0]["candidate_result"].as_str(),
+        Some("c1"),
+        "{report}"
+    );
+
+    let mut rows = plan_pair(100.0, 70.0);
+    rows[0]["nuisance"]["faults"] = json!([{
+        "class": "work-started-unverified",
+        "detail": "the observed conversation could not verify the declared work",
+    }]);
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+}
+
+#[test]
+fn recorded_background_contention_withholds_an_unbounded_verdict() {
+    let plain = with_nuisance(policy());
+    let declared = declare(&plain);
+
+    // Comparable recorded contention stays visible without inventing a
+    // correction; the declared effect still decides.
+    let mut rows = plan_pair(100.0, 85.0);
+    for row in &mut rows {
+        row["nuisance"]["load"]["observed"]["unrelated_wait"] = json!(true);
+        row["nuisance"]["load"]["observed"]["admission_evidence"] = json!("recorded");
+    }
+    let report = summarize(&rows, &plain);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert!(
+        evaluation
+            .coverage
+            .contains("nuisance-comparable-recorded-load"),
+        "{}",
+        evaluation.coverage
+    );
+
+    // Contention measured over exactly one arm without a declared
+    // work-efficiency binding cannot be waved away by a utilization guess.
+    let mut rows = plan_pair(100.0, 85.0);
+    rows[0]["nuisance"]["load"]["observed"]["unrelated_wait"] = json!(true);
+    rows[0]["nuisance"]["load"]["observed"]["admission_evidence"] = json!("recorded");
+    rows[1]["nuisance"]["load"]["observed"]["admission_evidence"] = json!("recorded");
+    let report = summarize(&rows, &plain);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation.reasons.iter().any(|reason| reason
+            .contains("unrelated external heavy command was measured over exactly one arm")),
+        "{:?}",
+        evaluation.reasons
+    );
+    // The raw evidence and the recorded load stay in the report.
+    assert!(report["attempts"][0]["nuisance"]["load"].is_object());
+
+    // With the declared work-efficiency binding the existing blocking
+    // adjustment bounds the eligible wait; the nuisance gate does not add a
+    // second, invented correction of its own.
+    let mut bound = with_nuisance(policy());
+    bound.uncertainty = format!(
+        "{}; {}",
+        bound.uncertainty,
+        binding_clause(MetricView::WorkEfficiency, Mechanism::None)
+    );
+    let declared = declare(&bound);
+    let mut rows = plan_pair(100.0, 85.0);
+    rows[0]["nuisance"]["load"]["observed"]["unrelated_wait"] = json!(true);
+    for row in &mut rows {
+        row["nuisance"]["load"]["observed"]["admission_evidence"] = json!("recorded");
+    }
+    let report = summarize(&rows, &bound);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert!(
+        evaluation
+            .coverage
+            .contains("nuisance-asymmetric-load-adjusted"),
+        "{}",
+        evaluation.coverage
+    );
+    assert!(
+        !evaluation.reasons.iter().any(|reason| reason
+            .contains("unrelated external heavy command was measured over exactly one arm")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn a_nuisance_plan_cannot_weaken_acceptance_identity_or_metric_gates() {
+    // The correctness gate and the declared experiment selection stay in
+    // force with a plan declared.
+    let mut invalid = with_nuisance(policy());
+    invalid.require_acceptance = false;
+    assert!(invalid.declare().is_err());
+    let mut invalid = with_nuisance(policy());
+    invalid.uncertainty = format!(
+        "unknown evidence stays inconclusive; {}; {}",
+        experiment_selection_clause(&ExperimentSelection {
+            method: ExperimentMethod::BoundedReplay,
+            claim: EffectPath::TaskStrategy,
+            outcome: "a smaller proxy stands in for the task".to_owned(),
+            rationale: "the declared plan cannot bypass the selection gate".to_owned(),
+            controls: "none".to_owned(),
+            projection: "one replay".to_owned(),
+            baseline: "the accepted revision".to_owned(),
+            stopping: "one attempt".to_owned(),
+        }),
+        nuisance_control_clause(&nuisance_plan())
+    );
+    assert!(
+        invalid.declare().is_err(),
+        "a proxy unit cannot replace the required full-task comparison"
+    );
+
+    // A faster candidate that fails independent acceptance is not adopted,
+    // whatever the plan records; proxy metrics never replace acceptance.
+    let policy = with_nuisance(policy());
+    let declared = declare(&policy);
+    let mut rows = plan_pair(100.0, 60.0);
+    rows[1]["checks"][0]["passed"] = json!(false);
+    rows[1]["checks"][0]["exit_code"] = json!(1);
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(evaluation.decision, PolicyDecision::Adopt);
 }
 
 /// One authoritative model-free attempt: the declared method executes no

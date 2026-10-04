@@ -6411,6 +6411,12 @@ fn a_settled_short_operation_is_reused_only_while_its_declared_inputs_match() {
         "solved",
         &["{workspace}", "{runtime}", "{target}"],
     );
+    // The reuse case is about retained executions, not about a margin: an
+    // unreachable declared effect makes the final verdict independent of the
+    // two operations' wall-clock noise while the accounting stays intact.
+    let mut policy = load_json(&fixture.policy);
+    policy["meaningfulEffectPercent"] = json!(1000.0);
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
     let first = resume_short_operation(&fixture);
     assert!(first.status.success(), "{}", text(&first));
     let baseline_path = fixture.arm_dir("baseline").join("operation-receipt.json");
@@ -6479,19 +6485,14 @@ fn a_settled_short_operation_is_reused_only_while_its_declared_inputs_match() {
     assert!(fixture.run.join("comparison/decision.json").is_file());
     assert_eq!(fs::read(&baseline_path).unwrap(), baseline_receipt);
     assert_eq!(fs::read(&candidate_path).unwrap(), candidate_receipt);
-    // Both arms passed their independent checks, yet the model-free unit
-    // cannot support an adoption: the current outcome accounting only forms a
-    // comparable pair when the model dimensions are known, and this method
-    // reports them as inapplicable rather than as a measured zero. The
-    // resulting verdict is an evidence-bound inconclusive that names the
-    // exact reason; no efficiency adoption is fabricated from a component-only
-    // operation.
+    // Both arms passed their independent checks and the model-free pair is a
+    // first-class measured unit whose model metrics are inapplicable rather
+    // than a measured zero. With the declared effect unreachable, the verdict
+    // is an evidence-bound rejection naming the measured effect; no efficiency
+    // adoption is fabricated from a component-only operation.
     let decision = load_json(&fixture.run.join("comparison/decision.json"));
     let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
-    assert_eq!(
-        decision["decision"], "inconclusive",
-        "{decision}\n{evaluation}"
-    );
+    assert_eq!(decision["decision"], "reject", "{decision}\n{evaluation}");
     assert!(
         evaluation["reasons"]
             .as_array()
@@ -6500,16 +6501,20 @@ fn a_settled_short_operation_is_reused_only_while_its_declared_inputs_match() {
             .any(|reason| reason
                 .as_str()
                 .unwrap_or_default()
-                .contains("no matched, independently accepted unit")),
-        "the non-adoption names the exact evaluator limit: {evaluation}"
+                .contains("does not meet the predeclared meaningful threshold")),
+        "the rejection names the measured effect against the declared threshold: {evaluation}"
     );
     assert_eq!(
         evaluation["acceptedTasks"], 2,
         "both real operations were independently accepted: {evaluation}"
     );
+    // The model-free pair is a first-class measured unit: its comparability
+    // rests on the declared identities and the operation's own recorded work,
+    // and its model metrics stay inapplicable rather than a measured zero.
+    assert_eq!(evaluation["matched"], 1, "{evaluation}");
     assert_eq!(
         evaluation["coverage"].as_str().unwrap_or_default(),
-        "none; complete-pairs:0; variation:unmeasured",
+        "time+method:real-operation model-metrics:inapplicable operation-work:duration+exit+inputs; complete-pairs:1; variation:unmeasured",
         "the unmeasured model dimensions are visible limits, never measured zero: {evaluation}"
     );
     let effects = fixture.cursor()["effects"].as_array().unwrap().clone();
@@ -6604,4 +6609,512 @@ fn status_json_phase(fixture: &Fixture) -> String {
         .as_str()
         .unwrap_or_default()
         .to_owned()
+}
+
+// ------------------------------------------------- frozen nuisance-control plan
+
+/// The frozen nuisance-control plan of the direct-operation checks: both arms
+/// start from empty owned state, the controller's predetermined baseline-first
+/// order is declared, shared caches are disclosed as unobserved, load is
+/// recorded without any utilization correction, faults are classified by
+/// observed effect and retries follow the policy's own stopping rule.
+fn fixture_nuisance_plan() -> harness_core::improvement_policy::NuisanceControlPlan {
+    use harness_core::improvement_policy::{
+        FaultRule, InitialState, LoadRule, NuisanceControlPlan, OrderRule, RetryRule, SharedState,
+    };
+    NuisanceControlPlan {
+        initial: InitialState::OwnedCold,
+        recipe: None,
+        shared: SharedState::Unobserved,
+        order: OrderRule::Fixed,
+        seed: None,
+        pairs: None,
+        load: LoadRule::Recorded,
+        faults: FaultRule::ObservedEffect,
+        retries: RetryRule::PolicyStopping,
+    }
+}
+
+/// Append the canonical nuisance-control clause to the fixture policy and
+/// write it back before the comparison is first advanced.
+fn write_nuisance_policy(
+    path: &Path,
+    plan: &harness_core::improvement_policy::NuisanceControlPlan,
+) {
+    let mut policy: Value =
+        serde_json::from_slice(&fs::read(path).expect("fixture policy exists")).unwrap();
+    let uncertainty = policy["uncertainty"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    policy["uncertainty"] = json!(format!(
+        "{uncertainty}; {}",
+        harness_core::improvement_policy::nuisance_control_clause(plan)
+    ));
+    fs::write(path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+}
+
+#[test]
+fn a_warmer_second_arm_blocks_the_pair_until_the_owned_state_is_corrected() {
+    let _serial = INSTALL.lock().unwrap();
+    let (fixture, _checkout) = short_operation_fixture(
+        "nuisance-warm-second-arm",
+        "solved",
+        "wrong",
+        &["{workspace}", "{runtime}", "{target}"],
+    );
+    write_nuisance_policy(&fixture.policy, &fixture_nuisance_plan());
+    // `continuous` drives the pair to its outcome or blocking condition in
+    // one invocation, as the declared comparison expects.
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+
+    let scratch = fixture
+        .run
+        .join("comparison")
+        .join("candidate")
+        .join("operation-target");
+    // While the baseline arm is being measured, the second arm's owned
+    // scratch receives inherited output - exactly the warmer-second-arm
+    // condition the frozen plan must not absorb silently. The write happens
+    // after the comparison is prepared (so it is not a partial preparation)
+    // and before the candidate arm starts.
+    let first = std::thread::scope(|scope| {
+        let running = scope.spawn(|| resume_short_operation(&fixture));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        // The frozen bindings appear at the end of the model-free preparation,
+        // while both arms are installed and long before the candidate arm
+        // starts. Writing afterwards cannot be mistaken for a partial
+        // preparation, and the candidate's own start check still runs later.
+        let bindings = fixture.run.join("comparison").join("bindings.json");
+        while !bindings.is_file() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the comparison was never prepared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("warm-leftover.bin"), b"inherited\n").unwrap();
+        running.join().unwrap()
+    });
+    let output = text(&first);
+    assert!(first.status.success(), "{output}");
+    assert!(
+        output.contains("would start from non-empty-owned-state"),
+        "the warmed second arm is refused: {output}"
+    );
+    assert!(
+        output.contains("no shared or unrelated state was cleared"),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read(scratch.join("warm-leftover.bin")).unwrap(),
+        b"inherited\n",
+        "the inherited owned state is preserved, never cleared"
+    );
+    assert_eq!(status_json_phase(&fixture), "blocked");
+    assert!(
+        !fixture.run.join("comparison/decision.json").is_file(),
+        "no decision is published from violated conditions"
+    );
+    let start = load_json(&fixture.run.join("comparison/candidate/nuisance-start.json"));
+    assert_eq!(start["declared"], "owned-cold", "{start}");
+    assert_eq!(start["violated"], true, "{start}");
+    assert!(
+        start["observed"]
+            .as_str()
+            .is_some_and(|observed| observed.contains("non-empty")),
+        "{start}"
+    );
+    // The frozen plan was already bound before the arms: the declared plan,
+    // its realized order and the unobserved shared state were recorded first.
+    let receipt_path = fixture.run.join("comparison/nuisance-preflight.json");
+    let receipt = load_json(&receipt_path);
+    assert_eq!(receipt["realized_first"], "baseline-first", "{receipt}");
+    assert_eq!(receipt["controller_order"], "baseline-first", "{receipt}");
+    assert_eq!(receipt["shared_state"], "unobserved", "{receipt}");
+    assert_eq!(receipt["plan"]["faults"], "observed-effect", "{receipt}");
+    assert_eq!(receipt["plan"]["retries"], "policy-stopping", "{receipt}");
+    assert!(
+        receipt["resets"]
+            .as_str()
+            .is_some_and(|resets| resets.starts_with("none:")),
+        "the receipt proves no state beyond owned observation is touched: {receipt}"
+    );
+
+    // Correcting the owned condition and resuming exercises the pair. The
+    // recorded block is retried by the single-step controller, which
+    // re-observes the corrected owned state before the arm starts.
+    fs::remove_dir_all(&scratch).unwrap();
+    fs::remove_file(fixture.run.join("supervision.json")).unwrap();
+    for _ in 0..4 {
+        if fixture.run.join("comparison/decision.json").is_file() {
+            break;
+        }
+        let step = resume_short_operation(&fixture);
+        assert!(step.status.success(), "{}", text(&step));
+    }
+    assert_eq!(status_json_phase(&fixture), "decision-recorded");
+    let candidate_start = load_json(&fixture.run.join("comparison/candidate/nuisance-start.json"));
+    assert_eq!(candidate_start["violated"], false, "{candidate_start}");
+
+    // Both measured arms carry the frozen declaration, the observed initial
+    // condition and the load disclosure into the report; the unobserved
+    // shared state and the retained order exposure stay explicit in the
+    // published evaluation.
+    for arm in ["baseline", "candidate"] {
+        let row = load_json(&fixture.arm_dir(arm).join("row.json"));
+        assert_eq!(
+            row["nuisance"]["order"]["realized"], "baseline-first",
+            "{row}"
+        );
+        assert_eq!(
+            row["nuisance"]["initial"]["observed"], "empty-or-absent-owned-state",
+            "{row}"
+        );
+        assert_eq!(
+            row["nuisance"]["load"]["observed"]["admission_evidence"], "unobserved",
+            "{row}"
+        );
+        assert_eq!(row["nuisance"]["load"]["rule"], "recorded", "{row}");
+    }
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let coverage = evaluation["coverage"].as_str().unwrap_or_default();
+    assert!(
+        coverage.contains("nuisance-shared-unobserved"),
+        "{evaluation}"
+    );
+    assert!(
+        coverage.contains("nuisance-order-exposure-retained"),
+        "{evaluation}"
+    );
+
+    // Recovery reuses the frozen receipt unchanged.
+    let frozen = fs::read(&receipt_path).unwrap();
+    let third = resume_short_operation(&fixture);
+    assert!(third.status.success(), "{}", text(&third));
+    assert_eq!(
+        fs::read(&receipt_path).unwrap(),
+        frozen,
+        "the nuisance-control receipt is reused unchanged on resume"
+    );
+}
+
+#[test]
+fn an_arm_order_this_controller_cannot_realize_is_refused_before_results() {
+    let _serial = INSTALL.lock().unwrap();
+    let (fixture, _checkout) = short_operation_fixture(
+        "nuisance-unrealizable-order",
+        "solved",
+        "solved",
+        &["{workspace}", "{runtime}", "{target}"],
+    );
+    // The predeclared seed realizes the candidate first. This sequential
+    // controller runs the baseline first and refuses to silently substitute.
+    let mut plan = fixture_nuisance_plan();
+    plan.order = harness_core::improvement_policy::OrderRule::Randomized;
+    plan.seed = Some(1);
+    write_nuisance_policy(&fixture.policy, &plan);
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+
+    let resume = resume_short_operation(&fixture);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("realizes candidate-first")
+            && output.contains("will not silently substitute a different order"),
+        "{output}"
+    );
+    assert_eq!(status_json_phase(&fixture), "blocked");
+    assert!(
+        !fixture
+            .run
+            .join("comparison/nuisance-preflight.json")
+            .is_file(),
+        "an unrealizable order is not frozen into a receipt"
+    );
+    assert!(
+        !fixture.arm_dir("baseline").join("row.json").is_file()
+            && !fixture.arm_dir("candidate").join("row.json").is_file(),
+        "no arm is measured under an unrealized order"
+    );
+}
+
+#[test]
+fn a_failed_measured_execution_is_classified_and_follows_the_frozen_retry_rule() {
+    let _serial = INSTALL.lock().unwrap();
+    let (fixture, _checkout) = short_operation_fixture(
+        "nuisance-execution-failure",
+        "solved",
+        "solved",
+        &["{workspace}", "{runtime}", "{target}", "--fail-build"],
+    );
+    write_nuisance_policy(&fixture.policy, &fixture_nuisance_plan());
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let first = resume_short_operation(&fixture);
+    let output = text(&first);
+    assert!(first.status.success(), "{output}");
+    assert!(output.contains("did not enter the comparison"), "{output}");
+
+    // The fault is classified by its observed effect: the operation started
+    // and failed, so it is not an eligible transport-only idle wait, and the
+    // frozen retry rule records that it is not replayed.
+    let fault_path = fixture.arm_dir("baseline").join("fault.json");
+    let fault = load_json(&fault_path);
+    assert_eq!(fault["class"], "execution-failure", "{fault}");
+    assert_ne!(fault["class"], "transport-only-refusal", "{fault}");
+    assert_eq!(fault["retry"]["rule"], "policy-stopping", "{fault}");
+    assert_eq!(fault["retry"]["max_attempts_per_arm"], 1, "{fault}");
+    assert_eq!(fault["retry"]["replayed"], false, "{fault}");
+
+    // The genuine failure is retained with its own exit status and never
+    // replayed; no row and no comparison decision are fabricated from it.
+    let receipt_path = fixture.arm_dir("baseline").join("operation-receipt.json");
+    let receipt_bytes = fs::read(&receipt_path).unwrap();
+    let receipt: Value = serde_json::from_slice(&receipt_bytes).unwrap();
+    assert_eq!(receipt["status"], "exited", "{receipt}");
+    assert_ne!(receipt["exit_code"], 0, "{receipt}");
+    let start = load_json(&fixture.run.join("comparison/baseline/nuisance-start.json"));
+    assert_eq!(start["violated"], false, "{start}");
+    assert!(!fixture.arm_dir("baseline").join("row.json").is_file());
+    assert!(!fixture.run.join("comparison/decision.json").is_file());
+
+    let second = resume_short_operation(&fixture);
+    assert!(second.status.success(), "{}", text(&second));
+    assert_eq!(
+        fs::read(&receipt_path).unwrap(),
+        receipt_bytes,
+        "the failed execution is never replayed"
+    );
+    assert_eq!(
+        load_json(&fault_path)["class"],
+        "execution-failure",
+        "the classification stays bound to the frozen plan"
+    );
+}
+
+/// The background-contention counterexample: an unrelated owned heavy command
+/// occupies the isolated account slot while the baseline arm runs. The
+/// recorded contention stays visible on that arm, no utilization-based time
+/// correction is invented for it, the retained attempts keep their raw and
+/// admitted evidence, and the unsupported causal claim stays inconclusive
+/// instead of publishing a false gain.
+#[test]
+fn recorded_background_contention_withholds_the_unsupported_verdict() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("nuisance-contention");
+    write_nuisance_policy(&fixture.policy, &fixture_nuisance_plan());
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_real_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    // One unrelated owned holder occupies the only slot of the isolated
+    // account the measured arms use.
+    let account = fixture.root.join("isolated-heavy-account");
+    harness_core::heavy_command::prepare(&account).unwrap();
+    let mut budget = harness_core::heavy_command::Budget::read(&account).unwrap();
+    budget.max_concurrent_trees = 1;
+    harness_core::heavy_command::Budget::write(&account, &budget).unwrap();
+    let started = fixture.root.join("holder-started.txt");
+    let launch = env!("CARGO_BIN_EXE_harness-launch-fixture");
+    let mut holder = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+    holder
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--attempt")
+        .arg("holder-other")
+        .arg("--")
+        .arg(launch)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "180000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &started);
+    let mut holder = holder.spawn().expect("isolated holder starts");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "holder did not acquire the isolated slot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // The baseline arm is dispatched while the unrelated holder blocks the
+    // shared slot; the holder is released after the arm reached its heavy
+    // command, exactly as the existing owned-contention check does.
+    let account_text = account.display().to_string();
+    let marker = fixture.root.join("heavy-started.txt");
+    let marker_text = marker.display().to_string();
+    let release = std::thread::spawn({
+        let marker = marker.clone();
+        move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(240);
+            while !marker.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if marker.exists() {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            let _ = holder.kill();
+            let _ = holder.wait();
+        }
+    });
+    let mut command = Command::new(manager());
+    command
+        .arg("improve")
+        .args(["resume", "--run", fixture.run.to_str().unwrap()])
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+        .env_remove("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE")
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .env_remove("HARNESS_LEAD_THREAD")
+        .env_remove("HARNESS_LEAD_RECIPIENT")
+        .env_remove("WT_SESSION")
+        .env(CONTROL_CHILD_MODE.0, CONTROL_CHILD_MODE.1)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY", "1")
+        .env("CODEX_HARNESS_HEAVY_ACCOUNT", &account_text)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_MARKER", &marker_text)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_PROGRAM", launch)
+        .env(
+            "HARNESS_IMPROVEMENT_FIXTURE_HEAVY_CLI",
+            env!("CARGO_BIN_EXE_codex-harness"),
+        )
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "1000");
+    let resume = command.output().expect("baseline resume");
+    let output = text(&resume);
+    assert!(
+        marker.exists(),
+        "the fixture did not reach the owned heavy command: {output}"
+    );
+    assert!(resume.status.success(), "{output}");
+    let _ = release.join();
+    let receipt = attempt_receipt(&fixture, "base-1");
+    let record = wait_for_terminal_receipt(&receipt);
+    assert_eq!(
+        record["observation"]["state"], "completed",
+        "the visible fixture conversation did not complete: {record}"
+    );
+
+    // The baseline settles, then the candidate arm is dispatched without the
+    // holder (the account slot is free again) and settles too.
+    let settle = fixture.resume_in_process(&[]);
+    assert!(settle.status.success(), "settlement: {}", text(&settle));
+    let candidate_receipt = attempt_receipt(&fixture, "cand-1");
+    let candidate_record = wait_for_terminal_receipt(&candidate_receipt);
+    assert_eq!(
+        candidate_record["observation"]["state"], "completed",
+        "{candidate_record}"
+    );
+    let settle = fixture.resume_in_process(&[]);
+    assert!(settle.status.success(), "decision: {}", text(&settle));
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+
+    // The baseline arm's own row records the observed unrelated contention;
+    // the candidate arm's row records none, and neither is repaired.
+    let baseline = load_json(&fixture.arm_dir("baseline").join("row.json"));
+    let candidate = load_json(&fixture.arm_dir("candidate").join("row.json"));
+    assert_eq!(
+        baseline["nuisance"]["load"]["observed"]["unrelated_wait"], true,
+        "{baseline}"
+    );
+    assert_eq!(
+        baseline["nuisance"]["load"]["observed"]["admission_evidence"], "recorded",
+        "{baseline}"
+    );
+    assert_eq!(
+        candidate["nuisance"]["load"]["observed"]["unrelated_wait"], false,
+        "{candidate}"
+    );
+    // The raw observed time and the admitted evidence stay retained.
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    assert!(
+        report["attempts"][0]["infrastructure"]["observed_seconds"]
+            .as_f64()
+            .is_some_and(|seconds| seconds > 0.0),
+        "{report}"
+    );
+
+    // The asymmetric contention could explain the observed difference without
+    // any declared work-efficiency binding: the causal claim is withheld and
+    // named, rather than corrected by an invented utilization factor.
+    let evaluation: Value = load_json(&fixture.run.join("comparison/evaluation.json"));
+    assert_eq!(evaluation["decision"], "inconclusive", "{evaluation}");
+    assert!(
+        evaluation["reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                .as_str()
+                .is_some_and(|reason| reason.contains(
+                    "unrelated external heavy command was measured over exactly one arm"
+                )))),
+        "{evaluation}"
+    );
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    assert_eq!(decision["decision"], "inconclusive", "{decision}");
+}
+
+/// A refusal that happened after the measured work started is classified by
+/// its observed effect: the changed or unverifiable response cannot be
+/// repaired by subtracting its wall duration, the original attempt stays
+/// retained, and the frozen retry rule records that it is never replayed.
+#[test]
+fn an_unverifiable_measured_response_is_classified_and_not_repaired() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("nuisance-unverified-response");
+    write_nuisance_policy(&fixture.policy, &fixture_nuisance_plan());
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    // The conversation ran and produced a response, but the observed model
+    // facts do not match the declared client: the trajectory is unverifiable,
+    // so the arm is refused instead of entering the comparison.
+    let session = session_id("nuisance-unverified-session");
+    fixture.simulate_arm("baseline", "baseline", "solved", 50, 5.0, 2, 3, &session);
+    rewrite_rollout(&fixture, "baseline", &session, "another-model", "low");
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(output.contains("recorded model another-model"), "{output}");
+
+    let fault_path = fixture.arm_dir("baseline").join("fault.json");
+    let fault = load_json(&fault_path);
+    assert_eq!(fault["class"], "work-started-unverified", "{fault}");
+    assert_ne!(fault["class"], "transport-only-refusal", "{fault}");
+    assert_eq!(fault["retry"]["rule"], "policy-stopping", "{fault}");
+    assert_eq!(fault["retry"]["replayed"], false, "{fault}");
+    // The attempt and its refusal stay retained; no comparison row, oracle
+    // result or decision is fabricated from the unverifiable trajectory.
+    assert_eq!(
+        fixture.cursor()["comparison"]["baseline"]["accepted"],
+        Value::Null
+    );
+    assert!(!fixture.arm_dir("baseline").join("row.json").is_file());
+    assert!(!fixture.run.join("comparison/decision.json").is_file());
+
+    // A resumed pass re-reads the retained refusal instead of replaying the
+    // arm or repairing its trajectory.
+    let second = fixture.resume();
+    assert!(second.status.success(), "{}", text(&second));
+    assert_eq!(
+        load_json(&fault_path)["class"],
+        "work-started-unverified",
+        "the classification stays bound to the frozen plan"
+    );
 }

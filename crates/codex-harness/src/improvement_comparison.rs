@@ -36,7 +36,8 @@ use harness_core::improvement_loop::{
     VARIANTS_SCHEMA, Variant, VariantSet, candidate_change_dir, changed_paths_within_scope,
 };
 use harness_core::improvement_policy::{
-    DeclaredComparison, EffectPath, ExperimentMethod, parse_experiment_selection,
+    DeclaredComparison, EffectPath, ExperimentMethod, InitialState, NuisanceControlPlan, OrderRule,
+    RealizedFirst, parse_experiment_selection, parse_nuisance_control,
 };
 use harness_core::improvement_runtime::{self, ArmRequest, ArmRuntime};
 use harness_core::improvement_spec::{OpenSpec, PlanningReceipt};
@@ -66,6 +67,18 @@ const MAX_ROLLOUT_ENTRIES: usize = 100_000;
 
 /// The retained frozen supervisor identity of one comparison window.
 const SUPERVISOR_FILE: &str = "supervisor.json";
+
+/// The frozen nuisance-control preflight receipt: the declared plan, its
+/// realized arm order, the observed identities and the explicit shared-state
+/// disclosure, written before either measured arm starts and reused unchanged
+/// on resume.
+const NUISANCE_RECEIPT_FILE: &str = "nuisance-preflight.json";
+/// One arm's observed start conditions, written immediately before that
+/// arm's measured execution begins. It is an observation record, not a reset
+/// command: the controller never clears shared or unrelated state.
+const NUISANCE_ARM_START_FILE: &str = "nuisance-start.json";
+/// The fault classification of one refused measured arm, by observed effect.
+const NUISANCE_FAULT_FILE: &str = "fault.json";
 
 fn now_seconds() -> f64 {
     SystemTime::now()
@@ -580,6 +593,14 @@ fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>, model_free: bool) -> 
         }
     }
     if let Err(reason) = ensure_task_workspace(run, &comparison, &bindings) {
+        block(run, notes, reason)?;
+        return Ok(false);
+    }
+    // The declared nuisance-control plan is frozen before either measured arm
+    // starts: the realized order, the observed identities and the explicit
+    // shared-state disclosure are recorded, and a plan this sequential
+    // controller cannot realize is refused instead of silently substituted.
+    if let Err(reason) = ensure_nuisance_preflight(run, &comparison) {
         block(run, notes, reason)?;
         return Ok(false);
     }
@@ -1969,6 +1990,12 @@ fn dispatch_next(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
             );
             run.store.save_cursor(&run.cursor)?;
         }
+        // The declared initial owned conditions of this arm are observed
+        // immediately before its measured execution; a warmed or violated
+        // state blocks the start instead of entering the comparison.
+        if let Err(reason) = verify_nuisance_arm_start(run, arm) {
+            return block(run, notes, reason);
+        }
         return dispatch_arm(run, &comparison, &bindings, arm, &runtime, &profile, notes);
     }
     Ok(())
@@ -2112,6 +2139,14 @@ fn dispatch_arm(
                 attempt.state = AttemptState::Failed;
                 attempt.reason = Some(reason.clone());
                 attempt.updated_ms = now_ms();
+            }
+            // A refusal before any model request is an observed
+            // transport-only refusal: no work started, so it may be
+            // re-attempted only under the configured pre-request policy and
+            // the frozen stopping rule, never by an unreported replay.
+            if let Err(fault_error) = record_arm_fault(run, arm, "transport-only-refusal", &reason)
+            {
+                notes.push(fault_error);
             }
             block(run, notes, reason)
         }
@@ -2441,6 +2476,12 @@ fn refuse_arm(
     reason: String,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
+    // A refusal after the measured work started keeps its classification: the
+    // observed trajectory cannot be verified, so its wall duration is never
+    // repaired by subtraction and the frozen retry rule is recorded with it.
+    if let Err(error) = record_arm_fault(run, arm, "work-started-unverified", &reason) {
+        notes.push(error);
+    }
     let mut state = run
         .cursor
         .comparison
@@ -2974,6 +3015,11 @@ fn build_row(
     }
     let declaration = comparison.declared_policy()?.policy.declaration();
     let infrastructure_capture = infrastructure_capture(run, attempt);
+    let admissions = infrastructure_capture
+        .get("admissions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let removal = declared_removal(run);
     let mut treatment = json!({
         "label": runtime.label,
@@ -3020,6 +3066,9 @@ fn build_row(
         "infrastructure_capture": infrastructure_capture,
         "treatment": treatment,
     });
+    if let Some(nuisance) = nuisance_arm_record(run, arm, Some(&admissions))? {
+        row["nuisance"] = nuisance;
+    }
     if let Some(removal) = &removal
         && let Some(target) = &removal.target
     {
@@ -4015,6 +4064,410 @@ fn preparation_policy(run: &Run, runtime: &ArmRuntime) -> io::Result<Option<Stri
 }
 
 // ---------------------------------------------------------------------------
+// Frozen nuisance-control plan.
+//
+// The declared plan fixes the initial cache/warm-up state, the arm-order
+// rule, the shared-state disclosure, the load rule and the fault/retry rules
+// before either measured arm starts. Preflight verifies the resulting actual
+// owned conditions and the identities the existing gates already check; a
+// reset configuration is never treated as proof of equal conditions, only
+// owned state is verified and never cleared, and the receipt is reused
+// unchanged on resume.
+// ---------------------------------------------------------------------------
+
+fn declared_nuisance_plan(run: &Run) -> Result<Option<NuisanceControlPlan>, String> {
+    let Some(comparison) = run.spec.comparison.as_ref() else {
+        return Ok(None);
+    };
+    let declared = comparison
+        .declared_policy()
+        .map_err(|error| format!("the predeclared comparison policy is unusable: {error}"))?;
+    parse_nuisance_control(&declared.policy.uncertainty)
+}
+
+fn nuisance_receipt_path(run: &Run) -> PathBuf {
+    run.store.comparison_dir().join(NUISANCE_RECEIPT_FILE)
+}
+
+/// The observed identity basis recorded before either arm starts. Only the
+/// identities the existing gates already verify are required: unavailable
+/// hardware or weight identity stays a disclosed limit of the API-observed
+/// boundary instead of becoming a new access prerequisite.
+fn nuisance_identities(
+    run: &Run,
+    comparison: &ComparisonInputs,
+    declared: &DeclaredComparison,
+) -> Result<Value, String> {
+    let bindings = load_bindings(run)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the comparison bindings are missing".to_owned())?;
+    let arm_identity = |arm: Arm| -> Result<Value, String> {
+        let binding = bindings.arm(arm).map_err(|error| error.to_string())?;
+        let comparison_arm = match arm {
+            Arm::Baseline => ComparisonArm::Baseline,
+            Arm::Candidate => ComparisonArm::Candidate,
+        };
+        let runtime_path = run
+            .cursor
+            .comparison
+            .as_ref()
+            .and_then(|state| state.arm(comparison_arm).runtime.clone());
+        let runtime: Option<ArmRuntime> = match runtime_path {
+            Some(path) => {
+                Some(read_json(&path, MAX_RUN_SPEC_BYTES).map_err(|error| error.to_string())?)
+            }
+            None => None,
+        };
+        Ok(json!({
+            "task_revision": binding.workload.revision,
+            "runtime_source_sha256": runtime.as_ref().map(|runtime| runtime.variant.source_sha256.clone()),
+            "runtime_record_sha256": runtime.as_ref().map(|runtime| runtime.variant.record_sha256.clone()),
+        }))
+    };
+    let runner = run.spec.runner.as_ref();
+    Ok(json!({
+        "baseline": arm_identity(Arm::Baseline)?,
+        "candidate": arm_identity(Arm::Candidate)?,
+        "model": runner.and_then(|runner| runner.model.clone()),
+        "reasoning_effort": runner.and_then(|runner| runner.reasoning_effort.clone()),
+        "acceptance_request_sha256": comparison.acceptance.request_sha256,
+        "policy_digest": declared.digest,
+        "hardware_or_weight_identity": "not required: the API-observed identity boundary is unchanged, and unavailable hardware or weight identity stays a disclosed limit",
+    }))
+}
+
+/// Freeze the declared nuisance-control plan before either measured arm
+/// starts: the realized arm order, the observed identities and the explicit
+/// shared-state disclosure. The receipt is written once and reused unchanged
+/// on resume; a changed plan, identity or an arm that already ran without the
+/// receipt blocks instead of being silently absorbed.
+fn ensure_nuisance_preflight(run: &Run, comparison: &ComparisonInputs) -> Result<(), String> {
+    let Some(plan) = declared_nuisance_plan(run)? else {
+        return Ok(());
+    };
+    let declared = comparison
+        .declared_policy()
+        .map_err(|error| format!("the predeclared comparison policy is unusable: {error}"))?;
+    let realized = plan.realized_first().ok_or_else(|| {
+        "the declared nuisance-control plan realizes no determinate first arm; an incomplete order rule cannot be fixed after results"
+            .to_owned()
+    })?;
+    if realized != RealizedFirst::BaselineFirst {
+        return Err(format!(
+            "the declared nuisance-control plan realizes {} from its predeclared {} order, but this sequential controller runs the baseline before the candidate within one pair and will not silently substitute a different order; declare an order whose first measured arm is the baseline or run that schedule through a comparison owner that supports it",
+            realized.as_str(),
+            plan.order.as_str()
+        ));
+    }
+    if plan.order == OrderRule::Balanced && plan.pairs.unwrap_or(1) > 1 {
+        return Err(format!(
+            "the declared balanced schedule needs {} repetitions, but this controller executes one pair and the declared corroboration units are separate retained comparisons; declare one repetition here or carry the balance into separately declared pairs",
+            plan.pairs.unwrap_or(1)
+        ));
+    }
+    let identities = nuisance_identities(run, comparison, &declared)?;
+    let current = json!({
+        "schema": 1,
+        "policy_digest": declared.digest,
+        "plan": plan.declaration(),
+        "realized_first": realized.as_str(),
+        "controller_order": "baseline-first",
+        "shared_state": plan.shared.as_str(),
+        "identities": identities,
+        "conditions": "observed owned state only; shared OS, compiler and inference caches are not read, reset or proven equal, and a configured reset command is not evidence of equal initial conditions",
+        "resets": "none: the control verifies owned initial state and never clears shared or unrelated state",
+    });
+    let path = nuisance_receipt_path(run);
+    if path.is_file() {
+        let retained: Value = read_json(&path, MAX_RUN_SPEC_BYTES).map_err(|error| {
+            format!("the retained nuisance-control receipt is unreadable: {error}")
+        })?;
+        if retained.get("schema").and_then(Value::as_u64) != Some(1) {
+            return Err(
+                "the retained nuisance-control receipt declares an unsupported schema".to_owned(),
+            );
+        }
+        if retained.get("policy_digest").and_then(Value::as_str) != Some(declared.digest.as_str()) {
+            return Err(
+                "the comparison policy changed after the nuisance-control receipt was frozen; the retained conditions no longer bind the declared plan and a fresh run is required"
+                    .to_owned(),
+            );
+        }
+        for key in ["plan", "realized_first", "identities"] {
+            if retained.get(key) != current.get(key) {
+                return Err(format!(
+                    "the nuisance-control receipt was frozen with different {key} values; the retained evidence no longer binds the declared plan and observed conditions"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    for arm in [ComparisonArm::Baseline, ComparisonArm::Candidate] {
+        let arm_dir = run.store.comparison_arm_dir(arm);
+        if arm_dir.join("row.json").is_file() || arm_dir.join(NUISANCE_ARM_START_FILE).is_file() {
+            return Err(
+                "a measured arm already started without the declared nuisance-control receipt; the plan was not frozen before results, so the comparison withholds a causal claim instead of back-filling the record"
+                    .to_owned(),
+            );
+        }
+    }
+    write_json_atomic(&path, &current)
+        .map_err(|error| format!("the nuisance-control receipt could not be written: {error}"))
+}
+
+/// Top-level entries of one owned directory; a missing path counts as empty.
+fn owned_directory_entries(path: &Path) -> u64 {
+    if !path.is_dir() {
+        return 0;
+    }
+    fs::read_dir(path)
+        .map(|entries| entries.flatten().count() as u64)
+        .unwrap_or(0)
+}
+
+/// Verify the declared initial owned state and the prepared recipe of one arm
+/// immediately before its measured execution. The observation is recorded,
+/// a violation blocks the arm start and the run stays resumable; no shared or
+/// unrelated state is cleared to make the condition pass.
+fn verify_nuisance_arm_start(run: &Run, arm: ComparisonArm) -> Result<(), String> {
+    let Some(plan) = declared_nuisance_plan(run)? else {
+        return Ok(());
+    };
+    let arm_dir = run.store.comparison_arm_dir(arm);
+    let scratch = arm_dir.join("operation-target");
+    let scratch_entries = owned_directory_entries(&scratch);
+    let runtime_path = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.arm(arm).runtime.clone());
+    let mut session_entries = 0;
+    let mut preparation = None;
+    if let Some(runtime_path) = runtime_path {
+        if let Ok(runtime) = read_json::<ArmRuntime>(&runtime_path, MAX_RUN_SPEC_BYTES) {
+            session_entries = owned_directory_entries(&runtime.home.join("sessions"));
+        }
+        preparation = read_preparation_method(&runtime_path).ok().flatten();
+    }
+    let (observed, violated, detail) = match plan.initial {
+        InitialState::OwnedCold => {
+            if scratch_entries > 0 || session_entries > 0 {
+                (
+                    "non-empty-owned-state".to_owned(),
+                    true,
+                    format!(
+                        "the arm's owned starting state is not empty ({scratch_entries} scratch entr{}, {session_entries} recorded session entr{})",
+                        if scratch_entries == 1 { "y" } else { "ies" },
+                        if session_entries == 1 { "y" } else { "ies" }
+                    ),
+                )
+            } else {
+                (
+                    "empty-or-absent-owned-state".to_owned(),
+                    false,
+                    String::new(),
+                )
+            }
+        }
+        InitialState::OwnedPrepared => {
+            let declared_recipe = plan.recipe.as_deref().unwrap_or("");
+            if scratch_entries > 0 || session_entries > 0 {
+                (
+                    "non-empty-owned-state".to_owned(),
+                    true,
+                    format!(
+                        "the arm's owned starting state is not empty ({scratch_entries} scratch entr{}, {session_entries} recorded session entr{})",
+                        if scratch_entries == 1 { "y" } else { "ies" },
+                        if session_entries == 1 { "y" } else { "ies" }
+                    ),
+                )
+            } else if preparation.as_deref() != Some(declared_recipe) {
+                (
+                    "prepared-state-recipe-mismatch".to_owned(),
+                    true,
+                    format!(
+                        "the observed preparation method {:?} is not the declared owned-prepared recipe {declared_recipe:?}",
+                        preparation.as_deref().unwrap_or("unrecorded")
+                    ),
+                )
+            } else {
+                ("prepared-owned-state".to_owned(), false, String::new())
+            }
+        }
+        InitialState::InheritDisclosed => {
+            // A treatment that deliberately inherits prepared or shared state:
+            // the plan discloses it, and only owned state stays verified.
+            ("inherited-state-disclosed".to_owned(), false, String::new())
+        }
+    };
+    let record = json!({
+        "schema": 1,
+        "arm": arm.as_str(),
+        "declared": plan.initial.as_str(),
+        "recipe": plan.recipe,
+        "observed": observed,
+        "detail": detail,
+        "violated": violated,
+        "checked_ms": now_ms(),
+    });
+    write_json_atomic(&arm_dir.join(NUISANCE_ARM_START_FILE), &record).map_err(|error| {
+        format!(
+            "the {} arm's nuisance-control start observation could not be recorded: {error}",
+            arm.as_str()
+        )
+    })?;
+    if violated {
+        return Err(format!(
+            "the {} arm would start from {} although the frozen nuisance-control plan declares {}: {}; only owned state is verified, no shared or unrelated state was cleared, and the comparison waits for corrected conditions instead of measuring a warmer arm",
+            arm.as_str(),
+            observed,
+            plan.initial.as_str(),
+            detail
+        ));
+    }
+    Ok(())
+}
+
+/// Classify one refused measured arm by its observed effect and record the
+/// frozen retry rule with it. A fault that changed or unverified a started
+/// trajectory is never repaired by subtracting its wall duration, and no
+/// failed measured attempt is replayed automatically.
+fn record_arm_fault(
+    run: &Run,
+    arm: ComparisonArm,
+    class: &'static str,
+    detail: &str,
+) -> Result<(), String> {
+    if declared_nuisance_plan(run)?.is_none() {
+        return Ok(());
+    }
+    let max_attempts = run
+        .spec
+        .comparison
+        .as_ref()
+        .and_then(|comparison| comparison.declared_policy().ok())
+        .map(|declared| declared.policy.stopping.max_attempts_per_arm)
+        .unwrap_or(1);
+    let record = json!({
+        "schema": 1,
+        "arm": arm.as_str(),
+        "class": class,
+        "detail": detail,
+        "retry": {
+            "rule": "policy-stopping",
+            "max_attempts_per_arm": max_attempts,
+            "replayed": false,
+        },
+        "recorded_ms": now_ms(),
+    });
+    write_json_atomic(
+        &run.store.comparison_arm_dir(arm).join(NUISANCE_FAULT_FILE),
+        &record,
+    )
+    .map_err(|error| {
+        format!(
+            "the {} arm fault classification could not be recorded: {error}",
+            arm.as_str()
+        )
+    })
+}
+
+/// The frozen nuisance-control record one measured arm carries into its
+/// outcome row: the declared plan, the realized order, the observed start
+/// conditions and the load/fault evidence the controller actually saw.
+/// `admissions` is the classified heavy-command admission evidence when the
+/// controller recorded it; `None` stays an explicit unobserved limit.
+fn nuisance_arm_record(
+    run: &Run,
+    arm: ComparisonArm,
+    admissions: Option<&[Value]>,
+) -> io::Result<Option<Value>> {
+    let Some(plan) = declared_nuisance_plan(run).map_err(invalid)? else {
+        return Ok(None);
+    };
+    let realized = plan
+        .realized_first()
+        .map(RealizedFirst::as_str)
+        .unwrap_or("unresolved");
+    let start_path = run
+        .store
+        .comparison_arm_dir(arm)
+        .join(NUISANCE_ARM_START_FILE);
+    let start: Option<Value> = if start_path.is_file() {
+        Some(read_json(&start_path, MAX_RUN_SPEC_BYTES)?)
+    } else {
+        None
+    };
+    let (observed, violated) = match &start {
+        Some(value) => (
+            value
+                .get("observed")
+                .and_then(Value::as_str)
+                .unwrap_or("unrecorded")
+                .to_owned(),
+            value
+                .get("violated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        // A settled arm without its start observation cannot prove the
+        // declared initial conditions; the comparison must not assume them.
+        None => ("unrecorded".to_owned(), true),
+    };
+    let (unrelated_wait, self_contention, admission_evidence) = match admissions {
+        Some(admissions) => {
+            let class = |name: &str| {
+                admissions
+                    .iter()
+                    .any(|item| item.get("class").and_then(Value::as_str) == Some(name))
+            };
+            (
+                json!(class("unrelated_wait")),
+                json!(class("self_contention")),
+                "recorded",
+            )
+        }
+        None => (Value::Null, Value::Null, "unobserved"),
+    };
+    let mut faults = Vec::new();
+    if let Some(admissions) = admissions {
+        for item in admissions {
+            if item.get("class").and_then(Value::as_str) == Some("failed") {
+                faults.push(json!({
+                    "class": "failed-infrastructure-admission",
+                    "detail": item.get("id").and_then(Value::as_str).unwrap_or("unnamed admission"),
+                }));
+            }
+        }
+    }
+    Ok(Some(json!({
+        "schema": 1,
+        "plan": plan.declaration(),
+        "order": {
+            "planned": realized,
+            "realized": realized,
+            "exposure": "the single pair runs one order; its exposure to time/order drift stays retained",
+        },
+        "initial": {
+            "declared": plan.initial.as_str(),
+            "observed": observed,
+            "violated": violated,
+            "condition_source": "observed-owned-state",
+        },
+        "load": {
+            "rule": plan.load.as_str(),
+            "observed": {
+                "unrelated_wait": unrelated_wait,
+                "self_contention": self_contention,
+                "admission_evidence": admission_evidence,
+            },
+            "uncontrolled": true,
+        },
+        "faults": faults,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Direct real-operation arms.
 //
 // A comparison whose predeclared selection is `method=real-operation`
@@ -4295,6 +4748,12 @@ fn settle_operation_arm(
     if let Err(reason) = ensure_operation_checkout(&source, &binding) {
         return block(run, notes, reason);
     }
+    // The declared initial owned conditions are observed immediately before
+    // the operation executes; a warmed owned scratch blocks the start instead
+    // of entering the comparison, and nothing shared is cleared to pass it.
+    if let Err(reason) = verify_nuisance_arm_start(run, arm) {
+        return block(run, notes, reason);
+    }
     let mut receipt = match run_direct_operation(run, comparison, operation, arm, &runtime, &source)
     {
         Ok(receipt) => receipt,
@@ -4401,6 +4860,12 @@ fn refuse_operation_arm(
     reason: String,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
+    // An execution failure is retained by its observed effect: the operation
+    // started but did not complete, so it is not an eligible transport-only
+    // idle wait and it is never replayed automatically.
+    if let Err(error) = record_arm_fault(run, arm, "execution-failure", &reason) {
+        notes.push(error);
+    }
     let mut state = run
         .cursor
         .comparison
@@ -4939,6 +5404,12 @@ fn build_operation_row(
         "retry_of": null,
         "treatment": treatment,
     });
+    // The direct-operation route records no heavy-command admission classes,
+    // so its load observation stays an explicit unobserved limit rather than
+    // an assumed comparable state.
+    if let Some(nuisance) = nuisance_arm_record(run, arm, None)? {
+        row["nuisance"] = nuisance;
+    }
     if let Some(removal) = &removal
         && let Some(target) = &removal.target
     {
