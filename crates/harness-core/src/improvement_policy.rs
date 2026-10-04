@@ -68,6 +68,11 @@ use std::{
 
 pub const POLICY_SCHEMA: u32 = 1;
 
+/// Bound of the digested uncertainty text. It has to carry the bounded
+/// statistical-analysis, experiment-selection, nuisance-control and
+/// infrastructure-binding clauses together.
+const MAX_UNCERTAINTY_BYTES: usize = 2048;
+
 fn invalid(detail: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -552,10 +557,17 @@ pub fn parse_experiment_selection(
         );
     }
     let rest = &uncertainty[start + SELECTION_CLAUSE.len()..];
-    let body = match rest.find(crate::infrastructure_accounting::RULE_VERSION) {
-        Some(end) => &rest[..end],
-        None => rest,
-    };
+    // The selection body ends at the next clause that belongs to another
+    // owner: the nuisance-control clause or the infrastructure binding.
+    let end = [
+        crate::infrastructure_accounting::RULE_VERSION,
+        NUISANCE_CLAUSE,
+    ]
+    .iter()
+    .filter_map(|marker| rest.find(marker))
+    .min()
+    .unwrap_or(rest.len());
+    let body = &rest[..end];
     if body.len() > MAX_SELECTION_CLAUSE_BYTES {
         return Err(
             "the experiment-selection clause exceeds its bounded size; keep every declared value within the clause bound"
@@ -665,6 +677,538 @@ fn set_selection_value(
     }
     *slot = Some(value.to_owned());
     Ok(())
+}
+
+/// Marker of the predeclared nuisance-control clause inside the policy's
+/// uncertainty text. Clause order is: any statistical-analysis clause, then
+/// the experiment-selection clause, then this nuisance-control clause, then
+/// the infrastructure binding, so every owner parses its own fields without
+/// consuming another's.
+pub const NUISANCE_CLAUSE: &str = "nuisance-control.v1";
+
+/// Bound on one optional nuisance-control value.
+const MAX_NUISANCE_FIELD_BYTES: usize = 192;
+/// Bound on the rendered nuisance-control clause.
+const MAX_NUISANCE_CLAUSE_BYTES: usize = 512;
+/// Bound on the declared balanced schedule's repetition count.
+const MAX_NUISANCE_PAIRS: u32 = 1024;
+
+/// The declared initial owned cache/warm-up state of both measured arms.
+/// Only owned state is reset or prepared: shared OS, compiler and inference
+/// caches stay outside the controller's writes and are disclosed separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InitialState {
+    /// Every owned working area the measured operation can write starts empty
+    /// or absent; no warm-up is applied.
+    OwnedCold,
+    /// Both arms start from the same declared prepared owned recipe, named by
+    /// the bounded `recipe` token; the recipe's preparation cost stays
+    /// accounted under the declared operating mode.
+    OwnedPrepared,
+    /// A treatment that deliberately inherits shared or previously prepared
+    /// state; the state is disclosed and only owned state stays reset.
+    InheritDisclosed,
+}
+
+impl InitialState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnedCold => "owned-cold",
+            Self::OwnedPrepared => "owned-prepared",
+            Self::InheritDisclosed => "inherit-disclosed",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "owned-cold" => Some(Self::OwnedCold),
+            "owned-prepared" => Some(Self::OwnedPrepared),
+            "inherit-disclosed" => Some(Self::InheritDisclosed),
+            _ => None,
+        }
+    }
+}
+
+/// The explicit disclosure of shared cache state. This controller observes
+/// owned state only; OS, shared-compiler and inference caches are never read,
+/// reset or proven equivalent, and a configured reset command alone is not
+/// evidence of equal initial conditions. The only truthful declaration is
+/// therefore that the shared state stays unobserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SharedState {
+    /// Shared cache state is explicitly uncontrolled and unobserved; only
+    /// owned state is verified, and residual shared-cache variation remains a
+    /// disclosed limit of the comparison.
+    Unobserved,
+}
+
+impl SharedState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unobserved => "unobserved",
+        }
+    }
+}
+
+/// The arm-order rule the plan fixes before any result. This sequential
+/// controller physically realizes one order per pair; a declared rule whose
+/// realization differs is refused by preflight instead of being silently
+/// substituted, and a single pair's exposure to time/order drift is retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrderRule {
+    /// The order is predetermined and fully determined by the plan itself.
+    Fixed,
+    /// The first arm is derived from the declared seed before results.
+    Randomized,
+    /// A balanced schedule across the declared repetition count, fixed before
+    /// results; the first pair's order is the schedule's first order.
+    Balanced,
+}
+
+impl OrderRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Randomized => "randomized",
+            Self::Balanced => "balanced",
+        }
+    }
+}
+
+/// The first measured arm a declared plan realizes, computed from the plan
+/// before any result exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealizedFirst {
+    BaselineFirst,
+    CandidateFirst,
+}
+
+impl RealizedFirst {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BaselineFirst => "baseline-first",
+            Self::CandidateFirst => "candidate-first",
+        }
+    }
+}
+
+/// How relevant background load is handled. Uncontrolled execution load is
+/// recorded and retained; it never authorizes a guessed utilization-factor
+/// time correction, and unresolved differences follow the declared
+/// uncertainty and stopping rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoadRule {
+    /// Load evidence is recorded per arm where the controller observes it;
+    /// unobserved shared load stays an explicit limit, and no utilization
+    /// factor is invented.
+    Recorded,
+}
+
+impl LoadRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+        }
+    }
+}
+
+/// How observed faults are classified before results. Only a verified
+/// transport-only idle wait may qualify for the existing blocking
+/// adjustment; ordinary inference/tool execution and unattributed request
+/// durations never do, and a fault that changed response, retries, context or
+/// subsequent work cannot be repaired by subtracting its wall duration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FaultRule {
+    /// Classify every fault by its observed effect; preserve the original
+    /// attempt, errors and usage.
+    ObservedEffect,
+}
+
+impl FaultRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservedEffect => "observed-effect",
+        }
+    }
+}
+
+/// What governs retries. The frozen comparison policy's stopping rule is the
+/// only retry budget: a failed measured attempt is never replayed
+/// automatically, and a refusal before any model request follows the
+/// configured dispatch policy, not a plan-authored favorable replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetryRule {
+    /// Retries follow the policy's own frozen stopping rule.
+    PolicyStopping,
+}
+
+impl RetryRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyStopping => "policy-stopping",
+        }
+    }
+}
+
+/// The frozen nuisance-control plan of one paired comparison. It binds the
+/// initial cache/warm-up state, the arm-order rule, the shared-state
+/// disclosure, the load rule and the fault/retry rules before either arm
+/// starts; preflight verifies the resulting actual owned state and the
+/// controller records what it observed per arm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NuisanceControlPlan {
+    pub initial: InitialState,
+    /// The prepared owned recipe token; required exactly for `owned-prepared`.
+    #[serde(default)]
+    pub recipe: Option<String>,
+    pub shared: SharedState,
+    pub order: OrderRule,
+    /// The randomization seed; required exactly for `randomized`.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// The declared repetition count of a balanced schedule; required exactly
+    /// for `balanced`.
+    #[serde(default)]
+    pub pairs: Option<u32>,
+    pub load: LoadRule,
+    pub faults: FaultRule,
+    pub retries: RetryRule,
+}
+
+impl NuisanceControlPlan {
+    /// The first measured arm this plan realizes, computed from its declared
+    /// rule and seed. `None` when the plan is internally incomplete (a case
+    /// [`Self::problem`] refuses).
+    pub fn realized_first(&self) -> Option<RealizedFirst> {
+        match self.order {
+            OrderRule::Fixed | OrderRule::Balanced => Some(RealizedFirst::BaselineFirst),
+            OrderRule::Randomized => self.seed.map(|seed| match seed % 2 {
+                0 => RealizedFirst::BaselineFirst,
+                _ => RealizedFirst::CandidateFirst,
+            }),
+        }
+    }
+
+    /// The bounded semantic problem, if any. Shared by the comparison policy
+    /// and by any other owner that consumes a declared plan.
+    pub fn problem(&self) -> Option<String> {
+        match (self.initial, self.recipe.as_deref()) {
+            (InitialState::OwnedPrepared, None) => Some(
+                "an owned-prepared initial state must name the bounded recipe token both arms start from".to_owned(),
+            ),
+            (InitialState::OwnedPrepared, Some(recipe))
+                if recipe.trim().is_empty()
+                    || recipe.len() > MAX_NUISANCE_FIELD_BYTES
+                    || recipe.contains(['\n', '\r', ';']) =>
+            {
+                Some(format!(
+                    "the owned-prepared recipe must be one bounded line of at most {MAX_NUISANCE_FIELD_BYTES} bytes without ';'"
+                ))
+            }
+            (InitialState::OwnedCold | InitialState::InheritDisclosed, Some(_)) => Some(
+                "a recipe token is declared only with an owned-prepared initial state; cold or inherited state names no preparation recipe".to_owned(),
+            ),
+            _ => None,
+        }
+        .or_else(|| match (self.order, self.seed, self.pairs) {
+            (OrderRule::Randomized, None, _) => Some(
+                "a randomized arm order must declare its seed before results; an undeclared order cannot be fixed after the outcome"
+                    .to_owned(),
+            ),
+            (OrderRule::Randomized, Some(_), Some(_)) => Some(
+                "a randomized arm order declares a seed, not a balanced repetition count".to_owned(),
+            ),
+            (OrderRule::Balanced, _, None) => Some(
+                "a balanced arm order must declare the repetition count it balances before results".to_owned(),
+            ),
+            (OrderRule::Balanced, Some(_), Some(_)) => Some(
+                "a balanced arm order declares a repetition count, not a randomization seed".to_owned(),
+            ),
+            (OrderRule::Balanced, None, Some(pairs))
+                if !(1..=MAX_NUISANCE_PAIRS).contains(&pairs) =>
+            {
+                Some(format!(
+                "a balanced schedule declares 1..={MAX_NUISANCE_PAIRS} repetitions"
+            ))
+            }
+            (OrderRule::Fixed, Some(_), _) | (OrderRule::Fixed, _, Some(_)) => Some(
+                "a fixed arm order declares neither a seed nor a repetition count".to_owned(),
+            ),
+            _ => None,
+        })
+    }
+
+    /// The recorded declaration shape of the plan, attached to every measured
+    /// attempt before results.
+    pub fn declaration(&self) -> Value {
+        let mut value = json!({
+            "initial": self.initial.as_str(),
+            "shared": self.shared.as_str(),
+            "order": self.order.as_str(),
+            "load": self.load.as_str(),
+            "faults": self.faults.as_str(),
+            "retries": self.retries.as_str(),
+            "realized_first": self.realized_first().map(RealizedFirst::as_str).unwrap_or("unresolved"),
+            "exposure": "a single pair runs one order and retains its exposure to time/order drift; only owned state is reset",
+        });
+        if let Some(recipe) = &self.recipe {
+            value["recipe"] = json!(recipe);
+        }
+        if let Some(seed) = self.seed {
+            value["seed"] = json!(seed);
+        }
+        if let Some(pairs) = self.pairs {
+            value["pairs"] = json!(pairs);
+        }
+        value
+    }
+}
+
+/// The canonical nuisance-control clause. It follows the experiment-selection
+/// clause and precedes the infrastructure binding.
+pub fn nuisance_control_clause(plan: &NuisanceControlPlan) -> String {
+    let mut clause = format!("{NUISANCE_CLAUSE}; initial={}; ", plan.initial.as_str());
+    if let Some(recipe) = &plan.recipe {
+        clause.push_str(&format!("recipe={recipe}; "));
+    }
+    clause.push_str(&format!(
+        "shared={}; order={}; ",
+        plan.shared.as_str(),
+        plan.order.as_str()
+    ));
+    if let Some(seed) = plan.seed {
+        clause.push_str(&format!("seed={seed}; "));
+    }
+    if let Some(pairs) = plan.pairs {
+        clause.push_str(&format!("pairs={pairs}; "));
+    }
+    clause.push_str(&format!(
+        "load={}; faults={}; retries={}",
+        plan.load.as_str(),
+        plan.faults.as_str(),
+        plan.retries.as_str()
+    ));
+    clause
+}
+
+/// Parse the predeclared nuisance-control clause out of the uncertainty text.
+/// `Ok(None)` when it is absent: an older default binds no plan. A present
+/// but unusable clause is an error so it can never silently degrade into
+/// different operating conditions.
+pub fn parse_nuisance_control(uncertainty: &str) -> Result<Option<NuisanceControlPlan>, String> {
+    let Some(start) = uncertainty.find(NUISANCE_CLAUSE) else {
+        return Ok(None);
+    };
+    if let Some(infrastructure) = uncertainty.find(crate::infrastructure_accounting::RULE_VERSION)
+        && infrastructure < start
+    {
+        return Err(
+            "the nuisance-control clause must precede the infrastructure binding it qualifies"
+                .to_owned(),
+        );
+    }
+    if let Some(selection) = uncertainty.find(SELECTION_CLAUSE)
+        && selection > start
+    {
+        return Err(
+            "the nuisance-control clause must follow the experiment-selection clause so each owner parses its own fields"
+                .to_owned(),
+        );
+    }
+    let rest = &uncertainty[start + NUISANCE_CLAUSE.len()..];
+    let body = match rest.find(crate::infrastructure_accounting::RULE_VERSION) {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    if body.len() > MAX_NUISANCE_CLAUSE_BYTES {
+        return Err(
+            "the nuisance-control clause exceeds its bounded size; keep every declared value within the clause bound"
+                .to_owned(),
+        );
+    }
+    let mut initial = None;
+    let mut recipe: Option<String> = None;
+    let mut shared = None;
+    let mut order = None;
+    let mut seed: Option<u64> = None;
+    let mut pairs: Option<u32> = None;
+    let mut load = None;
+    let mut faults = None;
+    let mut retries = None;
+    for segment in body.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = segment.split_once('=') else {
+            return Err("nuisance-control fields must use key=value separated by ';'".to_owned());
+        };
+        let value = value.trim();
+        match key.trim() {
+            "initial" => {
+                if initial.is_some() {
+                    return Err("the nuisance-control initial state is declared twice".to_owned());
+                }
+                initial = Some(InitialState::parse(value).ok_or_else(|| {
+                    "the declared initial state is not owned-cold, owned-prepared or inherit-disclosed"
+                        .to_owned()
+                })?);
+            }
+            "recipe" => {
+                if recipe.is_some() {
+                    return Err("the nuisance-control recipe is declared twice".to_owned());
+                }
+                recipe = Some(value.to_owned());
+            }
+            "shared" => {
+                if shared.is_some() {
+                    return Err("the nuisance-control shared state is declared twice".to_owned());
+                }
+                shared = Some(match value {
+                    "unobserved" => SharedState::Unobserved,
+                    "observed" | "reset" | "controlled" => {
+                        return Err(
+                            "OS, shared-compiler and inference caches are not observed by this controller, and a configured reset command alone never proves equivalent initial conditions; declare the shared state explicitly as unobserved"
+                                .to_owned(),
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            "the declared shared state is not a recognized disclosure; shared cache state is only recognized as unobserved"
+                                .to_owned(),
+                        );
+                    }
+                });
+            }
+            "order" => {
+                if order.is_some() {
+                    return Err("the nuisance-control arm order is declared twice".to_owned());
+                }
+                order = Some(match value {
+                    "fixed" => OrderRule::Fixed,
+                    "randomized" => OrderRule::Randomized,
+                    "balanced" => OrderRule::Balanced,
+                    _ => {
+                        return Err(
+                            "the declared arm order is not fixed, randomized or balanced"
+                                .to_owned(),
+                        );
+                    }
+                });
+            }
+            "seed" => {
+                if seed.is_some() {
+                    return Err("the nuisance-control seed is declared twice".to_owned());
+                }
+                seed = Some(value.parse::<u64>().map_err(|_| {
+                    "the nuisance-control seed must be an unsigned integer fixed before results"
+                        .to_owned()
+                })?);
+            }
+            "pairs" => {
+                if pairs.is_some() {
+                    return Err(
+                        "the nuisance-control repetition count is declared twice".to_owned()
+                    );
+                }
+                pairs = Some(value.parse::<u32>().map_err(|_| {
+                    "the balanced repetition count must be an unsigned integer fixed before results"
+                        .to_owned()
+                })?);
+            }
+            "load" => {
+                if load.is_some() {
+                    return Err("the nuisance-control load rule is declared twice".to_owned());
+                }
+                load = Some(match value {
+                    "recorded" => LoadRule::Recorded,
+                    "utilization-adjusted" | "utilization-factor" | "cpu-scaled" => {
+                        return Err(
+                            "uncontrolled execution load never authorizes a guessed utilization-factor time correction; declare the recorded rule under which load evidence is retained and bounded"
+                                .to_owned(),
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            "the declared load rule is not recognized; background load is only recognized as recorded, never as an invented utilization correction"
+                                .to_owned(),
+                        );
+                    }
+                });
+            }
+            "faults" => {
+                if faults.is_some() {
+                    return Err("the nuisance-control fault rule is declared twice".to_owned());
+                }
+                faults = Some(match value {
+                    "observed-effect" => FaultRule::ObservedEffect,
+                    _ => {
+                        return Err(
+                            "faults are classified by their observed effect: only a verified transport-only idle wait may qualify for the existing blocking adjustment, while ordinary inference/tool execution, unattributed latency and any fault that changed response, context or subsequent work are retained and never repaired by elapsed subtraction"
+                                .to_owned(),
+                        );
+                    }
+                });
+            }
+            "retries" => {
+                if retries.is_some() {
+                    return Err("the nuisance-control retry rule is declared twice".to_owned());
+                }
+                retries = Some(match value {
+                    "policy-stopping" => RetryRule::PolicyStopping,
+                    _ => {
+                        return Err(
+                            "retries follow the frozen policy stopping rule; a plan cannot declare a different retry budget or a favorable replay"
+                                .to_owned(),
+                        );
+                    }
+                });
+            }
+            _ => {
+                return Err(
+                    "the nuisance-control clause has an unknown field; undeclared operating conditions cannot be absorbed silently"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    let (Some(initial), Some(shared), Some(order), Some(load), Some(faults), Some(retries)) =
+        (initial, shared, order, load, faults, retries)
+    else {
+        return Err(
+            "the nuisance-control clause is incomplete; declare initial, shared, order, load, faults and retries before results"
+                .to_owned(),
+        );
+    };
+    let plan = NuisanceControlPlan {
+        initial,
+        recipe,
+        shared,
+        order,
+        seed,
+        pairs,
+        load,
+        faults,
+        retries,
+    };
+    if let Some(problem) = plan.problem() {
+        return Err(problem);
+    }
+    let rendered = nuisance_control_clause(&plan);
+    if rendered.len() > MAX_NUISANCE_CLAUSE_BYTES {
+        return Err(
+            "the rendered nuisance-control clause exceeds its bounded size; shorten the declared fields"
+                .to_owned(),
+        );
+    }
+    Ok(Some(plan))
 }
 
 /// The measured dimension of the declared comparison rule.
@@ -872,6 +1416,13 @@ impl ComparisonPolicy {
         if let Ok(Some(selection)) = parse_experiment_selection(&self.uncertainty) {
             value["selection"] = selection_declaration(&selection);
         }
+        // The frozen nuisance-control plan is recorded with every measured
+        // attempt before results: the initial cache/warm-up state, the arm
+        // order rule, the shared-state disclosure, the load rule and the
+        // fault/retry rules cannot be redefined after an outcome exists.
+        if let Ok(Some(plan)) = parse_nuisance_control(&self.uncertainty) {
+            value["nuisance_plan"] = plan.declaration();
+        }
         value
     }
 
@@ -921,7 +1472,7 @@ impl ComparisonPolicy {
         if self.task_mix.trim().is_empty() || self.task_mix.len() > 512 {
             return Err(invalid("a bounded task mix must be declared"));
         }
-        if self.uncertainty.trim().is_empty() || self.uncertainty.len() > 1024 {
+        if self.uncertainty.trim().is_empty() || self.uncertainty.len() > MAX_UNCERTAINTY_BYTES {
             return Err(invalid("an uncertainty policy must be declared"));
         }
         if self.stopping.max_attempts_per_arm == 0 || self.stopping.required_units == 0 {
@@ -986,6 +1537,11 @@ impl ComparisonPolicy {
         // the declared unit must exercise the declared claim path and no
         // size-only shortcut is accepted before any result exists.
         let _ = parse_experiment_selection(&self.uncertainty).map_err(invalid)?;
+        // A present nuisance-control clause is parsed and validated by its own
+        // owner before any result exists: an undeclared shared cache state,
+        // an invented utilization correction, a loosened fault classification
+        // or a plan-authored retry budget is refused at declaration.
+        let _ = parse_nuisance_control(&self.uncertainty).map_err(invalid)?;
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(self).map_err(io::Error::other)?)
@@ -2625,6 +3181,15 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         &mut coverage,
         &mut attribution,
     );
+    apply_nuisance_gate(
+        policy,
+        &included,
+        &results,
+        effect_only_reject,
+        &mut decision,
+        &mut reasons,
+        &mut coverage,
+    );
 
     // The decision record names the method distinction: a model-free adoption
     // rests on the operation's own measured work, and its model metrics stay
@@ -2661,6 +3226,169 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         corroboration,
         attribution,
     })
+}
+
+/// Apply the frozen nuisance-control plan to the summarized evidence. The
+/// gate only restricts a decision: it withholds an unsupported causal claim
+/// and never softens an independent rejection into an adoption. Retained
+/// attempts, errors and usage stay recorded; no elapsed subtraction is
+/// applied to a fault that changed response, context or subsequent work.
+fn apply_nuisance_gate(
+    policy: &ComparisonPolicy,
+    included: &[&Value],
+    results: &BTreeMap<&str, &Value>,
+    effect_only_reject: bool,
+    decision: &mut PolicyDecision,
+    reasons: &mut Vec<String>,
+    coverage: &mut String,
+) {
+    let plan = match parse_nuisance_control(&policy.uncertainty) {
+        Ok(None) => return,
+        Ok(Some(plan)) => plan,
+        Err(error) => {
+            if *decision != PolicyDecision::Reject || effect_only_reject {
+                *decision = PolicyDecision::Inconclusive;
+            }
+            reasons.push(format!(
+                "the declared nuisance-control plan is not usable: {error}"
+            ));
+            coverage.push_str("; nuisance-plan");
+            return;
+        }
+    };
+    let realized = plan
+        .realized_first()
+        .map(RealizedFirst::as_str)
+        .unwrap_or("unresolved");
+    let mut missing = false;
+    let mut violations: Vec<String> = Vec::new();
+    let mut baseline_unrelated = false;
+    let mut candidate_unrelated = false;
+    let mut observed_load = false;
+    for unit in included {
+        let name = unit_name(unit);
+        for (arm, key) in [
+            ("baseline", "baseline_result"),
+            ("candidate", "candidate_result"),
+        ] {
+            let Some(row) = arm_result(results, unit, key) else {
+                missing = true;
+                continue;
+            };
+            let Some(record) = row.get("nuisance") else {
+                missing = true;
+                continue;
+            };
+            if record.get("schema").and_then(Value::as_u64) != Some(1) {
+                missing = true;
+                continue;
+            }
+            let recorded_order = record.pointer("/order/realized").and_then(Value::as_str);
+            if recorded_order != Some(realized) {
+                violations.push(format!(
+                    "unit {name} {arm} arm realized arm order {recorded_order:?} instead of the declared {realized:?}"
+                ));
+            }
+            if record.pointer("/initial/violated").and_then(Value::as_bool) == Some(true) {
+                let observed = record
+                    .pointer("/initial/observed")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unrecorded");
+                violations.push(format!(
+                    "unit {name} {arm} arm violated the declared {} initial state ({observed})",
+                    record
+                        .pointer("/initial/declared")
+                        .and_then(Value::as_str)
+                        .unwrap_or(plan.initial.as_str())
+                ));
+            }
+            if let Some(faults) = record.get("faults").and_then(Value::as_array) {
+                for fault in faults {
+                    let class = fault.get("class").and_then(Value::as_str).unwrap_or("");
+                    if class == "work-started-unverified" || class == "changed-trajectory" {
+                        let detail = fault
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .unwrap_or("no detail recorded");
+                        violations.push(format!(
+                            "unit {name} {arm} arm retained a fault that changed or unverified the response, context or work ({detail}); elapsed subtraction alone cannot make its trajectory comparable"
+                        ));
+                    }
+                }
+            }
+            let unrelated = record
+                .pointer("/load/observed/unrelated_wait")
+                .and_then(Value::as_bool)
+                == Some(true);
+            if record
+                .pointer("/load/observed/admission_evidence")
+                .and_then(Value::as_str)
+                == Some("recorded")
+            {
+                observed_load = true;
+            }
+            if arm == "baseline" {
+                baseline_unrelated |= unrelated;
+            } else {
+                candidate_unrelated |= unrelated;
+            }
+        }
+    }
+    if missing {
+        if *decision != PolicyDecision::Reject || effect_only_reject {
+            *decision = PolicyDecision::Inconclusive;
+        }
+        reasons.push(
+            "a measured attempt of the declared nuisance-control comparison does not record its plan, realized order, initial-state observation and fault classification; the comparison withholds a causal claim rather than assuming uncontrolled conditions"
+                .to_owned(),
+        );
+        coverage.push_str("; nuisance-evidence-gap");
+        return;
+    }
+    let mut material = !violations.is_empty();
+    // Asymmetric recorded unrelated contention can explain an observed
+    // difference by itself. The existing blocking adjustment bounds an
+    // eligible external wait only under the declared work-efficiency binding;
+    // without it the causal claim is withheld instead of inventing a
+    // utilization-based time correction.
+    if observed_load && baseline_unrelated != candidate_unrelated {
+        let bounded = matches!(
+            crate::infrastructure_accounting::parse_binding(&policy.uncertainty),
+            Ok(Some(binding))
+                if binding.view == crate::infrastructure_accounting::MetricView::WorkEfficiency
+                    && !binding.mechanism.owns_queue()
+                    && policy.objective == Objective::Time
+        );
+        if bounded {
+            coverage.push_str("; nuisance-asymmetric-load-adjusted");
+        } else {
+            material = true;
+            violations.push(
+                "an unrelated external heavy command was measured over exactly one arm while no declared work-efficiency binding bounds that waiting; the raw difference is not corrected by a guessed utilization factor".to_owned(),
+            );
+        }
+    } else if observed_load && baseline_unrelated && candidate_unrelated {
+        coverage.push_str("; nuisance-comparable-recorded-load");
+    } else if !observed_load {
+        coverage.push_str("; nuisance-shared-and-load-state-unobserved");
+    }
+    coverage.push_str("; nuisance-order-exposure-retained");
+    if plan.shared == SharedState::Unobserved {
+        // The disclosure stays explicit in every plan-bound decision: unknown
+        // shared/OS/inference-cache state is never presented as controlled,
+        // and a configured reset is not treated as proof of equal conditions.
+        coverage.push_str("; nuisance-shared-unobserved");
+    }
+    if material {
+        if *decision != PolicyDecision::Reject || effect_only_reject {
+            *decision = PolicyDecision::Inconclusive;
+        }
+        reasons.append(&mut violations);
+        reasons.push(
+            "the declared nuisance-control conditions were not met; retained attempts, errors and usage stay recorded, and further attempts follow the frozen stopping rule without selecting favorable failures or load"
+                .to_owned(),
+        );
+    }
 }
 
 fn apply_infrastructure_gate(
