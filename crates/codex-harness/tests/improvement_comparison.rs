@@ -6479,18 +6479,16 @@ fn a_settled_short_operation_is_reused_only_while_its_declared_inputs_match() {
     assert!(fixture.run.join("comparison/decision.json").is_file());
     assert_eq!(fs::read(&baseline_path).unwrap(), baseline_receipt);
     assert_eq!(fs::read(&candidate_path).unwrap(), candidate_receipt);
-    // Both arms passed their independent checks, yet the model-free unit
-    // cannot support an adoption: the current outcome accounting only forms a
-    // comparable pair when the model dimensions are known, and this method
-    // reports them as inapplicable rather than as a measured zero. The
-    // resulting verdict is an evidence-bound inconclusive that names the
-    // exact reason; no efficiency adoption is fabricated from a component-only
-    // operation.
+    // Both arms passed their independent checks, so the model-free pair forms
+    // a comparable unit on the operation's own measured work: the model
+    // dimensions stay explicitly inapplicable (never measured zero), and the
+    // measured difference decides adopt or reject against the declared
+    // tolerance (real durations vary run to run; neither verdict is fabricated).
     let decision = load_json(&fixture.run.join("comparison/decision.json"));
     let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
-    assert_eq!(
-        decision["decision"], "inconclusive",
-        "{decision}\n{evaluation}"
+    assert!(
+        decision["decision"] == "adopt" || decision["decision"] == "reject",
+        "a supported decision replaces the former no-matched-unit inconclusive: {decision}\n{evaluation}"
     );
     assert!(
         evaluation["reasons"]
@@ -6500,17 +6498,19 @@ fn a_settled_short_operation_is_reused_only_while_its_declared_inputs_match() {
             .any(|reason| reason
                 .as_str()
                 .unwrap_or_default()
-                .contains("no matched, independently accepted unit")),
-        "the non-adoption names the exact evaluator limit: {evaluation}"
+                .contains("model metrics are inapplicable")),
+        "the decision names the model-free distinction: {evaluation}"
     );
     assert_eq!(
         evaluation["acceptedTasks"], 2,
         "both real operations were independently accepted: {evaluation}"
     );
-    assert_eq!(
-        evaluation["coverage"].as_str().unwrap_or_default(),
-        "none; complete-pairs:0; variation:unmeasured",
-        "the unmeasured model dimensions are visible limits, never measured zero: {evaluation}"
+    assert!(
+        evaluation["coverage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("method:real-operation"),
+        "the coverage names the real-operation method with inapplicable model metrics: {evaluation}"
     );
     let effects = fixture.cursor()["effects"].as_array().unwrap().clone();
     assert_eq!(
