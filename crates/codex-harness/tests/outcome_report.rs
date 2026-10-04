@@ -723,3 +723,183 @@ fn invalid_corroboration_receipts_are_refused_without_a_section() {
     }
     assert!(report.get("corroboration").is_none());
 }
+
+/// A retained capture with one verified unrelated external wait of
+/// `wait_seconds` inside a 10-second attempt and the given requests.
+fn cli_wait_capture(wait_seconds: u64, requests: Value) -> Value {
+    let wait_ns = wait_seconds * 1_000_000_000;
+    json!({
+        "window": {"start_ns": 0, "end_ns": 10_000_000_000_u64},
+        "admissions": [{
+            "id": "adm-1",
+            "class": "unrelated_wait",
+            "domain_match": true,
+            "start_ns": 0,
+            "end_ns": wait_ns,
+            "endpoint_start_ns": 0,
+            "endpoint_end_ns": 0,
+            "tick_ns": 0,
+            "tool_call_id": "tool-1",
+            "command_id": "cmd-1",
+            "started": true,
+            "terminal": "waited_grant"
+        }],
+        "activity": [{
+            "id": "tool-1",
+            "kind": "command",
+            "placement": "exact",
+            "start_ns": 0,
+            "end_ns": wait_ns,
+            "tool_call_id": "tool-1",
+            "command_id": "cmd-1"
+        }],
+        "requests": requests
+    })
+}
+
+fn cli_immediate_capture() -> Value {
+    json!({
+        "window": {"start_ns": 0, "end_ns": 10_000_000_000_u64},
+        "admissions": [{"id": "now", "class": "measured_zero", "domain_match": true}],
+        "activity": [],
+        "requests": []
+    })
+}
+
+fn cli_wait_request(id: &str) -> Value {
+    json!({
+        "id": id,
+        "wait_only": true,
+        "start_ns": 1_000_000_000_u64,
+        "end_ns": 2_000_000_000_u64,
+        "tool_call_id": "tool-1",
+        "command_id": "cmd-1",
+        "input_tokens": 12,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 12
+    })
+}
+
+/// The retained native trace replays into the same adjusted view through the
+/// real CLI entry point, the raw/adjusted/excluded totals reconcile, every
+/// exclusion carries its rule and evidence, and duplicate request usage is
+/// rejected instead of creating a saving.
+#[test]
+fn infrastructure_attribution_replays_reconciles_and_rejects_duplicates() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("attribution.json");
+    let rows = |requests: Value| {
+        let mut baseline = attempt("base", "baseline");
+        baseline["infrastructure_capture"] = cli_immediate_capture();
+        let mut candidate = attempt("cand", "candidate");
+        candidate["infrastructure_capture"] = cli_wait_capture(5, requests);
+        json!([baseline, candidate])
+    };
+    fs::write(
+        &input,
+        serde_json::to_vec(&rows(json!([cli_wait_request("wait-1")]))).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let attribution = report["attempts"][1]["attribution"].clone();
+    assert_eq!(attribution["replay"], "reproduced", "{attribution}");
+    assert_eq!(
+        attribution["rule_version"], "infrastructure-attribution.v1",
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["status"], "consistent",
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["elapsed"]["excluded_seconds"], 5.0,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["raw_total_tokens"], 12,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["excluded_total_tokens"], 12,
+        "{attribution}"
+    );
+    assert!(
+        attribution["exclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "deducted"
+                && entry["metric"] == "tokens"
+                && entry["requests"] == json!(["wait-1"])
+                && entry["rule"] == "infrastructure-attribution.v1"
+                && !entry["evidence"].as_str().unwrap_or("").is_empty()),
+        "{attribution}"
+    );
+
+    // Resuming from the retained report reproduces the same deductions: the
+    // second pass is the same deterministic reduction, not a new measurement.
+    let resumed_input = root.path().join("resumed.json");
+    fs::write(&resumed_input, serde_json::to_vec(&report).unwrap()).unwrap();
+    let output = run(&resumed_input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let resumed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(resumed["attempts"][1]["attribution"], attribution);
+
+    // A duplicated request identity is one request, not two savings: the
+    // exclusion does not happen, the adjusted total keeps the recorded usage,
+    // and the degraded coverage is explicit.
+    fs::write(
+        &input,
+        serde_json::to_vec(&rows(json!([
+            cli_wait_request("wait-1"),
+            cli_wait_request("wait-1")
+        ])))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let duplicate: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let attribution = duplicate["attempts"][1]["attribution"].clone();
+    assert_eq!(
+        attribution["duplicates"],
+        json!(["wait-1"]),
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["status"], "degraded",
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["excluded_total_tokens"], 0,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["adjusted_total_tokens"], 12,
+        "{attribution}"
+    );
+    assert!(
+        attribution["exclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "unresolved"
+                && entry["metric"] == "tokens"
+                && entry["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("duplicate request identity"))),
+        "{attribution}"
+    );
+}

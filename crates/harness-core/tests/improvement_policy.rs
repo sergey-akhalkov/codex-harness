@@ -159,13 +159,29 @@ fn with_claim_and_binding(scope: ClaimScope) -> ComparisonPolicy {
 
 /// Record a precomputed measurement/attribution bound on an attempt. The
 /// evaluator consumes exactly this contract; the accounting-side construction
-/// of these values is exercised by the infrastructure-accounting tests.
+/// of these values is exercised by the infrastructure-accounting tests. The
+/// rule identity and the raw/adjusted/excluded identity make the retained
+/// evidence reconcilable, as a real reduction would be.
 fn bounded(row: &mut Value, low: f64, high: f64) {
+    let observed_ns = (high * 1_000_000_000.0).round() as u64;
+    let low_ns = (low * 1_000_000_000.0).round() as u64;
     row["infrastructure"] = json!({
+        "rule_version": harness_core::infrastructure_accounting::RULE_VERSION,
+        "lineage": harness_core::infrastructure_accounting::MEASUREMENT_LINEAGE,
+        "eligible_cause": harness_core::infrastructure_accounting::ELIGIBLE_CAUSE,
+        "observed_ns": observed_ns,
+        "observed_seconds": high,
+        "adjusted_ns": observed_ns,
+        "adjusted_seconds": high,
+        "adjusted_low_ns": low_ns,
+        "adjusted_high_ns": observed_ns,
         "adjusted_low_seconds": low,
         "adjusted_high_seconds": high,
+        "deductible_ns": 0,
+        "deductible_seconds": 0.0,
+        "unresolved_ns": observed_ns - low_ns,
+        "unresolved_seconds": high - low,
         "coverage": "measured",
-        "unresolved_seconds": 0.0,
     });
 }
 
@@ -1126,6 +1142,854 @@ fn shared_costs_and_repeated_edges_count_once_and_drift_is_invalid() {
             .any(|reason| reason.contains("declaration differs")),
         "{:?}",
         evaluation.reasons
+    );
+}
+
+/// Declared policy bound to the work-efficiency infrastructure view with the
+/// given treatment mechanism.
+fn with_binding(mechanism: Mechanism) -> ComparisonPolicy {
+    let mut policy = policy();
+    policy.uncertainty = format!(
+        "unknown evidence stays inconclusive; {}",
+        binding_clause(MetricView::WorkEfficiency, mechanism)
+    );
+    policy
+}
+
+fn captured(row: Value, capture: Value) -> Value {
+    let mut row = row;
+    row["infrastructure_capture"] = capture;
+    row
+}
+
+/// A retained native capture with one verified unrelated external wait of
+/// `wait_seconds` inside an attempt of `total_seconds`, with its matching
+/// correlated command activity and the given model requests.
+fn wait_capture(wait_seconds: u64, total_seconds: u64, requests: Value) -> Value {
+    let wait_ns = wait_seconds * 1_000_000_000;
+    json!({
+        "window": {"start_ns": 0, "end_ns": total_seconds * 1_000_000_000_u64},
+        "admissions": [{
+            "id": "adm-1",
+            "class": "unrelated_wait",
+            "domain_match": true,
+            "start_ns": 0,
+            "end_ns": wait_ns,
+            "endpoint_start_ns": 0,
+            "endpoint_end_ns": 0,
+            "tick_ns": 0,
+            "tool_call_id": "tool-1",
+            "command_id": "cmd-1",
+            "started": true,
+            "terminal": "waited_grant"
+        }],
+        "activity": [{
+            "id": "tool-1",
+            "kind": "command",
+            "placement": "exact",
+            "start_ns": 0,
+            "end_ns": wait_ns,
+            "tool_call_id": "tool-1",
+            "command_id": "cmd-1"
+        }],
+        "requests": requests
+    })
+}
+
+/// A fully observed immediate grant: proven zero queue delay.
+fn immediate_capture(total_seconds: u64, requests: Value) -> Value {
+    json!({
+        "window": {"start_ns": 0, "end_ns": total_seconds * 1_000_000_000_u64},
+        "admissions": [{"id": "now", "class": "measured_zero", "domain_match": true}],
+        "activity": [],
+        "requests": requests
+    })
+}
+
+fn wait_only_request(id: &str, total_tokens: u64) -> Value {
+    json!({
+        "id": id,
+        "wait_only": true,
+        "start_ns": 1_000_000_000_u64,
+        "end_ns": 2_000_000_000_u64,
+        "tool_call_id": "tool-1",
+        "command_id": "cmd-1",
+        "input_tokens": total_tokens,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": total_tokens
+    })
+}
+
+fn task_request(id: &str, total_tokens: u64, start_ns: u64) -> Value {
+    json!({
+        "id": id,
+        "wait_only": false,
+        "start_ns": start_ns,
+        "end_ns": start_ns + 1_000_000_000,
+        "input_tokens": total_tokens,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": total_tokens
+    })
+}
+
+#[test]
+fn infrastructure_evidence_replays_and_reconciles_across_resume() {
+    let policy = with_binding(Mechanism::None);
+    let declared = declare(&policy);
+    let report = summarize(
+        &[
+            captured(
+                attempt(
+                    "b1",
+                    "baseline",
+                    "case-e",
+                    0.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(40, json!([task_request("task-b", 10, 1_000_000_000)])),
+            ),
+            captured(
+                attempt(
+                    "c1",
+                    "candidate",
+                    "case-e",
+                    100.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                wait_capture(10, 40, json!([wait_only_request("wait-1", 12)])),
+            ),
+        ],
+        &policy,
+    );
+    let attribution = report["attempts"][1]["attribution"].clone();
+    assert_eq!(attribution["replay"], "reproduced", "{attribution}");
+    assert_eq!(
+        attribution["rule_version"],
+        harness_core::infrastructure_accounting::RULE_VERSION
+    );
+    assert_eq!(
+        attribution["reconciliation"]["status"], "consistent",
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["elapsed"]["excluded_seconds"], 10.0,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["raw_total_tokens"], 12,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["excluded_total_tokens"], 12,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["adjusted_total_tokens"], 0,
+        "{attribution}"
+    );
+    // Every exclusion carries its rule, reason and evidence reference.
+    let exclusions = attribution["exclusions"].as_array().unwrap();
+    assert!(
+        exclusions.iter().any(|entry| {
+            entry["kind"] == "deducted"
+                && entry["metric"] == "elapsed"
+                && entry["rule"] == harness_core::infrastructure_accounting::RULE_VERSION
+                && entry["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty())
+                && entry["evidence"]
+                    .as_str()
+                    .is_some_and(|evidence| !evidence.is_empty())
+        }),
+        "{exclusions:?}"
+    );
+    assert!(
+        exclusions.iter().any(|entry| {
+            entry["kind"] == "deducted"
+                && entry["metric"] == "tokens"
+                && entry["requests"] == json!(["wait-1"])
+                && entry["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty())
+        }),
+        "{exclusions:?}"
+    );
+    // Replay is deterministic: re-summarizing the retained attempts (the
+    // resume path) reproduces the same deductions, exclusions and totals with
+    // no model call and no operator label.
+    let attempts = report["attempts"].as_array().unwrap().clone();
+    let resumed = summarize_attempts(&attempts).unwrap();
+    assert_eq!(resumed["attempts"][1]["attribution"], attribution);
+    // The explicit replay entry reduces the retained native trace into exactly
+    // the retained adjusted view, every time.
+    let replayed = harness_core::outcome_report::replay_attempt(&report["attempts"][1])
+        .expect("the retained capture replays");
+    assert_eq!(replayed, report["attempts"][1]["infrastructure"]);
+    assert_eq!(
+        replayed,
+        harness_core::outcome_report::replay_attempt(&report["attempts"][1]).unwrap()
+    );
+    // The durable evaluation binds the rule identity, declared view and
+    // reconciled totals to the decision.
+    let evaluation = evaluate(&declared, &report).unwrap();
+    let evidence = evaluation
+        .attribution
+        .as_ref()
+        .expect("attribution is bound to the evaluation");
+    assert_eq!(
+        evidence.rule_version.as_deref(),
+        Some("infrastructure-attribution.v1")
+    );
+    assert_eq!(evidence.view, "work-efficiency");
+    assert_eq!(evidence.replay, "reproduced");
+    assert_eq!(evidence.reconciliation, "consistent");
+    assert_eq!(evidence.elapsed_excluded_seconds, Some(10.0));
+    assert_eq!(evidence.tokens_raw_total, Some(22));
+    assert_eq!(evidence.tokens_excluded_total, Some(12));
+    assert_eq!(evidence.tokens_adjusted_total, Some(10));
+    assert!(
+        evidence.exclusions.iter().any(|entry| {
+            entry.kind == "deducted"
+                && entry.metric == "elapsed"
+                && entry.attempt == "c1"
+                && entry.arm == "candidate"
+        }),
+        "{:?}",
+        evidence.exclusions
+    );
+}
+
+#[test]
+fn queue_only_false_gain_and_regression_stay_inconclusive() {
+    let policy = with_binding(Mechanism::None);
+    let declared = declare(&policy);
+    // False gain: the baseline, not the candidate, sat in the external queue.
+    let false_gain = summarize(
+        &[
+            captured(
+                attempt(
+                    "b1",
+                    "baseline",
+                    "case-q",
+                    0.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                wait_capture(10, 40, json!([])),
+            ),
+            captured(
+                attempt(
+                    "c1",
+                    "candidate",
+                    "case-q",
+                    100.0,
+                    30.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(30, json!([])),
+            ),
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &false_gain).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("external waiting")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(evaluation.coverage.contains("raw-only-wait"));
+    // False regression: the candidate's extra observed time is a measured
+    // external wait and the adjusted view shows no material regression.
+    let false_regression = summarize(
+        &[
+            captured(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-q",
+                    0.0,
+                    30.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(30, json!([])),
+            ),
+            captured(
+                attempt(
+                    "c2",
+                    "candidate",
+                    "case-q",
+                    100.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                wait_capture(10, 40, json!([])),
+            ),
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &false_regression).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    // Counterexample: a measured regression beyond tolerance on the adjusted
+    // view stays a rejection rather than becoming inconclusive.
+    let genuine = summarize(
+        &[
+            captured(
+                attempt(
+                    "b3",
+                    "baseline",
+                    "case-q",
+                    0.0,
+                    30.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(30, json!([])),
+            ),
+            captured(
+                attempt(
+                    "c3",
+                    "candidate",
+                    "case-q",
+                    100.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(40, json!([])),
+            ),
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &genuine).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn an_unreconciled_unreplayable_or_stale_rule_view_cannot_inherit_an_adoption() {
+    let policy = with_binding(Mechanism::None);
+    let declared = declare(&policy);
+    let mut baseline = attempt(
+        "b1",
+        "baseline",
+        "case-r",
+        0.0,
+        100.0,
+        true,
+        Some(4),
+        Some(6),
+        false,
+    );
+    let mut candidate = attempt(
+        "c1",
+        "candidate",
+        "case-r",
+        100.0,
+        80.0,
+        true,
+        Some(3),
+        Some(6),
+        false,
+    );
+    bounded(&mut baseline, 100.0, 100.0);
+    bounded(&mut candidate, 80.0, 80.0);
+    let report = summarize(&[baseline.clone(), candidate.clone()], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A retained total that no longer reconciles is an accounting gap, not a
+    // larger deduction.
+    let mut gapped = candidate.clone();
+    gapped["infrastructure"]["adjusted_ns"] = json!(70_000_000_000_u64);
+    gapped["infrastructure"]["adjusted_high_ns"] = json!(70_000_000_000_u64);
+    gapped["infrastructure"]["adjusted_high_seconds"] = json!(70.0);
+    let gapped = summarize(&[baseline.clone(), gapped], &policy);
+    assert_eq!(
+        gapped["attempts"][1]["attribution"]["reconciliation"]["status"], "gap",
+        "{}",
+        gapped["attempts"][1]["attribution"]
+    );
+    let evaluation = evaluate(&declared, &gapped).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("do not reconcile")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Evidence produced under a different attribution rule/version cannot be
+    // consumed under the predeclared rule.
+    let mut stale = candidate.clone();
+    stale["infrastructure"]["rule_version"] = json!("infrastructure-attribution.v2");
+    let stale = summarize(&[baseline.clone(), stale], &policy);
+    let evaluation = evaluate(&declared, &stale).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("changed rule")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A retained adjusted view that no longer reproduces from its retained
+    // native trace is contaminated and cannot decide the comparison.
+    let report = summarize(
+        &[
+            captured(
+                attempt(
+                    "b4",
+                    "baseline",
+                    "case-r",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(100, json!([])),
+            ),
+            captured(
+                attempt(
+                    "c4",
+                    "candidate",
+                    "case-r",
+                    100.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                wait_capture(10, 40, json!([])),
+            ),
+        ],
+        &policy,
+    );
+    let mut attempts = report["attempts"].as_array().unwrap().clone();
+    attempts[1]["infrastructure"]["deductible_ns"] = json!(0);
+    attempts[1]["infrastructure"]["adjusted_ns"] = json!(40_000_000_000_u64);
+    attempts[1]["infrastructure"]["adjusted_high_ns"] = json!(40_000_000_000_u64);
+    attempts[1]["infrastructure"]["adjusted_low_ns"] = json!(40_000_000_000_u64);
+    attempts[1]["infrastructure"]["adjusted_seconds"] = json!(40.0);
+    attempts[1]["infrastructure"]["adjusted_low_seconds"] = json!(40.0);
+    attempts[1]["infrastructure"]["adjusted_high_seconds"] = json!(40.0);
+    let resumed = summarize_attempts(&attempts).unwrap();
+    assert_eq!(
+        resumed["attempts"][1]["attribution"]["replay"], "mismatch",
+        "{}",
+        resumed["attempts"][1]["attribution"]
+    );
+    let evaluation = evaluate(&declared, &resumed).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not reproduce")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn duplicate_usage_is_rejected_instead_of_creating_a_saving() {
+    let policy = with_binding(Mechanism::None);
+    let declared = declare(&policy);
+    let clean = summarize(
+        &[
+            captured(
+                attempt(
+                    "b1",
+                    "baseline",
+                    "case-u",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(100, json!([task_request("task-b", 10, 1_000_000_000)])),
+            ),
+            captured(
+                attempt(
+                    "c1",
+                    "candidate",
+                    "case-u",
+                    100.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                wait_capture(10, 40, json!([wait_only_request("wait-1", 12)])),
+            ),
+        ],
+        &policy,
+    );
+    assert_eq!(
+        clean["attempts"][1]["attribution"]["reconciliation"]["tokens"]["excluded_total_tokens"],
+        12,
+        "{}",
+        clean["attempts"][1]["attribution"]
+    );
+    let evaluation = evaluate(&declared, &clean).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The same wait-only request recorded twice is one request, not two
+    // savings: it is not excluded, the adjusted usage keeps the full total,
+    // and the degraded coverage is recorded instead.
+    let duplicate = summarize(
+        &[
+            captured(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-u",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(100, json!([task_request("task-b", 10, 1_000_000_000)])),
+            ),
+            captured(
+                attempt(
+                    "c2",
+                    "candidate",
+                    "case-u",
+                    100.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                wait_capture(
+                    10,
+                    40,
+                    json!([
+                        wait_only_request("wait-1", 12),
+                        wait_only_request("wait-1", 12)
+                    ]),
+                ),
+            ),
+        ],
+        &policy,
+    );
+    let attribution = duplicate["attempts"][1]["attribution"].clone();
+    assert_eq!(attribution["duplicates"], json!(["wait-1"]));
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["status"], "degraded",
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["raw_total_tokens"], 12,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["excluded_total_tokens"], 0,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["reconciliation"]["tokens"]["adjusted_total_tokens"], 12,
+        "{attribution}"
+    );
+    let evaluation = evaluate(&declared, &duplicate).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "duplicate usage cannot produce the exclusion saving: {:?}",
+        evaluation.reasons
+    );
+    let evidence = evaluation.attribution.as_ref().unwrap();
+    assert_eq!(evidence.reconciliation, "degraded");
+    assert_eq!(evidence.duplicates, vec!["wait-1".to_owned()]);
+}
+
+#[test]
+fn build_demand_treatment_keeps_its_effect_and_waiting_treatment_is_operational() {
+    let rows = [
+        captured(
+            attempt(
+                "b1",
+                "baseline",
+                "case-c",
+                0.0,
+                40.0,
+                true,
+                Some(4),
+                Some(6),
+                false,
+            ),
+            immediate_capture(40, json!([])),
+        ),
+        captured(
+            attempt(
+                "c1",
+                "candidate",
+                "case-c",
+                100.0,
+                20.0,
+                true,
+                Some(4),
+                Some(6),
+                false,
+            ),
+            immediate_capture(20, json!([])),
+        ),
+    ];
+    // A cache/build-demand treatment changes real work, not external waits:
+    // the reduced work stays in the adjusted view and supports the decision.
+    let policy = with_binding(Mechanism::Cache);
+    let declared = declare(&policy);
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    let evidence = evaluation.attribution.as_ref().unwrap();
+    assert_eq!(evidence.mechanism, "cache");
+    assert_eq!(evidence.elapsed_excluded_seconds, Some(0.0));
+    assert_eq!(evaluation.baseline_seconds, Some(40.0));
+    assert_eq!(evaluation.candidate_seconds, Some(20.0));
+
+    // A treatment that changes waiting itself is evaluated under controlled
+    // load; it is never subtracted from its own measurement.
+    let policy = with_binding(Mechanism::Waiting);
+    let declared = declare(&policy);
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("controlled load")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn downstream_context_after_an_external_wait_cannot_be_erased() {
+    let policy = with_binding(Mechanism::None);
+    let declared = declare(&policy);
+    let report = summarize(
+        &[
+            captured(
+                attempt(
+                    "b1",
+                    "baseline",
+                    "case-d",
+                    0.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(40, json!([task_request("task-b", 10, 1_000_000_000)])),
+            ),
+            captured(
+                attempt(
+                    "c1",
+                    "candidate",
+                    "case-d",
+                    100.0,
+                    20.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                wait_capture(
+                    5,
+                    20,
+                    json!([
+                        wait_only_request("wait-1", 20),
+                        task_request("task-c", 40, 10_000_000_000)
+                    ]),
+                ),
+            ),
+        ],
+        &policy,
+    );
+    let attempt = &report["attempts"][1];
+    // The measured wait interval alone is subtracted from elapsed time.
+    assert_eq!(attempt["infrastructure"]["adjusted_seconds"], 15.0);
+    // The later mixed-request usage caused by the waiting context stays in the
+    // adjusted total; only the contained wait-only request is excluded.
+    let reconciliation = &attempt["attribution"]["reconciliation"];
+    assert_eq!(reconciliation["tokens"]["excluded_total_tokens"], 20);
+    assert_eq!(reconciliation["tokens"]["adjusted_total_tokens"], 40);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("excluded wait usage is not a waiver")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn a_verdict_changing_coverage_gap_stays_visible_with_its_reasons() {
+    let policy = with_binding(Mechanism::None);
+    let declared = declare(&policy);
+    let mut gap = wait_capture(10, 40, json!([]));
+    gap["admissions"][0]["endpoint_end_ns"] = Value::Null;
+    let report = summarize(
+        &[
+            captured(
+                attempt(
+                    "b1",
+                    "baseline",
+                    "case-g",
+                    0.0,
+                    40.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                gap,
+            ),
+            captured(
+                attempt(
+                    "c1",
+                    "candidate",
+                    "case-g",
+                    100.0,
+                    30.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                immediate_capture(30, json!([])),
+            ),
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.coverage.contains("infrastructure-gap"),
+        "{}",
+        evaluation.coverage
+    );
+    let evidence = evaluation.attribution.as_ref().unwrap();
+    assert!(
+        evidence.exclusions.iter().any(|entry| {
+            entry.kind == "unresolved"
+                && entry.reason.contains("endpoint_unknown")
+                && entry.rule.as_deref()
+                    == Some(harness_core::infrastructure_accounting::RULE_VERSION)
+                && !entry.evidence.is_empty()
+        }),
+        "{:?}",
+        evidence.exclusions
     );
 }
 
