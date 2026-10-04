@@ -32,8 +32,8 @@ The retired script interface and its native equivalent. Selectors, preview
 | Instruction/source audit | Installed `harness-source-check --root CHECKOUT` |
 | Verification evidence | `harness-observe --scope TEXT --input FILE ... -- EXE ARGS` |
 | Feedback mechanics | `codex-harness feedback record|list|ledger|triage|candidates|promote` |
-| Hypothesis and removal records | `codex-harness feedback hypothesis-admit|search|trial|implement|decision` and `removal-propose|decide|check` |
-| Self-improvement controller | `codex-harness improve start|status|select|stop|resume` |
+| Hypothesis and removal records | `codex-harness feedback hypothesis-admit|search|trial|implement|decision|reconcile` and `removal-propose|decide|check` |
+| Self-improvement controller | `codex-harness improve start|status|select|stop|resume|prepare-runtime` |
 | `tools/outcome_*.py` helpers | `codex-harness outcome-prepare` / `outcome-oracle` / `outcome-discover` / `outcome-arm` / `outcome-run` / `outcome-report` |
 | Subscription login / restore scripts | `codex-harness subscription-login xai` / `zai` (native restore in the service host) |
 | Skill evolution helpers | `codex-harness skills catalogue` / `isolate` / `usage` / `publish` / `identity` |
@@ -822,40 +822,114 @@ the planning change and the installed profile binding owns the effective
 model:
 
 ```powershell
-codex-harness improve start  --run DIRECTORY --spec FILE
+codex-harness improve start  --run DIRECTORY --spec FILE [--supervision once|continuous]
+    [--integration-check FILE] [--successor-spec FILE --successor-run DIRECTORY]
 codex-harness improve status --run DIRECTORY [--json]
 codex-harness improve select --run DIRECTORY --variant baseline|candidate
 codex-harness improve stop   --run DIRECTORY [--reason TEXT]
 codex-harness improve resume --run DIRECTORY
+codex-harness improve prepare-runtime --source DIRECTORY --state DIRECTORY --output FILE
 ```
 
 `start` validates the strict schema-1 run inputs (project, board, OpenSpec
 change, base revision, writable scope, runner profile, evidence root, oracle,
-publication scope and any removal scope), refuses duplicate run ownership,
+publication scope and any removal scope, plus the declared local runner,
+qualification record and comparison inputs), refuses duplicate run ownership,
 qualifies the linked OpenSpec change through the installed CLI, creates the
-private run directory and performs model-free preparation. It then advances
-the bounded investigation, planning and implementation workflow: a retained
-investigator report is consumed through grounded intake, the candidate's own
-OpenSpec change must qualify before any implementation, and only a validated
-committed candidate reaches candidate-ready. A missing evidence base records
-idle and a missing dispatch, qualification or removal gate records blocked;
-neither starts hidden model work.
+private run directory and performs model-free preparation. The experiment
+declares its method before dependent work: the run's `experiment` contract
+fixes the mechanism, counterexample, applicability, independent acceptance,
+meaningful effect, operating conditions, comparison policy and stopping rule;
+the hypothesis's own OpenSpec change must state the declared measurement scope
+before any directed baseline measurement, and the predeclared comparison
+policy is digested into the experiment bindings. A missing or changed
+declaration blocks directed measurement instead of being silently re-frozen.
 
-`status` prints the recoverable phase cursor with no model call. `select`
-activates an already prepared baseline or candidate runtime through the
-build-selection owner and refuses while a measured attempt is active or
-unreconciled; a candidate that removes a capability additionally needs the
-current experimental removal authority. `stop` preserves every attempt and
-marks in-flight attempts unknown so `resume` never replays them. `resume`
-reconciles recorded receipts, re-resolves removal authority and advances only
-settled work.
+After preparation the controller advances the bounded investigation, planning
+and implementation workflow: a retained investigator report is consumed
+through grounded intake, the candidate's own OpenSpec change must qualify
+before any implementation, and only a validated committed candidate on its
+card-bound branch/worktree reaches `candidate-ready`. The candidate branch and
+worktree bind to the hypothesis card and the exact committed base; a busy,
+dirty or unpreserved existing allocation is left untouched and a new owned one
+is used instead. A missing evidence base records idle and a missing dispatch,
+qualification or removal gate records blocked; neither starts hidden model
+work. A run that declares the explicit comparison inputs additionally prepares
+and drives the sequential measured pair (baseline before candidate, one
+measured conversation at a time); without them the run stops at
+`candidate-ready`.
 
-Comparison execution and frozen runtime preparation remain separate owners:
-phases that need them stay explicitly pending until an actual effect records
-them, and the installed actual-model A-on-B/B-on-C acceptance is open rather
-than proven. The run directory, spec file and retained receipts are local
-private inputs. Read `improve --help` for the exact request contract and see
-the [self-improvement-loop skill](../.agents/skills/self-improvement-loop/SKILL.md)
+`select` activates an already prepared baseline or candidate runtime through
+the shared build-selection owner, records the identity it actually consumed
+and performs no model call, build or source edit. It refuses while a measured
+attempt is active or unreconciled, and a candidate that is a removal treatment
+additionally needs the current experimental removal authority. Prepared
+variants are immutable identities: repeated selection reuses them without
+source revert or rebuild while their inputs, qualification and consumption
+identity still validate, and after an interruption a completed arm is reused
+only while its planning inputs also remain valid - otherwise the controller
+records why remeasurement is required.
+
+`status` prints the recoverable phase cursor with no model call: current phase
+and condition, the hypothesis card, the qualified planning change, the
+effective runner binding, the evidence root, the consumed intake outcomes, the
+selected candidate with its branch/base/revision, the dispatch gate, the
+removal gate, the directed-measurement gate state (the declared scope file and
+the retained measurement receipt), every attempt with its receipt, the
+selected prepared variant, the decision-boundary receipts (the retained
+completed real task, the declared corroboration selection and the unadopted
+reconcile record) and the phases still pending. `--json` prints the same
+report as JSON.
+
+Once a decision is settled, the controller routes it to the merged owners
+without another user confirmation: the completed real workload task is
+retained identity-only as replayable pre-solution inputs under the card that
+already owns it, additional independent corroboration units are selected when
+the predeclared policy requires them (too few applicable units stay explicitly
+inconclusive), and an unadopted decision reconciles the hypothesis's own
+OpenSpec change - retention reads its actual task state and writes nothing,
+while archival uses the supported non-synchronizing path only when every
+required task is done. An adopted decision integrates only the exact supported
+candidate and only when the run's publication scope permits it with a declared
+combined-tree check: the check runs in the candidate's owned worktree and the
+exact evaluated revision is fast-forwarded only while the newest decision,
+removal authority, base and candidate tree still match, then the prepared
+candidate runtime is activated as the experimental baseline. Benefit,
+authorization, integration, activation and live publication stay distinct:
+rejection, an inconclusive result, drift, a failed check or missing removal
+authority leaves the accepted baseline unchanged while candidate, evidence and
+reason are retained, and restoring an owned experimental selection to that
+baseline is authorized recovery, not a new capability retirement.
+
+`stop` suspends new work, preserves every attempt and marks in-flight attempts
+unknown so `resume` never replays them. `resume` takes over a stopped or
+interrupted run, reconciles recorded receipts (a completed arm is reused only
+while its planning inputs still validate), re-resolves the current removal
+authority and advances only settled work. A declared successor
+(`--successor-spec`/`--successor-run`) starts only after the completed decision
+with retained lineage - it is the optional B-on-C rotation, never required for
+every hypothesis; without provable lineage, or when it would merely repeat the
+completed experiment, it is refused and the controller records a
+non-suppressing idle continuation instead of calling a model to stay busy.
+Continuous supervision is the default for a new `start`: it keeps driving
+settled attempts, prepares a missing runtime through the native build owner
+and hands the exact supported decision to the integration and activation
+owners; `--supervision once` is the explicit single-step mode.
+
+Local runner qualification follows the
+[outcome-run qualification](#outcome-usage-and-helpers) contract: the run
+declares the local runner and its retained qualification record, the
+comparison client route must match that runner, and a changed, missing or
+unverifiable identity holds the comparison instead of weakening the declared
+policy. Comparison execution and frozen runtime preparation remain separate
+owners: phases that need them stay explicitly pending until an actual effect
+records them; `prepare-runtime` performs that model-free preparation for an
+explicit source and state through the shared native build owner and reports
+the build identity it produced or reused. The installed actual-model
+A-on-B/B-on-C acceptance is open rather than proven. The run directory, spec
+file and retained receipts are local private inputs. Read `improve --help` for
+the exact request contract and see the
+[self-improvement-loop skill](../.agents/skills/self-improvement-loop/SKILL.md)
 for operation and the [sequential comparison guide](../.agents/skills/board-workflow/references/self-improvement.md)
 for records.
 

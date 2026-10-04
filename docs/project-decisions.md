@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-10-02**.
+Last updated: **2026-10-04**.
 
 ## Public pack
 
@@ -37,8 +37,9 @@ integrity and the existing machine resource budgets remain intact.
 Use the existing `cargo-fast` skill to carry measured, portable practices to
 other Rust projects. Optional caches, test runners, target consolidation and
 concurrency changes need evidence for their workload; no universal savings are
-implied. Implementation and acceptance belong to
-[reduce Rust build cost](../openspec/changes/reduce-rust-build-cost/proposal.md).
+implied. Implementation and acceptance belong to the archived
+[reduce Rust build cost](../openspec/changes/archive/2026-10-03-reduce-rust-build-cost/proposal.md)
+change.
 
 The measured implementation consolidates `harness-core` integration tests into
 one executable while preserving their cases and serial execution policy.
@@ -680,15 +681,37 @@ Short real operations, agent tasks, full paired implementations and repeated-use
 sequences are supported; verified applicable baseline evidence can be reused.
 A-on-B then B-on-C remains an optional supported route, not a requirement for
 every hypothesis. Short evidence cannot establish an unmeasured broader effect.
+A measured comparison qualifies the supplied local model through its retained
+record under the 2026-09-30 identity policy; the run's declared local runner
+and the comparison client route must agree, and changed or unverifiable
+qualification holds the comparison instead of substituting a route. Prepared
+baseline and candidate
+variants are immutable identities reused without source revert, rebuild or
+model call while their inputs, qualification and consumption identity still
+validate; a completed arm whose inputs changed requires recorded remeasurement
+rather than silent reuse. Candidate work stays on the hypothesis's own branch
+and owned worktree bound to its Beads card and the exact committed base; the
+accepted mainline receives only the exact evaluated revision after the declared
+combined-tree check, and busy, dirty or unpreserved allocations stay untouched.
 
 Beads owns hypotheses and evidence-backed decisions; OpenSpec owns the plan and
 lifecycle checklist; the controller cursor owns recovery. No change, reuse,
 simplification and subtraction remain part of intake; size alone is no
-efficiency evidence. Removal of accepted code, features or skills still needs a
-reviewable proposal and explicit scoped consent. Restoring an owned experimental
-selection to its unchanged accepted baseline is authorized recovery, not a new
-capability retirement. Experimental activation and live publication remain
-separate. The active change owns the method, control and acceptance details.
+efficiency evidence. A subtraction or simplification is admitted only with a
+coverage, lost-use, consumption and restoration basis; low usage is a lead for
+investigation, never a finding of uselessness or an automatic deletion. Removal
+of accepted code, features or skills still needs a reviewable proposal and
+explicit scoped consent. Consent binds to the exact reviewed proposal and the
+stages it names; a pending, refused, withdrawn or changed decision cannot
+inherit earlier consent, is not re-asked without a new evidential basis, and is
+never inferred from a benefit verdict. Restoring an owned experimental selection
+to its unchanged accepted baseline is authorized recovery, not a new capability
+retirement. Experimental activation and live publication remain separate. The
+native controller exposes start/status/select/stop/resume with a model-free
+status of the recovery cursor, gates, attempts and decision-boundary receipts;
+stop marks in-flight attempts unknown and resume reconciles rather than
+replaying them. The active change owns the method, control and acceptance
+details.
 
 **2026-09-19/20, confirmed (scoped 2026-10-01 to the ordinary feedback loop):**
 the ordinary feedback loop runs on the consuming project's board, not in chat.
