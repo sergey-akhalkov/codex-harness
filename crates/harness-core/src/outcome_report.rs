@@ -449,8 +449,332 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     row["treatment_kind"] = treatment["kind"].clone();
     row["removed_burden"] = treatment["removed"].clone();
     row["consumption_evidence"] = consumption_facts(record)?;
+    // The retained adjusted view from an earlier summarization is compared
+    // below against a fresh reduction of the retained native trace. Replay is
+    // deterministic: the same capture, observed elapsed time and rule version
+    // must reproduce the same deductions and decision inputs.
+    let retained_infrastructure = row.get("infrastructure").cloned();
     crate::infrastructure_accounting::attach(&mut row);
+    if let Some(attribution) = attribution_record(&row, retained_infrastructure.as_ref()) {
+        row["attribution"] = attribution;
+    }
     Ok(row)
+}
+
+/// Re-derive the infrastructure adjustment of one attempt from its retained
+/// native trace. The reduction is deterministic and performs no model call:
+/// the same retained capture and observed elapsed time reproduce the same
+/// adjusted view, exclusions and unresolved classifications. `None` when the
+/// row retains no native capture to replay.
+pub fn replay_attempt(row: &Value) -> Option<Value> {
+    let capture = row.get("infrastructure_capture")?;
+    let mut shell = json!({
+        "elapsed_seconds": row.get("elapsed_seconds").cloned().unwrap_or(Value::Null),
+        "infrastructure_capture": capture.clone(),
+    });
+    crate::infrastructure_accounting::attach(&mut shell);
+    shell.get("infrastructure").cloned()
+}
+
+/// The retained attribution record of one attempt: the rule identity that
+/// produced the adjusted view, the replay status against the retained native
+/// trace, the raw/adjusted/excluded reconciliation totals, and the rule or
+/// reason of every exclusion and unresolved classification. `None` when the
+/// attempt retains no infrastructure evidence at all.
+fn attribution_record(row: &Value, retained: Option<&Value>) -> Option<Value> {
+    let infrastructure = row.get("infrastructure")?;
+    if !infrastructure.is_object() {
+        return None;
+    }
+    let text = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+    let rule = text(infrastructure, "rule_version");
+    let lineage = text(infrastructure, "lineage");
+    let cause = text(infrastructure, "eligible_cause");
+    let capture = row.get("infrastructure_capture");
+    let (replay, replay_detail) = match capture {
+        Some(capture) if capture.is_object() => match retained {
+            // The first reduction of a retained trace is itself the
+            // deterministic replay of that trace.
+            None => ("reproduced".to_owned(), Value::Null),
+            Some(retained) if retained == infrastructure => ("reproduced".to_owned(), Value::Null),
+            Some(retained) => {
+                let mut differing = BTreeSet::new();
+                if let (Some(retained), Some(current)) =
+                    (retained.as_object(), infrastructure.as_object())
+                {
+                    for key in retained.keys().chain(current.keys()) {
+                        if retained.get(key) != current.get(key) {
+                            differing.insert(key.clone());
+                        }
+                    }
+                }
+                (
+                    "mismatch".to_owned(),
+                    json!(format!(
+                        "the retained adjusted view differs from a fresh reduction of the retained native trace in: {}",
+                        differing.into_iter().collect::<Vec<_>>().join(", ")
+                    )),
+                )
+            }
+        },
+        Some(_) => (
+            "unavailable".to_owned(),
+            json!("the retained capture is malformed and cannot be reduced"),
+        ),
+        None => (
+            "unavailable".to_owned(),
+            json!(
+                "no retained native capture; the adjusted view is retained but cannot be replayed"
+            ),
+        ),
+    };
+    let duplicates: Vec<String> = duplicate_request_ids(row).into_iter().collect();
+    let reconciliation = attribution_reconciliation(infrastructure, &duplicates);
+    let exclusions = attribution_exclusions(infrastructure, row, &duplicates);
+    Some(json!({
+        "rule_version": (!rule.is_empty()).then_some(rule),
+        "lineage": (!lineage.is_empty()).then_some(lineage),
+        "cause": (!cause.is_empty()).then_some(cause),
+        "replay": replay,
+        "replay_detail": replay_detail,
+        "coverage": infrastructure.get("coverage").cloned().unwrap_or_else(|| json!("unresolved")),
+        "duplicates": duplicates,
+        "reconciliation": reconciliation,
+        "exclusions": exclusions,
+        "basis": "deterministic reduction of the retained native trace under the frozen attribution rule; the raw totals stay beside the adjusted view; every exclusion and unresolved classification keeps its rule and evidence or reason, and missing telemetry stays unknown",
+    }))
+}
+
+/// Request identities that occur more than once in the retained capture. A
+/// repeated identity is one request, not two savings, and the degraded
+/// accounting coverage is retained beside the reconciled totals.
+fn duplicate_request_ids(row: &Value) -> BTreeSet<String> {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let Some(requests) = row
+        .get("infrastructure_capture")
+        .and_then(|capture| capture.get("requests"))
+        .and_then(Value::as_array)
+    else {
+        return BTreeSet::new();
+    };
+    for request in requests {
+        if let Some(id) = request
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            *seen.entry(id).or_default() += 1;
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(id, _)| id.to_owned())
+        .collect()
+}
+
+/// Raw/adjusted/excluded reconciliation totals for the two measured
+/// quantities eligible for subtraction. Each identity is checked exactly; an
+/// inconsistent total is an accounting gap, never a saving, and an absent
+/// component stays unknown.
+fn attribution_reconciliation(infrastructure: &Value, duplicates: &[String]) -> Value {
+    let u64_field = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64);
+    let observed = u64_field(infrastructure, "observed_ns");
+    let adjusted_high = u64_field(infrastructure, "adjusted_ns");
+    let adjusted_low = u64_field(infrastructure, "adjusted_low_ns");
+    let deducted = u64_field(infrastructure, "deductible_ns");
+    let unresolved = u64_field(infrastructure, "unresolved_ns");
+    let elapsed_status = match (observed, adjusted_high, adjusted_low, deducted, unresolved) {
+        (Some(observed), Some(high), Some(low), Some(deducted), Some(unresolved)) => {
+            let exact_high = high.checked_add(deducted) == Some(observed);
+            let exact_low = low
+                .checked_add(deducted)
+                .and_then(|value| value.checked_add(unresolved))
+                == Some(observed);
+            if exact_high && exact_low {
+                "consistent"
+            } else {
+                "gap"
+            }
+        }
+        _ => "unknown",
+    };
+    let usage = infrastructure.get("usage");
+    let side = |name: &str, field: &str| {
+        usage
+            .and_then(|usage| usage.get(name))
+            .and_then(|tokens| u64_field(tokens, field))
+    };
+    let raw_total = side("raw", "total_tokens");
+    let excluded_total = side("excluded", "total_tokens");
+    let adjusted_total = side("adjusted", "total_tokens");
+    let usage_incomplete = usage
+        .and_then(|usage| usage.get("incomplete"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let tokens_status = match (raw_total, excluded_total, adjusted_total) {
+        (Some(raw), Some(excluded), Some(adjusted)) => {
+            if adjusted.checked_add(excluded) == Some(raw) {
+                if usage_incomplete || !duplicates.is_empty() {
+                    "degraded"
+                } else {
+                    "consistent"
+                }
+            } else {
+                "gap"
+            }
+        }
+        _ => "unknown",
+    };
+    let status = if elapsed_status == "gap" || tokens_status == "gap" {
+        "gap"
+    } else if tokens_status == "degraded" {
+        "degraded"
+    } else if elapsed_status == "consistent" {
+        "consistent"
+    } else {
+        "unknown"
+    };
+    json!({
+        "status": status,
+        "elapsed": {
+            "status": elapsed_status,
+            "observed_seconds": infrastructure.get("observed_seconds").cloned().unwrap_or(Value::Null),
+            "adjusted_low_seconds": infrastructure.get("adjusted_low_seconds").cloned().unwrap_or(Value::Null),
+            "adjusted_high_seconds": infrastructure.get("adjusted_high_seconds").cloned().unwrap_or(Value::Null),
+            "excluded_seconds": infrastructure.get("deductible_seconds").cloned().unwrap_or(Value::Null),
+            "unresolved_seconds": infrastructure.get("unresolved_seconds").cloned().unwrap_or(Value::Null),
+            "identity": "observed_seconds = adjusted_high_seconds + excluded_seconds and observed_seconds = adjusted_low_seconds + excluded_seconds + unresolved_seconds; unresolved usage stays included and no time deduction implies a token, energy or currency deduction",
+        },
+        "tokens": {
+            "status": tokens_status,
+            "raw_total_tokens": raw_total,
+            "excluded_total_tokens": excluded_total,
+            "adjusted_total_tokens": adjusted_total,
+            "identity": "raw_total_tokens = adjusted_total_tokens + excluded_total_tokens; duplicate or incomplete request usage degrades coverage instead of creating savings",
+        },
+        "duplicates": duplicates,
+        "basis": "the two identities are checked exactly on the retained totals; absent components stay unknown, never zero",
+    })
+}
+
+/// One reason entry per exclusion and unresolved classification carried by the
+/// retained adjusted view. The reason, evidence reference and rule are kept so
+/// that no adjusted metric's subtraction can be read without its cause.
+fn attribution_exclusions(
+    infrastructure: &Value,
+    row: &Value,
+    duplicates: &[String],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let rule = infrastructure
+        .get("rule_version")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let cause = infrastructure
+        .get("eligible_cause")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let capture_retained = row
+        .get("infrastructure_capture")
+        .is_some_and(Value::is_object);
+    let evidence = if capture_retained {
+        "retained native queue capture on this attempt (admissions, activity, requests)"
+    } else {
+        "retained adjusted view on this attempt; the native capture is not retained"
+    };
+    if infrastructure
+        .get("deductible_ns")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        out.push(json!({
+            "kind": "deducted",
+            "metric": "elapsed",
+            "amount_seconds": infrastructure.get("deductible_seconds").cloned().unwrap_or(Value::Null),
+            "rule": rule,
+            "cause": cause,
+            "reason": "verified unrelated external queue blocking, clipped to the attempt, unioned once and reduced by overlapping useful work",
+            "evidence": evidence,
+        }));
+    }
+    let excluded_requests: Vec<Value> = infrastructure
+        .get("excluded_requests")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !excluded_requests.is_empty() {
+        let ids = excluded_requests
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(json!({
+            "kind": "deducted",
+            "metric": "tokens",
+            "amount_tokens": infrastructure
+                .get("usage")
+                .and_then(|usage| usage.get("excluded"))
+                .and_then(|tokens| tokens.get("total_tokens"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "requests": excluded_requests,
+            "rule": rule,
+            "cause": cause,
+            "reason": "whole observed wait-only model request(s), independently correlated with the verified blocking episode and contained in it",
+            "evidence": format!("retained native request evidence: {ids}"),
+        }));
+    }
+    for duplicate in duplicates {
+        out.push(json!({
+            "kind": "unresolved",
+            "metric": "tokens",
+            "rule": rule,
+            "reason": format!("duplicate request identity {duplicate} is one request, not two savings; the duplicated usage degrades accounting coverage"),
+            "evidence": format!("retained native request evidence: {duplicate}"),
+        }));
+    }
+    if infrastructure
+        .get("usage")
+        .and_then(|usage| usage.get("incomplete"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        out.push(json!({
+            "kind": "unresolved",
+            "metric": "tokens",
+            "rule": rule,
+            "reason": "accounted usage is incomplete: mixed, duplicated or unplaceable request usage stays included and is not fractionally reconstructed",
+            "evidence": evidence,
+        }));
+    }
+    for gap in infrastructure
+        .get("gaps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let metric = if gap.contains("request") || gap.contains("model") {
+            "tokens"
+        } else {
+            "elapsed"
+        };
+        out.push(json!({
+            "kind": "unresolved",
+            "metric": metric,
+            "rule": rule,
+            "reason": gap,
+            "evidence": format!("retained native evidence: {gap}"),
+        }));
+    }
+    out
 }
 
 pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>> {

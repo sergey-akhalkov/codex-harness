@@ -41,6 +41,18 @@
 //! different declared requirement, or a missing section leaves the broader
 //! claim inconclusive; the consumed section is recorded with the decision, and
 //! a changed or missing state cannot inherit an earlier adoption.
+//!
+//! When the policy declares the infrastructure binding, the adjusted decision
+//! is additionally bound to the retained attribution evidence of every
+//! included unit attempt: the rule/version and measurement lineage must match
+//! the predeclared rule, the adjusted view must reproduce from its retained
+//! native trace, and the raw/adjusted/excluded totals must reconcile. A
+//! mismatch, an unreconciled or duplicated usage total, or evidence produced
+//! under a different rule makes the result inconclusive instead of letting a
+//! changed analysis inherit the comparison; the bound identity, reconciled
+//! totals and every exclusion reason are recorded with the decision, and an
+//! observed difference that exists only in the excluded external waiting is
+//! neither a measured gain nor a measured regression.
 
 use crate::benefit_gate::{DecisionDraft, DecisionOutcome, QualityOutcome};
 use crate::outcome_report::{
@@ -1132,6 +1144,64 @@ pub struct VariationRecord {
     pub basis: String,
 }
 
+/// One retained exclusion or unresolved classification of an adjusted metric,
+/// copied into the durable evaluation with the arm and attempt it belongs to.
+/// Every entry keeps its rule or reason and evidence reference, so no
+/// deduction is recorded without its cause.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttributionExclusion {
+    pub kind: String,
+    pub metric: String,
+    pub reason: String,
+    #[serde(default)]
+    pub rule: Option<String>,
+    #[serde(default)]
+    pub cause: Option<String>,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub attempt: String,
+    #[serde(default)]
+    pub arm: String,
+    #[serde(default)]
+    pub amount_seconds: Option<f64>,
+    #[serde(default)]
+    pub amount_tokens: Option<u64>,
+    #[serde(default)]
+    pub requests: Vec<String>,
+}
+
+/// The attribution identity and reconciled totals the adjusted decision was
+/// bound to: the rule/version that reduced the retained native traces, the
+/// declared metric view and treatment mechanism, whether the retained adjusted
+/// views reproduce, and the raw/adjusted/excluded totals with every exclusion
+/// reason. A changed rule or an unreconciled total cannot silently replace the
+/// measured view or inherit an earlier adoption.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttributionEvidence {
+    pub rule_version: Option<String>,
+    pub lineage: Option<String>,
+    pub view: String,
+    pub mechanism: String,
+    /// `reproduced`, `unavailable` or a mismatch named with its unit attempts.
+    pub replay: String,
+    /// Worst retained coverage across the included attempts.
+    pub coverage: String,
+    /// Worst reconciliation status across the included attempts.
+    pub reconciliation: String,
+    pub elapsed_excluded_seconds: Option<f64>,
+    pub elapsed_unresolved_seconds: Option<f64>,
+    pub tokens_raw_total: Option<u64>,
+    pub tokens_excluded_total: Option<u64>,
+    pub tokens_adjusted_total: Option<u64>,
+    pub duplicates: Vec<String>,
+    pub exclusions: Vec<AttributionExclusion>,
+    pub exclusions_omitted: u64,
+    pub basis: String,
+}
+
 /// Operational evaluation evidence. Publishing the decision stays with the
 /// benefit-gate owner; this record only states what was measured and decided.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1171,6 +1241,10 @@ pub struct PolicyEvaluation {
     /// additional units or when the report carries no bound selection.
     #[serde(default)]
     pub corroboration: Option<CorroborationSection>,
+    /// The attribution identity and reconciled totals the adjusted decision
+    /// was bound to. `None` when the report carries no attribution evidence.
+    #[serde(default)]
+    pub attribution: Option<AttributionEvidence>,
 }
 
 struct UnitFacts {
@@ -2087,6 +2161,12 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
     };
 
     let mut corroboration: Option<CorroborationSection> = None;
+    let mut attribution: Option<AttributionEvidence> = None;
+    // Set only when the recorded effect below the declared threshold decides
+    // the rejection. A queue-only difference may explain that rejection, so
+    // the infrastructure gate revisits it; acceptance, trade-off and
+    // repayment rejections stay untouched.
+    let mut effect_only_reject = false;
     let mut decision = PolicyDecision::Inconclusive;
     if !drift.is_empty() {
         reasons.push(
@@ -2323,6 +2403,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                         "the recorded effect does not meet the predeclared meaningful threshold; reduced size or an unmeasured benefit is not an efficiency effect"
                             .to_owned(),
                     );
+                    effect_only_reject = true;
                     decision = PolicyDecision::Reject;
                 }
             } else {
@@ -2481,11 +2562,13 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
     apply_infrastructure_gate(
         policy,
         report,
+        effect_only_reject,
         &mut decision,
         &mut reasons,
         &mut baseline_seconds,
         &mut candidate_seconds,
         &mut coverage,
+        &mut attribution,
     );
 
     Ok(PolicyEvaluation {
@@ -2511,17 +2594,20 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         variation: Some(variation),
         statistical_claim,
         corroboration,
+        attribution,
     })
 }
 
 fn apply_infrastructure_gate(
     policy: &ComparisonPolicy,
     report: &Value,
+    effect_only_reject: bool,
     decision: &mut PolicyDecision,
     reasons: &mut Vec<String>,
     _baseline_seconds: &mut Option<f64>,
     _candidate_seconds: &mut Option<f64>,
     coverage: &mut String,
+    attribution: &mut Option<AttributionEvidence>,
 ) {
     let binding = match crate::infrastructure_accounting::parse_binding(&policy.uncertainty) {
         Ok(Some(binding)) => binding,
@@ -2599,6 +2685,9 @@ fn apply_infrastructure_gate(
     let mut above = true;
     let mut failed_infra = false;
     let mut saw = false;
+    let mut raw_wait_effect = false;
+    let mut retained = AttributionCollector::new(binding);
+    let mut enforcement_error: Option<String> = None;
     for unit in units.iter().filter(|unit| {
         unit.get("one_to_one").and_then(Value::as_bool) == Some(true)
             && unit
@@ -2610,8 +2699,50 @@ fn apply_infrastructure_gate(
         saw = true;
         let baseline = row(unit.get("baseline_result").and_then(Value::as_str));
         let candidate = row(unit.get("candidate_result").and_then(Value::as_str));
+        for (arm, arm_row) in [("baseline", baseline), ("candidate", candidate)] {
+            if let Some(arm_row) = arm_row
+                && let Some(attribution) = arm_row.get("attribution")
+                && let Err(error) = retained.observe(
+                    attribution,
+                    arm_row
+                        .get("attempt_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    arm,
+                )
+            {
+                enforcement_error.get_or_insert(error);
+            }
+        }
         if candidate.is_some_and(crate::infrastructure_accounting::failed_before_start) {
             failed_infra = true;
+        }
+        // A queue-only difference: at least one arm of this unit removed a
+        // measured external wait while the unadjusted observed times cross a
+        // decision boundary. The adjusted range below decides whether that
+        // difference is a measured effect or only infrastructure exposure.
+        let deducted = |row: Option<&Value>| {
+            row.and_then(|row| row.get("infrastructure"))
+                .and_then(|infrastructure| infrastructure.get("deductible_ns"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+        };
+        let raw_baseline = unit
+            .get("effect")
+            .and_then(|effect| number(&effect["baseline_seconds"]));
+        let raw_candidate = unit
+            .get("effect")
+            .and_then(|effect| number(&effect["candidate_seconds"]));
+        if (deducted(baseline) || deducted(candidate))
+            && let (Some(raw_baseline), Some(raw_candidate)) = (raw_baseline, raw_candidate)
+            && raw_baseline > 0.0
+        {
+            let reduction = (raw_baseline - raw_candidate) / raw_baseline * 100.0;
+            let regression = (raw_candidate - raw_baseline) / raw_baseline * 100.0;
+            if reduction >= threshold || regression > policy.tolerance_percent {
+                raw_wait_effect = true;
+            }
         }
         let Some((baseline_low, baseline_high)) =
             baseline.and_then(crate::infrastructure_accounting::arm_bounds)
@@ -2644,10 +2775,22 @@ fn apply_infrastructure_gate(
             above = false;
         }
     }
+    *attribution = retained.finish();
+    if let Some(error) = enforcement_error {
+        // Contaminated or unreplayable adjusted evidence is not a decision
+        // basis. An acceptance, trade-off or repayment rejection stands; an
+        // effect-only rejection becomes inconclusive.
+        if *decision != PolicyDecision::Reject || effect_only_reject {
+            *decision = PolicyDecision::Inconclusive;
+        }
+        reasons.push(error);
+        coverage.push_str("; infrastructure-evidence");
+        return;
+    }
     if !saw || missing || straddles {
         // A rejected acceptance, resource or trade-off gate stays rejected.
         // Uncertainty does not soften it, and it does not become adoption.
-        if *decision != PolicyDecision::Reject {
+        if *decision != PolicyDecision::Reject || effect_only_reject {
             *decision = PolicyDecision::Inconclusive;
         }
         reasons.push(
@@ -2685,6 +2828,347 @@ fn apply_infrastructure_gate(
             "adjusted bounds stay below the declared effect; external waiting is not a model or harness improvement"
                 .to_owned(),
         );
+        if *decision == PolicyDecision::Reject && effect_only_reject && raw_wait_effect {
+            // The unadjusted difference crosses a decision boundary while the
+            // whole adjusted range stays below the effect. That difference is
+            // attributed to excluded external waiting, so it is neither a
+            // measured gain nor a measured regression.
+            *decision = PolicyDecision::Inconclusive;
+            reasons.push(
+                "the observed difference is attributed to excluded external waiting; the adjusted view supports no model or harness effect, so the verdict stays inconclusive rather than a queue-only gain or regression"
+                    .to_owned(),
+            );
+            coverage.push_str("; raw-only-wait");
+        }
+    }
+}
+
+/// Accumulates the retained attribution evidence of the included unit attempts
+/// into one durable record, enforcing the predeclared rule identity, replay
+/// status and reconciliation before any adjusted figure may drive a decision.
+struct AttributionCollector {
+    view: &'static str,
+    mechanism: &'static str,
+    rule_version: Option<String>,
+    lineage: Option<String>,
+    replay: &'static str,
+    coverage: &'static str,
+    reconciliation: &'static str,
+    elapsed_excluded: Option<f64>,
+    elapsed_excluded_known: bool,
+    elapsed_unresolved: Option<f64>,
+    elapsed_unresolved_known: bool,
+    tokens_raw: Option<u64>,
+    tokens_raw_known: bool,
+    tokens_excluded: Option<u64>,
+    tokens_excluded_known: bool,
+    tokens_adjusted: Option<u64>,
+    tokens_adjusted_known: bool,
+    duplicates: BTreeSet<String>,
+    duplicates_omitted: u64,
+    exclusions: Vec<AttributionExclusion>,
+    exclusions_omitted: u64,
+    seen: u64,
+}
+
+impl AttributionCollector {
+    fn new(binding: crate::infrastructure_accounting::Binding) -> Self {
+        use crate::infrastructure_accounting::{Mechanism, MetricView};
+        Self {
+            view: match binding.view {
+                MetricView::WorkEfficiency => "work-efficiency",
+                MetricView::Operational => "operational",
+            },
+            mechanism: match binding.mechanism {
+                Mechanism::None => "none",
+                Mechanism::Admission => "admission",
+                Mechanism::Scheduling => "scheduling",
+                Mechanism::Waiting => "waiting",
+                Mechanism::Cache => "cache",
+            },
+            rule_version: None,
+            lineage: None,
+            replay: "reproduced",
+            coverage: "measured",
+            reconciliation: "consistent",
+            elapsed_excluded: None,
+            elapsed_excluded_known: true,
+            elapsed_unresolved: None,
+            elapsed_unresolved_known: true,
+            tokens_raw: None,
+            tokens_raw_known: true,
+            tokens_excluded: None,
+            tokens_excluded_known: true,
+            tokens_adjusted: None,
+            tokens_adjusted_known: true,
+            duplicates: BTreeSet::new(),
+            duplicates_omitted: 0,
+            exclusions: Vec::new(),
+            exclusions_omitted: 0,
+            seen: 0,
+        }
+    }
+
+    fn observe(&mut self, retained: &Value, attempt: &str, arm: &str) -> Result<(), String> {
+        let rule = crate::infrastructure_accounting::RULE_VERSION;
+        let Some(object) = retained.as_object() else {
+            return Err(format!(
+                "attempt {attempt} ({arm}) retains an attribution record that is not an object; the adjusted view cannot be bound to the predeclared rule"
+            ));
+        };
+        self.seen += 1;
+        let recorded_rule = object.get("rule_version").and_then(Value::as_str);
+        if recorded_rule != Some(rule) {
+            return Err(format!(
+                "attempt {attempt} ({arm}) retains adjusted evidence under attribution rule {}, not the predeclared {rule}; a changed rule/version cannot inherit the comparison",
+                recorded_rule.unwrap_or("<none>")
+            ));
+        }
+        let recorded_lineage = object.get("lineage").and_then(Value::as_str);
+        if recorded_lineage != Some(crate::infrastructure_accounting::MEASUREMENT_LINEAGE) {
+            return Err(format!(
+                "attempt {attempt} ({arm}) retains adjusted evidence outside the predeclared measurement lineage; a changed lineage cannot inherit the comparison"
+            ));
+        }
+        self.rule_version = Some(rule.to_owned());
+        self.lineage = Some(crate::infrastructure_accounting::MEASUREMENT_LINEAGE.to_owned());
+        let replay = object
+            .get("replay")
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable");
+        if replay == "mismatch" {
+            return Err(format!(
+                "attempt {attempt} ({arm}) retains an adjusted view that does not reproduce from its retained native trace; contaminated evidence is not a decision basis"
+            ));
+        }
+        let reconciliation = object
+            .get("reconciliation")
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if reconciliation == "gap" {
+            return Err(format!(
+                "attempt {attempt} ({arm}) records raw/adjusted/excluded totals that do not reconcile; inconsistent or duplicated usage is an accounting gap, not a saving"
+            ));
+        }
+        let coverage = object
+            .get("coverage")
+            .and_then(Value::as_str)
+            .unwrap_or("unresolved");
+        if coverage_severity(coverage) > coverage_severity(self.coverage) {
+            self.coverage = match coverage {
+                "measured" => "measured",
+                "partial" => "partial",
+                _ => "unresolved",
+            };
+        }
+        if replay_severity(replay) > replay_severity(self.replay) {
+            self.replay = match replay {
+                "reproduced" => "reproduced",
+                _ => "unavailable",
+            };
+        }
+        if reconciliation_severity(reconciliation) > reconciliation_severity(self.reconciliation) {
+            self.reconciliation = match reconciliation {
+                "consistent" => "consistent",
+                "degraded" => "degraded",
+                "gap" => "gap",
+                _ => "unknown",
+            };
+        }
+        if let Some(duplicates) = object.get("duplicates").and_then(Value::as_array) {
+            for duplicate in duplicates.iter().filter_map(Value::as_str) {
+                if self.duplicates.len() >= 64 {
+                    self.duplicates_omitted += 1;
+                } else {
+                    self.duplicates.insert(duplicate.to_owned());
+                }
+            }
+        }
+        let elapsed = object
+            .get("reconciliation")
+            .and_then(|value| value.get("elapsed"));
+        let add_seconds =
+            |value: Option<f64>, total: &mut Option<f64>, known: &mut bool| match value {
+                Some(value) if *known => {
+                    *total = Some(match *total {
+                        Some(sum) => sum + value,
+                        None => value,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    *known = false;
+                    *total = None;
+                }
+            };
+        add_seconds(
+            elapsed
+                .and_then(|elapsed| elapsed.get("excluded_seconds"))
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite()),
+            &mut self.elapsed_excluded,
+            &mut self.elapsed_excluded_known,
+        );
+        add_seconds(
+            elapsed
+                .and_then(|elapsed| elapsed.get("unresolved_seconds"))
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite()),
+            &mut self.elapsed_unresolved,
+            &mut self.elapsed_unresolved_known,
+        );
+        let tokens = object
+            .get("reconciliation")
+            .and_then(|value| value.get("tokens"));
+        let token_value = |key: &str| {
+            tokens
+                .and_then(|tokens| tokens.get(key))
+                .and_then(Value::as_u64)
+        };
+        let add_tokens = |value: Option<u64>, total: &mut Option<u64>, known: &mut bool| match value
+        {
+            Some(value) if *known => {
+                *total = match *total {
+                    Some(sum) => sum.checked_add(value),
+                    None => Some(value),
+                };
+            }
+            Some(_) => {}
+            None => {
+                *known = false;
+                *total = None;
+            }
+        };
+        add_tokens(
+            token_value("raw_total_tokens"),
+            &mut self.tokens_raw,
+            &mut self.tokens_raw_known,
+        );
+        add_tokens(
+            token_value("excluded_total_tokens"),
+            &mut self.tokens_excluded,
+            &mut self.tokens_excluded_known,
+        );
+        add_tokens(
+            token_value("adjusted_total_tokens"),
+            &mut self.tokens_adjusted,
+            &mut self.tokens_adjusted_known,
+        );
+        if let Some(entries) = object.get("exclusions").and_then(Value::as_array) {
+            for entry in entries {
+                if self.exclusions.len() >= 64 {
+                    self.exclusions_omitted += 1;
+                    continue;
+                }
+                self.exclusions
+                    .push(attribution_exclusion(entry, attempt, arm));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Option<AttributionEvidence> {
+        if self.seen == 0 {
+            return None;
+        }
+        let mut duplicates: Vec<String> = self.duplicates.into_iter().collect();
+        if self.duplicates_omitted > 0 {
+            duplicates.push(format!(
+                "{} further duplicate request identities",
+                self.duplicates_omitted
+            ));
+        }
+        Some(AttributionEvidence {
+            rule_version: self.rule_version,
+            lineage: self.lineage,
+            view: self.view.to_owned(),
+            mechanism: self.mechanism.to_owned(),
+            replay: self.replay.to_owned(),
+            coverage: self.coverage.to_owned(),
+            reconciliation: self.reconciliation.to_owned(),
+            elapsed_excluded_seconds: self
+                .elapsed_excluded_known
+                .then_some(self.elapsed_excluded)
+                .flatten(),
+            elapsed_unresolved_seconds: self
+                .elapsed_unresolved_known
+                .then_some(self.elapsed_unresolved)
+                .flatten(),
+            tokens_raw_total: self.tokens_raw_known.then_some(self.tokens_raw).flatten(),
+            tokens_excluded_total: self
+                .tokens_excluded_known
+                .then_some(self.tokens_excluded)
+                .flatten(),
+            tokens_adjusted_total: self
+                .tokens_adjusted_known
+                .then_some(self.tokens_adjusted)
+                .flatten(),
+            duplicates,
+            exclusions: self.exclusions,
+            exclusions_omitted: self.exclusions_omitted,
+            basis: "the adjusted decision is bound to the predeclared attribution rule, view and mechanism; the replay status and reconciled raw/adjusted/excluded totals cover every included unit attempt, and every exclusion keeps its rule or reason and evidence reference".to_owned(),
+        })
+    }
+}
+
+fn attribution_exclusion(entry: &Value, attempt: &str, arm: &str) -> AttributionExclusion {
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+    AttributionExclusion {
+        kind: text("kind"),
+        metric: text("metric"),
+        reason: text("reason"),
+        rule: entry.get("rule").and_then(Value::as_str).map(str::to_owned),
+        cause: entry
+            .get("cause")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        evidence: text("evidence"),
+        attempt: attempt.to_owned(),
+        arm: arm.to_owned(),
+        amount_seconds: entry.get("amount_seconds").and_then(Value::as_f64),
+        amount_tokens: entry.get("amount_tokens").and_then(Value::as_u64),
+        requests: entry
+            .get("requests")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn coverage_severity(value: &str) -> u8 {
+    match value {
+        "measured" => 0,
+        "partial" => 1,
+        _ => 2,
+    }
+}
+
+fn replay_severity(value: &str) -> u8 {
+    match value {
+        "reproduced" => 0,
+        _ => 1,
+    }
+}
+
+fn reconciliation_severity(value: &str) -> u8 {
+    match value {
+        "consistent" => 0,
+        "unknown" => 1,
+        "degraded" => 2,
+        _ => 3,
     }
 }
 
