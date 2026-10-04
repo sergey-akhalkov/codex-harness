@@ -165,8 +165,13 @@ User-owned agents and skill directories are preserved. Core skill linking
 delivers every top-level kit skill, including the loop guidance `team-lead`,
 `board-workflow` and `self-improvement-loop`, and the manager binary carries
 the matching `feedback` and `improve` verbs; an `update` after a skill is
-added or removed reconciles that set. The controller contract and its open
-acceptance are in [Rust native](rust-native.md#improvement-controller).
+added or removed reconciles that set. The installed loop consumes the
+consumer project's Beads board and OpenSpec CLI, keeps its run directory, spec
+file, qualification record and retained receipts as local private inputs, and
+surfaces its recovery cursor through `improve status` without a model call;
+operation lives in the `self-improvement-loop` skill. The controller contract,
+commands and open acceptance are in
+[Rust native](rust-native.md#improvement-controller).
 
 Shared keys are declared in `global/kit.json` and live in
 `global/harness.config.toml`: the model/reasoning preference
