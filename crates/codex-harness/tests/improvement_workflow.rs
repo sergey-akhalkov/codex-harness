@@ -1502,7 +1502,8 @@ fn a_declared_runner_that_cannot_be_honored_never_dispatches_a_model_request() {
     let fixture = Fixture::new("runner-refusal");
     let (root, _) = write_evidence_root(&fixture);
     fake_launcher(&fixture);
-    let cases: Vec<(&str, Vec<(&str, Value)>, &str)> = vec![
+    type Case<'a> = (&'a str, Vec<(&'a str, Value)>, &'a str);
+    let cases: Vec<Case> = vec![
         (
             "model-mismatch",
             vec![(
@@ -4208,7 +4209,7 @@ fn last_refusal(cursor: &Value) -> String {
         .iter()
         .filter(|effect| effect["kind"] == "dispatch-refused")
         .filter_map(|effect| effect["detail"].as_str())
-        .last()
+        .next_back()
         .unwrap_or_default()
         .to_owned()
 }

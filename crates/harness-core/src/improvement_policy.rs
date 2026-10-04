@@ -2548,7 +2548,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 .unwrap_or(0)
         })
         .sum();
-    let mut baseline_seconds = (facts.iter().all(|fact| fact.baseline_seconds.is_some())
+    let baseline_seconds = (facts.iter().all(|fact| fact.baseline_seconds.is_some())
         && !facts.is_empty())
     .then(|| {
         facts
@@ -2556,7 +2556,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             .filter_map(|fact| fact.baseline_seconds)
             .sum::<f64>()
     });
-    let mut candidate_seconds = (facts.iter().all(|fact| fact.candidate_seconds.is_some())
+    let candidate_seconds = (facts.iter().all(|fact| fact.candidate_seconds.is_some())
         && !facts.is_empty())
     .then(|| {
         facts
@@ -3176,8 +3176,6 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         effect_only_reject,
         &mut decision,
         &mut reasons,
-        &mut baseline_seconds,
-        &mut candidate_seconds,
         &mut coverage,
         &mut attribution,
     );
@@ -3397,8 +3395,6 @@ fn apply_infrastructure_gate(
     effect_only_reject: bool,
     decision: &mut PolicyDecision,
     reasons: &mut Vec<String>,
-    _baseline_seconds: &mut Option<f64>,
-    _candidate_seconds: &mut Option<f64>,
     coverage: &mut String,
     attribution: &mut Option<AttributionEvidence>,
 ) {

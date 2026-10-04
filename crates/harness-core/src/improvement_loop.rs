@@ -2010,10 +2010,11 @@ impl Cursor {
             for id in [
                 candidate.planner_attempt.as_deref(),
                 candidate.implementer_attempt.as_deref(),
-            ] {
-                if let Some(id) = id {
-                    protected.insert(id);
-                }
+            ]
+            .into_iter()
+            .flatten()
+            {
+                protected.insert(id);
             }
         }
         if let Some(comparison) = &self.comparison {

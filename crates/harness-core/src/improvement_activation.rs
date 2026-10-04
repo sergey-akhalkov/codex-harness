@@ -534,7 +534,7 @@ fn resolve_evidence(context: &FrozenContext<'_>) -> io::Result<Gate<Evidence>> {
             if let Err(block) =
                 removal_block(item, &proposal, &target, &comments, context.frozen_removal)
             {
-                return Ok(Gate::blocked(block));
+                return Ok(Gate::blocked(*block));
             }
         }
         // The run's frozen candidate state declares a removal treatment, but
@@ -583,13 +583,18 @@ fn removal_block(
     target: &str,
     comments: &[String],
     frozen_reviewed: Option<&str>,
-) -> Result<(), Blocked> {
+) -> Result<(), Box<Blocked>> {
     let authority = board_hypothesis::AuthorityRequest {
         proposal: proposal.to_owned(),
         target: target.to_owned(),
         action: board_hypothesis::RemovalAction::Integration,
     };
-    match improvement_loop::removal_gate_at(item, &authority, comments, frozen_reviewed) {
+    let outcome = match improvement_loop::removal_gate_at(
+        item,
+        &authority,
+        comments,
+        frozen_reviewed,
+    ) {
         improvement_loop::RemovalGate::Authorized { .. } => Ok(()),
         improvement_loop::RemovalGate::Pending { reason } => Err(Blocked {
             pending: true,
@@ -608,7 +613,8 @@ fn removal_block(
                 "the user withdrew approval for removal proposal {proposal} target {target}; the latest decision controls and blocks this effect"
             ),
         )),
-    }
+    };
+    outcome.map_err(Box::new)
 }
 
 fn reason_text(evaluation: &improvement_policy::PolicyEvaluation) -> String {

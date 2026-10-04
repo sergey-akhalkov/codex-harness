@@ -2421,12 +2421,14 @@ fn consume_settled_arm(
     let row = build_row(
         run,
         &comparison,
-        arm,
-        &attempt,
-        &runtime,
-        &runtime_path,
-        &solution,
-        &acceptance,
+        ArmCompletion {
+            arm,
+            attempt: &attempt,
+            runtime: &runtime,
+            runtime_path: &runtime_path,
+            solution: &solution,
+            acceptance: &acceptance,
+        },
     )?;
     let row_path = run.store.comparison_arm_dir(arm).join("row.json");
     write_json_atomic(&row_path, &row)?;
@@ -2912,6 +2914,16 @@ fn capability_consumption(runtime: &ArmRuntime, runtime_path: &Path, capability:
     })
 }
 
+/// One settled arm's completion data consumed when its comparison row is built.
+struct ArmCompletion<'a> {
+    arm: ComparisonArm,
+    attempt: &'a Attempt,
+    runtime: &'a ArmRuntime,
+    runtime_path: &'a Path,
+    solution: &'a Solution,
+    acceptance: &'a Acceptance,
+}
+
 /// One authoritative accounting row per arm. The identity fields are the
 /// frozen comparison inputs; the measured fields come from the native
 /// dispatcher receipt and the rollout owner, never from candidate prose. A
@@ -2932,13 +2944,16 @@ fn capability_consumption(runtime: &ArmRuntime, runtime_path: &Path, capability:
 fn build_row(
     run: &Run,
     comparison: &ComparisonInputs,
-    arm: ComparisonArm,
-    attempt: &Attempt,
-    runtime: &ArmRuntime,
-    runtime_path: &Path,
-    solution: &Solution,
-    acceptance: &Acceptance,
+    completion: ArmCompletion<'_>,
 ) -> io::Result<Value> {
+    let ArmCompletion {
+        arm,
+        attempt,
+        runtime,
+        runtime_path,
+        solution,
+        acceptance,
+    } = completion;
     let started_at = attempt.started_ms as f64 / 1000.0;
     let observation = retained_observation(attempt);
     let sessions = discovery_sessions(run, attempt)?;
@@ -3780,7 +3795,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         paths,
         verified: observed_model.is_some(),
         reason: None,
-        tool_calls: calls_complete.then(|| call_ids.len() as u64),
+        tool_calls: calls_complete.then_some(call_ids.len() as u64),
     })
 }
 

@@ -2924,9 +2924,10 @@ fn planner_assignment(
             &selection.stopping,
             &mut invariants,
         );
-        acceptance.push(format!(
+        acceptance.push(
             "the change states the predeclared experiment selection; the controller resolves it before any implementation or directed baseline measurement, and a missing, changed or mismatched section blocks dependent work"
-        ));
+                .to_string(),
+        );
     }
     if candidate.removal_required {
         invariants.push(format!(
