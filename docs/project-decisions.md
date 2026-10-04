@@ -697,6 +697,19 @@ or authorize a silent downgrade of a different run's identity policy.
 The active [change](../openspec/changes/add-evidence-driven-self-improvement-loop/proposal.md)
 owns the sequential experiments and remaining acceptance.
 
+**2026-10-05, confirmed (user decision, supersedes the local-first route for
+the loop's default):** the improvement loop's model-backed acceptance runs on
+the kit's existing orchestration executor profile by default - `ds`
+(`deepseek-flash` through the declared `deepseek` provider configuration,
+effort `max`) - instead of the local model. No new routing machinery is
+introduced: run inputs name the installed profile binding and its overlay and
+catalogue exactly as any executor dispatch does, and qualification,
+repeatability and no-silent-substitution rules apply unchanged to this route.
+A local model remains an explicitly selectable future route; its endpoint has
+been supplied privately and is recorded only in local run inputs, never in
+shared source. Switching routes remains a run-input decision, never a
+mid-run substitution.
+
 **2026-10-01, confirmed:** improvement analysis must separate external
 infrastructure waiting from agent/harness work without losing observed user
 cost. Use native lifecycle evidence for automatic adjustment, retain both
