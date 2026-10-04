@@ -244,6 +244,48 @@ does not need model calls. The archived [subscription orchestration](../openspec
 change delivered the successor-lead quota path; its earlier single-TUI proof
 did not establish today's tab-based views.
 
+**2026-10-03, confirmed, implementation pending:** executor dispatch must open
+tabs in the terminal window of the lead that invoked it, regardless of which
+application or terminal window currently has focus. Dispatch must preserve the
+user's foreground application and selected terminal tab throughout creation;
+activating either and restoring it afterwards does not satisfy this requirement.
+The user explicitly confirmed that selected-tab preservation is required too.
+A separate
+per-checkout window is not an acceptable automatic fallback. This supersedes
+the activation-and-restoration allowance in the current deterministic terminal
+targeting specification; that specification and its implementation still need
+revision. The user allows a different terminal after an explanation of why
+that specific terminal is selected, delivered before installation. Selection
+must preserve TUI support and clipboard-image paste, with speed and
+functionality no worse than Windows Terminal; Rust and very low resource use
+are preferences. Performance claims require comparable local measurements.
+The user prefers a full-featured Windows terminal with native tabs and declines
+an extra multiplexer layer as a workaround. Implementation language is not a
+selection constraint; Windows usability and reliability take priority.
+Only free terminals are eligible; paid terminal licenses are excluded.
+Remove rejected trial terminals and their owned temporary state, preserving
+pre-existing tools and unrelated user data.
+
+The inspected Windows Terminal 1.24.11911.0 source unconditionally summons an
+existing window in
+[`AppHost::DispatchCommandline`](https://github.com/microsoft/terminal/blob/v1.24.11911.0/src/cascadia/WindowsTerminal/AppHost.cpp)
+before executing the requested command line. Its
+[`IslandWindow::SummonWindow`](https://github.com/microsoft/terminal/blob/v1.24.11911.0/src/cascadia/WindowsTerminal/IslandWindow.cpp)
+path attempts foreground activation. This is source evidence of a constraint
+on the existing `wt.exe` dispatch route, not proof that every alternative is
+impossible or that a replacement terminal satisfies the requirement. The
+specific terminal choice and a verified non-activating dispatch path remain
+unresolved.
+
+An isolated trial of official WezTerm `20240203-110809-5046fc22` opened tabs in
+the requested window without an OS foreground event in two observed runs, but
+selected the new tab both times. The
+[`spawn_tab_or_window` implementation](https://github.com/wezterm/wezterm/blob/20240203-110809-5046fc22/mux/src/lib.rs)
+sets the new tab active, and the inspected CLI offers no background-tab option.
+Stock WezTerm therefore fails the accepted selected-tab requirement and is not
+adopted. A small ANSI throughput comparison is insufficient to establish full
+performance parity; clipboard-image compatibility has not been exercised.
+
 All assigned OpenAI models stay in the Astra family; GPT-5.* is excluded,
 including auxiliary calls. Combine related routine work; splitting a pair of
 short functions between two children is not treated as savings. After parent
