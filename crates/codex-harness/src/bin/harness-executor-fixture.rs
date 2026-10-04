@@ -21,6 +21,10 @@
 //! dispatch claims; see `harness_executor_fixture/claim_oracle.rs`.
 //! `claim-oracle-cleanup` exercises that checker's capture and termination
 //! helpers. It is not a claim-oracle case and does not broaden the checker.
+//! `parallel-lib-oracle` is the candidate-independent acceptance for the
+//! parallel `harness-core` lib isolation workload: three consecutive full
+//! parallel lib suites and every discovered `codex-harness` test target
+//! through plain cargo; see `harness_executor_fixture/parallel_lib_oracle.rs`.
 
 use serde_json::json;
 use std::{
@@ -36,6 +40,8 @@ use std::{
 mod claim_oracle;
 #[path = "harness_executor_fixture/control_fixture.rs"]
 mod control_fixture;
+#[path = "harness_executor_fixture/parallel_lib_oracle.rs"]
+mod parallel_lib_oracle;
 #[path = "harness_executor_fixture/watch_oracle.rs"]
 mod watch_oracle;
 
@@ -69,6 +75,13 @@ fn main() -> io::Result<()> {
     if first.as_ref().is_some_and(|arg| arg == "watch-oracle") {
         let rest: Vec<_> = args.collect();
         return exit(watch_oracle::run(&rest)?);
+    }
+    if first
+        .as_ref()
+        .is_some_and(|arg| arg == "parallel-lib-oracle")
+    {
+        let rest: Vec<_> = args.collect();
+        return exit(parallel_lib_oracle::run(&rest)?);
     }
     if first.as_ref().is_some_and(|arg| arg == "claim-oracle") {
         let rest: Vec<_> = args.collect();

@@ -419,3 +419,385 @@ fn fast_output_overrun_cannot_pass_and_retention_is_bounded() {
     let marker: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
     assert_eq!(marker["flooded_bytes"], json!(FLOOD));
 }
+
+/// One minimal, dependency-free stand-in for the harness checkout: a
+/// `harness-core` lib suite and a `codex-harness` crate whose integration
+/// targets come from its own manifest and `tests/` directory. The synthetic
+/// tree keeps the checker's real dispatch, discovery and cargo runs without
+/// compiling the full harness suite in a unit test.
+struct OracleWorkspace {
+    _root: tempfile::TempDir,
+    root: PathBuf,
+    checkout: PathBuf,
+}
+
+const PASSING_TARGET: &str = "#[test]\nfn works() {\n    assert_eq!(2 + 2, 4);\n}\n";
+const FAILING_TARGET: &str =
+    "#[test]\nfn breaks() {\n    assert!(false, \"deliberate target failure\");\n}\n";
+const FAILING_LIB: &str = "pub fn smoke() -> u32 {\n    2\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn breaks() {\n        assert!(false, \"deliberate lib failure\");\n    }\n}\n";
+
+impl OracleWorkspace {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let checkout = path.join("checkout");
+        write_text(
+            &checkout.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/harness-core\", \"crates/codex-harness\"]\nresolver = \"2\"\n",
+        );
+        write_text(
+            &checkout.join("crates/harness-core/Cargo.toml"),
+            "[package]\nname = \"harness-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_text(
+            &checkout.join("crates/harness-core/src/lib.rs"),
+            "pub fn smoke() -> u32 {\n    2\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn keeps_working() {\n        assert_eq!(2 + 2, 4);\n    }\n}\n",
+        );
+        write_text(
+            &checkout.join("crates/codex-harness/Cargo.toml"),
+            "[package]\nname = \"codex-harness\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_text(
+            &checkout.join("crates/codex-harness/src/lib.rs"),
+            "pub fn smoke() -> u32 {\n    1\n}\n",
+        );
+        Self {
+            _root: root,
+            root: path,
+            checkout,
+        }
+    }
+
+    fn lib_source(&self, text: &str) {
+        write_text(&self.checkout.join("crates/harness-core/src/lib.rs"), text);
+    }
+
+    fn manifest(&self, text: &str) {
+        write_text(&self.checkout.join("crates/codex-harness/Cargo.toml"), text);
+    }
+
+    fn target(&self, name: &str, body: &str) {
+        write_text(
+            &self
+                .checkout
+                .join(format!("crates/codex-harness/tests/{name}.rs")),
+            body,
+        );
+    }
+
+    /// The frozen strict request, outside the checked tree like the real
+    /// acceptance input.
+    fn request(&self) -> (PathBuf, String) {
+        let path = self.root.join("parallel-lib-request.json");
+        write_text(
+            &path,
+            &serde_json::to_string(&json!({
+                "schema": 1,
+                "source_root": self.checkout,
+                "lib_repetitions": 3,
+                "regression_targets": "auto",
+            }))
+            .unwrap(),
+        );
+        (path.clone(), hash_file(&path).unwrap())
+    }
+
+    fn checker(&self, request: &Path, sha: &str, extra: &[&str]) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+        command
+            .args(["parallel-lib-oracle", "--request"])
+            .arg(request)
+            .args(["--request-sha256", sha, "--workspace"])
+            .arg(&self.checkout)
+            .args(extra);
+        command.current_dir(&self.checkout);
+        command.output().unwrap()
+    }
+}
+
+fn write_text(path: &Path, text: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
+}
+
+fn string_array(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {value}"))
+        .iter()
+        .map(|item| item.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The current `codex-harness` integration targets, discovered independently
+/// by Cargo itself, as the reference for the checker's own discovery.
+fn cargo_metadata_test_targets(checkout: &Path) -> Vec<String> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(checkout)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut names: Vec<String> = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["name"] == "codex-harness")
+        .flat_map(|package| package["targets"].as_array().unwrap().iter())
+        .filter(|target| {
+            target["kind"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|kind| kind == "test")
+        })
+        .map(|target| target["name"].as_str().unwrap().to_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The checker runs three consecutive full parallel harness-core lib suites
+/// with no thread override, then one plain cargo run per discovered target,
+/// and the unchanged frozen real-task oracle drives exactly that acceptance.
+#[test]
+fn parallel_lib_oracle_passes_three_parallel_lib_repetitions_and_every_target() {
+    let case = OracleWorkspace::new();
+    case.target("alpha", PASSING_TARGET);
+    case.target("beta", PASSING_TARGET);
+    let (request, sha) = case.request();
+
+    let output = case.checker(&request, &sha, &[]);
+    let verdict: Value = record(&output);
+    assert!(output.status.success(), "{verdict}");
+    assert_eq!(verdict["passed"], true, "{verdict}");
+    assert_eq!(verdict["libRepetitions"], 3, "{verdict}");
+    assert_eq!(verdict["regressionTargets"], "auto", "{verdict}");
+    assert_eq!(verdict["modelCalls"], 0, "{verdict}");
+    assert_eq!(verdict["targets"], json!(["alpha", "beta"]), "{verdict}");
+    let cargo = verdict["cargo"].as_str().unwrap().to_owned();
+    let steps = verdict["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 5, "{verdict}");
+    for (index, step) in steps.iter().enumerate() {
+        assert_eq!(step["status"], "exited", "{step}");
+        assert_eq!(step["exitCode"], 0, "{step}");
+        let expected = match index {
+            0..=2 => json!([cargo, "test", "-p", "harness-core", "--lib"]),
+            3 => json!([cargo, "test", "-p", "codex-harness", "--test", "alpha"]),
+            _ => json!([cargo, "test", "-p", "codex-harness", "--test", "beta"]),
+        };
+        assert_eq!(step["command"], expected, "{step}");
+    }
+
+    // The frozen schema 1 real-task request the comparison supervisor runs:
+    // the checker image, the pinned strict request and {workspace}.
+    let program = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+    let request_text = request.to_string_lossy().into_owned();
+    let mut inputs = serde_json::Map::new();
+    inputs.insert(request_text.clone(), json!(sha));
+    let acceptance = case.root.join("acceptance-request.json");
+    write_text(
+        &acceptance,
+        &serde_json::to_string(&json!({
+            "schema": 1,
+            "kind": "real-task",
+            "case_root": case.checkout,
+            "task_contract_sha256": "b".repeat(64),
+            "timeout_seconds": 600,
+            "oracle": {
+                "program": program,
+                "program_sha256": hash_file(&program).unwrap(),
+                "arguments": [
+                    "parallel-lib-oracle", "--request", request_text,
+                    "--request-sha256", sha, "--workspace", "{workspace}"
+                ],
+                "inputs": Value::Object(inputs),
+            },
+        }))
+        .unwrap(),
+    );
+    let acceptance_sha = hash_file(&acceptance).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+    command
+        .args(["outcome-oracle", "--request"])
+        .arg(&acceptance)
+        .args(["--request-sha256", &acceptance_sha]);
+    with_isolated_account(&mut command, &case.root.join("heavy-account"));
+    let output = command.output().unwrap();
+    let oracle: Value = record(&output);
+    assert!(output.status.success(), "{oracle}");
+    assert_eq!(oracle["passed"], true, "{oracle}");
+    assert_eq!(oracle["checker_executed"], true, "{oracle}");
+    assert_eq!(oracle["model_calls"], 0, "{oracle}");
+    assert_eq!(oracle["runs"][0]["native"]["ExitCode"], 0, "{oracle}");
+    assert_eq!(
+        oracle["runs"][0]["declared_deadline_seconds"], 600,
+        "{oracle}"
+    );
+}
+
+/// A failing lib repetition stops the checker at the first failure and fails
+/// the oracle with a bounded verdict naming the failed command and exit code.
+#[test]
+fn parallel_lib_oracle_fails_bounded_on_a_failing_lib_repetition() {
+    let case = OracleWorkspace::new();
+    case.lib_source(FAILING_LIB);
+    case.target("alpha", PASSING_TARGET);
+    let (request, sha) = case.request();
+
+    let output = case.checker(&request, &sha, &[]);
+    let verdict: Value = record(&output);
+    assert!(!output.status.success(), "{verdict}");
+    assert_eq!(verdict["passed"], false, "{verdict}");
+    let failure = &verdict["failure"];
+    assert_eq!(failure["id"], "lib-run-1", "{verdict}");
+    assert_eq!(failure["exitCode"], 101, "{verdict}");
+    assert_eq!(
+        failure["command"],
+        json!([verdict["cargo"], "test", "-p", "harness-core", "--lib"]),
+        "{verdict}"
+    );
+    let steps = verdict["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{verdict}");
+    assert!(
+        steps[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("deliberate lib failure"),
+        "{verdict}"
+    );
+    assert!(
+        serde_json::to_vec(&verdict).unwrap().len() < 64 * 1024,
+        "the verdict is not bounded: {verdict}"
+    );
+}
+
+/// A failing discovered target is named with its exit code after the three
+/// serialized lib repetitions, and the remaining targets are not run.
+#[test]
+fn parallel_lib_oracle_fails_bounded_on_a_failing_discovered_target() {
+    let case = OracleWorkspace::new();
+    case.target("alpha", PASSING_TARGET);
+    case.target("zulu", FAILING_TARGET);
+    let (request, sha) = case.request();
+
+    let output = case.checker(&request, &sha, &[]);
+    let verdict: Value = record(&output);
+    assert!(!output.status.success(), "{verdict}");
+    let failure = &verdict["failure"];
+    assert_eq!(failure["id"], "target:zulu", "{verdict}");
+    assert_eq!(failure["exitCode"], 101, "{verdict}");
+    assert_eq!(
+        failure["command"],
+        json!([
+            verdict["cargo"],
+            "test",
+            "-p",
+            "codex-harness",
+            "--test",
+            "zulu"
+        ]),
+        "{verdict}"
+    );
+    let steps = verdict["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 5, "{verdict}");
+    assert_eq!(steps[3]["id"], "target:alpha", "{verdict}");
+    assert_eq!(steps[3]["exitCode"], 0, "{verdict}");
+    assert!(
+        steps[4]["output"]
+            .as_str()
+            .unwrap()
+            .contains("deliberate target failure"),
+        "{verdict}"
+    );
+    assert!(
+        serde_json::to_vec(&verdict).unwrap().len() < 64 * 1024,
+        "the verdict is not bounded: {verdict}"
+    );
+}
+
+/// Discovery reads the current unsplit target list exactly as Cargo resolves
+/// it and reads a split `[[test]]` list through the same logic.
+#[test]
+fn parallel_lib_oracle_discovery_reflects_the_current_and_a_split_target_list() {
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let current = cargo_metadata_test_targets(&checkout);
+    assert!(!current.is_empty(), "the current target list is empty");
+    let root = tempfile::tempdir().unwrap();
+    let request = root.path().join("parallel-lib-request.json");
+    write_text(
+        &request,
+        &serde_json::to_string(&json!({
+            "schema": 1,
+            "source_root": checkout,
+            "lib_repetitions": 3,
+            "regression_targets": "auto",
+        }))
+        .unwrap(),
+    );
+    let sha = hash_file(&request).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+    command
+        .args(["parallel-lib-oracle", "--discover", "--request"])
+        .arg(&request)
+        .args(["--request-sha256", &sha, "--workspace"])
+        .arg(&checkout);
+    let output = command.output().unwrap();
+    let verdict: Value = record(&output);
+    assert!(output.status.success(), "{verdict}");
+    assert_eq!(verdict["discoverOnly"], true, "{verdict}");
+    assert!(verdict["passed"].is_null(), "{verdict}");
+    assert_eq!(verdict["steps"].as_array().unwrap().len(), 0, "{verdict}");
+    let mut discovered = string_array(&verdict["targets"]);
+    discovered.sort();
+    assert_eq!(discovered, current, "{verdict}");
+
+    let split = OracleWorkspace::new();
+    split.manifest(
+        "[package]\nname = \"codex-harness\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"matrix\"\npath = \"tests/matrix.rs\"\n\n[[test]]\nname = \"vector\"\npath = \"tests/vector.rs\"\n",
+    );
+    split.target("matrix", PASSING_TARGET);
+    split.target("vector", PASSING_TARGET);
+    split.target("audit", PASSING_TARGET);
+    let (request, sha) = split.request();
+    let output = split.checker(&request, &sha, &["--discover"]);
+    let verdict: Value = record(&output);
+    assert!(output.status.success(), "{verdict}");
+    assert_eq!(
+        verdict["targets"],
+        json!(["matrix", "vector", "audit"]),
+        "{verdict}"
+    );
+
+    let plain = OracleWorkspace::new();
+    plain.target("matrix", PASSING_TARGET);
+    plain.target("vector", PASSING_TARGET);
+    plain.target("audit", PASSING_TARGET);
+    let (request, sha) = plain.request();
+    let output = plain.checker(&request, &sha, &["--discover"]);
+    let verdict: Value = record(&output);
+    assert!(output.status.success(), "{verdict}");
+    assert_eq!(
+        verdict["targets"],
+        json!(["audit", "matrix", "vector"]),
+        "{verdict}"
+    );
+
+    let mut split_names = vec!["matrix".to_owned(), "vector".to_owned(), "audit".to_owned()];
+    let mut plain_names = vec!["audit".to_owned(), "matrix".to_owned(), "vector".to_owned()];
+    split_names.sort();
+    plain_names.sort();
+    assert_eq!(split_names, plain_names);
+}
