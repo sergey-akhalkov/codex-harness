@@ -125,6 +125,90 @@ fn identity_known(value: &Value) -> bool {
     }
 }
 
+/// The recorded value that marks model metrics as inapplicable. A method
+/// without model execution records no measured zero here, and this value
+/// never satisfies or violates a model-based threshold.
+pub const MODEL_METRICS_INAPPLICABLE: &str = "inapplicable";
+
+/// The comparison identities that exist only for a method that executes a
+/// model. A model-free method records its model metrics as inapplicable;
+/// these values are neither required for its pair comparability nor able to
+/// establish a mismatch, because no model call is part of the measured work.
+const MODEL_EXECUTION_MATCH_FIELDS: &[&str] = &["model", "effort", "provider"];
+
+/// Whether an attempt declares a method without model execution. Its model
+/// metrics are recorded as inapplicable, never as a measured zero, and no
+/// model work (a call, request, round, tool operation or token usage) may be
+/// measured on the attempt or on any of its native runs. A record that claims
+/// inapplicable model metrics while also recording measured model work is not
+/// model-free, and every model-method gate keeps applying to it.
+pub fn model_free_attempt(row: &Value) -> bool {
+    if row.get("model_metrics").and_then(Value::as_str) != Some(MODEL_METRICS_INAPPLICABLE) {
+        return false;
+    }
+    if row
+        .get("model_calls")
+        .and_then(Value::as_u64)
+        .is_some_and(|calls| calls != 0)
+    {
+        return false;
+    }
+    !model_work_measured(row)
+}
+
+fn model_work_measured(row: &Value) -> bool {
+    let counters = ["requests", "rounds", "tool_calls", "tool_operations"];
+    if counters
+        .iter()
+        .any(|key| row.get(*key).and_then(Value::as_u64).is_some())
+    {
+        return true;
+    }
+    if let Some(usage) = row.get("usage").and_then(Value::as_object) {
+        let measured = usage.get("status").and_then(Value::as_str) == Some("per_run")
+            || usage.get("runs").is_some_and(truth)
+            || usage.get("workers").is_some_and(truth)
+            || usage.get("total_tokens").and_then(Value::as_u64).is_some();
+        if measured {
+            return true;
+        }
+    }
+    array(row, "native_runs")
+        .map(|runs| {
+            runs.iter().any(|run| {
+                counters
+                    .iter()
+                    .any(|key| run.get(*key).and_then(Value::as_u64).is_some())
+                    || run.get("usage").is_some_and(truth)
+                    || run
+                        .get("model_calls")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|calls| calls != 0)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The operation's own measured work for a method without model execution: a
+/// completed native execution whose exit status and duration were recorded
+/// with a retained evidence reference, over a declared input identity. This
+/// is what a model-free unit establishes completeness and comparable-pair
+/// coverage with, instead of a model identity and model-round counters.
+fn operation_work_recorded(row: &Value) -> bool {
+    number(&row["elapsed_seconds"]).is_some()
+        && identity_known(&row["matched"]["input_identity"])
+        && array(row, "native_runs")
+            .map(|runs| {
+                runs.iter().any(|run| {
+                    run["status"] == "completed"
+                        && (run["exit_code"].is_i64() || run["exit_code"].is_u64())
+                        && number(&run["elapsed_seconds"]).is_some()
+                        && text(run, "evidence").is_some()
+                })
+            })
+            .unwrap_or(false)
+}
+
 /// A child entry that references another attempt in the same report declares
 /// inherited work: its time and usage are accounted once by the referenced
 /// attempt instead of being counted again here.
@@ -789,6 +873,21 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
     {
         reasons.insert("not_opposite_arms".into());
     }
+    // A method without model execution is a first-class measured unit: its
+    // pair comparability rests on its declared identities and its own
+    // measured operation work, never on a model identity, effort or provider.
+    // Two different declared methods never form one comparable pair.
+    let left_model_free = model_free_attempt(left);
+    let right_model_free = model_free_attempt(right);
+    if left_model_free != right_model_free {
+        reasons.insert("different_method".into());
+    } else if left_model_free
+        && let (Some(left_method), Some(right_method)) =
+            (text(left, "method"), text(right, "method"))
+        && left_method != right_method
+    {
+        reasons.insert("different_method".into());
+    }
     // A declared experiment/pair identity scopes the comparison: an edge that
     // crosses two declared units is not evidence for either of them, while
     // attempts that declare no finer identity share their experiment/case unit
@@ -812,6 +911,19 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
         .chain(b.keys().map(String::as_str))
         .collect();
     for key in keys {
+        if left_model_free && right_model_free && MODEL_EXECUTION_MATCH_FIELDS.contains(&key) {
+            // The model-execution identity is inapplicable to this method: it
+            // is not required to be known, and a recorded value is compared
+            // only when both arms declare one.
+            if let (Some(x), Some(y)) = (a.get(key), b.get(key))
+                && identity_known(x)
+                && identity_known(y)
+                && x != y
+            {
+                reasons.insert(format!("mismatch:{key}"));
+            }
+            continue;
+        }
         match (a.get(key), b.get(key)) {
             (Some(x), Some(y)) if identity_known(x) && identity_known(y) => {
                 if x != y {
@@ -825,7 +937,13 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
     }
     for row in [left, right] {
         reasons.extend(strings(array(row, "excluded_reasons")?)?);
-        if !truth(&row["discovery_verified"]) {
+        if model_free_attempt(row) {
+            // A model-free method completes its evidence with the
+            // operation's own measured work instead of model metadata.
+            if !operation_work_recorded(row) {
+                reasons.insert("operation_work_unverified".into());
+            }
+        } else if !truth(&row["discovery_verified"]) {
             reasons.insert("discovery_unverified".into());
         }
     }
@@ -1311,6 +1429,29 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
         let one_to_one = baseline_results.len() == 1 && candidate_results.len() == 1;
         let baseline_result = baseline_results.first().copied();
         let candidate_result = candidate_results.first().copied();
+        // A unit whose method executes no model call proves its completeness
+        // through the operation's own measured work (duration, exit and the
+        // declared inputs); model identity, model metadata and model-round
+        // counters do not apply to it, and its metrics stay inapplicable
+        // rather than becoming a measured zero.
+        let model_free = baseline_result.is_some_and(model_free_attempt)
+            && candidate_result.is_some_and(model_free_attempt);
+        let operation_work = model_free
+            && baseline_result.is_some_and(operation_work_recorded)
+            && candidate_result.is_some_and(operation_work_recorded);
+        let model_free_method = if model_free {
+            match (
+                baseline_result.and_then(|row| text(row, "method")),
+                candidate_result.and_then(|row| text(row, "method")),
+            ) {
+                (Some(baseline), Some(candidate)) if baseline == candidate => {
+                    Some(baseline.to_owned())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         // The declaration is compared across every attempt of the declared
         // task, including rework attempts that are not themselves comparable
         // edge endpoints.
@@ -1415,13 +1556,26 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 candidate_result.and_then(|row| number(&row["total_result_seconds"]));
             let delta = candidate_seconds.zip(baseline_seconds).map(|(c, b)| c - b);
             effect = json!({"baseline_seconds": baseline_seconds, "candidate_seconds": candidate_seconds, "delta_seconds": delta});
-            let verified = baseline_result.is_some_and(|row| {
-                truth(&row["discovery_verified"]) && truth(&row["observed_model_metadata_verified"])
-            }) && candidate_result.is_some_and(|row| {
-                truth(&row["discovery_verified"]) && truth(&row["observed_model_metadata_verified"])
-            });
+            let verified = if model_free {
+                operation_work
+            } else {
+                baseline_result.is_some_and(|row| {
+                    truth(&row["discovery_verified"])
+                        && truth(&row["observed_model_metadata_verified"])
+                }) && candidate_result.is_some_and(|row| {
+                    truth(&row["discovery_verified"])
+                        && truth(&row["observed_model_metadata_verified"])
+                })
+            };
             if !verified {
-                limitations.push("model metadata not verified on both arms".to_owned());
+                limitations.push(
+                    if model_free {
+                        "the operation's own measured work (duration, exit and declared inputs) is not recorded on both arms"
+                    } else {
+                        "model metadata not verified on both arms"
+                    }
+                    .to_owned(),
+                );
             }
             match objective {
                 Some("quality") => {
@@ -1556,6 +1710,14 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
             unit_value["removed_burden"] = json!(facts.removed);
             unit_value["applicability"] = json!(facts.applicability);
             unit_value["retained_checks"] = json!(facts.retained_checks);
+        }
+        if model_free {
+            // The method distinction is part of the unit record: the
+            // evaluator consumes exactly this declaration, and the recorded
+            // metrics stay inapplicable rather than becoming a measured zero.
+            unit_value["method"] = json!(model_free_method);
+            unit_value["model_metrics"] = json!(MODEL_METRICS_INAPPLICABLE);
+            unit_value["operation_work"] = json!(operation_work);
         }
         units.push(unit_value);
     }
@@ -2569,6 +2731,54 @@ mod tests {
                 .contains(&json!("retry_identity_mismatch"))
         );
         assert!(summarize_attempts(&vec![Value::Null; 1025]).is_err());
+    }
+
+    #[test]
+    fn a_model_free_attempt_is_never_a_measured_zero_or_a_shortcut() {
+        let mut baseline = attempt("mf-b", "baseline", 0.0, 10.0);
+        let mut candidate = attempt("mf-c", "candidate", 0.0, 8.0);
+        for row in [&mut baseline, &mut candidate] {
+            row["method"] = json!("real-operation");
+            row["model_calls"] = json!(0);
+            row["model_metrics"] = json!(MODEL_METRICS_INAPPLICABLE);
+            row["native_runs"][0]["elapsed_seconds"] = json!(2.0);
+            row["native_runs"][0]["exit_code"] = json!(0);
+            row["native_runs"][0]["evidence"] = json!("private/operation-receipt.json");
+        }
+        let report = summarize_attempts(&[baseline.clone(), candidate]).unwrap();
+        assert_eq!(
+            report["comparisons"][0]["comparable"], true,
+            "{}",
+            report["comparisons"][0]
+        );
+        let unit = &report["units"][0];
+        assert_eq!(unit["method"], "real-operation", "{unit}");
+        assert_eq!(unit["model_metrics"], MODEL_METRICS_INAPPLICABLE, "{unit}");
+        assert_eq!(unit["operation_work"], true, "{unit}");
+        let finished = &report["attempts"][0];
+        assert!(model_free_attempt(finished));
+        assert_eq!(finished["requests"], Value::Null);
+        assert_eq!(finished["usage"]["status"], "unknown");
+
+        // Measured model work contradicts an inapplicable claim, and a
+        // numeric metric is not an inapplicable one.
+        let mut measured = baseline.clone();
+        measured["native_runs"][0]["rounds"] = json!(1);
+        assert!(!model_free_attempt(&measured));
+        let mut called = baseline.clone();
+        called["model_calls"] = json!(1);
+        assert!(!model_free_attempt(&called));
+        let mut numeric = baseline.clone();
+        numeric["model_metrics"] = json!(0);
+        assert!(!model_free_attempt(&numeric));
+        // The operation's own measured work needs the recorded exit and
+        // duration of the retained execution.
+        let mut missing_exit = baseline;
+        missing_exit["native_runs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("exit_code");
+        assert!(!operation_work_recorded(&missing_exit));
     }
 
     fn declared(objective: &str) -> Value {

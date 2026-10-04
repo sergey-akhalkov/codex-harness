@@ -1259,6 +1259,14 @@ struct UnitFacts {
     baseline_steps: Option<u64>,
     candidate_steps: Option<u64>,
     usage_measured: bool,
+    /// The unit's method executes no model call: its model metrics are
+    /// recorded as inapplicable, never as a measured zero.
+    model_free: bool,
+    /// A model-free unit recorded the operation's own measured work
+    /// (duration, exit and the declared inputs) on both arms.
+    operation_work: bool,
+    /// The declared model-free method name, when both arms agree on one.
+    method: Option<String>,
     baseline_accepted: bool,
     candidate_accepted: bool,
     positive_effect: bool,
@@ -1312,6 +1320,23 @@ fn unit_limitations(unit: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The declared model-free method name(s) a decision record can name, in a
+/// stable order; `unspecified` when no method token was recorded. The method
+/// distinction stays visible in the coverage and reason records instead of
+/// being flattened into an anonymous exemption.
+fn model_free_names(facts: &[UnitFacts]) -> String {
+    let names: BTreeSet<&str> = facts
+        .iter()
+        .filter(|fact| fact.model_free)
+        .filter_map(|fact| fact.method.as_deref())
+        .collect();
+    if names.is_empty() {
+        "unspecified".to_owned()
+    } else {
+        names.into_iter().collect::<Vec<_>>().join("+")
+    }
 }
 
 fn arm_result<'a>(
@@ -1810,6 +1835,13 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             baseline_steps: baseline_row.and_then(steps),
             candidate_steps: candidate_row.and_then(steps),
             usage_measured: usages,
+            model_free: unit.get("model_metrics").and_then(Value::as_str)
+                == Some(crate::outcome_report::MODEL_METRICS_INAPPLICABLE),
+            operation_work: unit.get("operation_work") == Some(&Value::Bool(true)),
+            method: unit
+                .get("method")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             baseline_accepted: baseline_row.is_some_and(accepted),
             candidate_accepted: candidate_row.is_some_and(accepted),
             positive_effect,
@@ -1915,6 +1947,14 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
     } else {
         VariationStatus::Unmeasured
     };
+    // The model-identity clause of the claim follows the declared method: a
+    // method without model execution keeps its metrics inapplicable instead
+    // of inheriting model-observation limits that do not apply to it.
+    let model_identity = if !facts.is_empty() && facts.iter().all(|fact| fact.model_free) {
+        "the declared method executes no model call, so its model metrics are inapplicable rather than a measured zero"
+    } else {
+        "model identity remains API-observed with unavailable weight hashes or hardware retained as limits"
+    };
     let variation = VariationRecord {
         complete_pairs: facts.len() as u64,
         status: variation_status,
@@ -1933,7 +1973,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             .as_ref()
             .map_or(ClaimScope::Scoped, |claim| claim.scope),
         basis: format!(
-            "{} complete paired unit(s); requests, rounds, tool operations and repeated readings within a task are dependent observations and are not replications; {}; model identity remains API-observed with unavailable weight hashes or hardware retained as limits; no statistical confidence level is assigned, and an undetected difference is not evidence of equivalence",
+            "{} complete paired unit(s); requests, rounds, tool operations and repeated readings within a task are dependent observations and are not replications; {}; {model_identity}; no statistical confidence level is assigned, and an undetected difference is not evidence of equivalence",
             facts.len(),
             match variation_status {
                 VariationStatus::Observed =>
@@ -2062,20 +2102,34 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         }
     );
 
-    // Required measured coverage for the declared objective.
-    let mut coverage_parts: Vec<&str> = Vec::new();
+    // Required measured coverage for the declared objective. A method without
+    // model execution covers the non-primary dimensions with the operation's
+    // own measured work (duration, exit and the declared inputs) instead of
+    // model rounds and tool operations; its model metrics stay inapplicable,
+    // never a measured zero.
+    let model_free_dimension = |fact: &UnitFacts| {
+        policy.objective == Objective::Time && fact.model_free && fact.operation_work
+    };
+    let model_free_work = !facts.is_empty() && facts.iter().all(model_free_dimension);
+    let mut coverage_parts: Vec<String> = Vec::new();
     if !facts.is_empty() {
         if facts
             .iter()
             .all(|fact| fact.baseline_seconds.is_some() && fact.candidate_seconds.is_some())
         {
-            coverage_parts.push("time");
+            coverage_parts.push("time".to_owned());
         }
         if facts.iter().all(|fact| fact.baseline_steps.is_some()) {
-            coverage_parts.push("rounds+tool_ops");
+            coverage_parts.push("rounds+tool_ops".to_owned());
+        } else if model_free_work {
+            coverage_parts.push(format!(
+                "method:{} model-metrics:{} operation-work:duration+exit+inputs",
+                model_free_names(&facts),
+                crate::outcome_report::MODEL_METRICS_INAPPLICABLE
+            ));
         }
         if facts.iter().all(|fact| fact.usage_measured) {
-            coverage_parts.push("usage");
+            coverage_parts.push("usage".to_owned());
         }
     }
     let mut coverage = if coverage_parts.is_empty() {
@@ -2094,9 +2148,10 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             Metric::Time => facts
                 .iter()
                 .all(|fact| fact.baseline_seconds.is_some() && fact.candidate_seconds.is_some()),
-            Metric::Rounds | Metric::ToolOperations => facts
-                .iter()
-                .all(|fact| fact.baseline_steps.is_some() && fact.candidate_steps.is_some()),
+            Metric::Rounds | Metric::ToolOperations => facts.iter().all(|fact| {
+                (fact.baseline_steps.is_some() && fact.candidate_steps.is_some())
+                    || model_free_dimension(fact)
+            }),
             Metric::Usage => facts.iter().all(|fact| fact.usage_measured),
         };
         if !measured {
@@ -2570,6 +2625,16 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         &mut coverage,
         &mut attribution,
     );
+
+    // The decision record names the method distinction: a model-free adoption
+    // rests on the operation's own measured work, and its model metrics stay
+    // inapplicable rather than becoming a measured zero.
+    if decision == PolicyDecision::Adopt && model_free_work {
+        reasons.push(format!(
+            "the declared model-free method(s) {} measured the operation's own work (duration, exit and declared inputs) on both arms; model metrics are inapplicable, never a measured zero, and no model round or tool-operation counter is required",
+            model_free_names(&facts)
+        ));
+    }
 
     Ok(PolicyEvaluation {
         schema: POLICY_SCHEMA,

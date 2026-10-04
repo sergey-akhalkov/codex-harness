@@ -1145,6 +1145,298 @@ fn shared_costs_and_repeated_edges_count_once_and_drift_is_invalid() {
     );
 }
 
+/// One authoritative model-free attempt: the declared method executes no
+/// model call, so its model metrics are recorded as inapplicable, never as a
+/// measured zero, and its measured work is the operation's own duration,
+/// exit and declared inputs.
+fn operation_attempt(
+    id: &str,
+    arm: &str,
+    case: &str,
+    start: f64,
+    seconds: f64,
+    accepted: bool,
+) -> Value {
+    let matched: BTreeMap<&str, &str> = MATCH_FIELDS.iter().map(|key| (*key, "fixed")).collect();
+    json!({
+        "attempt_id": id,
+        "case_id": case,
+        "arm": arm,
+        "experiment_id": "exp-1",
+        "method": "real-operation",
+        "model_calls": 0,
+        "model_metrics": "inapplicable",
+        "started_at": start,
+        "ended_at": start + seconds,
+        "execution_started_at": start,
+        "matched": matched,
+        "native_runs": [{
+            "role": "operation",
+            "method": "real-operation",
+            "status": "completed",
+            "started_at": start,
+            "ended_at": start + 2.0,
+            "elapsed_seconds": 2.0,
+            "exit_code": 0,
+            "model_calls": 0,
+            "model_metrics": "inapplicable",
+            "evidence": "private/operation-receipt.json",
+        }],
+        "checks": [{
+            "id": "independent-acceptance",
+            "round": 0,
+            "started_at": start + 2.0,
+            "ended_at": start + seconds,
+            "required": true,
+            "executed": true,
+            "passed": accepted,
+            "exit_code": if accepted { 0 } else { 1 },
+            "evidence": "private/oracle.json",
+        }],
+        "children": [],
+        "interventions": [],
+        "retry_of": null,
+    })
+}
+
+#[test]
+fn a_model_free_operation_pair_reaches_adoption_with_inapplicable_metrics() {
+    let policy = policy();
+    let declared = declare(&policy);
+    let report = summarize(
+        &[
+            operation_attempt("ob", "baseline", "operation-case", 0.0, 100.0, true),
+            operation_attempt("oc", "candidate", "operation-case", 200.0, 70.0, true),
+        ],
+        &policy,
+    );
+    let unit = &report["units"][0];
+    assert_eq!(unit["model_metrics"], "inapplicable", "{unit}");
+    assert_eq!(unit["method"], "real-operation", "{unit}");
+    assert_eq!(unit["operation_work"], true, "{unit}");
+    assert_eq!(unit["comparable_pairs"], 1, "{unit}");
+    assert_eq!(unit["evidence_complete"], true, "{unit}");
+    assert_eq!(unit["positive_effect"], true, "{unit}");
+    // Inapplicable stays non-numeric: no model counter is invented anywhere.
+    let row = &report["attempts"][0];
+    assert!(
+        row["total_rounds"].is_null()
+            && row["total_tool_operations"].is_null()
+            && row["total_requests"].is_null(),
+        "{row}"
+    );
+    assert_eq!(row["usage"]["status"], "unknown", "{row}");
+
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.coverage.contains("method:real-operation"),
+        "{}",
+        evaluation.coverage
+    );
+    assert!(
+        evaluation.coverage.contains("model-metrics:inapplicable"),
+        "{}",
+        evaluation.coverage
+    );
+    assert!(
+        evaluation
+            .coverage
+            .contains("operation-work:duration+exit+inputs"),
+        "{}",
+        evaluation.coverage
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("model-free method")),
+        "the decision record names the method distinction: {:?}",
+        evaluation.reasons
+    );
+    let variation = evaluation.variation.as_ref().expect("variation record");
+    assert!(
+        variation
+            .basis
+            .contains("inapplicable rather than a measured zero"),
+        "{}",
+        variation.basis
+    );
+    // The decision record consumes exactly the matched operation pair.
+    let draft = evaluation
+        .decision_draft("item-1", "exp-1", "base-rev", "cand-rev", "acceptance.json")
+        .expect("the adopt decision record is justified");
+    assert_eq!(draft.matched, 1);
+    assert!(
+        draft.coverage.contains("model-metrics:inapplicable"),
+        "{}",
+        draft.coverage
+    );
+}
+
+#[test]
+fn a_model_method_unit_without_identity_or_rounds_still_fails_as_before() {
+    let policy = with_claim(policy(), ClaimScope::Scoped);
+    let declared = declare(&policy);
+
+    // The model identity is unknown on both arms: the pair stays incomparable
+    // exactly as before the model-free method became first-class.
+    let mut baseline = attempt(
+        "mb", "baseline", "case-m", 0.0, 100.0, true, None, None, false,
+    );
+    let mut candidate = attempt(
+        "mc",
+        "candidate",
+        "case-m",
+        200.0,
+        70.0,
+        true,
+        None,
+        None,
+        false,
+    );
+    for row in [&mut baseline, &mut candidate] {
+        row["matched"].as_object_mut().unwrap().remove("model");
+    }
+    let report = summarize(&[baseline, candidate], &policy);
+    assert_eq!(report["comparisons"][0]["comparable"], false);
+    assert!(
+        report["comparisons"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unknown:model")),
+        "{}",
+        report["comparisons"][0]
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(
+        evaluation.coverage,
+        "none; complete-pairs:0; variation:unmeasured"
+    );
+
+    // A comparable model-method pair without measured rounds or tool
+    // operations keeps the declared metric coverage gate.
+    let report = summarize(
+        &[
+            attempt(
+                "rb", "baseline", "case-r", 0.0, 100.0, true, None, None, true,
+            ),
+            attempt(
+                "rc",
+                "candidate",
+                "case-r",
+                200.0,
+                70.0,
+                true,
+                None,
+                None,
+                true,
+            ),
+        ],
+        &policy,
+    );
+    assert_eq!(report["comparisons"][0]["comparable"], true);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("metric coverage is incomplete")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.coverage.contains("time"),
+        "{}",
+        evaluation.coverage
+    );
+    assert!(
+        !evaluation.coverage.contains("operation-work"),
+        "{}",
+        evaluation.coverage
+    );
+}
+
+#[test]
+fn inapplicable_model_metrics_never_become_a_measured_zero_or_a_shortcut() {
+    let policy = policy();
+    let declared = declare(&policy);
+
+    // A record that claims inapplicable model metrics while measuring model
+    // work is not model-free: the model identity and completeness gates keep
+    // applying to it.
+    let mut baseline = operation_attempt("sb", "baseline", "case-s", 0.0, 100.0, true);
+    let mut candidate = operation_attempt("sc", "candidate", "case-s", 200.0, 70.0, true);
+    for row in [&mut baseline, &mut candidate] {
+        row["native_runs"][0]["rounds"] = json!(2);
+        row["matched"].as_object_mut().unwrap().remove("model");
+        row["observed_model_metadata_verified"] = json!(false);
+    }
+    let report = summarize(&[baseline, candidate], &policy);
+    assert_eq!(report["comparisons"][0]["comparable"], false);
+    assert!(
+        report["comparisons"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unknown:model")),
+        "{}",
+        report["comparisons"][0]
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A model-free pair without the operation's own measured work (a recorded
+    // exit and duration on the retained execution) cannot form a comparable
+    // unit, whatever its elapsed difference.
+    let mut baseline = operation_attempt("wb", "baseline", "case-w", 0.0, 100.0, true);
+    let mut candidate = operation_attempt("wc", "candidate", "case-w", 200.0, 70.0, true);
+    for row in [&mut baseline, &mut candidate] {
+        row["native_runs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("exit_code");
+    }
+    let report = summarize(&[baseline, candidate], &policy);
+    assert_eq!(report["comparisons"][0]["comparable"], false);
+    assert!(
+        report["comparisons"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("operation_work_unverified")),
+        "{}",
+        report["comparisons"][0]
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
 /// Declared policy bound to the work-efficiency infrastructure view with the
 /// given treatment mechanism.
 fn with_binding(mechanism: Mechanism) -> ComparisonPolicy {

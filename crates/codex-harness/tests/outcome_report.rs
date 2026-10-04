@@ -903,3 +903,136 @@ fn infrastructure_attribution_replays_reconciles_and_rejects_duplicates() {
         "{attribution}"
     );
 }
+
+/// One model-free attempt row: the declared method executes no model call, so
+/// its model metrics are inapplicable rather than a measured zero, and its
+/// measured work is the operation's own duration, exit and declared inputs.
+fn operation_attempt(
+    id: &str,
+    arm: &str,
+    method: &str,
+    start: f64,
+    end: f64,
+    accepted: bool,
+) -> Value {
+    let matched: std::collections::BTreeMap<_, _> = harness_core::outcome_report::MATCH_FIELDS
+        .iter()
+        .map(|k| (*k, "fixed"))
+        .collect();
+    json!({
+        "attempt_id": id,
+        "case_id": "operation-case",
+        "arm": arm,
+        "method": method,
+        "model_calls": 0,
+        "model_metrics": "inapplicable",
+        "started_at": start,
+        "ended_at": end,
+        "matched": matched,
+        "native_runs": [{
+            "status": "completed",
+            "started_at": start,
+            "ended_at": start + 2.0,
+            "elapsed_seconds": 2.0,
+            "exit_code": 0,
+            "evidence": "private/operation-receipt.json",
+        }],
+        "checks": [{
+            "id": "independent-acceptance",
+            "required": true,
+            "executed": true,
+            "exit_code": if accepted { 0 } else { 1 },
+            "passed": accepted,
+            "started_at": start + 2.0,
+            "ended_at": end,
+            "evidence": "private/oracle.json",
+        }],
+    })
+}
+
+#[test]
+fn model_free_units_are_comparable_and_name_the_method_distinction() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("model-free.json");
+    let declaration = json!({
+        "task_mix": "one operation case",
+        "objective": "time",
+        "effect_percent": 5.0,
+        "nuisance": ["declared order"],
+        "stopping": "one declared pair",
+        "uncertainty": "unknown evidence stays inconclusive",
+    });
+    let mut baseline = operation_attempt("b", "baseline", "real-operation", 0.0, 100.0, true);
+    let mut candidate = operation_attempt("c", "candidate", "real-operation", 200.0, 270.0, true);
+    for row in [&mut baseline, &mut candidate] {
+        row["declaration"] = declaration.clone();
+    }
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline, candidate])).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["comparisons"][0]["comparable"], true, "{report}");
+    let unit = &report["units"][0];
+    assert_eq!(unit["method"], "real-operation", "{unit}");
+    assert_eq!(unit["model_metrics"], "inapplicable", "{unit}");
+    assert_eq!(unit["operation_work"], true, "{unit}");
+    assert_eq!(unit["comparable_pairs"], 1, "{unit}");
+    assert_eq!(unit["evidence_complete"], true, "{unit}");
+    // Inapplicable stays non-numeric: no model counter becomes zero.
+    assert_eq!(
+        report["attempts"][0]["total_rounds"],
+        Value::Null,
+        "{report}"
+    );
+    assert_eq!(
+        report["attempts"][0]["total_tool_operations"],
+        Value::Null,
+        "{report}"
+    );
+    assert_eq!(
+        report["attempts"][0]["usage"]["status"], "unknown",
+        "{report}"
+    );
+    // The rendered report keeps the declared unit visible.
+    let markdown = run(&input, true);
+    assert!(markdown.status.success());
+    let text = String::from_utf8(markdown.stdout).unwrap();
+    assert!(text.contains("operation-case"), "{text}");
+
+    // Two different declared methods never form one comparable pair.
+    let input = root.path().join("mixed-methods.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([
+            operation_attempt("b2", "baseline", "real-operation", 0.0, 100.0, true),
+            operation_attempt("c2", "candidate", "bounded-replay", 200.0, 270.0, true),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["comparisons"][0]["comparable"], false, "{report}");
+    assert!(
+        report["comparisons"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("different_method")),
+        "{}",
+        report["comparisons"][0]
+    );
+    assert_eq!(report["units"].as_array().unwrap().len(), 0, "{report}");
+}
