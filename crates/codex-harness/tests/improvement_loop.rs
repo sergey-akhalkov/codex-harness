@@ -4437,6 +4437,234 @@ fn declared_corroboration_selects_an_independent_retained_unit_by_identity() {
     assert_eq!(report["corroboration"]["units"][0]["case_id"], "case-c");
 }
 
+/// One ready corroboration receipt whose single unit carries identity and
+/// replay references only.
+fn ready_corroboration_receipt(case_id: &str, tree_sha256: &str) -> Value {
+    json!({
+        "schema": 1,
+        "status": "selected",
+        "required_units": 1,
+        "selection": {
+            "schema": 1,
+            "requiredUnits": 1,
+            "status": "ready",
+            "units": [{
+                "owner": "card-prior",
+                "caseId": case_id,
+                "experiment": "exp-prior",
+                "mechanism": "bounded-output",
+                "conditions": "local-tool-runs",
+                "revision": "rev-prior",
+                "treeSha256": tree_sha256,
+            }],
+            "excluded": [],
+        },
+        "reason": Value::Null,
+    })
+}
+
+/// A predeclared policy whose declared scope needs no additional unit.
+fn single_unit_policy() -> Value {
+    let mut policy = corroboration_policy();
+    policy["stopping"]["requiredUnits"] = json!(1);
+    policy
+}
+
+/// Seed the decision boundary of an adoption whose recorded evaluation
+/// consumed one ready corroboration section, and write the exact receipt the
+/// decision is bound to. Returns the evaluation path and the receipt.
+fn seed_corroborated_adoption_boundary(
+    fixture: &Fixture,
+    bindings: &Path,
+    workload_card: &str,
+    revision: &str,
+) -> (PathBuf, Value) {
+    let evaluation_path =
+        seed_decision_boundary(fixture, bindings, workload_card, revision, "adopt");
+    let receipt = ready_corroboration_receipt("case-c", &"c".repeat(64));
+    let section = harness_core::outcome_report::corroboration_section(&receipt)
+        .expect("the fixture receipt is a valid corroboration receipt");
+    let mut evaluation: Value =
+        serde_json::from_slice(&fs::read(&evaluation_path).unwrap()).unwrap();
+    evaluation["corroboration"] = serde_json::to_value(&section).unwrap();
+    fs::write(
+        &evaluation_path,
+        serde_json::to_vec_pretty(&evaluation).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.run.join("corroboration.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    (evaluation_path, receipt)
+}
+
+/// A recorded adoption is bound to the corroboration section its decision
+/// consumed: a matching receipt inherits it, while a changed, invalid or
+/// missing receipt blocks the inheritance with the exact identity instead of
+/// consuming the adoption from a state the decision never saw.
+#[test]
+fn a_changed_or_missing_corroboration_receipt_cannot_inherit_an_adoption() {
+    let fixture = Fixture::new("corroboration-inheritance");
+    let head = seed_comparison_spec(&fixture, &corroboration_policy(), "inheritance");
+    let workload = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        &head,
+        &fixture.root.join("workload-pre"),
+    )
+    .unwrap();
+    let workload_card = admit_workload_card(&fixture);
+    let bindings = seed_bindings(&fixture, &workload, &head);
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let (_, receipt) =
+        seed_corroborated_adoption_boundary(&fixture, &bindings, &workload_card, &head);
+
+    // The matching receipt inherits the adoption: the run consumes the
+    // recorded decision to this run's own publication scope instead of
+    // blocking on it.
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert!(
+        !status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("corroboration"),
+        "{status}"
+    );
+
+    // A changed selection state cannot inherit the recorded adoption.
+    seed_corroborated_adoption_boundary(&fixture, &bindings, &workload_card, &head);
+    let mut changed = receipt.clone();
+    changed["selection"]["units"][0]["caseId"] = json!("case-substituted");
+    fs::write(
+        fixture.run.join("corroboration.json"),
+        serde_json::to_vec_pretty(&changed).unwrap(),
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "blocked", "{status}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("does not match the digest")
+            && condition.contains("cannot inherit the adoption"),
+        "{status}"
+    );
+
+    // A missing receipt cannot inherit it either.
+    seed_corroborated_adoption_boundary(&fixture, &bindings, &workload_card, &head);
+    fs::remove_file(fixture.run.join("corroboration.json")).unwrap();
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "blocked", "{status}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing corroboration state"),
+        "{status}"
+    );
+
+    // A receipt that contradicts its own declared contract cannot inherit it
+    // either, and restoring the exact recorded receipt lets the same adoption
+    // be consumed recoverably.
+    seed_corroborated_adoption_boundary(&fixture, &bindings, &workload_card, &head);
+    fs::write(
+        fixture.run.join("corroboration.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "status": "selected",
+            "required_units": 1,
+            "selection": Value::Null,
+            "reason": Value::Null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "blocked", "{status}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("not a valid receipt")
+            && condition.contains("cannot inherit the adoption"),
+        "{status}"
+    );
+
+    // The block is a state condition, not a verdict: with the boundary's
+    // recorded decision re-established and the exact receipt restored to the
+    // file, the same adoption is consumed instead of blocked.
+    seed_corroborated_adoption_boundary(&fixture, &bindings, &workload_card, &head);
+    fs::write(
+        fixture.run.join("corroboration.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}");
+}
+
+/// A run whose declared policy needs no additional unit is unaffected: it
+/// requires and writes no corroboration receipt, and a stray receipt beside
+/// the run cannot change the consumption of a decision that recorded no
+/// corroboration section.
+#[test]
+fn a_run_without_a_declared_corroboration_requirement_consumes_its_decision_unchanged() {
+    let fixture = Fixture::new("corroboration-absent");
+    let head = seed_comparison_spec(&fixture, &single_unit_policy(), "absent");
+    let workload = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        &head,
+        &fixture.root.join("workload-pre"),
+    )
+    .unwrap();
+    let workload_card = admit_workload_card(&fixture);
+    let bindings = seed_bindings(&fixture, &workload, &head);
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    seed_decision_boundary(&fixture, &bindings, &workload_card, &head, "adopt");
+
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert!(
+        !fixture.run.join("corroboration.json").is_file(),
+        "a declared scope without additional units writes no corroboration receipt"
+    );
+
+    seed_decision_boundary(&fixture, &bindings, &workload_card, &head, "adopt");
+    fs::write(
+        fixture.run.join("corroboration.json"),
+        serde_json::to_vec_pretty(&ready_corroboration_receipt("case-stray", &"e".repeat(64)))
+            .unwrap(),
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}");
+}
+
 // ---------------------------------------------------------------------------
 // Installed removal gates and restoration (OpenSpec change task 6.5)
 // ---------------------------------------------------------------------------
