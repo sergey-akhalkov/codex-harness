@@ -541,3 +541,185 @@ fn subtractive_consumption_and_retained_checks_survive_the_cli() {
         report["comparisons"][0]["excluded_reasons"]
     );
 }
+
+/// The declared corroboration receipt is consumed into the report with its
+/// selection status and identity/replay references; the markdown keeps the
+/// status, the units, the exclusions and the exact reason visible.
+#[test]
+fn corroboration_status_and_evidence_references_survive_the_report() {
+    let rows = vec![
+        faster(attempt("a", "baseline"), 10.0),
+        faster(attempt("b", "candidate"), 8.0),
+    ];
+    let report = harness_core::outcome_report::summarize_attempts(&rows).unwrap();
+    let receipt = json!({
+        "schema": 1,
+        "status": "selected",
+        "required_units": 1,
+        "selection": {
+            "schema": 1,
+            "requiredUnits": 1,
+            "status": "ready",
+            "units": [{
+                "owner": "card-prior",
+                "caseId": "case-prior",
+                "experiment": "exp-prior",
+                "mechanism": "bounded-output",
+                "conditions": "local-tool-runs",
+                "revision": "rev-prior",
+                "treeSha256": "c".repeat(64)
+            }],
+            "excluded": [{
+                "owner": "card-other",
+                "caseId": "case-other",
+                "reason": "notApplicable"
+            }]
+        },
+        "reason": Value::Null
+    });
+    let report = harness_core::outcome_report::attach_corroboration(&report, &receipt).unwrap();
+    let section = &report["corroboration"];
+    assert_eq!(section["schema"], 1);
+    assert_eq!(section["status"], "ready");
+    assert_eq!(section["ready"], true);
+    assert_eq!(section["requiredUnits"], 1);
+    assert_eq!(section["units"][0]["owner"], "card-prior");
+    assert_eq!(section["units"][0]["caseId"], "case-prior");
+    assert_eq!(section["units"][0]["experiment"], "exp-prior");
+    assert_eq!(section["units"][0]["mechanism"], "bounded-output");
+    assert_eq!(section["units"][0]["conditions"], "local-tool-runs");
+    assert_eq!(section["units"][0]["revision"], "rev-prior");
+    assert_eq!(section["units"][0]["treeSha256"], "c".repeat(64));
+    assert!(section["units"][0].get("answer").is_none());
+    assert_eq!(section["excluded"][0]["reason"], "notApplicable");
+    let digest = section["digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    let bound: harness_core::outcome_report::CorroborationSection =
+        serde_json::from_value(section.clone()).unwrap();
+    assert_eq!(
+        harness_core::outcome_report::corroboration_digest(&bound).unwrap(),
+        digest
+    );
+    // A substituted reference no longer matches the binding digest.
+    let mut substituted = bound.clone();
+    substituted.units[0].case_id = "case-substituted".to_owned();
+    assert_ne!(
+        harness_core::outcome_report::corroboration_digest(&substituted).unwrap(),
+        digest
+    );
+
+    let text = harness_core::outcome_report::concise_report(&report).unwrap();
+    assert!(
+        text.contains("corroboration: status=ready required_units=1 units=1 excluded=1"),
+        "{text}"
+    );
+    assert!(text.contains("case=case-prior"), "{text}");
+    assert!(text.contains("tree_sha256="), "{text}");
+    assert!(
+        text.contains(
+            "corroboration excluded: owner=card-other case=case-other reason=not applicable"
+        ),
+        "{text}"
+    );
+
+    // An inconclusive selection and an unavailable selection stay explicit
+    // with their exact reason and exclusions, never replaced by a summary.
+    let inconclusive = json!({
+        "schema": 1,
+        "status": "selected",
+        "required_units": 1,
+        "selection": {
+            "schema": 1,
+            "requiredUnits": 1,
+            "status": {"inconclusive": "fewer applicable independent replayable retained tasks than the declared corroboration requirement (required 1, admissible 0); the broader claim remains unsupported"},
+            "units": [],
+            "excluded": [{"owner": "card-other", "caseId": "case-other", "reason": "notApplicable"}]
+        },
+        "reason": Value::Null
+    });
+    let changed =
+        harness_core::outcome_report::attach_corroboration(&report, &inconclusive).unwrap();
+    assert_eq!(changed["corroboration"]["status"], "inconclusive");
+    assert_eq!(changed["corroboration"]["ready"], false);
+    assert!(
+        changed["corroboration"]["units"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let text = harness_core::outcome_report::concise_report(&changed).unwrap();
+    assert!(
+        text.contains("corroboration: status=inconclusive"),
+        "{text}"
+    );
+    assert!(text.contains("corroboration reason: "), "{text}");
+
+    let unavailable = json!({
+        "schema": 1,
+        "status": "unavailable",
+        "required_units": 1,
+        "selection": Value::Null,
+        "reason": "retained-task discovery through the board is unavailable"
+    });
+    let report =
+        harness_core::outcome_report::attach_corroboration(&changed, &unavailable).unwrap();
+    assert_eq!(report["corroboration"]["status"], "unavailable");
+    assert!(
+        report["corroboration"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("retained-task discovery")
+    );
+    let text = harness_core::outcome_report::concise_report(&report).unwrap();
+    assert!(text.contains("corroboration: status=unavailable"), "{text}");
+}
+
+/// A receipt whose unit list contradicts its own declared requirement, whose
+/// fields are unknown, or whose unavailable status lacks its reason is refused
+/// without producing a section; no unit is fabricated or summarized.
+#[test]
+fn invalid_corroboration_receipts_are_refused_without_a_section() {
+    let rows = vec![attempt("a", "baseline"), attempt("b", "candidate")];
+    let report = harness_core::outcome_report::summarize_attempts(&rows).unwrap();
+    let unit = || {
+        json!({
+            "owner": "card", "caseId": "case", "experiment": "exp",
+            "mechanism": "mechanism", "conditions": "conditions",
+            "revision": "rev", "treeSha256": "tree"
+        })
+    };
+    let cases = [
+        // Ready with fewer units than its own declared requirement.
+        json!({"schema": 1, "status": "selected", "required_units": 2,
+            "selection": {"schema": 1, "requiredUnits": 2, "status": "ready",
+                "units": [unit()], "excluded": []},
+            "reason": Value::Null}),
+        // Ready with a blank identity reference.
+        json!({"schema": 1, "status": "selected", "required_units": 1,
+            "selection": {"schema": 1, "requiredUnits": 1, "status": "ready",
+                "units": [{"owner": "  ", "caseId": "case", "experiment": "exp",
+                    "mechanism": "mechanism", "conditions": "conditions",
+                    "revision": "rev", "treeSha256": "tree"}],
+                "excluded": []},
+            "reason": Value::Null}),
+        // Unknown receipt field: an assumed summary is not evidence.
+        json!({"schema": 1, "status": "unavailable", "required_units": 1,
+            "selection": Value::Null, "reason": "not performed",
+            "summary": "assumed saving"}),
+        // Unavailable without its exact reason.
+        json!({"schema": 1, "status": "unavailable", "required_units": 1,
+            "selection": Value::Null, "reason": Value::Null}),
+        // A selection whose declared requirement disagrees with the receipt.
+        json!({"schema": 1, "status": "selected", "required_units": 1,
+            "selection": {"schema": 1, "requiredUnits": 2, "status": "ready",
+                "units": [unit(), unit()], "excluded": []},
+            "reason": Value::Null}),
+    ];
+    for receipt in cases {
+        assert!(
+            harness_core::outcome_report::attach_corroboration(&report, &receipt).is_err(),
+            "{receipt}"
+        );
+    }
+    assert!(report.get("corroboration").is_none());
+}

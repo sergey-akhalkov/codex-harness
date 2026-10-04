@@ -28,7 +28,21 @@
 //! to) from an unexercised, unknown or not-applied one, and refuses to turn
 //! zero invocations, a missing consumption record or a deleted required check
 //! into an accounted saving.
+//!
+//! A declared adoption scope may require additional independent corroboration
+//! units from retained prior real tasks. [`corroboration_section`] consumes the
+//! driver's run-local receipt into the report's `corroboration` section:
+//! selection status, declared additional units, selected identity/replay
+//! references and exact exclusions, bound by [`corroboration_digest`]. The
+//! section is evidence about the selection only; it never fabricates a unit,
+//! replaces a missing selection with a summary or claims measured benefit for a
+//! selected task.
+use crate::improvement_experiment::{
+    CorroborationSelection, CorroborationStatus, EXPERIMENT_SCHEMA, ExclusionReason,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -1435,6 +1449,263 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
     }))
 }
 
+/// Schema of the `corroboration` section a summary report carries when a
+/// declared adoption scope requires additional independent retained units.
+pub const CORROBORATION_SCHEMA: u32 = 1;
+
+/// Input bound on corroboration references carried by one report section,
+/// mirroring the attempt bound of [`summarize_attempts`].
+const MAX_CORROBORATION_REFERENCES: usize = 1024;
+
+/// The state of the declared corroboration selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorroborationState {
+    /// Enough independent applicable replayable retained units were selected.
+    Ready,
+    /// Fewer units than declared: the broader claim remains unsupported.
+    Inconclusive,
+    /// Selection was not performed; the exact reason is recorded.
+    Unavailable,
+}
+
+impl CorroborationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Inconclusive => "inconclusive",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// One selected corroboration unit: identity and replay references only. A
+/// fresh executor reimplements the retained task without an earlier answer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CorroborationUnitReference {
+    pub owner: String,
+    pub case_id: String,
+    pub experiment: String,
+    pub mechanism: String,
+    pub conditions: String,
+    /// Frozen root commit identity of the replayed snapshot.
+    pub revision: String,
+    /// Content digest over the frozen tree entries.
+    pub tree_sha256: String,
+}
+
+/// One candidate left out of the corroboration selection, by identity and
+/// exact reason.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CorroborationExclusion {
+    pub owner: String,
+    pub case_id: String,
+    pub reason: ExclusionReason,
+}
+
+/// The report's corroboration section: the declared additional corroboration
+/// requirement, the selection outcome over retained prior real tasks and the
+/// identity/replay references of the selected units.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CorroborationSection {
+    pub schema: u32,
+    pub status: CorroborationState,
+    pub ready: bool,
+    /// Additional independent units the declared scope requires beyond the
+    /// run's own declared plan unit.
+    pub required_units: u32,
+    pub units: Vec<CorroborationUnitReference>,
+    pub excluded: Vec<CorroborationExclusion>,
+    /// The exact selection or unavailability reason; `None` when ready.
+    pub reason: Option<String>,
+    /// Digest binding the section's content ([`corroboration_digest`]).
+    pub digest: String,
+}
+
+/// Digest binding one corroboration section's content, so a changed selection
+/// state cannot be consumed as the one an earlier decision recorded.
+pub fn corroboration_digest(section: &CorroborationSection) -> io::Result<String> {
+    let mut content = section.clone();
+    content.digest.clear();
+    let bytes = serde_json::to_vec(&content).map_err(io::Error::other)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// A non-blank bounded evidence string. Identity and replay references are
+/// carried verbatim; a placeholder cannot stand in for a real one.
+fn evidence_text(value: &str) -> io::Result<String> {
+    if value.trim().is_empty() || value.len() > 1024 {
+        return Err(invalid());
+    }
+    Ok(value.to_owned())
+}
+
+/// Normalize and validate the driver's run-local corroboration receipt
+/// (`corroboration.json`) into the report's corroboration section. The receipt
+/// contract is consumed exactly: schema, selection status, declared additional
+/// units, unit identity/replay references and exclusions. A selected receipt
+/// must carry its selection, and a unit list that contradicts its own declared
+/// requirement is refused rather than normalized, so a fabricated unit cannot
+/// enter the report.
+pub fn corroboration_section(receipt: &Value) -> io::Result<CorroborationSection> {
+    let object = receipt.as_object().ok_or_else(invalid)?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "schema" | "status" | "required_units" | "selection" | "reason"
+        ) {
+            return Err(invalid());
+        }
+    }
+    if object.get("schema").and_then(Value::as_u64) != Some(1) {
+        return Err(invalid());
+    }
+    let required_units = object
+        .get("required_units")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(invalid)?;
+    let reason = match object.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|text| !text.trim().is_empty() && text.len() <= 4096)
+                .ok_or_else(invalid)?
+                .to_owned(),
+        ),
+    };
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let (status, ready, units, excluded, reason) = match status {
+        "selected" => {
+            if required_units == 0 || reason.is_some() {
+                return Err(invalid());
+            }
+            let selection: CorroborationSelection =
+                serde_json::from_value(object.get("selection").cloned().ok_or_else(invalid)?)
+                    .map_err(|_| invalid())?;
+            if selection.schema != EXPERIMENT_SCHEMA
+                || selection.required_units != required_units
+                || selection.units.len() > MAX_CORROBORATION_REFERENCES
+                || selection.excluded.len() > MAX_CORROBORATION_REFERENCES
+            {
+                return Err(invalid());
+            }
+            let ready = selection.is_ready();
+            if (ready && selection.units.len() != required_units as usize)
+                || (!ready && selection.units.len() >= required_units as usize)
+            {
+                return Err(invalid());
+            }
+            let units = selection
+                .units
+                .iter()
+                .map(|unit| {
+                    Ok(CorroborationUnitReference {
+                        owner: evidence_text(&unit.owner)?,
+                        case_id: evidence_text(&unit.case_id)?,
+                        experiment: evidence_text(&unit.experiment)?,
+                        mechanism: evidence_text(&unit.mechanism)?,
+                        conditions: evidence_text(&unit.conditions)?,
+                        revision: evidence_text(&unit.revision)?,
+                        tree_sha256: evidence_text(&unit.tree_sha256)?,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let excluded = selection
+                .excluded
+                .iter()
+                .map(|unit| {
+                    Ok(CorroborationExclusion {
+                        owner: evidence_text(&unit.owner)?,
+                        case_id: evidence_text(&unit.case_id)?,
+                        reason: unit.reason.clone(),
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let (status, reason) = match &selection.status {
+                CorroborationStatus::Ready => (CorroborationState::Ready, None),
+                CorroborationStatus::Inconclusive(detail) => (
+                    CorroborationState::Inconclusive,
+                    Some(evidence_text(detail)?),
+                ),
+            };
+            (status, ready, units, excluded, reason)
+        }
+        "unavailable" => {
+            if object
+                .get("selection")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(invalid());
+            }
+            (
+                CorroborationState::Unavailable,
+                false,
+                Vec::new(),
+                Vec::new(),
+                Some(reason.ok_or_else(invalid)?),
+            )
+        }
+        _ => return Err(invalid()),
+    };
+    let section = CorroborationSection {
+        schema: CORROBORATION_SCHEMA,
+        status,
+        ready,
+        required_units,
+        units,
+        excluded,
+        reason,
+        digest: String::new(),
+    };
+    let digest = corroboration_digest(&section)?;
+    Ok(CorroborationSection { digest, ..section })
+}
+
+/// Attach the validated corroboration section to a summary report, returning a
+/// new report. An existing section is replaced; the section is bound by its own
+/// digest so a changed state is detectable by the decision owner.
+pub fn attach_corroboration(report: &Value, receipt: &Value) -> io::Result<Value> {
+    if report.get("schema_version").and_then(Value::as_u64) != Some(2) {
+        return Err(invalid());
+    }
+    let mut report = report.as_object().cloned().ok_or_else(invalid)?;
+    report.insert(
+        "corroboration".to_owned(),
+        serde_json::to_value(corroboration_section(receipt)?).map_err(io::Error::other)?,
+    );
+    Ok(Value::Object(report))
+}
+
+/// One-line display of an evidence value; embedded newlines cannot break the
+/// line-oriented rendering.
+fn display_text(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
+}
+
+/// The exclusion reason in the words of the selector contract.
+fn exclusion_text(reason: &ExclusionReason) -> String {
+    match reason {
+        ExclusionReason::NotApplicable => {
+            "not applicable to the declared mechanism and conditions".to_owned()
+        }
+        ExclusionReason::AlreadyUsed => {
+            "already part of the declared plan or not independent of an earlier unit".to_owned()
+        }
+        ExclusionReason::NotReplayable { detail } => format!(
+            "the retained copy no longer verifies as pristine: {}",
+            display_text(detail)
+        ),
+    }
+}
+
 pub fn concise_report(report: &Value) -> io::Result<String> {
     let mut lines = vec!["Case | Arm | Attempt | Outcome | Preparation seconds | Native through checks wall seconds | Total verified seconds | Comparison exclusions".to_owned(),
         "--- | --- | --- | --- | ---: | ---: | ---: | ---".to_owned()];
@@ -1555,6 +1826,46 @@ pub fn concise_report(report: &Value) -> io::Result<String> {
             group["within_run_events"]["tool_calls"],
             group["within_run_events"]["tool_operations"],
         ));
+    }
+    // The declared corroboration state stays visible with its evidence
+    // references: a ready selection names the units a broader claim rests on,
+    // and an inconclusive or unavailable selection keeps its exact reason and
+    // excluded candidates instead of being replaced by a summary.
+    if let Some(section) = report.get("corroboration") {
+        let section: CorroborationSection =
+            serde_json::from_value(section.clone()).map_err(|_| invalid())?;
+        lines.push(String::new());
+        lines.push(format!(
+            "corroboration: status={} required_units={} units={} excluded={} digest={}",
+            section.status.as_str(),
+            section.required_units,
+            section.units.len(),
+            section.excluded.len(),
+            section.digest
+        ));
+        for unit in &section.units {
+            lines.push(format!(
+                "corroboration unit: owner={} case={} experiment={} mechanism={} conditions={} revision={} tree_sha256={}",
+                display_text(&unit.owner),
+                display_text(&unit.case_id),
+                display_text(&unit.experiment),
+                display_text(&unit.mechanism),
+                display_text(&unit.conditions),
+                display_text(&unit.revision),
+                display_text(&unit.tree_sha256),
+            ));
+        }
+        for excluded in &section.excluded {
+            lines.push(format!(
+                "corroboration excluded: owner={} case={} reason={}",
+                display_text(&excluded.owner),
+                display_text(&excluded.case_id),
+                display_text(&exclusion_text(&excluded.reason)),
+            ));
+        }
+        if let Some(reason) = &section.reason {
+            lines.push(format!("corroboration reason: {}", display_text(reason)));
+        }
     }
     let accounting = &report["accounting"];
     lines.push(String::new());

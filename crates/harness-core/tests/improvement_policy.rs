@@ -10,7 +10,10 @@ use harness_core::improvement_policy::{
     parse_statistical_claim, refuse_cross_task_speed_claim, statistical_clause,
 };
 use harness_core::infrastructure_accounting::{Mechanism, MetricView, binding_clause};
-use harness_core::outcome_report::{MATCH_FIELDS, summarize_attempts};
+use harness_core::outcome_report::{
+    CorroborationSection, CorroborationState, MATCH_FIELDS, attach_corroboration,
+    corroboration_digest, summarize_attempts,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -1123,6 +1126,417 @@ fn shared_costs_and_repeated_edges_count_once_and_drift_is_invalid() {
             .any(|reason| reason.contains("declaration differs")),
         "{:?}",
         evaluation.reasons
+    );
+}
+
+/// The driver's run-local corroboration receipt, exactly as the corroboration
+/// selector writes it: schema 1, `selected` or `unavailable`, the additional
+/// units the declared scope requires, and (for a selection) the identity-only
+/// `CorroborationSelection`.
+fn corroboration_receipt(
+    status: &str,
+    required_units: u64,
+    selection: Value,
+    reason: Value,
+) -> Value {
+    json!({
+        "schema": 1,
+        "status": status,
+        "required_units": required_units,
+        "selection": selection,
+        "reason": reason,
+    })
+}
+
+/// One retained prior real task selected for corroboration, by identity and
+/// replay references only.
+fn corroboration_unit(case: &str, revision: &str, tree: &str) -> Value {
+    json!({
+        "owner": format!("card-{case}"),
+        "caseId": case,
+        "experiment": "exp-prior",
+        "mechanism": "bounded-output",
+        "conditions": "local-tool-runs",
+        "revision": revision,
+        "treeSha256": tree,
+    })
+}
+
+/// A declared policy whose scope needs one additional independent retained
+/// unit beyond the run's own declared plan unit.
+fn broader_scope_policy() -> ComparisonPolicy {
+    let mut policy = policy();
+    policy.stopping.required_units = 2;
+    policy.repeated_selection = RepeatedSelection::BestOf;
+    policy.overhead = Overhead {
+        implementation_seconds: 0.0,
+        evaluation_seconds: 0.0,
+        maintenance_seconds_per_task: 0.0,
+    };
+    policy
+}
+
+/// One favorable complete pair on the run's own declared plan unit: 100s
+/// baseline against 70s candidate, above the 10% declared effect.
+fn favorable_pair(case: &str) -> Vec<Value> {
+    vec![
+        attempt(
+            "b1",
+            "baseline",
+            case,
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        attempt(
+            "c1",
+            "candidate",
+            case,
+            200.0,
+            70.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+    ]
+}
+
+#[test]
+fn a_broader_claim_needs_the_declared_corroboration_selection() {
+    let policy = broader_scope_policy();
+    let declared = declare(&policy);
+    let report = summarize(&favorable_pair("case-b"), &policy);
+
+    // One recorded unit without any corroboration state: the declared scope
+    // needs two independent units, and no summary replaces the selection.
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(evaluation.corroboration.is_none());
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no corroboration selection")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A ready selection of the declared additional retained unit supports the
+    // broader claim, and the decision carries its identity and replay
+    // references.
+    let tree = "c".repeat(64);
+    let receipt = corroboration_receipt(
+        "selected",
+        1,
+        json!({
+            "schema": 1,
+            "requiredUnits": 1,
+            "status": "ready",
+            "units": [corroboration_unit("case-c", "rev-c", &tree)],
+            "excluded": [],
+        }),
+        Value::Null,
+    );
+    let report = attach_corroboration(&report, &receipt).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    let evidence = evaluation
+        .corroboration
+        .as_ref()
+        .expect("consumed corroboration section");
+    assert_eq!(evidence.status, CorroborationState::Ready);
+    assert_eq!(evidence.required_units, 1);
+    assert_eq!(evidence.units.len(), 1);
+    assert_eq!(evidence.units[0].owner, "card-case-c");
+    assert_eq!(evidence.units[0].case_id, "case-c");
+    assert_eq!(evidence.units[0].experiment, "exp-prior");
+    assert_eq!(evidence.units[0].mechanism, "bounded-output");
+    assert_eq!(evidence.units[0].conditions, "local-tool-runs");
+    assert_eq!(evidence.units[0].revision, "rev-c");
+    assert_eq!(evidence.units[0].tree_sha256, tree);
+    assert_eq!(evidence.digest.len(), 64);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("ready corroboration selection")
+                && reason.contains("case-c")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A recorded effect below the declared threshold does not become an
+    // adoption on the strength of a selected, not yet measured unit, and it is
+    // not a rejection either: the broader claim stays inconclusive.
+    let weak = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                95.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+        ],
+        &policy,
+    );
+    let weak = attach_corroboration(&weak, &receipt).unwrap();
+    let evaluation = evaluate(&declared, &weak).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("partially measured set")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn insufficient_corroboration_units_leave_the_broader_claim_inconclusive() {
+    let policy = broader_scope_policy();
+    let declared = declare(&policy);
+    let report = summarize(&favorable_pair("case-b"), &policy);
+
+    // An inconclusive selection keeps its exact reason and excluded
+    // candidates; no unit is fabricated and no adoption follows.
+    let receipt = corroboration_receipt(
+        "selected",
+        1,
+        json!({
+            "schema": 1,
+            "requiredUnits": 1,
+            "status": {"inconclusive": "fewer applicable independent replayable retained tasks than the declared corroboration requirement (required 1, admissible 0); the broader claim remains unsupported, and a workload that does not exercise the mechanism is not evidence against it"},
+            "units": [],
+            "excluded": [
+                {"owner": "card-case-x", "caseId": "case-x", "reason": "notApplicable"},
+                {"owner": "card-case-b", "caseId": "case-b", "reason": "alreadyUsed"},
+            ],
+        }),
+        Value::Null,
+    );
+    let report = attach_corroboration(&report, &receipt).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation.reasons.iter().any(|reason| reason
+            .contains("corroboration selection is inconclusive")
+            && reason.contains("broader claim remains unsupported")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("case-x") && reason.contains("not applicable")),
+        "{:?}",
+        evaluation.reasons
+    );
+    let evidence = evaluation
+        .corroboration
+        .as_ref()
+        .expect("consumed corroboration section");
+    assert_eq!(evidence.status, CorroborationState::Inconclusive);
+    assert_eq!(evidence.required_units, 1);
+    assert!(evidence.units.is_empty(), "no unit may be fabricated");
+    assert_eq!(evidence.excluded.len(), 2);
+    assert_eq!(evidence.excluded[0].case_id, "case-x");
+    assert!(
+        evidence
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("broader claim remains unsupported")
+    );
+
+    // An unavailable selection records why it was not performed.
+    let unavailable = corroboration_receipt(
+        "unavailable",
+        1,
+        Value::Null,
+        json!("retained-task discovery through the board is unavailable"),
+    );
+    let report = attach_corroboration(&report, &unavailable).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation.reasons.iter().any(|reason| reason
+            .contains("the corroboration selection was not performed: retained-task discovery")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(
+        evaluation.corroboration.as_ref().unwrap().status,
+        CorroborationState::Unavailable
+    );
+
+    // A selection claiming readiness with fewer units than its own declared
+    // requirement is fabricated: the evaluator refuses to consume it even
+    // when its digest is recomputed, and no unit is invented to fill the gap.
+    let mut forged = attach_corroboration(
+        &report,
+        &corroboration_receipt(
+            "selected",
+            1,
+            json!({
+                "schema": 1,
+                "requiredUnits": 1,
+                "status": "ready",
+                "units": [corroboration_unit("case-c", "rev-c", &"c".repeat(64))],
+                "excluded": [],
+            }),
+            Value::Null,
+        ),
+    )
+    .unwrap();
+    let mut section: CorroborationSection =
+        serde_json::from_value(forged["corroboration"].clone()).unwrap();
+    section.units.clear();
+    section.digest = corroboration_digest(&section).unwrap();
+    forged["corroboration"] = serde_json::to_value(&section).unwrap();
+    let evaluation = evaluate(&declared, &forged).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("still fall short of the declared 2 independent unit(s)")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn changed_or_missing_corroboration_state_cannot_inherit_an_adoption() {
+    let policy = broader_scope_policy();
+    let declared = declare(&policy);
+    let base = summarize(&favorable_pair("case-b"), &policy);
+    let ready = |case: &str, tree: &str| {
+        attach_corroboration(
+            &base,
+            &corroboration_receipt(
+                "selected",
+                1,
+                json!({
+                    "schema": 1,
+                    "requiredUnits": 1,
+                    "status": "ready",
+                    "units": [corroboration_unit(case, "rev-prior", tree)],
+                    "excluded": [],
+                }),
+                Value::Null,
+            ),
+        )
+        .unwrap()
+    };
+    let adopted = evaluate(&declared, &ready("case-c", &"c".repeat(64))).unwrap();
+    assert_eq!(adopted.decision, PolicyDecision::Adopt);
+    let first = adopted.corroboration.clone().expect("consumed section");
+    assert_eq!(first.units[0].case_id, "case-c");
+
+    // Resume/repeated evaluation against the same recorded attempts without
+    // the corroboration state: the earlier adoption is not inherited and the
+    // broader claim stays inconclusive with an exact reason.
+    let resumed = evaluate(&declared, &base).unwrap();
+    assert_eq!(resumed.decision, PolicyDecision::Inconclusive);
+    assert!(resumed.corroboration.is_none());
+    assert!(
+        resumed
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no corroboration selection")),
+        "{:?}",
+        resumed.reasons
+    );
+
+    // A changed selection that still supports the count is re-established
+    // under its own exact evidence: the recorded references and binding digest
+    // change with the state, so the earlier adoption's evidence is not
+    // inherited.
+    let second = evaluate(&declared, &ready("case-d", &"d".repeat(64))).unwrap();
+    assert_eq!(second.decision, PolicyDecision::Adopt);
+    let evidence = second.corroboration.clone().expect("consumed section");
+    assert_eq!(evidence.units[0].case_id, "case-d");
+    assert_eq!(evidence.units[0].tree_sha256, "d".repeat(64));
+    assert_ne!(evidence.digest, first.digest);
+
+    // A selection made for a different declared requirement cannot carry the
+    // adoption: the requirement mapping is checked against the declared
+    // policy, not against the receipt's own claim.
+    let mismatched = evaluate(
+        &declared,
+        &attach_corroboration(
+            &base,
+            &corroboration_receipt(
+                "selected",
+                2,
+                json!({
+                    "schema": 1,
+                    "requiredUnits": 2,
+                    "status": "ready",
+                    "units": [
+                        corroboration_unit("case-c", "rev-c", &"c".repeat(64)),
+                        corroboration_unit("case-d", "rev-d", &"d".repeat(64)),
+                    ],
+                    "excluded": [],
+                }),
+                Value::Null,
+            ),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mismatched.decision, PolicyDecision::Inconclusive);
+    assert!(
+        mismatched.reasons.iter().any(|reason| reason
+            .contains("a changed corroboration state cannot support the broader claim")),
+        "{:?}",
+        mismatched.reasons
+    );
+
+    // A section whose stored digest no longer binds its content (the unit was
+    // substituted after the selection) cannot support the claim either.
+    let mut tampered = ready("case-c", &"c".repeat(64));
+    tampered["corroboration"]["units"][0]["caseId"] = json!("case-substituted");
+    let evaluation = evaluate(&declared, &tampered).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not bind its own content")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.corroboration.is_none(),
+        "an unbound section is not consumed"
     );
 }
 
