@@ -12,6 +12,12 @@
 //! are ignored. Instruction texts are measured but never retained: consumers
 //! receive byte counts, identities and counters, not instruction or transcript
 //! content.
+//!
+//! [`RetainedTrace`] captures and verifies the change-generation identity of
+//! one retained trace file referenced by reused measurement evidence: a
+//! missing or changed trace is refused with the exact reason, so retained
+//! evidence never stands in for a trace that no longer describes the
+//! recorded bytes.
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,7 +25,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 /// Recorded token counters of one response, turn or thread snapshot.
@@ -233,6 +239,65 @@ impl FileIdentity {
             return Err("file_modified");
         }
         Ok(())
+    }
+}
+
+/// A retained rollout trace referenced by reused measurement evidence: the
+/// exact file the retained execution was reduced from, together with the
+/// change-generation identity it had when the evidence was captured.
+///
+/// Reuse of a retained attempt is refused with an exact reason when the trace
+/// file is missing or its generation changed; a summary, identity hash or
+/// unavailable telemetry never stands in for the retained trace, and retained
+/// evidence that cannot point at one is not a comparable baseline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedTrace {
+    pub path: PathBuf,
+    pub identity: FileIdentity,
+}
+
+impl RetainedTrace {
+    /// Capture the identity of one retained trace file. A missing or
+    /// unreadable file is an error carrying the exact path: without the trace
+    /// the retained execution cannot be verified.
+    pub fn capture(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "the retained trace at {} is missing or unreadable: {error}; the retained execution cannot be verified",
+                    path.display()
+                ),
+            )
+        })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            identity: FileIdentity::of_file(&file)?,
+        })
+    }
+
+    /// Verify the retained trace still describes the captured bytes. The
+    /// exact difference is reported; every difference makes the retained
+    /// evidence unusable until a fresh control is measured.
+    pub fn verify(&self) -> Result<(), String> {
+        let file = File::open(&self.path).map_err(|error| {
+            format!(
+                "the retained trace at {} is missing: {error}; the retained execution cannot be verified",
+                self.path.display()
+            )
+        })?;
+        let current = FileIdentity::of_file(&file).map_err(|error| {
+            format!(
+                "the retained trace at {} cannot be identified: {error}; the retained execution cannot be verified",
+                self.path.display()
+            )
+        })?;
+        self.identity.verify_unchanged(&current).map_err(|reason| {
+            format!(
+                "the retained trace at {} changed since it was captured ({reason}); the retained execution cannot be reused",
+                self.path.display()
+            )
+        })
     }
 }
 
@@ -1609,6 +1674,38 @@ mod tests {
             change_time: change,
             size,
         }
+    }
+
+    #[test]
+    fn a_retained_trace_verifies_unchanged_and_refuses_missing_or_changed_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(root.path(), "retained.jsonl", &[meta("thread_retained")]);
+        let trace = RetainedTrace::capture(&path).unwrap();
+        assert!(trace.verify().is_ok());
+
+        // A grown trace is a different generation: reuse is refused with the
+        // exact change reason instead of consuming the changed bytes.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", meta("second")).unwrap();
+        let reason = trace.verify().unwrap_err();
+        assert!(reason.contains("changed since it was captured"), "{reason}");
+
+        // A missing trace cannot verify the retained execution at all.
+        std::fs::remove_file(&path).unwrap();
+        let reason = trace.verify().unwrap_err();
+        assert!(reason.contains("is missing"), "{reason}");
+    }
+
+    #[test]
+    fn capturing_a_missing_trace_names_the_exact_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("absent.jsonl");
+        let reason = RetainedTrace::capture(&path).unwrap_err().to_string();
+        assert!(reason.contains("missing or unreadable"), "{reason}");
+        assert!(reason.contains("absent.jsonl"), "{reason}");
     }
 
     #[test]

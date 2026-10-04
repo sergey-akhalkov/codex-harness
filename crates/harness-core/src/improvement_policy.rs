@@ -42,6 +42,20 @@
 //! claim inconclusive; the consumed section is recorded with the decision, and
 //! a changed or missing state cannot inherit an earlier adoption.
 //!
+//! A retained baseline measurement may replace a fresh execution of the old
+//! variant only under a predeclared baseline-reuse clause
+//! ([`BASELINE_REUSE_CLAUSE`]): the evidence owner must have verified the
+//! retained input/runtime/acceptance/metric/condition identity, a retained
+//! trace reference, and the recorded age, coverage, uncertainty and
+//! predeclared selection. [`evaluate`] refuses a reuse whose age exceeds the
+//! declared bound, whose selection postdates the candidate outcome, or whose
+//! recorded facts contradict the frozen policy; a model-dependent reuse
+//! additionally needs the selected runtime qualification and context
+//! isolation, while a method without model execution keeps its model metrics
+//! inapplicable and requires none. An admitted reuse is recorded with its
+//! retained identity, age, coverage, uncertainty and original cost instead of
+//! being presented as a fresh measurement.
+//!
 //! When the policy declares the infrastructure binding, the adjusted decision
 //! is additionally bound to the retained attribution evidence of every
 //! included unit attempt: the rule/version and measurement lineage must match
@@ -201,6 +215,7 @@ pub fn parse_statistical_claim(
     let end = [
         crate::infrastructure_accounting::RULE_VERSION,
         SELECTION_CLAUSE,
+        BASELINE_REUSE_CLAUSE,
     ]
     .into_iter()
     .filter_map(|marker| rest.find(marker))
@@ -562,6 +577,7 @@ pub fn parse_experiment_selection(
     let end = [
         crate::infrastructure_accounting::RULE_VERSION,
         NUISANCE_CLAUSE,
+        BASELINE_REUSE_CLAUSE,
     ]
     .iter()
     .filter_map(|marker| rest.find(marker))
@@ -1023,10 +1039,17 @@ pub fn parse_nuisance_control(uncertainty: &str) -> Result<Option<NuisanceContro
         );
     }
     let rest = &uncertainty[start + NUISANCE_CLAUSE.len()..];
-    let body = match rest.find(crate::infrastructure_accounting::RULE_VERSION) {
-        Some(end) => &rest[..end],
-        None => rest,
-    };
+    // The body ends at the next clause that belongs to another owner: the
+    // baseline-reuse clause or the infrastructure binding.
+    let end = [
+        crate::infrastructure_accounting::RULE_VERSION,
+        BASELINE_REUSE_CLAUSE,
+    ]
+    .into_iter()
+    .filter_map(|marker| rest.find(marker))
+    .min()
+    .unwrap_or(rest.len());
+    let body = &rest[..end];
     if body.len() > MAX_NUISANCE_CLAUSE_BYTES {
         return Err(
             "the nuisance-control clause exceeds its bounded size; keep every declared value within the clause bound"
@@ -1209,6 +1232,188 @@ pub fn parse_nuisance_control(uncertainty: &str) -> Result<Option<NuisanceContro
         );
     }
     Ok(Some(plan))
+}
+
+/// Marker of the predeclared baseline-reuse clause inside the policy's
+/// uncertainty text. Clause order is: any statistical-analysis clause, then
+/// the experiment-selection clause, then the nuisance-control clause, then
+/// this baseline-reuse clause, then the infrastructure binding, so every
+/// owner parses its own fields without consuming another's.
+pub const BASELINE_REUSE_CLAUSE: &str = "baseline-reuse.v1";
+
+/// The exact identity groups a retained baseline measurement must still match
+/// before it can be reused. The set is fixed: a declared policy can withhold
+/// reuse but can never waive input, runtime, acceptance, metric or relevant
+/// condition comparability for it.
+pub const REUSE_IDENTITIES: &str = "input+runtime+acceptance+metrics+conditions";
+
+/// Bound on the rendered baseline-reuse clause.
+const MAX_REUSE_CLAUSE_BYTES: usize = 320;
+
+/// Upper bound on a declared retention age. A bounded window is required so
+/// an unbounded reuse of old evidence is never assumed; evidence beyond the
+/// declared window needs the smallest sufficient fresh control instead.
+const MAX_REUSE_AGE_SECONDS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
+
+/// The frozen policy under which a retained baseline measurement may be
+/// reused for a new candidate arm instead of executing the old variant again.
+/// It declares before results that reuse is admissible at all and for how
+/// long, and it states the fixed requirements a reuse must satisfy: the
+/// retained input/runtime/acceptance/metric/condition identity, a retained
+/// trace reference, and the selected runtime qualification and context
+/// isolation for a model-dependent method. A method without model execution
+/// keeps its model metrics inapplicable and requires no unrelated model
+/// qualification.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaselineReusePlan {
+    /// Retained evidence older than this is not reusable without a fresh
+    /// control.
+    pub max_age_seconds: f64,
+}
+
+impl BaselineReusePlan {
+    /// The recorded declaration shape of the plan, attached to every measured
+    /// attempt before results.
+    pub fn declaration(&self) -> Value {
+        json!({
+            "identities": REUSE_IDENTITIES,
+            "trace": "required",
+            "qualification": "model-context",
+            "max_age_seconds": self.max_age_seconds,
+            "basis": "a retained baseline is reusable only while its input, runtime, acceptance, metric and relevant condition identity still matches the current comparison, its retained trace is present, and the declared age bound holds; model-dependent reuse additionally needs the selected runtime qualification and context isolation, while a method without model execution keeps its model metrics inapplicable",
+        })
+    }
+}
+
+/// The canonical baseline-reuse clause. It follows the nuisance-control
+/// clause and precedes the infrastructure binding.
+pub fn baseline_reuse_clause(plan: &BaselineReusePlan) -> String {
+    format!(
+        "{BASELINE_REUSE_CLAUSE}; identities={REUSE_IDENTITIES}; trace=required; qualification=model-context; max-age-seconds={}",
+        plan.max_age_seconds
+    )
+}
+
+/// Parse the predeclared baseline-reuse clause out of the uncertainty text.
+/// `Ok(None)` when it is absent: the older default does not reuse retained
+/// baseline evidence. A present but unusable clause is an error so it can
+/// never silently degrade into different reuse conditions.
+pub fn parse_baseline_reuse(uncertainty: &str) -> Result<Option<BaselineReusePlan>, String> {
+    let Some(start) = uncertainty.find(BASELINE_REUSE_CLAUSE) else {
+        return Ok(None);
+    };
+    if let Some(infrastructure) = uncertainty.find(crate::infrastructure_accounting::RULE_VERSION)
+        && infrastructure < start
+    {
+        return Err(
+            "the baseline-reuse clause must precede the infrastructure binding it qualifies"
+                .to_owned(),
+        );
+    }
+    for marker in [STATISTICAL_CLAUSE, SELECTION_CLAUSE, NUISANCE_CLAUSE] {
+        if uncertainty[start + BASELINE_REUSE_CLAUSE.len()..].contains(marker) {
+            return Err(
+                "the baseline-reuse clause must follow the statistical-analysis, experiment-selection and nuisance-control clauses so each owner parses its own fields"
+                    .to_owned(),
+            );
+        }
+    }
+    let rest = &uncertainty[start + BASELINE_REUSE_CLAUSE.len()..];
+    let body = match rest.find(crate::infrastructure_accounting::RULE_VERSION) {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    if body.len() > MAX_REUSE_CLAUSE_BYTES {
+        return Err(
+            "the baseline-reuse clause exceeds its bounded size; keep every declared value within the clause bound"
+                .to_owned(),
+        );
+    }
+    let mut identities = false;
+    let mut trace = false;
+    let mut qualification = false;
+    let mut max_age: Option<f64> = None;
+    for segment in body.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = segment.split_once('=') else {
+            return Err("baseline-reuse fields must use key=value separated by ';'".to_owned());
+        };
+        match (key.trim(), value.trim()) {
+            ("identities", REUSE_IDENTITIES) => {
+                if identities {
+                    return Err("the baseline-reuse identity set is declared twice".to_owned());
+                }
+                identities = true;
+            }
+            ("identities", _) => {
+                return Err(format!(
+                    "baseline reuse must require the fixed identity set {REUSE_IDENTITIES}; a reuse cannot waive input, runtime, acceptance, metric or condition comparability"
+                ));
+            }
+            ("trace", "required") => {
+                if trace {
+                    return Err("the baseline-reuse trace requirement is declared twice".to_owned());
+                }
+                trace = true;
+            }
+            ("trace", _) => {
+                return Err(
+                    "a retained trace reference is mandatory for reuse; a summary, identity hash or unavailable telemetry cannot stand in for it"
+                        .to_owned(),
+                );
+            }
+            ("qualification", "model-context") => {
+                if qualification {
+                    return Err("the baseline-reuse qualification is declared twice".to_owned());
+                }
+                qualification = true;
+            }
+            ("qualification", _) => {
+                return Err(
+                    "model-dependent reuse requires the selected runtime qualification and context isolation; methods without model execution keep their model metrics inapplicable and are not required to qualify"
+                        .to_owned(),
+                );
+            }
+            ("max-age-seconds", value) => {
+                if max_age.is_some() {
+                    return Err("the baseline-reuse age bound is declared twice".to_owned());
+                }
+                let parsed = value.parse::<f64>().map_err(|_| {
+                    "the baseline-reuse age bound must be a finite positive number of seconds fixed before results"
+                        .to_owned()
+                })?;
+                if !parsed.is_finite() || parsed <= 0.0 || parsed > MAX_REUSE_AGE_SECONDS {
+                    return Err(
+                        "the baseline-reuse age bound must be positive and within 30 days; retained evidence beyond a bounded window needs a fresh control rather than an unbounded reuse"
+                            .to_owned(),
+                    );
+                }
+                max_age = Some(parsed);
+            }
+            _ => {
+                return Err(
+                    "the baseline-reuse clause has an unknown field; undeclared reuse conditions cannot be absorbed silently"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    if !(identities && trace && qualification) {
+        return Err(
+            "the baseline-reuse clause is incomplete; declare identities, trace, qualification and max-age-seconds before results"
+                .to_owned(),
+        );
+    }
+    let Some(max_age_seconds) = max_age else {
+        return Err(
+            "the baseline-reuse clause is incomplete; declare identities, trace, qualification and max-age-seconds before results"
+                .to_owned(),
+        );
+    };
+    Ok(Some(BaselineReusePlan { max_age_seconds }))
 }
 
 /// The measured dimension of the declared comparison rule.
@@ -1423,6 +1628,13 @@ impl ComparisonPolicy {
         if let Ok(Some(plan)) = parse_nuisance_control(&self.uncertainty) {
             value["nuisance_plan"] = plan.declaration();
         }
+        // The declared baseline-reuse plan is recorded with every measured
+        // attempt before results: whether a retained baseline may be reused at
+        // all, and within which bounded age, cannot be declared after a
+        // candidate outcome exists.
+        if let Ok(Some(plan)) = parse_baseline_reuse(&self.uncertainty) {
+            value["baseline_reuse"] = plan.declaration();
+        }
         value
     }
 
@@ -1542,6 +1754,11 @@ impl ComparisonPolicy {
         // an invented utilization correction, a loosened fault classification
         // or a plan-authored retry budget is refused at declaration.
         let _ = parse_nuisance_control(&self.uncertainty).map_err(invalid)?;
+        // A present baseline-reuse clause is parsed and validated by its own
+        // owner before any result exists: a waived identity, an optional
+        // trace, an unbounded age or an unrelated model qualification is
+        // refused at declaration.
+        let _ = parse_baseline_reuse(&self.uncertainty).map_err(invalid)?;
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(self).map_err(io::Error::other)?)
@@ -1801,6 +2018,43 @@ pub struct PolicyEvaluation {
     /// was bound to. `None` when the report carries no attribution evidence.
     #[serde(default)]
     pub attribution: Option<AttributionEvidence>,
+    /// The retained baselines this comparison consumed instead of executing
+    /// the old variant again: the exact retained execution identity, its age,
+    /// retained coverage and uncertainty, and its original cost. Empty when
+    /// every arm was measured in this comparison.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reused_baselines: Vec<ReusedBaselineEvidence>,
+}
+
+/// One reused retained baseline as consumed by the decision: the retained
+/// execution identity, when it was executed and selected, its age, the
+/// retained coverage and uncertainty records, its original cost and the
+/// model-metric applicability. The record preserves the original accounting;
+/// it never presents the retained execution as a fresh measurement, and a
+/// method without model execution keeps its model metrics inapplicable rather
+/// than a measured zero or a model saving.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReusedBaselineEvidence {
+    pub unit: String,
+    /// The retained execution identity the reuse references.
+    pub attempt: String,
+    pub executed_at: f64,
+    /// When the reuse selection and exclusions were fixed.
+    pub selected_at: f64,
+    pub age_seconds: f64,
+    /// The retained execution's original cost; accounted once, never fabricated.
+    pub original_seconds: Option<f64>,
+    pub trace: String,
+    /// The coverage recorded with the retained evidence.
+    pub coverage: String,
+    /// The unresolved uncertainty recorded with the retained evidence.
+    pub uncertainty: String,
+    /// `inapplicable` for a method without model execution; `measured` otherwise.
+    pub model_metrics: String,
+    /// `inapplicable` for a model-free method; `verified` for a model-dependent
+    /// reuse whose runtime qualification and context isolation were checked.
+    pub qualification: String,
 }
 
 struct UnitFacts {
@@ -1834,7 +2088,30 @@ struct UnitFacts {
     token_regression: Option<f64>,
     /// Subtractive applicability recorded by the accounting, when declared.
     subtractive: Option<SubtractiveFacts>,
+    /// The unit's baseline result is retained evidence from an earlier
+    /// execution reused for this comparison; `None` for a freshly measured
+    /// baseline.
+    reuse: Option<ReusedBaselineFacts>,
     limitations: Vec<String>,
+}
+
+/// The retained-baseline facts of one unit, taken from the evidence owner's
+/// normalized reuse record before the frozen policy is applied.
+struct ReusedBaselineFacts {
+    attempt: String,
+    executed_at: f64,
+    selected_at: f64,
+    age_seconds: f64,
+    original_seconds: Option<f64>,
+    trace: String,
+    retained_coverage: String,
+    retained_uncertainty: String,
+    model_free: bool,
+    model_metrics: String,
+    qualification: String,
+    /// The candidate arm's recorded start, used to locate the reuse selection
+    /// before the candidate outcome existed.
+    candidate_started_at: Option<f64>,
 }
 
 impl UnitFacts {
@@ -2353,6 +2630,43 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         })
         .collect();
 
+    // Every reuse refusal the evidence owner recorded is retained for the
+    // decision: a reused baseline whose identity, conditions, trace,
+    // qualification or selection could not be verified is not a comparable
+    // baseline, whatever the measured difference looks like.
+    let mut reuse_refused: BTreeSet<String> = BTreeSet::new();
+    for row in attempts {
+        for reason in row
+            .get("excluded_reasons")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if let Some(detail) = reason.strip_prefix("reuse-refused: ") {
+                reuse_refused.insert(detail.to_owned());
+            }
+        }
+    }
+    for pair in report
+        .get("comparisons")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for reason in pair
+            .get("excluded_reasons")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if let Some(detail) = reason.strip_prefix("reuse-refused: ") {
+                reuse_refused.insert(detail.to_owned());
+            }
+        }
+    }
+
     let mut facts: Vec<UnitFacts> = Vec::new();
     let mut missing_results = false;
     for unit in &included {
@@ -2378,6 +2692,32 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             positive_effect = view.positive_effect;
             time_uncertain = view.uncertain;
         }
+        // A unit whose baseline result is retained evidence carries the
+        // evidence owner's normalized reuse record: the retained execution
+        // identity, its age, the retained coverage and uncertainty, its
+        // original cost, and the model-metric applicability. The frozen
+        // reuse policy is applied to exactly these facts.
+        let reuse = unit
+            .get("reuse")
+            .and_then(Value::as_object)
+            .and_then(|reuse| {
+                let text = |key: &str| reuse.get(key).and_then(Value::as_str).map(str::to_owned);
+                Some(ReusedBaselineFacts {
+                    attempt: text("of")?,
+                    executed_at: reuse.get("executed_at").and_then(number)?,
+                    selected_at: reuse.get("selected_at").and_then(number)?,
+                    age_seconds: reuse.get("age_seconds").and_then(number)?,
+                    original_seconds: reuse.get("original_seconds").and_then(number),
+                    trace: text("trace")?,
+                    retained_coverage: text("coverage")?,
+                    retained_uncertainty: text("uncertainty")?,
+                    model_free: reuse.get("model_metrics").and_then(Value::as_str)
+                        == Some(crate::outcome_report::MODEL_METRICS_INAPPLICABLE),
+                    model_metrics: text("model_metrics")?,
+                    qualification: text("qualification")?,
+                    candidate_started_at: candidate_row.and_then(|row| number(&row["started_at"])),
+                })
+            });
         facts.push(UnitFacts {
             case_id: unit
                 .get("case_id")
@@ -2427,6 +2767,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                         .is_some_and(|saving| !saving.is_null()),
                 }
             }),
+            reuse,
             limitations: unit_limitations(unit),
             name,
         });
@@ -3188,6 +3529,16 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         &mut reasons,
         &mut coverage,
     );
+    let mut reused_baselines: Vec<ReusedBaselineEvidence> = Vec::new();
+    apply_baseline_reuse_gate(
+        policy,
+        &facts,
+        &reuse_refused.iter().cloned().collect::<Vec<_>>(),
+        &mut decision,
+        &mut reasons,
+        &mut coverage,
+        &mut reused_baselines,
+    );
 
     // The decision record names the method distinction: a model-free adoption
     // rests on the operation's own measured work, and its model metrics stay
@@ -3223,6 +3574,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         statistical_claim,
         corroboration,
         attribution,
+        reused_baselines,
     })
 }
 
@@ -3386,6 +3738,159 @@ fn apply_nuisance_gate(
             "the declared nuisance-control conditions were not met; retained attempts, errors and usage stay recorded, and further attempts follow the frozen stopping rule without selecting favorable failures or load"
                 .to_owned(),
         );
+    }
+}
+
+/// Apply the frozen baseline-reuse plan to the summarized evidence. A reused
+/// baseline is admissible only while every declared requirement still holds:
+/// the retained identity and relevant conditions matched the current
+/// comparison, the trace reference is retained, the age is within the
+/// declared bound, the reuse selection was fixed before the candidate
+/// outcome, and a model-dependent reuse carries the verified runtime
+/// qualification and context isolation. The gate only restricts a decision:
+/// it withholds an unsupported claim, never softens a measured rejection, and
+/// records the retained identity, age, coverage, uncertainty and original
+/// cost with the decision instead of presenting the retained execution as a
+/// fresh measurement.
+fn apply_baseline_reuse_gate(
+    policy: &ComparisonPolicy,
+    facts: &[UnitFacts],
+    refused: &[String],
+    decision: &mut PolicyDecision,
+    reasons: &mut Vec<String>,
+    coverage: &mut String,
+    reused: &mut Vec<ReusedBaselineEvidence>,
+) {
+    let hold = |decision: &mut PolicyDecision| {
+        if *decision != PolicyDecision::Reject {
+            *decision = PolicyDecision::Inconclusive;
+        }
+    };
+    let plan = match parse_baseline_reuse(&policy.uncertainty) {
+        Ok(None) => None,
+        Ok(Some(plan)) => Some(plan),
+        Err(error) => {
+            hold(decision);
+            reasons.push(format!(
+                "the declared baseline-reuse policy is not usable: {error}"
+            ));
+            coverage.push_str("; baseline-reuse-plan");
+            return;
+        }
+    };
+    let mut violations: Vec<String> = Vec::new();
+    for detail in refused.iter().take(4) {
+        violations.push(format!("retained baseline evidence was refused: {detail}"));
+    }
+    if refused.len() > 4 {
+        violations.push(format!(
+            "{} further retained-baseline reuse refusal(s) are recorded in the report and not listed here",
+            refused.len() - 4
+        ));
+    }
+    let mut valid = 0usize;
+    for fact in facts {
+        let Some(reuse) = &fact.reuse else {
+            continue;
+        };
+        let mut problems: Vec<String> = Vec::new();
+        let Some(plan) = plan.as_ref() else {
+            problems.push(format!(
+                "unit {}: the comparison reuses retained baseline evidence without a predeclared baseline-reuse clause; retained evidence cannot be consumed under a policy fixed after it was selected",
+                fact.name
+            ));
+            violations.append(&mut problems);
+            continue;
+        };
+        if reuse.trace.trim().is_empty() {
+            problems.push(format!(
+                "unit {}: the retained baseline records no trace reference; reuse cannot verify the original execution",
+                fact.name
+            ));
+        }
+        if !(reuse.age_seconds.is_finite() && reuse.age_seconds >= 0.0) {
+            problems.push(format!(
+                "unit {}: the retained baseline records no usable age; retained age must be exposed rather than assumed",
+                fact.name
+            ));
+        } else if reuse.age_seconds > plan.max_age_seconds {
+            problems.push(format!(
+                "unit {}: the retained baseline evidence is {:.1} s old, beyond the declared {:.1} s reuse bound; a fresh control is required instead of reusing drift-prone evidence",
+                fact.name, reuse.age_seconds, plan.max_age_seconds
+            ));
+        }
+        match reuse.candidate_started_at {
+            Some(start) if reuse.selected_at <= start => {
+                if reuse.executed_at > start {
+                    problems.push(format!(
+                        "unit {}: the recorded original execution at {:.1} does not predate the candidate attempt at {:.1}; a reused baseline must reference an earlier retained execution",
+                        fact.name, reuse.executed_at, start
+                    ));
+                }
+            }
+            Some(start) => problems.push(format!(
+                "unit {}: the retained baseline was selected at {:.1}, after the candidate arm started at {:.1}; post-result baseline selection cannot satisfy the frozen comparison policy",
+                fact.name, reuse.selected_at, start
+            )),
+            None => problems.push(format!(
+                "unit {}: the comparison records no candidate start time; the retained baseline selection cannot be located before the candidate outcome",
+                fact.name
+            )),
+        }
+        if reuse.model_free {
+            if reuse.model_metrics != crate::outcome_report::MODEL_METRICS_INAPPLICABLE
+                || reuse.qualification != crate::outcome_report::MODEL_METRICS_INAPPLICABLE
+            {
+                problems.push(format!(
+                    "unit {}: a method without model execution keeps its model metrics inapplicable; the reused baseline records model-metrics {:?} and qualification {:?}, and no model metric may become a measured zero or a model saving",
+                    fact.name, reuse.model_metrics, reuse.qualification
+                ));
+            }
+        } else if reuse.qualification != "verified" {
+            problems.push(format!(
+                "unit {}: model-dependent reuse requires the retained runtime qualification and context isolation; the reused baseline records qualification {:?}",
+                fact.name, reuse.qualification
+            ));
+        }
+        if problems.is_empty() {
+            valid += 1;
+            reused.push(ReusedBaselineEvidence {
+                unit: fact.name.clone(),
+                attempt: reuse.attempt.clone(),
+                executed_at: reuse.executed_at,
+                selected_at: reuse.selected_at,
+                age_seconds: reuse.age_seconds,
+                original_seconds: reuse.original_seconds,
+                trace: reuse.trace.clone(),
+                coverage: reuse.retained_coverage.clone(),
+                uncertainty: reuse.retained_uncertainty.clone(),
+                model_metrics: reuse.model_metrics.clone(),
+                qualification: reuse.qualification.clone(),
+            });
+        } else {
+            violations.append(&mut problems);
+        }
+    }
+    if !violations.is_empty() {
+        hold(decision);
+        for violation in violations.iter().take(4) {
+            reasons.push(violation.clone());
+        }
+        reasons.push(
+            "the declared baseline-reuse conditions were not met; the retained evidence is preserved unchanged, no fresh baseline is fabricated and no old variant is replayed, and the comparison needs the smallest sufficient fresh control or stays inconclusive"
+                .to_owned(),
+        );
+        coverage.push_str("; baseline-reuse-violation");
+        return;
+    }
+    if valid > 0 {
+        coverage.push_str(&format!("; baseline-reuse:{valid} retained attempt(s)"));
+        if let Some(plan) = plan.as_ref() {
+            coverage.push_str(&format!(" within {}s", plan.max_age_seconds));
+        }
+        reasons.push(format!(
+            "the comparison consumed {valid} retained baseline result(s) instead of executing the old variant again; the retained identity, age, coverage, uncertainty, model-metric applicability and original cost are recorded with the decision"
+        ));
     }
 }
 

@@ -3,13 +3,14 @@
 //! (`outcome_report::summarize_attempts`); no case substitutes a candidate
 //! claim, a synthetic statistic or a post-hoc threshold.
 use harness_core::improvement_policy::{
-    AnalysisMethod, Basis, ClaimScope, ComparisonPolicy, DeclaredComparison, EffectPath,
-    ExperimentMethod, ExperimentSelection, FaultRule, InitialState, LoadRule, MeasurementStatus,
-    NuisanceControlPlan, Objective, OrderRule, Overhead, PerSuccessStatus, PolicyDecision,
-    RealizedFirst, RepeatedSelection, RetryRule, SharedState, StatisticalClaim, StoppingRule,
-    TradeOff, VariationStatus, evaluate, experiment_selection_clause, nuisance_control_clause,
-    parse_experiment_selection, parse_nuisance_control, parse_statistical_claim,
-    refuse_cross_task_speed_claim, statistical_clause,
+    AnalysisMethod, BASELINE_REUSE_CLAUSE, BaselineReusePlan, Basis, ClaimScope, ComparisonPolicy,
+    DeclaredComparison, EffectPath, ExperimentMethod, ExperimentSelection, FaultRule, InitialState,
+    LoadRule, MeasurementStatus, NuisanceControlPlan, Objective, OrderRule, Overhead,
+    PerSuccessStatus, PolicyDecision, REUSE_IDENTITIES, RealizedFirst, RepeatedSelection,
+    RetryRule, SharedState, StatisticalClaim, StoppingRule, TradeOff, VariationStatus,
+    baseline_reuse_clause, evaluate, experiment_selection_clause, nuisance_control_clause,
+    parse_baseline_reuse, parse_experiment_selection, parse_nuisance_control,
+    parse_statistical_claim, refuse_cross_task_speed_claim, statistical_clause,
 };
 use harness_core::infrastructure_accounting::{Mechanism, MetricView, binding_clause};
 use harness_core::outcome_report::{
@@ -1147,6 +1148,864 @@ fn shared_costs_and_repeated_edges_count_once_and_drift_is_invalid() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Retained baseline reuse.
+// ---------------------------------------------------------------------------
+
+/// Declare the baseline-reuse clause in the policy's uncertainty text. The
+/// clause must follow the clauses owned by the other parsers.
+fn with_reuse(scope: ClaimScope, max_age_seconds: f64) -> ComparisonPolicy {
+    let mut policy = with_claim(policy(), scope);
+    policy.uncertainty = format!(
+        "{}; {}",
+        statistical_clause(&claim(scope)),
+        baseline_reuse_clause(&BaselineReusePlan { max_age_seconds })
+    );
+    policy
+}
+
+/// One retained-baseline reuse record as the evidence owner normalizes it:
+/// the retained execution identity, when it ran, its age, the retained trace,
+/// coverage and uncertainty, the predeclared selection and the conditions it
+/// was measured under.
+fn retained(row: Value, executed_at: f64, selected_at: f64, age_seconds: f64) -> Value {
+    let mut row = row;
+    row["reuse"] = json!({
+        "of": "retained-execution-1",
+        "executed_at": executed_at,
+        "age_seconds": age_seconds,
+        "trace": "private/retained/trace.jsonl",
+        "coverage": "time+method:real-operation; complete-pairs:1",
+        "uncertainty": "single-pair variation remains unmeasured",
+        "selection": {"at": selected_at, "basis": "declared before candidate results"},
+        "conditions": {"cache": "owned-cold", "load": "recorded-idle"},
+        "qualification": "verified",
+    });
+    row
+}
+
+/// The current arm's actually observed conditions, which a reused baseline
+/// must still match.
+fn conditions(row: Value, cache: &str, load: &str) -> Value {
+    let mut row = row;
+    row["conditions"] = json!({"cache": cache, "load": load});
+    row
+}
+
+#[test]
+fn a_baseline_reuse_policy_is_frozen_before_results() {
+    let plan = BaselineReusePlan {
+        max_age_seconds: 3600.0,
+    };
+    let clause = baseline_reuse_clause(&plan);
+    assert!(clause.contains(REUSE_IDENTITIES), "{clause}");
+    let declared = declare(&with_reuse(ClaimScope::Scoped, 3600.0));
+    assert_eq!(
+        parse_baseline_reuse(&declared.policy.uncertainty).unwrap(),
+        Some(plan),
+        "the frozen reuse policy round-trips through its clause"
+    );
+    let declaration = declared.policy.declaration();
+    assert_eq!(declaration["baseline_reuse"]["max_age_seconds"], 3600.0);
+    assert_eq!(declaration["baseline_reuse"]["trace"], "required");
+    assert_eq!(
+        declaration["baseline_reuse"]["identities"],
+        REUSE_IDENTITIES
+    );
+
+    // A waived identity, an optional trace, an unbounded age or an unrelated
+    // model qualification cannot be declared before results.
+    let base = format!(
+        "unknown evidence stays inconclusive; {BASELINE_REUSE_CLAUSE}; identities={REUSE_IDENTITIES}; trace=required; qualification=model-context; max-age-seconds=3600"
+    );
+    assert!(parse_baseline_reuse(&base).unwrap().is_some());
+    for broken in [
+        base.replace(REUSE_IDENTITIES, "input+runtime"),
+        base.replace("trace=required", "trace=optional"),
+        base.replace("qualification=model-context", "qualification=none"),
+        base.replace("max-age-seconds=3600", "max-age-seconds=0"),
+        base.replace("max-age-seconds=3600", "max-age-seconds=999999999999"),
+        base.replace("max-age-seconds=3600", "max-age-seconds=soon"),
+    ] {
+        assert!(parse_baseline_reuse(&broken).is_err(), "{broken}");
+    }
+    let mut invalid = policy();
+    invalid.uncertainty = base.replace(REUSE_IDENTITIES, "input+runtime");
+    assert!(
+        invalid.declare().is_err(),
+        "a waived reuse identity is refused at declaration"
+    );
+
+    // The clause must follow the nuisance-control clause so each owner parses
+    // its own fields, and the declared policy validates the whole text.
+    let ordered = format!(
+        "unknown evidence stays inconclusive; {}; {}",
+        nuisance_control_clause(&nuisance_plan()),
+        clause
+    );
+    assert!(parse_nuisance_control(&ordered).unwrap().is_some());
+    assert_eq!(parse_baseline_reuse(&ordered).unwrap(), Some(plan));
+    let mut accepted = policy();
+    accepted.uncertainty = ordered;
+    assert!(accepted.declare().is_ok());
+    let misordered = format!(
+        "unknown evidence stays inconclusive; {clause}; {}",
+        nuisance_control_clause(&nuisance_plan())
+    );
+    assert!(parse_baseline_reuse(&misordered).is_err());
+}
+
+#[test]
+fn a_valid_retained_operation_baseline_is_reused_without_a_fresh_baseline_run() {
+    let policy = with_reuse(ClaimScope::Scoped, 3600.0);
+    let declared = declare(&policy);
+    let baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    let unit = &report["units"][0];
+    assert_eq!(unit["baseline_reused"], true, "{unit}");
+    assert_eq!(
+        unit["baseline_executed_now"], false,
+        "the retained baseline is never presented as a fresh run: {unit}"
+    );
+    assert_eq!(unit["reuse"]["of"], "retained-execution-1", "{unit}");
+    assert_eq!(unit["reuse"]["age_seconds"], 1200.0, "{unit}");
+    assert_eq!(
+        unit["reuse"]["original_seconds"], 100.0,
+        "the retained execution's original cost is preserved: {unit}"
+    );
+    assert_eq!(unit["reuse"]["model_metrics"], "measured", "{unit}");
+    assert_eq!(
+        report["accounting"]["reused_baseline_attempts"], 1,
+        "{report}"
+    );
+    assert_eq!(
+        report["accounting"]["reuse_refused_attempts"], 0,
+        "{report}"
+    );
+
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(evaluation.baseline_seconds, Some(100.0));
+    assert_eq!(evaluation.candidate_seconds, Some(50.0));
+    assert_eq!(evaluation.reused_baselines.len(), 1, "{evaluation:?}");
+    let reuse = &evaluation.reused_baselines[0];
+    assert_eq!(reuse.unit, unit["unit"]);
+    assert_eq!(reuse.attempt, "retained-execution-1");
+    assert_eq!(reuse.executed_at, 0.0);
+    assert_eq!(reuse.selected_at, 500.0);
+    assert_eq!(reuse.age_seconds, 1200.0);
+    assert_eq!(reuse.original_seconds, Some(100.0));
+    assert!(reuse.trace.contains("trace.jsonl"), "{reuse:?}");
+    assert!(reuse.coverage.contains("complete-pairs:1"), "{reuse:?}");
+    assert!(reuse.uncertainty.contains("unmeasured"), "{reuse:?}");
+    assert_eq!(reuse.model_metrics, "measured");
+    assert_eq!(reuse.qualification, "verified");
+    assert!(
+        evaluation
+            .coverage
+            .contains("baseline-reuse:1 retained attempt(s)"),
+        "{}",
+        evaluation.coverage
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("retained baseline result(s)")),
+        "the decision names the consumed retained baseline: {:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn stale_retained_source_identity_refuses_baseline_reuse_with_the_exact_fact() {
+    let policy = with_reuse(ClaimScope::Scoped, 3600.0);
+    let declared = declare(&policy);
+    let mut baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    baseline["matched"]["source_state"] = json!("retained-frozen-tree");
+    let mut candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    candidate["matched"]["source_state"] = json!("current-tree");
+
+    let report = summarize(&[baseline, candidate], &policy);
+    assert!(
+        report["units"].as_array().unwrap().is_empty(),
+        "a stale retained baseline supplies no comparable unit: {report}"
+    );
+    let pair = &report["comparisons"][0];
+    assert!(
+        pair["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().is_some_and(
+                |text| text.contains("reuse-refused") && text.contains("source_state")
+            )),
+        "{pair}"
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("source_state") && reason.contains("fresh control")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The same refusal covers the other required identity groups: a changed
+    // runtime identity is named exactly instead of being averaged over.
+    let mut baseline = retained(
+        attempt(
+            "rb2",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    baseline["matched"]["runtime"] = json!("retained-runtime");
+    let mut candidate = conditions(
+        attempt(
+            "rc2",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    candidate["matched"]["runtime"] = json!("current-runtime");
+    let report = summarize(&[baseline, candidate], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("different runtime") && reason.contains("fresh control")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn changed_or_unverified_retained_conditions_refuse_baseline_reuse() {
+    let policy = with_reuse(ClaimScope::Scoped, 3600.0);
+    let declared = declare(&policy);
+    let pair = |candidate: Value| {
+        let baseline = retained(
+            attempt(
+                "rb",
+                "baseline",
+                "case-r",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            0.0,
+            500.0,
+            1200.0,
+        );
+        summarize(&[baseline, candidate], &policy)
+    };
+    let reason_of = |report: &Value| -> Vec<String> {
+        report["comparisons"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // The current arm records a different cache condition: the retained
+    // baseline was measured under another state and cannot be reused.
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "warm",
+        "recorded-idle",
+    );
+    let report = pair(candidate);
+    assert!(report["units"].as_array().unwrap().is_empty(), "{report}");
+    let reasons = reason_of(&report);
+    assert!(
+        reasons.iter().any(|reason| reason.contains("reuse-refused")
+            && reason.contains("cache")
+            && reason.contains("warm")),
+        "{reasons:?}"
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("cache") && reason.contains("fresh control")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The current comparison records no conditions at all: unchanged
+    // conditions cannot be verified, so the retained baseline is refused.
+    let candidate = attempt(
+        "rc",
+        "candidate",
+        "case-r",
+        1000.0,
+        50.0,
+        true,
+        Some(3),
+        Some(5),
+        true,
+    );
+    let report = pair(candidate);
+    let reasons = reason_of(&report);
+    assert!(
+        reasons.iter().any(|reason| reason.contains("reuse-refused")
+            && reason.contains("does not record its cache condition")),
+        "{reasons:?}"
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("cannot be verified")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // An undeclared condition cannot be absorbed silently either: a recorded
+    // condition the reuse does not verify refuses the reuse.
+    let mut baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    baseline["reuse"]["conditions"] =
+        json!({"cache": "owned-cold", "load": "recorded-idle", "gpu": "shared"});
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    assert!(
+        report["attempts"][0]["reuse_refused"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("unknown condition 'gpu'")),
+        "{report}"
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("unknown condition 'gpu'")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn a_missing_retained_trace_refuses_baseline_reuse() {
+    let policy = with_reuse(ClaimScope::Scoped, 3600.0);
+    let declared = declare(&policy);
+    let mut baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    baseline["reuse"]["trace"] = json!("");
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    assert!(
+        report["attempts"][0]["reuse_refused"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("trace is missing")),
+        "{report}"
+    );
+    assert_eq!(
+        report["accounting"]["reuse_refused_attempts"], 1,
+        "{report}"
+    );
+    assert!(report["units"].as_array().unwrap().is_empty(), "{report}");
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("trace is missing")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn baseline_selection_after_the_candidate_result_is_refused() {
+    let policy = with_reuse(ClaimScope::Scoped, 3600.0);
+    let declared = declare(&policy);
+    // The retained execution and conditions are valid and comparable; only
+    // the recorded selection happens after the candidate arm already ran.
+    let baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        1100.0,
+        1200.0,
+    );
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    assert_eq!(
+        report["units"][0]["baseline_reused"], true,
+        "the evidence owner records the retained facts; the policy decides their admissibility: {report}"
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("post-result baseline selection")
+                && reason.contains("1100.0")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn retained_evidence_beyond_the_declared_age_bound_is_refused() {
+    let policy = with_reuse(ClaimScope::Scoped, 600.0);
+    let declared = declare(&policy);
+    let baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation.reasons.iter().any(|reason| reason
+            .contains("1200.0 s old")
+            && reason.contains("600.0 s reuse bound")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn reuse_without_a_predeclared_clause_cannot_support_a_decision() {
+    let policy = policy();
+    let declared = declare(&policy);
+    let baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    assert_eq!(report["units"][0]["baseline_reused"], true);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("without a predeclared baseline-reuse clause")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn a_model_free_reused_baseline_keeps_its_model_metrics_inapplicable() {
+    let policy = with_reuse(ClaimScope::Scoped, 3600.0);
+    let declared = declare(&policy);
+    let mut baseline = retained(
+        operation_attempt("ob", "baseline", "case-m", 0.0, 100.0, true),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    // A method without model execution requires no model qualification: the
+    // evidence owner normalizes the applicability itself instead of demanding
+    // unrelated model evidence.
+    baseline["reuse"]
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification");
+    let candidate = conditions(
+        operation_attempt("oc", "candidate", "case-m", 1000.0, 70.0, true),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    assert_eq!(
+        report["accounting"]["reuse_refused_attempts"], 0,
+        "{report}"
+    );
+    let unit = &report["units"][0];
+    assert_eq!(unit["baseline_reused"], true, "{unit}");
+    assert_eq!(unit["model_metrics"], "inapplicable", "{unit}");
+    assert_eq!(unit["reuse"]["model_metrics"], "inapplicable", "{unit}");
+    assert_eq!(unit["reuse"]["qualification"], "inapplicable", "{unit}");
+
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(evaluation.reused_baselines.len(), 1);
+    let reuse = &evaluation.reused_baselines[0];
+    assert_eq!(reuse.model_metrics, "inapplicable");
+    assert_eq!(reuse.qualification, "inapplicable");
+    assert!(
+        evaluation.coverage.contains("model-metrics:inapplicable"),
+        "{}",
+        evaluation.coverage
+    );
+    assert!(
+        evaluation
+            .coverage
+            .contains("baseline-reuse:1 retained attempt(s)"),
+        "{}",
+        evaluation.coverage
+    );
+    // Inapplicable stays non-numeric: no model metric or model saving is
+    // fabricated for the retained evidence.
+    let serialized = serde_json::to_string(&evaluation).unwrap();
+    assert!(
+        !serialized.contains("model_saving") && !serialized.contains("model_tokens"),
+        "{serialized}"
+    );
+}
+
+#[test]
+fn a_model_dependent_reuse_needs_its_runtime_qualification_and_a_retained_baseline_arm() {
+    // A model-dependent reuse without the verified qualification and context
+    // isolation is refused by the evidence owner with the exact reason.
+    let policy = with_reuse(ClaimScope::Scoped, 3600.0);
+    let mut baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    baseline["reuse"]
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification");
+    let candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    assert!(
+        report["attempts"][0]["reuse_refused"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("model-dependent reuse requires")),
+        "{report}"
+    );
+
+    // Only a retained baseline may be reused: a reused candidate would
+    // replace the measured treatment.
+    let mut candidate = conditions(
+        attempt(
+            "rc",
+            "candidate",
+            "case-r",
+            1000.0,
+            50.0,
+            true,
+            Some(3),
+            Some(5),
+            true,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    candidate["reuse"] = json!({
+        "of": "retained-execution-2",
+        "executed_at": 200.0,
+        "age_seconds": 100.0,
+        "trace": "private/retained/candidate.jsonl",
+        "coverage": "time+method:agent-task",
+        "uncertainty": "unmeasured",
+        "selection": {"at": 300.0, "basis": "declared"},
+        "conditions": {"cache": "owned-cold", "load": "recorded-idle"},
+        "qualification": "verified",
+    });
+    let baseline = retained(
+        attempt(
+            "rb",
+            "baseline",
+            "case-r",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        0.0,
+        500.0,
+        1200.0,
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    assert!(
+        report["attempts"][1]["reuse_refused"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("only a retained baseline may be reused")),
+        "{report}"
+    );
+}
 // ---------------------------------------------------------------------------
 // Frozen nuisance-control plan for paired same-task runs.
 // ---------------------------------------------------------------------------

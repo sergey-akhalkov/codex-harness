@@ -37,6 +37,18 @@
 //! section is evidence about the selection only; it never fabricates a unit,
 //! replaces a missing selection with a summary or claims measured benefit for a
 //! selected task.
+//!
+//! A retained baseline result may declare a `reuse` block when it is earlier
+//! evidence reused for a new comparison instead of executing the old variant
+//! again. The record is normalized and verified (retained execution identity,
+//! age, trace, coverage, uncertainty, predeclared selection, cache/load
+//! conditions and model-metric applicability); a record that fails
+//! verification becomes an exact `reuse-refused` reason that keeps the row out
+//! of every comparable edge, so an unverifiable reuse never silently becomes a
+//! fresh run or a usable baseline. A verified reuse is marked on its unit
+//! (`baseline_reused`, `baseline_executed_now: false`) with the retained age,
+//! coverage, uncertainty and original cost, and the accounting counts it
+//! separately from fresh executions.
 use crate::improvement_experiment::{
     CorroborationSelection, CorroborationStatus, EXPERIMENT_SCHEMA, ExclusionReason,
 };
@@ -129,6 +141,24 @@ fn identity_known(value: &Value) -> bool {
 /// without model execution records no measured zero here, and this value
 /// never satisfies or violates a model-based threshold.
 pub const MODEL_METRICS_INAPPLICABLE: &str = "inapplicable";
+
+/// Bound on one recorded reuse fact.
+const MAX_REUSE_FIELD_BYTES: usize = 1024;
+
+/// The declared fields of one retained-baseline reuse record. Anything else
+/// is refused rather than normalized, so an undeclared claim cannot enter the
+/// evidence.
+const REUSE_FIELDS: &[&str] = &[
+    "of",
+    "executed_at",
+    "age_seconds",
+    "trace",
+    "coverage",
+    "uncertainty",
+    "selection",
+    "conditions",
+    "qualification",
+];
 
 /// The comparison identities that exist only for a method that executes a
 /// model. A model-free method records its model metrics as inapplicable;
@@ -376,6 +406,201 @@ fn execution_start(row: &Value) -> &Value {
         .unwrap_or(&row["started_at"])
 }
 
+/// Normalize the optional `reuse` record of a retained baseline attempt.
+///
+/// A baseline result may be retained evidence from an earlier execution that
+/// is reused instead of running the old variant again. Reuse is never
+/// inferred: the record must name the retained execution identity, when it
+/// was executed, its age, the retained trace reference, the coverage and
+/// uncertainty recorded with it, the predeclared selection, the relevant
+/// cache/load conditions and — for a method that executes a model — the
+/// verified runtime qualification and context isolation. A record that fails
+/// any requirement yields exact refusal reasons: the attempt stays retained
+/// for review, never enters a comparable edge, and the refusal is visible
+/// with the row. A method without model execution keeps its model metrics
+/// inapplicable; `qualification` is normalized to `inapplicable` for it, and
+/// an unrelated model qualification is refused rather than consumed.
+fn reuse_evidence(record: &Value) -> io::Result<(Option<Value>, Vec<String>)> {
+    let Some(value) = record.get("reuse") else {
+        return Ok((None, Vec::new()));
+    };
+    if value.is_null() {
+        return Ok((None, Vec::new()));
+    }
+    let Some(object) = value.as_object() else {
+        return Ok((
+            None,
+            vec![
+                "the recorded reuse evidence is not an object; the retained baseline cannot be verified"
+                    .to_owned(),
+            ],
+        ));
+    };
+    if record.get("arm").and_then(Value::as_str) == Some("candidate") {
+        return Ok((
+            None,
+            vec![
+                "only a retained baseline may be reused; a reused candidate would replace the measured treatment and cannot enter the comparison"
+                    .to_owned(),
+            ],
+        ));
+    }
+    let mut refusals: Vec<String> = Vec::new();
+    for key in object.keys() {
+        if !REUSE_FIELDS.contains(&key.as_str()) {
+            refusals.push(format!(
+                "the recorded reuse evidence has an unknown field '{key}'; reuse consumes only the declared retention facts"
+            ));
+        }
+    }
+    let bounded = |key: &str, bound: usize| -> Option<String> {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= bound)
+            .map(str::to_owned)
+    };
+    let of = bounded("of", MAX_REUSE_FIELD_BYTES);
+    if of.is_none() {
+        refusals.push(
+            "the reused baseline names no retained execution identity; reuse requires the exact retained attempt reference"
+                .to_owned(),
+        );
+    }
+    let executed_at = object.get("executed_at").and_then(number);
+    if executed_at.is_none() {
+        refusals.push(
+            "the reused baseline records no original execution time; reuse cannot verify that the retained execution predates this comparison"
+                .to_owned(),
+        );
+    }
+    let age_seconds = object
+        .get("age_seconds")
+        .and_then(number)
+        .filter(|v| *v >= 0.0);
+    if age_seconds.is_none() {
+        refusals.push(
+            "the reused baseline records no retention age; age must be exposed rather than silently assumed"
+                .to_owned(),
+        );
+    }
+    let trace = bounded("trace", MAX_REUSE_FIELD_BYTES);
+    if trace.is_none() {
+        refusals.push(
+            "the retained baseline trace is missing; the retained execution cannot be verified and is not reused"
+                .to_owned(),
+        );
+    }
+    let retained_coverage = bounded("coverage", MAX_REUSE_FIELD_BYTES);
+    if retained_coverage.is_none() {
+        refusals.push(
+            "the retained baseline coverage is not recorded; an unverified coverage cannot be reused"
+                .to_owned(),
+        );
+    }
+    let uncertainty = bounded("uncertainty", MAX_REUSE_FIELD_BYTES);
+    if uncertainty.is_none() {
+        refusals.push(
+            "the retained baseline uncertainty is not recorded; unresolved uncertainty must stay visible with the reused evidence"
+                .to_owned(),
+        );
+    }
+    let selection = object.get("selection").and_then(Value::as_object);
+    if let Some(selection) = selection {
+        for key in selection.keys() {
+            if !matches!(key.as_str(), "at" | "basis") {
+                refusals.push(format!(
+                    "the reused baseline selection has an unknown field '{key}'; only the recorded selection time and basis are consumed"
+                ));
+            }
+        }
+    }
+    let selected_at = selection.and_then(|s| s.get("at")).and_then(number);
+    let selection_basis = selection
+        .and_then(|s| s.get("basis"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_REUSE_FIELD_BYTES)
+        .map(str::to_owned);
+    if selected_at.is_none() || selection_basis.is_none() {
+        refusals.push(
+            "the reused baseline records no predeclared selection; a baseline selected after the candidate result cannot satisfy the frozen comparison policy"
+                .to_owned(),
+        );
+    }
+    let conditions = object.get("conditions").and_then(Value::as_object);
+    if let Some(conditions) = conditions {
+        for key in conditions.keys() {
+            if !matches!(key.as_str(), "cache" | "load") {
+                refusals.push(format!(
+                    "the reused baseline records an unknown condition '{key}'; reuse consumes only the declared cache/load conditions"
+                ));
+            }
+        }
+    }
+    let condition = |key: &str| -> Option<String> {
+        conditions
+            .and_then(|c| c.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .map(str::to_owned)
+    };
+    let cache = condition("cache");
+    let load = condition("load");
+    if cache.is_none() || load.is_none() {
+        refusals.push(
+            "the retained baseline's relevant cache/load conditions are not recorded; unchanged conditions cannot be verified"
+                .to_owned(),
+        );
+    }
+    let model_free = model_free_attempt(record);
+    let raw_qualification = object.get("qualification");
+    let qualification = match raw_qualification {
+        None | Some(Value::Null) => None,
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .map(str::to_owned),
+    };
+    let qualification = match (model_free, raw_qualification, qualification) {
+        (true, None | Some(Value::Null), _) => Some(MODEL_METRICS_INAPPLICABLE.to_owned()),
+        (_, _, value) => value,
+    };
+    match (model_free, qualification.as_deref()) {
+        (true, Some(MODEL_METRICS_INAPPLICABLE)) | (false, Some("verified")) => {}
+        (true, _) => refusals.push(
+            "a method without model execution keeps its model metrics inapplicable; an unrelated model qualification is not consumed and can never establish a model saving"
+                .to_owned(),
+        ),
+        (false, _) => refusals.push(
+            "model-dependent reuse requires the retained runtime qualification and context isolation; the reused baseline records none"
+                .to_owned(),
+        ),
+    }
+    if !refusals.is_empty() {
+        return Ok((None, refusals));
+    }
+    Ok((
+        Some(json!({
+            "of": of,
+            "executed_at": executed_at,
+            "age_seconds": age_seconds,
+            "trace": trace,
+            "coverage": retained_coverage,
+            "uncertainty": uncertainty,
+            "selected_at": selected_at,
+            "selection_basis": selection_basis,
+            "conditions": {"cache": cache, "load": load},
+            "qualification": qualification,
+            "model_metrics": if model_free { MODEL_METRICS_INAPPLICABLE } else { "measured" },
+        })),
+        Vec::new(),
+    ))
+}
+
 /// Retains all input fields, failed checks and native runs. Only executed final
 /// round acceptance plus completed native work can establish correctness; a
 /// recorded cancellation that acceptance never resolved keeps its status.
@@ -528,6 +753,22 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     row["tool_calls"] = counter_total(native, "tool_calls");
     row["tool_operations"] = counter_total(native, "tool_operations");
     row["unit"] = json!(unit_of(record));
+    // A retained baseline may declare that its result is earlier evidence
+    // reused for this comparison instead of a fresh execution of the old
+    // variant. The normalized reuse record is carried with the row; a record
+    // that fails verification becomes a retained refusal that keeps the row
+    // out of every comparable edge, so a fabricated or unverifiable reuse is
+    // never silently treated as either a fresh run or a usable baseline.
+    let (reuse, reuse_refusals) = reuse_evidence(record)?;
+    if let Some(evidence) = reuse {
+        row["reuse_evidence"] = evidence;
+    }
+    if !reuse_refusals.is_empty() {
+        for refusal in &reuse_refusals {
+            reasons.insert(format!("reuse-refused: {refusal}"));
+        }
+        row["reuse_refused"] = json!(reuse_refusals);
+    }
     row["excluded_reasons"] = json!(reasons);
     let treatment = treatment_facts(record)?;
     row["treatment_kind"] = treatment["kind"].clone();
@@ -910,6 +1151,18 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
         .chain(a.keys().map(String::as_str))
         .chain(b.keys().map(String::as_str))
         .collect();
+    // A reused baseline binds retained evidence to the current comparison:
+    // its retained identity and relevant conditions must still match exactly.
+    // A mismatch or an unverified identity refuses the reuse with the exact
+    // changed or missing fact instead of letting stale evidence look like the
+    // same measurement.
+    let reused = if left.get("reuse_evidence").is_some() {
+        Some((left, right))
+    } else if right.get("reuse_evidence").is_some() {
+        Some((right, left))
+    } else {
+        None
+    };
     for key in keys {
         if left_model_free && right_model_free && MODEL_EXECUTION_MATCH_FIELDS.contains(&key) {
             // The model-execution identity is inapplicable to this method: it
@@ -921,6 +1174,11 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
                 && x != y
             {
                 reasons.insert(format!("mismatch:{key}"));
+                if reused.is_some() {
+                    reasons.insert(format!(
+                        "reuse-refused: the retained baseline was measured under a different {key}; stale retained evidence cannot be reused and a fresh control is required"
+                    ));
+                }
             }
             continue;
         }
@@ -928,10 +1186,59 @@ pub fn comparison_reasons(left: &Value, right: &Value) -> io::Result<Vec<String>
             (Some(x), Some(y)) if identity_known(x) && identity_known(y) => {
                 if x != y {
                     reasons.insert(format!("mismatch:{key}"));
+                    if reused.is_some() {
+                        reasons.insert(format!(
+                            "reuse-refused: the retained baseline was measured under a different {key}; stale retained evidence cannot be reused and a fresh control is required"
+                        ));
+                    }
                 }
             }
             _ => {
                 reasons.insert(format!("unknown:{key}"));
+                if reused.is_some() {
+                    reasons.insert(format!(
+                        "reuse-refused: the comparison does not verify {key} between the retained baseline and the current arm; unverified comparability cannot be reused"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some((retained, current)) = reused {
+        if current["arm"] != json!("candidate") {
+            reasons.insert(
+                "reuse-refused: a retained baseline may only be reused against the candidate arm; a retained candidate would replace the measured treatment"
+                    .to_owned(),
+            );
+        }
+        if retained["attempt_id"] == current["attempt_id"] {
+            reasons.insert(
+                "reuse-refused: the reuse names the candidate's own attempt as its retained baseline; a reused baseline must reference an earlier retained execution"
+                    .to_owned(),
+            );
+        }
+        let recorded = retained.get("reuse_evidence");
+        let conditions = current.get("conditions").and_then(Value::as_object);
+        for key in ["cache", "load"] {
+            let expected = recorded
+                .and_then(|value| value.get("conditions"))
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_str);
+            let actual = conditions
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_str);
+            match (expected, actual) {
+                (Some(expected), Some(actual)) if expected == actual => {}
+                (Some(expected), Some(actual)) => {
+                    reasons.insert(format!(
+                        "reuse-refused: the retained baseline was measured under a different {key} condition ({expected:?} vs {actual:?}); changed conditions require a fresh control"
+                    ));
+                }
+                (Some(_), None) => {
+                    reasons.insert(format!(
+                        "reuse-refused: the current comparison does not record its {key} condition; the retained baseline's conditions cannot be verified"
+                    ));
+                }
+                (None, _) => {}
             }
         }
     }
@@ -1682,6 +1989,22 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 })),
             })
         });
+        // A retained baseline is not a fresh execution: the unit records the
+        // retained identity, age, coverage, uncertainty, conditions and
+        // original cost beside the effect, so the reuse stays visible instead
+        // of being presented as a new run of the old variant.
+        let reuse = baseline_result.and_then(|row| row.get("reuse_evidence"));
+        if let Some(evidence) = reuse {
+            let at = number(&evidence["executed_at"])
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "an unrecorded time".to_owned());
+            let age = number(&evidence["age_seconds"])
+                .map(|value| format!("{value:.1} s"))
+                .unwrap_or_else(|| "an unrecorded age".to_owned());
+            limitations.push(format!(
+                "the baseline result is retained evidence executed at {at} and reused for this comparison ({age} old); its original cost is accounted once and no fresh baseline execution is claimed"
+            ));
+        }
         let mut unit_value = json!({
             "unit": unit,
             "experiment_id": participants.first().and_then(|row| text(row, "experiment_id")).unwrap_or(""),
@@ -1718,6 +2041,24 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
             unit_value["method"] = json!(model_free_method);
             unit_value["model_metrics"] = json!(MODEL_METRICS_INAPPLICABLE);
             unit_value["operation_work"] = json!(operation_work);
+        }
+        if let Some(evidence) = reuse {
+            unit_value["baseline_reused"] = json!(true);
+            unit_value["baseline_executed_now"] = json!(false);
+            unit_value["reuse"] = json!({
+                "of": evidence["of"],
+                "executed_at": evidence["executed_at"],
+                "selected_at": evidence["selected_at"],
+                "selection_basis": evidence["selection_basis"],
+                "age_seconds": evidence["age_seconds"],
+                "trace": evidence["trace"],
+                "coverage": evidence["coverage"],
+                "uncertainty": evidence["uncertainty"],
+                "conditions": evidence["conditions"],
+                "original_seconds": baseline_result.and_then(|row| number(&row["total_result_seconds"])),
+                "model_metrics": evidence["model_metrics"],
+                "qualification": evidence["qualification"],
+            });
         }
         units.push(unit_value);
     }
@@ -1905,11 +2246,25 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
             })
         })
         .collect();
+    // Retained reuse stays visible in the accounting: a reused baseline
+    // attests to an earlier execution whose original cost is counted once,
+    // while a refused reuse is retained for review and never supplies
+    // comparable evidence.
+    let reused_baseline_attempts = rows
+        .iter()
+        .filter(|row| row.get("reuse_evidence").is_some())
+        .count();
+    let reuse_refused_attempts = rows
+        .iter()
+        .filter(|row| row.get("reuse_refused").is_some())
+        .count();
     let accounting = json!({
         "attempts": attempts_count,
         "tasks": tasks.len(),
         "accepted_tasks": accepted_tasks,
         "acceptance_rate": acceptance_rate,
+        "reused_baseline_attempts": reused_baseline_attempts,
+        "reuse_refused_attempts": reuse_refused_attempts,
         "attributed_seconds": attributed_seconds,
         "cost_per_accepted_task": cost_per_accepted_task,
         "coverage": {
@@ -1920,7 +2275,7 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
             "usage_unknown_attempts": attempts_count - measured_usage,
         },
         "case_mix": case_mix,
-        "basis": "Each attempt contributes its own enclosing time once; retries, workers, interventions and failed attempts are included; overlapping spans are not summed. Usage stays per run and is never a billing or subscription measurement.",
+        "basis": "Each attempt contributes its own enclosing time once; retries, workers, interventions and failed attempts are included; overlapping spans are not summed. A reused baseline contributes the original retained execution's cost exactly once and is never presented as a fresh run. Usage stays per run and is never a billing or subscription measurement.",
     });
     Ok(json!({
         "schema_version": 2,

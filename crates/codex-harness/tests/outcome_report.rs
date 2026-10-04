@@ -1036,3 +1036,164 @@ fn model_free_units_are_comparable_and_name_the_method_distinction() {
     );
     assert_eq!(report["units"].as_array().unwrap().len(), 0, "{report}");
 }
+
+// ---------------------------------------------------------------------------
+// Retained baseline reuse.
+// ---------------------------------------------------------------------------
+
+/// One retained-baseline reuse record: the retained execution identity, when
+/// it ran, its age, the retained trace, coverage and uncertainty, the
+/// predeclared selection and the conditions it was measured under.
+fn retained_reuse() -> Value {
+    json!({
+        "of": "retained-execution-1",
+        "executed_at": 0.0,
+        "age_seconds": 1200.0,
+        "trace": "private/retained/trace.jsonl",
+        "coverage": "time+method:real-operation; complete-pairs:1",
+        "uncertainty": "single-pair variation remains unmeasured",
+        "selection": {"at": 150.0, "basis": "declared before candidate results"},
+        "conditions": {"cache": "owned-cold", "load": "recorded-idle"},
+    })
+}
+
+#[test]
+fn a_reused_operation_baseline_keeps_its_original_cost_and_inapplicable_metrics() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("reused-baseline.json");
+    // The baseline result is the retained execution (executed at 0); only the
+    // candidate operation runs now. The reuse was selected before the
+    // candidate started, so the original cost is accounted once and no fresh
+    // baseline execution is claimed.
+    let mut baseline = operation_attempt("b", "baseline", "real-operation", 0.0, 100.0, true);
+    baseline["reuse"] = retained_reuse();
+    let mut candidate = operation_attempt("c", "candidate", "real-operation", 200.0, 270.0, true);
+    candidate["conditions"] = json!({"cache": "owned-cold", "load": "recorded-idle"});
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline, candidate])).unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["comparisons"][0]["comparable"], true, "{report}");
+    let unit = &report["units"][0];
+    assert_eq!(unit["baseline_reused"], true, "{unit}");
+    assert_eq!(
+        unit["baseline_executed_now"], false,
+        "retained evidence is never presented as a fresh execution: {unit}"
+    );
+    assert_eq!(unit["reuse"]["of"], "retained-execution-1", "{unit}");
+    assert_eq!(unit["reuse"]["age_seconds"], 1200.0, "{unit}");
+    assert_eq!(
+        unit["reuse"]["original_seconds"], 100.0,
+        "the retained execution's original cost is preserved: {unit}"
+    );
+    assert_eq!(unit["reuse"]["model_metrics"], "inapplicable", "{unit}");
+    assert_eq!(unit["reuse"]["qualification"], "inapplicable", "{unit}");
+    assert_eq!(
+        unit["model_metrics"], "inapplicable",
+        "a method without model execution keeps its model metrics inapplicable: {unit}"
+    );
+    assert_eq!(unit["operation_work"], true, "{unit}");
+    assert_eq!(
+        report["accounting"]["reused_baseline_attempts"], 1,
+        "{report}"
+    );
+    assert_eq!(
+        report["accounting"]["reuse_refused_attempts"], 0,
+        "{report}"
+    );
+    assert_eq!(
+        report["attempts"][0]["reuse_evidence"]["trace"], "private/retained/trace.jsonl",
+        "{report}"
+    );
+    assert!(
+        report["attempts"][0].get("reuse_refused").is_none(),
+        "{report}"
+    );
+    // The rendered report keeps the retained baseline's status visible: its
+    // original cost is accounted once, and no model metric becomes zero.
+    let markdown = run(&input, true);
+    assert!(markdown.status.success());
+    let text = String::from_utf8(markdown.stdout).unwrap();
+    assert!(text.contains("retained evidence"), "{text}");
+}
+
+#[test]
+fn a_reuse_without_a_retained_trace_is_refused_with_its_exact_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("missing-trace.json");
+    let mut baseline = operation_attempt("b", "baseline", "real-operation", 0.0, 100.0, true);
+    let mut reuse = retained_reuse();
+    reuse["trace"] = json!("");
+    baseline["reuse"] = reuse;
+    let mut candidate = operation_attempt("c", "candidate", "real-operation", 200.0, 270.0, true);
+    candidate["conditions"] = json!({"cache": "owned-cold", "load": "recorded-idle"});
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline, candidate])).unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["comparisons"][0]["comparable"], false,
+        "an unverifiable reuse supplies no comparable edge: {report}"
+    );
+    let refused = report["attempts"][0]["reuse_refused"][0]
+        .as_str()
+        .unwrap_or_default();
+    assert!(refused.contains("trace is missing"), "{refused}");
+    assert_eq!(
+        report["accounting"]["reuse_refused_attempts"], 1,
+        "{report}"
+    );
+    assert!(report["units"].as_array().unwrap().is_empty(), "{report}");
+    let markdown = run(&input, true);
+    assert!(markdown.status.success());
+    let text = String::from_utf8(markdown.stdout).unwrap();
+    assert!(text.contains("trace is missing"), "{text}");
+}
+
+#[test]
+fn the_retained_trace_identity_refuses_missing_or_changed_bytes() {
+    use harness_core::rollout_reader::RetainedTrace;
+
+    let root = tempfile::tempdir().unwrap();
+    let trace_path = root.path().join("retained-trace.jsonl");
+    fs::write(&trace_path, "{\"type\":\"session_meta\"}\n").unwrap();
+    let trace = RetainedTrace::capture(&trace_path).unwrap();
+    trace
+        .verify()
+        .expect("the unchanged retained trace verifies");
+
+    // A trace that changed after capture is a different generation: the
+    // retained execution cannot be reused from it.
+    fs::write(
+        &trace_path,
+        "{\"type\":\"session_meta\"}\n{\"type\":\"turn_context\"}\n",
+    )
+    .unwrap();
+    let reason = trace.verify().unwrap_err();
+    assert!(reason.contains("changed since it was captured"), "{reason}");
+
+    // A missing trace cannot verify the retained execution at all.
+    fs::remove_file(&trace_path).unwrap();
+    let reason = trace.verify().unwrap_err();
+    assert!(reason.contains("is missing"), "{reason}");
+    let reason = RetainedTrace::capture(&trace_path).unwrap_err().to_string();
+    assert!(reason.contains("missing or unreadable"), "{reason}");
+}
