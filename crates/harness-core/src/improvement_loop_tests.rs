@@ -551,6 +551,226 @@ fn removal_gate_blocks_missing_refused_withdrawn_and_changed_scope() {
     ));
 }
 
+/// One recorded proposal/decision pair for an arbitrary capability target, in
+/// the exact board comment shapes the owners write.
+fn capability_proposal_text(target: &str, detail: &str) -> String {
+    format!(
+        "removal-proposal v1 item=bdct-h1 proposal=remove-skill target={target} evidence=evidence-1 loss=retired-capability preview=preview-1 detail={detail}"
+    )
+}
+
+fn capability_decision_text(decision: &str, actions: &str, target: &str, reviewed: &str) -> String {
+    format!(
+        "removal-decision v1 item=bdct-h1 decision={decision} proposal=remove-skill target={target} actions={actions} loss=retired-capability evidence=evidence-1 preview=preview-1 reviewed={reviewed} basis=user-turn-7"
+    )
+}
+
+/// The digest a decision owner records for one complete proposal comment.
+fn recorded_comment_digest(proposal: &str) -> String {
+    let record = crate::board_hypothesis::parse_removal_proposals(&[proposal.to_owned()])
+        .into_iter()
+        .next()
+        .expect("a complete recorded proposal");
+    crate::board_hypothesis::reviewed_proposal_digest(&record)
+}
+
+#[test]
+fn removal_targets_accept_the_board_grammar_and_refuse_path_shapes() {
+    let root = fixture_root("target-grammar");
+    let mut spec = spec_fixture(root.path(), "target-grammar");
+    let removal = |target: &str| RemovalScope {
+        proposal: "remove-skill".to_owned(),
+        target: target.to_owned(),
+    };
+    // The board owner records capability targets with the same single-token
+    // grammar, including the `owner:name` separator.
+    spec.removal = Some(removal("skill:context-heavy"));
+    spec.validate().expect("a board-recorded target declares");
+    spec.removal = Some(removal("kit@2.0+trial#1;stable,quiet"));
+    spec.validate()
+        .expect("the board token set stays declarable");
+    let sized = "x".repeat(96);
+    spec.removal = Some(removal(&sized));
+    spec.validate()
+        .expect("a target sized for the board stays declarable");
+
+    let oversized = "x".repeat(201);
+    for target in [
+        ".",
+        "..",
+        "../escaped",
+        "skill/context",
+        r"nested\target",
+        r"..\escaped",
+        "/etc/passwd",
+        r"C:\absolute",
+        "skill:two words",
+        oversized.as_str(),
+    ] {
+        spec.removal = Some(removal(target));
+        assert!(spec.validate().is_err(), "{target} must stay undeclarable");
+    }
+}
+
+#[test]
+fn workload_removal_targets_accept_the_board_grammar_and_refuse_path_shapes() {
+    let root = fixture_root("workload-target");
+    let mut spec = comparison_spec(root.path(), "workload-target");
+    let removal = |target: &str| RemovalScope {
+        proposal: "remove-skill".to_owned(),
+        target: target.to_owned(),
+    };
+    spec.comparison.as_mut().unwrap().workload_removal = Some(removal("skill:context-heavy"));
+    spec.validate()
+        .expect("a board-recorded workload target declares");
+    for target in ["..", "nested/target", r"nested\target", r"C:\absolute"] {
+        spec.comparison.as_mut().unwrap().workload_removal = Some(removal(target));
+        assert!(spec.validate().is_err(), "{target} must stay undeclarable");
+    }
+}
+
+#[test]
+fn board_grammar_removal_target_is_declared_and_gated_end_to_end() {
+    let root = fixture_root("capability-gate");
+    let mut spec = spec_fixture(root.path(), "capability-gate");
+    spec.removal = Some(RemovalScope {
+        proposal: "remove-skill".to_owned(),
+        target: "skill:context-heavy".to_owned(),
+    });
+    // The declaration loads through the run's own entry point, so the accepted
+    // grammar is exactly what a real run accepts.
+    let spec_path = root.path().join("run.json");
+    fs::write(&spec_path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let spec = RunSpec::load(&spec_path).expect("the declared run loads");
+
+    let proposal = capability_proposal_text("skill:context-heavy", "consumer list: none known");
+    let expected_reviewed = recorded_comment_digest(&proposal);
+    let comments = vec![
+        proposal,
+        capability_decision_text(
+            "approve",
+            "experiment",
+            "skill:context-heavy",
+            &expected_reviewed,
+        ),
+    ];
+    let frozen = frozen_removal_digest(&spec, &comments).expect("the reviewed version freezes");
+    let mut cursor = Cursor::new(
+        &spec.run,
+        spec.digest().unwrap(),
+        spec.project.join("openspec/changes/add-synthetic"),
+        &spec.hypothesis_item,
+    );
+    cursor.removal_frozen = Some(frozen);
+    let gate = declared_removal_gate(&spec, &cursor, &comments, RemovalAction::Experiment)
+        .expect("the declared removal has a gate");
+    match &gate {
+        RemovalGate::Authorized { reviewed } => assert_eq!(reviewed, &expected_reviewed),
+        other => panic!("expected an authorized removal, got {other:?}"),
+    }
+    selection_gate(&cursor, "candidate", Some(&gate))
+        .expect("the reviewed board target clears selection");
+}
+
+#[test]
+fn a_fresh_decision_after_a_changed_proposal_clears_the_stale_frozen_digest() {
+    let root = fixture_root("fresh-decision");
+    let mut spec = spec_fixture(root.path(), "fresh-decision");
+    spec.removal = Some(RemovalScope {
+        proposal: "remove-skill".to_owned(),
+        target: "skill:context-heavy".to_owned(),
+    });
+    spec.validate().expect("the declared removal validates");
+    let stable = capability_proposal_text("skill:context-heavy", "consumer list: none known");
+    let stable_reviewed = recorded_comment_digest(&stable);
+    let approved = vec![
+        stable,
+        capability_decision_text(
+            "approve",
+            "experiment",
+            "skill:context-heavy",
+            &stable_reviewed,
+        ),
+    ];
+    // The run freezes the version and decision that existed when it started.
+    let frozen = frozen_removal_digest(&spec, &approved).expect("the frozen reviewed version");
+    let mut cursor = Cursor::new(
+        &spec.run,
+        spec.digest().unwrap(),
+        spec.project.join("openspec/changes/add-synthetic"),
+        &spec.hypothesis_item,
+    );
+    cursor.removal_frozen = Some(frozen);
+
+    // The reviewed proposal changes after the freeze (a newly discovered
+    // consumer): the older approval no longer covers it and selection refuses.
+    let changed = capability_proposal_text(
+        "skill:context-heavy",
+        "consumer list: one indirect caller found",
+    );
+    let changed_reviewed = recorded_comment_digest(&changed);
+    let mut changed_comments = approved.clone();
+    changed_comments.push(changed);
+    let stale = declared_removal_gate(&spec, &cursor, &changed_comments, RemovalAction::Experiment)
+        .expect("the declared removal has a gate");
+    match &stale {
+        RemovalGate::Pending { reason } => {
+            assert!(
+                reason.contains("changed after the frozen approval"),
+                "{reason}"
+            );
+            assert!(reason.contains("fresh decision"), "{reason}");
+        }
+        other => panic!("expected pending on the changed proposal, got {other:?}"),
+    }
+    assert!(selection_gate(&cursor, "candidate", Some(&stale)).is_err());
+
+    // A fresh decision bound to the changed version - the exact scope
+    // `removal-check` resolves - clears the stale frozen digest.
+    let mut fresh = changed_comments.clone();
+    fresh.push(capability_decision_text(
+        "approve",
+        "experiment",
+        "skill:context-heavy",
+        &changed_reviewed,
+    ));
+    let gate = declared_removal_gate(&spec, &cursor, &fresh, RemovalAction::Experiment)
+        .expect("the declared removal has a gate");
+    match &gate {
+        RemovalGate::Authorized { reviewed } => assert_eq!(reviewed, &changed_reviewed),
+        other => panic!("expected the fresh approval to authorize, got {other:?}"),
+    }
+    selection_gate(&cursor, "candidate", Some(&gate)).expect("the fresh decision clears select");
+
+    // A withdrawal recorded for the changed version stops selection as a final
+    // decision instead of prompting again for the stale version.
+    let mut withdrawn = changed_comments.clone();
+    withdrawn.push(capability_decision_text(
+        "withdraw",
+        "none",
+        "skill:context-heavy",
+        &changed_reviewed,
+    ));
+    let gate = declared_removal_gate(&spec, &cursor, &withdrawn, RemovalAction::Experiment)
+        .expect("the declared removal has a gate");
+    assert!(matches!(gate, RemovalGate::Withdrawn { .. }), "{gate:?}");
+    let refusal = selection_gate(&cursor, "candidate", Some(&gate)).unwrap_err();
+    assert!(refusal.contains("withdrawn"), "{refusal}");
+
+    let mut refused = changed_comments.clone();
+    refused.push(capability_decision_text(
+        "refuse",
+        "none",
+        "skill:context-heavy",
+        &changed_reviewed,
+    ));
+    let gate = declared_removal_gate(&spec, &cursor, &refused, RemovalAction::Experiment)
+        .expect("the declared removal has a gate");
+    assert!(matches!(gate, RemovalGate::Refused { .. }), "{gate:?}");
+    let refusal = selection_gate(&cursor, "candidate", Some(&gate)).unwrap_err();
+    assert!(refusal.contains("declined"), "{refusal}");
+}
+
 fn authorized_permits(gate: &RemovalGate) -> bool {
     matches!(gate, RemovalGate::Authorized { .. })
 }

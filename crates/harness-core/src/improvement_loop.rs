@@ -151,6 +151,29 @@ fn token(name: &str, value: &str, max: usize) -> io::Result<String> {
     Ok(trimmed.to_owned())
 }
 
+/// The board-recorded removal-target grammar, minus path shapes. A target
+/// names a capability (`skill:context-heavy`) or a bounded label and uses the
+/// same single-token character set the board owner records, while path
+/// separators and traversal forms stay undeclarable: a target is never a
+/// filesystem location.
+fn removal_target(name: &str, value: &str, max: usize) -> io::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > max
+        || matches!(trimmed, "." | "..")
+        || !trimmed.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'.' | b'_' | b'-' | b':' | b'@' | b'+' | b',' | b';' | b'~' | b'#'
+                )
+        })
+    {
+        return Err(invalid(format!("invalid {name}")));
+    }
+    Ok(trimmed.to_owned())
+}
+
 fn line(name: &str, value: &str, max: usize) -> io::Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > max || trimmed.contains(['\n', '\r']) {
@@ -510,7 +533,7 @@ impl ComparisonInputs {
         token("workload card", &self.workload_card, MAX_TOKEN)?;
         if let Some(removal) = &self.workload_removal {
             token("workload removal proposal", &removal.proposal, MAX_TOKEN)?;
-            token("workload removal target", &removal.target, MAX_TOKEN)?;
+            removal_target("workload removal target", &removal.target, MAX_TOKEN)?;
         }
         self.task.validate()?;
         self.runtimes.validate()?;
@@ -705,7 +728,7 @@ impl RunSpec {
         }
         if let Some(removal) = &self.removal {
             token("removal proposal", &removal.proposal, MAX_TOKEN)?;
-            token("removal target", &removal.target, MAX_TOKEN)?;
+            removal_target("removal target", &removal.target, MAX_TOKEN)?;
         }
         Ok(())
     }
@@ -2567,10 +2590,13 @@ pub enum RemovalGate {
 
 /// The removal gate used by every removal effect boundary. It resolves the
 /// current authority for one exact item/proposal/target/action against the live
-/// board comments, and binds it to the digest frozen at run start. Any changed
+/// board comments, and binds it to the digest frozen at run start: the latest
+/// decision must cover the currently recorded proposal version, so any changed
 /// reviewed field - including the bounded prose detail - requires a fresh
-/// decision before the effect; a missing, refused or withdrawn decision blocks
-/// it, and no benefit verdict is consulted as consent.
+/// decision before the effect. A fresh decision recorded after the change
+/// clears the stale frozen digest exactly as `removal-check` resolves it; a
+/// missing, refused or withdrawn decision keeps the effect blocked, and no
+/// benefit verdict is consulted as consent.
 pub fn removal_gate_at(
     item: &str,
     request: &crate::board_hypothesis::AuthorityRequest,
@@ -2587,6 +2613,33 @@ pub fn removal_gate_at(
                 && proposal.proposal == request.proposal
                 && proposal.target == request.target
         });
+    // The current decision is resolved before the frozen version: a decision
+    // that binds the recorded proposal content - an approval, refusal or
+    // withdrawal - is the latest word for this exact scope, so it clears a
+    // digest frozen at run start that a later proposal version made stale,
+    // exactly as `removal-check` reports it. Consent never widens: only a
+    // decision bound to the current content and covering the action qualifies.
+    let authority = crate::board_hypothesis::removal_authority(comments, item, request);
+    match &authority {
+        RemovalAuthority::Authorized { record } => {
+            return RemovalGate::Authorized {
+                reviewed: record.reviewed.clone().unwrap_or_default(),
+            };
+        }
+        RemovalAuthority::Refused { record } => {
+            return RemovalGate::Refused {
+                reviewed: record.reviewed.clone(),
+            };
+        }
+        RemovalAuthority::Withdrawn { record } => {
+            return RemovalGate::Withdrawn {
+                reviewed: record.reviewed.clone(),
+            };
+        }
+        RemovalAuthority::Missing | RemovalAuthority::NotCovered { .. } => {}
+    }
+    // No current decision covers the recorded version. A frozen version made
+    // stale by a later proposal keeps the gate closed until a fresh decision.
     if let Some(frozen) = frozen_reviewed {
         match &current {
             Some(proposal) if reviewed_proposal_digest(proposal) == frozen => {}
@@ -2615,25 +2668,16 @@ pub fn removal_gate_at(
             ),
         };
     }
-    match crate::board_hypothesis::removal_authority(comments, item, request) {
-        RemovalAuthority::Authorized { record } => RemovalGate::Authorized {
-            reviewed: record.reviewed.unwrap_or_default(),
-        },
-        RemovalAuthority::Refused { record } => RemovalGate::Refused {
-            reviewed: record.reviewed,
-        },
-        RemovalAuthority::Withdrawn { record } => RemovalGate::Withdrawn {
-            reviewed: record.reviewed,
-        },
-        RemovalAuthority::Missing => RemovalGate::Pending {
-            reason: format!(
-                "no removal decision for proposal={} target={} action={} is recorded; the missing approval blocks this effect",
-                request.proposal,
-                request.target,
-                request.action.as_str()
-            ),
-        },
-        RemovalAuthority::NotCovered { reason, .. } => RemovalGate::Pending { reason },
+    if let RemovalAuthority::NotCovered { reason, .. } = authority {
+        return RemovalGate::Pending { reason };
+    }
+    RemovalGate::Pending {
+        reason: format!(
+            "no removal decision for proposal={} target={} action={} is recorded; the missing approval blocks this effect",
+            request.proposal,
+            request.target,
+            request.action.as_str()
+        ),
     }
 }
 
