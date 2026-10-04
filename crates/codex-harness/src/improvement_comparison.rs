@@ -35,7 +35,9 @@ use harness_core::improvement_loop::{
     COMPARISON_STATE_SCHEMA, ComparisonArm, ComparisonInputs, ComparisonState, EffectKind,
     VARIANTS_SCHEMA, Variant, VariantSet, candidate_change_dir, changed_paths_within_scope,
 };
-use harness_core::improvement_policy::DeclaredComparison;
+use harness_core::improvement_policy::{
+    DeclaredComparison, EffectPath, ExperimentMethod, parse_experiment_selection,
+};
 use harness_core::improvement_runtime::{self, ArmRequest, ArmRuntime};
 use harness_core::improvement_spec::{OpenSpec, PlanningReceipt};
 use harness_core::outcome_qualification::{
@@ -375,8 +377,22 @@ pub(super) fn advance(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> 
     ) {
         return Ok(());
     }
-    if !ensure_prepared(run, notes)? {
+    // The predeclared selection decides the measured unit. A
+    // `real-operation`/`local-operation` selection is executed directly as
+    // the declared real operation; every other selection keeps the two
+    // measured conversations. A declared direct operation that cannot be
+    // resolved refuses instead of falling back to a model conversation. The
+    // selection is resolved before preparation so a direct unit does not
+    // require the unrelated model qualification the conversation route needs.
+    let direct = match direct_operation(run) {
+        Ok(operation) => operation,
+        Err(reason) => return block(run, notes, reason),
+    };
+    if !ensure_prepared(run, notes, direct.is_some())? {
         return Ok(());
+    }
+    if let Some(operation) = direct {
+        return advance_direct_operation(run, &operation, notes);
     }
     if let Some(reason) = reuse_refusal(run) {
         return block(run, notes, reason);
@@ -430,7 +446,7 @@ fn reuse_refusal(run: &Run) -> Option<String> {
 /// The model-free comparison preparation, idempotent across resumes. Returns
 /// `true` when the two arms are prepared; a refusal is recorded as the run's
 /// blocking condition and returns `false` without any dispatch.
-fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
+fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>, model_free: bool) -> io::Result<bool> {
     let Some(comparison) = run.spec.comparison.clone() else {
         return Ok(false);
     };
@@ -486,8 +502,10 @@ fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
 
     // The measured arms must not even begin preparation without a usable
     // qualification: an unqualified or drifting record blocks here, before
-    // any Git copy, installation or model-facing step.
-    if let Some(reason) = qualification_block(&run.spec)? {
+    // any Git copy, installation or model-facing step. A direct-operation
+    // unit performs no model dispatch, so it does not require the unrelated
+    // model qualification the conversation route needs.
+    if !model_free && let Some(reason) = qualification_block(&run.spec)? {
         block(
             run,
             notes,
@@ -3994,6 +4012,939 @@ fn preparation_policy(run: &Run, runtime: &ArmRuntime) -> io::Result<Option<Stri
         return Ok(None);
     };
     read_preparation_method(&runtime_path)
+}
+
+// ---------------------------------------------------------------------------
+// Direct real-operation arms.
+//
+// A comparison whose predeclared selection is `method=real-operation`
+// `claim=local-operation` measures one declared real operation per arm: the
+// operator-supplied program runs through the shared heavy resource owner,
+// inside that arm's own frozen workload checkout, with the exact prepared
+// runtime the arm consumed. No model conversation is opened, no simulated
+// counter is recorded, and only the executed operation's own retained
+// execution and the frozen oracle's independent check enter the pair. The
+// executable declaration binds the measurement scope's declared operation
+// identity; a missing, changed or candidate-writable declaration refuses
+// instead of being silently re-frozen.
+// ---------------------------------------------------------------------------
+
+/// The run-local executable declaration of the declared workload operation.
+const OPERATION_FILE: &str = "operation.json";
+const OPERATION_RECEIPT_FILE: &str = "operation-receipt.json";
+/// The run-local measurement scope the directed-measurement gate consumes;
+/// the direct operation must bind the operation identity it declares.
+const MEASUREMENT_SCOPE_FILE: &str = "measurement-scope.json";
+const MAX_OPERATION_ARGS: usize = 256;
+const MAX_OPERATION_ARG_BYTES: usize = 32_768;
+const MAX_OPERATION_TIMEOUT_SECONDS: u64 = 86_400;
+const MAX_OPERATION_BYTES: u64 = 1024 * 1024;
+
+/// The executable form of the run's declared workload operation. It is
+/// operator-supplied local input outside the candidate's writable scope and
+/// every field is validated before the first execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredOperation {
+    schema: u32,
+    /// The bounded `workload.operation` identity the measurement scope
+    /// declared; the executable declaration binds exactly it.
+    identity: String,
+    /// The explicit operation program: an absolute regular file outside the
+    /// candidate's writable scope.
+    program: PathBuf,
+    /// Literal argv. The exact placeholders `{workspace}`, `{runtime}` and
+    /// `{target}` are replaced with the arm's frozen checkout, its prepared
+    /// runtime build and its owned scratch directory.
+    #[serde(default)]
+    arguments: Vec<String>,
+    timeout_seconds: u64,
+}
+
+fn operation_path(run: &Run) -> PathBuf {
+    run.store.root().join(OPERATION_FILE)
+}
+
+fn operation_receipt_path(run: &Run, arm: ComparisonArm) -> PathBuf {
+    run.store
+        .comparison_arm_dir(arm)
+        .join(OPERATION_RECEIPT_FILE)
+}
+
+/// Resolve the direct-operation route from the predeclared selection. The
+/// selection is read from the frozen policy's own uncertainty clause, so the
+/// measured unit cannot be changed after results. `Ok(None)` keeps the
+/// conversation route; a declared direct selection without a usable
+/// declaration is an error, never a fallback.
+fn direct_operation(run: &Run) -> Result<Option<DeclaredOperation>, String> {
+    let Some(comparison) = run.spec.comparison.as_ref() else {
+        return Ok(None);
+    };
+    let declared = comparison
+        .declared_policy()
+        .map_err(|error| format!("the predeclared comparison policy is unusable: {error}"))?;
+    let Some(selection) = parse_experiment_selection(&declared.policy.uncertainty)? else {
+        return Ok(None);
+    };
+    if selection.method != ExperimentMethod::RealOperation
+        || selection.claim != EffectPath::LocalOperation
+    {
+        return Ok(None);
+    }
+    let path = operation_path(run);
+    if !path.is_file() {
+        return Err(format!(
+            "the predeclared selection is method=real-operation claim=local-operation, but no direct operation is declared at {}; the measured arms are executed directly and no model-conversation fallback exists - declare the operation and resume",
+            path.display()
+        ));
+    }
+    let operation: DeclaredOperation = read_json(&path, 64 * 1024).map_err(|error| {
+        format!(
+            "the declared direct operation at {} is unreadable: {error}",
+            path.display()
+        )
+    })?;
+    validate_operation(run, &operation).map_err(|reason| {
+        format!(
+            "the declared direct operation at {} is unusable: {reason}",
+            path.display()
+        )
+    })?;
+    Ok(Some(operation))
+}
+
+fn validate_operation(run: &Run, operation: &DeclaredOperation) -> Result<(), String> {
+    if operation.schema != 1 {
+        return Err(format!(
+            "unsupported schema {}; this controller reads schema 1",
+            operation.schema
+        ));
+    }
+    let identity = operation.identity.trim();
+    if identity.is_empty() || identity.len() > 512 || identity.contains(['\n', '\r']) {
+        return Err("the identity must be one bounded non-empty line".to_owned());
+    }
+    let declared = declared_measurement_operation_identity(run)?;
+    if identity != declared {
+        return Err(format!(
+            "the executable declaration binds identity {identity:?} while the declared measurement scope names {declared:?}"
+        ));
+    }
+    if !operation.program.is_absolute() || !operation.program.is_file() {
+        return Err("the program must be an explicit absolute regular file".to_owned());
+    }
+    if operation.timeout_seconds == 0 || operation.timeout_seconds > MAX_OPERATION_TIMEOUT_SECONDS {
+        return Err(format!(
+            "timeout_seconds must be 1..={MAX_OPERATION_TIMEOUT_SECONDS}"
+        ));
+    }
+    if operation.arguments.len() > MAX_OPERATION_ARGS {
+        return Err(format!(
+            "at most {MAX_OPERATION_ARGS} arguments are accepted"
+        ));
+    }
+    for argument in &operation.arguments {
+        if argument.len() > MAX_OPERATION_ARG_BYTES || argument.contains('\0') {
+            return Err("every argument must be bounded UTF-8 without NUL".to_owned());
+        }
+    }
+    // The measured program must stay outside the candidate's writable scope:
+    // a candidate that can rewrite the measured operation could alter the
+    // treatment its own comparison measures.
+    let program = overlap_path(&operation.program);
+    for entry in &run.spec.writable_scope {
+        let scope = overlap_path(&run.spec.project.join(entry));
+        if program.starts_with(&scope) || scope.starts_with(&program) {
+            return Err(format!(
+                "the operation program {} lies inside the candidate's writable scope {entry}; the measured operation must be declared outside candidate reach",
+                operation.program.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `workload.operation` identity the directed-measurement scope declared,
+/// read from the same run-local file the gate consumes.
+fn declared_measurement_operation_identity(run: &Run) -> Result<String, String> {
+    let path = run.store.root().join(MEASUREMENT_SCOPE_FILE);
+    let bytes = crate::outcome_run::bounded_read(&path, MAX_RUN_SPEC_BYTES).map_err(|error| {
+        format!(
+            "the declared measurement scope at {} is unreadable: {error}",
+            path.display()
+        )
+    })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "the declared measurement scope at {} is not JSON: {error}",
+            path.display()
+        )
+    })?;
+    value["workload"]["operation"]
+        .as_str()
+        .map(str::trim)
+        .filter(|identity| !identity.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "the declared measurement scope at {} names no workload operation",
+                path.display()
+            )
+        })
+}
+
+/// Drive the direct-operation pair as far as the retained evidence allows:
+/// one real operation per arm, baseline before candidate, each settled only
+/// through its own retained execution and the frozen oracle's acceptance.
+fn advance_direct_operation(
+    run: &mut Run,
+    operation: &DeclaredOperation,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(comparison) = run.spec.comparison.clone() else {
+        return Ok(());
+    };
+    for arm in [ComparisonArm::Baseline, ComparisonArm::Candidate] {
+        let arm_state = run
+            .cursor
+            .comparison
+            .as_ref()
+            .map(|state| state.arm(arm).clone())
+            .unwrap_or_default();
+        if arm_state.condition.is_some() {
+            return Ok(());
+        }
+        if arm_state.row.is_none() {
+            if retained_row_without_state(run, arm) {
+                return block(
+                    run,
+                    notes,
+                    format!(
+                        "the {} direct operation left a retained result without its recorded state; the retained evidence is preserved and the arm is not replayed - reconcile the run before continuing",
+                        arm.as_str()
+                    ),
+                );
+            }
+            return settle_operation_arm(run, &comparison, operation, arm, notes);
+        }
+        // A settled arm's result is reused only while every declared input
+        // still matches exactly what was measured; any change requires
+        // remeasurement and never silently reuses the retained execution.
+        if let Err(reason) = verify_operation_reuse(run, &comparison, operation, arm) {
+            return block(run, notes, reason);
+        }
+    }
+    publish_decision(run, notes)
+}
+
+fn retained_row_without_state(run: &Run, arm: ComparisonArm) -> bool {
+    run.store.comparison_arm_dir(arm).join("row.json").is_file()
+}
+
+/// Execute and settle one direct-operation arm. Every refusal is recorded as
+/// the run's blocking condition with the exact cause; a retained execution is
+/// never replayed and a failed one is never converted into a result.
+fn settle_operation_arm(
+    run: &mut Run,
+    comparison: &ComparisonInputs,
+    operation: &DeclaredOperation,
+    arm: ComparisonArm,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(bindings) = load_bindings(run)? else {
+        return Ok(());
+    };
+    let binding = match bindings.arm(arm_to_experiment(arm)) {
+        Ok(binding) => binding.clone(),
+        Err(error) => return block(run, notes, error.to_string()),
+    };
+    let arm_state = run
+        .cursor
+        .comparison
+        .as_ref()
+        .map(|state| state.arm(arm).clone())
+        .unwrap_or_default();
+    let runtime_path = match arm_state.runtime.clone() {
+        Some(path) => path,
+        None => {
+            return block(
+                run,
+                notes,
+                "the prepared arm runtime receipt is missing".to_owned(),
+            );
+        }
+    };
+    let runtime: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
+    if let Err(error) = bindings.verify_pre_attempt(arm_to_experiment(arm)) {
+        return block(
+            run,
+            notes,
+            format!(
+                "the {} arm is no longer a pristine pre-attempt snapshot: {error}",
+                arm.as_str()
+            ),
+        );
+    }
+    if let Err(reason) = verify_build_provenance(run, &bindings) {
+        return block(run, notes, reason);
+    }
+    if let Err(reason) = verify_consumed_arm(run, comparison, arm, "pre-attempt") {
+        return block(run, notes, reason);
+    }
+    let source = run.store.comparison_arm_dir(arm).join("checkout");
+    if let Err(reason) = ensure_operation_checkout(&source, &binding) {
+        return block(run, notes, reason);
+    }
+    let mut receipt = match run_direct_operation(run, comparison, operation, arm, &runtime, &source)
+    {
+        Ok(receipt) => receipt,
+        Err(reason) => return refuse_operation_arm(run, arm, reason, notes),
+    };
+    // The executed operation's own receipt is retained before its outcome is
+    // judged: a failed execution keeps its exact exit status and retained
+    // streams, and is never replayed from a summary.
+    let receipt_path = operation_receipt_path(run, arm);
+    write_json_atomic(&receipt_path, &receipt)?;
+    let exited = receipt["status"].as_str() == Some("exited");
+    let exit_code = receipt["exit_code"].as_i64();
+    if !exited || exit_code != Some(0) {
+        let reason = format!(
+            "the execution {} at exit_code {}",
+            receipt["status"].as_str().unwrap_or("did not start"),
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+        return refuse_operation_arm(run, arm, reason, notes);
+    }
+    // The operation's own committed outputs are the arm's solution. Only the
+    // declared writable scope is committed; anything else refuses so no
+    // unrelated state reaches acceptance.
+    let (revision, changed) = match commit_operation_outputs(&source, comparison, &binding) {
+        Ok(result) => result,
+        Err(reason) => return refuse_operation_arm(run, arm, reason, notes),
+    };
+    receipt["solution_revision"] = json!(revision);
+    receipt["solution_paths"] = json!(changed);
+    write_json_atomic(&receipt_path, &receipt)?;
+    let solution = Solution {
+        revision,
+        changed_paths: changed,
+        checkout: source,
+    };
+    let acceptance = match run_oracle(run, comparison, arm, &solution) {
+        Ok(acceptance) => acceptance,
+        Err(reason) => {
+            return block(
+                run,
+                notes,
+                format!(
+                    "the {} arm acceptance did not complete: {reason}",
+                    arm.as_str()
+                ),
+            );
+        }
+    };
+    let row = build_operation_row(
+        run,
+        comparison,
+        arm,
+        &receipt,
+        &runtime,
+        &runtime_path,
+        &solution,
+        &acceptance,
+    )?;
+    let row_path = run.store.comparison_arm_dir(arm).join("row.json");
+    write_json_atomic(&row_path, &row)?;
+    let mut state = run
+        .cursor
+        .comparison
+        .clone()
+        .unwrap_or_else(|| ComparisonState::new("unset".to_owned()));
+    {
+        let arm_state = state.arm_mut(arm);
+        arm_state.revision = Some(solution.revision.clone());
+        arm_state.oracle = Some(acceptance.record_path.clone());
+        arm_state.accepted = Some(acceptance.passed);
+        arm_state.row = Some(row_path.clone());
+        arm_state.condition = None;
+    }
+    run.cursor.comparison = Some(state);
+    run.cursor.effect(
+        EffectKind::ComparisonArmAccepted,
+        format!(
+            "arm={} method=real-operation exit_code=0 elapsed={:.3}s accepted={} oracle={}",
+            arm.as_str(),
+            receipt["elapsed_seconds"].as_f64().unwrap_or(0.0),
+            acceptance.passed,
+            acceptance.record_path.display()
+        ),
+    );
+    run.cursor.phase = match arm {
+        ComparisonArm::Baseline => Phase::CandidateAttempt,
+        ComparisonArm::Candidate => Phase::Acceptance,
+    };
+    run.cursor.condition = None;
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "comparison: the {} direct operation completed through the real heavy-command route and its result was independently checked (accepted={})",
+        arm.as_str(),
+        acceptance.passed
+    ));
+    Ok(())
+}
+
+fn refuse_operation_arm(
+    run: &mut Run,
+    arm: ComparisonArm,
+    reason: String,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let mut state = run
+        .cursor
+        .comparison
+        .clone()
+        .unwrap_or_else(|| ComparisonState::new("unset".to_owned()));
+    state.arm_mut(arm).condition = Some(reason.clone());
+    run.cursor.comparison = Some(state);
+    run.cursor.effect(
+        EffectKind::ComparisonArmRefused,
+        format!("arm={} direct operation: {reason}", arm.as_str()),
+    );
+    block(
+        run,
+        notes,
+        format!(
+            "the {} direct operation did not enter the comparison: {reason}; the retained execution is preserved and never replayed automatically",
+            arm.as_str()
+        ),
+    )
+}
+
+/// The direct-operation clone of the frozen workload: an independent minimal
+/// repository at the exact frozen revision, without the conversation-only
+/// dispatch declaration, so the operation consumes only frozen task content
+/// and the checkout is a pristine pre-attempt snapshot.
+fn ensure_operation_checkout(source: &Path, binding: &ArmBinding) -> Result<(), String> {
+    if !source.exists() {
+        git(
+            &binding.workload.source,
+            &[
+                "clone",
+                "-q",
+                "--no-hardlinks",
+                &binding.workload.path.to_string_lossy(),
+                &source.to_string_lossy(),
+            ],
+        )
+        .map_err(|error| {
+            format!(
+                "the {} operation checkout could not be created: {error}",
+                binding.arm.as_str()
+            )
+        })?;
+    }
+    if !git_ok(source, &["rev-parse", "--is-inside-work-tree"]) {
+        return Err(format!(
+            "the {} operation checkout {} is not a Git checkout",
+            binding.arm.as_str(),
+            source.display()
+        ));
+    }
+    if !git_ok(
+        source,
+        &[
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", binding.workload.revision),
+        ],
+    ) {
+        return Err(format!(
+            "the {} operation checkout lost the frozen task revision",
+            binding.arm.as_str()
+        ));
+    }
+    verify_pristine_operation_checkout(source, binding)
+}
+
+/// Verify the arm's frozen checkout is exactly the pristine task revision
+/// before its operation runs. A partial earlier execution or foreign state
+/// refuses instead of being overwritten by a replay.
+fn verify_pristine_operation_checkout(source: &Path, binding: &ArmBinding) -> Result<(), String> {
+    let revision = git(source, &["rev-parse", "HEAD"])
+        .map_err(|error| {
+            format!(
+                "the {} operation checkout revision is unavailable: {error}",
+                binding.arm.as_str()
+            )
+        })?
+        .trim()
+        .to_owned();
+    if revision != binding.workload.revision {
+        return Err(format!(
+            "the {} operation checkout is at {revision} instead of the frozen task revision {}",
+            binding.arm.as_str(),
+            binding.workload.revision
+        ));
+    }
+    let status =
+        git(source, &["status", "--porcelain", "--untracked-files=all"]).map_err(|error| {
+            format!(
+                "the {} operation checkout status is unavailable: {error}",
+                binding.arm.as_str()
+            )
+        })?;
+    let status = status.trim();
+    if !status.is_empty() {
+        let detail: String = status.chars().take(256).collect();
+        return Err(format!(
+            "the {} operation checkout is not a pristine pre-attempt snapshot ({detail}); no operation is started over retained partial state",
+            binding.arm.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the declared argv for one arm. The substitution tokens are the
+/// only per-arm values; everything else is the operator's literal argv.
+fn resolve_operation_arguments(
+    operation: &DeclaredOperation,
+    workspace: &Path,
+    runtime_build: &Path,
+    scratch: &Path,
+    arm: ComparisonArm,
+) -> Result<Vec<String>, String> {
+    let substitutions = [
+        ("{workspace}", workspace.to_string_lossy().into_owned()),
+        ("{runtime}", runtime_build.to_string_lossy().into_owned()),
+        ("{target}", scratch.to_string_lossy().into_owned()),
+    ];
+    let mut resolved = Vec::with_capacity(operation.arguments.len());
+    for argument in &operation.arguments {
+        if argument.len() > MAX_OPERATION_ARG_BYTES || argument.contains('\0') {
+            return Err(format!(
+                "the {} operation argument is oversized or contains NUL",
+                arm.as_str()
+            ));
+        }
+        let mut value = argument.clone();
+        for (token, replacement) in &substitutions {
+            value = value.replace(token, replacement);
+        }
+        resolved.push(value);
+    }
+    Ok(resolved)
+}
+
+/// Run the declared operation for one arm through the shared heavy resource
+/// owner. The retained execution time is the owner's measured wall clock and
+/// the streams are retained to bounded files; no counter is simulated.
+fn run_direct_operation(
+    run: &Run,
+    comparison: &ComparisonInputs,
+    operation: &DeclaredOperation,
+    arm: ComparisonArm,
+    runtime: &ArmRuntime,
+    source: &Path,
+) -> Result<Value, String> {
+    let declared = comparison
+        .declared_policy()
+        .map_err(|error| format!("the predeclared comparison policy is unusable: {error}"))?;
+    let Some(bindings) = load_bindings(run).map_err(|error| error.to_string())? else {
+        return Err("the comparison bindings are missing".to_owned());
+    };
+    let binding = bindings
+        .arm(arm_to_experiment(arm))
+        .map_err(|error| error.to_string())?;
+    let scratch = run.store.comparison_arm_dir(arm).join("operation-target");
+    fs::create_dir_all(&scratch).map_err(|error| {
+        format!(
+            "the {} operation scratch directory could not be created: {error}",
+            arm.as_str()
+        )
+    })?;
+    let arguments =
+        resolve_operation_arguments(operation, source, &runtime.variant.build, &scratch, arm)?;
+    let program_sha256 = build_identity::hash_file(&operation.program).map_err(|error| {
+        format!(
+            "the declared {} operation program is unreadable: {error}",
+            arm.as_str()
+        )
+    })?;
+    let evidence = run.store.comparison_arm_dir(arm).join("operation-evidence");
+    let references: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let started_at = now_seconds();
+    let mut runs = Vec::new();
+    let admitted = crate::outcome_oracle::run_admitted_program(
+        source,
+        &evidence,
+        "operation",
+        &operation.program,
+        &references,
+        operation.timeout_seconds,
+        &mut runs,
+    )
+    .map_err(|error| {
+        format!(
+            "the {} direct operation could not run: {error}",
+            arm.as_str()
+        )
+    })?;
+    let ended_at = now_seconds();
+    Ok(json!({
+        "schema": 1,
+        "arm": arm.as_str(),
+        "method": "real-operation",
+        "identity": operation.identity,
+        "program": operation.program.to_string_lossy(),
+        "program_sha256": program_sha256,
+        "arguments": arguments,
+        "workspace": source.to_string_lossy(),
+        "runtime_build": runtime.variant.build.to_string_lossy(),
+        "runtime_record_sha256": runtime.variant.record_sha256,
+        "runtime_source_sha256": runtime.variant.source_sha256,
+        "task_revision": binding.workload.revision,
+        "policy_digest": declared.digest,
+        "acceptance_request_sha256": comparison.acceptance.request_sha256,
+        "timeout_seconds": operation.timeout_seconds,
+        "status": admitted["status"],
+        "exit_code": admitted["exit_code"],
+        "elapsed_seconds": admitted["elapsed_seconds"],
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "model_calls": 0,
+        "model_metrics": "inapplicable",
+        "recorded_ms": now_ms(),
+        "admitted": admitted,
+    }))
+}
+
+/// Commit the operation's own outputs within the declared writable scope and
+/// return the resulting revision. A clean checkout keeps the frozen revision
+/// (an operation that changed nothing has no fabricated diff); any path
+/// outside the declared scope refuses the arm.
+fn commit_operation_outputs(
+    source: &Path,
+    comparison: &ComparisonInputs,
+    binding: &ArmBinding,
+) -> Result<(String, Vec<String>), String> {
+    let base = binding.workload.revision.clone();
+    let status = git(
+        source,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )?;
+    let paths = porcelain_paths(&status)?;
+    if paths.is_empty() {
+        return Ok((base, Vec::new()));
+    }
+    changed_paths_within_scope(
+        &paths,
+        &comparison.task.writable_scope,
+        &comparison.specification.change,
+    )?;
+    let mut staged: Vec<&str> = vec!["add", "--"];
+    staged.extend(paths.iter().map(String::as_str));
+    git(source, &staged)?;
+    git(
+        source,
+        &[
+            "-c",
+            "user.email=codex-harness@local",
+            "-c",
+            "user.name=codex-harness",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "record the direct operation outputs",
+        ],
+    )?;
+    let revision = git(source, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let changed = git(
+        source,
+        &["diff", "--name-only", &format!("{base}..{revision}")],
+    )?;
+    let changed: Vec<String> = changed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    changed_paths_within_scope(
+        &changed,
+        &comparison.task.writable_scope,
+        &comparison.specification.change,
+    )?;
+    let remaining = git(source, &["status", "--porcelain", "--untracked-files=all"])?;
+    let remaining = remaining.trim();
+    if !remaining.is_empty() {
+        let detail: String = remaining.chars().take(256).collect();
+        return Err(format!(
+            "the {} operation left paths outside the declared writable scope ({detail}); the result is refused",
+            binding.arm.as_str()
+        ));
+    }
+    Ok((revision, changed))
+}
+
+/// Parse `git status --porcelain -z --untracked-files=all` into the reported
+/// paths. Rename and copy entries carry their source path in the following
+/// NUL-separated record, which is not a reported destination.
+fn porcelain_paths(text: &str) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    let mut skip_source = false;
+    for record in text.split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        if skip_source {
+            skip_source = false;
+            continue;
+        }
+        if record.len() < 3 || record.as_bytes()[2] != b' ' {
+            return Err(
+                "the operation checkout returned an unreadable git status entry".to_owned(),
+            );
+        }
+        let flags = &record[..2];
+        paths.push(record[3..].to_owned());
+        skip_source = flags.starts_with('R')
+            || flags.ends_with('R')
+            || flags.starts_with('C')
+            || flags.ends_with('C');
+    }
+    Ok(paths)
+}
+
+/// Revalidate one settled direct-operation arm against every declared input
+/// before its retained result is reused. The first mismatch names the exact
+/// changed field; the retained execution is never replayed automatically.
+fn verify_operation_reuse(
+    run: &Run,
+    comparison: &ComparisonInputs,
+    operation: &DeclaredOperation,
+    arm: ComparisonArm,
+) -> Result<(), String> {
+    let path = operation_receipt_path(run, arm);
+    if !path.is_file() {
+        return Err(format!(
+            "the completed {} direct operation receipt at {} is missing; the retained result cannot be revalidated and is not reused",
+            arm.as_str(),
+            path.display()
+        ));
+    }
+    let receipt: Value = read_json(&path, MAX_OPERATION_BYTES).map_err(|error| {
+        format!(
+            "the completed {} direct operation receipt is unreadable: {error}",
+            arm.as_str()
+        )
+    })?;
+    let Some(bindings) = load_bindings(run).map_err(|error| error.to_string())? else {
+        return Err("the comparison bindings are missing".to_owned());
+    };
+    let binding = bindings
+        .arm(arm_to_experiment(arm))
+        .map_err(|error| error.to_string())?;
+    let declared = comparison
+        .declared_policy()
+        .map_err(|error| format!("the predeclared comparison policy is unusable: {error}"))?;
+    let source = run.store.comparison_arm_dir(arm).join("checkout");
+    let scratch = run.store.comparison_arm_dir(arm).join("operation-target");
+    let arm_state = run
+        .cursor
+        .comparison
+        .as_ref()
+        .map(|state| state.arm(arm).clone())
+        .unwrap_or_default();
+    let runtime_path = arm_state
+        .runtime
+        .clone()
+        .ok_or_else(|| "the prepared arm runtime receipt is missing".to_owned())?;
+    let runtime: ArmRuntime =
+        read_json(&runtime_path, MAX_RUN_SPEC_BYTES).map_err(|error| error.to_string())?;
+    let arguments =
+        resolve_operation_arguments(operation, &source, &runtime.variant.build, &scratch, arm)?;
+    let program_sha256 = build_identity::hash_file(&operation.program)
+        .map_err(|error| format!("the declared operation program is now unreadable: {error}"))?;
+    let checks: [(&str, Value, Value); 13] = [
+        ("arm", receipt["arm"].clone(), json!(arm.as_str())),
+        (
+            "identity",
+            receipt["identity"].clone(),
+            json!(operation.identity),
+        ),
+        (
+            "program",
+            receipt["program"].clone(),
+            json!(operation.program.to_string_lossy()),
+        ),
+        (
+            "program_sha256",
+            receipt["program_sha256"].clone(),
+            json!(program_sha256),
+        ),
+        ("arguments", receipt["arguments"].clone(), json!(arguments)),
+        (
+            "workspace",
+            receipt["workspace"].clone(),
+            json!(source.to_string_lossy()),
+        ),
+        (
+            "runtime_build",
+            receipt["runtime_build"].clone(),
+            json!(runtime.variant.build.to_string_lossy()),
+        ),
+        (
+            "runtime_record_sha256",
+            receipt["runtime_record_sha256"].clone(),
+            json!(runtime.variant.record_sha256),
+        ),
+        (
+            "runtime_source_sha256",
+            receipt["runtime_source_sha256"].clone(),
+            json!(runtime.variant.source_sha256),
+        ),
+        (
+            "task_revision",
+            receipt["task_revision"].clone(),
+            json!(binding.workload.revision),
+        ),
+        (
+            "policy_digest",
+            receipt["policy_digest"].clone(),
+            json!(declared.digest),
+        ),
+        (
+            "acceptance_request_sha256",
+            receipt["acceptance_request_sha256"].clone(),
+            json!(comparison.acceptance.request_sha256),
+        ),
+        (
+            "timeout_seconds",
+            receipt["timeout_seconds"].clone(),
+            json!(operation.timeout_seconds),
+        ),
+    ];
+    for (field, recorded, current) in checks {
+        if recorded != current {
+            return Err(format!(
+                "the completed {} direct operation cannot be reused: {field} changed since it was measured; changed conditions require remeasurement, and the retained execution is preserved and never replayed automatically",
+                arm.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One direct-operation arm's authoritative outcome row. It carries the
+/// operation's own measured duration and exit status, the frozen oracle's
+/// independent acceptance and the matched comparison identities. Model
+/// metrics are recorded as inapplicable, never as a measured zero: this
+/// method performs no model call.
+#[allow(clippy::too_many_arguments)]
+fn build_operation_row(
+    run: &Run,
+    comparison: &ComparisonInputs,
+    arm: ComparisonArm,
+    receipt: &Value,
+    runtime: &ArmRuntime,
+    runtime_path: &Path,
+    solution: &Solution,
+    acceptance: &Acceptance,
+) -> io::Result<Value> {
+    let started_at = receipt["started_at"].as_f64().unwrap_or_else(now_seconds);
+    let ended_at = receipt["ended_at"].as_f64().unwrap_or(started_at);
+    let bindings =
+        load_bindings(run)?.ok_or_else(|| invalid("the comparison bindings are missing"))?;
+    let snapshot = snapshot_facts(
+        &bindings
+            .arm(Arm::Baseline)
+            .map_err(|error| invalid(error.to_string()))?
+            .workload,
+    )?;
+    let matched = matched_fields(
+        run,
+        comparison,
+        runtime,
+        &snapshot,
+        &acceptance.workspace_preparation,
+    )?;
+    let declaration = comparison.declared_policy()?.policy.declaration();
+    let mut native = json!({
+        "role": "operation",
+        "method": "real-operation",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "status": "completed",
+        "exit_code": receipt["exit_code"].as_i64().unwrap_or(0),
+        "elapsed_seconds": receipt["elapsed_seconds"],
+        "model_calls": 0,
+        "model_metrics": "inapplicable",
+        "evidence": operation_receipt_path(run, arm).display().to_string(),
+    });
+    if let Some(admission) = receipt["admitted"].get("admission") {
+        native["admission"] = admission.clone();
+    }
+    if let Some(streams) = receipt["admitted"].get("streams") {
+        native["streams"] = streams.clone();
+    }
+    let removal = declared_removal(run);
+    let mut treatment = json!({
+        "label": runtime.label,
+        "build": runtime.variant.build.display().to_string(),
+        "build_source_sha256": runtime.variant.source_sha256,
+        "solution_revision": solution.revision,
+        "solution_paths": solution.changed_paths,
+        "components": component_inventory(runtime),
+        "operation_identity": receipt["identity"],
+        "operation_program_sha256": receipt["program_sha256"],
+    });
+    if let Some(removal) = &removal {
+        treatment["kind"] = json!("subtraction");
+        if let Some(target) = &removal.target {
+            treatment["removed"] = json!(target);
+        }
+    }
+    let mut row = json!({
+        "attempt_id": format!("{}-{}-operation", run.cursor.experiment, arm.as_str()),
+        "case_id": comparison.task.name,
+        "arm": arm.as_str(),
+        "experiment_id": run.cursor.experiment,
+        "unit": format!("{}/{}", run.cursor.experiment, comparison.task.name),
+        "method": "real-operation",
+        "model_calls": 0,
+        "model_metrics": "inapplicable",
+        "started_at": started_at,
+        "ended_at": acceptance.ended_at,
+        "execution_started_at": started_at,
+        "discovery_verified": false,
+        "observed_model_metadata_verified": false,
+        "matched": matched,
+        "declaration": declaration,
+        "native_runs": [native],
+        "checks": [{
+            "id": "independent-acceptance",
+            "round": 0,
+            "started_at": acceptance.started_at,
+            "ended_at": acceptance.ended_at,
+            "required": true,
+            "executed": true,
+            "passed": acceptance.passed,
+            "exit_code": if acceptance.passed { 0 } else { 1 },
+            "evidence": acceptance.record_path.display().to_string(),
+        }],
+        "children": [],
+        "interventions": [],
+        "retry_of": null,
+        "treatment": treatment,
+    });
+    if let Some(removal) = &removal
+        && let Some(target) = &removal.target
+    {
+        row["consumption"] = capability_consumption(runtime, runtime_path, target);
+    }
+    Ok(row)
 }
 
 // ---------------------------------------------------------------------------
