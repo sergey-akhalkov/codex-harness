@@ -21,7 +21,7 @@ use harness_core::improvement_activation::{
 use harness_core::improvement_experiment::{
     Arm, CorroborationRequirement, CorroborationSelection, CorroborationStatus, ExperimentBindings,
     RetainedTask, TaskRetention, retain_completed_task, retained_tasks_from_board,
-    select_corroboration,
+    select_corroboration, select_variant,
 };
 use harness_core::improvement_loop::{
     AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, OwnerRecord, Phase, RunSpec,
@@ -69,6 +69,13 @@ const RETAINED_DIR: &str = "retained";
 const RETAINED_INDEX_FILE: &str = "retained-tasks.json";
 const CORROBORATION_FILE: &str = "corroboration.json";
 const RECONCILE_FILE: &str = "reconcile.json";
+/// The run-local settlement record of the accepted-runtime restoration at a
+/// non-adopt decision boundary. The experimental selection is switched back
+/// to the accepted baseline through the shared runtime-selection owner, or
+/// the unknown/failed restoration blocks dependent work with the exact
+/// reason. This is authorized experiment recovery, not a capability
+/// retirement: it consults no removal authority and waives none.
+const RESTORATION_FILE: &str = "restoration.json";
 /// Bound on one recorded consumption reason; the receipt names the exact
 /// identity, never a long transcript.
 const MAX_CONSUMPTION_DETAIL: usize = 512;
@@ -1224,21 +1231,49 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
     consume_decision_evidence(run, &evaluation, notes)?;
     if evaluation.decision != PolicyDecision::Adopt {
         record_lineage(run, &evaluation, notes)?;
-        run.cursor.phase = Phase::Idle;
-        run.cursor.condition = Some(format!(
-            "decision {} leaves the baseline unchanged; workload artifacts stay retained and no model work is started to repeat this experiment",
-            evaluation.decision.as_str()
-        ));
-        run.cursor.effect(
-            EffectKind::ContinuationRecorded,
-            format!("decision={} idle", evaluation.decision.as_str()),
-        );
-        run.store.save_cursor(&run.cursor)?;
-        notes.push(format!(
-            "controller: decision {} did not authorize integration or activation",
-            evaluation.decision.as_str()
-        ));
-        return Ok(());
+        // Rejection and inconclusive outcomes settle the runtime state before
+        // the run idles or continues: an experimental selection that left the
+        // accepted baseline is restored and verified through the shared
+        // runtime-selection owner, and an unknown or failed restoration keeps
+        // the decision boundary blocked with the exact reason instead of
+        // releasing conflicting work.
+        match restore_accepted_runtime(run, evaluation.decision)? {
+            RestorationOutcome::Blocked(reason) => {
+                run.cursor.condition =
+                    Some(format!("{BOUNDARY_BLOCKED_PREFIX}restoration: {reason}"));
+                run.store.save_cursor(&run.cursor)?;
+                notes.push(format!("controller: restoration blocked ({reason})"));
+                return Ok(());
+            }
+            RestorationOutcome::Settled { detail } => {
+                run.cursor.phase = Phase::Idle;
+                let mut condition = format!(
+                    "decision {} leaves the baseline unchanged; {detail}; candidate commits, failed attempts and measurement/decision evidence stay retained and no model work is started to repeat this experiment",
+                    evaluation.decision.as_str()
+                );
+                if evaluation.decision == PolicyDecision::Inconclusive {
+                    // The candidate stays inactive with the missing fact and
+                    // its reconsideration condition recorded: another
+                    // measurement of this experiment needs a new declared,
+                    // decision-changing observation, never an identical
+                    // repeat.
+                    condition.push_str(
+                        "; the missing evidence and its reconsideration condition stay recorded in the retained evaluation, and the unchanged experiment is not retried",
+                    );
+                }
+                run.cursor.condition = Some(condition);
+                run.cursor.effect(
+                    EffectKind::ContinuationRecorded,
+                    format!("decision={} idle", evaluation.decision.as_str()),
+                );
+                run.store.save_cursor(&run.cursor)?;
+                notes.push(format!(
+                    "controller: decision {} did not authorize integration or activation",
+                    evaluation.decision.as_str()
+                ));
+                return Ok(());
+            }
+        }
     }
     if !run
         .spec
@@ -1374,6 +1409,258 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
     }
 }
 
+/// The settlement of one non-adopt decision's runtime restoration: either the
+/// accepted runtime is settled (restored, confirmed or never left), or the
+/// boundary stays blocked with the exact reason.
+enum RestorationOutcome {
+    Settled { detail: String },
+    Blocked(String),
+}
+
+/// Settle the accepted runtime after a rejection or inconclusive decision.
+///
+/// The loop dispatches each measured arm through the shared runtime-selection
+/// owner, so a completed pair can leave the recorded selection on the
+/// experimental candidate. This restores that selection to the unchanged
+/// accepted baseline through the same owner and verifies the identity it
+/// actually consumed; the run-local receipt keeps the settlement and every
+/// refusal visible. Restoration is part of authorized experiment recovery:
+/// it consults no capability-retirement approval and waives none, and the
+/// existing removal gates keep gating every candidate removal effect. An
+/// unknown state (no identifiable baseline runtime, an unresolved attempt) or
+/// a failed selection blocks conflicting work with the exact reason until the
+/// resource is reconciled.
+fn restore_accepted_runtime(
+    run: &mut Run,
+    decision: PolicyDecision,
+) -> io::Result<RestorationOutcome> {
+    let path = run.store.root().join(RESTORATION_FILE);
+    let previous = load_optional::<RestorationReceipt>(&path)?;
+    let attempts = previous.map_or(1, |receipt| receipt.attempts + 1);
+    let settlement = |status: &str,
+                      selected: &str,
+                      runtime: Option<&Path>,
+                      identity: Option<&str>,
+                      record_sha256: Option<&str>,
+                      reason: Option<String>|
+     -> RestorationReceipt {
+        RestorationReceipt {
+            schema: 1,
+            decision: decision.as_str().to_owned(),
+            status: status.to_owned(),
+            selected: selected.to_owned(),
+            runtime: runtime.map(Path::to_path_buf),
+            identity: identity.map(str::to_owned),
+            record_sha256: record_sha256.map(str::to_owned),
+            reason,
+            attempts,
+        }
+    };
+    let Some(selected) = run.cursor.selected_variant.clone() else {
+        write_json_atomic(
+            &path,
+            &settlement(
+                "not-required",
+                "none",
+                None,
+                None,
+                None,
+                Some(
+                    "the run recorded no experimental runtime selection; the accepted runtime was never left"
+                        .to_owned(),
+                ),
+            ),
+        )?;
+        return Ok(RestorationOutcome::Settled {
+            detail:
+                "no experimental runtime selection was recorded, so the accepted runtime was never left"
+                    .to_owned(),
+        });
+    };
+    if selected == "baseline" {
+        write_json_atomic(
+            &path,
+            &settlement(
+                "not-required",
+                &selected,
+                None,
+                None,
+                None,
+                Some("the recorded selection is already the accepted baseline runtime".to_owned()),
+            ),
+        )?;
+        return Ok(RestorationOutcome::Settled {
+            detail: "the recorded selection already was the accepted baseline runtime".to_owned(),
+        });
+    }
+    if selected != "candidate" {
+        let reason = format!(
+            "the recorded runtime selection {selected} is neither the accepted baseline nor the experimental candidate; the owned runtime state is unknown"
+        );
+        write_json_atomic(
+            &path,
+            &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+        )?;
+        return Ok(RestorationOutcome::Blocked(reason));
+    }
+    // The experimental candidate was the recorded selection: the accepted
+    // baseline must be identified from the run's own retained runtime state.
+    let Some(state) = run
+        .spec
+        .comparison
+        .as_ref()
+        .map(|comparison| comparison.runtimes.state.clone())
+    else {
+        let reason = "the recorded selection is the experimental candidate, but the run declares no comparison runtime state to restore from; the owned runtime state is unknown".to_owned();
+        write_json_atomic(
+            &path,
+            &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+        )?;
+        return Ok(RestorationOutcome::Blocked(reason));
+    };
+    let Some(receipt_path) = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.baseline.runtime.clone())
+    else {
+        let reason = "the accepted baseline runtime receipt is missing; the accepted runtime cannot be verified".to_owned();
+        write_json_atomic(
+            &path,
+            &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+        )?;
+        return Ok(RestorationOutcome::Blocked(reason));
+    };
+    if !receipt_path.is_file() {
+        let reason = format!(
+            "the accepted baseline runtime receipt is missing at {}; the accepted runtime cannot be verified",
+            receipt_path.display()
+        );
+        write_json_atomic(
+            &path,
+            &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+        )?;
+        return Ok(RestorationOutcome::Blocked(reason));
+    }
+    let runtime: ArmRuntime = match read_json(&receipt_path, MAX_RUN_SPEC_BYTES) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let reason = format!(
+                "the accepted baseline runtime receipt at {} is unreadable: {error}",
+                receipt_path.display()
+            );
+            write_json_atomic(
+                &path,
+                &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+            )?;
+            return Ok(RestorationOutcome::Blocked(reason));
+        }
+    };
+    if runtime.arm != Arm::Baseline {
+        let reason = format!(
+            "the retained accepted runtime receipt at {} belongs to the {} arm instead of the accepted baseline; the owned runtime state is unknown",
+            receipt_path.display(),
+            runtime.arm.as_str()
+        );
+        write_json_atomic(
+            &path,
+            &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+        )?;
+        return Ok(RestorationOutcome::Blocked(reason));
+    }
+    if let Some(active) = run.cursor.active_attempt() {
+        let reason = format!(
+            "attempt {} ({}) is active; the accepted runtime cannot be restored while a measured attempt keeps its frozen runtime",
+            active.id,
+            active.role.as_str()
+        );
+        write_json_atomic(
+            &path,
+            &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+        )?;
+        return Ok(RestorationOutcome::Blocked(reason));
+    }
+    let unresolved = run.cursor.unresolved_attempts();
+    if !unresolved.is_empty() {
+        let ids: Vec<&str> = unresolved
+            .iter()
+            .map(|attempt| attempt.id.as_str())
+            .collect();
+        let reason = format!(
+            "attempt(s) {} have unknown outcomes; the accepted runtime cannot be restored until they are reconciled through their owning dispatcher",
+            ids.join(", ")
+        );
+        write_json_atomic(
+            &path,
+            &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+        )?;
+        return Ok(RestorationOutcome::Blocked(reason));
+    }
+    let prepared = &runtime.variant;
+    match select_variant(&state, prepared, false) {
+        Ok(consumed) => {
+            let identity = format!("sha256:{}", short_identity(&prepared.source_sha256));
+            run.cursor.selected_variant = Some("baseline".to_owned());
+            run.cursor.selected_runtime = Some(consumed.build.clone());
+            run.cursor.selected_identity = Some(identity.clone());
+            run.cursor.effect(
+                EffectKind::VariantSelected,
+                format!(
+                    "restored variant=baseline runtime={} identity={identity} changed={} (authorized experiment recovery: no model call, no build, no source edit, no removal approval consumed)",
+                    consumed.build.display(),
+                    consumed.changed
+                ),
+            );
+            let status = if consumed.changed {
+                "restored"
+            } else {
+                "confirmed"
+            };
+            write_json_atomic(
+                &path,
+                &settlement(
+                    status,
+                    &selected,
+                    Some(&consumed.build),
+                    Some(&identity),
+                    Some(&consumed.record_sha256),
+                    None,
+                ),
+            )?;
+            Ok(RestorationOutcome::Settled {
+                detail: format!(
+                    "the accepted runtime at {} was {} and verified (identity={identity})",
+                    consumed.build.display(),
+                    if consumed.changed {
+                        "restored"
+                    } else {
+                        "confirmed"
+                    }
+                ),
+            })
+        }
+        Err(error) => {
+            let reason = format!("the accepted baseline runtime was not restored: {error}");
+            run.cursor.effect(
+                EffectKind::VariantsUnavailable,
+                format!("restore refused variant=baseline: {error}"),
+            );
+            write_json_atomic(
+                &path,
+                &settlement("failed", &selected, None, None, None, Some(reason.clone())),
+            )?;
+            Ok(RestorationOutcome::Blocked(reason))
+        }
+    }
+}
+
+/// The short source identity the cursor records for a selected prepared
+/// variant: `sha256:` plus the first 16 hex digits, exactly as the arm
+/// dispatch records it.
+fn short_identity(source_sha256: &str) -> String {
+    source_sha256.chars().take(16).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Decision-boundary consumption.
 //
@@ -1441,6 +1728,39 @@ pub(super) struct ReconcileReceipt {
     pub(super) status: String,
     pub(super) exit_code: Option<i32>,
     pub(super) detail: Option<String>,
+}
+
+/// The run-local settlement record of the accepted-runtime restoration at a
+/// non-adopt decision boundary. It names identities only: which variant the
+/// experimental selection named, the accepted baseline runtime the selection
+/// was restored to, the verified build record digest and, for a refusal, the
+/// exact reason. A failed record is the evidence that dependent work stayed
+/// blocked until the resource was reconciled.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestorationReceipt {
+    pub(super) schema: u32,
+    /// The decision whose settlement wrote this record (`reject` or
+    /// `inconclusive`).
+    pub(super) decision: String,
+    /// `restored`, `confirmed`, `not-required` or `failed`.
+    pub(super) status: String,
+    /// The variant the recorded experimental selection named, or `none`.
+    pub(super) selected: String,
+    /// The accepted baseline runtime actually selected, when verified.
+    #[serde(default)]
+    pub(super) runtime: Option<PathBuf>,
+    #[serde(default)]
+    pub(super) identity: Option<String>,
+    #[serde(default)]
+    pub(super) record_sha256: Option<String>,
+    /// The settlement note or the exact refusal reason.
+    #[serde(default)]
+    pub(super) reason: Option<String>,
+    /// How many settlement attempts this record accounts for: a blocked
+    /// restoration is re-resolved once per resume, and the count keeps the
+    /// repeats visible instead of hiding them.
+    pub(super) attempts: u32,
 }
 
 pub(super) fn retention_receipt(run: &Run) -> io::Result<Option<RetentionReceipt>> {

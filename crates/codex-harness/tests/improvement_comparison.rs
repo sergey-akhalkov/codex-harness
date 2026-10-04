@@ -1823,6 +1823,130 @@ fn a_forged_candidate_result_is_rejected_and_never_integrated() {
         fixture.cursor()["comparison"]["decision"],
         before["comparison"]["decision"]
     );
+
+    // Rejection recovery consumes the retained verdict through the real
+    // controller path: with continuous supervision the decision boundary
+    // restores the accepted runtime through the same shared runtime-selection
+    // owner the measured dispatches consumed, verifies the identity actually
+    // selected, and retains the restoration, the candidate commit, the
+    // measured rows and the decision evidence. No model work and no removal
+    // approval are involved in restoring the accepted baseline.
+    let baseline_runtime: harness_core::improvement_runtime::ArmRuntime = serde_json::from_slice(
+        &fs::read(fixture.arm_dir("baseline").join("runtime.json")).unwrap(),
+    )
+    .unwrap();
+    let cursor_before = fixture.cursor();
+    assert_eq!(
+        cursor_before["selected_variant"], "candidate",
+        "{cursor_before}"
+    );
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let consumed = fixture.resume();
+    let output = text(&consumed);
+    assert!(consumed.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}\n{output}");
+    assert_eq!(
+        PathBuf::from(cursor["selected_runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        baseline_runtime.variant.build.canonicalize().unwrap(),
+        "the recorded selection is the accepted baseline runtime: {cursor}"
+    );
+    assert_eq!(
+        cursor["selected_identity"],
+        format!(
+            "sha256:{}",
+            &baseline_runtime.variant.source_sha256
+                [..16.min(baseline_runtime.variant.source_sha256.len())]
+        ),
+        "{cursor}"
+    );
+    let (active, _) = harness_core::build_selection::selected(&fixture.state).unwrap();
+    assert_eq!(
+        active.canonicalize().unwrap(),
+        baseline_runtime.variant.build.canonicalize().unwrap(),
+        "the shared runtime-selection journal resolves to the accepted baseline"
+    );
+    let restoration: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("restoration.json")).unwrap()).unwrap();
+    assert_eq!(restoration["status"], "restored", "{restoration}");
+    assert_eq!(restoration["decision"], "reject", "{restoration}");
+    assert_eq!(restoration["selected"], "candidate", "{restoration}");
+    assert_eq!(
+        PathBuf::from(restoration["runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        baseline_runtime.variant.build.canonicalize().unwrap(),
+        "{restoration}"
+    );
+    assert_eq!(
+        restoration["record_sha256"],
+        build_identity::hash_file(&baseline_runtime.variant.build.join("build.json")).unwrap(),
+        "{restoration}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "idle", "{status}\n{output}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("accepted runtime"),
+        "the idle condition records the verified settlement: {status}"
+    );
+    // The rejected candidate stays outside the accepted mainline with its
+    // commit, its failed acceptance and every measurement/decision artifact
+    // retained.
+    assert!(
+        checkout.path.is_dir(),
+        "the candidate checkout is preserved"
+    );
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), base);
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+    for artifact in [
+        "comparison/decision.json",
+        "comparison/report.json",
+        "comparison/evaluation.json",
+        "lineage.json",
+    ] {
+        assert!(
+            fixture.run.join(artifact).is_file(),
+            "{artifact} is retained"
+        );
+    }
+    // Restoration is a selection, never a dispatch or a build: exactly one
+    // restoration selection is journaled and the attempt history is unchanged.
+    assert_eq!(cursor["attempts"], cursor_before["attempts"], "{cursor}");
+    let effects_before = cursor_before["effects"].as_array().unwrap().len();
+    let variants = cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(effects_before)
+        .filter(|effect| effect["kind"] == "variant-selected")
+        .count();
+    assert_eq!(
+        variants, 1,
+        "exactly one restoration selection is journaled: {cursor}"
+    );
+    // A later resume leaves the restored runtime untouched: the verification
+    // is repeated as state, not re-run as work.
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}");
+    assert_eq!(
+        PathBuf::from(cursor["selected_runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        baseline_runtime.variant.build.canonicalize().unwrap(),
+        "no later resume switches the restored selection away: {cursor}"
+    );
 }
 
 /// An accepted, measurably faster candidate yields the evidence-bound adopt

@@ -5572,6 +5572,646 @@ fn a_run_without_a_declared_corroboration_requirement_consumes_its_decision_unch
 }
 
 // ---------------------------------------------------------------------------
+// Rejection and inconclusive-result recovery through the controller and the
+// real runtime-selection owner (OpenSpec change task 5.8).
+//
+// A measured pair selects each arm's prepared runtime through the shared
+// runtime-selection owner, so a settled non-adoption can leave the recorded
+// selection on the experimental candidate. The continuous controller's
+// decision boundary restores and verifies the accepted baseline through the
+// same owner, retains the restoration and every decision artifact, continues
+// a declared grounded successor, and blocks conflicting work with the exact
+// reason when the restoration is unknown or failed. Restoring an owned
+// experimental selection is authorized recovery: it consumes no
+// capability-retirement approval, and the existing removal gates keep gating
+// every candidate removal effect.
+// ---------------------------------------------------------------------------
+
+/// One real prepared runtime state for a continuous fixture: the owned native
+/// state with its immutably published baseline and candidate builds, exactly
+/// the state the declared comparison and the runtime-selection owner consume.
+fn prepared_runtime_state(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let (state, baseline_build) = prepare_runtime(&fixture.root, name);
+    let (staged_state, staged_candidate) = prepare_runtime(&fixture.root, &format!("{name}-cand"));
+    let candidate_build = state.join("builds").join("ha-build");
+    fs::rename(&staged_candidate, &candidate_build).unwrap();
+    fs::remove_dir_all(&staged_state).unwrap();
+    // Keep the declared build names aligned with `comparison_inputs`.
+    let declared = state.join("builds").join("h-build");
+    fs::rename(&baseline_build, &declared).unwrap();
+    (state, declared, candidate_build)
+}
+
+/// The retained `ArmRuntime` receipt of the prepared baseline runtime, written
+/// exactly where the comparison owner retains it. The variant records the
+/// build identity actually published in the owned state, so the restoration
+/// verifies the same artifact a measured dispatch consumed.
+fn write_baseline_runtime_receipt(fixture: &Fixture, name: &str, baseline_build: &Path) -> PathBuf {
+    let record: Value =
+        serde_json::from_slice(&fs::read(baseline_build.join("build.json")).unwrap()).unwrap();
+    let link = |link_name: &str| {
+        json!({
+            "name": link_name,
+            "destination": fixture.home.join("harness").join(link_name).display().to_string(),
+            "source": fixture.proj.join(link_name).display().to_string(),
+            "sha256": "e".repeat(64),
+        })
+    };
+    let runtime = fixture.run.join(format!("{name}-baseline-runtime.json"));
+    fs::write(
+        &runtime,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 2,
+            "arm": "baseline",
+            "label": format!("{name}-baseline"),
+            "variant": {
+                "arm": "baseline",
+                "label": format!("{name}-baseline"),
+                "build": baseline_build.display().to_string(),
+                "recordSha256": build_identity::hash_file(&baseline_build.join("build.json")).unwrap(),
+                "sourceSha256": record["source"]["sha256"],
+            },
+            "source": fixture.proj,
+            "home": fixture.home,
+            "userHome": fixture.home,
+            "dependencyUserHome": fixture.home,
+            "upstream": fixture.root.join("upstream.exe"),
+            "upstreamSha256": "f".repeat(64),
+            "launcher": link("bin/codex.exe"),
+            "launchRegistration": fixture.home.join("harness/native-launch.json").display().to_string(),
+            "launchSha256": "e".repeat(64),
+            "instructions": link("AGENTS.md"),
+            "agents": link("agents"),
+            "skills": [],
+            "commands": [],
+            "private": [],
+            "installation": {
+                "status": "healthy",
+                "links": 0,
+                "changedLinks": 0,
+                "pathChange": false,
+                "runtimeExecutableSha256": "e".repeat(64),
+                "runtimeEvidence": fixture.root.join("runtime-evidence").display().to_string(),
+            },
+            "modelCalls": 0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    runtime
+}
+
+/// Seed one settled non-adoption whose measured pair left the recorded
+/// experimental candidate selection active, exactly as the comparison owner
+/// leaves the decision boundary.
+fn seed_selected_nonadoption(
+    fixture: &Fixture,
+    decision: &str,
+    runtime_receipt: &Path,
+    candidate_build: &Path,
+) {
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let bindings = fixture.run.join("comparison/bindings.json");
+    seed_decision_boundary(fixture, &bindings, "workload-b", &head, decision);
+    let mut cursor = fixture.cursor();
+    cursor["comparison"]["baseline"] = json!({
+        "runtime": runtime_receipt.display().to_string(),
+    });
+    cursor["comparison"]["candidate"] = json!({
+        "revision": head,
+    });
+    cursor["selected_variant"] = json!("candidate");
+    cursor["selected_runtime"] = json!(candidate_build.display().to_string());
+    cursor["selected_identity"] = json!("sha256:candidate-fixture");
+    fixture.write_cursor(&cursor);
+}
+
+/// The comparison run spec every 5.8 fixture starts from: the declared
+/// comparison over the real prepared runtime state, an explicit runner and
+/// the frozen acceptance request inputs, exactly as the measured-pair owner
+/// consumes them.
+fn write_recovery_spec(fixture: &Fixture, state: &Path, removal: Option<Value>) {
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let comparison = comparison_inputs(
+        fixture,
+        state,
+        &upstream,
+        &policy,
+        &request,
+        &request_sha,
+        &head,
+    );
+    let mut replacements = vec![
+        (
+            "runner",
+            json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+        ),
+        (
+            "local_runner",
+            json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+        ),
+        ("qualification", json!(qualification)),
+        ("comparison", comparison),
+    ];
+    if let Some(removal) = removal {
+        replacements.push(("removal", removal));
+    }
+    fixture.write_spec(&replacements, None);
+}
+
+/// Start one recovery fixture around the real prepared runtime state. Returns
+/// the accepted base revision. A declared successor is written from the
+/// frozen comparison spec after that spec exists, so the successor really is
+/// an independent specification of another grounded hypothesis.
+fn start_recovery_fixture(
+    fixture: &Fixture,
+    state: &Path,
+    removal: Option<Value>,
+    successor: Option<(&Path, &Path, &str, &str)>,
+) -> String {
+    write_recovery_spec(fixture, state, removal);
+    if let Some((spec, _, hypothesis, workload)) = successor {
+        successor_run_spec(fixture, spec, "loop-fixture-next", hypothesis, workload);
+    }
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let mut args = vec![
+        "start".to_owned(),
+        "--run".to_owned(),
+        fixture.run.to_string_lossy().into_owned(),
+        "--spec".to_owned(),
+        fixture.spec.to_string_lossy().into_owned(),
+    ];
+    if let Some((spec, run, _, _)) = successor {
+        args.extend([
+            "--successor-spec".to_owned(),
+            spec.to_string_lossy().into_owned(),
+            "--successor-run".to_owned(),
+            run.to_string_lossy().into_owned(),
+        ]);
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let started = fixture.improve(&refs);
+    assert!(started.status.success(), "{}", text(&started));
+    head
+}
+
+/// A rejection consumes through the continuous controller: the accepted
+/// baseline runtime is restored and verified through the same shared
+/// runtime-selection owner the measured dispatches consumed, the candidate
+/// commit and every measurement/decision artifact stay retained, and another
+/// grounded hypothesis continues through its declared own specification. No
+/// model work and no capability-retirement approval are involved.
+#[test]
+fn a_rejection_restores_the_accepted_runtime_and_continues_the_declared_successor() {
+    let fixture = Fixture::new("reject-restore");
+    let (state, baseline_build, candidate_build) =
+        prepared_runtime_state(&fixture, "reject-restore");
+    let other = admit_distinct_hypothesis_card(&fixture, "bounded-quantity");
+    let spec_b = fixture.root.join("spec-reject-restore-next.json");
+    let run_b = fixture.root.join("runs-reject-restore-next");
+    let head = start_recovery_fixture(
+        &fixture,
+        &state,
+        None,
+        Some((&spec_b, &run_b, &other, "workload-c")),
+    );
+    let runtime_receipt =
+        write_baseline_runtime_receipt(&fixture, "reject-restore", &baseline_build);
+    seed_selected_nonadoption(&fixture, "reject", &runtime_receipt, &candidate_build);
+
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    assert!(output.contains("restored"), "{output}");
+
+    // The restored selection is the exact prepared baseline variant, verified
+    // through the shared journal and reported with its own identity.
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}");
+    assert_eq!(
+        PathBuf::from(cursor["selected_runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        baseline_build.canonicalize().unwrap(),
+        "{cursor}"
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(baseline_build.join("build.json")).unwrap()).unwrap();
+    let source_sha = record["source"]["sha256"].as_str().unwrap();
+    assert_eq!(
+        cursor["selected_identity"],
+        format!("sha256:{}", &source_sha[..16]),
+        "{cursor}"
+    );
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(
+        active.canonicalize().unwrap(),
+        baseline_build.canonicalize().unwrap(),
+        "the shared runtime-selection journal resolves to the accepted baseline"
+    );
+    let restoration: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("restoration.json")).unwrap()).unwrap();
+    assert_eq!(restoration["status"], "restored", "{restoration}");
+    assert_eq!(restoration["decision"], "reject", "{restoration}");
+    assert_eq!(restoration["selected"], "candidate", "{restoration}");
+    assert_eq!(
+        PathBuf::from(restoration["runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        baseline_build.canonicalize().unwrap(),
+        "{restoration}"
+    );
+    assert_eq!(
+        restoration["record_sha256"],
+        build_identity::hash_file(&baseline_build.join("build.json")).unwrap(),
+        "{restoration}"
+    );
+
+    // The candidate commit, the decision and every measured artifact stay
+    // retained, and the accepted mainline is unchanged.
+    let lineage: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("lineage.json")).unwrap()).unwrap();
+    assert_eq!(lineage["decision"], "reject", "{lineage}");
+    assert_eq!(lineage["candidate_revision"], head, "{lineage}");
+    assert!(fixture.run.join("comparison/evaluation.json").is_file());
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), head);
+
+    // Another grounded hypothesis continues: the declared successor started
+    // with the retained lineage and no model work ran in this run.
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "completed", "{marker}");
+    assert_eq!(marker["hypothesis"], other, "{marker}");
+    assert_eq!(marker["decision"], "reject", "{marker}");
+    assert!(
+        run_b.join("cursor.json").is_file(),
+        "the declared successor run was started"
+    );
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("leaves the baseline unchanged"),
+        "{status}"
+    );
+    assert!(
+        fixture.cursor()["attempts"].as_array().unwrap().is_empty(),
+        "recovery dispatches no model work"
+    );
+    // Restoration is a selection, never a dispatch or a build: exactly one
+    // restoration selection is journaled.
+    let variants = cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|effect| effect["kind"] == "variant-selected")
+        .count();
+    assert_eq!(variants, 1, "{cursor}");
+
+    // A repeated resume settles on the restored runtime and starts nothing
+    // new: the successor was already consumed once.
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}");
+    assert_eq!(
+        PathBuf::from(cursor["selected_runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        baseline_build.canonicalize().unwrap(),
+        "{cursor}"
+    );
+    assert!(
+        text(&again).contains("already completed"),
+        "{}",
+        text(&again)
+    );
+}
+
+/// Inconclusive evidence defers: the candidate stays inactive with the missing
+/// fact recorded, the accepted runtime is restored, and the unchanged
+/// experiment is never retried. A successor that names this run's own
+/// specification is refused with the exact reason and no second controller is
+/// started.
+#[test]
+fn inconclusive_evidence_defers_without_an_identical_retry() {
+    let fixture = Fixture::new("inconclusive-defer");
+    let (state, baseline_build, candidate_build) =
+        prepared_runtime_state(&fixture, "inconclusive-defer");
+    let head = start_recovery_fixture(&fixture, &state, None, None);
+    let runtime_receipt =
+        write_baseline_runtime_receipt(&fixture, "inconclusive-defer", &baseline_build);
+    seed_selected_nonadoption(&fixture, "inconclusive", &runtime_receipt, &candidate_build);
+
+    let run_b = fixture.root.join("runs-inconclusive-defer");
+    let own_spec = fixture.run.join("spec.json");
+    fs::write(
+        fixture.run.join("successor.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "spec": own_spec.display().to_string(),
+            "run": run_b.display().to_string(),
+            "integration_check": Value::Null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}");
+    let restoration: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("restoration.json")).unwrap()).unwrap();
+    assert_eq!(restoration["status"], "restored", "{restoration}");
+    assert_eq!(restoration["decision"], "inconclusive", "{restoration}");
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "blocked", "{status}\n{output}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("unchanged inconclusive or completed experiment is not repeated"),
+        "the identical retry is refused with the exact reason: {status}"
+    );
+    assert!(
+        !run_b.join("cursor.json").exists(),
+        "no identical second controller is started"
+    );
+    assert!(
+        cursor["attempts"].as_array().unwrap().is_empty(),
+        "deferral starts no model work: {cursor}"
+    );
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), head);
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+
+    // The refusal is stable across resumes: the run stays blocked with the
+    // same recorded reason and never replays the settled experiment.
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "blocked", "{status}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not repeated"),
+        "{status}"
+    );
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+}
+
+/// Inconclusive evidence continues eligible work when a distinct grounded
+/// successor is declared: the candidate stays inactive with the missing fact
+/// and its reconsideration condition recorded, and the successor's own
+/// specification drives the next experiment.
+#[test]
+fn inconclusive_evidence_continues_another_grounded_hypothesis() {
+    let fixture = Fixture::new("inconclusive-next");
+    let (state, baseline_build, candidate_build) =
+        prepared_runtime_state(&fixture, "inconclusive-next");
+    let other = admit_distinct_hypothesis_card(&fixture, "bounded-output");
+    let spec_b = fixture.root.join("spec-inconclusive-next.json");
+    let run_b = fixture.root.join("runs-inconclusive-next");
+    start_recovery_fixture(
+        &fixture,
+        &state,
+        None,
+        Some((&spec_b, &run_b, &other, "workload-c")),
+    );
+    let runtime_receipt =
+        write_baseline_runtime_receipt(&fixture, "inconclusive-next", &baseline_build);
+    seed_selected_nonadoption(&fixture, "inconclusive", &runtime_receipt, &candidate_build);
+
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}\n{output}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("missing evidence") && condition.contains("not retried"),
+        "the deferral records the missing fact and its reconsideration condition: {status}"
+    );
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "completed", "{marker}");
+    assert_eq!(marker["hypothesis"], other, "{marker}");
+    assert_eq!(marker["decision"], "inconclusive", "{marker}");
+    assert!(
+        run_b.join("cursor.json").is_file(),
+        "another eligible hypothesis proceeds"
+    );
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+}
+
+/// Unknown or failed restoration blocks conflicting use with the exact reason
+/// until the owned runtime state is reconciled: a missing baseline runtime
+/// receipt and a changed prepared build each hold the decision boundary, start
+/// no successor and dispatch no model work; reconciling the resource lets the
+/// same boundary settle the accepted runtime.
+#[test]
+fn unknown_or_failed_restoration_blocks_conflicting_use() {
+    let fixture = Fixture::new("restoration-blocked");
+    let (state, baseline_build, candidate_build) =
+        prepared_runtime_state(&fixture, "restoration-blocked");
+    let head = start_recovery_fixture(&fixture, &state, None, None);
+    let runtime_receipt = fixture
+        .run
+        .join("restoration-blocked-baseline-runtime.json");
+    seed_selected_nonadoption(&fixture, "reject", &runtime_receipt, &candidate_build);
+
+    // Unknown: the accepted baseline runtime receipt does not exist, so the
+    // restoration cannot identify the accepted runtime.
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.starts_with("decision boundary blocked")
+            && condition.contains("restoration")
+            && condition.contains("baseline runtime receipt is missing"),
+        "the unknown state blocks with the exact reason: {status}"
+    );
+    let restoration: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("restoration.json")).unwrap()).unwrap();
+    assert_eq!(restoration["status"], "failed", "{restoration}");
+    assert_eq!(restoration["attempts"], 1, "{restoration}");
+    assert!(
+        !fixture.run.join("continuation.json").exists(),
+        "no conflicting continuation starts while the resource is unknown"
+    );
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), head);
+
+    // Failed: the receipt exists but the prepared build no longer matches the
+    // recorded identity; the exact refusal reason stays recorded and repeated
+    // resumes stay blocked without replaying anything.
+    let receipt = write_baseline_runtime_receipt(&fixture, "restoration-blocked", &baseline_build);
+    assert_eq!(receipt, runtime_receipt);
+    let build_json = baseline_build.join("build.json");
+    let original = fs::read(&build_json).unwrap();
+    let mut altered = original.clone();
+    altered.push(b' ');
+    fs::write(&build_json, &altered).unwrap();
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("restoration") && condition.contains("changed since preparation"),
+        "the failed restoration blocks with its exact reason: {status}"
+    );
+    let restoration: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("restoration.json")).unwrap()).unwrap();
+    assert_eq!(restoration["status"], "failed", "{restoration}");
+    assert_eq!(restoration["attempts"], 2, "{restoration}");
+    assert!(
+        restoration["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("changed since preparation"),
+        "{restoration}"
+    );
+    assert!(!fixture.run.join("continuation.json").exists());
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+
+    // Reconciled: the prepared build returns to its recorded identity and the
+    // same boundary settles the accepted runtime; the run idles and the
+    // verified selection is the accepted baseline again.
+    fs::write(&build_json, &original).unwrap();
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}\n{output}");
+    assert_eq!(
+        PathBuf::from(cursor["selected_runtime"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap(),
+        baseline_build.canonicalize().unwrap(),
+        "{cursor}"
+    );
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(
+        active.canonicalize().unwrap(),
+        baseline_build.canonicalize().unwrap()
+    );
+    let restoration: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("restoration.json")).unwrap()).unwrap();
+    assert_eq!(restoration["status"], "restored", "{restoration}");
+    assert_eq!(restoration["attempts"], 3, "{restoration}");
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+}
+
+/// Experimental restoration consumes no capability-retirement approval, while
+/// the existing removal gates stay intact: a rejection of a removal-treated
+/// candidate restores the accepted baseline with the removal decision still
+/// pending, and selecting the candidate still waits for that decision.
+#[test]
+fn rejection_restoration_needs_no_removal_approval_and_keeps_the_gates_intact() {
+    let fixture = Fixture::new("restore-removal");
+    let (state, baseline_build, candidate_build) =
+        prepared_runtime_state(&fixture, "restore-removal");
+    let head = start_recovery_fixture(
+        &fixture,
+        &state,
+        Some(json!({"proposal": "remove-x", "target": "skill-x"})),
+        None,
+    );
+    let runtime_receipt =
+        write_baseline_runtime_receipt(&fixture, "restore-removal", &baseline_build);
+    seed_selected_nonadoption(&fixture, "reject", &runtime_receipt, &candidate_build);
+
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}\n{output}");
+    let restoration: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("restoration.json")).unwrap()).unwrap();
+    assert_eq!(restoration["status"], "restored", "{restoration}");
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert_eq!(status["removal"]["declared"], true, "{status}");
+    assert!(
+        status["removal"]["gate"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pending"),
+        "the removal decision is still pending: {status}"
+    );
+    // No approval ritual was performed for the restoration, and the candidate
+    // removal was not applied anywhere.
+    let comments =
+        harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &fixture.card)
+            .unwrap();
+    assert!(
+        comments
+            .iter()
+            .all(|comment| !comment.contains("removal-decision v1")),
+        "restoration asks for no removal decision: {comments:?}"
+    );
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), head);
+
+    // The existing gates stay intact through the real `select` verb: the
+    // accepted baseline is selectable (restoration needs no approval), the
+    // removal candidate still waits for the missing decision.
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+    fs::write(
+        fixture.run.join("variants.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "baseline": {"state": state, "build": baseline_build, "identity": Value::Null},
+            "candidate": {"state": state, "build": candidate_build, "identity": Value::Null},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let select_baseline = fixture.improve(&["select", "--run", &run_arg, "--variant", "baseline"]);
+    assert!(
+        select_baseline.status.success(),
+        "{}",
+        text(&select_baseline)
+    );
+    let select_candidate =
+        fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(
+        select_candidate.status.code(),
+        Some(2),
+        "{}",
+        text(&select_candidate)
+    );
+    assert!(
+        text(&select_candidate).contains("removal approval is pending"),
+        "the removal gate still refuses the candidate: {}",
+        text(&select_candidate)
+    );
+    assert_eq!(fixture.cursor()["selected_variant"], "baseline");
+}
+
+// ---------------------------------------------------------------------------
 // Installed removal gates and restoration (OpenSpec change task 6.5)
 // ---------------------------------------------------------------------------
 
