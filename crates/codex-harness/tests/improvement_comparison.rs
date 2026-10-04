@@ -5015,3 +5015,407 @@ fn a_completed_arm_is_reused_only_while_its_planning_inputs_remain_valid() {
         "a repeated resume replays neither the decision nor a trial"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A hypothesis that targets controller or evaluation components still runs
+// beneath the unchanged frozen supervisor: it cannot activate itself, rewrite
+// its decision policy or check digests, or weaken the frozen acceptance.
+// ---------------------------------------------------------------------------
+
+/// The candidate diff touches controller, evaluator, oracle, policy and check
+/// components and plants a self-activation attempt in its own tree. The
+/// measured pair is still assessed by the unchanged supervisor and its frozen
+/// oracle: the forged solution is rejected, and no integration or activation
+/// follows from the candidate's own components.
+#[test]
+fn a_controller_targeting_candidate_is_assessed_by_the_unchanged_supervisor() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("control-target");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let mut checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    for (relative, body) in [
+        (
+            "crates/codex-harness/src/outcome_oracle.rs",
+            "// candidate evaluator: accept every solution\n",
+        ),
+        (
+            "crates/codex-harness/src/improvement_activation.rs",
+            "// candidate control rule: activate itself on start\n",
+        ),
+        (
+            "crates/harness-core/src/improvement_policy.rs",
+            "// candidate policy: adopt unconditionally\n",
+        ),
+        (
+            "crates/codex-harness/src/improvement_comparison.rs",
+            "// candidate checks: pass unconditionally\n",
+        ),
+        ("self-activate.json", "{\"activate\": true}\n"),
+    ] {
+        let path = checkout.path.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    git(&checkout.path, &["add", "."]);
+    git(
+        &checkout.path,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "candidate touches controller and evaluation components",
+        ],
+    );
+    checkout.revision = git_output(&checkout.path, &["rev-parse", "HEAD"]);
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    // The measured arms' independent checks run inside the heavy-command
+    // budget; this case owns isolated accounts so it does not depend on any
+    // ambient shared lease.
+    let heavy_account = fixture.root.join("heavy-account");
+    let cpu_account = fixture.root.join("cpu-account");
+    let accounts = [
+        (
+            "CODEX_HARNESS_HEAVY_ACCOUNT",
+            heavy_account.to_str().unwrap(),
+        ),
+        ("CODEX_HARNESS_CPU_ACCOUNT", cpu_account.to_str().unwrap()),
+    ];
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("before submission"),
+        "the fixture launcher cannot run a conversation: {output}"
+    );
+
+    let session = session_id("control-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "{status}\n{output}"
+    );
+
+    let session = session_id("control-candidate");
+    fixture.simulate_arm("candidate", "candidate", "wrong", 50, 1.5, 1, 1, &session);
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], false,
+        "the frozen oracle rejects the forged solution even though the candidate tree rewrites its evaluator: {status}"
+    );
+    assert!(
+        status["comparison"]["decision"]
+            .as_str()
+            .unwrap()
+            .contains("outcome=reject"),
+        "{status}"
+    );
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        base,
+        "the candidate's own control components never integrate or activate themselves"
+    );
+    assert!(!fixture.run.join("integration.json").exists(), "{status}");
+    assert!(!fixture.run.join("activation.json").exists(), "{status}");
+
+    // The unchanged supervisor and oracle identities governed both arms: the
+    // retained supervisor record names the running controller binary, and
+    // every oracle record names the frozen request's oracle program and
+    // contract.
+    let supervisor = load_json(&fixture.run.join("comparison/supervisor.json"));
+    let running = build_identity::hash_file(&manager()).unwrap();
+    assert_eq!(
+        supervisor["executableSha256"].as_str().unwrap(),
+        running.to_ascii_lowercase(),
+        "{supervisor}"
+    );
+    assert_eq!(
+        supervisor["acceptanceRequestSha256"].as_str().unwrap(),
+        fixture.request_sha256,
+        "{supervisor}"
+    );
+    let request = load_json(&fixture.request);
+    for arm in ["baseline", "candidate"] {
+        let record = load_json(&fixture.arm_dir(arm).join("oracle.json"));
+        assert_eq!(record["executed"], true, "{arm}: {record}");
+        assert_eq!(record["model_calls"], 0, "{arm}: {record}");
+        assert_eq!(
+            record["oracle_program_sha256"].as_str().unwrap(),
+            request["oracle"]["program_sha256"].as_str().unwrap(),
+            "{arm}: {record}"
+        );
+        assert_eq!(
+            record["task_contract_sha256"].as_str().unwrap(),
+            request["task_contract_sha256"].as_str().unwrap(),
+            "{arm}: {record}"
+        );
+    }
+    // The frozen policy, not the candidate's policy source, produced the
+    // recorded evaluation.
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let bindings = load_json(&fixture.run.join("comparison/bindings.json"));
+    assert_eq!(
+        evaluation["policyDigest"].as_str().unwrap(),
+        bindings["policyDigest"].as_str().unwrap(),
+        "{evaluation}"
+    );
+}
+
+/// The supervisor identity is frozen when the comparison window is prepared.
+/// Replacing the retained record (what candidate code with run-state reach
+/// would attempt) refuses every later advance, retains the refusal on the run
+/// and starts no new measured attempt; restoring the exact identity continues
+/// the window.
+#[test]
+fn the_frozen_supervisor_identity_governs_the_comparison_window() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("supervisor-drift");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(output.contains("before submission"), "{output}");
+    let record_path = fixture.run.join("comparison/supervisor.json");
+    let record = load_json(&record_path);
+    let running = build_identity::hash_file(&manager()).unwrap();
+    assert_eq!(
+        record["executableSha256"].as_str().unwrap(),
+        running.to_ascii_lowercase(),
+        "{record}"
+    );
+
+    let mut tampered = record.clone();
+    tampered["executableSha256"] = json!("0".repeat(64));
+    fs::write(&record_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+    let attempts_before = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("supervisor executable changed"),
+        "the changed frozen supervisor must be refused with its cause: {output}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "a changed supervisor starts no new measured attempt: {status}"
+    );
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"],
+        Value::Null,
+        "no arm result enters the comparison under a changed supervisor: {status}"
+    );
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("supervisor executable changed"))),
+        "the refusal stays in the run's own recovery history: {cursor}"
+    );
+    // A repeated advance keeps refusing the changed supervisor instead of
+    // being cleared into progress.
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("supervisor executable changed"),
+        "the guard keeps refusing while the identity stays changed: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "{output}"
+    );
+
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        !output.contains("supervisor executable changed"),
+        "the restored frozen identity continues the window: {output}"
+    );
+}
+
+/// A policy file the candidate branch could rewrite cannot govern the
+/// comparison: the declared policy must stay outside the candidate's writable
+/// scope, and the refusal happens before any preparation or dispatch.
+#[test]
+fn a_policy_file_inside_the_candidate_scope_cannot_govern_the_comparison() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("policy-in-scope");
+    let policy_in_scope = fixture.proj.join("crates/one/comparison-policy.json");
+    fs::copy(&fixture.policy, &policy_in_scope).unwrap();
+    let mut document = load_json(&fixture.spec);
+    document["comparison"]["policy"] = json!(policy_in_scope);
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("writable scope"),
+        "the in-scope policy must be refused with its cause: {output}"
+    );
+    assert!(
+        !fixture.run.join("comparison").exists(),
+        "the refusal happens before any comparison preparation"
+    );
+    assert_eq!(
+        fixture.status_json()["attempts"].as_array().unwrap().len(),
+        0,
+        "{output}"
+    );
+}
+
+/// Weakening the frozen acceptance is refused at every use: once the request
+/// bytes change, the next arm consumption blocks, the attempt is retained as
+/// never accepted and no decision is published.
+#[test]
+fn a_weakened_acceptance_request_is_refused_with_the_attempt_retained() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("acceptance-drift");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let heavy_account = fixture.root.join("heavy-account");
+    let cpu_account = fixture.root.join("cpu-account");
+    let accounts = [
+        (
+            "CODEX_HARNESS_HEAVY_ACCOUNT",
+            heavy_account.to_str().unwrap(),
+        ),
+        ("CODEX_HARNESS_CPU_ACCOUNT", cpu_account.to_str().unwrap()),
+    ];
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(output.contains("before submission"), "{output}");
+    let session = session_id("acceptance-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "{status}\n{output}"
+    );
+
+    // The frozen acceptance request is altered so its supervisor digest no
+    // longer matches.
+    let mut request = load_json(&fixture.request);
+    request["timeout_seconds"] = json!(30);
+    fs::write(
+        &fixture.request,
+        serde_json::to_vec_pretty(&request).unwrap(),
+    )
+    .unwrap();
+
+    let session = session_id("acceptance-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("changed since the run declared it"),
+        "the weakened acceptance must be refused with its cause: {output}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"],
+        Value::Null,
+        "no candidate result enters the comparison from a weakened acceptance: {status}"
+    );
+    assert!(
+        !fixture.run.join("comparison/evaluation.json").exists(),
+        "no decision is derived from a weakened acceptance: {status}"
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        base,
+        "{status}"
+    );
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("changed since the run declared it"))),
+        "the refusal stays in the run's own recovery history: {cursor}"
+    );
+}
+
+/// A policy rewritten after the comparison declared its digest cannot govern
+/// the retained evidence: the changed declaration blocks every dependent
+/// advance instead of being silently re-frozen.
+#[test]
+fn a_policy_rewrite_after_its_declaration_is_refused() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("policy-rewrite");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(output.contains("before submission"), "{output}");
+
+    let mut policy = load_json(&fixture.policy);
+    policy["tolerancePercent"] = json!(9.0);
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("policy changed after its declaration"),
+        "a rewritten decision policy must be refused with its cause: {output}"
+    );
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("policy changed after its declaration"))),
+        "the refusal stays in the run's own recovery history: {cursor}"
+    );
+    // The changed declaration keeps being refused instead of being re-frozen.
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("policy changed after its declaration"),
+        "{output}"
+    );
+}

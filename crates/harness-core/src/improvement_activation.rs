@@ -706,6 +706,27 @@ pub fn integrate(request: &IntegrationRequest<'_>) -> io::Result<IntegrationOutc
     // hypothesis card before any effect, so the receipt can name the exact
     // retained solution the integrated candidate carries.
     let workload_lineage = carried_workload_lineage(request, candidate_checkout)?;
+    // The declared combined-tree check is frozen once a retained receipt has
+    // exercised it: a later declaration cannot silently run a different
+    // (possibly weakened) check to reauthorize the same integrated revision.
+    // The checker bytes at the declared path remain re-derivable, and every
+    // receipt records the digest actually executed.
+    if let Some(prior) = request
+        .prior
+        .as_ref()
+        .filter(|prior| prior.item == evidence.item && prior.experiment == evidence.experiment)
+        && (!same_path(&prior.checks.program, &request.check.program)
+            || prior.checks.args != declared_args(&request.check))
+    {
+        return Ok(IntegrationOutcome::Blocked(blocked(
+            false,
+            format!(
+                "the declared combined-tree check changed after the retained receipt exercised a different check ({} vs {}); a changed check declaration cannot reauthorize the same integrated revision, so a fresh decision is required",
+                prior.checks.program.display(),
+                request.check.program.display()
+            ),
+        )));
+    }
     let head = git_head(&request.mainline)?;
     if head == evidence.candidate_revision {
         let checks = match request

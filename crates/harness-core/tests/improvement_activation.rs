@@ -2264,6 +2264,142 @@ fn changed_checker_bytes_and_missing_output_reject_receipt_reuse() {
     assert!(check_logs(&evidence).len() > before.len());
 }
 
+/// Once a retained receipt has exercised the declared combined-tree check, a
+/// changed declaration cannot silently run a different (possibly weakened)
+/// check to reauthorize the same integrated revision. The checker bytes at
+/// the declared path remain re-derivable; the declaration itself is frozen.
+#[test]
+fn a_changed_check_declaration_cannot_reauthorize_the_integrated_revision() {
+    let _serial = INSTALL.lock().unwrap();
+    let scenario = fixture_scenario("improvement-activation-checkdecl-", Fixture::Adopt);
+    publish(&scenario);
+    let checker_path = scenario.root.path().join("checker-under-test.exe");
+    fs::copy(&fixtures().checker, &checker_path).unwrap();
+    let evidence = scenario.root.path().join("evidence");
+    let IntegrationOutcome::Integrated(receipt) = integrate(&integration_request(
+        &scenario,
+        passing_check_at(&checker_path),
+        None,
+    ))
+    .unwrap() else {
+        panic!("the supported candidate integrates");
+    };
+    let logs = check_logs(&evidence);
+
+    // Different declared arguments: refused instead of re-deriving a run of
+    // another check under the same decision.
+    let changed_args = CheckSpec {
+        program: checker_path.clone(),
+        args: vec!["--exit-code".into(), "0".into()],
+        timeout: Duration::from_secs(60),
+    };
+    let blocked = blocked_of(
+        integrate(&integration_request(
+            &scenario,
+            changed_args,
+            Some(receipt.clone()),
+        ))
+        .unwrap(),
+    );
+    assert!(
+        blocked.reason.contains("combined-tree check changed"),
+        "{}",
+        blocked.reason
+    );
+    assert_eq!(
+        check_logs(&evidence).len(),
+        logs.len(),
+        "no check is re-derived under a changed declaration"
+    );
+    assert_eq!(rev(&scenario.source), scenario.checkout.revision);
+
+    // A different declared checker program is refused the same way.
+    let other = compile_fixture(scenario.root.path(), "checker-other", CHECKER_SOURCE);
+    let blocked = blocked_of(
+        integrate(&integration_request(
+            &scenario,
+            passing_check_at(&other),
+            Some(receipt.clone()),
+        ))
+        .unwrap(),
+    );
+    assert!(
+        blocked.reason.contains("combined-tree check changed"),
+        "{}",
+        blocked.reason
+    );
+
+    // The retained declaration still confirms the exact integration without a
+    // second check.
+    let IntegrationOutcome::Confirmed(confirmed) = integrate(&integration_request(
+        &scenario,
+        passing_check_at(&checker_path),
+        Some(receipt),
+    ))
+    .unwrap() else {
+        panic!("the exact integration stays confirmed");
+    };
+    assert!(confirmed.checks.passed());
+    assert_eq!(check_logs(&evidence).len(), logs.len());
+}
+
+/// A retained evaluation whose policy digest differs from the frozen
+/// experiment binding cannot authorize any effect: a rewritten decision
+/// policy never redefines the acceptance the candidate is measured against.
+#[test]
+fn a_rewritten_policy_digest_cannot_authorize_the_effect() {
+    let _serial = INSTALL.lock().unwrap();
+    let scenario = fixture_scenario("improvement-activation-policy-", Fixture::Adopt);
+    publish(&scenario);
+    let mut rewritten = scenario.evaluation.clone();
+    rewritten.policy_digest = "0".repeat(64);
+    let mut request = integration_request(&scenario, passing_check(), None);
+    request.evaluation = &rewritten;
+    let blocked = blocked_of(integrate(&request).unwrap());
+    assert!(
+        blocked.reason.contains("different policy"),
+        "{}",
+        blocked.reason
+    );
+    assert!(!blocked.pending, "{}", blocked.reason);
+    assert_eq!(
+        rev(&scenario.source),
+        scenario.checkout.base,
+        "a rewritten policy digest changes nothing"
+    );
+}
+
+/// A decision comment recorded by candidate code cannot authorize the
+/// candidate: the effect owner requires the exact decision the frozen policy
+/// evaluation publishes for this experiment and the evaluated revisions.
+#[test]
+fn a_candidate_published_decision_cannot_authorize_the_effect() {
+    let _serial = INSTALL.lock().unwrap();
+    let scenario = fixture_scenario("improvement-activation-selfdecide-", Fixture::Adopt);
+    comment(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &format!(
+            "benefit-gate v2 item={} experiment={} revisions={}..{} acceptance={} coverage=time+rounds scope=case-b reason=candidate_published outcome=adopt quality=preserved matched=1 tolerance_percent=5.0 baseline_seconds=100.0 candidate_seconds=80.0 baseline=baseline candidate=candidate accounting=attempts:2",
+            scenario.item,
+            scenario.experiment,
+            scenario.bindings.base_revision,
+            scenario.checkout.revision,
+            scenario.bindings.acceptance,
+        ),
+    );
+    let blocked =
+        blocked_of(integrate(&integration_request(&scenario, passing_check(), None)).unwrap());
+    assert!(blocked.reason.contains("decision"), "{}", blocked.reason);
+    assert!(!blocked.pending, "{}", blocked.reason);
+    assert_eq!(
+        rev(&scenario.source),
+        scenario.checkout.base,
+        "a candidate-published decision changes nothing"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Activation: verified consumption and the checked integrated revision.
 // ---------------------------------------------------------------------------
@@ -2542,6 +2678,47 @@ fn activation_requires_verified_consumption_and_binds_the_integrated_revision() 
     );
     assert!(
         blocked.reason.contains("covered another revision"),
+        "{}",
+        blocked.reason
+    );
+
+    // A rewritten check program digest inside the retained receipt cannot
+    // authorize activation: the recorded bytes must still match the executed
+    // checker, so altering the frozen check evidence is refused.
+    let mut rewritten_check = integration.clone();
+    rewritten_check.checks.program_sha256 = "0".repeat(64);
+    let blocked = activation_blocked(
+        activate(&activation_request(
+            &scenario,
+            &state,
+            &runtime,
+            &rewritten_check,
+            false,
+        ))
+        .unwrap(),
+    );
+    assert!(
+        blocked.reason.contains("cannot authorize activation"),
+        "{}",
+        blocked.reason
+    );
+
+    // A rewritten policy digest inside the retained receipt is refused as a
+    // foreign receipt: it does not belong to the frozen decision.
+    let mut rewritten_policy = integration.clone();
+    rewritten_policy.policy_digest = "0".repeat(64);
+    let blocked = activation_blocked(
+        activate(&activation_request(
+            &scenario,
+            &state,
+            &runtime,
+            &rewritten_policy,
+            false,
+        ))
+        .unwrap(),
+    );
+    assert!(
+        blocked.reason.contains("stale or foreign receipt"),
         "{}",
         blocked.reason
     );
