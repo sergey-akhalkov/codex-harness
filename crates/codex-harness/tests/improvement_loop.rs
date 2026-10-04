@@ -5,6 +5,7 @@
 #![cfg(windows)]
 
 use harness_core::build_identity::{BINARIES, hash_bytes};
+use harness_core::{board_lifecycle, build_identity, core_install, installation_state::PathScope};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -4434,4 +4435,977 @@ fn declared_corroboration_selects_an_independent_retained_unit_by_identity() {
     let report = status_value(&fixture);
     assert_eq!(report["corroboration"]["ready"], true, "{report}");
     assert_eq!(report["corroboration"]["units"][0]["case_id"], "case-c");
+}
+
+// ---------------------------------------------------------------------------
+// Installed removal gates and restoration (OpenSpec change task 6.5)
+// ---------------------------------------------------------------------------
+
+/// The fixture-owned disposable capability: a synthetic skill package the
+/// exercise publishes into an isolated installed home and may remove.
+const DISPOSABLE_SKILL: &str = "owned-disposable";
+const DISPOSABLE_PROPOSAL: &str = "remove-owned-capability";
+const DISPOSABLE_TARGET: &str = "skill-owned-disposable";
+
+/// One isolated installed kit outside this checkout: the installed manager and
+/// the homes every child command is confined to. No verb runs the test build.
+struct InstalledKit {
+    manager: PathBuf,
+    codex_home: PathBuf,
+    user_home: PathBuf,
+}
+
+impl InstalledKit {
+    fn command(&self, program: &Path, cwd: &Path) -> Command {
+        let mut command = Command::new(program);
+        command
+            .current_dir(cwd)
+            .env("CODEX_HOME", &self.codex_home)
+            .env("USERPROFILE", &self.user_home)
+            .env("HOME", &self.user_home);
+        command
+    }
+
+    fn run(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.command(&self.manager, cwd)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn feedback(&self, project: &Path, bd: &Path, args: &[&str]) -> Output {
+        let mut command = self.command(&self.manager, project);
+        command
+            .arg("feedback")
+            .args(args)
+            .arg("--project")
+            .arg(project)
+            .arg("--bd")
+            .arg(bd);
+        command.output().unwrap()
+    }
+}
+
+fn assert_succeeded(label: &str, out: &Output) {
+    assert!(out.status.success(), "{label}: {}", text(out));
+}
+
+fn assert_exit(label: &str, out: &Output, code: i32) {
+    assert_eq!(out.status.code(), Some(code), "{label}: {}", text(out));
+}
+
+fn bd_run(bd: &Path, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(bd)
+        .args(args)
+        .current_dir(cwd)
+        .env("BD_NON_INTERACTIVE", "1")
+        .env("BEADS_ACTOR", "removal-gate-exercise")
+        .output()
+        .unwrap()
+}
+
+/// Writes the staged disposable capability: a minimal valid skill package the
+/// installed skill lifecycle can publish and re-publish unchanged.
+fn write_disposable_package(root: &Path) {
+    for (relative, content) in [
+        (
+            "SKILL.md",
+            "---\nname: owned-disposable\ndescription: Fixture-owned disposable capability for the removal-gate exercise.\n---\n\nSynthetic fixture capability; never a delivered skill.\n",
+        ),
+        ("payload.txt", "synthetic removal-gate payload\n"),
+    ] {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+    }
+}
+
+/// Publishes one staged package through the installed skill lifecycle.
+fn publish_package(
+    installed: &InstalledKit,
+    requests: &Path,
+    staged: &Path,
+    dest: &Path,
+    expected_parent: &str,
+) -> Output {
+    let request = requests.join(format!(
+        "publish-{}.json",
+        dest.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(
+        &request,
+        serde_json::to_vec_pretty(&json!({
+            "staged": staged,
+            "dest": dest,
+            "expected_parent": expected_parent,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    installed.run(
+        requests,
+        &["skills", "publish", "--request", request.to_str().unwrap()],
+    )
+}
+
+/// Every entry under `root` as `relative -> file digest | link target | dir`.
+/// Link and junction entries are recorded, never followed, so the delivered
+/// skill links into this checkout stay single entries.
+fn tree_snapshot(root: &Path) -> BTreeMap<String, String> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if let Ok(target) = fs::read_link(&path) {
+                out.insert(relative, format!("link:{}", target.display()));
+            } else if path.is_dir() {
+                out.insert(relative, "dir".to_owned());
+                walk(root, &path, out);
+            } else {
+                out.insert(
+                    relative,
+                    format!("file:{}", hash_bytes(&fs::read(&path).unwrap())),
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The run spec for the isolated controller, declaring the removal treatment.
+fn write_installed_run_spec(path: &Path, project: &Path, codex_home: &Path, bd: &Path, card: &str) {
+    let document = json!({
+        "schema": 1,
+        "run": "installed-removal-gate",
+        "project": project,
+        "codex_home": codex_home,
+        "board": {"bd": bd, "project": project},
+        "specification": {
+            "project": project,
+            "change": "add-synthetic",
+            "store": Value::Null,
+            "planning_root": project,
+        },
+        "hypothesis_item": card,
+        "experiment": {
+            "acceptance_artifact": "specs/synthetic/spec.md",
+            "acceptance_heading": "#### Scenario: Synthetic case",
+            "mechanism": "bounded-output",
+            "counterexample": "diagnostics vanish",
+            "applicability": "local tool runs",
+            "independent_acceptance": "the oracle checker executes",
+            "meaningful_effect": "fewer repeated loads",
+            "operating_conditions": "cold context",
+            "comparison_policy": "matched pairs",
+            "stopping_rule": "two repeats",
+        },
+        "base_revision": git_output(project, &["rev-parse", "HEAD"]),
+        "writable_scope": ["crates/one"],
+        "runner": Value::Null,
+        "local_runner": Value::Null,
+        "qualification": Value::Null,
+        "publication_scope": ["experiment"],
+        "oracle": "outcome-oracle:private-request",
+        "removal": {"proposal": DISPOSABLE_PROPOSAL, "target": DISPOSABLE_TARGET},
+    });
+    fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+}
+
+/// Resolves the current removal authority for the fixture scope through the
+/// installed decision owner.
+fn removal_check(
+    installed: &InstalledKit,
+    project: &Path,
+    bd: &Path,
+    item: &str,
+    action: &str,
+) -> Output {
+    installed.feedback(
+        project,
+        bd,
+        &[
+            "removal-check",
+            "--item",
+            item,
+            "--proposal",
+            DISPOSABLE_PROPOSAL,
+            "--target",
+            DISPOSABLE_TARGET,
+            "--action",
+            action,
+        ],
+    )
+}
+
+/// Applies the publication effect exactly when the installed gate authorizes
+/// the exact reviewed proposal: the check is the real installed verb, and the
+/// effect is the fixture-owned removal of the capability directory.
+fn publish_removal_if_authorized(
+    installed: &InstalledKit,
+    project: &Path,
+    bd: &Path,
+    item: &str,
+    capability: &Path,
+) -> bool {
+    let check = removal_check(installed, project, bd, item, "publication");
+    if !check.status.success() {
+        eprintln!("publication withheld: {}", text(&check).trim());
+        return false;
+    }
+    assert!(
+        text(&check).contains("result=authorized"),
+        "{}",
+        text(&check)
+    );
+    fs::remove_dir_all(capability).unwrap();
+    true
+}
+
+struct PathRestore(Option<std::ffi::OsString>);
+impl PathRestore {
+    fn capture() -> Self {
+        Self(std::env::var_os("PATH"))
+    }
+}
+impl Drop for PathRestore {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
+/// OpenSpec change task 6.5: an isolated kit is installed outside this
+/// checkout from a genuine build; a fixture-owned disposable capability is
+/// published into that installed home; real board, controller and decision
+/// owner verbs gate its removal; and restoration returns it. Proves wiring and
+/// authority boundaries only: it cannot replace task 6.3 or justify retiring
+/// an actual capability. No model call and no mutation of the live user home
+/// or this checkout's run state.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE, installed OpenSpec and the owner PowerShell; isolated homes only"]
+fn installed_removal_gates_and_restoration_outside_checkout() {
+    let source = plain_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    let upstream = PathBuf::from(
+        std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("explicit native Codex executable"),
+    );
+    assert!(upstream.is_file(), "{}", upstream.display());
+
+    let root = tempfile::Builder::new()
+        .prefix("removal-gate-")
+        .tempdir()
+        .unwrap();
+    let root_path = plain_path(root.path());
+    eprintln!("isolated removal-gate evidence: {}", root_path.display());
+    let build = root_path.join("build");
+    let codex_home = root_path.join("codex");
+    let user_home = root_path.join("user");
+    let workspace = root_path.join("outside");
+    let project = root_path.join("project");
+    let run = root_path.join("runs/removal-gate");
+    let requests = root_path.join("requests");
+    let staged = root_path.join("staged").join(DISPOSABLE_SKILL);
+    for dir in [
+        &build,
+        &codex_home,
+        &user_home,
+        &workspace,
+        &project,
+        &requests,
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::create_dir_all(run.parent().unwrap()).unwrap();
+
+    // The genuine build of this checkout: this test's own build directory
+    // already holds every workspace binary the isolated install records.
+    let compiled = Path::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    for name in BINARIES {
+        let from = compiled.join(name);
+        assert!(
+            from.is_file(),
+            "workspace binary {name} is missing at {}; build the workspace before this exercise",
+            from.display()
+        );
+        fs::copy(&from, build.join(name)).unwrap();
+    }
+    let record = build_identity::BuildRecord {
+        schema: build_identity::SCHEMA,
+        source_root: source.clone(),
+        source: build_identity::source_identity(&source).unwrap(),
+        rustc: "isolated removal-gate install".into(),
+        cargo: "isolated removal-gate install".into(),
+        target: "x86_64-pc-windows-msvc".into(),
+        profile: "release".into(),
+        binaries: BINARIES
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    build_identity::hash_file(&build.join(name)).unwrap(),
+                )
+            })
+            .collect(),
+    };
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    // Unrelated state a real home carries, plus a foreign skill the kit must
+    // preserve. Seeded before the install so the lifecycle preservation is
+    // part of the exercise too.
+    fs::write(
+        codex_home.join("config.toml"),
+        b"model = 'unrelated-kept'\n",
+    )
+    .unwrap();
+    fs::write(codex_home.join("auth.json"), b"unrelated-auth").unwrap();
+    let foreign = user_home.join(".agents/skills/foreign/SKILL.md");
+    fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    fs::write(&foreign, b"---\nname: foreign\ndescription: Kept.\n---\n").unwrap();
+
+    let _path = PathRestore::capture();
+    let request = core_install::Request {
+        source: source.clone(),
+        build: build.clone(),
+        codex_home: codex_home.clone(),
+        user_home: user_home.clone(),
+        dependency_user_home: user_home.clone(),
+        upstream: Some(upstream.clone()),
+        timeout: Duration::from_secs(45),
+        path_scope: Some(PathScope::Process),
+    };
+    let preview = core_install::connect(&request, true).unwrap();
+    assert_eq!(preview.status, "preview");
+    let connected = core_install::connect(&request, false).unwrap();
+    assert_eq!(connected.status, "connected");
+    assert!(connected.runtime.unwrap().passed);
+    let installed = InstalledKit {
+        manager: codex_home.join("harness/bin/codex-harness.exe"),
+        codex_home: codex_home.clone(),
+        user_home: user_home.clone(),
+    };
+    assert!(
+        installed.manager.is_file(),
+        "the installed manager is present"
+    );
+    let version = installed.run(&workspace, &["--version"]);
+    assert_succeeded("installed manager version", &version);
+    assert!(
+        text(&version).contains("codex-harness"),
+        "{}",
+        text(&version)
+    );
+    let config_text = fs::read_to_string(codex_home.join("config.toml")).unwrap();
+    assert!(
+        config_text.contains("model = 'unrelated-kept'"),
+        "unrelated configuration survives the install: {config_text}"
+    );
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        b"unrelated-auth",
+        "credentials are unrelated configuration"
+    );
+    assert_eq!(
+        fs::read_to_string(&foreign).unwrap(),
+        "---\nname: foreign\ndescription: Kept.\n---\n",
+        "foreign skills are preserved"
+    );
+
+    // The real board component: the pinned bd is acquired through the board
+    // lifecycle into the isolated home. A warm package from the machine's own
+    // installation is copied in first so the pinned acquisition does not
+    // re-download what is already verified locally.
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        let packages = PathBuf::from(home).join("harness/board/packages");
+        if let Ok(entries) = fs::read_dir(&packages) {
+            for entry in entries.flatten() {
+                let cached = entry.path().join("bd.exe");
+                if cached.is_file() {
+                    let package = codex_home
+                        .join("harness/board/packages")
+                        .join(entry.file_name());
+                    fs::create_dir_all(&package).unwrap();
+                    fs::copy(&cached, package.join("bd.exe")).unwrap();
+                }
+            }
+        }
+    }
+    let board = board_lifecycle::Request {
+        source: source.clone(),
+        codex_home: codex_home.clone(),
+        user_home: user_home.clone(),
+        preview: true,
+    };
+    let board_preview = board_lifecycle::install(&board).unwrap();
+    assert_eq!(board_preview.status, "Preview board Install");
+    let board_report = board_lifecycle::install(&board_lifecycle::Request {
+        preview: false,
+        ..board
+    })
+    .unwrap();
+    assert_eq!(board_report.status, "Board connected");
+    let bd = codex_home.join("harness/bin/bd.exe");
+    assert!(bd.is_file(), "the installed board is present");
+    let bd_version =
+        String::from_utf8_lossy(&bd_run(&bd, &workspace, &["--version"]).stdout).into_owned();
+    assert!(bd_version.contains("1.3.0"), "{bd_version}");
+
+    // The isolated project outside this checkout: a real git repository with
+    // its own board and OpenSpec workspace.
+    git(
+        &root_path,
+        &[
+            "init",
+            "-q",
+            "--initial-branch=main",
+            project.to_str().unwrap(),
+        ],
+    );
+    git(&project, &["config", "user.email", "fixture@example.test"]);
+    git(&project, &["config", "user.name", "Fixture"]);
+    fs::create_dir_all(project.join("crates/one/src")).unwrap();
+    fs::write(project.join("crates/one/src/lib.rs"), "// synthetic\n").unwrap();
+    fs::create_dir_all(project.join("global")).unwrap();
+    fs::write(
+        project.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\n",
+    )
+    .unwrap();
+    fs::write(project.join("README.md"), "synthetic\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-qm", "seed"]);
+    let init = bd_run(
+        &bd,
+        &project,
+        &[
+            "init",
+            "--skip-agents",
+            "--non-interactive",
+            "--quiet",
+            "--prefix",
+            "rgx",
+        ],
+    );
+    assert!(init.status.success(), "bd init: {}", text(&init));
+    let openspec_init = openspec(
+        &project,
+        &["init", "--tools", "none", "--no-animation", "--force"],
+    );
+    assert!(
+        openspec_init.status.success(),
+        "openspec init: {}",
+        text(&openspec_init)
+    );
+    let created = openspec(
+        &project,
+        &[
+            "new",
+            "change",
+            "add-synthetic",
+            "--schema",
+            "spec-driven",
+            "--json",
+        ],
+    );
+    assert!(created.status.success(), "openspec new: {}", text(&created));
+    write_change(
+        &project,
+        "## Why\n\nSynthetic.\n",
+        "## Context\n\nSynthetic.\n",
+        "## 1. Work\n\n- [ ] 1.1 Do the synthetic thing.\n",
+    );
+
+    // The hypothesis card lives on the real board; its admission consumes the
+    // limits from the installed kit record (no --source was passed).
+    let admit = installed.feedback(
+        &project,
+        &bd,
+        &[
+            "hypothesis-admit",
+            "--mechanism",
+            "bounded-output",
+            "--conditions",
+            "installed-removal-gate",
+            "--observation",
+            "observation:removal-gate-exercise",
+            "--predicted",
+            "the removal gate holds without implicit consent",
+            "--counterexample",
+            "consent is inferred from a favorable benefit verdict",
+            "--acceptance",
+            "the independent oracle passes",
+            "--spec",
+            "openspec/changes/add-synthetic",
+            "--basis",
+            "basis:removal-gate-exercise",
+        ],
+    );
+    assert_succeeded("hypothesis-admit", &admit);
+    let admit_text = text(&admit);
+    assert!(
+        admit_text.contains("configured(installed kit"),
+        "the installed kit record supplies the limits: {admit_text}"
+    );
+    let card = admit_text
+        .strip_prefix("hypothesis ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!card.is_empty(), "admission named no card: {admit_text}");
+
+    // The fixture-owned disposable capability enters the installed home
+    // through the real skill lifecycle; the staged package is retained
+    // outside the installation as the recorded restoration route.
+    write_disposable_package(&staged);
+    let skills_root = user_home.join(".agents/skills");
+    let capability = skills_root.join(DISPOSABLE_SKILL);
+    let published = publish_package(&installed, &requests, &staged, &capability, "");
+    assert_succeeded("publish disposable capability", &published);
+    assert!(
+        capability.join("SKILL.md").is_file() && capability.join("payload.txt").is_file(),
+        "the capability is installed"
+    );
+    let baseline = tree_snapshot(&skills_root);
+    let disposable_keys: Vec<String> = baseline
+        .keys()
+        .filter(|key| {
+            key.as_str() == DISPOSABLE_SKILL || key.starts_with(&format!("{DISPOSABLE_SKILL}/"))
+        })
+        .cloned()
+        .collect();
+    assert_eq!(disposable_keys.len(), 3, "{disposable_keys:?}");
+    let foreign_bytes = fs::read(&foreign).unwrap();
+    let config_bytes = fs::read(codex_home.join("config.toml")).unwrap();
+    let auth_bytes = fs::read(codex_home.join("auth.json")).unwrap();
+
+    // The reviewable proposal is recorded by the real decision owner before
+    // the run starts, so the controller freezes its reviewed digest.
+    let propose = installed.feedback(
+        &project,
+        &bd,
+        &[
+            "removal-propose",
+            "--item",
+            &card,
+            "--proposal",
+            DISPOSABLE_PROPOSAL,
+            "--target",
+            DISPOSABLE_TARGET,
+            "--evidence",
+            "evidence:removal-gate-exercise",
+            "--loss",
+            DISPOSABLE_TARGET,
+            "--preview",
+            "preview:isolated-disposable",
+            "--detail",
+            "consumer list: none known beyond this fixture; restoration route: the retained staged package is re-published through the installed skill lifecycle",
+        ],
+    );
+    assert_succeeded("removal-propose", &propose);
+    assert!(
+        text(&propose).contains("record=written"),
+        "{}",
+        text(&propose)
+    );
+
+    let spec = root_path.join("run-spec.json");
+    write_installed_run_spec(&spec, &project, &codex_home, &bd, &card);
+    let run_arg = run.to_str().unwrap().to_owned();
+    let spec_arg = spec.to_str().unwrap().to_owned();
+    let started = installed.run(
+        &workspace,
+        &["improve", "start", "--run", &run_arg, "--spec", &spec_arg],
+    );
+    assert_succeeded("improve start", &started);
+    let status = installed.run(
+        &workspace,
+        &["improve", "status", "--run", &run_arg, "--json"],
+    );
+    assert_succeeded("improve status", &status);
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["removal"]["declared"], true, "{report}");
+    assert!(
+        report["removal"]["gate"]
+            .as_str()
+            .is_some_and(|gate| gate.contains("pending")),
+        "{report}"
+    );
+    let select = installed.run(
+        &workspace,
+        &[
+            "improve",
+            "select",
+            "--run",
+            &run_arg,
+            "--variant",
+            "candidate",
+        ],
+    );
+    assert_exit("select without a decision", &select, 2);
+    assert!(
+        text(&select).contains("removal approval is pending"),
+        "{}",
+        text(&select)
+    );
+    assert!(
+        text(&select).contains("no removal decision"),
+        "{}",
+        text(&select)
+    );
+    assert!(
+        capability.join("SKILL.md").is_file(),
+        "an undecided proposal never removes the capability"
+    );
+
+    // The test user refuses: the refusal preserves the capability, blocks the
+    // controller and authorizes nothing.
+    let refuse = installed.feedback(
+        &project,
+        &bd,
+        &[
+            "removal-decide",
+            "--item",
+            &card,
+            "--decision",
+            "refuse",
+            "--proposal",
+            DISPOSABLE_PROPOSAL,
+            "--target",
+            DISPOSABLE_TARGET,
+            "--basis",
+            "test-user:refusal-1",
+        ],
+    );
+    assert_succeeded("removal-decide refuse", &refuse);
+    assert!(
+        text(&refuse).contains("decision=refuse"),
+        "{}",
+        text(&refuse)
+    );
+    let select = installed.run(
+        &workspace,
+        &[
+            "improve",
+            "select",
+            "--run",
+            &run_arg,
+            "--variant",
+            "candidate",
+        ],
+    );
+    assert_exit("select after refusal", &select, 2);
+    assert!(
+        text(&select).contains("the user declined"),
+        "{}",
+        text(&select)
+    );
+    let refused = removal_check(&installed, &project, &bd, &card, "experiment");
+    assert_exit("removal-check after refusal", &refused, 1);
+    assert!(
+        text(&refused).contains("result=refused"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(
+        tree_snapshot(&skills_root),
+        baseline,
+        "a refusal preserves the capability and every unrelated entry"
+    );
+
+    // A fresh informed approval covering only the isolated experiment clears
+    // the controller's removal gate; the run then stops at the pending
+    // runtime preparation instead of starting any model work.
+    let approve_experiment = installed.feedback(
+        &project,
+        &bd,
+        &[
+            "removal-decide",
+            "--item",
+            &card,
+            "--decision",
+            "approve",
+            "--proposal",
+            DISPOSABLE_PROPOSAL,
+            "--target",
+            DISPOSABLE_TARGET,
+            "--actions",
+            "experiment",
+            "--loss",
+            DISPOSABLE_TARGET,
+            "--basis",
+            "test-user:approval-experiment-1",
+        ],
+    );
+    assert_succeeded("removal-decide approve experiment", &approve_experiment);
+    assert!(
+        text(&approve_experiment).contains("actions=experiment"),
+        "{}",
+        text(&approve_experiment)
+    );
+    let select = installed.run(
+        &workspace,
+        &[
+            "improve",
+            "select",
+            "--run",
+            &run_arg,
+            "--variant",
+            "candidate",
+        ],
+    );
+    assert_exit("select with the experiment approval", &select, 2);
+    assert!(
+        text(&select).contains("runtime preparation"),
+        "{}",
+        text(&select)
+    );
+    let experiment = removal_check(&installed, &project, &bd, &card, "experiment");
+    assert_succeeded("removal-check experiment", &experiment);
+    assert!(
+        text(&experiment).contains("result=authorized"),
+        "{}",
+        text(&experiment)
+    );
+    let integration = removal_check(&installed, &project, &bd, &card, "integration");
+    assert_exit("integration is not covered", &integration, 1);
+    assert!(
+        text(&integration).contains("integration is not covered"),
+        "{}",
+        text(&integration)
+    );
+    let publication = removal_check(&installed, &project, &bd, &card, "publication");
+    assert_exit("publication is not covered", &publication, 1);
+    assert!(
+        text(&publication).contains("publication is not covered"),
+        "{}",
+        text(&publication)
+    );
+    let applied = publish_removal_if_authorized(&installed, &project, &bd, &card, &capability);
+    assert!(
+        !applied,
+        "publication without its own coverage must not be applied"
+    );
+    assert_eq!(
+        tree_snapshot(&skills_root),
+        baseline,
+        "experiment-only consent leaves the live installation intact"
+    );
+
+    // A fresh approval that expressly covers publication authorizes the live
+    // removal, but not the controller's experiment stage.
+    let approve_publication = installed.feedback(
+        &project,
+        &bd,
+        &[
+            "removal-decide",
+            "--item",
+            &card,
+            "--decision",
+            "approve",
+            "--proposal",
+            DISPOSABLE_PROPOSAL,
+            "--target",
+            DISPOSABLE_TARGET,
+            "--actions",
+            "publication",
+            "--loss",
+            DISPOSABLE_TARGET,
+            "--basis",
+            "test-user:approval-publication-1",
+        ],
+    );
+    assert_succeeded("removal-decide approve publication", &approve_publication);
+    assert!(
+        text(&approve_publication).contains("actions=publication"),
+        "{}",
+        text(&approve_publication)
+    );
+    let select = installed.run(
+        &workspace,
+        &[
+            "improve",
+            "select",
+            "--run",
+            &run_arg,
+            "--variant",
+            "candidate",
+        ],
+    );
+    assert_exit("select under the publication approval", &select, 2);
+    assert!(
+        text(&select).contains("experiment is not covered"),
+        "{}",
+        text(&select)
+    );
+    let applied = publish_removal_if_authorized(&installed, &project, &bd, &card, &capability);
+    assert!(applied, "the covered publication authorization is consumed");
+    assert!(
+        !capability.exists(),
+        "the authorized removal removed the capability"
+    );
+
+    // Only the intended capability is gone: every remaining entry is
+    // byte-identical to the baseline, and the installation still runs.
+    let after_removal = tree_snapshot(&skills_root);
+    let missing: Vec<String> = baseline
+        .keys()
+        .filter(|key| !after_removal.contains_key(*key))
+        .cloned()
+        .collect();
+    assert_eq!(
+        missing, disposable_keys,
+        "covered publication removes only the intended capability"
+    );
+    for (key, value) in &after_removal {
+        assert_eq!(
+            baseline.get(key),
+            Some(value),
+            "unrelated entry {key} changed"
+        );
+    }
+    assert_eq!(fs::read(&foreign).unwrap(), foreign_bytes);
+    assert_eq!(
+        fs::read(codex_home.join("config.toml")).unwrap(),
+        config_bytes
+    );
+    assert_eq!(fs::read(codex_home.join("auth.json")).unwrap(), auth_bytes);
+    let version = installed.run(&workspace, &["--version"]);
+    assert_succeeded("the installation still runs after the removal", &version);
+
+    // Restoration follows the recorded route: the retained staged package is
+    // re-published through the installed skill lifecycle. Recovering the
+    // owned experimental capability is not a removal effect.
+    let restored = publish_package(&installed, &requests, &staged, &capability, "");
+    assert_succeeded("restore the capability", &restored);
+    assert_eq!(
+        tree_snapshot(&skills_root),
+        baseline,
+        "restoration returns the exact capability and touches nothing else"
+    );
+    assert_eq!(fs::read(&foreign).unwrap(), foreign_bytes);
+    assert_eq!(
+        fs::read(codex_home.join("config.toml")).unwrap(),
+        config_bytes
+    );
+    assert_eq!(fs::read(codex_home.join("auth.json")).unwrap(), auth_bytes);
+
+    // A changed reviewed proposal is a new version: the recorded approval
+    // receipt is bound to the older content, so neither the decision owner
+    // nor the run's frozen digest authorizes any further effect.
+    let changed = installed.feedback(
+        &project,
+        &bd,
+        &[
+            "removal-propose",
+            "--item",
+            &card,
+            "--proposal",
+            DISPOSABLE_PROPOSAL,
+            "--target",
+            DISPOSABLE_TARGET,
+            "--evidence",
+            "evidence:removal-gate-exercise",
+            "--loss",
+            DISPOSABLE_TARGET,
+            "--preview",
+            "preview:isolated-disposable",
+            "--detail",
+            "consumer list: one indirect consumer recorded after the approval; restoration route: the retained staged package is re-published through the installed skill lifecycle",
+        ],
+    );
+    assert_succeeded("removal-propose changed version", &changed);
+    assert!(
+        text(&changed).contains("record=written"),
+        "{}",
+        text(&changed)
+    );
+    let stale = removal_check(&installed, &project, &bd, &card, "publication");
+    assert_exit("stale approval receipt", &stale, 1);
+    assert!(
+        text(&stale).contains("changed after the latest decision"),
+        "{}",
+        text(&stale)
+    );
+    assert!(
+        text(&stale).contains("fresh decision is required"),
+        "{}",
+        text(&stale)
+    );
+    let select = installed.run(
+        &workspace,
+        &[
+            "improve",
+            "select",
+            "--run",
+            &run_arg,
+            "--variant",
+            "candidate",
+        ],
+    );
+    assert_exit("select with a stale frozen digest", &select, 2);
+    assert!(
+        text(&select).contains("changed after the frozen approval"),
+        "{}",
+        text(&select)
+    );
+    let applied = publish_removal_if_authorized(&installed, &project, &bd, &card, &capability);
+    assert!(
+        !applied,
+        "a stale approval receipt authorizes no further effect"
+    );
+    assert_eq!(tree_snapshot(&skills_root), baseline);
+
+    // An explicit withdrawal of the current proposal version authorizes
+    // nothing either, and the capability stays exactly as restored.
+    let withdraw = installed.feedback(
+        &project,
+        &bd,
+        &[
+            "removal-decide",
+            "--item",
+            &card,
+            "--decision",
+            "withdraw",
+            "--proposal",
+            DISPOSABLE_PROPOSAL,
+            "--target",
+            DISPOSABLE_TARGET,
+            "--basis",
+            "test-user:withdrawal-1",
+        ],
+    );
+    assert_succeeded("removal-decide withdraw", &withdraw);
+    assert!(
+        text(&withdraw).contains("decision=withdraw"),
+        "{}",
+        text(&withdraw)
+    );
+    let withdrawn = removal_check(&installed, &project, &bd, &card, "publication");
+    assert_exit("withdrawn approval", &withdrawn, 1);
+    assert!(
+        text(&withdrawn).contains("result=withdrawn"),
+        "{}",
+        text(&withdrawn)
+    );
+    let applied = publish_removal_if_authorized(&installed, &project, &bd, &card, &capability);
+    assert!(!applied, "a withdrawal authorizes no removal effect");
+    assert_eq!(tree_snapshot(&skills_root), baseline);
+    eprintln!(
+        "installed removal-gate exercise complete: refusal preserved, experiment-only consent left the live installation intact, covered publication removed only {DISPOSABLE_SKILL}, restoration returned it, and stale receipts authorized nothing"
+    );
 }
