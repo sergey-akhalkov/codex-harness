@@ -6481,37 +6481,104 @@ fn a_settled_short_operation_is_reused_only_while_its_declared_inputs_match() {
     assert_eq!(fs::read(&candidate_path).unwrap(), candidate_receipt);
     // Both arms passed their independent checks, so the model-free pair forms
     // a comparable unit on the operation's own measured work: the model
-    // dimensions stay explicitly inapplicable (never measured zero), and the
-    // measured difference decides adopt or reject against the declared
-    // tolerance (real durations vary run to run; neither verdict is fabricated).
+    // dimensions stay explicitly inapplicable (never a measured zero). Real
+    // durations vary run to run, so which supported verdict the measured
+    // difference reaches (adopt or reject against the declared threshold) is
+    // not fixed here; the assertions below bind the record instead of a
+    // timing value.
     let decision = load_json(&fixture.run.join("comparison/decision.json"));
     let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
-    assert!(
-        decision["decision"] == "adopt" || decision["decision"] == "reject",
-        "a supported decision replaces the former no-matched-unit inconclusive: {decision}\n{evaluation}"
+    assert_eq!(
+        decision["decision"], evaluation["decision"],
+        "the published decision is the evaluated verdict: {decision}\n{evaluation}"
     );
+    let verdict = evaluation["decision"].as_str().unwrap_or_default();
     assert!(
-        evaluation["reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason
-                .as_str()
-                .unwrap_or_default()
-                .contains("model metrics are inapplicable")),
-        "the decision names the model-free distinction: {evaluation}"
+        verdict == "adopt" || verdict == "reject",
+        "both real operations were independently accepted, so the verdict is supported, never inconclusive: {decision}\n{evaluation}"
     );
     assert_eq!(
         evaluation["acceptedTasks"], 2,
         "both real operations were independently accepted: {evaluation}"
     );
-    assert!(
-        evaluation["coverage"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("method:real-operation"),
+    assert_eq!(
+        evaluation["matched"], 1,
+        "the two executions form one comparable measured unit: {evaluation}"
+    );
+    assert_eq!(
+        evaluation["quality"], "unchanged",
+        "independent acceptance held on both arms: {evaluation}"
+    );
+    // The model-free distinction is recorded whichever way the timing falls:
+    // the operation's own work covers the non-time dimensions and the model
+    // metrics stay inapplicable rather than becoming a measured zero.
+    assert_eq!(
+        evaluation["coverage"].as_str().unwrap_or_default(),
+        "time+method:real-operation model-metrics:inapplicable operation-work:duration+exit+inputs; complete-pairs:1; variation:unmeasured",
         "the coverage names the real-operation method with inapplicable model metrics: {evaluation}"
     );
+    assert!(
+        evaluation["variation"]["basis"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(
+                "the declared method executes no model call, so its model metrics are inapplicable rather than a measured zero"
+            ),
+        "the recorded variation basis carries the model-free distinction: {evaluation}"
+    );
+    // The verdict must follow the record's own measured work: an adoption
+    // needs a positive reduction clearing the declared meaningful threshold;
+    // a non-adoption either names the un-met threshold or a material time
+    // regression beyond the declared tolerance.
+    let reasons = evaluation["reasons"]
+        .as_array()
+        .expect("the evaluation records its reasons")
+        .iter()
+        .map(|reason| reason.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let baseline_seconds = evaluation["baselineSeconds"]
+        .as_f64()
+        .expect("the accepted pair records the baseline duration");
+    let candidate_seconds = evaluation["candidateSeconds"]
+        .as_f64()
+        .expect("the accepted pair records the candidate duration");
+    assert!(
+        baseline_seconds > 0.0 && candidate_seconds > 0.0,
+        "the pair records real measured durations: {evaluation}"
+    );
+    let policy = load_json(&fixture.policy);
+    let meaningful = policy["meaningfulEffectPercent"]
+        .as_f64()
+        .expect("the fixture policy declares its meaningful effect");
+    let tolerance = policy["tolerancePercent"]
+        .as_f64()
+        .expect("the fixture policy declares its tolerance");
+    let effect_percent = (baseline_seconds - candidate_seconds) / baseline_seconds * 100.0;
+    if verdict == "adopt" {
+        assert!(
+            effect_percent >= meaningful,
+            "the adoption clears the declared meaningful effect on the recorded work: {evaluation}"
+        );
+        assert!(
+            reasons.contains("model metrics are inapplicable"),
+            "the adoption names the model-free distinction: {evaluation}"
+        );
+    } else if reasons.contains("materially regressed the primary time metric") {
+        assert!(
+            effect_percent < -tolerance,
+            "the recorded material regression is beyond the declared tolerance: {evaluation}"
+        );
+    } else {
+        assert!(
+            reasons.contains("does not meet the predeclared meaningful threshold"),
+            "the non-adoption states the measured limit precisely: {evaluation}"
+        );
+        assert!(
+            effect_percent >= -tolerance && effect_percent < meaningful,
+            "the non-adoption is grounded in the recorded work below the declared threshold: {evaluation}"
+        );
+    }
     let effects = fixture.cursor()["effects"].as_array().unwrap().clone();
     assert_eq!(
         effects
