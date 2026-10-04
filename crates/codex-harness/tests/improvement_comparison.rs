@@ -2187,6 +2187,313 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     assert_eq!(fixture.bd_comments(&fixture.card), comments_before);
 }
 
+/// The predeclared policy that requires one additional independent unit beyond
+/// the run's own declared plan unit.
+fn corroboration_scope_policy() -> Value {
+    json!({
+        "schema": 1,
+        "objective": "time",
+        "basis": "efficiency",
+        "meaningfulEffectPercent": 10.0,
+        "tolerancePercent": 5.0,
+        "requireAcceptance": true,
+        "taskMix": "one frozen workload case",
+        "stopping": {"maxAttemptsPerArm": 1, "requiredUnits": 2},
+        "repeatedSelection": "predeclared",
+        "tradeOff": Value::Null,
+        "uncertainty": "unknown evidence stays inconclusive",
+        "horizonTasks": 1.0,
+        "overhead": {
+            "implementationSeconds": 0.0,
+            "evaluationSeconds": 0.0,
+            "maintenanceSecondsPerTask": 0.0,
+        },
+    })
+}
+
+/// One admitted hypothesis card on the fixture board; admission reuses one
+/// card per mechanism/conditions identity, so this returns the existing card
+/// rather than creating a duplicate.
+fn admit_prior_hypothesis_card(fixture: &Fixture, mechanism: &str) -> String {
+    let out = fixture.feedback(&[
+        "hypothesis-admit",
+        "--mechanism",
+        mechanism,
+        "--conditions",
+        "local-tool-runs",
+        "--observation",
+        "token-audit:prior#7",
+        "--predicted",
+        "the prior task completed under the same conditions",
+        "--counterexample",
+        "the prior solution is unavailable",
+        "--acceptance",
+        "the independent oracle passed for the prior task",
+        "--spec",
+        "openspec/changes/prior",
+        "--basis",
+        "token-audit:prior#7",
+    ]);
+    assert!(out.status.success(), "prior admit: {}", text(&out));
+    let printed = text(&out);
+    let id = printed
+        .strip_prefix("hypothesis ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!id.is_empty(), "prior admission named no card: {printed}");
+    id
+}
+
+/// A retained completed real task that a prior run already recorded: the
+/// frozen pre-solution copy plus a committed answer the retention never keeps.
+fn prior_retained_task(
+    fixture: &Fixture,
+    revision: &str,
+    owner: &str,
+    case_id: &str,
+    mechanism: &str,
+) -> harness_core::improvement_experiment::RetainedTask {
+    let completed = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        revision,
+        &fixture.root.join(format!("{case_id}-completed")),
+    )
+    .unwrap();
+    fs::write(
+        completed.path.join("answer.txt"),
+        "prior solution: earlier attempt answer\n",
+    )
+    .unwrap();
+    git(&completed.path, &["add", "."]);
+    git(
+        &completed.path,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "prior answer",
+        ],
+    );
+    harness_core::improvement_experiment::retain_completed_task(
+        &completed,
+        &fixture.root.join(format!("{case_id}-retained")),
+        &harness_core::improvement_experiment::TaskRetention {
+            owner: owner.to_owned(),
+            case_id: case_id.to_owned(),
+            experiment: "exp-prior".to_owned(),
+            mechanism: mechanism.to_owned(),
+            conditions: "local-tool-runs".to_owned(),
+            oracle: "oracle-7".to_owned(),
+            acceptance: "acceptance/run-9".to_owned(),
+        },
+    )
+    .unwrap()
+}
+
+/// Record one retained task on its owner card through the durable board
+/// writer, exactly as the controller does at the decision boundary, so a later
+/// run discovers it from the board instead of a run-local index.
+fn record_prior_retention_on_board(
+    fixture: &Fixture,
+    owner: &str,
+    retained: &harness_core::improvement_experiment::RetainedTask,
+) {
+    let draft = harness_core::board_hypothesis::RetentionDraft {
+        case_id: retained.case_id.clone(),
+        experiment: retained.experiment.clone(),
+        mechanism: retained.mechanism.clone(),
+        conditions: retained.conditions.clone(),
+        revision: retained.replay.source_revision.clone(),
+        frozen: retained.replay.revision.clone(),
+        tree: retained.replay.tree_sha256.clone(),
+        oracle: retained.oracle.clone(),
+        acceptance: retained.acceptance.clone(),
+        replay: retained.replay.path.display().to_string(),
+        detail: Some("prior completed real task retained for corroboration".to_owned()),
+    };
+    let bounded = harness_core::board_hypothesis::BoundedRetention::try_from_draft(draft)
+        .expect("the fixture retention draft is bounded");
+    harness_core::board_hypothesis::record_retention(&fixture.bd, &fixture.proj, owner, &bounded)
+        .expect("the owner card records the retention");
+}
+
+/// A declared corroboration requirement with too few applicable retained units
+/// stays explicitly inconclusive: the comparison selects through the driver's
+/// merged owner before evaluating, attaches the run's own receipt to the
+/// evaluated report and the frozen policy consumes it end-to-end instead of a
+/// summary.
+#[test]
+fn declared_corroboration_insufficient_units_leave_the_broader_claim_inconclusive() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("corroboration-short");
+    fs::write(
+        &fixture.policy,
+        serde_json::to_vec_pretty(&corroboration_scope_policy()).unwrap(),
+    )
+    .unwrap();
+    fixture.write_spec(&[], None);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("corroboration-short-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("corroboration-short-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    assert!(
+        status["comparison"]["decision"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outcome=inconclusive"),
+        "{status}"
+    );
+    let evaluation: harness_core::improvement_policy::PolicyEvaluation =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
+            .unwrap();
+    let corroboration = evaluation
+        .corroboration
+        .clone()
+        .expect("the consumed selection is recorded with the decision");
+    assert_eq!(
+        corroboration.status,
+        harness_core::outcome_report::CorroborationState::Inconclusive,
+        "{evaluation:?}"
+    );
+    assert!(!corroboration.ready, "{evaluation:?}");
+    assert_eq!(corroboration.required_units, 1, "{evaluation:?}");
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("corroboration selection is inconclusive")),
+        "{:?}",
+        evaluation.reasons
+    );
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    assert_eq!(report["corroboration"]["ready"], false, "{report}");
+    assert_eq!(report["corroboration"]["requiredUnits"], 1, "{report}");
+    let receipt = load_json(&fixture.run.join("corroboration.json"));
+    assert_eq!(receipt["status"], "selected", "{receipt}");
+    assert_eq!(receipt["required_units"], 1, "{receipt}");
+}
+
+/// A declared corroboration requirement with one applicable independent
+/// retained unit available is attached to the evaluated report and supplies
+/// the missing unit by identity, so the frozen policy reports the broader
+/// claim with the adoption; the receipt carries identity and replay references
+/// only, never the retained solution.
+#[test]
+fn declared_corroboration_sufficient_units_are_reported_with_the_adoption() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("corroboration-ready");
+    // The prior completed real task is committed before the run spec is
+    // re-declared, so the frozen base revision and the prepared builds agree
+    // with the source the retained snapshot is taken from.
+    fs::write(fixture.proj.join("prior-task.txt"), "prior real task\n").unwrap();
+    git(&fixture.proj, &["add", "."]);
+    git(
+        &fixture.proj,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "prior task identity",
+        ],
+    );
+    let prior_revision = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fs::write(
+        &fixture.policy,
+        serde_json::to_vec_pretty(&corroboration_scope_policy()).unwrap(),
+    )
+    .unwrap();
+    fixture.write_spec(&[], None);
+    let owner = admit_prior_hypothesis_card(&fixture, "bounded-output");
+    let prior = prior_retained_task(
+        &fixture,
+        &prior_revision,
+        &owner,
+        "case-c",
+        "bounded-output",
+    );
+    record_prior_retention_on_board(&fixture, &owner, &prior);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("corroboration-ready-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("corroboration-ready-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    assert!(
+        status["comparison"]["decision"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outcome=adopt"),
+        "{status}"
+    );
+    let comments = fixture.bd_comments(&fixture.card);
+    assert!(comments.contains("outcome=adopt"), "{comments}");
+    let evaluation: harness_core::improvement_policy::PolicyEvaluation =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
+            .unwrap();
+    let corroboration = evaluation
+        .corroboration
+        .clone()
+        .expect("the consumed selection is recorded with the decision");
+    assert_eq!(
+        corroboration.status,
+        harness_core::outcome_report::CorroborationState::Ready,
+        "{evaluation:?}"
+    );
+    assert!(corroboration.ready, "{evaluation:?}");
+    assert_eq!(corroboration.units[0].case_id, "case-c", "{evaluation:?}");
+    assert_eq!(corroboration.units[0].owner, owner, "{evaluation:?}");
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    assert_eq!(report["corroboration"]["ready"], true, "{report}");
+    assert_eq!(
+        report["corroboration"]["units"][0]["caseId"], "case-c",
+        "{report}"
+    );
+    let receipt = load_json(&fixture.run.join("corroboration.json"));
+    assert_eq!(receipt["selection"]["status"], "ready", "{receipt}");
+    assert_eq!(
+        receipt["selection"]["units"][0]["caseId"], "case-c",
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["selection"]["units"][0]["owner"], owner,
+        "{receipt}"
+    );
+    assert!(!receipt.to_string().contains("prior solution"), "{receipt}");
+}
+
 /// The continuous controller consumes a supported adoption through the real
 /// integration and activation owners: the checked revision reaches the
 /// mainline, the prepared candidate runtime becomes the experimental

@@ -4024,7 +4024,30 @@ fn publish_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
     let declared = comparison
         .declared_policy()
         .map_err(|error| invalid(format!("the predeclared policy is unusable: {error}")))?;
-    let report = summarize_attempts(&[baseline_row, candidate_row])?;
+    // The declared adoption scope's corroboration selection is run evidence
+    // about this run, not a verdict about it: the driver's merged owner
+    // selects it before the report is evaluated, so the predeclared policy
+    // consumes the run's own receipt and the recorded decision stays bound to
+    // exactly the selection state it saw.
+    super::improvement_driver::select_corroboration_units(run, notes)?;
+    let mut report = summarize_attempts(&[baseline_row, candidate_row])?;
+    if declared.policy.stopping.required_units > 1
+        && let Some(receipt) = super::improvement_driver::corroboration_receipt(run)?
+    {
+        let receipt = serde_json::to_value(&receipt).map_err(io::Error::other)?;
+        match harness_core::outcome_report::attach_corroboration(&report, &receipt) {
+            Ok(attached) => report = attached,
+            Err(error) => {
+                return block(
+                    run,
+                    notes,
+                    format!(
+                        "the run's corroboration receipt is not a valid receipt ({error}); no decision was published from it"
+                    ),
+                );
+            }
+        }
+    }
     let report_path = run.store.comparison_dir().join("report.json");
     write_json_atomic(&report_path, &report)?;
     let evaluation = harness_core::improvement_policy::evaluate(&declared, &report)

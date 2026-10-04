@@ -1196,6 +1196,9 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
         return Ok(());
     }
     let evaluation: PolicyEvaluation = read_json(&evaluation_path, MAX_RUN_SPEC_BYTES)?;
+    if !validate_recorded_corroboration(run, &evaluation)? {
+        return Ok(());
+    }
     // Routed consumption at the decision boundary: the merged owners retain
     // the completed real task, select declared corroboration units and
     // reconcile an unadopted decision with its own change's actual task
@@ -1424,6 +1427,58 @@ fn consume_decision_evidence(
     select_corroboration_units(run, notes)?;
     reconcile_unadopted_decision(run, evaluation, notes)?;
     Ok(())
+}
+
+/// Resume validation for a recorded adoption: the corroboration section the
+/// decision consumed is bound by its own digest, so a changed, invalid or
+/// missing receipt is no longer the state the adoption recorded and cannot
+/// inherit it. The run blocks with the exact identity instead of consuming
+/// the adoption; a decision that recorded no section is unaffected.
+fn validate_recorded_corroboration(
+    run: &mut Run,
+    evaluation: &PolicyEvaluation,
+) -> io::Result<bool> {
+    if evaluation.decision != PolicyDecision::Adopt {
+        return Ok(true);
+    }
+    let Some(recorded) = evaluation.corroboration.as_ref() else {
+        return Ok(true);
+    };
+    let path = run.store.root().join(CORROBORATION_FILE);
+    let current = match load_optional::<serde_json::Value>(&path) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            run.cursor.block(format!(
+                "the recorded adoption is bound to corroboration digest {} but the run has no corroboration receipt at {}; a missing corroboration state cannot inherit the adoption",
+                recorded.digest,
+                path.display()
+            ));
+            run.store.save_cursor(&run.cursor)?;
+            return Ok(false);
+        }
+        Err(error) => {
+            run.cursor.block(format!(
+                "the current corroboration receipt at {} is unreadable ({error}); a changed corroboration state cannot inherit the adoption",
+                path.display()
+            ));
+            run.store.save_cursor(&run.cursor)?;
+            return Ok(false);
+        }
+    };
+    let blocked = match harness_core::outcome_report::corroboration_section(&current) {
+        Err(error) => format!(
+            "the current corroboration receipt at {} is not a valid receipt ({error}); a changed corroboration state cannot inherit the adoption",
+            path.display()
+        ),
+        Ok(section) if section.digest != recorded.digest => format!(
+            "the current corroboration section digest {} does not match the digest {} recorded with the adoption; a changed corroboration state cannot inherit the adoption",
+            section.digest, recorded.digest
+        ),
+        Ok(_) => return Ok(true),
+    };
+    run.cursor.block(blocked);
+    run.store.save_cursor(&run.cursor)?;
+    Ok(false)
 }
 
 /// Retains the completed real workload task through the experiment owner as
@@ -1741,7 +1796,7 @@ fn append_retained_task(run: &Run, retained: &RetainedTask) -> io::Result<()> {
 /// applicable, independent, replayable retained tasks leave the broader claim
 /// explicitly inconclusive rather than turning an inapplicable workload into
 /// evidence or repeating an identical measurement.
-fn select_corroboration_units(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
+pub(super) fn select_corroboration_units(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
     if run.store.root().join(CORROBORATION_FILE).is_file() {
         return Ok(());
     }
