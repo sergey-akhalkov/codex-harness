@@ -1837,6 +1837,177 @@ fn observations_mode_collects_model_free_without_process_dispatch() {
     assert!(!f.case.join("fixture-call.json").exists());
 }
 
+/// The declared bearer auth is never ambient: an https plan that names an
+/// auth client input refuses clearly before any request when it was not
+/// supplied, uses the TLS transport when it was, and never echoes the
+/// material through the real entry point.
+#[test]
+fn declared_bearer_auth_is_explicit_and_never_echoed() {
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    let auth = f.root.path().join("route.key");
+    fs::write(&auth, "sk-synthetic-route-token\n").unwrap();
+    let request = f.root.path().join("auth-observations.json");
+    let body = |inputs: Value| {
+        json!({
+            "runner": api_runner("https://127.0.0.1:65500"),
+            "plan": {
+                "requests": [{
+                    "path": "/v1/models",
+                    "fields": [
+                        {"name": "server.model_id", "pointer": "/data/0/id", "required": true}
+                    ]
+                }],
+                "required_client_inputs": ["catalogue"],
+                "bearer_auth": "route-key"
+            },
+            "client_inputs": inputs
+        })
+    };
+
+    // The named auth input is missing: a clear refusal before transport.
+    fs::write(
+        &request,
+        serde_json::to_vec(&body(
+            json!([{"name": "catalogue", "path": files.catalogue}]),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = mode_command("--observations", &request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["observation_failure"]["kind"], "client-input");
+    assert_eq!(value["observation_failure"]["source"], "route-key");
+    assert_eq!(
+        value["observation_failure"]["detail"],
+        "declared bearer auth client input was not supplied"
+    );
+    assert!(!f.case.join("fixture-call.json").exists());
+
+    // With the declared input supplied the declared https transport is used;
+    // the closed port is a bounded transport failure that echoes no material.
+    fs::write(
+        &request,
+        serde_json::to_vec(&body(json!([
+            {"name": "catalogue", "path": files.catalogue},
+            {"name": "route-key", "path": auth}
+        ])))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = mode_command("--observations", &request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["observation_failure"]["kind"], "transport");
+    assert_eq!(
+        value["observation_failure"]["detail"],
+        "https endpoint could not be reached"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("sk-synthetic-route-token"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("sk-synthetic-route-token"));
+    assert!(!f.case.join("fixture-call.json").exists());
+}
+
+/// Observes an explicitly declared external HTTPS route through the real
+/// entry point. Run only with private paths supplied through the environment
+/// (never committed):
+///
+/// ```text
+/// CODEX_HARNESS_OBSERVATION_REQUEST=<private --observations request JSON>
+/// cargo test --locked -p codex-harness --test outcome_run -- --ignored
+/// ```
+///
+/// The private request declares the endpoint, model, plan (including
+/// `bearer_auth` naming one of its explicit private client inputs) and all
+/// paths. The test performs no model call: it collects the declared fields
+/// once through the model-free `--observations` mode, requires every declared
+/// required field to be observed, and checks that the declared bearer
+/// material is never echoed.
+#[test]
+#[ignore = "requires CODEX_HARNESS_OBSERVATION_REQUEST naming a private observations request file"]
+fn declared_external_https_observation_collects_through_the_real_entry_point() {
+    let request = PathBuf::from(
+        std::env::var_os("CODEX_HARNESS_OBSERVATION_REQUEST").expect(
+            "set CODEX_HARNESS_OBSERVATION_REQUEST to a private --observations request file",
+        ),
+    );
+    let declaration: Value = read(&request);
+    let auth_name = declaration["plan"]["bearer_auth"]
+        .as_str()
+        .expect("the declared plan must name its bearer auth client input")
+        .to_owned();
+    let cwd = request.parent().unwrap().to_path_buf();
+    let resolved = |path: &Value| {
+        let path = PathBuf::from(path.as_str().expect("a declared client input path"));
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    };
+    let auth_path = declaration["client_inputs"]
+        .as_array()
+        .expect("the request declares its client inputs")
+        .iter()
+        .find(|input| input["name"].as_str() == Some(auth_name.as_str()))
+        .map(|input| resolved(&input["path"]))
+        .expect("the declared bearer auth input must be supplied");
+    let material =
+        fs::read_to_string(&auth_path).expect("the declared bearer auth input is readable");
+    assert!(!material.trim().is_empty());
+
+    let out = mode_command("--observations", &request, &cwd)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "collected");
+    let observations = &value["observations"];
+    assert!(
+        observations["endpoint"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://")
+    );
+    assert!(!observations["plan_digest"].as_str().unwrap().is_empty());
+    for source in declaration["plan"]["requests"]
+        .as_array()
+        .expect("the plan declares its sources")
+    {
+        for field in source["fields"]
+            .as_array()
+            .expect("a source declares fields")
+        {
+            if field["required"] == true {
+                let name = field["name"].as_str().unwrap();
+                assert!(
+                    !observations["fields"][name].is_null(),
+                    "required declared field {name} was not observed"
+                );
+            }
+        }
+    }
+    // The declared bearer material is used for the request and never echoed.
+    let rendered = format!(
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!rendered.contains(material.trim()));
+}
+
 #[test]
 fn qualify_and_recheck_modes_use_retained_attempts_model_free() {
     let server = ObservationServer::start(ObservedResponse::status(404));

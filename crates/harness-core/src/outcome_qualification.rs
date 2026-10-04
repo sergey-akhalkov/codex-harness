@@ -662,8 +662,9 @@ pub struct ObservationRequest {
     pub fields: Vec<DeclaredObservation>,
 }
 
-/// The declared observation plan: the observable server sources and the
-/// effective client inputs whose explicit files are observed by digest.
+/// The declared observation plan: the observable server sources, the
+/// effective client inputs whose explicit files are observed by digest, and
+/// the optional declared bearer authentication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiObservationPlan {
@@ -672,6 +673,12 @@ pub struct ApiObservationPlan {
     /// that must be supplied and observed; the exact paths stay private run
     /// inputs and are never part of a public error.
     pub required_client_inputs: Vec<String>,
+    /// Optional declared bearer authentication: names one supplied effective
+    /// client input whose explicit private file holds the bearer token. The
+    /// token is read once, used only in the `Authorization` header of the
+    /// declared requests and never observed, echoed or retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_auth: Option<String>,
 }
 
 /// The selected API-observed identity policy.
@@ -734,6 +741,8 @@ impl ApiObservationPlan {
     /// Checks the declared plan; a contradiction is a caller error. Endpoint
     /// and model identity plus at least one effective client input are always
     /// required, and a declared optional fact only narrows what may be absent.
+    /// The optional declared bearer auth names a supplied effective client
+    /// input without ever carrying its path or material.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.requests.is_empty() {
             return Err("API-observed policy requires at least one observation source");
@@ -779,6 +788,13 @@ impl ApiObservationPlan {
             if names.contains(name.as_str()) {
                 return Err("a client input name cannot repeat an observed field name");
             }
+        }
+        if let Some(name) = &self.bearer_auth
+            && (!name_is_bounded(name)
+                || API_OBSERVED_IDENTITY.contains(&name.as_str())
+                || names.contains(name.as_str()))
+        {
+            return Err("bearer auth input name is invalid or repeats a declared field");
         }
         Ok(())
     }
@@ -901,12 +917,16 @@ const OBSERVATION_HEAD_LIMIT: usize = 64 * 1024;
 const CLIENT_INPUT_LIMIT: u64 = 64 * 1024 * 1024;
 const OBSERVATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OBSERVATION_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const OBSERVATION_AUTH_LIMIT: u64 = 8 * 1024;
 
 /// Collects the declared observations from the explicit local runner.
 ///
 /// The transport performs one bounded `GET` per declared source against the
-/// endpoint's origin through the standard library; effective client inputs
-/// are hashed from their explicit local files (owned regular files only). A
+/// endpoint's origin: plain HTTP through the standard library and declared
+/// HTTPS through the pinned TLS client. Effective client inputs are hashed
+/// from their explicit local files (owned regular files only), and an
+/// optional declared bearer authorization is read once from its named
+/// explicit private client input and attached to the declared requests. A
 /// required observation that cannot be fetched, read, parsed, or that is
 /// absent or unreadable returns a distinguishable [`ObservationFailure`]. A
 /// declared optional field that is absent stays a disclosed limit in the
@@ -962,8 +982,21 @@ pub fn collect_observations(
         }
         fields.insert(name.clone(), ObservedFact { value, provenance });
     }
+    let authorization = match &plan.bearer_auth {
+        None => None,
+        Some(name) => {
+            let path = supplied.get(name.as_str()).ok_or_else(|| {
+                ObservationFailure::new(
+                    ObservationFailureKind::ClientInput,
+                    name.as_str(),
+                    "declared bearer auth client input was not supplied",
+                )
+            })?;
+            Some(bearer_authorization(path, name)?)
+        }
+    };
     for request in &plan.requests {
-        let document = observation_document(&origin, &request.path)?;
+        let document = observation_document(&origin, &request.path, authorization.as_deref())?;
         for field in &request.fields {
             match pointer_value(&document, &field.pointer) {
                 None | Some(Value::Null) => {
@@ -1020,26 +1053,23 @@ pub fn collect_observations(
     })
 }
 
-/// The explicit local endpoint's origin (`scheme://authority`). Declared
-/// observation paths are absolute on that origin. Only the plain HTTP
-/// transport is available for observations; an endpoint that cannot use it is
-/// a disclosed transport failure, not a silent skip.
+/// The explicit endpoint's origin (`scheme://authority`). Declared
+/// observation paths are absolute on that origin. Plain HTTP origins are
+/// served by the standard library and declared HTTPS origins by the pinned
+/// TLS client; any other endpoint is a disclosed declaration failure, not a
+/// silent skip.
 fn observation_origin(endpoint: &str) -> Result<String, ObservationFailure> {
-    let rest = endpoint.strip_prefix("http://").ok_or_else(|| {
-        if endpoint.starts_with("https://") {
-            ObservationFailure::new(
-                ObservationFailureKind::Transport,
-                "endpoint",
-                "https observation transport is unsupported",
-            )
-        } else {
-            ObservationFailure::new(
-                ObservationFailureKind::Declaration,
-                "endpoint",
-                "not an explicit http origin",
-            )
-        }
-    })?;
+    let (scheme, rest) = if let Some(rest) = endpoint.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = endpoint.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        return Err(ObservationFailure::new(
+            ObservationFailureKind::Declaration,
+            "endpoint",
+            "not an explicit http or https origin",
+        ));
+    };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') || rest.contains(['?', '#']) {
         return Err(ObservationFailure::new(
@@ -1048,11 +1078,16 @@ fn observation_origin(endpoint: &str) -> Result<String, ObservationFailure> {
             "invalid explicit local endpoint",
         ));
     }
-    Ok(format!("http://{authority}"))
+    Ok(format!("{scheme}://{authority}"))
 }
 
-fn observation_document(origin: &str, path: &str) -> Result<Value, ObservationFailure> {
-    let body = observation_get(origin, path)?;
+/// Fetches one declared origin-relative source and parses it as JSON.
+fn observation_document(
+    origin: &str,
+    path: &str,
+    authorization: Option<&str>,
+) -> Result<Value, ObservationFailure> {
+    let body = observation_get(origin, path, authorization)?;
     serde_json::from_slice(&body).map_err(|_| {
         ObservationFailure::new(
             ObservationFailureKind::Parse,
@@ -1062,10 +1097,18 @@ fn observation_document(origin: &str, path: &str) -> Result<Value, ObservationFa
     })
 }
 
-/// One bounded plain-HTTP GET. The whole response is read under a size bound
-/// with explicit timeouts; content-length and chunked framings are decoded,
-/// and everything else is a visible parse failure.
-fn observation_get(origin: &str, path: &str) -> Result<Vec<u8>, ObservationFailure> {
+/// One bounded GET against the declared origin: plain HTTP through the
+/// standard library, declared HTTPS through the pinned TLS client. The whole
+/// response is read under a size bound with explicit timeouts; a declared
+/// bearer authorization is attached to the request and never echoed.
+fn observation_get(
+    origin: &str,
+    path: &str,
+    authorization: Option<&str>,
+) -> Result<Vec<u8>, ObservationFailure> {
+    if let Some(authority) = origin.strip_prefix("https://") {
+        return observation_get_https(authority, path, authorization);
+    }
     let transport =
         |detail: &str| ObservationFailure::new(ObservationFailureKind::Transport, path, detail);
     let authority = origin.strip_prefix("http://").unwrap_or(origin);
@@ -1085,9 +1128,12 @@ fn observation_get(origin: &str, path: &str) -> Result<Vec<u8>, ObservationFailu
     stream
         .set_write_timeout(Some(OBSERVATION_IO_TIMEOUT))
         .map_err(|_| transport("endpoint write timeout could not be set"))?;
+    let declared_authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\n{declared_authorization}Connection: close\r\n\r\n"
     )
     .map_err(|_| transport("observation request could not be sent"))?;
     let mut response = Vec::new();
@@ -1189,6 +1235,106 @@ fn observation_get(origin: &str, path: &str) -> Result<Vec<u8>, ObservationFailu
             Ok(body.to_vec())
         }
     }
+}
+
+/// One bounded HTTPS GET through the pinned `ureq` client (rustls, no async
+/// runtime). The URL is built only from the validated origin and the declared
+/// bounded path; ambient proxy configuration is ignored rather than followed,
+/// and every failure is a bounded description that never carries the declared
+/// authorization.
+fn observation_get_https(
+    authority: &str,
+    path: &str,
+    authorization: Option<&str>,
+) -> Result<Vec<u8>, ObservationFailure> {
+    let transport =
+        |detail: &str| ObservationFailure::new(ObservationFailureKind::Transport, path, detail);
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .proxy(None)
+            .timeout_connect(Some(OBSERVATION_CONNECT_TIMEOUT))
+            .timeout_send_request(Some(OBSERVATION_IO_TIMEOUT))
+            .timeout_recv_response(Some(OBSERVATION_IO_TIMEOUT))
+            .timeout_recv_body(Some(OBSERVATION_IO_TIMEOUT))
+            .build(),
+    );
+    let url = format!("https://{authority}{path}");
+    let mut request = agent.get(url.as_str()).header("Accept", "application/json");
+    if let Some(value) = authorization {
+        request = request.header("Authorization", value);
+    }
+    let mut response = request
+        .call()
+        .map_err(|_| transport("https endpoint could not be reached"))?;
+    let status = response.status().as_u16();
+    if !(200..=299).contains(&status) {
+        return Err(ObservationFailure::new(
+            ObservationFailureKind::Status,
+            path,
+            format!("HTTP {status}"),
+        ));
+    }
+    let limit = OBSERVATION_BODY_LIMIT as u64;
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(limit + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| transport("https response could not be read"))?;
+    if body.len() as u64 > limit {
+        return Err(ObservationFailure::new(
+            ObservationFailureKind::Parse,
+            path,
+            "response exceeds the size bound",
+        ));
+    }
+    Ok(body)
+}
+
+/// Reads the declared bearer token once from its explicit private client
+/// input file and returns the bounded `Authorization` header value. The
+/// material never reaches an observation, record, receipt or error: a refusal
+/// is a static description of the file, and the value is dropped with the
+/// collection call.
+fn bearer_authorization(path: &Path, name: &str) -> Result<String, ObservationFailure> {
+    let input = |detail: &'static str| {
+        ObservationFailure::new(ObservationFailureKind::ClientInput, name, detail)
+    };
+    crate::build_identity::ordinary(path)
+        .map_err(|_| input("input is not an owned regular file"))?;
+    let metadata = std::fs::metadata(path).map_err(|_| input("input is unreadable"))?;
+    if !metadata.is_file() {
+        return Err(input("input is not a regular file"));
+    }
+    if metadata.len() > OBSERVATION_AUTH_LIMIT {
+        return Err(input("input exceeds the size bound"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| input("input is unreadable"))?
+        .take(OBSERVATION_AUTH_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| input("input is unreadable"))?;
+    if bytes.len() as u64 > OBSERVATION_AUTH_LIMIT {
+        return Err(input("input exceeds the size bound"));
+    }
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .ok_or_else(|| input("input contains no bearer token"))?;
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(start);
+    let token = &bytes[start..=end];
+    if token.iter().any(|byte| !byte.is_ascii_graphic()) {
+        return Err(input("input is not a bounded bearer token"));
+    }
+    let token =
+        std::str::from_utf8(token).map_err(|_| input("input is not a bounded bearer token"))?;
+    Ok(format!("Bearer {token}"))
 }
 
 fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
@@ -2186,6 +2332,7 @@ mod tests {
                     ],
                 }],
                 required_client_inputs: vec!["profile".to_owned(), "catalogue".to_owned()],
+                bearer_auth: None,
             },
         }
     }
@@ -2753,6 +2900,218 @@ mod tests {
         https.endpoint = "https://127.0.0.1:65500/v1".to_owned();
         let failure = collect_observations(&https, &api_policy().plan, &inputs).unwrap_err();
         assert_eq!(failure.kind, ObservationFailureKind::Transport);
-        assert!(failure.to_string().contains("https"));
+        assert_eq!(failure.detail, "https endpoint could not be reached");
+    }
+
+    /// Serves one bounded loopback response and returns the captured request
+    /// head of the single accepted connection.
+    fn loopback_response(
+        listener: std::net::TcpListener,
+        status: &'static str,
+        body: String,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => head.extend_from_slice(&buffer[..count]),
+                    Err(_) => break,
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            head
+        })
+    }
+
+    /// The unchanged synthetic `/props` document of the test plan.
+    fn loopback_props() -> String {
+        json!({"build": "b1", "settings": {"n_ctx": 42}, "template": "t"}).to_string()
+    }
+
+    /// Real temporary effective client inputs; never the private run inputs.
+    fn private_inputs(root: &Path) -> Vec<ClientInput> {
+        let profile = root.join("profile.toml");
+        let catalogue = root.join("catalogue.json");
+        std::fs::write(&profile, "model = \"synth\"\n").unwrap();
+        std::fs::write(&catalogue, "{\"servers\":[]}\n").unwrap();
+        vec![
+            ClientInput {
+                name: "profile".to_owned(),
+                path: profile,
+            },
+            ClientInput {
+                name: "catalogue".to_owned(),
+                path: catalogue,
+            },
+        ]
+    }
+
+    #[test]
+    fn api_observed_plain_http_sends_only_declared_bearer_auth() {
+        let private = tempfile::tempdir().unwrap();
+        let inputs = private_inputs(private.path());
+        let auth = private.path().join("route.key");
+        std::fs::write(&auth, "sk-synthetic-route-token\n").unwrap();
+        let mut runner = runner();
+
+        // Without a declared bearer auth the plain-HTTP request keeps its
+        // exact unchanged shape and no authorization header is attached.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = loopback_response(listener, "200 OK", loopback_props());
+        runner.endpoint = format!("http://{address}/v1");
+        let observations = collect_observations(&runner, &api_policy().plan, &inputs).unwrap();
+        assert_eq!(observations.fields["server.build"].value, "b1");
+        assert_eq!(observations.fields["server.context"].value, "42");
+        let head = String::from_utf8(server.join().unwrap()).unwrap();
+        assert_eq!(
+            head,
+            format!(
+                "GET /props HTTP/1.1\r\nHost: {address}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+            )
+        );
+
+        // The declared bearer auth is read once from its named private client
+        // input and attached; it never reaches the observations.
+        let mut plan = api_policy().plan;
+        plan.bearer_auth = Some("route-key".to_owned());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = loopback_response(listener, "200 OK", loopback_props());
+        runner.endpoint = format!("http://{address}/v1");
+        let mut declared = inputs.clone();
+        declared.push(ClientInput {
+            name: "route-key".to_owned(),
+            path: auth.clone(),
+        });
+        let observations = collect_observations(&runner, &plan, &declared).unwrap();
+        let head = String::from_utf8(server.join().unwrap()).unwrap();
+        assert!(head.contains("Authorization: Bearer sk-synthetic-route-token\r\n"));
+        let serialized = serde_json::to_string(&observations).unwrap();
+        assert!(!serialized.contains("sk-synthetic-route-token"));
+        assert!(!serialized.contains(&auth.display().to_string()));
+
+        // A non-success status stays a bounded status failure without bodies
+        // or material.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = loopback_response(
+            listener,
+            "401 Unauthorized",
+            "{\"error\":\"private fixture body\"}".to_owned(),
+        );
+        runner.endpoint = format!("http://{address}/v1");
+        let failure = collect_observations(&runner, &plan, &declared).unwrap_err();
+        assert_eq!(failure.kind, ObservationFailureKind::Status);
+        assert_eq!(failure.detail, "HTTP 401");
+        let rendered = failure.to_string();
+        assert!(!rendered.contains("sk-synthetic-route-token"));
+        assert!(!rendered.contains("private fixture body"));
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn api_observed_missing_declared_bearer_auth_is_refused_before_transport() {
+        let private = tempfile::tempdir().unwrap();
+        let inputs = private_inputs(private.path());
+        let mut plan = api_policy().plan;
+        plan.bearer_auth = Some("route-key".to_owned());
+        let mut runner = runner();
+        runner.endpoint = "https://127.0.0.1:65500/v1".to_owned();
+        let failure = collect_observations(&runner, &plan, &inputs).unwrap_err();
+        assert_eq!(failure.kind, ObservationFailureKind::ClientInput);
+        assert_eq!(failure.source, "route-key");
+        assert_eq!(
+            failure.detail,
+            "declared bearer auth client input was not supplied"
+        );
+        assert!(!failure.to_string().contains("65500"));
+        assert!(!serde_json::to_string(&failure).unwrap().contains("65500"));
+    }
+
+    #[test]
+    fn api_observed_malformed_bearer_auth_files_are_refused_without_leaking() {
+        let private = tempfile::tempdir().unwrap();
+        let inputs = private_inputs(private.path());
+        let mut plan = api_policy().plan;
+        plan.bearer_auth = Some("route-key".to_owned());
+        let mut runner = runner();
+        runner.endpoint = "https://127.0.0.1:65500/v1".to_owned();
+
+        let refusal = |path: &Path| {
+            let mut declared = inputs.clone();
+            declared.push(ClientInput {
+                name: "route-key".to_owned(),
+                path: path.to_path_buf(),
+            });
+            let failure = collect_observations(&runner, &plan, &declared).unwrap_err();
+            assert_eq!(failure.kind, ObservationFailureKind::ClientInput);
+            assert_eq!(failure.source, "route-key");
+            failure
+        };
+
+        let absent = private.path().join("absent.key");
+        assert_eq!(
+            refusal(&absent).detail,
+            "input is not an owned regular file"
+        );
+
+        let empty = private.path().join("empty.key");
+        std::fs::write(&empty, " \r\n\t").unwrap();
+        assert_eq!(refusal(&empty).detail, "input contains no bearer token");
+
+        let malformed = private.path().join("malformed.key");
+        std::fs::write(&malformed, "sk-synthetic\r\nX-Declared-Evil: injected").unwrap();
+        let failure = refusal(&malformed);
+        assert_eq!(failure.detail, "input is not a bounded bearer token");
+        let rendered = format!("{failure} {:?}", serde_json::to_string(&failure).unwrap());
+        assert!(!rendered.contains("X-Declared-Evil"));
+        assert!(!rendered.contains("sk-synthetic"));
+        assert!(!rendered.contains(&malformed.display().to_string()));
+
+        let oversized = private.path().join("oversized.key");
+        std::fs::write(&oversized, "a".repeat(8 * 1024 + 1)).unwrap();
+        assert_eq!(refusal(&oversized).detail, "input exceeds the size bound");
+
+        // A well-formed declared token reaches the TLS transport; the closed
+        // port is a bounded transport failure that still carries no material.
+        let valid = private.path().join("valid.key");
+        std::fs::write(&valid, "sk-synthetic-route-token\n").unwrap();
+        let mut declared = inputs.clone();
+        declared.push(ClientInput {
+            name: "route-key".to_owned(),
+            path: valid,
+        });
+        let failure = collect_observations(&runner, &plan, &declared).unwrap_err();
+        assert_eq!(failure.kind, ObservationFailureKind::Transport);
+        assert_eq!(failure.detail, "https endpoint could not be reached");
+        assert!(!failure.to_string().contains("sk-synthetic-route-token"));
+    }
+
+    #[test]
+    fn api_observed_plan_rejects_invalid_bearer_auth_name_and_keeps_digest_shape() {
+        let plan = api_policy().plan;
+        let value = serde_json::to_value(&plan).unwrap();
+        assert!(value.get("bearer_auth").is_none());
+        let restored: ApiObservationPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, plan);
+
+        let mut invalid = api_policy().plan;
+        invalid.bearer_auth = Some(String::new());
+        assert!(invalid.validate().is_err());
+        invalid.bearer_auth = Some("endpoint".to_owned());
+        assert!(invalid.validate().is_err());
+        invalid.bearer_auth = Some("server.build".to_owned());
+        assert!(invalid.validate().is_err());
+        invalid.bearer_auth = Some("route-key".to_owned());
+        assert!(invalid.validate().is_ok());
     }
 }

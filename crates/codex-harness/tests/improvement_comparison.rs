@@ -2938,6 +2938,7 @@ fn install_api_observed_qualification(fixture: &Fixture, server: &ObservationSer
                 }],
             }],
             required_client_inputs: vec!["overlay".to_owned()],
+            bearer_auth: None,
         },
     };
     let inputs = vec![ClientInput {
