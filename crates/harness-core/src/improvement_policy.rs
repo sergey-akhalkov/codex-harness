@@ -31,8 +31,21 @@
 //! repeated-use sequence, or a size-only shortcut) is refused at declaration,
 //! and a declaration changed after results cannot inherit an earlier
 //! adoption.
+//!
+//! The declared corroboration requirement is consumed from the report's
+//! corroboration section ([`crate::outcome_report::CorroborationSection`],
+//! built from the run-local receipt): a decision may claim a scope that needs
+//! more independent units than the recorded complete units only when the
+//! declared additional units are selected ready by identity and replay
+//! reference. An inconclusive or unavailable selection, a selection made for a
+//! different declared requirement, or a missing section leaves the broader
+//! claim inconclusive; the consumed section is recorded with the decision, and
+//! a changed or missing state cannot inherit an earlier adoption.
 
 use crate::benefit_gate::{DecisionDraft, DecisionOutcome, QualityOutcome};
+use crate::outcome_report::{
+    CORROBORATION_SCHEMA, CorroborationSection, CorroborationState, corroboration_digest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1151,6 +1164,13 @@ pub struct PolicyEvaluation {
     /// The predeclared statistical claim, when one was bound.
     #[serde(default)]
     pub statistical_claim: Option<StatisticalClaim>,
+    /// The declared corroboration requirement consumed at decision time: the
+    /// selection status over the additional independent retained units, their
+    /// identity and replay references, the exact exclusions and the digest
+    /// binding the consumed section. `None` for a declared scope that needs no
+    /// additional units or when the report carries no bound selection.
+    #[serde(default)]
+    pub corroboration: Option<CorroborationSection>,
 }
 
 struct UnitFacts {
@@ -1345,6 +1365,179 @@ fn selected_time_view(
         uncertain,
         token_regression,
     })
+}
+
+/// The declared corroboration requirement consumed from the report: whether
+/// the selection covers the units the recorded evidence still lacks, and the
+/// bound section the decision reports when the report carries one.
+struct CorroborationConsumption {
+    /// The self-consistent bound section the report carried; `None` when the
+    /// report carries none or the section does not bind its own content.
+    evidence: Option<CorroborationSection>,
+    /// True when a ready selection matches the declared requirement and covers
+    /// the additional units beyond the recorded complete units.
+    supports: bool,
+}
+
+/// Consume the declared corroboration requirement from the report. The
+/// declared stopping count is the number of independent units an adoption
+/// needs; the run's own declared plan unit is recorded in the report, and the
+/// declared additional units (`required_units - 1`, the driver's requirement
+/// mapping) must be selected from retained prior real tasks. A missing,
+/// unbound, unavailable, inconclusive, mismatched or short selection leaves
+/// the broader claim unsupported with its exact reasons; units are never
+/// fabricated and a summary never replaces a selection.
+fn consume_corroboration(
+    policy: &ComparisonPolicy,
+    report: &Value,
+    recorded_units: usize,
+    reasons: &mut Vec<String>,
+) -> io::Result<CorroborationConsumption> {
+    let required_total = policy.stopping.required_units as usize;
+    if required_total <= 1 {
+        return Ok(CorroborationConsumption {
+            evidence: None,
+            supports: false,
+        });
+    }
+    let needed = required_total.saturating_sub(recorded_units);
+    let Some(section_value) = report.get("corroboration") else {
+        if needed > 0 {
+            reasons.push(format!(
+                "the declared scope needs {required_total} independent unit(s) and {recorded_units} complete unit(s) were recorded; no corroboration selection of the additional retained units is recorded, so the broader claim stays unsupported and no summary replaces absent evidence"
+            ));
+        }
+        return Ok(CorroborationConsumption {
+            evidence: None,
+            supports: false,
+        });
+    };
+    let section: CorroborationSection = serde_json::from_value(section_value.clone())
+        .map_err(|_| invalid("the report carries an invalid corroboration section"))?;
+    if section.schema != CORROBORATION_SCHEMA {
+        return Err(invalid(
+            "the report corroboration section has an unsupported schema",
+        ));
+    }
+    match corroboration_digest(&section) {
+        Ok(bound) if bound == section.digest => {}
+        _ => {
+            if needed > 0 {
+                reasons.push(
+                    "the corroboration section does not bind its own content; a changed corroboration state cannot support the broader claim"
+                        .to_owned(),
+                );
+            }
+            return Ok(CorroborationConsumption {
+                evidence: None,
+                supports: false,
+            });
+        }
+    }
+    if needed == 0 {
+        // The recorded units meet the declared count; the selection state is
+        // reported with the decision but nothing is required of it.
+        return Ok(CorroborationConsumption {
+            evidence: Some(section),
+            supports: false,
+        });
+    }
+    let declared_additional = (required_total - 1) as u32;
+    let supports = match section.status {
+        CorroborationState::Unavailable => {
+            reasons.push(format!(
+                "the declared scope needs {required_total} independent unit(s) with {recorded_units} complete unit(s) recorded; the corroboration selection was not performed: {}",
+                section.reason.as_deref().unwrap_or("no reason recorded")
+            ));
+            false
+        }
+        CorroborationState::Inconclusive => {
+            reasons.push(format!(
+                "the declared scope needs {required_total} independent unit(s) with {recorded_units} complete unit(s) recorded; the corroboration selection is inconclusive: {}",
+                section.reason.as_deref().unwrap_or("no reason recorded")
+            ));
+            for excluded in section.excluded.iter().take(4) {
+                reasons.push(format!(
+                    "corroboration unit {} ({}) was excluded: {}",
+                    excluded.case_id,
+                    excluded.owner,
+                    exclusion_text(&excluded.reason)
+                ));
+            }
+            if section.excluded.len() > 4 {
+                reasons.push(format!(
+                    "{} more corroboration candidate exclusion(s) stay recorded with their exact reasons in the evaluation",
+                    section.excluded.len() - 4
+                ));
+            }
+            false
+        }
+        CorroborationState::Ready => {
+            let incomplete = section.units.iter().any(|unit| {
+                [
+                    &unit.owner,
+                    &unit.case_id,
+                    &unit.experiment,
+                    &unit.mechanism,
+                    &unit.conditions,
+                    &unit.revision,
+                    &unit.tree_sha256,
+                ]
+                .iter()
+                .any(|value| value.trim().is_empty())
+            });
+            if section.required_units != declared_additional {
+                reasons.push(format!(
+                    "the corroboration selection was made for {} additional unit(s) but the declared scope requires {declared_additional} beyond the run's own declared plan unit; a changed corroboration state cannot support the broader claim",
+                    section.required_units
+                ));
+                false
+            } else if incomplete {
+                reasons.push(
+                    "the corroboration selection records a unit without complete identity and replay references; a selection cannot stand in for the retained unit's identity"
+                        .to_owned(),
+                );
+                false
+            } else if section.units.len() < needed {
+                reasons.push(format!(
+                    "the corroboration selection is ready with {} additional unit(s); the recorded {recorded_units} complete unit(s) plus the selection still fall short of the declared {required_total} independent unit(s), so the broader claim stays unsupported",
+                    section.units.len()
+                ));
+                false
+            } else {
+                reasons.push(format!(
+                    "the declared scope needs {required_total} independent unit(s); {recorded_units} complete unit(s) were recorded and the ready corroboration selection supplies the remaining {needed} additional retained unit(s) by identity: {}",
+                    section
+                        .units
+                        .iter()
+                        .map(|unit| format!("{} ({})", unit.case_id, unit.owner))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                true
+            }
+        }
+    };
+    Ok(CorroborationConsumption {
+        evidence: Some(section),
+        supports,
+    })
+}
+
+/// The selector exclusion reason in the words of the decision record.
+fn exclusion_text(reason: &crate::improvement_experiment::ExclusionReason) -> String {
+    use crate::improvement_experiment::ExclusionReason;
+    match reason {
+        ExclusionReason::NotApplicable => {
+            "not applicable to the declared mechanism and conditions".to_owned()
+        }
+        ExclusionReason::AlreadyUsed => {
+            "already part of the declared plan or not independent of an earlier unit".to_owned()
+        }
+        ExclusionReason::NotReplayable { detail } => {
+            format!("the retained copy no longer verifies as pristine: {detail}")
+        }
+    }
 }
 
 /// Evaluate the declared policy against the authoritative outcome summary.
@@ -1893,6 +2086,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             .is_some_and(|trade_off| worst <= trade_off.allowed_regression_percent)
     };
 
+    let mut corroboration: Option<CorroborationSection> = None;
     let mut decision = PolicyDecision::Inconclusive;
     if !drift.is_empty() {
         reasons.push(
@@ -2037,12 +2231,31 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             decision = PolicyDecision::Reject;
         } else {
             let maintenance = policy.basis.maintenance_basis().map(str::to_owned);
-            if facts.len() < required_units {
+            // The declared unit count is met by the recorded complete units or
+            // by the declared corroboration selection covering the units the
+            // recorded evidence still lacks; a broader claim without enough
+            // corroborating units stays inconclusive with the selection's
+            // exact reasons.
+            let consumed = consume_corroboration(policy, report, facts.len(), &mut reasons)?;
+            let sufficient_units = facts.len() >= required_units || consumed.supports;
+            let recorded_target = if consumed.supports {
+                facts.len()
+            } else {
+                required_units
+            };
+            corroboration = consumed.evidence;
+            if !sufficient_units {
+                // consume_corroboration recorded the exact reasons.
+            } else if consumed.supports && positive_units < recorded_target {
+                // The count is met only with selected, not yet measured,
+                // corroboration units: a partially measured set that does not
+                // show the declared effect on every recorded unit cannot carry
+                // the broader claim, and partial measurement is not a
+                // rejection of it either.
                 reasons.push(format!(
-                    "the predeclared corroboration was not recorded (needed {required_units} independent unit(s), recorded {})",
-                    facts.len()
+                    "the recorded {recorded_target} complete unit(s) do not all show the declared effect while the declared {required_units} independent unit(s) rely on selected corroboration units; a partially measured set stays inconclusive for the broader claim"
                 ));
-            } else if positive_units < required_units {
+            } else if positive_units < recorded_target {
                 if let Some(basis) = &maintenance {
                     // A maintenance-only basis never covers a material
                     // regression of a measured dimension: an exchange must be
@@ -2297,6 +2510,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         measurement: Some(measurement),
         variation: Some(variation),
         statistical_claim,
+        corroboration,
     })
 }
 
