@@ -48,7 +48,7 @@ use harness_core::task_worktree;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -2860,6 +2860,16 @@ fn capability_consumption(runtime: &ArmRuntime, runtime_path: &Path, capability:
 /// this arm's consumption of it in the shapes the outcome report and policy
 /// owners consume, so a comparison is accounted under the same subtractive
 /// contract as every other measured attempt.
+///
+/// Each native run carries the request/tool/round counters the outcome report
+/// consumes, each with the source that produced it in `counter_sources`:
+/// `rounds` is the completed-turn count of the retained receipt observation
+/// (one counted turn per completed native turn, the same definition the native
+/// outcome runner uses for `turn.completed`), `tool_operations` is that
+/// observation's completed tool items, `requests` is the delegation reader's
+/// deduplicated response count and `tool_calls` counts the attempt's recorded
+/// outer function calls. A counter no source produced stays absent (unknown),
+/// never zero, and the two tool counters stay distinct for batched calls.
 fn build_row(
     run: &Run,
     comparison: &ComparisonInputs,
@@ -2893,19 +2903,55 @@ fn build_row(
         "ended_at": acceptance.started_at,
         "status": if attempt.state == AttemptState::Completed { "completed" } else { "failed" },
     });
-    if let Some(messages) = observation
+    // Native request/tool/round counters, each recorded with the source that
+    // produced it. `rounds` is the authoritative completed-turn count of the
+    // retained receipt observation — the same completed-turn event the native
+    // outcome runner counts — and the legacy agent-message count is
+    // deliberately not used as a round count. A counter no source recorded
+    // stays absent and is reported unknown, never zero.
+    let mut counter_sources = serde_json::Map::new();
+    if let Some(rounds) = observation
         .as_ref()
-        .and_then(|value| value["messages"].as_u64())
+        .and_then(|value| value["rounds"].as_u64())
     {
-        native["rounds"] = json!(messages);
+        native["rounds"] = json!(rounds);
+        counter_sources.insert(
+            "rounds".to_owned(),
+            json!("receipt-observation:completed-native-turns"),
+        );
     }
     if let Some(tools) = observation
         .as_ref()
         .and_then(|value| value["toolCalls"].as_u64())
     {
         native["tool_operations"] = json!(tools);
+        counter_sources.insert(
+            "tool_operations".to_owned(),
+            json!("receipt-observation:completed-tool-items"),
+        );
     }
-    if let Some(usage) = usage_totals(&sessions.paths) {
+    let usage = usage_totals(&sessions.paths);
+    if let Some(requests) = usage
+        .as_ref()
+        .and_then(|value| value["response_count"].as_u64())
+    {
+        native["requests"] = json!(requests);
+        counter_sources.insert(
+            "requests".to_owned(),
+            json!("rollout-usage:deduplicated-responses"),
+        );
+    }
+    if let Some(calls) = sessions.tool_calls {
+        native["tool_calls"] = json!(calls);
+        counter_sources.insert(
+            "tool_calls".to_owned(),
+            json!("rollout:recorded-outer-calls"),
+        );
+    }
+    if !counter_sources.is_empty() {
+        native["counter_sources"] = Value::Object(counter_sources);
+    }
+    if let Some(usage) = usage {
         native["usage"] = usage;
     }
     let declaration = comparison.declared_policy()?.policy.declaration();
@@ -3510,6 +3556,11 @@ struct Sessions {
     verified: bool,
     /// Why the observation is unverified; named for the arm refusal.
     reason: Option<String>,
+    /// Distinct outer tool calls (recorded `function_call` items) across this
+    /// attempt's rollout files, deduplicated by call identity. `None` when the
+    /// rollouts were not read or lost lines, so the count stays unknown
+    /// instead of becoming a fabricated low number.
+    tool_calls: Option<u64>,
 }
 
 /// Discover this attempt's own rollout files under the arm home and verify
@@ -3521,6 +3572,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         paths: Vec::new(),
         verified: false,
         reason: Some(reason),
+        tool_calls: None,
     };
     let Some(binding) = &attempt.binding else {
         return Ok(unverified(
@@ -3587,9 +3639,24 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
             "no rollout was observed for the attempt's recorded session {expected}; the measured model and effort cannot be verified"
         )));
     }
+    // Outer tool calls come from the attempt's own rollouts: each recorded
+    // function call is one outer call, and the same call repeated in another
+    // recorded file of the conversation counts once. A file with corrupt or
+    // oversized lines cannot support a complete count, so the counter stays
+    // unknown instead of becoming a fabricated low number.
+    let mut call_ids: BTreeSet<String> = BTreeSet::new();
+    let mut calls_complete = true;
     let mut observed_model = None;
     for path in &paths {
         let summary = rollout_reader::read(path);
+        for call in &summary.calls {
+            if !call.call_id.is_empty() {
+                call_ids.insert(call.call_id.clone());
+            }
+        }
+        if summary.coverage.corrupt_lines > 0 || summary.coverage.oversized_lines > 0 {
+            calls_complete = false;
+        }
         let id = summary.row["id"].as_str().unwrap_or("");
         let model = summary.row["model"].as_str().unwrap_or("");
         let effort = summary.row["reasoning"].as_str().unwrap_or("");
@@ -3646,6 +3713,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         paths,
         verified: observed_model.is_some(),
         reason: None,
+        tool_calls: calls_complete.then(|| call_ids.len() as u64),
     })
 }
 
@@ -3656,8 +3724,10 @@ fn arm_of_role(role: AttemptRole) -> ComparisonArm {
     }
 }
 
-/// Measured token totals through the existing delegation reader. A partial or
-/// missing measurement is omitted, never reported as a fabricated zero.
+/// Measured token totals through the existing delegation reader, with the
+/// reader's deduplicated response count retained as the measured model-request
+/// total. A partial or missing measurement is omitted, never reported as a
+/// fabricated zero.
 fn usage_totals(paths: &[PathBuf]) -> Option<Value> {
     if paths.is_empty() {
         return None;
@@ -3691,6 +3761,17 @@ fn usage_totals(paths: &[PathBuf]) -> Option<Value> {
         let value = totals.get(key)?;
         value.as_u64()?;
         result.insert(key.to_owned(), value.clone());
+    }
+    // The delegation reader deduplicates response identities across the
+    // supplied rollouts exactly once; that measured count is retained beside
+    // the token totals so the row's request counter and the usage record come
+    // from the same accounting. Conflicting response identities cannot support
+    // a request count.
+    let responses = &value["responses"];
+    if let Some(count) = responses["response_count"].as_u64()
+        && responses["conflicting_response_ids"].as_u64() == Some(0)
+    {
+        result.insert("response_count".to_owned(), json!(count));
     }
     Some(Value::Object(result))
 }

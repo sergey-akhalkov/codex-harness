@@ -237,6 +237,11 @@ fn observed_run_records_identity_and_renders_readable_events() {
     assert!(observation["events"].as_u64().unwrap() >= 5, "{receipt}");
     assert_eq!(observation["messages"], 1, "{receipt}");
     assert_eq!(observation["toolCalls"], 1, "{receipt}");
+    assert_eq!(observation["rounds"], 1, "{receipt}");
+    assert_eq!(
+        observation["toolOperationCounts"]["commandExecution"], 1,
+        "{receipt}"
+    );
     assert_eq!(observation["malformed"], 0, "{receipt}");
     // The host identity is a full identity, not a bare pid.
     let host = &observation["host"];
@@ -2281,6 +2286,58 @@ fn completion_racing_frontend_exit_keeps_the_retained_result() {
     assert!(
         !watched_text.contains("state=interrupted"),
         "{watched_text}"
+    );
+}
+
+/// The control route records completed turns as rounds and partitions the
+/// aggregate tool counter by operation kind under its own item spellings, so
+/// the receipt carries the same counter vocabulary the exec route records.
+#[test]
+fn control_route_records_per_operation_tool_counters_and_completed_rounds() {
+    let (host, session) = spawn_managed("operation-counters");
+    for (id, kind) in [
+        ("c1", "commandExecution"),
+        ("m1", "mcpToolCall"),
+        ("w1", "webSearch"),
+        ("f1", "fileChange"),
+    ] {
+        host.server().push(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": CONTROL_THREAD,
+                "item": {"id": id, "type": kind}
+            }
+        }));
+    }
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "a1", "type": "agentMessage", "text": CONTROL_FINAL}
+        }
+    }));
+    push_completed(&host, CONTROL_TURN, "completed");
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let receipt = receipt_json(&host.receipt);
+    let observation = &receipt["observation"];
+    assert_eq!(observation["state"], "completed", "{receipt}");
+    assert_eq!(observation["messages"], 1, "{receipt}");
+    assert_eq!(observation["toolCalls"], 4, "{receipt}");
+    assert_eq!(observation["rounds"], 1, "{receipt}");
+    for kind in ["commandExecution", "mcpToolCall", "webSearch", "fileChange"] {
+        assert_eq!(
+            observation["toolOperationCounts"][kind], 1,
+            "{kind}: {receipt}"
+        );
+    }
+    let counts = observation["toolOperationCounts"]
+        .as_object()
+        .expect("the per-operation counters are recorded");
+    assert_eq!(
+        counts.values().filter_map(Value::as_u64).sum::<u64>(),
+        observation["toolCalls"].as_u64().unwrap(),
+        "the per-operation counters must partition the aggregate: {receipt}"
     );
 }
 

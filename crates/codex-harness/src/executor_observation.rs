@@ -21,6 +21,7 @@ use harness_core::process_service::ServiceProcess;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs, io,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -197,6 +198,23 @@ pub(crate) struct RunObservation {
     pub messages: u64,
     #[serde(default)]
     pub tool_calls: u64,
+    /// Completed interaction rounds (completed native turns) observed in this
+    /// run: `turn.completed` on the exec route and the committed `completed`
+    /// turn lifecycle on the control route. Zero means the observed stream
+    /// recorded no completed turn. A receipt written before this counter
+    /// existed carries no value, parses with the zero default here, and the
+    /// comparison accounting reads the raw receipt and reports the round count
+    /// unknown instead of zero.
+    #[serde(default)]
+    pub rounds: u64,
+    /// Completed tool items grouped by operation kind (`commandExecution`,
+    /// `mcpToolCall`, `webSearch`, `fileChange`). The values partition the
+    /// aggregate [`Self::tool_calls`] counter: both count the same completed
+    /// items, the aggregate first and this breakdown by operation. Item
+    /// spellings from the exec and control routes normalize to the one
+    /// vocabulary.
+    #[serde(default)]
+    pub tool_operation_counts: BTreeMap<String, u64>,
     #[serde(default)]
     pub malformed: u64,
     /// Failure, defect or interruption cause; named, never fabricated.
@@ -295,6 +313,8 @@ impl RunObservation {
             events: 0,
             messages: 0,
             tool_calls: 0,
+            rounds: 0,
+            tool_operation_counts: BTreeMap::new(),
             malformed: 0,
             cause: None,
             host: None,
@@ -323,6 +343,8 @@ impl RunObservation {
             events: 0,
             messages: 0,
             tool_calls: 0,
+            rounds: 0,
+            tool_operation_counts: BTreeMap::new(),
             malformed: 0,
             cause: None,
             host: None,
@@ -758,6 +780,20 @@ pub(crate) struct RunTracker {
     oversize: u64,
 }
 
+/// One completed tool item's operation kind in the receipt's single camelCase
+/// vocabulary. The exec route spells items `command_execution` and the control
+/// route `commandExecution`; both normalize to the same operation so the
+/// per-operation counters stay comparable across routes.
+fn tool_operation_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "command_execution" | "commandExecution" | "CommandExecution" => Some("commandExecution"),
+        "mcp_tool_call" | "mcpToolCall" | "McpToolCall" => Some("mcpToolCall"),
+        "web_search" | "webSearch" | "WebSearch" => Some("webSearch"),
+        "file_change" | "fileChange" | "FileChange" => Some("fileChange"),
+        _ => None,
+    }
+}
+
 impl RunTracker {
     pub(crate) fn new(mut observation: RunObservation) -> Self {
         observation.state = STATE_ACCEPTED.into();
@@ -801,6 +837,7 @@ impl RunTracker {
                 }
             }
             NativeEvent::TurnCompleted { turn_id } => {
+                self.observation.rounds = self.observation.rounds.saturating_add(1);
                 if self.terminal_matches(turn_id.as_deref()) {
                     self.saw_turn_completed = true;
                     self.observation.state = STATE_RUNNING.into();
@@ -819,12 +856,10 @@ impl RunTracker {
                     self.observation.state = STATE_RUNNING.into();
                 }
                 if *phase == ItemPhase::Completed {
-                    match item.kind.as_str() {
-                        "agent_message" => self.observation.messages += 1,
-                        "command_execution" | "mcp_tool_call" | "web_search" | "file_change" => {
-                            self.observation.tool_calls += 1
-                        }
-                        _ => {}
+                    if item.kind == "agent_message" {
+                        self.observation.messages = self.observation.messages.saturating_add(1);
+                    } else if let Some(operation) = tool_operation_kind(&item.kind) {
+                        self.count_tool_operation(operation);
                     }
                 }
             }
@@ -848,6 +883,19 @@ impl RunTracker {
         self.observation.malformed += 1;
         self.observation.updated_ms = now_ms();
         true
+    }
+
+    /// Counts one completed tool item in both the aggregate counter and the
+    /// per-operation breakdown, so the breakdown always partitions the
+    /// aggregate.
+    fn count_tool_operation(&mut self, operation: &'static str) {
+        self.observation.tool_calls = self.observation.tool_calls.saturating_add(1);
+        let count = self
+            .observation
+            .tool_operation_counts
+            .entry(operation.to_owned())
+            .or_default();
+        *count = count.saturating_add(1);
     }
 
     pub(crate) fn count_oversize(&mut self) {
@@ -898,15 +946,19 @@ impl RunTracker {
             self.observation.session = Some(thread.to_owned());
         }
         if let Some(state) = state {
+            // The control driver commits this state once per completed turn and
+            // stamps it on that turn's own event, so one observation is one
+            // completed interaction round.
+            if state == STATE_COMPLETED {
+                self.observation.rounds = self.observation.rounds.saturating_add(1);
+            }
             self.observation.state = state.to_owned();
         }
         if let Some(kind) = completed_item {
-            match kind {
-                "agentMessage" => self.observation.messages += 1,
-                "commandExecution" | "mcpToolCall" | "webSearch" | "fileChange" => {
-                    self.observation.tool_calls += 1
-                }
-                _ => {}
+            if kind == "agentMessage" {
+                self.observation.messages = self.observation.messages.saturating_add(1);
+            } else if let Some(operation) = tool_operation_kind(kind) {
+                self.count_tool_operation(operation);
             }
         }
         self.observation.updated_ms = now_ms();
@@ -2193,6 +2245,69 @@ mod tests {
         .unwrap();
         tracker.apply(&turn);
         assert_eq!(tracker.observation.events, 4);
+    }
+
+    /// The aggregate tool counter and its per-operation breakdown count the
+    /// same completed items, exec item spellings normalize to one operation
+    /// vocabulary, and every completed turn counts once as a round.
+    #[test]
+    fn tool_counters_partition_by_operation_and_completed_turns_are_rounds() {
+        let mut tracker = RunTracker::new(observation());
+        for line in [
+            r#"{"type":"thread.started","thread_id":"s-1"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"id":"c1","type":"command_execution"}}"#,
+            r#"{"type":"item.completed","item":{"id":"c2","type":"command_execution"}}"#,
+            r#"{"type":"item.completed","item":{"id":"w1","type":"web_search"}}"#,
+            r#"{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"done"}}"#,
+            r#"{"type":"turn.completed"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"id":"f1","type":"file_change"}}"#,
+            r#"{"type":"turn.completed"}"#,
+        ] {
+            tracker.apply(&parse_event(line).unwrap());
+        }
+        assert_eq!(tracker.observation.messages, 1);
+        assert_eq!(tracker.observation.tool_calls, 4);
+        assert_eq!(tracker.observation.rounds, 2);
+        let counts = &tracker.observation.tool_operation_counts;
+        assert_eq!(counts.get("commandExecution"), Some(&2));
+        assert_eq!(counts.get("webSearch"), Some(&1));
+        assert_eq!(counts.get("fileChange"), Some(&1));
+        assert_eq!(counts.get("mcpToolCall"), None);
+        assert_eq!(
+            counts.values().sum::<u64>(),
+            tracker.observation.tool_calls,
+            "the per-operation counters must partition the aggregate"
+        );
+    }
+
+    /// The control route records the same per-operation counters under its own
+    /// item spellings, and a committed completed turn counts once as a round
+    /// while `running` establishes no round.
+    #[test]
+    fn control_items_record_operation_counters_and_completed_rounds() {
+        let mut tracker = RunTracker::new(observation());
+        tracker.apply_control(Some("running"), None, "thread-1");
+        assert_eq!(tracker.observation.rounds, 0);
+        for kind in [
+            "agentMessage",
+            "commandExecution",
+            "mcpToolCall",
+            "webSearch",
+            "fileChange",
+        ] {
+            tracker.apply_control(Some("running"), Some(kind), "thread-1");
+        }
+        assert_eq!(tracker.observation.messages, 1);
+        assert_eq!(tracker.observation.tool_calls, 4);
+        let counts = &tracker.observation.tool_operation_counts;
+        for operation in ["commandExecution", "mcpToolCall", "webSearch", "fileChange"] {
+            assert_eq!(counts.get(operation), Some(&1), "{operation}");
+        }
+        tracker.apply_control(Some("completed"), None, "thread-1");
+        assert_eq!(tracker.observation.rounds, 1);
+        assert_eq!(tracker.observation.state, STATE_COMPLETED);
     }
 
     #[test]

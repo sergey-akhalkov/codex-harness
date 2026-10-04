@@ -1293,7 +1293,7 @@ impl Fixture {
         let sessions = home.join("sessions/2026/10/01");
         fs::create_dir_all(&sessions).unwrap();
         let rollout = sessions.join(format!("rollout-{session}.jsonl"));
-        let lines = [
+        let mut lines = vec![
             json!({
                 "type": "session_meta",
                 "payload": {"id": session, "base_instructions": "fixture"},
@@ -1302,11 +1302,41 @@ impl Fixture {
                 "type": "turn_context",
                 "payload": {"model": "fixture-glyph-1", "effort": "low", "turn_id": "turn-1"},
             }),
-            json!({
-                "type": "token_usage_record",
+        ];
+        // One recorded outer function call per completed tool item: the
+        // unbatched conversation these fixtures simulate.
+        for index in 1..=tool_calls {
+            lines.push(json!({
+                "type": "response_item",
                 "payload": {
-                    "response_id": "response-1",
-                    "usage": {
+                    "type": "function_call",
+                    "call_id": format!("call-{index}"),
+                    "name": "exec_command",
+                },
+            }));
+        }
+        lines.push(json!({
+            "type": "token_usage_record",
+            "payload": {
+                "response_id": "response-1",
+                "usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 40,
+                    "output_tokens": 20,
+                    "reasoning_output_tokens": 5,
+                    "total_tokens": 120,
+                },
+            },
+        }));
+        // The cumulative snapshot a recorded conversation carries beside its
+        // per-response usage; the accounting reader requires it to measure a
+        // complete total.
+        lines.push(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
                         "input_tokens": 100,
                         "cached_input_tokens": 40,
                         "output_tokens": 20,
@@ -1314,12 +1344,13 @@ impl Fixture {
                         "total_tokens": 120,
                     },
                 },
-            }),
-        ]
-        .iter()
-        .map(|value| serde_json::to_string(value).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
+            },
+        }));
+        let lines = lines
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(&rollout, format!("{lines}\n")).unwrap();
 
         let receipt = self.run.join(format!("{arm}-receipt.json"));
@@ -1381,6 +1412,8 @@ impl Fixture {
                     "events": 5,
                     "messages": messages,
                     "toolCalls": tool_calls,
+                    "rounds": 1,
+                    "toolOperationCounts": {"commandExecution": tool_calls},
                     "malformed": 0,
                     "cause": Value::Null,
                     "host": {"pid": 4294967294u32, "created": 1, "program": "C:\\missing\\host.exe"},
@@ -2283,7 +2316,9 @@ fn a_continuous_controller_consumes_an_adoption_through_integration_and_activati
 
 /// Missing measured counters stay visible: the declared rounds/tool evidence
 /// is incomplete, so the frozen policy cannot adopt and the decision records
-/// the missing coverage instead of assuming zero.
+/// the missing coverage instead of assuming zero. The authoritative
+/// counters are removed at their producer: the completed-turn counter and the
+/// completed-tool-item counter of the retained receipt observation.
 #[test]
 fn missing_counter_evidence_stays_inconclusive() {
     let _serial = INSTALL.lock().unwrap();
@@ -2311,7 +2346,7 @@ fn missing_counter_evidence_stays_inconclusive() {
     receipt["observation"]
         .as_object_mut()
         .unwrap()
-        .remove("messages");
+        .remove("rounds");
     fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     let resume = fixture.resume();
     assert!(resume.status.success(), "{}", text(&resume));
@@ -2326,6 +2361,114 @@ fn missing_counter_evidence_stays_inconclusive() {
     );
     let comments = fixture.bd_comments(&fixture.card);
     assert!(comments.contains("outcome=inconclusive"), "{comments}");
+
+    // A counter no source recorded stays absent (unknown), and the provenance
+    // map names exactly the counters that were recorded.
+    let baseline_row = load_json(&fixture.arm_dir("baseline").join("row.json"));
+    let native = &baseline_row["native_runs"][0];
+    assert!(native["tool_operations"].is_null(), "{baseline_row}");
+    assert!(native["rounds"].is_number(), "{baseline_row}");
+    assert_eq!(
+        native["counter_sources"]["rounds"], "receipt-observation:completed-native-turns",
+        "{baseline_row}"
+    );
+    assert_eq!(
+        native["counter_sources"]["tool_calls"], "rollout:recorded-outer-calls",
+        "{baseline_row}"
+    );
+    assert!(
+        native["counter_sources"]["tool_operations"].is_null(),
+        "the missing counter must not claim a source: {baseline_row}"
+    );
+    let candidate_row = load_json(&fixture.arm_dir("candidate").join("row.json"));
+    let native = &candidate_row["native_runs"][0];
+    assert!(native["rounds"].is_null(), "{candidate_row}");
+    assert!(native["tool_operations"].is_number(), "{candidate_row}");
+    assert!(
+        native["counter_sources"]["rounds"].is_null(),
+        "the missing round counter must not claim a source: {candidate_row}"
+    );
+}
+
+/// Requests, rounds, outer calls and tool operations travel from the retained
+/// receipt and the attempt's own rollout through the accounting row into the
+/// authoritative report: a batched outer call keeps its lower call count from
+/// being read as less work, and the call and operation counters stay distinct
+/// end to end.
+#[test]
+fn batched_calls_and_operations_stay_distinct_through_the_report() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("batched-counters");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    let baseline_session = session_id("batched-baseline");
+    fixture.simulate_arm(
+        "baseline",
+        "baseline",
+        "solved",
+        1200,
+        60.0,
+        2,
+        6,
+        &baseline_session,
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    let candidate_session = session_id("batched-candidate");
+    fixture.simulate_arm(
+        "candidate",
+        "candidate",
+        "solved",
+        50,
+        1.0,
+        1,
+        6,
+        &candidate_session,
+    );
+    // One batched outer call performed all six tool operations the candidate
+    // receipt observed; the completed-item evidence is unchanged.
+    keep_recorded_calls(&fixture, "candidate", &candidate_session, 1);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+
+    let baseline_row = load_json(&fixture.arm_dir("baseline").join("row.json"));
+    let native = &baseline_row["native_runs"][0];
+    assert_eq!(native["requests"], 1, "{baseline_row}");
+    assert_eq!(native["rounds"], 1, "{baseline_row}");
+    assert_eq!(native["tool_calls"], 6, "{baseline_row}");
+    assert_eq!(native["tool_operations"], 6, "{baseline_row}");
+    assert_eq!(native["usage"]["response_count"], 1, "{baseline_row}");
+    assert_eq!(
+        native["counter_sources"]["requests"], "rollout-usage:deduplicated-responses",
+        "{baseline_row}"
+    );
+    assert_eq!(
+        native["counter_sources"]["tool_operations"], "receipt-observation:completed-tool-items",
+        "{baseline_row}"
+    );
+
+    let candidate_row = load_json(&fixture.arm_dir("candidate").join("row.json"));
+    let native = &candidate_row["native_runs"][0];
+    assert_eq!(native["requests"], 1, "{candidate_row}");
+    assert_eq!(native["rounds"], 1, "{candidate_row}");
+    assert_eq!(native["tool_calls"], 1, "{candidate_row}");
+    assert_eq!(native["tool_operations"], 6, "{candidate_row}");
+
+    // The outcome report keeps every counter available and the batched shape
+    // distinct: the lower outer-call count alone is not less recorded work.
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let events = &report["variation"][0]["within_run_events"];
+    assert_eq!(events["requests"], 2, "{events}");
+    assert_eq!(events["rounds"], 2, "{events}");
+    assert_eq!(events["tool_calls"], 7, "{events}");
+    assert_eq!(events["tool_operations"], 12, "{events}");
 }
 
 /// Write one API-observed qualification produced by the owner against the
@@ -2841,6 +2984,31 @@ fn rewrite_rollout(fixture: &Fixture, arm: &str, session: &str, model: &str, eff
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&rollout, format!("{rewritten}\n")).unwrap();
+}
+
+/// Rewrites one arm's recorded rollout so only the first `keep` outer function
+/// calls remain. The completed tool-item observation is unchanged, which is
+/// exactly the batched-call shape the call and operation counters must keep
+/// distinct.
+fn keep_recorded_calls(fixture: &Fixture, arm: &str, session: &str, keep: usize) {
+    let rollout = fixture
+        .arm_dir(arm)
+        .join("home/sessions/2026/10/01")
+        .join(format!("rollout-{session}.jsonl"));
+    let text = fs::read_to_string(&rollout).unwrap();
+    let mut kept = 0usize;
+    let mut lines = Vec::new();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let value: Value = serde_json::from_str(line).unwrap();
+        if value["type"] == "response_item" && value["payload"]["type"] == "function_call" {
+            kept += 1;
+            if kept > keep {
+                continue;
+            }
+        }
+        lines.push(line.to_owned());
+    }
+    fs::write(&rollout, format!("{}\n", lines.join("\n"))).unwrap();
 }
 
 // ---------------------------------------------------------------- native path
