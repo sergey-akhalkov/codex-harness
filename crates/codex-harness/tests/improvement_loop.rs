@@ -829,6 +829,28 @@ fn removal_authority_blocks_candidate_selection_until_it_is_current() {
         text(&select)
     );
 
+    // Interruption at the pending-approval boundary preserves the recorded
+    // state: the resume resolves the current (still missing) decision instead
+    // of inheriting anything from before the stop, and no decision is ever
+    // recorded on the user's behalf.
+    let stopped = fixture.improve(&["stop", "--run", &run_arg]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(select.status.code(), Some(2), "{}", text(&select));
+    assert!(
+        text(&select).contains("no reviewed removal proposal"),
+        "{}",
+        text(&select)
+    );
+    assert!(
+        removal_comments(&fixture)
+            .iter()
+            .all(|record| !record.contains("removal-decision v1")),
+        "a resume never records a removal decision"
+    );
+
     let propose = fixture.feedback(&[
         "removal-propose",
         "--item",
@@ -876,6 +898,90 @@ fn removal_authority_blocks_candidate_selection_until_it_is_current() {
         text(&select)
     );
 
+    // A stop and resume around the unchanged approval reuses it: the proposal
+    // and decision records survive interruption and no approval ritual is
+    // repeated.
+    let stopped = fixture.improve(&["stop", "--run", &run_arg]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(select.status.code(), Some(2), "{}", text(&select));
+    assert!(
+        text(&select).contains("runtime preparation"),
+        "the interrupted approved scope resumes without another question: {}",
+        text(&select)
+    );
+    assert_eq!(
+        removal_comments(&fixture)
+            .iter()
+            .filter(|record| record.contains("removal-decision v1"))
+            .count(),
+        1,
+        "the unchanged approval is not asked for again"
+    );
+
+    // A withdrawal blocks the next effect; it too survives an interruption
+    // and no resume silently restores the withdrawn consent.
+    let withdraw = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "withdraw",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--basis",
+        "user-turn-8",
+    ]);
+    assert!(withdraw.status.success(), "{}", text(&withdraw));
+    let stopped = fixture.improve(&["stop", "--run", &run_arg]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(select.status.code(), Some(2), "{}", text(&select));
+    assert!(text(&select).contains("withdrawn"), "{}", text(&select));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(select.status.code(), Some(2), "{}", text(&select));
+    assert!(
+        text(&select).contains("withdrawn"),
+        "the withdrawal survives the interruption: {}",
+        text(&select)
+    );
+
+    // A fresh informed decision is a new basis: the next effect follows the
+    // latest decision instead of the withdrawn one.
+    let reapprove = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--actions",
+        "experiment",
+        "--loss",
+        "retired-skill",
+        "--basis",
+        "user-turn-9",
+    ]);
+    assert!(reapprove.status.success(), "{}", text(&reapprove));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(select.status.code(), Some(2), "{}", text(&select));
+    assert!(
+        text(&select).contains("runtime preparation"),
+        "{}",
+        text(&select)
+    );
+
     // A changed reviewed detail is a changed proposal: the frozen consent no
     // longer covers it and dependent selection blocks again.
     let change = fixture.feedback(&[
@@ -903,9 +1009,41 @@ fn removal_authority_blocks_candidate_selection_until_it_is_current() {
         "{}",
         text(&select)
     );
+    // Interruption preserves every required input: both reviewed proposal
+    // versions and the decided records stay readable for the updated
+    // decision and for the recorded restoration route.
+    let stopped = fixture.improve(&["stop", "--run", &run_arg]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let records = removal_comments(&fixture);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.contains("removal-proposal v1"))
+            .count(),
+        2,
+        "both reviewed proposal versions survive the interruption: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.contains("preview=preview-1"))
+            && records
+                .iter()
+                .any(|record| record.contains("loss=retired-skill")),
+        "the evidence and restoration inputs survive the interruption: {records:?}"
+    );
+    let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(select.status.code(), Some(2), "{}", text(&select));
+    assert!(
+        text(&select).contains("changed") && text(&select).contains("fresh decision"),
+        "{}",
+        text(&select)
+    );
 
     // A refusal is not a measurement failure and the same request is not
-    // repeated without a new basis.
+    // repeated without a new basis; it also survives an interruption.
     let refuse = fixture.feedback(&[
         "removal-decide",
         "--item",
@@ -923,6 +1061,774 @@ fn removal_authority_blocks_candidate_selection_until_it_is_current() {
     let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
     assert_eq!(select.status.code(), Some(2), "{}", text(&select));
     assert!(text(&select).contains("user declined"), "{}", text(&select));
+    let stopped = fixture.improve(&["stop", "--run", &run_arg]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let select = fixture.improve(&["select", "--run", &run_arg, "--variant", "candidate"]);
+    assert_eq!(select.status.code(), Some(2), "{}", text(&select));
+    assert!(
+        text(&select).contains("user declined"),
+        "the refusal survives the interruption: {}",
+        text(&select)
+    );
+    assert_eq!(
+        removal_comments(&fixture)
+            .iter()
+            .filter(|record| record.contains("removal-decision v1"))
+            .count(),
+        4,
+        "no resume asks for the removal decision again"
+    );
+}
+
+/// Every native removal record currently on the hypothesis card, as the
+/// decision owner wrote it.
+fn removal_comments(fixture: &Fixture) -> Vec<String> {
+    harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &fixture.card)
+        .unwrap()
+        .into_iter()
+        .filter(|comment| {
+            comment.contains("removal-proposal v1") || comment.contains("removal-decision v1")
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Removal authorization through interruption and resume (OpenSpec change task
+// 5.7): the actual board decision owner and the real improve
+// start/status/stop/resume verbs drive an adoption whose treatment is a
+// removal. The latest decision and its actual scope control the next effect;
+// a stale approval or retained receipt never authorizes integration or
+// activation; refusals and withdrawals are not prompted again without a new
+// basis; and interruption preserves the decision, proposal and evidence the
+// later stages need.
+// ---------------------------------------------------------------------------
+
+/// One candidate checkout ahead of the frozen base: a real owned branch whose
+/// committed revision is the exact evaluated candidate.
+fn advance_candidate_checkout(fixture: &Fixture) -> harness_core::task_worktree::CandidateCheckout {
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let worktree = fixture.root.join("candidate-worktree");
+    let branch = format!("improve/removal-fixture/{}", fixture.card);
+    let mut checkout = harness_core::task_worktree::allocate_candidate_checkout(
+        &fixture.proj,
+        &worktree,
+        &branch,
+        &base,
+    )
+    .expect("the candidate allocation is created");
+    fs::write(
+        checkout.path.join("crates/one/src/lib.rs"),
+        "// removal candidate\n",
+    )
+    .unwrap();
+    fs::write(checkout.path.join("answer.txt"), "integrated\n").unwrap();
+    git(&checkout.path, &["add", "."]);
+    git(
+        &checkout.path,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "candidate implementation",
+        ],
+    );
+    checkout.revision = git_output(&checkout.path, &["rev-parse", "HEAD"]);
+    checkout
+}
+
+/// The synthetic fixture's board and OpenSpec workspace enter the project
+/// after its seed commit; record them once so the accepted mainline is clean
+/// for the integration owner, exactly as the comparison fixtures commit their
+/// planning workspace.
+fn commit_planning_workspace(fixture: &Fixture) {
+    git(&fixture.proj, &["add", "."]);
+    git(
+        &fixture.proj,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "planning workspace",
+        ],
+    );
+}
+
+/// The comparison run spec whose declared treatment is a removal and whose
+/// authority covers integration as well as the isolated experiment.
+fn seed_removal_comparison_spec(fixture: &Fixture, name: &str) -> String {
+    let head = seed_comparison_spec(fixture, &json!({}), name);
+    let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    spec["publication_scope"] = json!(["experiment", "integration"]);
+    spec["removal"] = json!({"proposal": "remove-x", "target": "skill-x"});
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    head
+}
+
+/// The retained comparison bindings of a removal adoption: both arms share the
+/// frozen pre-solution workload copy and the evaluated candidate is the real
+/// branch ahead of the accepted base.
+fn seed_removal_bindings(
+    fixture: &Fixture,
+    workload: &harness_core::task_worktree::FrozenCopy,
+    checkout: &harness_core::task_worktree::CandidateCheckout,
+    policy_digest: &str,
+) -> PathBuf {
+    let path = fixture.run.join("comparison/bindings.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let arm = |name: &str, arm: &str| {
+        json!({
+            "arm": arm,
+            "home": fixture.root.join(name).display().to_string(),
+            "workload": workload,
+            "runtime": {
+                "arm": arm,
+                "label": name,
+                "build": fixture.root.join("builds").join(name).display().to_string(),
+                "recordSha256": "a".repeat(64),
+                "sourceSha256": "b".repeat(64),
+            }
+        })
+    };
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "hypothesis": fixture.card,
+            "caseId": "case-b",
+            "baseRevision": checkout.base,
+            "candidate": {
+                "source": fixture.proj,
+                "path": checkout.path,
+                "branch": checkout.branch,
+                "base": checkout.base,
+                "revision": checkout.revision,
+            },
+            "oracle": "oracle-7",
+            "acceptance": "acceptance/run-9",
+            "policyDigest": policy_digest,
+            "arms": [arm("baseline-home", "baseline"), arm("candidate-home", "candidate")],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+/// The measured evaluation identity the removal adoption is bound to, exactly
+/// as the comparison owner leaves it for the decision boundary.
+fn adoption_evaluation(policy_digest: &str) -> Value {
+    json!({
+        "schema": 1,
+        "policyDigest": policy_digest,
+        "decision": "adopt",
+        "basis": "efficiency",
+        "quality": "improved",
+        "matched": 1,
+        "baselineSeconds": 2.0,
+        "candidateSeconds": 1.0,
+        "tolerancePercent": 5.0,
+        "coverage": "fixture",
+        "scope": "fixture",
+        "reasons": ["the candidate reduced the declared metric"],
+        "perSuccess": {
+            "status": "complete",
+            "seconds": 1.0,
+            "acceptedTasks": 1,
+            "tasks": 1,
+            "reason": "measured",
+        },
+        "attempts": 2,
+        "tasks": 1,
+        "acceptedTasks": 1,
+        "acceptanceRate": 1.0,
+        "tradeOffUsed": false,
+    })
+}
+
+/// Seed the removal adoption's decision boundary: the retained evaluation, the
+/// cursor the decision boundary consumes, the published evidence-bound
+/// adoption the activation owner re-derives from exactly those values, and a
+/// readable candidate runtime receipt that does not belong to the bound
+/// prepared variant (so an authorized activation attempt stops as a reportable
+/// state condition instead of touching an installed runtime).
+fn seed_removal_adoption_boundary(
+    fixture: &Fixture,
+    bindings: &Path,
+    workload_card: &str,
+    checkout: &harness_core::task_worktree::CandidateCheckout,
+    policy_digest: &str,
+) -> PathBuf {
+    let evaluation_path = seed_decision_boundary(
+        fixture,
+        bindings,
+        workload_card,
+        &checkout.revision,
+        "adopt",
+    );
+    let evaluation = adoption_evaluation(policy_digest);
+    fs::write(
+        &evaluation_path,
+        serde_json::to_vec_pretty(&evaluation).unwrap(),
+    )
+    .unwrap();
+    let parsed: harness_core::improvement_policy::PolicyEvaluation =
+        serde_json::from_value(evaluation).unwrap();
+    let draft = parsed
+        .decision_draft(
+            &fixture.card,
+            "exp-fixture",
+            &checkout.base,
+            &checkout.revision,
+            "acceptance/run-9",
+        )
+        .unwrap();
+    harness_core::benefit_gate::publish_decision(&fixture.bd, &fixture.proj, &draft)
+        .expect("the evidence-bound adoption is published");
+
+    let runtime = fixture.run.join("candidate-runtime.json");
+    let link = |name: &str| {
+        json!({
+            "name": name,
+            "destination": fixture.home.join("harness").join(name).display().to_string(),
+            "source": checkout.path.join(name).display().to_string(),
+            "sha256": "e".repeat(64),
+        })
+    };
+    fs::write(
+        &runtime,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 2,
+            "arm": "candidate",
+            "label": "candidate-home",
+            "variant": {
+                "arm": "candidate",
+                "label": "candidate-home",
+                "build": fixture.root.join("builds/candidate-home").display().to_string(),
+                "recordSha256": "d".repeat(64),
+                "sourceSha256": "b".repeat(64),
+            },
+            "source": checkout.path,
+            "home": fixture.home,
+            "userHome": fixture.home,
+            "dependencyUserHome": fixture.home,
+            "upstream": fixture.root.join("upstream.exe"),
+            "upstreamSha256": "f".repeat(64),
+            "launcher": link("bin/codex.exe"),
+            "launchRegistration": fixture.home.join("harness/native-launch.json").display().to_string(),
+            "launchSha256": "e".repeat(64),
+            "instructions": link("AGENTS.md"),
+            "agents": link("agents"),
+            "skills": [],
+            "commands": [],
+            "private": [],
+            "installation": {
+                "status": "healthy",
+                "links": 0,
+                "changedLinks": 0,
+                "pathChange": false,
+                "runtimeExecutableSha256": "e".repeat(64),
+                "runtimeEvidence": fixture.root.join("runtime-evidence").display().to_string(),
+            },
+            "modelCalls": 0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut cursor = fixture.cursor();
+    cursor["candidate"]["removal_required"] = json!(true);
+    cursor["comparison"]["policy_digest"] = json!(policy_digest);
+    cursor["comparison"]["candidate"]["runtime"] = json!(runtime.display().to_string());
+    fixture.write_cursor(&cursor);
+    runtime
+}
+
+/// Spawn one continuous controller invocation in the background; the caller
+/// observes status read-only and interrupts it through `improve stop`.
+fn spawn_controller(fixture: &Fixture) -> Child {
+    Command::new(manager())
+        .arg("improve")
+        .args(["resume", "--run", fixture.run.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the controller starts")
+}
+
+/// Wait until the run's recorded condition names the expected state.
+fn wait_for_condition(fixture: &Fixture, needle: &str, limit: Duration) -> Value {
+    let deadline = Instant::now() + limit;
+    loop {
+        let report = status_value(fixture);
+        if report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return report;
+        }
+        if Instant::now() >= deadline {
+            panic!("the run never reported {needle:?}: {report}");
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// Collect one background controller's output after it leaves.
+fn controller_result(mut child: Child) -> String {
+    let finished = wait_for(
+        || matches!(child.try_wait(), Ok(Some(_))),
+        Duration::from_secs(60),
+    );
+    if !finished {
+        panic!("the controller did not leave: {}", controller_output(child));
+    }
+    let output = child.wait_with_output().unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn a_removal_adoption_takes_effect_only_under_the_current_scoped_decision() {
+    let fixture = Fixture::new("removal-integration");
+    commit_planning_workspace(&fixture);
+    // The reviewed removal proposal is recorded before the run starts, so the
+    // run freezes exactly the reviewed version the user decided on.
+    let propose = fixture.feedback(&[
+        "removal-propose",
+        "--item",
+        &fixture.card,
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--evidence",
+        "evidence-7",
+        "--loss",
+        "retired-skill",
+        "--preview",
+        "preview-1",
+        "--detail",
+        "consumer list: none known",
+    ]);
+    assert!(propose.status.success(), "{}", text(&propose));
+
+    let policy_digest = "c".repeat(64);
+    let head = seed_removal_comparison_spec(&fixture, "removal-integration");
+    let workload_card = admit_workload_card(&fixture);
+    let checkout = advance_candidate_checkout(&fixture);
+    assert_eq!(
+        checkout.base, head,
+        "the candidate branch is bound to the accepted base"
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let workload = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        &head,
+        &fixture.root.join("workload-pre"),
+    )
+    .unwrap();
+    let bindings = seed_removal_bindings(&fixture, &workload, &checkout, &policy_digest);
+    let runtime = seed_removal_adoption_boundary(
+        &fixture,
+        &bindings,
+        &workload_card,
+        &checkout,
+        &policy_digest,
+    );
+    fs::write(
+        fixture.run.join("integration-check.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "program": manager(),
+            "args": ["--version"],
+            "timeout_seconds": 120,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The evidence-bound adoption is complete and benefit-supported, but no
+    // removal decision exists: the continuous controller waits for the user's
+    // decision and nothing is integrated or activated.
+    let controller = spawn_controller(&fixture);
+    let report = wait_for_condition(
+        &fixture,
+        "waiting for removal authority",
+        Duration::from_secs(60),
+    );
+    assert_eq!(report["phase"], "decision-recorded", "{report}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no removal decision"),
+        "{report}"
+    );
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        head,
+        "a pending removal decision leaves the mainline exactly as evaluated"
+    );
+
+    // Experiment-only consent covers the isolated experiment; the later
+    // integration stage is not covered and the controller keeps waiting
+    // instead of applying the treatment.
+    let experiment_only = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--actions",
+        "experiment",
+        "--loss",
+        "retired-skill",
+        "--basis",
+        "user-turn-7",
+    ]);
+    assert!(
+        experiment_only.status.success(),
+        "{}",
+        text(&experiment_only)
+    );
+    let report = wait_for_condition(
+        &fixture,
+        "integration is not covered",
+        Duration::from_secs(60),
+    );
+    assert!(
+        report["removal"]["gate"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("authorized"),
+        "the experiment stage is covered: {report}"
+    );
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), head);
+
+    // A fresh decision that expressly covers integration is the new basis:
+    // the latest decision controls the next effect through the real
+    // integration owner.
+    let covered = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--actions",
+        "experiment,integration",
+        "--loss",
+        "retired-skill",
+        "--basis",
+        "user-turn-8",
+    ]);
+    assert!(covered.status.success(), "{}", text(&covered));
+    let output = controller_result(controller);
+    assert!(
+        output.contains("controller: integration owner applied"),
+        "{output}"
+    );
+    assert!(
+        output.contains("controller: activation blocked"),
+        "{output}"
+    );
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "decision-recorded", "{report}");
+    let condition = report["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("decision boundary blocked")
+            && condition.contains("activation")
+            && condition.contains("prepared candidate variant"),
+        "the authorized activation attempt stops on its own state, not on removal authority: {report}"
+    );
+    assert!(fixture.run.join("integration.json").is_file());
+    assert!(
+        !fixture.run.join("activation.json").is_file(),
+        "a runtime that is not the prepared variant is never activated"
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        checkout.revision,
+        "the checked integrated revision is the mainline"
+    );
+
+    // Interruption preserves every input the later stages need: the reviewed
+    // proposal and decisions, the retained evaluation and bindings, the
+    // combined-tree evidence and the prepared integration receipt.
+    let evidence_files = [
+        fixture.run.join("comparison/evaluation.json"),
+        bindings.clone(),
+        fixture.run.join("integration.json"),
+        runtime.clone(),
+    ];
+    for path in &evidence_files {
+        assert!(path.is_file(), "{} is retained", path.display());
+    }
+    let decisions_before = removal_comments(&fixture)
+        .iter()
+        .filter(|record| record.contains("removal-decision v1"))
+        .count();
+
+    // A withdrawal after the integration effect blocks the next activation
+    // attempt: the retained integration receipt does not carry the withdrawn
+    // consent, and a repeated resume neither re-prompts nor restores it.
+    let withdraw = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "withdraw",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--basis",
+        "user-turn-9",
+    ]);
+    assert!(withdraw.status.success(), "{}", text(&withdraw));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("withdrew approval for removal proposal"),
+        "the withdrawal blocks the next effect: {report}"
+    );
+    assert!(!fixture.run.join("activation.json").is_file());
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    let report = status_value(&fixture);
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("withdrew approval"),
+        "the withdrawn consent is re-resolved, never restored: {report}"
+    );
+
+    // A refusal is the user's current word too: activation stays blocked
+    // without a new basis.
+    let refuse = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "refuse",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--basis",
+        "user-turn-10",
+    ]);
+    assert!(refuse.status.success(), "{}", text(&refuse));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refused removal proposal"),
+        "the refusal blocks the next effect: {report}"
+    );
+    assert!(!fixture.run.join("activation.json").is_file());
+
+    // A fresh informed approval restores the covered scope and the next
+    // attempt follows the latest decision.
+    let reapprove = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--actions",
+        "experiment,integration",
+        "--loss",
+        "retired-skill",
+        "--basis",
+        "user-turn-11",
+    ]);
+    assert!(reapprove.status.success(), "{}", text(&reapprove));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    let condition = report["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("prepared candidate variant")
+            && !condition.contains("withdrew")
+            && !condition.contains("refused"),
+        "the latest decision controls the next effect: {report}"
+    );
+    let integration_bytes = fs::read(fixture.run.join("integration.json")).unwrap();
+
+    // A newly discovered consumer loss is a changed reviewed proposal: the
+    // stale approval and the retained integration receipt do not authorize
+    // the next activation, and the controller waits for an updated informed
+    // decision instead of applying anything.
+    let changed = fixture.feedback(&[
+        "removal-propose",
+        "--item",
+        &fixture.card,
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--evidence",
+        "evidence-8",
+        "--loss",
+        "retired-skill+recovery",
+        "--preview",
+        "preview-1",
+        "--detail",
+        "consumer list: one indirect consumer recorded after the approval",
+    ]);
+    assert!(changed.status.success(), "{}", text(&changed));
+    let controller = spawn_controller(&fixture);
+    let report = wait_for_condition(
+        &fixture,
+        "changed after the frozen approval",
+        Duration::from_secs(60),
+    );
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fresh decision is required"),
+        "{report}"
+    );
+    assert!(
+        !fixture.run.join("activation.json").is_file(),
+        "a retained receipt or stale approval never authorizes activation"
+    );
+
+    // Interrupt the waiting controller through the real stop verb; every
+    // decision, proposal and evidence input survives.
+    let stopped = fixture.improve(&["stop", "--run", fixture.run.to_str().unwrap()]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let output = controller_result(controller);
+    assert!(
+        output.contains("integration is waiting for removal authority")
+            || output.contains("consumed the exact stop request"),
+        "{output}"
+    );
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "stopped", "{report}");
+    for path in &evidence_files {
+        assert!(
+            path.is_file(),
+            "{} survives the interruption",
+            path.display()
+        );
+    }
+    assert_eq!(
+        fs::read(fixture.run.join("integration.json")).unwrap(),
+        integration_bytes,
+        "the retained integration receipt is not rewritten while a fresh decision is required"
+    );
+    assert_eq!(
+        removal_comments(&fixture)
+            .iter()
+            .filter(|record| record.contains("removal-proposal v1"))
+            .count(),
+        2,
+        "both reviewed proposal versions are retained"
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        checkout.revision
+    );
+
+    // Resuming while the changed proposal has no decision keeps waiting: the
+    // interruption did not turn the stale approval into consent.
+    let controller = spawn_controller(&fixture);
+    let report = wait_for_condition(
+        &fixture,
+        "changed after the frozen approval",
+        Duration::from_secs(60),
+    );
+    assert_eq!(report["phase"], "decision-recorded", "{report}");
+    let stopped = fixture.improve(&["stop", "--run", fixture.run.to_str().unwrap()]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let _ = controller_result(controller);
+    assert!(!fixture.run.join("activation.json").is_file());
+
+    // The updated informed decision on the changed content is the only thing
+    // that lets the next activation attempt proceed.
+    let covered_change = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "remove-x",
+        "--target",
+        "skill-x",
+        "--actions",
+        "experiment,integration",
+        "--loss",
+        "retired-skill+recovery",
+        "--basis",
+        "user-turn-12",
+    ]);
+    assert!(covered_change.status.success(), "{}", text(&covered_change));
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    let condition = report["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("prepared candidate variant")
+            && !condition.contains("fresh decision is required"),
+        "the updated decision on exactly the changed content controls the next effect: {report}"
+    );
+    assert!(!fixture.run.join("activation.json").is_file());
+    assert_eq!(
+        removal_comments(&fixture)
+            .iter()
+            .filter(|record| record.contains("removal-decision v1"))
+            .count(),
+        decisions_before + 4,
+        "no resume recorded a decision on the user's behalf"
+    );
 }
 
 #[test]

@@ -55,6 +55,11 @@ const ACTIVATION_FILE: &str = "activation.json";
 const SUCCESSOR_FILE: &str = "successor.json";
 const LINEAGE_FILE: &str = "lineage.json";
 const CONTINUATION_FILE: &str = "continuation.json";
+/// The condition prefix for a decision-boundary effect that is held back by
+/// the current state or authorization. The exact reason stays visible, the
+/// boundary stays recorded, and a later resume re-resolves the current
+/// decision and state before another effect; the prefix is never an outcome.
+const BOUNDARY_BLOCKED_PREFIX: &str = "decision boundary blocked: ";
 /// The decision-boundary consumption receipts: the completed real task's
 /// retention, the declared corroboration selection and the unadopted
 /// reconciliation of the hypothesis' own change. Each is written once per
@@ -588,6 +593,18 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
         notes.extend(advance_run(run)?);
         if run.cursor.phase == Phase::DecisionRecorded {
             consume_decision(run, &mut notes)?;
+        }
+        if run.cursor.phase == Phase::DecisionRecorded
+            && run
+                .cursor
+                .condition
+                .as_deref()
+                .is_some_and(|condition| condition.starts_with(BOUNDARY_BLOCKED_PREFIX))
+        {
+            // The boundary was re-resolved once on this pass and is still
+            // held back by its current state: return with the exact reason
+            // instead of re-running the same effect resolution.
+            return Ok(notes);
         }
         if matches!(run.cursor.phase, Phase::Idle | Phase::ActivationConfirmed) {
             if continuation_expected(run) {
@@ -1293,6 +1310,29 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
                     "controller: integration is waiting for removal authority; the baseline is unchanged and no model work was started"
                         .to_owned(),
                 );
+                return Ok(());
+            }
+            if blocked.check.is_none() {
+                // A block without a failed check is a condition of the current
+                // state and authorization, not a verdict: the boundary stays
+                // recorded with the exact reason, and a later resume
+                // re-resolves the current decision and state before another
+                // effect. A failed combined-tree check is a verdict on the
+                // exact evaluated revision and keeps the hard block below so
+                // it is never silently re-run.
+                run.cursor.condition = Some(format!(
+                    "{BOUNDARY_BLOCKED_PREFIX}integration: {}",
+                    blocked.reason
+                ));
+                run.cursor.effect(
+                    EffectKind::IntegrationConsumed,
+                    format!("blocked: {}", blocked.reason),
+                );
+                run.store.save_cursor(&run.cursor)?;
+                notes.push(format!(
+                    "controller: integration blocked ({})",
+                    blocked.reason
+                ));
                 return Ok(());
             }
             run.cursor.block(format!(
@@ -2152,8 +2192,12 @@ fn activate_integrated(
     let trusted = super::improvement_comparison::dispatch_workspaces(run, ComparisonArm::Candidate);
     match improvement_activation::activate_with_trust(&request, &trusted)? {
         ActivationOutcome::Blocked(blocked) => {
-            run.cursor.block(format!(
-                "activation refused; the integrated tree is unchanged by this owner: {}",
+            // Activation blocks are conditions of the current decision and
+            // state: the integrated tree is unchanged by this owner, the
+            // exact reason stays visible, and a later resume re-resolves the
+            // current decision and state before another activation attempt.
+            run.cursor.condition = Some(format!(
+                "{BOUNDARY_BLOCKED_PREFIX}activation: {}",
                 blocked.reason
             ));
             run.cursor.effect(
