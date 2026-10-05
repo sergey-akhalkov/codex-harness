@@ -510,6 +510,13 @@ pub struct ComparisonInputs {
     /// observes; empty for a full-material qualification.
     #[serde(default)]
     pub observation_inputs: Vec<ClientInput>,
+    /// Optional declared bearer-auth transport for the API-observed plan: the
+    /// plan's `bearer_auth` names this explicit private input, whose token is
+    /// attached to the declared requests and never observed, digested into
+    /// the identity or retained. It is transport, not an observed fact;
+    /// absent means a declared bearer cannot be supplied.
+    #[serde(default)]
+    pub observation_auth: Option<ClientInput>,
 }
 
 impl ComparisonInputs {
@@ -547,6 +554,19 @@ impl ComparisonInputs {
             token("observed client input name", &input.name, MAX_TOKEN)?;
             if !input.path.is_absolute() {
                 return Err(invalid("every observed client input path must be absolute"));
+            }
+        }
+        if let Some(auth) = &self.observation_auth {
+            token("observed bearer auth input name", &auth.name, MAX_TOKEN)?;
+            if !auth.path.is_absolute() {
+                return Err(invalid(
+                    "the observed bearer auth input path must be absolute",
+                ));
+            }
+            if !auth.path.is_file() {
+                return Err(invalid(
+                    "the observed bearer auth input must be an existing regular file",
+                ));
             }
         }
         Ok(())

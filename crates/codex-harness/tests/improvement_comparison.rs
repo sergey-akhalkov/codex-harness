@@ -2904,8 +2904,13 @@ fn batched_calls_and_operations_stay_distinct_through_the_report() {
 
 /// Write one API-observed qualification produced by the owner against the
 /// local observation fixture, and declare the same explicit client inputs in
-/// the run spec: the observed client file is the overlay the arms consume.
-fn install_api_observed_qualification(fixture: &Fixture, server: &ObservationServer) -> PathBuf {
+/// the run spec: the observed client file is the overlay the arms consume, and
+/// an optional bearer transport input is declared through `observation_auth`.
+fn install_api_observed_qualification(
+    fixture: &Fixture,
+    server: &ObservationServer,
+    bearer: Option<&str>,
+) -> (PathBuf, Option<PathBuf>) {
     use harness_core::outcome_qualification::{
         ApiObservationPlan, ApiObservedPolicy, ClientInput, DeclaredObservation, LocalRunner,
         MaterialIdentity, ObservationBinding, ObservationRequest, QualificationAttempt,
@@ -2913,6 +2918,11 @@ fn install_api_observed_qualification(fixture: &Fixture, server: &ObservationSer
     };
     let overlay = fixture.root.join("client-overlay.toml");
     fs::write(&overlay, "model_context_window = 262144\n").unwrap();
+    let bearer_path = bearer.map(|name| {
+        let path = fixture.root.join("client-bearer.token");
+        fs::write(&path, format!("synthetic-{name}\n")).unwrap();
+        path
+    });
     let runner = LocalRunner {
         endpoint: server.endpoint(),
         model: "fixture-glyph-1".to_owned(),
@@ -2938,13 +2948,19 @@ fn install_api_observed_qualification(fixture: &Fixture, server: &ObservationSer
                 }],
             }],
             required_client_inputs: vec!["overlay".to_owned()],
-            bearer_auth: None,
+            bearer_auth: bearer.map(str::to_owned),
         },
     };
-    let inputs = vec![ClientInput {
+    let mut inputs = vec![ClientInput {
         name: "overlay".to_owned(),
         path: overlay.clone(),
     }];
+    if let (Some(name), Some(path)) = (bearer, &bearer_path) {
+        inputs.push(ClientInput {
+            name: name.to_owned(),
+            path: path.clone(),
+        });
+    }
     let observations = collect_observations(&runner, &policy.plan, &inputs)
         .expect("the local observation fixture answers the declared facts");
     let attempt = |id: &str| QualificationAttempt {
@@ -2981,8 +2997,11 @@ fn install_api_observed_qualification(fixture: &Fixture, server: &ObservationSer
     spec["comparison"]["observation_inputs"] = json!([
         {"name": "overlay", "path": overlay},
     ]);
+    if let (Some(name), Some(path)) = (bearer, &bearer_path) {
+        spec["comparison"]["observation_auth"] = json!({"name": name, "path": path});
+    }
     fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
-    overlay
+    (overlay, bearer_path)
 }
 
 /// A qualified API-observed record and an unconsumed observation template are
@@ -2994,7 +3013,7 @@ fn api_observed_qualification_drift_blocks_the_measured_arm() {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("api-observed");
     let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
-    install_api_observed_qualification(&fixture, &server);
+    install_api_observed_qualification(&fixture, &server, None);
     let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
     fixture.prepare_builds(&checkout);
     fixture.start_with_ready_candidate(&checkout, false);
@@ -3059,7 +3078,7 @@ fn api_observed_qualification_drift_blocks_the_measured_arm() {
     // stand in for the arm's actual configuration.
     let unconsumed = Fixture::new("api-unconsumed-input");
     let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
-    install_api_observed_qualification(&unconsumed, &server);
+    install_api_observed_qualification(&unconsumed, &server, None);
     let mut spec: Value = serde_json::from_slice(&fs::read(&unconsumed.spec).unwrap()).unwrap();
     spec["comparison"]["observation_inputs"] = json!([
         {"name": "profile", "path": unconsumed.home.join("config.toml")},
@@ -3080,6 +3099,117 @@ fn api_observed_qualification_drift_blocks_the_measured_arm() {
     assert!(!unconsumed.run.join("comparison").exists());
 }
 
+/// A bearer-authenticated API-observed plan is re-collected with its declared
+/// transport input: the bearer file rides along with the observed client
+/// inputs from `observation_auth`, the measured arm reaches its visible
+/// dispatch, and the synthetic token is never echoed back.
+#[test]
+fn api_observed_bearer_auth_is_recollected_from_the_declared_transport_input() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("api-bearer-auth");
+    let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
+    let (overlay, bearer) =
+        install_api_observed_qualification(&fixture, &server, Some("route-key"));
+    let bearer = bearer.expect("the bearer plan declares its transport input");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        !output.contains("declared bearer auth client input was not supplied"),
+        "the declared bearer transport input is supplied from the comparison inputs: {output}"
+    );
+    assert!(
+        output.contains("before submission"),
+        "the bearer-authenticated API-observed arm reaches its visible dispatch: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        1,
+        "the re-collected observation set admits the measured attempt"
+    );
+    assert!(
+        overlay.is_file(),
+        "the observed client input stays explicit"
+    );
+    assert!(
+        bearer.is_file(),
+        "the bearer transport input stays an explicit private file"
+    );
+    assert!(
+        !output.contains("synthetic-route-key"),
+        "the bearer token is never echoed: {output}"
+    );
+}
+
+/// A bearer token file declared as an observed client input is still refused:
+/// it is transport, not one of the client files the arms consume, so it cannot
+/// enter through `observation_inputs` even under a bearer plan.
+#[test]
+fn api_observed_bearer_auth_inside_observation_inputs_is_still_refused() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("api-bearer-in-observed-inputs");
+    let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
+    let (overlay, bearer) =
+        install_api_observed_qualification(&fixture, &server, Some("route-key"));
+    let bearer = bearer.expect("the bearer plan declares its transport input");
+    let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    spec["comparison"]["observation_inputs"] = json!([
+        {"name": "overlay", "path": overlay},
+        {"name": "route-key", "path": bearer},
+    ]);
+    spec["comparison"]["observation_auth"] = Value::Null;
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(output.contains("not one of the client files"), "{output}");
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        0,
+        "no measured attempt is even prepared from the transport file"
+    );
+    assert!(!fixture.run.join("comparison").exists());
+}
+
+/// A bearer-authenticated plan without the declared transport input still
+/// blocks: the missing bearer file is reported with the collector's own exact
+/// reason instead of being dropped or silently succeeded.
+#[test]
+fn api_observed_bearer_auth_without_the_transport_input_still_blocks() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("api-bearer-absent");
+    let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
+    install_api_observed_qualification(&fixture, &server, Some("route-key"));
+    let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    spec["comparison"]["observation_auth"] = Value::Null;
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("the pre-attempt API observation set is unavailable"),
+        "{output}"
+    );
+    assert!(
+        output.contains("declared bearer auth client input was not supplied"),
+        "the missing transport input blocks with the collector's exact reason: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        0,
+        "the bearer plan dispatches nothing without its declared transport input"
+    );
+}
+
 /// The selected API-observed policy reaches the planning/implementation
 /// dispatch through the real controller: a qualified API record lets the
 /// bounded investigator conversation start, while a blocked full-material
@@ -3089,7 +3219,7 @@ fn api_observed_qualification_reaches_planning_and_implementation() {
     // Qualified API-observed identity: the investigator dispatch is attempted.
     let fixture = Fixture::new("api-planning");
     let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
-    let overlay = install_api_observed_qualification(&fixture, &server);
+    let (overlay, _) = install_api_observed_qualification(&fixture, &server, None);
     let evidence = fixture.root.join("evidence");
     fs::create_dir_all(&evidence).unwrap();
     fs::write(evidence.join("observation.txt"), "retained observation\n").unwrap();
