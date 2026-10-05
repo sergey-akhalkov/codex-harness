@@ -5,6 +5,22 @@ description: Operate a requested continuous harness-improvement loop with propor
 
 # Self-improvement loop
 
+Ordering fixed by the owner: when improving this harness, look first for
+complexity to eliminate - redundant stages, entities, copies and machinery -
+because removal both shrinks the maintained surface and makes work faster and
+cheaper in tokens. That ordering never licenses a quality trade: work
+quality, reasoning depth and the ability to close tasks stay maximal in every
+arm, and speed or token savings are accepted only on top of unchanged or
+better task-closing ability.
+
+The ordering is two-phase. Only after no further removable complexity is
+found does the loop propose additions or enhancements, and each such
+candidate is judged on all three dimensions together: lower token
+consumption, faster work and higher task-closing quality - quality meaning
+accepted tasks that do not later demand extensive rework from surfacing
+critical P0/P1 defects. An addition that saves tokens or time while leaving
+task success or defect behavior unchanged at best is not a benefit claim.
+
 Use the consuming project's Beads board and the native `codex-harness improve`
 controller. Read `codex-harness improve --help` for the installed request and
 command contract:
@@ -102,9 +118,19 @@ describes ownership.
    retained native evidence — never investigator-supplied labels alone.
    Admit attributable evidence with a mechanism, predicted effect,
    applicability, counterexample and independent acceptance. Consider no
-   change, reuse, simplification and subtraction first. No new basis means
-   reuse the earlier conclusion or remain idle, without manufacturing work or
-   votes.
+   change, reuse, simplification and subtraction first - and among these,
+   look first for removable complexity: a candidate that eliminates
+   unnecessary machinery should both reduce the entities the kit maintains
+   and make everyday work faster and cheaper in tokens. Only when no further
+   removable complexity is found does the loop propose additions, and an
+   addition must improve all three together - tokens, speed and task-closing
+   quality (fewer later P0/P1 rework demands), not just cost. Quality is
+   never the payment for that speed or economy: work quality, reasoning depth
+   and the ability to close tasks stay maximal in every arm, and a hypothesis
+   that would trade them away is refused at intake no matter how much it
+   saves.
+   No new basis means reuse the earlier conclusion or remain idle, without
+   manufacturing work or votes.
 2. **One planning contract per hypothesis.** Each hypothesis — including a
    one-line instruction change — needs its own complete, validated OpenSpec
    change before implementation: proposal, specs, design, tasks, and an

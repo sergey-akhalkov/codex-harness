@@ -710,6 +710,24 @@ been supplied privately and is recorded only in local run inputs, never in
 shared source. Switching routes remains a run-input decision, never a
 mid-run substitution.
 
+**2026-10-05, confirmed (user emphasis, ordering and invariant):** when the
+loop proposes improvements, it examines removable complexity first - a good
+simplification both shrinks the maintained entity surface and makes everyday
+work faster and cheaper in tokens. This ordering is bounded by a fixed
+invariant: work quality, reasoning depth and the ability to close tasks stay
+maximal in every arm; speed or token savings are accepted only on top of
+unchanged or better task-closing ability, never in exchange for it. The
+skill, the change's simplification requirement and the controller intake all
+carry this ordering and invariant.
+
+The ordering is two-phase: additions and enhancements are proposed only after
+the loop no longer finds complexity it can eliminate. An addition is then
+judged on the same three dimensions together - lower token consumption,
+faster work and higher task-closing quality, where quality means accepted
+tasks that do not later require extensive rework for surfacing critical P0/P1
+defects. An addition that saves tokens or time while leaving task success or
+defect behavior unchanged at best is not a benefit claim.
+
 **2026-10-01, confirmed:** improvement analysis must separate external
 infrastructure waiting from agent/harness work without losing observed user
 cost. Use native lifecycle evidence for automatic adjustment, retain both
