@@ -131,6 +131,51 @@ fn console_entry(text: &str, name: &str, module: &str) -> bool {
     matches == 1
 }
 
+/// A stable numeric dotted version (an installer record such as `v0.2.0`).
+/// Placeholder records like `unknown` are rejected, so they cannot be adopted.
+fn dotted_version(text: &str) -> Option<String> {
+    let text = text.trim();
+    let text = text.strip_prefix(['v', 'V']).unwrap_or(text);
+    if text.is_empty() || text.len() > 64 {
+        return None;
+    }
+    let mut parts = 0;
+    for part in text.split('.') {
+        if part.is_empty() || part.len() > 10 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        parts += 1;
+    }
+    (parts >= 2).then(|| text.to_owned())
+}
+
+/// The FPC driver and source tree a shared pasls installation uses for
+/// CodeTools: `prerequisites/<fpc>/bin/<target>/fpc.exe` next to the
+/// distribution's `source` directory. An absent, ambiguous or escaping pair
+/// is not adoption evidence.
+fn fpc_prerequisites(root: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for prerequisite in directories(&root.join("prerequisites"))? {
+        let source = prerequisite.join("source");
+        if !source.is_dir() {
+            continue;
+        }
+        for target in directories(&prerequisite.join("bin"))? {
+            let fpc = target.join("fpc.exe");
+            if !fpc.is_file() {
+                continue;
+            }
+            let fpc = package::resolved(&fpc)?;
+            let source = package::resolved(&source)?;
+            if !package::contained(&fpc, root) || !package::contained(&source, root) {
+                return Err(package::invalid());
+            }
+            found.push((fpc, source));
+        }
+    }
+    Ok(found.pop().filter(|_| found.is_empty()))
+}
+
 fn uv(spec: &Value, tools: &Path, full: bool) -> io::Result<Vec<Value>> {
     let package_name = spec["package"].as_str().ok_or_else(package::invalid)?;
     let root = local_path(&tools.join(package_name))?;
@@ -240,6 +285,7 @@ impl Discovery {
                     ("mcp", "nuphus") => ("@nuphus/nuphus-mcp", "npm"),
                     ("languages", "python") => ("basedpyright", "npm"),
                     ("languages", "rust") => ("rust-analyzer", "rustup"),
+                    ("languages", "delphi") => ("pascal-language-server", "serena-cache"),
                     _ => return Err(package::invalid()),
                 };
                 if !ids.insert(id)
@@ -251,7 +297,7 @@ impl Discovery {
                 }
             }
         }
-        if ["serena", "nuphus", "python", "rust"]
+        if ["serena", "nuphus", "python", "rust", "delphi"]
             .iter()
             .any(|id| !ids.contains(id))
         {
@@ -428,6 +474,68 @@ impl Discovery {
         ])
     }
 
+    /// The existing shared pasls (PascalLanguageServer) installation: the
+    /// Serena cache layout stores `pasls.exe` with the installer's
+    /// `.meta/version` record and, for CodeTools, a matching FPC tree under
+    /// `prerequisites/<fpc>/` (`bin/<target>/fpc.exe` plus `source`). Adoption
+    /// requires all of them; the harness never downloads or updates this
+    /// backend, and it records fingerprints instead of claiming a published
+    /// per-binary identity.
+    fn pascal(&self) -> io::Result<Vec<Value>> {
+        let root = package::resolved(&self.serena.join("PascalLanguageServer"))?;
+        let executable = package::resolved(&root.join("pasls.exe"))?;
+        if !executable.is_file() {
+            return Ok(vec![]);
+        }
+        if !package::contained(&executable, &root) {
+            return Err(package::invalid());
+        }
+        let mut evidence = vec![
+            json!({"kind":"executable-fingerprint","path":executable,"sha256":package::fingerprint(&executable)?}),
+            json!({"kind":"limitation","detail":"No published per-binary hash is recorded; identity is the installer-written version record plus the observed fingerprints."}),
+        ];
+        let version_file = package::package_file(&root, ".meta/version")?;
+        let version = package::read_text(&version_file)?.and_then(|text| dotted_version(&text));
+        match &version {
+            Some(version) => {
+                evidence.push(json!({"kind":"version-record","path":version_file,"value":version}))
+            }
+            None => evidence
+                .push(json!({"kind":"missing-version-record","path":version_file,"detail":"The installer version record is missing, unreadable or not a stable dotted version."})),
+        }
+        let (status, command, paths) = match (&version, fpc_prerequisites(&root)?) {
+            (Some(_), Some((fpc, source))) => {
+                evidence.push(json!({"kind":"prerequisite-fingerprint","driver":fpc,"sha256":package::fingerprint(&fpc)?,"source":source}));
+                (
+                    "adopted",
+                    json!([executable]),
+                    json!({"executable":executable,"fpc":fpc,"fpc_source":source,"version_file":version_file}),
+                )
+            }
+            (Some(_), None) => {
+                evidence.push(json!({"kind":"missing-prerequisites","detail":"No unambiguous FPC compiler driver and source tree were observed under prerequisites."}));
+                (
+                    "broken",
+                    json!([]),
+                    json!({"executable":executable,"version_file":version_file}),
+                )
+            }
+            (None, _) => (
+                "incomplete",
+                json!([]),
+                json!({"executable":executable,"version_file":version_file}),
+            ),
+        };
+        let installed = status == "adopted";
+        Ok(vec![
+            json!({"manager":"serena-cache","version":version,"executable":executable,
+            "command":command,"paths":paths,"installation_root":root,"status":status,
+            "ownership":"adopted-shared",
+            "health":{"installed":installed,"identity_verified":installed,"integrity":"unknown","callable":null,"checked_operations":[]},
+            "update_safe":false,"provenance":{"version_record":version_file},"evidence":evidence}),
+        ])
+    }
+
     fn record(&self, spec: &Value, group: &str) -> Value {
         let result = match spec["id"].as_str().unwrap() {
             "serena" => uv(spec, &self.uv, self.full),
@@ -447,6 +555,7 @@ impl Discovery {
                     Ok(candidates)
                 }),
             "rust" => self.rust(),
+            "delphi" => self.pascal(),
             _ => unreachable!(),
         };
         let base = package::base(spec);

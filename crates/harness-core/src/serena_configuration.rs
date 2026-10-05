@@ -43,6 +43,17 @@ fn required_file(value: Option<&str>, label: &str) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 
+fn required_directory(value: Option<&str>, label: &str) -> io::Result<PathBuf> {
+    let Some(text) = value else {
+        return Err(unavailable(&format!("missing adopted {label}")));
+    };
+    let resolved = local_path(Path::new(text))?;
+    if !resolved.is_dir() {
+        return Err(unavailable(&format!("missing adopted {label}")));
+    }
+    Ok(resolved)
+}
+
 /// Explicit launch commands for every adopted backend, keyed by Serena's
 /// language-server id. The registry's `serena_id` is the single mapping owner.
 pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Value>> {
@@ -76,12 +87,23 @@ pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Val
                 )
             }
         };
-        settings.insert(serena_id.to_owned(), launch_setting(&base, &args));
+        let mut setting = launch_setting(&base, &args);
+        // pasls reads its CodeTools configuration (PP/FPCDIR) from
+        // `ls_specific_settings["pascal"]`, so the pinned FPC driver and
+        // source tree need their own entries next to the launch command.
+        if serena_id == "pascal" {
+            let fpc = required_file(paths["fpc"].as_str(), "FPC compiler driver")?;
+            let source =
+                required_directory(paths["fpc_source"].as_str(), "FPC source directory")?;
+            setting["pp"] = json!(fpc.to_string_lossy().into_owned());
+            setting["fpcdir"] = json!(source.to_string_lossy().into_owned());
+        }
+        settings.insert(serena_id.to_owned(), setting.clone());
         // The retired seam mapped several Serena ids onto one adopted backend
         // (for example both `python` and `python_basedpyright`).
         if let Some((_, aliases)) = ALIASES.iter().find(|(owner, _)| *owner == serena_id) {
             for alias in *aliases {
-                settings.insert((*alias).to_owned(), launch_setting(&base, &args));
+                settings.insert((*alias).to_owned(), setting.clone());
             }
         }
     }
@@ -91,8 +113,31 @@ pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Val
 /// Serena ids that select the same adopted backend as their registry owner.
 const ALIASES: &[(&str, &[&str])] = &[
     ("python_basedpyright", &["python"]),
-    ("delphi", &["pascal"]),
+    ("pascal", &["delphi"]),
 ];
+
+/// The verified shared pasls directory for a worker environment. The pascal
+/// backend prefers `pasls` from `PATH` before consulting its per-home cache,
+/// which would otherwise provision a copy into the owned Serena home during a
+/// session. The directory stays absent unless the delphi record is adopted,
+/// and a recorded-but-vanished executable is refused instead of silently
+/// falling back to provisioning.
+pub(crate) fn pasls_directory(registry: &Value) -> io::Result<Option<PathBuf>> {
+    let Some(record) = registry["languages"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == "delphi"))
+    else {
+        return Ok(None);
+    };
+    if !adopted(record) {
+        return Ok(None);
+    }
+    let executable = required_file(
+        record["paths"]["executable"].as_str(),
+        "language server executable",
+    )?;
+    Ok(executable.parent().map(Path::to_path_buf))
+}
 
 fn launch_setting(base: &[PathBuf], args: &[String]) -> Value {
     json!({
@@ -280,6 +325,13 @@ fn render(settings: &BTreeMap<String, Value>) -> String {
                     "      - '{}'\n",
                     item.as_str().unwrap_or_default()
                 ));
+            }
+        }
+        // Backend settings such as the pasls CodeTools inputs stay plain
+        // scalars next to the explicit launch command.
+        for key in ["pp", "fpcdir"] {
+            if let Some(item) = value.get(key).and_then(Value::as_str) {
+                text.push_str(&format!("    {key}: '{item}'\n"));
             }
         }
     }
@@ -534,5 +586,71 @@ mod tests {
         let error = ls_specific_settings(&registry).unwrap_err();
         assert!(error.to_string().contains("missing adopted Node runtime"));
         assert!(!error.to_string().contains("gone"));
+    }
+
+    #[test]
+    fn pascal_adoption_pins_pasls_and_its_fpc_prerequisites() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = Path::new("PascalLanguageServer");
+        let pasls = root.path().join(relative).join("pasls.exe");
+        let fpc = root
+            .path()
+            .join(relative)
+            .join("prerequisites/fpc-3.2.2/bin/i386-win32/fpc.exe");
+        let source = root.path().join(relative).join("prerequisites/fpc-3.2.2/source");
+        fs::create_dir_all(pasls.parent().unwrap()).unwrap();
+        fs::create_dir_all(fpc.parent().unwrap()).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(&pasls, b"fixture").unwrap();
+        fs::write(&fpc, b"fixture").unwrap();
+        let mut registry = json!({"languages": [{
+            "id": "delphi", "serena_id": "pascal", "status": "adopted",
+            "paths": {"executable": pasls, "fpc": fpc, "fpc_source": source}
+        }]});
+        let settings = ls_specific_settings(&registry).unwrap();
+        assert_eq!(
+            settings.keys().cloned().collect::<Vec<_>>(),
+            vec!["delphi".to_owned(), "pascal".to_owned()]
+        );
+        let fpc = local_path(&fpc).unwrap();
+        let source = local_path(&source).unwrap();
+        assert_eq!(settings["pascal"]["pp"], json!(fpc.to_string_lossy()));
+        assert_eq!(settings["pascal"]["fpcdir"], json!(source.to_string_lossy()));
+        assert_eq!(
+            settings["pascal"]["ls_base_cmd"],
+            json!([local_path(&pasls).unwrap().to_string_lossy()])
+        );
+        // The alias selects the same backend and settings.
+        assert_eq!(settings["delphi"], settings["pascal"]);
+        let rendered = render(&settings);
+        assert!(rendered.contains("pascal:\n"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("    pp: '{}'", fpc.to_string_lossy())),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("    fpcdir: '{}'", source.to_string_lossy())),
+            "{rendered}"
+        );
+        // A vanished or tampered prerequisite refuses adoption without echoing it.
+        registry["languages"][0]["paths"]["fpc"] =
+            json!(root.path().join(relative).join("missing/fpc.exe"));
+        let error = ls_specific_settings(&registry).unwrap_err();
+        assert!(error.to_string().contains("FPC compiler driver"));
+        assert!(!error.to_string().contains("missing/fpc.exe"));
+        registry["languages"][0]["paths"]["fpc"] = json!(fpc);
+        registry["languages"][0]["paths"]["fpc_source"] =
+            json!(root.path().join(relative).join("absent-source"));
+        let error = ls_specific_settings(&registry).unwrap_err();
+        assert!(error.to_string().contains("FPC source directory"));
+        // Only an adopted record contributes settings or a PATH pin.
+        registry["languages"][0]["status"] = json!("broken");
+        assert!(ls_specific_settings(&registry).unwrap().is_empty());
+        assert_eq!(pasls_directory(&registry).unwrap(), None);
+        registry["languages"][0]["status"] = json!("adopted");
+        assert_eq!(
+            pasls_directory(&registry).unwrap(),
+            Some(local_path(&root.path().join(relative)).unwrap())
+        );
     }
 }

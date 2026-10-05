@@ -43,6 +43,11 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
             "rustup",
             "https://static.rust-lang.org/dist/channel-rust-stable.toml",
         ),
+        Some("delphi") => (
+            "pascal-language-server",
+            "serena-cache",
+            "https://api.github.com/repos/zen010101/pascal-language-server/releases/latest",
+        ),
         _ => return Err("unsupported-metadata-source"),
     };
     if spec["package"] != package || spec["manager"] != manager {

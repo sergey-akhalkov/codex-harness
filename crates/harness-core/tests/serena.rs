@@ -126,6 +126,78 @@ fn command_uses_the_generated_owned_home_without_spawning() {
     let generated = fs::read_to_string(serena_home.join("serena_config.yml")).unwrap();
     assert!(generated.contains("rust"), "{generated}");
     assert!(generated.contains("ls_base_cmd"), "{generated}");
+    // No adopted Pascal record: no PATH pin is added.
+    assert!(!command.env.contains_key(OsStr::new("PATH")));
+}
+
+#[test]
+fn adopted_pascal_record_pins_the_shared_pasls_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let console = dummy_console(root.path());
+    let pasls_dir = root.path().join("cache/PascalLanguageServer");
+    let prerequisites = pasls_dir.join("prerequisites/fpc-3.2.2");
+    fs::create_dir_all(prerequisites.join("bin/i386-win32")).unwrap();
+    fs::create_dir_all(prerequisites.join("source")).unwrap();
+    let pasls = pasls_dir.join("pasls.exe");
+    fs::write(&pasls, b"inert pasls, never executed").unwrap();
+    let fpc = prerequisites.join("bin/i386-win32/fpc.exe");
+    fs::write(&fpc, b"inert fpc, never executed").unwrap();
+    let registry_path = root.path().join("code-tools.json");
+    fs::write(
+        &registry_path,
+        serde_json::to_vec(&json!({
+            "mcp": [{
+                "id": "serena", "identity": "serena-agent", "version": "1.7.0",
+                "status": "adopted", "paths": {"console_entrypoint": console}
+            }],
+            "languages": [
+                {"id": "rust", "serena_id": "rust", "status": "adopted",
+                 "paths": {"executable": console}},
+                {"id": "delphi", "serena_id": "pascal", "status": "adopted",
+                 "paths": {"executable": pasls, "fpc": fpc,
+                           "fpc_source": prerequisites.join("source")}}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let launch = owned_launch(root.path(), registry_path.clone(), console);
+    let command = serena::command(&launch).unwrap();
+    let path = command
+        .env
+        .get(OsStr::new("PATH"))
+        .cloned()
+        .flatten()
+        .expect("worker PATH pin")
+        .to_string_lossy()
+        .into_owned();
+    let first = path.split(';').next().unwrap();
+    assert!(first.ends_with("PascalLanguageServer"), "{path}");
+    assert!(Path::new(first).join("pasls.exe").is_file(), "{path}");
+    // The generated configuration also names the pinned pasls and its FPC inputs.
+    let serena_home = PathBuf::from(
+        command
+            .env
+            .get(OsStr::new("SERENA_HOME"))
+            .cloned()
+            .flatten()
+            .expect("worker home is configured"),
+    );
+    let generated = fs::read_to_string(serena_home.join("serena_config.yml")).unwrap();
+    assert!(generated.contains("pascal:"), "{generated}");
+    assert!(generated.contains("pasls.exe"), "{generated}");
+    assert!(generated.contains("pp:"), "{generated}");
+    // A broken or missing record contributes no pin and refuses the backend.
+    let mut registry: Value = serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry["languages"][1]["status"] = json!("broken");
+    fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    let command = serena::command(&launch).unwrap();
+    assert!(!command.env.contains_key(OsStr::new("PATH")));
+    registry["languages"][1]["status"] = json!("adopted");
+    registry["languages"][1]["paths"]["fpc"] = json!(root.path().join("absent-fpc.exe"));
+    fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    let error = serena::command(&launch).unwrap_err();
+    assert!(error.to_string().contains("FPC compiler driver"), "{error}");
 }
 
 #[test]
@@ -512,4 +584,107 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
     assert!(alpha_still_shared);
     pool.close(Deadline::after(Duration::from_secs(60)).unwrap())
         .unwrap();
+}
+
+/// Legacy Delphi-style sources stored as CP1251 with CRLF endings. The class
+/// has one declaration and a second unit consumes it, so reference lookup has
+/// an unambiguous symbol and a real cross-unit reference.
+const LEGACY_UNIT: &[u8] = b"unit unit1;{ \xcf\xf0\xe8\xe2\xe5\xf2, test CP1251 }\r\ninterface\r\ntype\r\n  TGreeter = class\r\n  public\r\n    procedure Hello;\r\n  end;\r\nimplementation\r\nprocedure TGreeter.Hello;\r\nbegin\r\n  { \xef\xf0\xe8\xe2\xe5\xf2 }\r\nend;\r\nend.\r\n";
+const LEGACY_CONSUMER: &[u8] = b"unit unit2;\r\ninterface\r\nuses unit1;\r\nprocedure Use(g: TGreeter);\r\nimplementation\r\nprocedure Use(g: TGreeter);\r\nbegin\r\n  g.Hello;\r\nend;\r\nend.\r\n";
+const LEGACY_PROGRAM: &[u8] = b"program sample;\r\nuses unit1;\r\nvar\r\n  Greeter: TGreeter;\r\nbegin\r\n  Greeter := TGreeter.Create;\r\n  Greeter.Hello;\r\nend.\r\n";
+
+fn contains_file(root: &Path, name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if contains_file(&path, name) {
+                return true;
+            }
+        } else if path.file_name().is_some_and(|found| found == name) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn pascal_session_reports_symbols_and_references_on_a_legacy_fixture() {
+    let inventory = adopted_registry();
+    let delphi = inventory["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "delphi")
+        .expect("the restored Pascal row");
+    assert_eq!(delphi["status"], "adopted", "{delphi}");
+    let pasls = PathBuf::from(delphi["paths"]["executable"].as_str().unwrap());
+    let console = adopted_console(&inventory);
+    let before = optional_hash(&pasls);
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("Pascal session probe root: {}", root.path().display());
+    let project = root.path().join("legacy pascal");
+    fs::create_dir_all(project.join(".serena")).unwrap();
+    fs::write(
+        project.join(".serena/project.yml"),
+        "project_name: 'legacy pascal'\nlanguage_servers:\n- pascal\nencoding: cp1251\n",
+    )
+    .unwrap();
+    fs::write(project.join("unit1.pas"), LEGACY_UNIT).unwrap();
+    fs::write(project.join("unit2.pas"), LEGACY_CONSUMER).unwrap();
+    fs::write(project.join("sample.lpr"), LEGACY_PROGRAM).unwrap();
+    let registry = PathBuf::from(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap());
+    let home = root.path().join("home");
+    let cancel = Cancellation::default();
+    let mut session = Session::start(
+        &Launch {
+            serena: console.clone(),
+            registry,
+            project,
+            home: home.clone(),
+        },
+        &cancel,
+    )
+    .unwrap();
+    let hello = session
+        .initialize(Deadline::after(Duration::from_secs(240)).unwrap())
+        .unwrap_or_else(|error| {
+            panic!(
+                "pascal init: {error}; {}",
+                fs::read_to_string(session.stderr_path()).unwrap_or_default()
+            )
+        });
+    assert_eq!(hello["serverInfo"]["name"], "Serena");
+    let overview = tool_text(
+        &mut session,
+        "get_symbols_overview",
+        // Legacy unit symbols sit under the section pseudo-namespace.
+        json!({"relative_path":"unit1.pas","depth":1}),
+    );
+    assert!(overview.contains("TGreeter"), "{overview}");
+    let symbol = tool_text(
+        &mut session,
+        "find_symbol",
+        json!({"relative_path":"unit1.pas","name_path_pattern":"TGreeter","include_body":true}),
+    );
+    assert!(symbol.contains("Hello"), "{symbol}");
+    let references = tool_text(
+        &mut session,
+        "find_referencing_symbols",
+        // pasls reports the class under section pseudo-namespaces, so the
+        // qualified name path is the unambiguous one.
+        json!({"relative_path":"unit1.pas","name_path":"interface/TGreeter"}),
+    );
+    assert!(references.contains("unit2.pas"), "{references}");
+    let _ = session.close().unwrap();
+    // Session startup pinned the shared pasls instead of provisioning a copy
+    // into the owned home, and the shared installation stayed unchanged.
+    assert!(
+        !contains_file(&home, "pasls.exe"),
+        "pasls was provisioned into the owned home"
+    );
+    assert_eq!(before, optional_hash(&pasls), "shared pasls changed");
 }

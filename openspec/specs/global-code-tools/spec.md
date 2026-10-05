@@ -94,7 +94,16 @@ refactoring claims SHALL be checked with current Serena or source evidence.
 
 ### Requirement: Selected languages
 
-The support matrix SHALL record each candidate language and the accepted selection separately: retained explicit operations, retained automatic diagnostics, disabled, unavailable or retired. Rust, TypeScript, JavaScript, PowerShell, Python, Delphi, C++, C#, JSON, Markdown, TOML, XML, CMake, Bash and conditional YAML/QML/HTML/CSS are evaluation candidates rather than mandatory LSP installations. Any or all LSP support SHALL be allowed to remain disabled or be retired when its outcome benefit is absent or unproven.
+The support matrix SHALL record each candidate language and the accepted
+selection separately: retained explicit operations, retained automatic
+diagnostics, disabled, unavailable or retired. The accepted selection retains
+Python and Rust, and includes Pascal/Delphi as a reuse-only conditional row
+when the verified shared pasls installation and its matching FPC prerequisites
+are present. TypeScript, JavaScript, PowerShell, C++, C#, JSON, Markdown,
+TOML, XML, CMake, Bash and conditional YAML/QML/HTML/CSS remain evaluation
+candidates rather than mandatory LSP installations. Any or all LSP support
+SHALL be allowed to remain disabled or be retired when its outcome benefit is
+absent or unproven.
 
 Each retained operation SHALL have actual backend evidence and correct project inputs; an extension or installed package alone SHALL NOT count as working support. Ambiguous extensions such as Qt XML `.ts` SHALL use actual content/project identity. Supported definition, references, symbol discovery and other navigation operations SHALL be distinguished from unavailable ones. Automatic diagnostics SHALL obey the strict creation/content-modification-only contract and SHALL NOT become required merely because explicit navigation was retained. Equivalent alternatives SHALL NOT cause redundant installations. Unrelated pre-existing packages SHALL be preserved.
 
@@ -129,13 +138,25 @@ operations and passes the same freshness, isolation and delivery checks.
 - **WHEN** discovery encounters a backend outside the accepted language selection
 - **THEN** it is not provisioned or updated merely because the source kit supports it, and an unrelated existing installation is preserved
 
-### Requirement: Delphi support is verified on Delphi source
+### Requirement: Managed Pascal navigation reuses the verified shared pasls installation
 
-If Delphi LSP operations are retained, they SHALL use Delphi-appropriate syntax, project options, unit/include paths and SDK information. Free Pascal/Lazarus results alone SHALL NOT establish Delphi support, and source or compiler settings SHALL NOT be rewritten to obtain a passing check. Retired Delphi LSP SHALL be reported as intentionally absent rather than an incomplete compulsory installation.
+Where Pascal/Delphi navigation is retained, it SHALL use the shared pasls
+installation that discovery verified - its `pasls.exe`, installer version
+record, and matching FPC compiler driver plus source tree - pinned explicitly
+for the session. Session startup SHALL NOT download, install or update the
+backend or its prerequisites; a missing, ambiguous or tampered installation
+SHALL leave the language unavailable and refuse affected projects before a
+worker starts. Free Pascal/CodeTools evidence SHALL NOT be reported as Delphi
+SDK support or clean Delphi compilation, and the user's Delphi project
+options, unit/include paths and SDK information SHALL NOT be rewritten.
 
-#### Scenario: A Delphi project has multiple units and include paths
-- **WHEN** a retained Delphi operation is exercised on representative Delphi units with their declared compiler inputs
-- **THEN** evidence records the dialect and limitations, verifies promised cross-unit navigation, and verifies error/correction when diagnostics are retained
+#### Scenario: A Pascal project is served from the shared installation
+- **WHEN** a retained Pascal operation is exercised on representative legacy Pascal units with their declared compiler inputs
+- **THEN** evidence records the observed pasls version, prerequisite fingerprints and FPC/CodeTools limits, and verifies the promised cross-unit navigation through the managed session without provisioning
+
+#### Scenario: Prerequisites are missing or tampered
+- **WHEN** `pasls.exe`, its installer version record, the FPC driver or the FPC source tree is missing, ambiguous or modified
+- **THEN** the language is reported unavailable, affected projects are refused before a worker starts, and nothing is downloaded or substituted
 
 ### Requirement: Workspace and session isolation
 

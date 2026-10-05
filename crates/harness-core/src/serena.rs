@@ -123,7 +123,13 @@ pub fn validated(launch: &Launch) -> io::Result<Validated> {
     })
 }
 
-fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path, serena_home: &Path) {
+fn base_environment(
+    command: &mut CommandSpec,
+    inventory: &Value,
+    registry: &Path,
+    home: &Path,
+    serena_home: &Path,
+) -> io::Result<()> {
     for key in [
         "PIP_REQUIRE_VIRTUALENV",
         "UV_NO_CACHE",
@@ -155,6 +161,19 @@ fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path, ser
         .env
         .insert("PIP_REQUIRE_VIRTUALENV".into(), Some("1".into()));
     command.env.insert("UV_NO_CACHE".into(), Some("1".into()));
+    // The pascal backend resolves `pasls` from PATH before its per-home cache
+    // and would otherwise download a copy into the owned home; the adopted
+    // shared directory keeps session startup download-free. A recorded but
+    // vanished installation is refused instead of falling back to provisioning.
+    if let Some(directory) = crate::serena_configuration::pasls_directory(inventory)? {
+        let mut paths = directory.into_os_string();
+        paths.push(";");
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.push(existing);
+        }
+        command.env.insert("PATH".into(), Some(paths));
+    }
+    Ok(())
 }
 
 pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
@@ -171,11 +190,9 @@ pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
             "Serena launch inputs are missing",
         ));
     }
-    crate::serena_configuration::ensure_supported_languages(
-        &serde_json::from_slice(&fs::read(&registry)?)
-            .map_err(|_| io::Error::other("Serena registry is not JSON"))?,
-        &project,
-    )?;
+    let inventory: Value = serde_json::from_slice(&fs::read(&registry)?)
+        .map_err(|_| io::Error::other("Serena registry is not JSON"))?;
+    crate::serena_configuration::ensure_supported_languages(&inventory, &project)?;
     let serena_home = crate::serena_configuration::prepare_worker(&registry, &home, &project)?;
     let mut command = CommandSpec::new(serena);
     command.current_dir = Some(project.clone());
@@ -190,7 +207,7 @@ pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
         "--enable-gui-log-window".into(),
         "false".into(),
     ];
-    base_environment(&mut command, &registry, &home, &serena_home);
+    base_environment(&mut command, &inventory, &registry, &home, &serena_home)?;
     Ok(command)
 }
 
@@ -213,11 +230,9 @@ pub fn shared_command(
             "Serena launch inputs are missing",
         ));
     }
-    crate::serena_configuration::ensure_supported_languages(
-        &serde_json::from_slice(&fs::read(&registry)?)
-            .map_err(|_| io::Error::other("Serena registry is not JSON"))?,
-        &cwd,
-    )?;
+    let inventory: Value = serde_json::from_slice(&fs::read(&registry)?)
+        .map_err(|_| io::Error::other("Serena registry is not JSON"))?;
+    crate::serena_configuration::ensure_supported_languages(&inventory, &cwd)?;
     let serena_home = crate::serena_configuration::prepare_worker(&registry, &home, &cwd)?;
     let mut command = CommandSpec::new(serena);
     command.current_dir = Some(cwd);
@@ -226,7 +241,7 @@ pub fn shared_command(
         command.args.push("--project".into());
         command.args.push(project.clone().into_os_string());
     }
-    base_environment(&mut command, &registry, &home, &serena_home);
+    base_environment(&mut command, &inventory, &registry, &home, &serena_home)?;
     Ok(command)
 }
 

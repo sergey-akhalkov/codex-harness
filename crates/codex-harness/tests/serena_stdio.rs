@@ -17,7 +17,7 @@ fn native_semantic_acceptance_checks_real_backends_and_edit_readback() {
         .args(["mcp", "serena-check", "--source"])
         .arg(repo())
         .arg("--registry")
-        .arg(registry)
+        .arg(&registry)
         .output()
         .unwrap();
     assert!(
@@ -27,7 +27,20 @@ fn native_semantic_acceptance_checks_real_backends_and_edit_readback() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "semantic-ready");
-    assert_eq!(report["languages"], json!(["rust", "python"]));
+    // Pascal is exercised only where discovery adopted the shared pasls row.
+    let inventory: Value =
+        serde_json::from_slice(&fs::read(registry.as_os_str()).unwrap()).unwrap();
+    let pascal = inventory["languages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| row["id"] == "delphi" && row["status"] == "adopted");
+    let expected = if pascal {
+        json!(["rust", "python", "pascal"])
+    } else {
+        json!(["rust", "python"])
+    };
+    assert_eq!(report["languages"], expected);
     assert_eq!(report["owned_state_removed"], true);
     assert_eq!(
         report["manager_sha256"],

@@ -119,6 +119,7 @@ fn parse_release(spec: &Value, body: &[u8]) -> Result<Parsed, &'static str> {
         Some("serena") => parse_pypi(package, text),
         Some("nuphus" | "python") => parse_npm(package, text),
         Some("rust") => parse_rust_channel(text),
+        Some("delphi") => parse_github_release(package, text),
         _ => Err("unsupported-metadata-source"),
     }
 }
@@ -199,6 +200,25 @@ fn parse_rust_channel(text: &str) -> Result<Parsed, &'static str> {
     Ok(Parsed {
         version: version.to_owned(),
         rust: Some(RustMeta { component, date }),
+    })
+}
+
+/// The official pasls release endpoint returns the release document; the
+/// package identity is fixed by the exact catalogue mapping, and only the
+/// tag supplies a version.
+fn parse_github_release(package: &str, text: &str) -> Result<Parsed, &'static str> {
+    if package != "pascal-language-server" {
+        return Err("metadata-package-mismatch");
+    }
+    let value: Value = serde_json::from_str(text).map_err(|_| "metadata-unparseable")?;
+    let tag = bounded_str(value.get("tag_name")).ok_or("metadata-version-unusable")?;
+    let version = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
+    if !stable_version(version) {
+        return Err("metadata-version-unusable");
+    }
+    Ok(Parsed {
+        version: version.to_owned(),
+        rust: None,
     })
 }
 
@@ -543,6 +563,9 @@ mod tests {
             "rust" => {
                 json!({"id":"rust","package":"rust-analyzer","manager":"rustup","required":true,"metadata":"https://static.rust-lang.org/dist/channel-rust-stable.toml","metadata_format":"rust-channel","runtime":["project Rust toolchain"]})
             }
+            "delphi" => {
+                json!({"id":"delphi","package":"pascal-language-server","manager":"serena-cache","required":false,"metadata":"https://api.github.com/repos/zen010101/pascal-language-server/releases/latest","metadata_format":"github-release","runtime":["Existing shared pasls installation (reuse-only)"]})
+            }
             _ => panic!("unsupported fixture id"),
         }
     }
@@ -604,12 +627,17 @@ mod tests {
         .into_bytes()
     }
 
+    fn github_release(tag: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({"tag_name":tag,"name":"fixture release"})).unwrap()
+    }
+
     fn checked(id: &str, version: &str) -> Value {
         let body = match id {
             "serena" => pypi("serena-agent", version),
             "nuphus" => npm("@nuphus/nuphus-mcp", version),
             "python" => npm("basedpyright", version),
             "rust" => rust_channel(version, "0.0.0", "2026-09-03"),
+            "delphi" => github_release(&format!("v{version}")),
             _ => panic!("unsupported fixture id"),
         };
         release(&spec(id), Ok(&body))
@@ -985,6 +1013,82 @@ mod tests {
         assert_eq!(scoped["state"], "checked");
         let wrong_scope = release(&spec("nuphus"), Ok(&npm("nuphus-mcp", "0.2.2")));
         assert_eq!(wrong_scope["reason"], "metadata-package-mismatch");
+    }
+
+    #[test]
+    fn github_release_tag_is_the_pasls_version_and_rejects_unusable_tags() {
+        let delphi = spec("delphi");
+        let checked = release(&delphi, Ok(&github_release("v0.2.0")));
+        assert_eq!(checked["state"], "checked");
+        assert_eq!(checked["version"], "0.2.0");
+        assert_eq!(
+            checked["source"],
+            "https://api.github.com/repos/zen010101/pascal-language-server/releases/latest"
+        );
+        for tag in ["latest", "v0.3.0-rc.1", "", "v0.2.0 PRIVATE"] {
+            let unresolved = release(&delphi, Ok(&github_release(tag)));
+            assert_eq!(unresolved["state"], "unresolved", "{tag}");
+            assert_eq!(unresolved["reason"], "metadata-version-unusable", "{tag}");
+            assert!(unresolved["version"].is_null(), "{tag}");
+        }
+        let malformed = release(&delphi, Ok(b"not-json token=PRIVATE"));
+        assert_eq!(malformed["reason"], "metadata-unparseable");
+        assert!(!malformed.to_string().contains("PRIVATE"));
+    }
+
+    #[test]
+    fn pascal_row_is_reuse_only_and_absent_pascal_is_conditional() {
+        let ids = ["serena", "nuphus", "python", "rust", "delphi"];
+        let cat = catalogue(&ids);
+        let mut releases = BTreeMap::new();
+        releases.insert("serena".into(), checked("serena", "1.7.0"));
+        releases.insert("nuphus".into(), checked("nuphus", "0.2.2"));
+        releases.insert("python".into(), checked("python", "1.29.0"));
+        releases.insert("rust".into(), checked("rust", "1.98.1"));
+        releases.insert("delphi".into(), checked("delphi", "0.2.0"));
+        let adopted = inventory(&[
+            record("serena", "adopted", json!("1.7.0"), idle()),
+            record("nuphus", "adopted", json!("0.2.2"), idle()),
+            record("python", "adopted", json!("1.29.0"), idle()),
+            record("rust", "adopted", json!("1.97.1"), idle()),
+            record("delphi", "adopted", json!("0.2.0"), idle()),
+        ]);
+        let planned = plan(&cat, &adopted, &releases).unwrap();
+        let row = planned["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "delphi")
+            .unwrap();
+        assert_eq!(row["action"], "reuse", "{row}");
+        assert_eq!(row["required"], false);
+        // An absent reuse-only row is accepted instead of planned for
+        // provisioning, and a newer upstream tag is only reported.
+        let absent = inventory(&[
+            record("serena", "adopted", json!("1.7.0"), idle()),
+            record("nuphus", "adopted", json!("0.2.2"), idle()),
+            record("python", "adopted", json!("1.29.0"), idle()),
+            record("rust", "adopted", json!("1.97.1"), idle()),
+            record("delphi", "missing", Value::Null, idle()),
+        ]);
+        let planned = plan(&cat, &absent, &releases).unwrap();
+        let row = planned["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "delphi")
+            .unwrap();
+        assert_eq!(row["action"], "conditional-absent", "{row}");
+        let mut newer_releases = releases.clone();
+        newer_releases.insert("delphi".into(), checked("delphi", "0.3.0"));
+        let planned = plan(&cat, &adopted, &newer_releases).unwrap();
+        let row = planned["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "delphi")
+            .unwrap();
+        assert_eq!(row["action"], "stage-compatible-update", "{row}");
     }
 
     #[test]

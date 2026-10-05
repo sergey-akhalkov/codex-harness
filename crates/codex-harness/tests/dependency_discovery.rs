@@ -126,7 +126,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
     assert_eq!(report["read_only"], true);
     assert_eq!(report["network_requested"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 5);
     for item in items {
         assert_eq!(item["release"]["state"], "unresolved");
         assert!(item["release"]["version"].is_null());
@@ -139,7 +139,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
 }
 
 #[test]
-#[ignore = "explicit public HTTPS release metadata for the four selected dependencies"]
+#[ignore = "explicit public HTTPS release metadata for the selected dependencies"]
 fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptance() {
     let fixture = Fixture::new();
     let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
@@ -166,7 +166,7 @@ fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptan
     assert_eq!(report["model_calls"], 0);
     assert_eq!(report["read_only"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 6);
     for item in items {
         assert_eq!(
             item["release"]["state"], "checked",
@@ -174,7 +174,15 @@ fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptan
             item["id"], item["release"]
         );
         assert!(item["release"]["version"].as_str().is_some());
-        assert_eq!(item["action"], "install-required");
+        // The reuse-only Pascal row is accepted as absent instead of planned
+        // for provisioning; managed rows with an install route stay
+        // install-required until they are adopted.
+        let expected = if item["id"] == "delphi" {
+            "conditional-absent"
+        } else {
+            "install-required"
+        };
+        assert_eq!(item["action"], expected, "{}", item["id"]);
     }
     assert!(!fixture.home.exists());
 }
@@ -196,9 +204,9 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["processes_started"], 0);
     assert_eq!(report["model_calls"], 0);
-    assert_eq!(report["languages"].as_array().unwrap().len(), 2);
+    assert_eq!(report["languages"].as_array().unwrap().len(), 3);
     assert_eq!(report["mcp"].as_array().unwrap().len(), 2);
-    for id in ["serena", "nuphus", "python", "rust"] {
+    for id in ["serena", "nuphus", "python", "rust", "delphi"] {
         assert_eq!(record(&report, id)["status"], "missing", "{id}: {report}");
     }
     assert!(!fixture.home.exists());
@@ -587,4 +595,77 @@ fn cli_process_observation_sees_owned_consumer_without_disclosing_arguments_or_s
         "observation stopped its consumer"
     );
     assert!(binary.exists());
+}
+
+#[test]
+fn pascal_adoption_requires_pasls_and_matching_fpc_prerequisites() {
+    let fixture = Fixture::new();
+    let root = fixture
+        .home
+        .join(".serena/language_servers/static/PascalLanguageServer");
+    let pasls = root.join("pasls.exe");
+    let meta = root.join(".meta/version");
+    let fpc = root.join("prerequisites/fpc-3.2.2/bin/i386-win32/fpc.exe");
+    let source = root.join("prerequisites/fpc-3.2.2/source");
+    // No shared installation: the row stays missing.
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "delphi")["status"],
+        "missing"
+    );
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&pasls, b"inert pasls payload, never executed").unwrap();
+    fs::create_dir_all(meta.parent().unwrap()).unwrap();
+    fs::write(&meta, b"v0.2.0").unwrap();
+    // A pasls binary without the matching FPC tree is not adoption evidence.
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "delphi")["status"],
+        "broken"
+    );
+    fs::create_dir_all(fpc.parent().unwrap()).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(&fpc, b"inert fpc payload, never executed").unwrap();
+    let adopted = fixture.observe(&["--no-process-environment"]);
+    let row = record(&adopted, "delphi");
+    assert_eq!(row["status"], "adopted", "{row}");
+    assert_eq!(row["version"], "0.2.0");
+    assert_eq!(row["manager"], "serena-cache");
+    assert_eq!(row["update_safe"], false);
+    assert_eq!(row["serena_id"], "pascal");
+    assert!(
+        row["paths"]["executable"]
+            .as_str()
+            .unwrap()
+            .ends_with("pasls.exe")
+    );
+    assert!(row["paths"]["fpc"].as_str().unwrap().ends_with("fpc.exe"));
+    assert!(
+        row["paths"]["fpc_source"]
+            .as_str()
+            .unwrap()
+            .ends_with("source")
+    );
+    // A placeholder version record cannot be adopted.
+    fs::write(&meta, b"unknown").unwrap();
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "delphi")["status"],
+        "incomplete"
+    );
+    fs::write(&meta, b"v0.2.0").unwrap();
+    // Tampered prerequisites remove the row instead of adopting it.
+    fs::remove_file(&fpc).unwrap();
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "delphi")["status"],
+        "broken"
+    );
+    fs::write(&fpc, b"inert fpc payload, never executed").unwrap();
+    fs::remove_dir_all(&source).unwrap();
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "delphi")["status"],
+        "broken"
+    );
+    fs::remove_file(&pasls).unwrap();
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "delphi")["status"],
+        "missing"
+    );
 }

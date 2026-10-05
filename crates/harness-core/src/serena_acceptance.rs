@@ -88,16 +88,30 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
         "clientInfo":{"name":"harness-semantic-acceptance","version":"1"}});
     let mut clients = Vec::new();
     let result: io::Result<Value> = (|| {
-        for language in ["rust", "python"] {
+        // Pascal navigation is retained only where discovery adopted the
+        // verified shared pasls installation; absence keeps the acceptance on
+        // the remaining backends instead of provisioning anything.
+        let pascal_adopted = inventory["languages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| row["id"] == "delphi" && row["status"] == "adopted");
+        let mut languages: Vec<&str> = vec!["rust", "python"];
+        if pascal_adopted {
+            languages.push("pascal");
+        }
+        let mut exercised: Vec<&str> = Vec::new();
+        for language in languages {
             let project = state.path().join(language);
             fs::create_dir_all(project.join(".serena"))?;
+            let encoding = if language == "pascal" { "cp1251" } else { "utf-8" };
             fs::write(
                 project.join(".serena/project.yml"),
                 format!(
-                    "project_name: acceptance-{language}\nlanguage_servers:\n- {language}\nencoding: utf-8\n"
+                    "project_name: acceptance-{language}\nlanguage_servers:\n- {language}\nencoding: {encoding}\n"
                 ),
             )?;
-            let (relative, before, after) = if language == "rust" {
+            let (relative, before, after): (&str, Vec<u8>, String) = if language == "rust" {
                 fs::create_dir_all(project.join("src"))?;
                 fs::write(
                     project.join("Cargo.toml"),
@@ -105,17 +119,23 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
                 )?;
                 (
                     "src/lib.rs",
-                    "pub fn acceptance_value() -> i32 { 7101 }\n",
-                    "pub fn acceptance_value() -> i32 { 7102 }",
+                    b"pub fn acceptance_value() -> i32 { 7101 }\n".to_vec(),
+                    "pub fn acceptance_value() -> i32 { 7102 }".to_owned(),
+                )
+            } else if language == "pascal" {
+                (
+                    "unit1.pas",
+                    b"unit acceptance_unit;{ \xef\xf0\xe8\xe2\xe5\xf2 }\r\ninterface\r\nimplementation\r\nfunction acceptance_value: Integer;\r\nbegin\r\n  acceptance_value := 7101;\r\nend;\r\nend.\r\n".to_vec(),
+                    "function acceptance_value: Integer;\r\nbegin\r\n  acceptance_value := 7102;\r\nend;".to_owned(),
                 )
             } else {
                 (
                     "sample.py",
-                    "def acceptance_value() -> int:\n    return 7101\n",
-                    "def acceptance_value() -> int:\n    return 7102",
+                    b"def acceptance_value() -> int:\n    return 7101\n".to_vec(),
+                    "def acceptance_value() -> int:\n    return 7102".to_owned(),
                 )
             };
-            fs::write(project.join(relative), before)?;
+            fs::write(project.join(relative), &before)?;
             clients.push(Client::new(
                 Configuration {
                     serena: console.into(),
@@ -138,7 +158,9 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
                 route,
                 &initialize,
                 "get_symbols_overview",
-                json!({"relative_path":relative,"depth":0,"max_answer_chars":3800}),
+                // One level of descendants so unit symbols grouped under a
+                // backend section pseudo-namespace (legacy Pascal) appear.
+                json!({"relative_path":relative,"depth":1,"max_answer_chars":3800}),
                 deadline,
                 &cancel,
             )?;
@@ -183,14 +205,16 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
                 changed.contains("7102") && !changed.contains("7101"),
                 "Serena edit was not observed by semantic readback",
             )?;
-            let actual = fs::read_to_string(project.join(relative))?;
+            let actual = fs::read(project.join(relative))?;
             require(
-                actual.contains("7102") && !actual.contains("7101"),
+                actual.windows(4).any(|window| window == b"7102".as_slice())
+                    && !actual.windows(4).any(|window| window == b"7101".as_slice()),
                 "Serena edit was not persisted to the owned fixture",
             )?;
+            exercised.push(language);
         }
         Ok(
-            json!({"status":"semantic-ready","languages":["rust","python"],
+            json!({"status":"semantic-ready","languages":exercised,
             "checks":["symbol-overview","symbol-body","semantic-edit","semantic-readback","disk-readback"],
             "manager_sha256":crate::build_identity::hash_file(&std::env::current_exe()?)?}),
         )

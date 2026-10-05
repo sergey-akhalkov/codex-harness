@@ -600,4 +600,119 @@ mod tests {
             "Check must not mutate the recorded selection"
         );
     }
+
+    /// A fake adopted Serena uv install, in the layout discovery observes.
+    fn write_adopted_serena(dependency: &Path) -> PathBuf {
+        let root = dependency.join("AppData/Roaming/uv/tools/serena-agent");
+        let site = root.join("Lib/site-packages");
+        let dist = site.join("serena_agent-1.7.0.dist-info");
+        fs::create_dir_all(&dist).unwrap();
+        fs::create_dir_all(site.join("serena")).unwrap();
+        fs::create_dir_all(root.join("Scripts")).unwrap();
+        fs::write(
+            dist.join("METADATA"),
+            "Metadata-Version: 2.4\nName: Serena_Agent\nVersion: 1.7.0\n",
+        )
+        .unwrap();
+        fs::write(
+            dist.join("entry_points.txt"),
+            "[console_scripts]\nserena = serena.cli:top_level\n",
+        )
+        .unwrap();
+        fs::write(site.join("serena/cli.py"), b"abc").unwrap();
+        fs::write(root.join("Scripts/python.exe"), b"inert Python runtime").unwrap();
+        fs::write(
+            root.join("Scripts/serena.exe"),
+            b"inert external console entry",
+        )
+        .unwrap();
+        fs::write(
+            root.join("uv-receipt.toml"),
+            "[tool]\nrequirements = [{name = 'serena-agent'}]\n",
+        )
+        .unwrap();
+        // Published SHA-256 of the literal three bytes 'abc'; fixed oracle.
+        fs::write(
+            dist.join("RECORD"),
+            "serena/cli.py,sha256=ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0,3\n",
+        )
+        .unwrap();
+        root.join("Scripts/serena.exe")
+    }
+
+    /// A fake shared pasls cache entry with its FPC prerequisites.
+    fn write_adopted_pasls(dependency: &Path) -> PathBuf {
+        let root = dependency.join(".serena/language_servers/static/PascalLanguageServer");
+        let prerequisites = root.join("prerequisites/fpc-3.2.2");
+        fs::create_dir_all(prerequisites.join("bin/i386-win32")).unwrap();
+        fs::create_dir_all(prerequisites.join("source")).unwrap();
+        fs::create_dir_all(root.join(".meta")).unwrap();
+        fs::write(root.join("pasls.exe"), b"inert pasls, never executed").unwrap();
+        fs::write(root.join(".meta/version"), b"v0.2.0").unwrap();
+        fs::write(
+            prerequisites.join("bin/i386-win32/fpc.exe"),
+            b"inert fpc, never executed",
+        )
+        .unwrap();
+        root.join("pasls.exe")
+    }
+
+    #[test]
+    fn install_writes_the_registry_whose_pascal_row_the_worker_configuration_pins() {
+        let root = tempfile::tempdir().unwrap();
+        let dependency = root.path().join("dependency");
+        let console = write_adopted_serena(&dependency);
+        let pasls = write_adopted_pasls(&dependency);
+        let home = root.path().join("codex");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        // The recorded selection carries both managed tools; a mutating
+        // lifecycle run must not drop them.
+        fs::write(
+            home.join("harness/code-tools-registration.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "registrations": {
+                    "serena": {"command": "D:/mgr.exe",
+                               "args": ["mcp", "serena", "--serena", console]},
+                    "nuphus": {"command": "D:/mgr.exe", "args": ["mcp", "nuphus"]}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(home.join("config.toml"), "model = 'fixture'\n").unwrap();
+        let report = run(&Request {
+            source: repo(),
+            codex_home: home.clone(),
+            user_home: root.path().join("user"),
+            dependency_user_home: dependency,
+            mode: Mode::Install,
+            preview: false,
+            manager: None,
+        })
+        .unwrap();
+        assert!(report.mutated);
+        let registry_path = home.join("harness/code-tools.json");
+        let registry: Value = serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        let delphi = registry["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "delphi")
+            .expect("the lifecycle registry retains the Pascal row");
+        assert_eq!(delphi["status"], "adopted", "{delphi}");
+        assert_eq!(delphi["version"], "0.2.0");
+        assert_eq!(
+            delphi["paths"]["executable"].as_str().unwrap(),
+            local_path(&pasls).unwrap().to_str().unwrap()
+        );
+        // The registry the lifecycle wrote feeds the worker configuration
+        // generator directly; the generated home pins pasls with its FPC inputs.
+        let serena_home = crate::serena_configuration::prepare(&registry_path, &home).unwrap();
+        let generated =
+            fs::read_to_string(serena_home.join(crate::serena_configuration::CONFIG_NAME)).unwrap();
+        assert!(generated.contains("pascal:"), "{generated}");
+        assert!(generated.contains("pasls.exe"), "{generated}");
+        assert!(generated.contains("fpcdir:"), "{generated}");
+    }
 }

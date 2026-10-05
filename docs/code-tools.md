@@ -66,14 +66,19 @@ selection, not the full capabilities of pre-existing shared packages.
 | --- | --- | --- |
 | Python | Serena 1.7.0, LSP backend basedpyright 1.39.10: symbol discovery, definitions, cross-file references, suitable symbol/body and matching-text edits; actual error diagnostics with stated uncertainty | Automatic rejected; empty diagnostics do not prove clean current analysis |
 | Rust | Explicit Serena navigation using the adopted rust-analyzer; enabled in this repository's Serena project configuration | Automatic diagnostics remain disabled; use Cargo checks for acceptance |
-| Other historical candidates | None selected | Retired from managed discovery, including TypeScript, JavaScript, PowerShell, Delphi, C++, C#, JSON, Markdown, TOML, XML, CMake, Bash, YAML, QML, HTML and CSS |
+| Pascal / Delphi sources | Serena 1.7.0 with the adopted shared pasls installation and its matching FPC prerequisites pinned as `PP`/`FPCDIR`: symbol overview, definitions and cross-unit references on legacy Pascal units, with stated FPC/CodeTools limits | Automatic diagnostics remain disabled; FPC/CodeTools navigation does not establish Delphi SDK support or clean compilation |
+| Other historical candidates | None selected | Retired from managed discovery, including TypeScript, JavaScript, PowerShell, C++, C#, JSON, Markdown, TOML, XML, CMake, Bash, YAML, QML, HTML and CSS |
 
 Python remains in dependency discovery because Serena's startup guard requires
 its verified backend; BasedPyright registry updates are held
 (`held-backend-staging`) until the native dependency staging path lands, so
-ordinary upstream releases do not block installs. Retired candidates stay
-outside provisioning. Shared installations are not deleted. Native project
-checks remain available.
+ordinary upstream releases do not block installs. Pascal/Delphi is a
+reuse-only row: discovery adopts the existing shared pasls installation only
+when `pasls.exe`, its installer version record and the matching FPC driver and
+source tree are all present; a missing or tampered installation leaves Pascal
+projects refused instead of provisioning anything, and no session downloads or
+updates the backend. Retired candidates stay outside provisioning. Shared
+installations are not deleted. Native project checks remain available.
 
 Specialized controller or CNC source formats are not a managed language set.
 Extension presence does not prove a compatible language server.
