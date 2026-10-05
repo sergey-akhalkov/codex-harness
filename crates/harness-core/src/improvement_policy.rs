@@ -300,7 +300,7 @@ pub const SELECTION_CLAUSE: &str = "experiment-selection.v1";
 
 /// Bound on one experiment-selection value. The rendered clause also has its
 /// own bound so the whole declaration fits the uncertainty text.
-const MAX_SELECTION_FIELD_BYTES: usize = 192;
+const MAX_SELECTION_FIELD_BYTES: usize = 512;
 /// Bound on the rendered experiment-selection clause.
 const MAX_SELECTION_CLAUSE_BYTES: usize = 640;
 
@@ -703,7 +703,7 @@ fn set_selection_value(
 pub const NUISANCE_CLAUSE: &str = "nuisance-control.v1";
 
 /// Bound on one optional nuisance-control value.
-const MAX_NUISANCE_FIELD_BYTES: usize = 192;
+const MAX_NUISANCE_FIELD_BYTES: usize = 512;
 /// Bound on the rendered nuisance-control clause.
 const MAX_NUISANCE_CLAUSE_BYTES: usize = 512;
 /// Bound on the declared balanced schedule's repetition count.

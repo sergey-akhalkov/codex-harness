@@ -6079,3 +6079,56 @@ fn a_changed_experiment_selection_cannot_inherit_an_adoption() {
         evaluation.reasons
     );
 }
+
+/// The raised experiment-selection and nuisance-control field bounds admit
+/// honest single-line detail up to 512 bytes; oversized, multiline or
+/// separator-carrying values still refuse and name the new bound.
+#[test]
+fn raised_field_bounds_admit_bounded_detail_and_refuse_beyond_them() {
+    let mut at_bound = selection(ExperimentMethod::RealOperation, EffectPath::LocalOperation);
+    at_bound.rationale = "r".repeat(512);
+    assert!(at_bound.problem().is_none(), "{:?}", at_bound.problem());
+
+    let mut over = selection(ExperimentMethod::RealOperation, EffectPath::LocalOperation);
+    over.outcome = "o".repeat(513);
+    let problem = over.problem().unwrap();
+    assert!(
+        problem.contains("outcome") && problem.contains("at most 512 bytes without ';'"),
+        "{problem}"
+    );
+
+    let mut multiline = selection(ExperimentMethod::RealOperation, EffectPath::LocalOperation);
+    multiline.controls = "one\ntwo".to_owned();
+    let problem = multiline.problem().unwrap();
+    assert!(
+        problem.contains("controls") && problem.contains("must be one bounded line"),
+        "{problem}"
+    );
+
+    let mut separated = selection(ExperimentMethod::RealOperation, EffectPath::LocalOperation);
+    separated.stopping = "stop after the attempts; escalate for a missing observation".to_owned();
+    let problem = separated.problem().unwrap();
+    assert!(
+        problem.contains("stopping") && problem.contains("without ';'"),
+        "{problem}"
+    );
+
+    // The owned-prepared recipe carries the same bounded single-line rule.
+    let prepared = |recipe: String| {
+        let mut plan = nuisance_plan();
+        plan.initial = InitialState::OwnedPrepared;
+        plan.recipe = Some(recipe);
+        plan
+    };
+    let at_bound = prepared("r".repeat(512));
+    assert!(at_bound.problem().is_none(), "{:?}", at_bound.problem());
+    let problem = prepared("r".repeat(513)).problem().unwrap();
+    assert!(
+        problem.contains("at most 512 bytes without ';'"),
+        "{problem}"
+    );
+    let problem = prepared("one\ntwo".to_owned()).problem().unwrap();
+    assert!(problem.contains("must be one bounded line"), "{problem}");
+    let problem = prepared("one;two".to_owned()).problem().unwrap();
+    assert!(problem.contains("without ';'"), "{problem}");
+}

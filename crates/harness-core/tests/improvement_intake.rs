@@ -1277,3 +1277,201 @@ fn a_costly_low_value_measurement_is_deferred_with_its_reconsideration_condition
         "{next}"
     );
 }
+
+/// A report of the quality a real investigator produces passes one grounded
+/// intake round: the five-route alternatives comparison and the no-change
+/// reason exceed the former 256-byte statement bound, and the selection
+/// clauses exceed the former 192-byte field bound, while every field stays
+/// one bounded single line.
+#[test]
+fn rich_investigator_analysis_within_the_raised_bounds_is_admitted() {
+    let bd = bd_executable();
+    let temp = tempfile::tempdir().unwrap();
+    let project = board_project(temp.path());
+    let seed_path = write_rollout(temp.path(), "seed.jsonl", false);
+    let index = EvidenceIndex::new(vec![
+        EvidenceItem::read_rollout("rollout:cycle-1#seed", &seed_path).unwrap(),
+    ])
+    .unwrap();
+
+    // A single-line field of exactly `total` bytes carrying rich prose.
+    let filled = |prefix: &str, total: usize| {
+        let mut value = prefix.to_owned();
+        while value.len() < total {
+            value.push_str(" detail");
+        }
+        value.truncate(total);
+        value
+    };
+
+    let alternatives = filled(
+        "all five routes were compared: no change leaves the recorded repeated-read burden in place",
+        1200,
+    );
+    assert!(
+        (257..=2048).contains(&alternatives.len()),
+        "the fixture must exceed the former statement bound: {}",
+        alternatives.len()
+    );
+
+    let mut selection = selection(ExperimentMethod::RealOperation, EffectPath::LocalOperation);
+    selection.outcome = filled(
+        "the declared outcome measured through the real operation",
+        256,
+    );
+    selection.rationale = filled(
+        "the unit exercises the claimed mechanism under the declared conditions",
+        512,
+    );
+    selection.controls = filled(
+        "frozen inputs and the accepted baseline conditions are retained for both arms",
+        320,
+    );
+    selection.projection = filled(
+        "one bounded local cycle with the retention cost staying bounded",
+        224,
+    );
+    selection.baseline = filled("the accepted revision excluding the candidate edit", 200);
+    selection.stopping = filled(
+        "stop after the declared attempts and escalate only for a named missing observation",
+        448,
+    );
+    for field in [
+        &selection.outcome,
+        &selection.rationale,
+        &selection.controls,
+        &selection.projection,
+        &selection.baseline,
+        &selection.stopping,
+    ] {
+        assert!(
+            (193..=512).contains(&field.len()),
+            "the fixture must exceed the former field bound within the raised one: {}",
+            field.len()
+        );
+    }
+
+    let mut addition = base_proposal("rollout:cycle-1#seed");
+    addition.alternatives = Some(alternatives);
+    addition.selection = Some(selection);
+
+    let reason = filled(
+        "no change: the retained outcome records show the burden repeating on every accepted task",
+        1100,
+    );
+    assert!(
+        (257..=2048).contains(&reason.len()),
+        "the fixture must exceed the former statement bound: {}",
+        reason.len()
+    );
+    let mut no_change = base_proposal("rollout:cycle-1#seed");
+    no_change.treatment = Treatment::NoChange {
+        reason: reason.clone(),
+    };
+
+    let outcomes = intake(
+        &bd,
+        &project,
+        &InvestigatorReport {
+            schema: 1,
+            candidates: vec![addition, no_change],
+            idle_reason: None,
+        },
+        &index,
+    )
+    .unwrap();
+
+    assert_eq!(outcomes.outcomes.len(), 2);
+    match &outcomes.outcomes[0] {
+        IntakeOutcome::Admitted { id, .. } => {
+            let card = board_hypothesis::load_card(&bd, &project, id).unwrap();
+            assert!(card.labels.iter().any(|label| label == "hypothesis"));
+        }
+        other => panic!("expected the rich addition to be admitted, got {other:?}"),
+    }
+    match &outcomes.outcomes[1] {
+        IntakeOutcome::NoChange { reason: conclusion } => assert_eq!(conclusion, &reason),
+        other => panic!("expected the rich no-change conclusion, got {other:?}"),
+    }
+}
+
+/// The raised bounds admit honest analysis; genuinely oversized or multiline
+/// values still refuse before any board access.
+#[test]
+fn oversized_or_multiline_values_still_refuse_under_the_raised_bounds() {
+    let temp = tempfile::tempdir().unwrap();
+    let rollout = write_rollout(temp.path(), "seed.jsonl", false);
+    let index = EvidenceIndex::new(vec![
+        EvidenceItem::read_rollout("rollout:cycle-1#seed", &rollout).unwrap(),
+    ])
+    .unwrap();
+    let unowned = (Path::new("no-such-bd"), Path::new("no-such-project"));
+    let refused = |candidate: Proposal| -> Vec<String> {
+        let outcomes = intake(unowned.0, unowned.1, &report(candidate), &index).unwrap();
+        match outcomes.outcomes.into_iter().next().unwrap() {
+            IntakeOutcome::Refused { reasons } => reasons,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    };
+
+    // A single-line alternatives statement beyond the raised bound.
+    let mut alternatives = base_proposal("rollout:cycle-1#seed");
+    alternatives.alternatives = Some("a".repeat(2049));
+    let reasons = refused(alternatives);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("alternatives consideration exceeds 2048 bytes")),
+        "{reasons:?}"
+    );
+
+    // A multiline alternatives statement refuses inside the byte bound too.
+    let mut multiline = base_proposal("rollout:cycle-1#seed");
+    multiline.alternatives = Some("first line\nsecond line".to_owned());
+    let reasons = refused(multiline);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("alternatives consideration must be a single line")),
+        "{reasons:?}"
+    );
+
+    // A no-change reason beyond the raised bound.
+    let mut no_change = base_proposal("rollout:cycle-1#seed");
+    no_change.treatment = Treatment::NoChange {
+        reason: "r".repeat(2049),
+    };
+    let reasons = refused(no_change);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("no-change reason exceeds 2048 bytes")),
+        "{reasons:?}"
+    );
+
+    // A selection field beyond its raised bound, and a multiline one.
+    let mut over = base_proposal("rollout:cycle-1#seed");
+    if let Some(selection) = over.selection.as_mut() {
+        selection.rationale = "r".repeat(513);
+    }
+    let reasons = refused(over);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason
+                .contains("must be one bounded line of at most 512 bytes without ';'")),
+        "{reasons:?}"
+    );
+    let mut multiline = base_proposal("rollout:cycle-1#seed");
+    if let Some(selection) = multiline.selection.as_mut() {
+        selection.controls = "one\ntwo".to_owned();
+    }
+    let reasons = refused(multiline);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason
+                .contains("must be one bounded line of at most 512 bytes without ';'")),
+        "{reasons:?}"
+    );
+}

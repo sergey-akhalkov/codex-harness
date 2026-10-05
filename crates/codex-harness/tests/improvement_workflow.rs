@@ -1263,6 +1263,8 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
         "\"subtraction\"",
         "\"alternatives\"",
         "before additional machinery",
+        "at most 2048 bytes",
+        "at most 512 bytes",
         "counterexample",
         "actual consumption",
         "skills usage",
@@ -1291,6 +1293,35 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
     // Replace the refused investigator conversation with the completed one the
     // real dispatcher would record; the controller must consume it exactly once.
     let result = fixture.run.join("investigator-result.json");
+    // The consumed report carries the honest analysis of a real investigator
+    // round: the five-route alternatives comparison and the selection clauses
+    // exceed the former 256/192-byte bounds and stay single-line.
+    let rich_alternatives = format!(
+        "all five routes were compared: no change leaves the recorded burden repeating, reuse of the existing reader re-enters the same load path, simplification removes no measured step, and subtraction would drop a still-consumed capability; {}",
+        "each smaller route fails the evidenced need under the frozen conditions ".repeat(3)
+    );
+    let mut rich_selection = selection_json();
+    rich_selection["rationale"] = json!(format!(
+        "the chosen unit exercises the claimed mechanism because {}",
+        "the recorded repeated reads happen inside the same command the candidate changes "
+            .repeat(3)
+    ));
+    rich_selection["controls"] = json!(format!(
+        "frozen inputs and the accepted baseline conditions are retained for both arms, and {}",
+        "the declared operating mode stays frozen while no shared state is written ".repeat(3)
+    ));
+    assert!(
+        (257..=2048).contains(&rich_alternatives.len()),
+        "the fixture must exceed the former statement bound: {}",
+        rich_alternatives.len()
+    );
+    for field in ["rationale", "controls"] {
+        let length = rich_selection[field].as_str().unwrap().len();
+        assert!(
+            (193..=512).contains(&length),
+            "the fixture must exceed the former field bound within the raised one: {length}"
+        );
+    }
     let report = json!({
         "schema": 1,
         "candidates": [{
@@ -1300,12 +1331,12 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
             "predicted": "less repeated context loading",
             "counterexample": "diagnostics vanish on failure",
             "acceptance": "the independent oracle passes",
-            "alternatives": "no change, reuse of the existing reader, simplification and subtraction leave the measured burden in place",
+            "alternatives": rich_alternatives,
             "spec": format!("openspec/changes/{change}"),
             "basis": locator,
             "treatment": "addition",
             "evidence": [{"locator": locator, "kind": "observed"}],
-            "selection": selection_json(),
+            "selection": rich_selection,
             "next_check": null,
         }],
         "idle_reason": null,

@@ -119,7 +119,7 @@ pub const MAX_LOCATOR: usize = 128;
 /// Bound on one token field (mechanism, conditions, target).
 pub const MAX_TOKEN: usize = 96;
 /// Bound on one statement line (effect, counterexample, acceptance, reason).
-pub const MAX_STATEMENT: usize = 256;
+pub const MAX_STATEMENT: usize = 2048;
 /// Bound on the coverage description of one evidence item.
 pub const MAX_COVERAGE: usize = 192;
 /// Bound on the error and warning notes of one evidence item.
