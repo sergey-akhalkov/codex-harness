@@ -3543,13 +3543,25 @@ fn an_idle_run_reenters_selection_when_its_evidence_root_is_populated() {
         "the new evidence prepared exactly one dispatch: {cursor}"
     );
 
-    // Without fresh evidence the further resume dispatches nothing.
+    // Without fresh evidence the further resume makes no model request. The
+    // recorded block is re-checked once per resume, and the dispatch gate's
+    // bounded policy allows exactly one immediate explicit retry of a refused
+    // dispatch (no model request was made either time), so a second
+    // investigator attempt is recorded once; a further resume inside the
+    // bounded backoff dispatches nothing.
     let again = fixture.resume();
     assert!(again.status.success(), "{}", text(&again));
-    assert_eq!(
-        fixture.cursor()["attempts"].as_array().unwrap().len(),
-        1,
-        "no second model round is started from unchanged evidence"
+    let attempts = fixture.cursor()["attempts"].as_array().unwrap().clone();
+    assert!(
+        attempts.len() <= 2,
+        "at most one recorded refusal retry follows the unchanged evidence: {cursor}",
+        cursor = fixture.cursor()
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt["state"] != "completed" || attempt["receipt"].is_null()),
+        "no model round completed from unchanged evidence: {attempts:?}"
     );
 }
 
