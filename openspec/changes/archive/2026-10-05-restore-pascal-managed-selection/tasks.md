@@ -19,7 +19,7 @@
   and references on a synthetic CP1251/CRLF fixture with the registry produced
   by the supported discovery/lifecycle inputs, including the deployment
   semantic acceptance on that registry.
-- [ ] 1.7 Lead: deploy through the installation lifecycle and verify a
+- [x] 1.7 Lead: deploy through the installation lifecycle and verify a
   separate private Delphi consumer; archive the change.
 
 ## 2. Documentation

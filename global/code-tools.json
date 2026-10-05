@@ -137,7 +137,7 @@
         ".dpk",
         ".inc"
       ],
-      "provision": "Reuse-only: adopt the verified shared pasls installation with its matching FPC prerequisites; never download or update it during a session. Missing or tampered prerequisites leave the row unavailable rather than trigger provisioning.",
+      "provision": "Reuse-only: adopt the observed shared pasls installation with its matching FPC prerequisites; never download or update it during a session. Discovery rejects missing or ambiguous prerequisites and absent or invalid version records. Startup checks recorded paths exist; observed fingerprints do not establish arbitrary content integrity.",
       "verification": "Managed Serena session on owned legacy Pascal sources with the pinned PP/FPCDIR: symbol overview, definition and references with stated FPC/CodeTools limits; no clean-compilation or Delphi-SDK claim."
     }
   ],
