@@ -728,6 +728,12 @@ tasks that do not later require extensive rework for surfacing critical P0/P1
 defects. An addition that saves tokens or time while leaving task success or
 defect behavior unchanged at best is not a benefit claim.
 
+Quality has two measured faces, not one: the absence of later P0/P1 rework
+AND the overall task success rate. A harness change that makes previously
+solvable tasks fail has reduced quality even when it contains no defect of
+its own; the loop treats a measured success-rate drop as a benefit rejection
+and rolls the change back to the accepted baseline.
+
 **2026-10-01, confirmed:** improvement analysis must separate external
 infrastructure waiting from agent/harness work without losing observed user
 cost. Use native lifecycle evidence for automatic adjustment, retain both

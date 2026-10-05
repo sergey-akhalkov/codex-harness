@@ -20,6 +20,10 @@ consumption, faster work and higher task-closing quality - quality meaning
 accepted tasks that do not later demand extensive rework from surfacing
 critical P0/P1 defects. An addition that saves tokens or time while leaving
 task success or defect behavior unchanged at best is not a benefit claim.
+Quality is measured on two faces: no later P0/P1 rework AND the overall task
+success rate. A harness change that makes previously solvable tasks fail has
+reduced quality even without a defect of its own; a measured success-rate
+drop rejects the benefit and rolls the change back to the accepted baseline.
 
 Use the consuming project's Beads board and the native `codex-harness improve`
 controller. Read `codex-harness improve --help` for the installed request and
@@ -124,11 +128,12 @@ describes ownership.
    and make everyday work faster and cheaper in tokens. Only when no further
    removable complexity is found does the loop propose additions, and an
    addition must improve all three together - tokens, speed and task-closing
-   quality (fewer later P0/P1 rework demands), not just cost. Quality is
-   never the payment for that speed or economy: work quality, reasoning depth
-   and the ability to close tasks stay maximal in every arm, and a hypothesis
-   that would trade them away is refused at intake no matter how much it
-   saves.
+   quality (fewer later P0/P1 rework demands AND a higher overall task
+   success rate), not just cost. A measured success-rate drop rejects the
+   benefit and restores the accepted baseline. Quality is never the payment
+   for that speed or economy: work quality, reasoning depth and the ability
+   to close tasks stay maximal in every arm, and a hypothesis that would
+   trade them away is refused at intake no matter how much it saves.
    No new basis means reuse the earlier conclusion or remain idle, without
    manufacturing work or votes.
 2. **One planning contract per hypothesis.** Each hypothesis — including a
