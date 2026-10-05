@@ -1479,6 +1479,7 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
             request_sha256: format!("{:x}", Sha256::digest(&request_bytes)),
         },
         observation_inputs: Vec::new(),
+        observation_auth: None,
     });
     spec
 }

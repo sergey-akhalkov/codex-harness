@@ -913,7 +913,9 @@ fn verify_client_binding(
 
 /// Every declared API observation input must be exactly one of the declared
 /// client files the arms consume (overlay or catalogue). A qualified but
-/// unconsumed template cannot stand in for the installed configuration.
+/// unconsumed template cannot stand in for the installed configuration. The
+/// optional `observation_auth` transport input is deliberately not checked
+/// here: it supplies the declared bearer and is not an observed identity fact.
 fn verify_observation_inputs(comparison: &ComparisonInputs) -> Result<(), String> {
     let client = &comparison.runtimes.client;
     for input in &comparison.observation_inputs {
@@ -1700,14 +1702,19 @@ fn api_observed(run: &Run) -> io::Result<Option<ApiObservedQualification>> {
 
 /// Re-collect the declared API observations and refuse drift before and after
 /// each measured attempt. Model-free; a required observation that cannot be
-/// fetched blocks instead of being dropped.
+/// fetched blocks instead of being dropped. The optional declared bearer-auth
+/// transport input rides along with the declared observation inputs without
+/// entering the collected identity it is re-checked against.
 fn verify_observations(
     comparison: &ComparisonInputs,
     qualification: &ApiObservedQualification,
     phase: &str,
 ) -> Result<(), String> {
     let runner = qualification.runner.clone();
-    let inputs: Vec<ClientInput> = comparison.observation_inputs.clone();
+    let mut inputs: Vec<ClientInput> = comparison.observation_inputs.clone();
+    if let Some(auth) = &comparison.observation_auth {
+        inputs.push(auth.clone());
+    }
     let observed = collect_observations(&runner, &qualification.policy.plan, &inputs)
         .map_err(|failure| format!("the {phase} API observation set is unavailable: {failure}"))?;
     if observed.digest().map_err(|error| error.to_string())? != qualification.observation_digest {
