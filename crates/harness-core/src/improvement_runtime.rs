@@ -83,6 +83,12 @@ pub const LOCAL_PROVIDER: &str = "local";
 
 const CONFIG_LIMIT: usize = 1024 * 1024;
 const FILE_LIMIT: u64 = 4 * 1024 * 1024;
+/// The upstream Codex client is a single self-contained native executable
+/// that today reaches hundreds of megabytes; it carries its own bound instead
+/// of the shared small-file limit, and hashing one at this bound stays
+/// seconds, not minutes.
+const UPSTREAM_CLIENT_LIMIT: u64 = 1024 * 1024 * 1024;
+
 const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn invalid(detail: impl std::fmt::Display) -> io::Error {
@@ -195,6 +201,12 @@ fn hash_file(name: &str, path: &Path, limit: u64) -> io::Result<String> {
         return Err(invalid(format!("{name} exceeds its size bound")));
     }
     build_identity::hash_file(path)
+}
+
+/// Digest of the declared upstream Codex client under its dedicated bound:
+/// one self-contained native executable, never the shared small-file limit.
+fn upstream_client_digest(path: &Path) -> io::Result<String> {
+    hash_file("the upstream client", path, UPSTREAM_CLIENT_LIMIT)
 }
 
 /// Deterministic digest of one source directory: every ordinary file's
@@ -745,12 +757,11 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
             "the upstream client must be an absolute native executable",
         ));
     }
-    let upstream_sha256 =
-        hash_file("the upstream client", &upstream, FILE_LIMIT).map_err(|error| {
-            invalid(format!(
-                "the declared upstream client is missing or unreadable ({error})"
-            ))
-        })?;
+    let upstream_sha256 = upstream_client_digest(&upstream).map_err(|error| {
+        invalid(format!(
+            "the declared upstream client is missing or unreadable ({error})"
+        ))
+    })?;
     for (name, path) in [
         ("prepared runtime", &build),
         ("kit source", &source),
@@ -2097,7 +2108,7 @@ pub fn verify_consumption_with_trust(
             "the declared upstream client is missing or is not an ordinary file",
         ));
     }
-    if build_identity::hash_file(&runtime.upstream)? != runtime.upstream_sha256 {
+    if upstream_client_digest(&runtime.upstream)? != runtime.upstream_sha256 {
         return Err(invalid(
             "the declared upstream client changed since preparation",
         ));
@@ -2552,4 +2563,39 @@ fn disconnect_homes(
         path_change: report.path_change,
         model_calls: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dedicated upstream-client bound admits a self-contained native
+    /// client larger than the shared small-file bound, while the same size
+    /// stays refused for private runner inputs.
+    #[test]
+    fn upstream_client_bound_admits_large_client_while_private_inputs_refuse() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let size = FILE_LIMIT as usize + 1024 * 1024;
+        let source = scratch.path().join("codex.exe");
+        fs::write(&source, vec![0x5a; size]).expect("oversize client file");
+
+        let digest = upstream_client_digest(&source).expect("upstream client admitted");
+        assert_eq!(digest.len(), 64);
+
+        let home = scratch.path().join("home");
+        fs::create_dir(&home).expect("arm home");
+        let error = validate_private_inputs(
+            &home,
+            &[PrivateInput {
+                source: source.clone(),
+                destination: "notes.txt".to_owned(),
+            }],
+        )
+        .err()
+        .expect("a private input over the shared bound must refuse");
+        assert!(
+            error.to_string().contains("exceeds its size bound"),
+            "unexpected refusal: {error}"
+        );
+    }
 }
