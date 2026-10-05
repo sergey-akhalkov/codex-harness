@@ -114,6 +114,11 @@ const MAX_POLICY_FILE_BYTES: u64 = 256 * 1024;
 /// may contribute to the model-free carry; the activation lineage owner reads
 /// the same bounded comment set.
 const MAX_RETAINED_SOLUTIONS: usize = 8;
+/// Bound on investigator rounds one run dispatches: an unreadable retained
+/// report justifies fresh bounded rounds, but a run never exceeds this many
+/// investigator conversations. At the bound the run records idle with the
+/// exact reason instead of re-reading the same unreadable result forever.
+const MAX_INVESTIGATOR_ROUNDS: usize = 3;
 
 /// Advances the run as far as the recorded state and the dispatch gates
 /// allow. Returns human-readable progress notes; a blocked or idle condition
@@ -748,7 +753,12 @@ fn advance_selection(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
 /// already-consumed one. The retained terminal message may frame the report
 /// in investigator prose; only its single unambiguous final JSON payload is
 /// parsed (`improvement_intake::parse_terminal_report`) and the raw message
-/// digest stays the authoritative identity. Returns whether a result was
+/// digest stays the authoritative identity. A result the controller cannot
+/// consume (no retained result, unreadable bytes, beyond the report bound or
+/// not a schema-1 report) is recorded as consumed once with no outcomes so the
+/// same bytes are never re-read on every resume; below the investigator-round
+/// bound the next advance dispatches one fresh bounded round, and at the bound
+/// the run records idle with the exact reason. Returns whether a result was
 /// handled (consumed or explicitly blocked), so the caller never falls
 /// through to a new dispatch while unconsumed evidence exists.
 fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
@@ -766,11 +776,17 @@ fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Re
     };
     let Some(result) = retained_result(&attempt) else {
         let reason = format!(
-            "the completed investigator attempt {} retained no terminal result, so no structured report can be consumed; the attempt is not replayed - dispatch a fresh bounded round or retain the result",
+            "the completed investigator attempt {} retained no terminal result, so no structured report can be consumed and the attempt is not replayed",
             attempt.id
         );
-        refused(run, notes, reason)?;
-        return Ok(true);
+        return consume_unreadable_result(
+            run,
+            notes,
+            &attempt.id,
+            None,
+            unreadable_result_identity(&attempt.id),
+            reason,
+        );
     };
     let bytes = match fs::read(&result) {
         Ok(bytes) if bytes.len() as u64 <= improvement_intake::MAX_REPORT_BYTES => bytes,
@@ -781,16 +797,28 @@ fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Re
                 bytes.len(),
                 improvement_intake::MAX_REPORT_BYTES
             );
-            refused(run, notes, reason)?;
-            return Ok(true);
+            return consume_unreadable_result(
+                run,
+                notes,
+                &attempt.id,
+                Some(&result),
+                build_identity::hash_bytes(&bytes),
+                reason,
+            );
         }
         Err(error) => {
             let reason = format!(
                 "the retained investigator result at {} is unreadable: {error}; no intake round runs",
                 result.display()
             );
-            refused(run, notes, reason)?;
-            return Ok(true);
+            return consume_unreadable_result(
+                run,
+                notes,
+                &attempt.id,
+                Some(&result),
+                unreadable_result_identity(&attempt.id),
+                reason,
+            );
         }
     };
     let result_sha256 = build_identity::hash_bytes(&bytes);
@@ -806,11 +834,17 @@ fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Re
         Ok(report) => report,
         Err(error) => {
             let reason = format!(
-                "the retained investigator result at {} is not a bounded schema-1 investigator report ({error}); no candidate is admitted from unreadable output and no model round is started",
+                "the retained investigator result at {} is not a bounded schema-1 investigator report ({error}); no candidate is admitted from unreadable output",
                 result.display()
             );
-            refused(run, notes, reason)?;
-            return Ok(true);
+            return consume_unreadable_result(
+                run,
+                notes,
+                &attempt.id,
+                Some(&result),
+                result_sha256,
+                reason,
+            );
         }
     };
     let evidence = build_evidence(run)?;
@@ -822,6 +856,9 @@ fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Re
     ) {
         Ok(outcomes) => outcomes,
         Err(error) => {
+            // The report itself is readable; only the external intake owner
+            // failed. The same bytes stay eligible for the next resume
+            // instead of being consumed once without their outcomes.
             let reason = format!(
                 "grounded intake could not be completed: {error}; the board failure is reported instead of being replaced by a local journal, and no model round is started"
             );
@@ -867,6 +904,107 @@ fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Re
         }
     }
     Ok(true)
+}
+
+/// Consumes one retained investigator result the controller cannot turn into
+/// grounded outcomes: the attempt retained no result, the retained bytes are
+/// unreadable or beyond the report bound, or they are not a bounded schema-1
+/// report. The result identity is recorded so the same bytes are never
+/// re-consumed by every resume. Below the investigator-round bound the record
+/// carries no evidence shape (no grounded intake ran against evidence), so the
+/// next advance dispatches exactly one fresh bounded investigator round; at
+/// the bound the record carries the current evidence shape and the run records
+/// idle with the exact reason, so no model round starts again. Unreadable
+/// output admits no candidate and is never replayed.
+fn consume_unreadable_result(
+    run: &mut Run,
+    notes: &mut Vec<String>,
+    attempt_id: &str,
+    result: Option<&Path>,
+    result_sha256: String,
+    reason: String,
+) -> io::Result<bool> {
+    if run
+        .cursor
+        .intake
+        .as_ref()
+        .is_some_and(|intake| intake.result_sha256 == result_sha256)
+    {
+        return Ok(false);
+    }
+    let retained = result
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "no retained path".to_owned());
+    let detail = format!(
+        "attempt={attempt_id} result={retained} sha256={} outcomes=0 unreadable: {reason}",
+        &result_sha256[..16.min(result_sha256.len())]
+    );
+    if investigator_rounds(&run.cursor) >= MAX_INVESTIGATOR_ROUNDS {
+        // The current evidence shape is recorded so the unchanged-evidence
+        // guard keeps this settled round from starting another investigator
+        // round while the exact reason stays recorded in idle.
+        let evidence = build_evidence(run)?;
+        run.cursor.record_intake(IntakeState {
+            result_sha256,
+            evidence_digest: evidence.digest,
+            outcomes: Vec::new(),
+            consumed_ms: now_ms(),
+        })?;
+        run.cursor.effect(
+            EffectKind::IntakeConsumed,
+            format!("{detail}; investigator rounds reached the bound of {MAX_INVESTIGATOR_ROUNDS}"),
+        );
+        return idle(
+            run,
+            notes,
+            format!(
+                "{reason}; the run reached its bound of {MAX_INVESTIGATOR_ROUNDS} investigator rounds, so no further investigator round is dispatched - supply a readable schema-1 report, change the evidence or start a new run"
+            ),
+        )
+        .map(|()| true);
+    }
+    run.cursor.record_intake(IntakeState {
+        result_sha256,
+        // No grounded intake ran against any evidence shape, so no evidence
+        // identity is claimed; the unchanged-evidence guard stays out of the
+        // way and the next advance dispatches one fresh bounded round.
+        evidence_digest: String::new(),
+        outcomes: Vec::new(),
+        consumed_ms: now_ms(),
+    })?;
+    run.cursor.effect(
+        EffectKind::IntakeConsumed,
+        format!("{detail}; consumed once, one fresh bounded investigator round may follow"),
+    );
+    let follow = format!(
+        "{reason}; the unreadable result is consumed once and the next resume dispatches one fresh bounded investigator round"
+    );
+    if run.cursor.phase == Phase::Idle {
+        return idle(run, notes, follow).map(|()| true);
+    }
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "intake: the retained investigator result of attempt {attempt_id} is not consumable and is recorded as consumed once without outcomes; the next resume dispatches one fresh bounded investigator round ({reason})"
+    ));
+    Ok(true)
+}
+
+/// The investigator rounds this run has recorded: every investigator attempt
+/// dispatches one round, and the run's total stays within the bound.
+fn investigator_rounds(cursor: &Cursor) -> usize {
+    cursor
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.role == AttemptRole::Investigator)
+        .count()
+}
+
+/// The recorded identity of a retained investigator result whose bytes could
+/// not be read at all: a stable digest of the attempt identity, so the same
+/// unreadable attempt is consumed once while later readable bytes (a changed
+/// digest) can still be consumed normally.
+fn unreadable_result_identity(attempt_id: &str) -> String {
+    build_identity::hash_bytes(format!("unreadable-investigator-result:{attempt_id}").as_bytes())
 }
 
 fn retained_result(attempt: &Attempt) -> Option<PathBuf> {
@@ -3247,12 +3385,23 @@ fn attempt_ordinal(attempt_id: &str) -> u32 {
 /// Dispatches the bounded investigator conversation. Its only output is the
 /// schema-1 investigator report as its final message; the controller consumes
 /// that report through grounded intake, so the conversation itself admits no
-/// hypothesis.
+/// hypothesis. The run's investigator rounds are bounded: unreadable retained
+/// results justify fresh bounded rounds, but at the bound the run records idle
+/// instead of dispatching another round.
 fn dispatch_investigator(
     run: &mut Run,
     evidence: &Evidence,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
+    if investigator_rounds(&run.cursor) >= MAX_INVESTIGATOR_ROUNDS {
+        return idle(
+            run,
+            notes,
+            format!(
+                "the run already dispatched its bound of {MAX_INVESTIGATOR_ROUNDS} investigator rounds and no readable schema-1 report was consumed from them; no further investigator round is dispatched - change the evidence, supply the missing report or start a new run"
+            ),
+        );
+    }
     let host = DispatchHost {
         checkout: run.spec.project.clone(),
         base: run.spec.base_revision.clone(),

@@ -644,6 +644,43 @@ fn seed_investigator_report(fixture: &Fixture, report: &Value) -> PathBuf {
     seed_investigator_message(fixture, &serde_json::to_vec_pretty(report).unwrap())
 }
 
+/// Writes one retained investigator terminal message for a specific round
+/// beside the run and seeds the started attempt that produced it; the next
+/// resume settles the seeded receipt, retains the message and consumes it
+/// exactly like a real completed round. Unlike `seed_investigator_message`
+/// this replaces an existing attempt for the same round, so a controller
+/// re-dispatch and its later completion can be simulated in sequence.
+fn seed_investigator_round(fixture: &Fixture, ordinal: u32, message: &[u8]) -> PathBuf {
+    let result = fixture
+        .run
+        .join(format!("investigator-result-{ordinal}.json"));
+    fs::write(&result, message).unwrap();
+    let receipt = fixture
+        .run
+        .join(format!("investigator-receipt-{ordinal}.json"));
+    seed_bound_receipt(
+        &receipt,
+        &format!("workflow-fixture-investigator-{ordinal}"),
+        "gen-1",
+        "completed",
+        Some(0),
+    );
+    replace_attempt(
+        fixture,
+        attempt_json(
+            &format!("investigator-{ordinal}"),
+            "investigator",
+            &format!("workflow-fixture-investigator-{ordinal}"),
+            "gen-1",
+            &receipt,
+            Some(&result),
+            None,
+            "started",
+        ),
+    );
+    result
+}
+
 /// One valid experiment-selection declaration for the report fixtures: a
 /// local build/output treatment measured through a short real operation. The
 /// report contract requires it for every treatment that selects an
@@ -683,6 +720,15 @@ fn anchored_report(observation: &str) -> Value {
         }],
         "idle_reason": null,
     })
+}
+
+/// One report-shaped payload whose evidence entries are strings instead of
+/// the schema's locator/kind objects: real model format variance that the
+/// strict schema-1 contract refuses as unreadable output.
+fn malformed_report_payload(observation: &str) -> Vec<u8> {
+    let mut report = anchored_report(observation);
+    report["candidates"][0]["evidence"] = json!([observation]);
+    serde_json::to_vec_pretty(&report).unwrap()
 }
 
 fn write_evidence_root(fixture: &Fixture) -> (PathBuf, String) {
@@ -1149,8 +1195,11 @@ fn prose_framed_terminal_result_is_consumed_and_never_replayed() {
 
 /// Two complete payloads in one terminal message are ambiguous: the intake
 /// refuses the whole message and admits no candidate from either payload.
+/// The unreadable bytes are still consumed once under their raw digest, so a
+/// resume never re-reads them; without an installed launcher the fresh bounded
+/// round stays gated instead of re-refusing the same message.
 #[test]
-fn an_ambiguous_terminal_message_is_refused_without_model_churn() {
+fn an_ambiguous_terminal_message_is_consumed_once_without_admitting_a_candidate() {
     let fixture = Fixture::new("ambiguous-report");
     let (root, locator) = write_evidence_root(&fixture);
     fixture.write_spec(&[("evidence_root", json!(root))]);
@@ -1165,32 +1214,283 @@ fn an_ambiguous_terminal_message_is_refused_without_model_churn() {
     let resume = fixture.resume();
     assert!(resume.status.success(), "{}", text(&resume));
     let report = fixture.status_json();
-    assert_eq!(report["phase"], "idle", "{report}");
     assert!(report["candidate"].is_null(), "{report}");
-    assert!(
-        report["condition"]
-            .as_str()
-            .unwrap()
-            .contains("not a bounded schema-1 investigator report"),
-        "{report}"
-    );
     let cursor = fixture.cursor();
-    assert!(cursor["intake"].is_null(), "{cursor}");
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(hash_bytes(message.as_bytes())),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["intake"]["outcomes"].as_array().unwrap().len(),
+        0,
+        "ambiguity admits no candidate outcome: {cursor}"
+    );
     assert_eq!(
         cursor["attempts"].as_array().unwrap().len(),
         baseline + 1,
         "ambiguity starts no model work: {cursor}"
     );
 
-    // A repeated resume keeps refusing the same ambiguous message without
-    // admitting anything or dispatching a fresh round.
+    // A repeated resume never re-reads the consumed bytes: the recorded raw
+    // digest stays untouched and, without an installed launcher, the fresh
+    // bounded round waits on the missing visibility instead of re-refusing
+    // the same message.
     let again = fixture.resume();
     assert!(again.status.success(), "{}", text(&again));
-    assert!(fixture.status_json()["candidate"].is_null());
-    assert_eq!(
-        fixture.cursor()["attempts"].as_array().unwrap().len(),
-        baseline + 1
+    let report = fixture.status_json();
+    assert!(report["candidate"].is_null(), "{report}");
+    assert_eq!(report["dispatch"]["state"], "blocked", "{report}");
+    assert!(
+        report["dispatch"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing visibility"),
+        "{report}"
     );
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(hash_bytes(message.as_bytes())),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        baseline + 1,
+        "{cursor}"
+    );
+}
+
+/// The real 2.8 wedge: a schema-1-unparseable investigator result (model
+/// format variance - here string evidence entries) used to idle without
+/// recording the intake digest, so every resume re-consumed the same
+/// unreadable bytes and the run never progressed. The bytes are consumed once
+/// with no outcomes; the next resume dispatches exactly one fresh bounded
+/// round; and a valid second report proceeds through grounded intake
+/// normally.
+#[test]
+fn an_unreadable_investigator_result_is_consumed_once_then_redispatched() {
+    let fixture = Fixture::new("unreadable-redispatch");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    fake_launcher(&fixture);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+
+    let malformed = malformed_report_payload(&locator);
+    seed_investigator_round(&fixture, 1, &malformed);
+
+    // The resume settles and consumes the unreadable bytes exactly once: the
+    // raw digest is recorded with no outcomes and no candidate is admitted.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert!(report["candidate"].is_null(), "{report}");
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(hash_bytes(&malformed)),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["intake"]["outcomes"].as_array().unwrap().len(),
+        0,
+        "{cursor}"
+    );
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1, "{cursor}");
+
+    // The next resume dispatches exactly one fresh bounded round instead of
+    // re-consuming the same bytes. The fixture launcher refuses the
+    // conversation before submission, so the re-dispatch is proven by the
+    // attempt record it wrote through the real dispatch path.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(hash_bytes(&malformed)),
+        "the consumed bytes are never re-read: {cursor}"
+    );
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "{cursor}");
+    assert_eq!(attempts[1]["id"], "investigator-2", "{cursor}");
+    assert_dispatched_conversation(&fixture, "investigator-2", AttemptRole::Investigator);
+
+    // A valid second report proceeds through grounded intake normally.
+    let valid = serde_json::to_vec_pretty(&anchored_report(&locator)).unwrap();
+    seed_investigator_round(&fixture, 2, &valid);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(report["candidate"]["hypothesis"], fixture.card, "{report}");
+    assert_eq!(
+        report["intake"]["outcomes"][0]["outcome"], "existing",
+        "{report}"
+    );
+    assert_eq!(
+        report["intake"]["result_sha256"],
+        json!(hash_bytes(&valid)),
+        "{report}"
+    );
+}
+
+/// Three consecutive unreadable investigator rounds consume the bounded retry
+/// budget: each round's bytes are consumed exactly once, below the bound the
+/// next resume re-dispatches one fresh round, and the third unreadable round
+/// records idle with the exact reason at the bound of three rounds.
+#[test]
+fn three_unreadable_investigator_rounds_end_idle_at_the_bound() {
+    let fixture = Fixture::new("unreadable-bound");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    fake_launcher(&fixture);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+
+    let mut digests = Vec::new();
+    for ordinal in 1..=3_u32 {
+        // Each round's terminal message differs, exactly as separate model
+        // rounds would: prose framing followed by the unreadable payload.
+        let malformed = [
+            format!("Investigator round {ordinal}.\n\n").into_bytes(),
+            malformed_report_payload(&locator),
+        ]
+        .concat();
+        let digest = hash_bytes(&malformed);
+        digests.push(digest.clone());
+        seed_investigator_round(&fixture, ordinal, &malformed);
+
+        // This resume settles and consumes the unreadable round exactly once.
+        let resume = fixture.resume();
+        assert!(resume.status.success(), "{}", text(&resume));
+        let cursor = fixture.cursor();
+        assert_eq!(cursor["intake"]["result_sha256"], json!(digest), "{cursor}");
+        assert_eq!(
+            cursor["intake"]["outcomes"].as_array().unwrap().len(),
+            0,
+            "{cursor}"
+        );
+        assert!(cursor["candidate"].is_null(), "{cursor}");
+
+        if ordinal < 3 {
+            // Below the bound the next resume re-dispatches exactly one fresh
+            // bounded round.
+            let resume = fixture.resume();
+            assert!(resume.status.success(), "{}", text(&resume));
+            let cursor = fixture.cursor();
+            let attempts = cursor["attempts"].as_array().unwrap();
+            assert_eq!(attempts.len(), ordinal as usize + 1, "{cursor}");
+            assert_eq!(
+                attempts[ordinal as usize]["id"],
+                format!("investigator-{}", ordinal + 1),
+                "{cursor}"
+            );
+        }
+    }
+
+    // The third unreadable round reached the bound: the run idles with the
+    // exact unreadable reason and dispatches no further investigator round.
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "idle", "{report}");
+    let condition = report["condition"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        condition.contains("not a bounded schema-1 investigator report"),
+        "{report}"
+    );
+    assert!(
+        condition.contains("bound of 3 investigator rounds"),
+        "{report}"
+    );
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "idle", "{report}");
+    assert_eq!(report["candidate"], Value::Null, "{report}");
+    assert_eq!(
+        report["condition"].as_str().unwrap_or_default(),
+        condition,
+        "the bounded idle reason stays recorded: {report}"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(digests[2]),
+        "{cursor}"
+    );
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 3, "{cursor}");
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt["id"] != "investigator-4"),
+        "the bound starts no fourth round: {cursor}"
+    );
+}
+
+/// A completed investigator round that retained no terminal result at all was
+/// refused on every resume without recording any identity, so the run could
+/// never move past it. The missing result is consumed once under the
+/// attempt's own recorded identity, and the next resume dispatches one fresh
+/// round.
+#[test]
+fn a_completed_investigator_without_a_retained_result_is_consumed_once() {
+    let fixture = Fixture::new("unretained-result");
+    let (root, _locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    fake_launcher(&fixture);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+
+    let receipt = fixture.run.join("investigator-receipt-1.json");
+    seed_bound_receipt(
+        &receipt,
+        "workflow-fixture-investigator-1",
+        "gen-1",
+        "completed",
+        Some(0),
+    );
+    replace_attempt(
+        &fixture,
+        attempt_json(
+            "investigator-1",
+            "investigator",
+            "workflow-fixture-investigator-1",
+            "gen-1",
+            &receipt,
+            None,
+            None,
+            "started",
+        ),
+    );
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let cursor = fixture.cursor();
+    let identity = cursor["intake"]["result_sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(identity.len(), 64, "{cursor}");
+    assert_eq!(
+        cursor["intake"]["outcomes"].as_array().unwrap().len(),
+        0,
+        "{cursor}"
+    );
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1, "{cursor}");
+
+    // The recorded identity settles the attempt, so the next resume
+    // re-dispatches one fresh round instead of re-refusing it forever.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(identity),
+        "{cursor}"
+    );
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "{cursor}");
+    assert_eq!(attempts[1]["id"], "investigator-2", "{cursor}");
 }
 
 /// The reproducing ordinary case: one long change name, seven explicit
