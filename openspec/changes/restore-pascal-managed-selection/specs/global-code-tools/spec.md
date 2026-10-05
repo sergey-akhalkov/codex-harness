@@ -69,16 +69,25 @@ Where Pascal/Delphi navigation is retained, it SHALL use the shared pasls
 installation that discovery verified - its `pasls.exe`, installer version
 record, and matching FPC compiler driver plus source tree - pinned explicitly
 for the session. Session startup SHALL NOT download, install or update the
-backend or its prerequisites; a missing, ambiguous or tampered installation
-SHALL leave the language unavailable and refuse affected projects before a
-worker starts. Free Pascal/CodeTools evidence SHALL NOT be reported as Delphi
-SDK support or clean Delphi compilation, and the user's Delphi project
-options, unit/include paths and SDK information SHALL NOT be rewritten.
+backend or its prerequisites, and it SHALL refuse an affected project before a
+worker starts when `pasls.exe` is absent, when the FPC driver/source pairing
+is missing or ambiguous, or when the installer version record is absent or not
+a stable dotted version. Discovery SHALL record SHA-256 fingerprints of the
+observed executables as observations and state that no independent upstream
+per-binary integrity guarantee is available; startup SHALL check that the
+recorded paths exist rather than assert arbitrary content integrity. Free
+Pascal/CodeTools evidence SHALL NOT be reported as Delphi SDK support or clean
+Delphi compilation, and the user's Delphi project options, unit/include paths
+and SDK information SHALL NOT be rewritten.
 
 #### Scenario: A Pascal project is served from the shared installation
 - **WHEN** a retained Pascal operation is exercised on representative legacy Pascal units with their declared compiler inputs
-- **THEN** evidence records the observed pasls version, prerequisite fingerprints and FPC/CodeTools limits, and verifies the promised cross-unit navigation through the managed session without provisioning
+- **THEN** evidence records the observed pasls version, the observed prerequisite fingerprints with their stated limits, and the FPC/CodeTools limits, and verifies the promised cross-unit navigation through the managed session without provisioning
 
-#### Scenario: Prerequisites are missing or tampered
-- **WHEN** `pasls.exe`, its installer version record, the FPC driver or the FPC source tree is missing, ambiguous or modified
+#### Scenario: Prerequisites are missing or ambiguous, or the version record is unusable
+- **WHEN** `pasls.exe` is absent, the FPC driver/source pairing is missing or ambiguous, or the installer version record is absent or not a stable dotted version
 - **THEN** the language is reported unavailable, affected projects are refused before a worker starts, and nothing is downloaded or substituted
+
+#### Scenario: An existing installation changes after discovery
+- **WHEN** an observed executable or prerequisite is modified while its recorded paths still exist
+- **THEN** startup checks only that the recorded paths exist and does not claim content integrity; the observed fingerprints remain the recorded identity

@@ -17,7 +17,8 @@ them to pasls as `PP`/`FPCDIR`.
   unique `prerequisites/<fpc>/bin/<target>/fpc.exe` with its sibling `source`
   directory. The record fingerprints both binaries, keeps `update_safe`
   false, and states that the version record is installer-written identity,
-  not a published per-binary hash.
+  not a published per-binary hash; the observed fingerprints have no
+  independent upstream integrity guarantee.
 - The generated `pascal` (with the `delphi` settings alias) launch setting
   pins `ls_base_cmd` to the verified pasls executable and adds `pp`/`fpcdir`;
   the worker environment prepends the pasls directory to `PATH`. Under
@@ -25,8 +26,10 @@ them to pasls as `PP`/`FPCDIR`.
   pin stays correct if a later Serena honors `ls_base_cmd` for this backend.
 - The catalogue row is `required: false` with a conditional note: absence is
   an accepted state (`conditional-absent` in planning) and nothing is
-  provisioned. A missing or tampered installation refuses affected projects
-  before a worker starts instead of falling back to provisioning.
+  provisioned. An absent executable, a missing or ambiguous FPC pairing, or an
+  absent or unusable version record refuses affected projects before a worker
+  starts instead of falling back to provisioning; startup checks that the
+  recorded paths exist and does not assert arbitrary content integrity.
 - Metadata planning supports the exact GitHub releases endpoint so
   `dependencies plan` and `apply --check` keep working; a newer upstream tag
   is reported, never applied by the shared installer.
@@ -34,8 +37,8 @@ them to pasls as `PP`/`FPCDIR`.
 ## Risks
 
 - A future Serena may rename the cache directory or change the pasls settings
-  contract: discovery and the launch settings fail closed (missing or
-  unverified) instead of provisioning, and the change is re-evaluated then.
+  contract: discovery and the launch settings fail closed (missing, ambiguous
+  or unusable) instead of provisioning, and the change is re-evaluated then.
 - Legacy CP1251 sources: the managed session is exercised with a project
   `encoding: cp1251` fixture; FPC/CodeTools navigation is partial and is not
   reported as Delphi compiler support or clean compilation.

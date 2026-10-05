@@ -74,11 +74,16 @@ its verified backend; BasedPyright registry updates are held
 (`held-backend-staging`) until the native dependency staging path lands, so
 ordinary upstream releases do not block installs. Pascal/Delphi is a
 reuse-only row: discovery adopts the existing shared pasls installation only
-when `pasls.exe`, its installer version record and the matching FPC driver and
-source tree are all present; a missing or tampered installation leaves Pascal
+when `pasls.exe`, a stable installer version record and a unique matching FPC
+driver plus source tree are all present; an absent `pasls.exe`, a missing or
+ambiguous FPC pairing, or an absent or unusable version record leaves Pascal
 projects refused instead of provisioning anything, and no session downloads or
-updates the backend. Retired candidates stay outside provisioning. Shared
-installations are not deleted. Native project checks remain available.
+updates the backend. Discovery records SHA-256 fingerprints of the observed
+executables as observations - there is no independent upstream per-binary
+integrity guarantee - and startup checks that the recorded paths exist rather
+than detecting arbitrary content changes. Retired candidates stay outside
+provisioning. Shared installations are not deleted. Native project checks
+remain available.
 
 Specialized controller or CNC source formats are not a managed language set.
 Extension presence does not prove a compatible language server.

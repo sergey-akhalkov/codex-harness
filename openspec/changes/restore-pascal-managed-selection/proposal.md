@@ -16,8 +16,10 @@ selection from the existing installation, without new downloads.
 - Discover the shared `PascalLanguageServer` cache layout (`pasls.exe`, the
   installer version record, and `prerequisites/<fpc>/bin/<target>/fpc.exe`
   with its sibling `source` tree) and adopt it only when every part is present
-  and unambiguous; missing, ambiguous or tampered parts leave the row
-  missing, broken or incomplete.
+  and unambiguous; an absent executable, a missing or ambiguous FPC pairing,
+  or an absent or unusable version record leaves the row missing, broken or
+  incomplete, with observed fingerprints and no independent upstream
+  per-binary integrity claim.
 - Generate the Pascal launch setting with the pinned pasls executable plus
   `pp`/`fpcdir` entries so pasls CodeTools uses the matching FPC driver and
   sources, and pin the adopted pasls directory ahead of `PATH` for Serena
@@ -26,10 +28,10 @@ selection from the existing installation, without new downloads.
 - Support the exact GitHub releases metadata endpoint in dependency planning
   so the reuse-only row keeps `dependencies plan` and `dependencies apply
   --check` working.
-- Cover adoption, missing and tampered cases in native tests, exercise a
-  managed MCP session on a synthetic CP1251/CRLF Pascal fixture, and keep
-  docs/specs coherent with explicit non-claims for Delphi SDK support and
-  clean compilation.
+- Cover adoption, absent or ambiguous prerequisite and invalid version-record
+  cases in native tests, exercise a managed MCP session on a synthetic
+  CP1251/CRLF Pascal fixture, and keep docs/specs coherent with explicit
+  non-claims for Delphi SDK support and clean compilation.
 - Verify the row through the supported registry/install lifecycle: the
   `install/update --code-tools-only` path must write a
   `harness/code-tools.json` whose adopted Pascal record feeds the worker
