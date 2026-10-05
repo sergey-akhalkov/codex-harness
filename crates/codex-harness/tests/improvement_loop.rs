@@ -3449,6 +3449,110 @@ fn continuous_activation_without_a_successor_idles_without_a_model_call() {
     );
 }
 
+/// A recorded idle is re-checked once per resume: the run declares an
+/// initially empty evidence root, the operator later populates it, and the
+/// following resume re-enters selection and dispatches the bounded
+/// investigator instead of repeating the idle note forever. No model call is
+/// made: the fixture's launcher is an owned file, so the dispatch stops at the
+/// recorded attempt and never opens a visible conversation.
+#[test]
+fn an_idle_run_reenters_selection_when_its_evidence_root_is_populated() {
+    let fixture = Fixture::new("idle-recheck");
+    let evidence = fixture.root.join("evidence-idle-recheck");
+    fs::create_dir_all(&evidence).unwrap();
+    fs::write(
+        fixture.home.join("config.toml"),
+        "[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let launcher = fixture.home.join("harness/bin/codex.exe");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    fs::write(&launcher, "fixture launcher").unwrap();
+    fixture.write_spec(
+        &[
+            ("evidence_root", json!(evidence.display().to_string())),
+            (
+                "runner",
+                json!({
+                    "profile": "ds",
+                    "model": "deepseek-flash",
+                    "model_provider": "deepseek",
+                    "reasoning_effort": "max",
+                }),
+            ),
+        ],
+        None,
+    );
+
+    // The declared evidence root is empty: the start records idle and
+    // dispatches nothing.
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["phase"], "idle", "{cursor}");
+    assert!(
+        cursor["attempts"].as_array().unwrap().is_empty(),
+        "{cursor}"
+    );
+
+    // Resume re-checks selection; unchanged empty evidence grounds no work.
+    let empty = fixture.resume();
+    assert!(empty.status.success(), "{}", text(&empty));
+    assert!(
+        text(&empty).contains("no retained evidence is available"),
+        "the resume re-enters selection instead of returning at the recorded phase: {}",
+        text(&empty)
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["phase"], "idle", "{cursor}");
+    assert!(
+        cursor["attempts"].as_array().unwrap().is_empty(),
+        "{cursor}"
+    );
+
+    // The operator populates the declared evidence root; the next resume
+    // dispatches the bounded investigator from the new evidence.
+    fs::write(
+        evidence.join("observation.md"),
+        "retained observation: the synthetic probe repeated its context load 12 times\n",
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let cursor = fixture.cursor();
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{cursor}");
+    assert_eq!(attempts[0]["id"], "investigator-1", "{cursor}");
+    assert_eq!(attempts[0]["role"], "investigator", "{cursor}");
+    assert!(
+        fixture
+            .run
+            .join("assignments")
+            .join("investigator-1.json")
+            .is_file(),
+        "the dispatch recorded its bounded assignment"
+    );
+    let prepared = cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|effect| effect["kind"] == "dispatch-prepared")
+        .count();
+    assert_eq!(
+        prepared, 1,
+        "the new evidence prepared exactly one dispatch: {cursor}"
+    );
+
+    // Without fresh evidence the further resume dispatches nothing.
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        1,
+        "no second model round is started from unchanged evidence"
+    );
+}
+
 /// The supported transition after adoption: A's experiment was decided and
 /// the resulting baseline advanced; the independently specified successor
 /// investigates this run's evaluated workload B on its own declared workload

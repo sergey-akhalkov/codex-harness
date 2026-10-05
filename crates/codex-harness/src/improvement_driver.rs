@@ -557,15 +557,25 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
             Phase::Idle => {
                 if continuation_expected(run) {
                     finish_continuation(run, &mut notes)?;
-                } else {
+                    // A stop requested during the continuation is consumed here,
+                    // so it does not linger after the controller leaves.
+                    should_leave(run, &mut notes)?;
+                    return Ok(notes);
+                }
+                if idle_spins > 0 {
+                    // The one selection re-check from Idle for this invocation
+                    // already ran and grounded no new work.
                     notes.push(
                         "controller: idle; no model work is started only to stay busy".to_owned(),
                     );
+                    should_leave(run, &mut notes)?;
+                    return Ok(notes);
                 }
-                // A stop requested during the continuation is consumed here,
-                // so it does not linger after the controller leaves.
-                should_leave(run, &mut notes)?;
-                return Ok(notes);
+                // One advance pass per drive invocation re-enters selection so
+                // evidence declared or populated since the recorded idle state
+                // can dispatch the investigator; a pass over unchanged evidence
+                // leaves the idle note in place below instead of spinning.
+                idle_spins = 1;
             }
             Phase::ActivationConfirmed => {
                 finish_continuation(run, &mut notes)?;
@@ -614,6 +624,22 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
             return Ok(notes);
         }
         if matches!(run.cursor.phase, Phase::Idle | Phase::ActivationConfirmed) {
+            if run.cursor.phase == Phase::Idle {
+                if in_flight_id(&run.cursor).is_some() {
+                    // The Idle re-check dispatched its conversation: keep
+                    // supervising it like any other pass instead of leaving
+                    // while the attempt is in flight.
+                    idle_spins = 0;
+                    continue;
+                }
+                if idle_spins > 0 && !continuation_expected(run) {
+                    // Still Idle after the re-check: the retained evidence
+                    // grounded no new work, so the idle note stays truthful.
+                    notes.push(
+                        "controller: idle; no model work is started only to stay busy".to_owned(),
+                    );
+                }
+            }
             if continuation_expected(run) {
                 finish_continuation(run, &mut notes)?;
             }
