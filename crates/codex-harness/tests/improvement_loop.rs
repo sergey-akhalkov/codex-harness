@@ -3553,6 +3553,499 @@ fn an_idle_run_reenters_selection_when_its_evidence_root_is_populated() {
     );
 }
 
+/// A recorded block is re-checked once per resume: the run blocks on an
+/// unreadable qualification record before any measured preparation, and a
+/// resume after the operator replaced the record with a qualified one
+/// re-enters the suspended comparison phase, prepares the measured pair and
+/// records the first measured dispatch instead of returning at the recorded
+/// phase forever. A resume while the record is still unreadable records no
+/// attempt and keeps the blocked condition.
+#[test]
+fn a_blocked_run_rechecks_a_replaced_qualification_record() {
+    /// One synthetic OpenSpec change with the measurement section the
+    /// hypothesis's own change must state.
+    fn change(project: &Path, name: &str, group: &str, scenario: &str) {
+        let dir = project.join("openspec/changes").join(name);
+        fs::create_dir_all(dir.join("specs").join(group)).unwrap();
+        fs::write(
+            dir.join("proposal.md"),
+            format!(
+                "## Why\n\n{scenario}.\n\n## Measurement\n\nObserved problem: the {scenario} flow \
+                 repeats measurable work. Investigation scope: one frozen workload revision on this \
+                 fixture. Measurement question: how much accepted time does the repeated work cost? \
+                 Workload: the existing comparison operation linked from this change. Evidence: the \
+                 retained outcome record. Limits: one local fixture and one frozen revision.\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("design.md"),
+            format!("## Context\n\n{scenario}.\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tasks.md"),
+            format!("## 1. Work\n\n- [ ] 1.1 Do the {scenario} thing.\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("specs").join(group).join("spec.md"),
+            format!(
+                "## ADDED Requirements\n\n### Requirement: {scenario} behavior\n\nThe system SHALL do \
+                 the {scenario} thing.\n\n#### Scenario: {scenario}\n\n- **WHEN** the probe runs\n- \
+                 **THEN** it reports success\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// One published immutable fixture build inside the owned state.
+    fn build(state: &Path, name: &str, source: &Path, launcher: &Path, marker: &str) -> PathBuf {
+        let directory = state.join("builds").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        let mut binaries = BTreeMap::new();
+        for binary in BINARIES {
+            let bytes = if *binary == "codex.exe" {
+                fs::read(launcher).unwrap()
+            } else {
+                format!("{binary} fixture {marker}\n").into_bytes()
+            };
+            fs::write(directory.join(binary), &bytes).unwrap();
+            binaries.insert((*binary).to_owned(), build_identity::hash_bytes(&bytes));
+        }
+        let record = build_identity::BuildRecord {
+            schema: build_identity::SCHEMA,
+            source_root: source.to_path_buf(),
+            source: build_identity::source_identity(source).unwrap(),
+            rustc: "fixture".into(),
+            cargo: "fixture".into(),
+            target: "x86_64-pc-windows-msvc".into(),
+            profile: "release".into(),
+            binaries,
+        };
+        fs::write(
+            directory.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        directory
+    }
+
+    let fixture = Fixture::new("blocked-recheck");
+    // Ownership-neutral line endings so the frozen baseline worktree records
+    // the same source identity as the working tree the build was published
+    // from.
+    git(&fixture.proj, &["config", "core.autocrlf", "false"]);
+    // The hypothesis's own change must state the measurement scope, and the
+    // prepared arm installation consumes the kit metadata; both belong to the
+    // committed base the comparison is frozen against.
+    let proposal = fixture
+        .proj
+        .join("openspec/changes/add-synthetic/proposal.md");
+    let mut content = fs::read_to_string(&proposal).unwrap();
+    content.push_str(
+        "\n## Measurement\n\nObserved problem: identical repeated reads waste accepted-task time. \
+         Investigation scope: reads at one frozen source revision. Measurement question: how much \
+         accepted-task time do they cost? Workload: the existing cargo build operation linked from \
+         this change. Evidence: the retained outcome record. Limits: one local machine and one \
+         frozen source revision.\n",
+    );
+    fs::write(&proposal, content).unwrap();
+    fs::write(
+        fixture.proj.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(fixture.proj.join("Cargo.lock"), "# fixture lock\n").unwrap();
+    for directory in ["global/agents", ".agents/skills/arm-skill"] {
+        fs::create_dir_all(fixture.proj.join(directory)).unwrap();
+    }
+    fs::write(fixture.proj.join("global/agents/.gitkeep"), "\n").unwrap();
+    fs::write(
+        fixture.proj.join("global/kit.json"),
+        serde_json::to_vec(&json!({
+            "schema": 1,
+            "profile_name": "harness",
+            "profile": "global/harness.config.toml",
+            "instructions": "global/principles-of-work.md",
+            "skills": ".agents/skills",
+            "agents": "global/agents",
+            "hooks": "global/hooks.json",
+            "token_hooks": "global/rtk-hooks.json",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.proj.join("global/harness.config.toml"),
+        "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[features]\ncode_mode = true\napps = false\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.proj.join("global/principles-of-work.md"),
+        "# Principles\nfixture arm instructions\n",
+    )
+    .unwrap();
+    fs::write(fixture.proj.join("global/hooks.json"), "{}\n").unwrap();
+    fs::write(fixture.proj.join("global/rtk-hooks.json"), "{}\n").unwrap();
+    fs::write(
+        fixture.proj.join(".agents/skills/arm-skill/SKILL.md"),
+        "---\nname: arm-skill\ndescription: Fixture skill.\n---\n\nfixture skill body\n",
+    )
+    .unwrap();
+    git(&fixture.proj, &["add", "."]);
+    git(
+        &fixture.proj,
+        &["commit", "-qm", "measurement scope and kit metadata"],
+    );
+
+    // The frozen workload project: its own committed OpenSpec change and the
+    // work item the measured conversations transform.
+    let workload = fixture.root.join("workload-blocked-recheck");
+    fs::create_dir_all(&workload).unwrap();
+    git(
+        &fixture.root,
+        &[
+            "init",
+            "-q",
+            "--initial-branch=main",
+            workload.to_str().unwrap(),
+        ],
+    );
+    git(&workload, &["config", "user.email", "fixture@example.test"]);
+    git(&workload, &["config", "user.name", "Fixture"]);
+    git(&workload, &["config", "core.autocrlf", "false"]);
+    let init = openspec(
+        &workload,
+        &["init", "--tools", "none", "--no-animation", "--force"],
+    );
+    assert!(
+        init.status.success(),
+        "workload openspec init: {}",
+        text(&init)
+    );
+    let created = openspec(
+        &workload,
+        &[
+            "new",
+            "change",
+            "add-workload",
+            "--schema",
+            "spec-driven",
+            "--json",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "workload openspec new: {}",
+        text(&created)
+    );
+    change(&workload, "add-workload", "workload", "Workload case");
+    fs::write(workload.join("solution.txt"), "todo\n").unwrap();
+    fs::write(workload.join("sleep_ms"), "0\n").unwrap();
+    git(&workload, &["add", "."]);
+    git(&workload, &["commit", "-qm", "frozen workload snapshot"]);
+    let workload_revision = git_output(&workload, &["rev-parse", "HEAD"]);
+
+    // Workload B's own admitted card on the same board.
+    let admitted = fixture.feedback(&[
+        "hypothesis-admit",
+        "--mechanism",
+        "frozen-workload",
+        "--conditions",
+        "frozen-task-snapshot",
+        "--observation",
+        "workload:fixture",
+        "--predicted",
+        "the workload is solved within the declared conditions",
+        "--counterexample",
+        "the task snapshot changed between arms",
+        "--acceptance",
+        "the frozen checker program passes",
+        "--spec",
+        "openspec/changes/add-workload",
+        "--basis",
+        "workload-basis-1",
+    ]);
+    assert!(
+        admitted.status.success(),
+        "workload admit: {}",
+        text(&admitted)
+    );
+    let printed = text(&admitted);
+    let workload_card = printed
+        .strip_prefix("hypothesis ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !workload_card.is_empty(),
+        "workload admission named no card: {printed}"
+    );
+
+    // The owned native state with the two prepared builds and the ready
+    // candidate checkout the measured pair is frozen against.
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds")).unwrap();
+    fs::write(state.join("owner"), "codex-harness-native-state-v1\n").unwrap();
+    fs::write(
+        fixture.home.join("config.toml"),
+        "[profiles.ds]\nmodel = 'fixture-glyph-1'\nmodel_provider = 'local'\nmodel_reasoning_effort = 'low'\n",
+    )
+    .unwrap();
+    let launcher = blocked_programs().launcher.clone();
+    let upstream = blocked_programs().upstream.clone();
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let worktree = fixture.root.join("candidate-worktree");
+    let branch = format!("improve/blocked-recheck/{}", fixture.card);
+    let mut checkout = harness_core::task_worktree::allocate_candidate_checkout(
+        &fixture.proj,
+        &worktree,
+        &branch,
+        &base,
+    )
+    .unwrap();
+    fs::write(
+        checkout.path.join("crates/one/src/lib.rs"),
+        "// candidate implementation\n",
+    )
+    .unwrap();
+    git(&checkout.path, &["add", "."]);
+    git(
+        &checkout.path,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "candidate implementation",
+        ],
+    );
+    checkout.revision = git_output(&checkout.path, &["rev-parse", "HEAD"]);
+    build(&state, "h-build", &fixture.proj, &launcher, "baseline");
+    build(&state, "ha-build", &checkout.path, &launcher, "candidate");
+
+    // The frozen acceptance request the measured pair is checked against.
+    let contract = fixture.root.join("task-contract.txt");
+    fs::write(&contract, "the workload acceptance contract\n").unwrap();
+    let checker = blocked_programs().checker.clone();
+    let contract_sha = hash_bytes(&fs::read(&contract).unwrap());
+    let request = fixture.root.join("acceptance-request.json");
+    fs::write(
+        &request,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "kind": "real-task",
+            "case_root": fixture.root.join("task-workspace"),
+            "task_contract_sha256": contract_sha,
+            "oracle": {
+                "program": checker,
+                "program_sha256": hash_bytes(&fs::read(&checker).unwrap()),
+                "arguments": ["{workspace}"],
+                "inputs": {
+                    contract.to_string_lossy().into_owned(): contract_sha,
+                },
+            },
+            "timeout_seconds": 120,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let policy = fixture.root.join("policy.json");
+    fs::write(
+        &policy,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "objective": "time",
+            "basis": "efficiency",
+            "meaningfulEffectPercent": 10.0,
+            "tolerancePercent": 5.0,
+            "requireAcceptance": true,
+            "taskMix": "one frozen workload case",
+            "stopping": {"maxAttemptsPerArm": 1, "requiredUnits": 1},
+            "repeatedSelection": "predeclared",
+            "tradeOff": Value::Null,
+            "uncertainty": "unknown evidence stays inconclusive",
+            "horizonTasks": 1.0,
+            "overhead": {
+                "implementationSeconds": 0.0,
+                "evaluationSeconds": 0.0,
+                "maintenanceSecondsPerTask": 0.0,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // The declared qualification record starts unreadable: the measured arms
+    // must not begin preparation until the operator supplies a real record.
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+
+    fixture.write_spec(
+        &[
+            (
+                "runner",
+                json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+            ),
+            (
+                "local_runner",
+                json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+            ),
+            ("qualification", json!(qualification)),
+            (
+                "comparison",
+                json!({
+                    "schema": 1,
+                    "specification": {
+                        "project": workload,
+                        "change": "add-workload",
+                        "store": Value::Null,
+                        "planning_root": workload,
+                    },
+                    "contract": {
+                        "acceptance_artifact": "specs/workload/spec.md",
+                        "acceptance_heading": "#### Scenario: Workload case",
+                        "mechanism": "frozen-workload",
+                        "counterexample": "the workload is changed between arms",
+                        "applicability": "the frozen task snapshot",
+                        "independent_acceptance": "the frozen checker program executes",
+                        "meaningful_effect": "less time through acceptance",
+                        "operating_conditions": "one predeclared pair",
+                        "comparison_policy": "matched pairs",
+                        "stopping_rule": "one predeclared pair",
+                    },
+                    "workload_card": workload_card,
+                    "task": {
+                        "source": workload,
+                        "revision": workload_revision,
+                        "name": "workload-b",
+                        "writable_scope": ["solution.txt", "sleep_ms"],
+                    },
+                    "runtimes": {
+                        "state": state,
+                        "baseline_build": state.join("builds/h-build"),
+                        "candidate_build": state.join("builds/ha-build"),
+                        "baseline_label": "H",
+                        "candidate_label": "H+A",
+                        "upstream": upstream,
+                        "client": {
+                            "runner": {"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}},
+                            "reasoningEffort": "low",
+                        },
+                    },
+                    "policy": policy,
+                    "acceptance": {"request": request, "request_sha256": request_sha},
+                    "observation_inputs": [],
+                }),
+            ),
+        ],
+        None,
+    );
+    fs::create_dir_all(&fixture.run).unwrap();
+    fs::write(
+        fixture.run.join("measurement-scope.json"),
+        serde_json::to_vec_pretty(&measurement_scope_json()).unwrap(),
+    )
+    .unwrap();
+
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "worktree": serde_json::to_value(&checkout).unwrap(),
+        "revision": checkout.revision,
+    });
+    fixture.write_cursor(&cursor);
+
+    // The unreadable qualification record blocks the measured arms before any
+    // model work; the directed-measurement gate is already satisfied by the
+    // declared scope and the change's own section.
+    let blocked = fixture.resume();
+    let output = text(&blocked);
+    assert!(blocked.status.success(), "{output}");
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "blocked", "{status}\n{output}");
+    let condition = status["condition"].as_str().unwrap_or_default();
+    assert!(
+        condition.contains("local qualification blocks dependent model dispatch")
+            && condition.contains("unreadable"),
+        "{status}\n{output}"
+    );
+    assert!(
+        fixture.cursor()["attempts"].as_array().unwrap().is_empty(),
+        "no model work begins while the record is unreadable"
+    );
+
+    // The condition is still present: the re-check records no attempt and
+    // keeps the exact blocked condition.
+    let again = fixture.resume();
+    let output = text(&again);
+    assert!(again.status.success(), "{output}");
+    let status = status_value(&fixture);
+    assert_eq!(status["phase"], "blocked", "{status}\n{output}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("local qualification blocks dependent model dispatch"),
+        "{status}\n{output}"
+    );
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+
+    // The operator replaces the record with a qualified one. The next resume
+    // re-checks the recorded block once, re-enters the suspended comparison
+    // phase, prepares the measured pair and records the first measured
+    // dispatch; the fixture launcher cannot execute a conversation, so the
+    // dispatch stops at the recorded attempt.
+    fs::write(
+        &qualification,
+        serde_json::to_vec_pretty(&json!({
+            "status": "qualified",
+            "policy": {"repeats": 2, "required_outputs": ["solution.txt"], "ignored_metadata": []},
+            "missing_identity": [],
+            "unfinished_attempts": [],
+            "unverified_attempts": [],
+            "tool_exchange_missing": [],
+            "runner_mismatch": [],
+            "missing_outputs": [],
+            "divergent_outputs": [],
+            "observed_repeats": 2,
+            "required_repeats": 2,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    assert!(
+        output.contains("comparison prepared"),
+        "the resolved condition prepared the measured pair: {output}"
+    );
+    let cursor = fixture.cursor();
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "the resolved block re-entered preparation and recorded exactly one measured dispatch: {cursor}\n{output}"
+    );
+    assert_eq!(attempts[0]["role"], "baseline", "{cursor}\n{output}");
+    assert_eq!(attempts[0]["state"], "failed", "{cursor}\n{output}");
+    assert!(
+        fixture.run.join("comparison/bindings.json").is_file(),
+        "the resolved condition ran the measured preparation: {cursor}\n{output}"
+    );
+}
+
 /// The supported transition after adoption: A's experiment was decided and
 /// the resulting baseline advanced; the independently specified successor
 /// investigates this run's evaluated workload B on its own declared workload
@@ -7286,4 +7779,236 @@ fn installed_removal_gates_and_restoration_outside_checkout() {
     eprintln!(
         "installed removal-gate exercise complete: refusal preserved, experiment-only consent left the live installation intact, covered publication removed only {DISPOSABLE_SKILL}, restoration returned it, and stale receipts authorized nothing"
     );
+}
+
+/// Compiled model-free fixture programs for the blocked-recheck regression:
+/// the original-client stand-in the arm installation exercises, the launcher
+/// that refuses a visible conversation before submission, and the frozen
+/// acceptance checker./// owner's runtime check and the arm configuration exercise it.
+const UPSTREAM_SOURCE: &str = r##"
+use std::{env, fs, path::PathBuf, process::exit};
+
+fn home() -> PathBuf {
+    PathBuf::from(env::var_os("CODEX_HOME").expect("CODEX_HOME"))
+}
+
+// The native frontend the host attaches is `codex --remote ... resume THREAD`.
+// A real TUI replaces its own console caption with `{title} | ` once the named
+// thread is loaded; this double does exactly that and then stays alive until
+// the owning host ends it.
+unsafe extern "system" {
+    fn GetConsoleTitleW(lp_console_title: *mut u16, n_size: u32) -> u32;
+    fn SetConsoleTitleW(lp_console_title: *const u16) -> u32;
+}
+
+fn frontend(caption_source: &str) -> ! {
+    let mut buffer = [0u16; 1024];
+    let count = unsafe { GetConsoleTitleW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    let mut title = String::from_utf16_lossy(&buffer[..count as usize]);
+    if title.is_empty() {
+        title = caption_source.to_owned();
+    }
+    let caption = format!("{title} | ");
+    let mut wide: Vec<u16> = caption.encode_utf16().collect();
+    wide.push(0);
+    unsafe { SetConsoleTitleW(wide.as_ptr()) };
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn set_feature(text: &mut String, name: &str, enabled: bool) {
+    let mut replaced = String::new();
+    let mut in_features = false;
+    let mut seen_features = false;
+    let mut done = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            if in_features && !done {
+                replaced.push_str(&format!("{name} = {enabled}\n"));
+                done = true;
+            }
+            in_features = trimmed == "[features]";
+            seen_features |= in_features;
+        }
+        if in_features && !done && trimmed.starts_with(name) && line.contains('=') {
+            replaced.push_str(&format!("{name} = {enabled}\n"));
+            done = true;
+            continue;
+        }
+        replaced.push_str(line);
+        replaced.push('\n');
+    }
+    if in_features && !done {
+        replaced.push_str(&format!("{name} = {enabled}\n"));
+        done = true;
+    }
+    *text = if done {
+        replaced
+    } else if seen_features {
+        format!("{replaced}{name} = {enabled}\n")
+    } else {
+        format!("{replaced}\n[features]\n{name} = {enabled}\n")
+    };
+}
+
+fn feature_state(text: &str, name: &str) -> bool {
+    text.lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with(name) && line.contains('='))
+        .and_then(|line| line.split('=').nth(1))
+        .map(|value| value.trim() == "true")
+        .unwrap_or(false)
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--remote") {
+        frontend(env::args().next().as_deref().unwrap_or("codex"));
+    }
+    match args.first().map(String::as_str) {
+        Some("--version") => println!("codex-cli 0.160.0"),
+        Some("--help") => println!(
+            "Codex CLI\n\nUsage: codex [OPTIONS]\n      --profile <PROFILE>  Configuration profile from config.toml\n      Select <name>.config.toml with --profile.\n"
+        ),
+        Some("features") => {
+            let config = home().join("config.toml");
+            let mut text = fs::read_to_string(&config).unwrap_or_default();
+            match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+                (Some("disable"), Some(name @ ("hooks" | "code_mode"))) => {
+                    set_feature(&mut text, name, false);
+                    fs::write(&config, text).unwrap();
+                }
+                (Some("enable"), Some(name @ ("hooks" | "code_mode"))) => {
+                    set_feature(&mut text, name, true);
+                    fs::write(&config, text).unwrap();
+                }
+                (Some("list"), _) => {
+                    println!("hooks stable {}", feature_state(&text, "hooks"));
+                    println!("code_mode experimental {}", feature_state(&text, "code_mode"));
+                }
+                _ => exit(2),
+            }
+        }
+        _ => exit(2),
+    }
+}
+"##;
+
+/// Model-free stand-in for the installed launcher of an arm. It answers the
+/// installation owner's prompt diagnostic (installed instructions plus the
+/// shared permission defaults) but deliberately does not expose the
+/// executor-shell prompt contract, so the visible dispatch owner refuses the
+/// arm before submission and no console, tab or model request is created. The
+/// checks seed the conversation receipts instead; real launcher execution is
+/// parent acceptance.
+const LAUNCHER_SOURCE: &str = r##"
+use std::{env, fs, path::PathBuf, process::exit};
+
+fn escape(text: &str) -> String {
+    let mut out = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if (other as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", other as u32)),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) != Some("debug")
+        || args.get(1).map(String::as_str) != Some("prompt-input")
+    {
+        exit(2);
+    }
+    let home = PathBuf::from(env::var_os("CODEX_HOME").expect("CODEX_HOME"));
+    let instructions = fs::read_to_string(home.join("AGENTS.md")).expect("installed instructions");
+    let permissions = "Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`: No filesystem sandboxing - all commands are permitted.\nApproval policy is currently never.";
+    println!(
+        "[{{\"role\":\"developer\",\"content\":[{{\"type\":\"input_text\",\"text\":{}}},{{\"type\":\"input_text\",\"text\":{}}}]}}]",
+        escape(&instructions),
+        escape(permissions)
+    );
+}
+"##;
+
+/// The frozen independent acceptance checker: it sleeps for the work item's
+/// declared duration and accepts only a solved workspace.
+const CHECKER_SOURCE: &str = r##"
+use std::{env, fs, path::PathBuf, process::exit, thread, time::Duration};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let root = PathBuf::from(args.first().cloned().unwrap_or_default());
+    let sleep: u64 = fs::read_to_string(root.join("sleep_ms"))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    if sleep > 0 {
+        thread::sleep(Duration::from_millis(sleep));
+    }
+    let text = fs::read_to_string(root.join("solution.txt")).unwrap_or_default();
+    if text.trim() == "solved" {
+        exit(0);
+    }
+    exit(1);
+}
+"##;
+
+struct BlockedPrograms {
+    _root: tempfile::TempDir,
+    upstream: PathBuf,
+    launcher: PathBuf,
+    checker: PathBuf,
+}
+
+fn blocked_programs() -> &'static BlockedPrograms {
+    static PROGRAMS: std::sync::OnceLock<BlockedPrograms> = std::sync::OnceLock::new();
+    PROGRAMS.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("improvement-loop-blocked-fixtures-")
+            .tempdir()
+            .unwrap();
+        let upstream = compile_fixture(root.path(), "upstream", UPSTREAM_SOURCE);
+        let launcher = compile_fixture(root.path(), "launcher", LAUNCHER_SOURCE);
+        let checker = compile_fixture(root.path(), "checker", CHECKER_SOURCE);
+        BlockedPrograms {
+            _root: root,
+            upstream,
+            launcher,
+            checker,
+        }
+    })
+}
+
+fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {
+    let source_path = root.join(format!("{name}.rs"));
+    fs::write(&source_path, source).unwrap();
+    let located = Command::new("where.exe").arg("rustc.exe").output().unwrap();
+    assert!(located.status.success(), "rustc is required for fixtures");
+    let located = String::from_utf8(located.stdout).unwrap();
+    let rustc = located.lines().next().unwrap();
+    let executable = root.join(format!("{name}.exe"));
+    let output = Command::new(rustc)
+        .arg(&source_path)
+        .arg("--edition=2024")
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    executable
 }

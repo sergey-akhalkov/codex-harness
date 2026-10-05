@@ -535,6 +535,7 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
             .to_owned(),
     );
     let mut idle_spins = 0u32;
+    let mut blocked_spins = 0u32;
     loop {
         if should_leave(run, &mut notes)? {
             notes.push("controller: stop or ownership change; no further dispatch".to_owned());
@@ -583,11 +584,24 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
                 return Ok(notes);
             }
             Phase::Blocked => {
-                notes.push(
-                    "controller: blocked; the recorded condition must change before another dispatch"
-                        .to_owned(),
-                );
-                return Ok(notes);
+                if blocked_spins > 0 {
+                    // The one transition re-check from Blocked for this
+                    // invocation already ran and the recorded condition still
+                    // holds.
+                    notes.push(
+                        "controller: blocked; the recorded condition must change before another dispatch"
+                            .to_owned(),
+                    );
+                    should_leave(run, &mut notes)?;
+                    return Ok(notes);
+                }
+                // One advance pass per drive invocation re-enters the phase the
+                // recorded condition suspended, so a condition resolved since
+                // the record can proceed; a pass over an unchanged condition
+                // records the same block again and returns below with the
+                // blocked note instead of spinning.
+                blocked_spins = 1;
+                run.cursor.clear_blocked();
             }
             _ => {}
         }
@@ -647,6 +661,23 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
             return Ok(notes);
         }
         if matches!(run.cursor.phase, Phase::Blocked | Phase::Stopped) {
+            if run.cursor.phase == Phase::Blocked {
+                if in_flight_id(&run.cursor).is_some() {
+                    // The Blocked re-check dispatched its attempt: keep
+                    // supervising it like any other pass instead of leaving
+                    // while the attempt is in flight.
+                    blocked_spins = 0;
+                    continue;
+                }
+                if blocked_spins > 0 {
+                    // Still Blocked after the re-check: the recorded condition
+                    // still holds, so the blocked note stays truthful.
+                    notes.push(
+                        "controller: blocked; the recorded condition must change before another dispatch"
+                            .to_owned(),
+                    );
+                }
+            }
             return Ok(notes);
         }
         if in_flight_id(&run.cursor).is_some() {
