@@ -83,6 +83,12 @@ pub const LOCAL_PROVIDER: &str = "local";
 
 const CONFIG_LIMIT: usize = 1024 * 1024;
 const FILE_LIMIT: u64 = 4 * 1024 * 1024;
+/// The linked native commands installed into every arm home (the launcher and
+/// its sibling binaries) are self-contained executables that legitimately
+/// reach tens of megabytes, so the installed-file digests carry their own
+/// bound instead of the shared small-file limit, matching the installed
+/// component bound.
+const INSTALLED_FILE_LIMIT: u64 = 128 * 1024 * 1024;
 /// The upstream Codex client is a single self-contained native executable
 /// that today reaches hundreds of megabytes; it carries its own bound instead
 /// of the shared small-file limit, and hashing one at this bound stays
@@ -1505,7 +1511,7 @@ fn checked_link(destination: &Path, source: &Path, directory: bool) -> io::Resul
 
 fn file_link(name: &str, destination: &Path, source: &Path) -> io::Result<InstalledLink> {
     let source = checked_link(destination, source, false)?;
-    let sha256 = hash_file("an installed source file", &source, FILE_LIMIT)?;
+    let sha256 = hash_file("an installed source file", &source, INSTALLED_FILE_LIMIT)?;
     Ok(InstalledLink {
         name: name.to_owned(),
         destination: plain(destination)?,
@@ -2399,7 +2405,7 @@ fn normalize_trust_workspace(path: &str) -> String {
 
 fn file_link_unchanged(link: &InstalledLink) -> io::Result<()> {
     let source = checked_link(&link.destination, &link.source, false)?;
-    let sha256 = hash_file("an installed source file", &source, FILE_LIMIT)?;
+    let sha256 = hash_file("an installed source file", &source, INSTALLED_FILE_LIMIT)?;
     if sha256 != link.sha256 {
         return Err(invalid(format!(
             "the installed {} content changed since preparation",
@@ -2589,6 +2595,44 @@ mod tests {
             &[PrivateInput {
                 source: source.clone(),
                 destination: "notes.txt".to_owned(),
+            }],
+        )
+        .err()
+        .expect("a private input over the shared bound must refuse");
+        assert!(
+            error.to_string().contains("exceeds its size bound"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// The dedicated installed-file bound admits an installed linked native
+    /// command larger than the shared small-file bound at both the link digest
+    /// and its retained re-verification, while the same size stays refused for
+    /// private runner inputs.
+    #[test]
+    fn installed_link_bound_admits_large_command_while_private_inputs_refuse() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let size = FILE_LIMIT as usize + 1024 * 1024;
+        let source = scratch.path().join("codex-harness.exe");
+        fs::write(&source, vec![0x5a; size]).expect("oversize command file");
+
+        let bin = scratch.path().join("bin");
+        fs::create_dir(&bin).expect("installed bin directory");
+        let destination = bin.join("codex-harness.exe");
+        std::os::windows::fs::symlink_file(&source, &destination).expect("installed command link");
+
+        let link = file_link("codex-harness", &destination, &source)
+            .expect("an oversize installed command must be admitted");
+        assert_eq!(link.sha256.len(), 64);
+        file_link_unchanged(&link).expect("the retained re-check admits the same command");
+
+        let home = scratch.path().join("home");
+        fs::create_dir(&home).expect("arm home");
+        let error = validate_private_inputs(
+            &home,
+            &[PrivateInput {
+                source: source.clone(),
+                destination: "notes.bin".to_owned(),
             }],
         )
         .err()
