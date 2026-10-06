@@ -193,15 +193,22 @@ supported approach when a mechanism has material drawbacks. Routine technical
 choices use existing authorization; material changes to the outcome or explicit
 constraints require agreement.
 
-Invest proportionate effort in a simple complete solution and justify complexity
-by comparison across understanding, verification, operation and change. Preserve
-required quality and performance. Reassess burdensome designs on evidence; keep
-useful verified lessons in their owning records. Requests for proof normally use
-native automated checks and reproducible observations, with legitimate fixtures,
-diagnostics, audit and recovery data preserved. The [portable principles](../global/principles-of-work.md#simplicity-and-reuse)
-own the policy; [the accepted change](../openspec/changes/archive/2026-09-12-prefer-simple-effective-solutions/proposal.md)
-owns its bounded adoption checks. No new skill, report protocol or recurring
-review ritual is required.
+**2026-10-05, confirmed (user decision):** Occam's razor and DRY govern solution
+selection throughout the pack. Audit simplification first; examine project and
+external foundations for direct reuse, adaptation and targeted refactoring before
+new implementation. A missing interface does not rule out reuse: extract shared
+logic for actual consumers and migrate affected callers, preserving required
+behavior and removing superseded duplication. Implement only the justified gap.
+
+Judge total lifecycle complexity and preserve required quality and performance;
+do not force an unsuitable dependency or speculative abstraction. Bound research
+by consequential uncertainty, retain sources and specific mismatches in existing
+owners, and keep predicted benefits distinct from observations. Requests for
+proof use native checks and reproducible observations, preserving legitimate
+fixtures, diagnostics, audit and recovery data. The [portable principles](../global/principles-of-work.md#simplicity-and-reuse)
+own the policy and the [working-principles specification](../openspec/specs/global-working-principles/spec.md#requirement-research-precedes-substantive-design-and-implementation)
+owns its scenarios. No new skill, report protocol or recurring review ritual is
+required.
 
 ## Official Codex CLI
 
