@@ -10,9 +10,11 @@
 //! untracked files while keeping ignored build caches) and records the slot
 //! mapping in kit-local task state. Slot claims use exclusive file creation, so
 //! a lost race surfaces as an occupied-slot refusal instead of two sessions in
-//! one tree; reconciliation frees only slots whose recorded session is not
-//! live, and a slot holding unreviewed work stays awaiting review until the
-//! lead merges it or records an explicit discard.
+//! one tree. A startup reservation keeps that claim exclusive until a host
+//! lease exists. Reconciliation frees only a resolved-dead reservation, or a
+//! reservation-less slot whose recorded session is not live, and a slot holding
+//! unreviewed work stays awaiting review until the lead merges it or
+//! records an explicit discard.
 use crate::build_identity::hash_bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -328,6 +330,30 @@ pub enum SlotDisposition {
     Discarded,
 }
 
+/// Creating process of one dispatch, recorded before a host lease exists.
+///
+/// Pid reuse is distinguished by the process creation time. A missing
+/// reservation means the record predates this boundary and still follows
+/// session liveness alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupReservation {
+    pub pid: u32,
+    pub created: u64,
+    pub program: PathBuf,
+}
+
+/// Whether a startup reservation still excludes other dispatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationLiveness {
+    /// The creating process is the recorded identity and is running.
+    Live,
+    /// The recorded process has exited or its pid was reused.
+    Dead,
+    /// Identity could not be resolved. The claim stays exclusive.
+    Uncertain,
+}
+
 /// Kit-local task-state record of one pool slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -345,6 +371,10 @@ pub struct SlotRecord {
     pub disposition: Option<SlotDisposition>,
     /// Why the slot is preserved, or why the last dispatch aborted.
     pub reason: Option<String>,
+    /// Process that owns the claim until a host lease is published. Absent on
+    /// records written before startup reservations, which keep session liveness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<StartupReservation>,
 }
 
 /// Private slot state root; one directory per source checkout.
@@ -392,16 +422,173 @@ pub fn load_slot_record(
     })
 }
 
+/// Bound for the per-slot record lock. It covers the claim mutation only,
+/// not fetch, host attach, or the model conversation.
+const SLOT_CLAIM_LOCK_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn slot_lock_path(codex_home: &Path, source: &Path, index: u32) -> io::Result<PathBuf> {
+    Ok(pool_state_dir(codex_home, source)?.join(format!("slot-{index}.lock")))
+}
+
+/// Serialize one slot's claim mutation. The lock file stays in place: replacing
+/// it would let two callers lock different objects. Process exit releases it.
+fn lock_slot(
+    codex_home: &Path,
+    source: &Path,
+    index: u32,
+) -> io::Result<crate::process::ExclusiveFileLock> {
+    let path = slot_lock_path(codex_home, source, index)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let deadline = crate::process::Deadline::after(SLOT_CLAIM_LOCK_BOUND)?;
+    match crate::process::ExclusiveFileLock::acquire(
+        &path,
+        deadline,
+        &crate::process::Cancellation::default(),
+    ) {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(pool_error(&format!(
+            "slot {index} claim record stayed locked by another dispatch for {SLOT_CLAIM_LOCK_BOUND:?}; refusing to replace the pending claim"
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+/// Identity of this process as a startup reservation. Inspection failure is
+/// returned rather than claiming a slot that later recovery cannot attribute.
+#[cfg(windows)]
+pub fn current_startup_reservation() -> io::Result<StartupReservation> {
+    let program = std::env::current_exe().map_err(|error| {
+        pool_error(&format!(
+            "startup reservation needs the current executable: {error}"
+        ))
+    })?;
+    let user = crate::process_service::current_user().map_err(|error| {
+        pool_error(&format!(
+            "startup reservation needs the current user identity: {error}"
+        ))
+    })?;
+    let identity =
+        crate::process_service::ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .map_err(|error| {
+                pool_error(&format!(
+                    "startup reservation could not observe this process: {error}"
+                ))
+            })?
+            .identity();
+    Ok(StartupReservation {
+        pid: identity.pid,
+        created: identity.creation_time,
+        program,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn current_startup_reservation() -> io::Result<StartupReservation> {
+    Err(pool_error(
+        "startup reservation requires Windows process identity",
+    ))
+}
+
+fn startup_matches(reservation: &StartupReservation, current: &StartupReservation) -> bool {
+    reservation.pid == current.pid && reservation.created == current.created
+}
+
+/// True when this process created the reservation. An identity that cannot be
+/// observed is not treated as a match, so an uncertain caller cannot release
+/// someone else's claim.
+pub fn startup_matches_current(reservation: &StartupReservation) -> bool {
+    current_startup_reservation()
+        .ok()
+        .is_some_and(|current| startup_matches(reservation, &current))
+}
+
+fn startup_liveness(reservation: &StartupReservation) -> ReservationLiveness {
+    #[cfg(windows)]
+    {
+        if !reservation.program.is_file() {
+            return ReservationLiveness::Dead;
+        }
+        let Ok(user) = crate::process_service::current_user() else {
+            return ReservationLiveness::Uncertain;
+        };
+        match crate::process_service::ServiceProcess::inspect(
+            crate::process::ProcessIdentity {
+                pid: reservation.pid,
+                creation_time: reservation.created,
+            },
+            &reservation.program,
+            &user,
+        ) {
+            Ok(Some(_)) => ReservationLiveness::Live,
+            Ok(None) => ReservationLiveness::Dead,
+            Err(_) => ReservationLiveness::Uncertain,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = reservation;
+        ReservationLiveness::Uncertain
+    }
+}
+
+fn startup_exclusive(reservation: &StartupReservation) -> bool {
+    matches!(
+        startup_liveness(reservation),
+        ReservationLiveness::Live | ReservationLiveness::Uncertain
+    )
+}
+
+fn pending_startup_reason(
+    index: u32,
+    owner: Option<&str>,
+    liveness: ReservationLiveness,
+) -> String {
+    let owner = owner.unwrap_or("no session");
+    match liveness {
+        ReservationLiveness::Uncertain => format!(
+            "slot {index} startup of session {owner} has uncertain process identity; the claim is preserved until that identity is resolved"
+        ),
+        ReservationLiveness::Live | ReservationLiveness::Dead => format!(
+            "slot {index} is reserved by in-flight startup of session {owner} until its host lease exists"
+        ),
+    }
+}
+
+fn refusal(slot: &PoolSlot, reason: String) -> SlotClaim {
+    SlotClaim::Unavailable(SlotRefusal {
+        index: slot.index,
+        path: slot.path.clone(),
+        reason,
+    })
+}
+
 /// Claim a pool slot for one executor session. Exclusive file creation is the
 /// compare-and-set step, so a concurrent claim loses the race instead of
-/// sharing the tree; a claim whose session is gone is reclaimed only when the
-/// slot is clean at its recorded base.
+/// sharing the tree. A claim whose session is gone is reclaimed only when the
+/// slot is clean at its recorded base and no live or uncertain startup
+/// reservation still owns it.
 pub fn claim_slot(
     codex_home: &Path,
     pool: &Pool,
     index: u32,
     owner: &str,
     is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<SlotClaim> {
+    claim_slot_for(codex_home, pool, index, owner, is_live, None)
+}
+
+/// Claim one slot, optionally recording the creating process as its startup
+/// reservation. `startup` of `None` preserves the session-liveness claim used
+/// by records and tests that predate the reservation.
+pub fn claim_slot_for(
+    codex_home: &Path,
+    pool: &Pool,
+    index: u32,
+    owner: &str,
+    is_live: &dyn Fn(&str) -> bool,
+    startup: Option<&StartupReservation>,
 ) -> io::Result<SlotClaim> {
     if owner.trim().is_empty() {
         return Err(pool_error(
@@ -411,6 +598,7 @@ pub fn claim_slot(
     let slot = pool.slot(index)?;
     let record_path = slot_record_path(codex_home, &pool.source, index)?;
     for _ in 0..CLAIM_ATTEMPTS {
+        let _lock = lock_slot(codex_home, &pool.source, index)?;
         let previous = load_slot_record(codex_home, &pool.source, index)?;
         let claim = SlotRecord {
             schema: SLOT_STATE_SCHEMA,
@@ -422,6 +610,7 @@ pub fn claim_slot(
             base: previous.as_ref().and_then(|record| record.base.clone()),
             disposition: None,
             reason: None,
+            startup: startup.cloned(),
         };
         if create_slot_record(&record_path, &claim)? {
             return Ok(SlotClaim::Claimed(claim));
@@ -436,15 +625,31 @@ pub fn claim_slot(
                 existing.source.display()
             )));
         }
-        if existing.owner.as_deref() == Some(owner) {
+        if let Some(reserved) = existing.startup.as_ref() {
+            let liveness = startup_liveness(reserved);
+            if matches!(
+                liveness,
+                ReservationLiveness::Live | ReservationLiveness::Uncertain
+            ) {
+                if existing.owner.as_deref() == Some(owner) && startup_matches_current(reserved) {
+                    return Ok(SlotClaim::Claimed(existing));
+                }
+                return Ok(refusal(
+                    &slot,
+                    pending_startup_reason(index, existing.owner.as_deref(), liveness),
+                ));
+            }
+        } else if existing.owner.as_deref() == Some(owner) {
+            // A reservation-less record is the same generation retry used by
+            // in-process claim recovery. A dead startup reservation must not
+            // take this shortcut: that owner string may now belong to a new process.
             return Ok(SlotClaim::Claimed(existing));
         }
         if let Some(live) = existing.owner.as_deref().filter(|owner| is_live(owner)) {
-            return Ok(SlotClaim::Unavailable(SlotRefusal {
-                index,
-                path: slot.path.clone(),
-                reason: format!("slot {index} is occupied by live session {live}"),
-            }));
+            return Ok(refusal(
+                &slot,
+                format!("slot {index} is occupied by live session {live}"),
+            ));
         }
         match slot_content(pool, index, existing.base.as_deref())? {
             SlotContent::Reusable => match fs::remove_file(&record_path) {
@@ -457,20 +662,14 @@ pub fn claim_slot(
                     &record_path,
                     &SlotRecord {
                         state: SlotState::AwaitingReview,
-                        // The last owner stays recorded so the interrupted
-                        // session can resume this exact slot; only the lead's
-                        // release or a clean return to the pool clears it.
                         owner: existing.owner.clone(),
                         disposition: None,
                         reason: Some(reason.clone()),
+                        startup: None,
                         ..existing
                     },
                 )?;
-                return Ok(SlotClaim::Unavailable(SlotRefusal {
-                    index,
-                    path: slot.path.clone(),
-                    reason,
-                }));
+                return Ok(refusal(&slot, reason));
             }
         }
     }
@@ -479,7 +678,9 @@ pub fn claim_slot(
     )))
 }
 
-/// Bind the claimed slot to its session at the synchronized base.
+/// Bind the claimed slot to its session at the synchronized base. A startup
+/// reservation stays recorded until the host lease is published; another
+/// generation cannot bind over it.
 pub fn bind_slot(
     codex_home: &Path,
     pool: &Pool,
@@ -487,6 +688,7 @@ pub fn bind_slot(
     owner: &str,
     base: &str,
 ) -> io::Result<SlotRecord> {
+    let _lock = lock_slot(codex_home, &pool.source, index)?;
     let record = load_slot_record(codex_home, &pool.source, index)?
         .ok_or_else(|| pool_error(&format!("slot {index} has no claim to bind")))?;
     if record.owner.as_deref() != Some(owner) {
@@ -494,6 +696,15 @@ pub fn bind_slot(
             "slot {index} is claimed by {}; refusing to bind another session",
             record.owner.as_deref().unwrap_or("no session")
         )));
+    }
+    if let Some(startup) = record.startup.as_ref() {
+        if startup_exclusive(startup) && !startup_matches_current(startup) {
+            return Err(pool_error(&pending_startup_reason(
+                index,
+                record.owner.as_deref(),
+                startup_liveness(startup),
+            )));
+        }
     }
     let bound = SlotRecord {
         state: SlotState::Occupied,
@@ -512,7 +723,8 @@ pub fn bind_slot(
 /// a live owner or another owner's claim is refused instead of being repaired
 /// by a reset. A clean slot whose owner was cleared back to the pool is
 /// adopted for the explicitly named owner; a slot left awaiting review keeps
-/// its interrupted owner recorded, so only that owner resumes it.
+/// its interrupted owner recorded, so only that owner resumes it. A live or
+/// uncertain startup reservation of another process is not resumed over.
 pub fn adopt_slot(
     codex_home: &Path,
     pool: &Pool,
@@ -545,6 +757,14 @@ pub fn adopt_slot(
             pool.source.display()
         )));
     }
+    if let Some(startup) = record.startup.as_ref() {
+        if startup_exclusive(startup) && !startup_matches_current(startup) {
+            return Err(pool_error(&format!(
+                "slot {index} is reserved by in-flight startup of session {}; resume waits until that dispatch hands off or its process identity is resolved",
+                record.owner.as_deref().unwrap_or("no session")
+            )));
+        }
+    }
     match record.owner.as_deref() {
         Some(existing) if existing == owner => (),
         Some(other) => {
@@ -568,12 +788,18 @@ pub fn adopt_slot(
                 "slot {index} has no synchronized base to resume; dispatch executor spawn first"
             ))
         })?;
+    let _lock = lock_slot(codex_home, &pool.source, index)?;
+    // Resume has no host lease yet. Record this process when it can be
+    // observed so another dispatch cannot reclaim the adopted slot in the
+    // interval before handoff. Observation failure leaves the previous record.
+    let startup = current_startup_reservation().ok();
     let bound = SlotRecord {
         state: SlotState::Occupied,
         owner: Some(owner.to_owned()),
         base: Some(base),
         disposition: None,
         reason: None,
+        startup,
         ..record
     };
     write_slot_record(&slot_record_path(codex_home, &pool.source, index)?, &bound)?;
@@ -582,7 +808,8 @@ pub fn adopt_slot(
 
 /// Explicit slot release: record the lead's merged or discarded disposition,
 /// then reset or preserve the tree under the existing reset-for-reuse rules.
-/// A live owner session is never reset beneath.
+/// A live owner session is never reset beneath. A live or uncertain startup
+/// reservation owned by another process is not a release target.
 pub fn release_slot(
     codex_home: &Path,
     pool: &Pool,
@@ -597,6 +824,14 @@ pub fn release_slot(
             "slot {index} has no recorded assignment to release"
         ))
     })?;
+    if let Some(startup) = record.startup.as_ref() {
+        if startup_exclusive(startup) && !startup_matches_current(startup) {
+            return Err(pool_error(&format!(
+                "slot {index} is reserved by in-flight startup of session {}; release waits until that dispatch hands off or its process identity is resolved",
+                record.owner.as_deref().unwrap_or("no session")
+            )));
+        }
+    }
     if let Some(owner) = record.owner.as_deref().filter(|owner| is_live(owner)) {
         return Err(pool_error(&format!(
             "slot {index} is still owned by live session {owner}; stop it before release"
@@ -613,15 +848,28 @@ pub fn release_slot(
             "release base '{base}' is not a commit in slot {index}; the slot is preserved unchanged"
         ))
     })?;
+    let _lock = lock_slot(codex_home, &pool.source, index)?;
+    let record = load_slot_record(codex_home, &pool.source, index)?.ok_or_else(|| {
+        pool_error(&format!(
+            "slot {index} has no recorded assignment to release"
+        ))
+    })?;
+    if let Some(startup) = record.startup.as_ref() {
+        if startup_exclusive(startup) && !startup_matches_current(startup) {
+            return Err(pool_error(&format!(
+                "slot {index} is reserved by in-flight startup of session {}; release waits until that dispatch hands off or its process identity is resolved",
+                record.owner.as_deref().unwrap_or("no session")
+            )));
+        }
+    }
     let record_path = slot_record_path(codex_home, &pool.source, index)?;
-    // The disposition is recorded before anything is destroyed: from here the
-    // reset of this slot is authorized.
     let released = SlotRecord {
         state: SlotState::Released,
         owner: None,
         base: Some(commit.clone()),
         disposition: Some(disposition),
         reason: Some(reason.to_owned()),
+        startup: None,
         ..record
     };
     write_slot_record(&record_path, &released)?;
@@ -642,6 +890,7 @@ pub fn release_slot(
                 &SlotRecord {
                     state: SlotState::AwaitingReview,
                     reason: Some(limitation.clone()),
+                    startup: None,
                     ..released
                 },
             )?;
@@ -650,10 +899,11 @@ pub fn release_slot(
     }
 }
 
-/// Reconcile recorded occupancy with executor session liveness. Only slots
-/// whose recorded session is gone change state: a clean slot returns to the
-/// pool without an owner, while a slot holding work becomes awaiting review
-/// with its reason and its interrupted owner still recorded for resume.
+/// Reconcile recorded occupancy with executor session liveness. A live or
+/// uncertain startup reservation is left untouched even when no host lease
+/// exists yet. Only a resolved-dead reservation, or a reservation-less record,
+/// follows session liveness: a clean slot returns to the pool, and a slot
+/// holding work becomes awaiting review with its interrupted owner recorded.
 pub fn reconcile_slots(
     codex_home: &Path,
     pool: &Pool,
@@ -665,6 +915,24 @@ pub fn reconcile_slots(
             records.push(free_slot_record(pool, slot));
             continue;
         };
+        if record.startup.as_ref().is_some_and(startup_exclusive) {
+            records.push(record);
+            continue;
+        }
+        let live = record.owner.as_deref().is_some_and(is_live);
+        if live || !matches!(record.state, SlotState::Occupied | SlotState::Synchronizing) {
+            records.push(record);
+            continue;
+        }
+        let _lock = lock_slot(codex_home, &pool.source, slot.index)?;
+        let Some(record) = load_slot_record(codex_home, &pool.source, slot.index)? else {
+            records.push(free_slot_record(pool, slot));
+            continue;
+        };
+        if record.startup.as_ref().is_some_and(startup_exclusive) {
+            records.push(record);
+            continue;
+        }
         let live = record.owner.as_deref().is_some_and(is_live);
         if live || !matches!(record.state, SlotState::Occupied | SlotState::Synchronizing) {
             records.push(record);
@@ -676,13 +944,14 @@ pub fn reconcile_slots(
                 owner: None,
                 disposition: None,
                 reason: None,
+                startup: None,
                 ..record.clone()
             },
             SlotContent::Unreviewed(reason) | SlotContent::Missing(reason) => SlotRecord {
                 state: SlotState::AwaitingReview,
-                // Preserve the interrupted session's identity for resume.
                 owner: record.owner.clone(),
                 reason: Some(reason),
+                startup: None,
                 ..record.clone()
             },
         };
@@ -821,6 +1090,42 @@ pub fn acquire_slot(
     base: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
 ) -> io::Result<AcquiredSlot> {
+    acquire_slot_with(codex_home, source, size, owner, base, is_live, None)
+}
+
+/// Dispatch acquisition that records this process as the startup reservation.
+/// The reservation stays exclusive until `release_startup_reservation` runs
+/// at host handoff. Competing dispatches cannot reclaim the slot merely
+/// because no host lease exists yet.
+pub fn acquire_slot_for_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    owner: &str,
+    base: Option<&str>,
+    startup: &StartupReservation,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<AcquiredSlot> {
+    acquire_slot_with(
+        codex_home,
+        source,
+        size,
+        owner,
+        base,
+        is_live,
+        Some(startup),
+    )
+}
+
+fn acquire_slot_with(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    owner: &str,
+    base: Option<&str>,
+    is_live: &dyn Fn(&str) -> bool,
+    startup: Option<&StartupReservation>,
+) -> io::Result<AcquiredSlot> {
     let pool = pool(source, size)?;
     reconcile_slots(codex_home, &pool, is_live)?;
     let mut refusals = Vec::new();
@@ -834,7 +1139,7 @@ pub fn acquire_slot(
             )));
         }
         create_slot(&pool, slot.index)?;
-        match claim_slot(codex_home, &pool, slot.index, owner, is_live)? {
+        match claim_slot_for(codex_home, &pool, slot.index, owner, is_live, startup)? {
             SlotClaim::Claimed(_) => {
                 let synchronized = match synchronize_slot(codex_home, &pool, slot.index, base) {
                     Ok(synchronized) => synchronized,
@@ -862,6 +1167,103 @@ pub fn acquire_slot(
         "no free slot in the pool of {size} (max_concurrent_executors): {}",
         refusals.join("; ")
     )))
+}
+
+/// Drop the startup reservation after the host lease is the authority.
+/// A different session's reservation is left in place.
+pub fn release_startup_reservation(
+    codex_home: &Path,
+    source: &Path,
+    index: u32,
+    owner: &str,
+) -> io::Result<()> {
+    let Some(record) = load_slot_record(codex_home, source, index)? else {
+        return Ok(());
+    };
+    if record.owner.as_deref() != Some(owner) || record.startup.is_none() {
+        return Ok(());
+    }
+    let _lock = lock_slot(codex_home, source, index)?;
+    let Some(record) = load_slot_record(codex_home, source, index)? else {
+        return Ok(());
+    };
+    if record.owner.as_deref() != Some(owner) || record.startup.is_none() {
+        return Ok(());
+    }
+    write_slot_record(
+        &slot_record_path(codex_home, source, index)?,
+        &SlotRecord {
+            startup: None,
+            ..record
+        },
+    )
+}
+
+/// Refuse to publish a receipt when another generation now owns the slot.
+pub fn claim_still_held(
+    codex_home: &Path,
+    source: &Path,
+    index: u32,
+    owner: &str,
+) -> io::Result<()> {
+    let record = load_slot_record(codex_home, source, index)?.ok_or_else(|| {
+        pool_error(&format!(
+            "slot {index} has no claim; refusing to replace its assignment or receipt"
+        ))
+    })?;
+    if record.owner.as_deref() != Some(owner) {
+        return Err(pool_error(&format!(
+            "slot {index} is claimed by {}; refusing to replace its assignment or receipt",
+            record.owner.as_deref().unwrap_or("no session")
+        )));
+    }
+    if let Some(startup) = record.startup.as_ref() {
+        if startup_exclusive(startup) && !startup_matches_current(startup) {
+            return Err(pool_error(&pending_startup_reason(
+                index,
+                record.owner.as_deref(),
+                startup_liveness(startup),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Record this process as the startup owner of a slot it already holds.
+/// Resume uses this after adoption so the interval before its host lease is
+/// not reclaimable by another dispatch.
+pub fn hold_startup_reservation(
+    codex_home: &Path,
+    source: &Path,
+    index: u32,
+    owner: &str,
+) -> io::Result<()> {
+    let startup = current_startup_reservation()?;
+    let _lock = lock_slot(codex_home, source, index)?;
+    let record = load_slot_record(codex_home, source, index)?
+        .ok_or_else(|| pool_error(&format!("slot {index} has no claim to reserve for startup")))?;
+    if record.owner.as_deref() != Some(owner) {
+        return Err(pool_error(&format!(
+            "slot {index} is claimed by {}; refusing to reserve it for {owner}",
+            record.owner.as_deref().unwrap_or("no session")
+        )));
+    }
+    if let Some(existing) = record.startup.as_ref() {
+        if startup_exclusive(existing) && !startup_matches(existing, &startup) {
+            return Err(pool_error(&pending_startup_reason(
+                index,
+                record.owner.as_deref(),
+                startup_liveness(existing),
+            )));
+        }
+    }
+    write_slot_record(
+        &slot_record_path(codex_home, source, index)?,
+        &SlotRecord {
+            startup: Some(startup),
+            ..record
+        },
+    )
 }
 
 /// Worktree inventory classification: pool slots of this checkout, foreign or
@@ -1016,7 +1418,9 @@ fn slot_content(pool: &Pool, index: u32, base: Option<&str>) -> io::Result<SlotC
 }
 
 /// Hand a slot whose dispatch aborted back to the pool, or preserve it when it
-/// still holds unreviewed work.
+/// still holds unreviewed work. Only this process's own reservation is
+/// released; a live or uncertain reservation of another generation is left
+/// untouched and the original caller still reports its own failure.
 fn abort_claim(
     codex_home: &Path,
     pool: &Pool,
@@ -1030,6 +1434,23 @@ fn abort_claim(
     if record.owner.as_deref() != Some(owner) {
         return Ok(());
     }
+    if let Some(startup) = record.startup.as_ref() {
+        if startup_exclusive(startup) && !startup_matches_current(startup) {
+            return Ok(());
+        }
+    }
+    let _lock = lock_slot(codex_home, &pool.source, index)?;
+    let Some(record) = load_slot_record(codex_home, &pool.source, index)? else {
+        return Ok(());
+    };
+    if record.owner.as_deref() != Some(owner) {
+        return Ok(());
+    }
+    if let Some(startup) = record.startup.as_ref() {
+        if startup_exclusive(startup) && !startup_matches_current(startup) {
+            return Ok(());
+        }
+    }
     let state = match slot_content(pool, index, record.base.as_deref())? {
         SlotContent::Reusable => SlotState::Free,
         SlotContent::Unreviewed(_) | SlotContent::Missing(_) => SlotState::AwaitingReview,
@@ -1041,6 +1462,7 @@ fn abort_claim(
             owner: None,
             disposition: None,
             reason: Some(format!("dispatch aborted: {cause}")),
+            startup: None,
             ..record
         },
     )
@@ -1057,6 +1479,7 @@ fn free_slot_record(pool: &Pool, slot: &PoolSlot) -> SlotRecord {
         base: None,
         disposition: None,
         reason: None,
+        startup: None,
     }
 }
 
@@ -2502,6 +2925,60 @@ mod tests {
         ));
         let error = claim_slot(&home, &layout, 1, "", &dead).unwrap_err();
         assert!(error.to_string().contains("session identity"), "{error}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn startup_reservation_excludes_other_dispatches_until_the_creator_is_dead() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let layout = pool(&up.source, 1).unwrap();
+        create_slot(&layout, 1).unwrap();
+        let dead = |_: &str| false;
+        let startup = current_startup_reservation().expect("this process is observable");
+        let claimed = claim_slot_for(&home, &layout, 1, "exec-1", &dead, Some(&startup)).unwrap();
+        let SlotClaim::Claimed(record) = claimed else {
+            panic!("the creating process must claim the slot");
+        };
+        assert_eq!(
+            record.startup.as_ref().map(|startup| startup.pid),
+            Some(startup.pid)
+        );
+        match claim_slot_for(&home, &layout, 1, "exec-2", &dead, None).unwrap() {
+            SlotClaim::Unavailable(refusal) => {
+                assert!(
+                    refusal
+                        .reason
+                        .contains("in-flight startup of session exec-1"),
+                    "{}",
+                    refusal.reason
+                );
+            }
+            SlotClaim::Claimed(_) => panic!("a live startup reservation must not be reclaimed"),
+        }
+        assert!(matches!(
+            claim_slot_for(&home, &layout, 1, "exec-1", &dead, Some(&startup)).unwrap(),
+            SlotClaim::Claimed(_)
+        ));
+        let kept = reconcile_slots(&home, &layout, &dead).unwrap();
+        assert_eq!(kept[0].state, SlotState::Synchronizing);
+        assert_eq!(kept[0].owner.as_deref(), Some("exec-1"));
+
+        let path = slot_record_path(&home, &up.source, 1).unwrap();
+        let mut stored = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        stored.startup = Some(StartupReservation {
+            pid: u32::MAX,
+            created: 1,
+            program: std::env::current_exe().unwrap(),
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+        let SlotClaim::Claimed(reclaimed) = claim_slot(&home, &layout, 1, "exec-2", &dead).unwrap()
+        else {
+            panic!("a confirmed-dead creator's clean reservation must be reclaimable");
+        };
+        assert_eq!(reclaimed.owner.as_deref(), Some("exec-2"));
+        assert!(reclaimed.startup.is_none());
     }
 
     #[test]
