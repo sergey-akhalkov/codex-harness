@@ -122,14 +122,29 @@ fn installed_integration_is_a_separate_explicitly_selected_route() {
         "model-backed evaluation stays outside both workflows"
     );
     // Omitted checks cannot look green: the installed test command must name
-    // every integration target that exists in the tests directory.
+    // every integration target that exists in the tests directory. The shared
+    // comparison fixture module is included by the split targets; it is not a
+    // route target and must not hide tests.
     let tests_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let mut expected: Vec<String> = std::fs::read_dir(tests_root)
+    let shared_module = "improvement_comparison_common";
+    let shared_text = std::fs::read_to_string(tests_root.join(format!("{shared_module}.rs")))
+        .expect("comparison shared module");
+    assert!(
+        !shared_text.contains("#[test]"),
+        "the shared comparison module must not define tests"
+    );
+    let mut expected: Vec<String> = std::fs::read_dir(&tests_root)
         .expect("tests directory")
         .filter_map(|entry| {
             let path = entry.ok()?.path();
-            (path.extension()? == "rs")
-                .then(|| format!("--test {}", path.file_stem().unwrap().to_string_lossy()))
+            if path.extension()? != "rs" {
+                return None;
+            }
+            let stem = path.file_stem()?.to_string_lossy();
+            if stem == shared_module {
+                return None;
+            }
+            Some(format!("--test {}", stem))
         })
         .collect();
     expected.sort();
