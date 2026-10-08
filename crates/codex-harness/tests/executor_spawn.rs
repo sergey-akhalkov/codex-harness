@@ -562,6 +562,101 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
     fixture.drop();
 }
 
+#[test]
+fn pending_startup_claim_is_not_replaced_before_the_host_lease() {
+    overlap_while_fetch_is_held("startup-other", "exec-hold", "exec-other");
+    overlap_while_fetch_is_held("startup-same", "exec-hold", "exec-hold");
+}
+
+fn installed_git() -> PathBuf {
+    let output = Command::new("where.exe").arg("git").output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .map(str::trim)
+        .find(|line| line.to_ascii_lowercase().ends_with("git.exe"))
+        .map(PathBuf::from)
+        .expect("git.exe")
+}
+
+/// Hold the first dispatch on `git fetch` after its claim. The second dispatch
+/// starts only after that gate file exists; the loop only observes the gate.
+fn overlap_while_fetch_is_held(name: &str, owner_a: &str, owner_b: &str) {
+    let fixture = Fixture::new(name, 1);
+    let gate = fixture.root.join("gate");
+    fs::create_dir_all(&gate).unwrap();
+    fs::write(gate.join("hold"), b"hold\n").unwrap();
+    let stand_in = gate.join("git.cmd");
+    fs::write(
+        &stand_in,
+        r#"@echo off
+setlocal
+if /I "%~1"=="fetch" (
+  >"%HARNESS_SPAWN_GATE%\entered.txt" echo entered
+  :wait
+  if exist "%HARNESS_SPAWN_GATE%\hold" (
+    ping -n 2 127.0.0.1 >nul
+    goto wait
+  )
+)
+"%HARNESS_SPAWN_GIT%" %*
+exit /b %ERRORLEVEL%
+"#,
+    )
+    .unwrap();
+    let mut path = std::ffi::OsString::from(&gate);
+    path.push(";");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let mut first = fixture.spawn_command();
+    first
+        .args(["--exec", "first assignment", "--owner", owner_a])
+        .env("PATH", &path)
+        .env("HARNESS_SPAWN_GATE", &gate)
+        .env("HARNESS_SPAWN_GIT", installed_git())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut first = first.spawn().unwrap();
+    let entered = gate.join("entered.txt");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !entered.is_file() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "first dispatch exited before the post-claim fetch gate"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first dispatch did not reach the post-claim fetch gate"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let during = fixture.record(1);
+    assert_eq!(during["owner"], owner_a, "{during}");
+    assert!(during["startup"].is_object(), "{during}");
+    let second = fixture.spawn(&["--owner", owner_b]);
+    let text = output_text(&second);
+    assert!(
+        !second.status.success(),
+        "contender must refuse while startup is reserved: {text}"
+    );
+    assert!(
+        !text.contains("executor dispatch accepted"),
+        "contender must not accept a replaced assignment: {text}"
+    );
+    assert!(
+        text.contains("in-flight startup") || text.contains("no free slot"),
+        "{text}"
+    );
+    let after = fixture.record(1);
+    assert_eq!(
+        after["owner"], owner_a,
+        "contender replaced the pending claim: {after}"
+    );
+    assert_eq!(after["startup"]["pid"], during["startup"]["pid"], "{after}");
+    let _ = fs::remove_file(gate.join("hold"));
+    let _ = first.kill();
+    let _ = first.wait();
+    fixture.drop();
+}
+
 fn assignment_document(objective: &str, inputs: &[&str], outputs: &[&str]) -> Vec<u8> {
     serde_json::to_vec_pretty(&json!({
         "schema": 1,

@@ -896,6 +896,7 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
     let live = |owner: &str| owner_live(&codex_home, &source, owner);
     let pool = task_worktree::pool(&source, config.max_concurrent_executors)?;
     let record = task_worktree::adopt_slot(&codex_home, &pool, slot, &owner, &live)?;
+    task_worktree::hold_startup_reservation(&codex_home, &source, slot, &owner)?;
     let (remote, branch) = task_worktree::upstream(&record.path)?;
     let binding = SlotBinding {
         index: record.index,
@@ -1754,16 +1755,19 @@ fn display_paths(paths: &[PathBuf]) -> String {
 }
 
 /// The pool core owns selection, claims, synchronization and slot records; the
-/// CLI supplies the session identity and the process-level liveness of its host.
+/// CLI supplies the session identity, the creating process reservation, and
+/// the process-level liveness of its host.
 fn acquire_pool_slot(request: &Dispatch) -> io::Result<AcquiredSlot> {
     let live = |owner: &str| owner_live(request.codex_home, request.source, owner);
     refuse_a_live_owner(request.codex_home, request.source, request.owner)?;
-    task_worktree::acquire_slot(
+    let startup = task_worktree::current_startup_reservation()?;
+    task_worktree::acquire_slot_for_startup(
         request.codex_home,
         request.source,
         request.pool_size,
         request.owner,
         request.base,
+        &startup,
         &live,
     )
 }
@@ -1828,7 +1832,9 @@ fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPath
 }
 
 /// Record this process as the live host of a bound slot. A slot that was
-/// rebound to another session is refused instead of sharing the tree.
+/// rebound to another session is refused instead of sharing the tree. Publishing
+/// the lease ends startup exclusion: the lease, not the creating process, is
+/// authoritative from this write onward.
 fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
     let record = task_worktree::load_slot_record(codex_home, &binding.source, binding.index)?
         .ok_or_else(|| {
@@ -1870,7 +1876,34 @@ fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(&path, serde_json::to_vec_pretty(&lease)?)
+    fs::write(&path, serde_json::to_vec_pretty(&lease)?)?;
+    task_worktree::release_startup_reservation(
+        codex_home,
+        &binding.source,
+        binding.index,
+        &binding.owner,
+    )
+}
+
+/// Stay in this dispatch until the host publishes a live lease, so creator
+/// exit is not mistaken for an unused reservation while the tab host is still
+/// starting. The bound is the existing host grace, not a conversation lifetime.
+fn wait_for_host_lease(request: &Dispatch, binding: &SlotBinding) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + HOST_GRACE;
+    loop {
+        if let Some(lease) = live_lease(request.codex_home, request.source, &binding.owner)
+            && lease.index == binding.index
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(invalid(&format!(
+                "slot {} host did not publish its lease within {HOST_GRACE:?}; startup of {} was not reported as accepted",
+                binding.index, binding.owner
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Drop the lease this process recorded and leave another session's lease alone.
@@ -5234,6 +5267,13 @@ fn dispatch_terminal_tab(
         receipt,
         request.terminal_profile,
     )?;
+    task_worktree::claim_still_held(
+        request.codex_home,
+        &binding.source,
+        binding.index,
+        &binding.owner,
+    )
+    .map_err(|error| invalid(&error.to_string()))?;
     save_receipt(
         receipt,
         launcher,
@@ -5281,6 +5321,10 @@ fn dispatch_terminal_tab(
     if !status.success() {
         return Err(invalid("windows terminal tab spawn failed"));
     }
+    // The tab host publishes the lease after this process would otherwise
+    // exit. Stay alive until that handoff so a competing dispatch cannot
+    // treat the creator's exit as an unused reservation.
+    wait_for_host_lease(request, binding)?;
     println!(
         "{}",
         spawn_summary(
@@ -5314,6 +5358,13 @@ fn dispatch_owned_console(
     // the recorded liveness of the slot.
     record_lease(request.codex_home, binding)?;
     let outcome = (|| -> io::Result<i32> {
+        task_worktree::claim_still_held(
+            request.codex_home,
+            &binding.source,
+            binding.index,
+            &binding.owner,
+        )
+        .map_err(|error| invalid(&error.to_string()))?;
         save_receipt(
             receipt,
             launcher,
