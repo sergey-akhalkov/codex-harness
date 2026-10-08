@@ -556,6 +556,92 @@ fn watch_reports_failure_interruption_and_never_waits_forever() {
 }
 
 #[test]
+fn watch_waits_for_host_finalization_after_turn_completion() {
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f3f21";
+    let result_text = "WATCH_FINALIZED_RESULT\nremaining: none\n";
+    for json_output in [false, true] {
+        let run = SeededRun::new();
+        let mut receipt = receipt_json(&run.receipt);
+        receipt["observation"]["state"] = json!("completed");
+        receipt["observation"]["session"] = json!(session);
+        receipt["observation"]["exitCode"] = Value::Null;
+        receipt["observation"]["updatedMs"] = json!(u64::MAX / 2);
+        receipt["observation"]["events"] = json!(3);
+        let before = serde_json::to_vec_pretty(&receipt).unwrap();
+        fs::write(&run.receipt, &before).unwrap();
+        let _ = fs::remove_file(&run.result);
+
+        let started = Instant::now();
+        let mut command = lead_command();
+        command
+            .args(["executor", "watch", "--receipt"])
+            .arg(&run.receipt)
+            .args(["--timeout", "20", "--poll", "50"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if json_output {
+            command.arg("--json");
+        }
+        let mut child = command.spawn().unwrap();
+        thread::sleep(Duration::from_millis(400));
+        match child.try_wait() {
+            Ok(None) => {}
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("watch returned before the host finalized ({json_output:?}): {other:?}");
+            }
+        }
+        let unchanged = fs::read(&run.receipt).unwrap();
+        assert_eq!(
+            unchanged, before,
+            "pending finalization must not rewrite the receipt"
+        );
+
+        // The host retains the result, then the successful exit. Watch must
+        // return only after both are visible, in either output mode.
+        fs::write(&run.result, result_text).unwrap();
+        receipt["observation"]["exitCode"] = json!(0);
+        let temp = run
+            .receipt
+            .with_extension(format!("{}.tmp", std::process::id()));
+        fs::write(&temp, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        fs::rename(&temp, &run.receipt).unwrap();
+
+        let out = child.wait_with_output().unwrap();
+        let output = text(&out);
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "watch returned before the controlled finalization: {output}"
+        );
+        assert_eq!(out.status.code(), Some(0), "{output}");
+        assert!(
+            output.contains(result_text.trim()),
+            "the retained bounded result is missing: {output}"
+        );
+        if json_output {
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+                panic!("JSON watch report is not readable: {error}: {output}")
+            });
+            assert_eq!(report["exitCode"], json!(0), "{output}");
+            assert_eq!(report["session"], json!(session), "{output}");
+            assert_eq!(report["state"], json!("completed"), "{output}");
+            assert!(
+                report["returned"]
+                    .as_str()
+                    .is_some_and(|returned| returned.contains(result_text.trim())),
+                "{output}"
+            );
+        } else {
+            assert!(output.contains("state=completed"), "{output}");
+            assert!(output.contains(&format!("session: {session}")), "{output}");
+            assert!(output.contains("exit: 0"), "{output}");
+        }
+    }
+}
+
+#[test]
 fn legacy_and_tui_receipts_keep_their_documented_coverage_limits() {
     // A legacy receipt has no observation record: run stays pass-through.
     let run = SeededRun::new();

@@ -2513,10 +2513,12 @@ fn parse_seconds(value: Option<&str>, fallback: u64, name: &str) -> io::Result<D
 }
 
 /// `executor watch`: block on the recorded lifecycle of one run and return
-/// compact review data when it reaches a terminal state, without polling a
+/// compact review data when it reaches a settled outcome, without polling a
 /// model or searching rollouts. Exit codes: 0 completed, 1 failed, defect or
 /// interrupted, and 2 unavailable coverage or the timeout expired first. A
-/// live run with an unresolved reply request returns 3 with the bounded
+/// native turn completion whose exit status is not yet recorded stays open:
+/// success requires that recorded zero exit and a readable nonempty result.
+/// A live run with an unresolved reply request returns 3 with the bounded
 /// request references: action required, so the lead answers and watches the
 /// same run again instead of resuming or releasing it.
 fn watch(args: &[OsString]) -> io::Result<i32> {
@@ -2665,14 +2667,15 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
             );
             return Ok(2);
         }
-        let terminal = watch_terminal_state(run.state.as_str());
+        // A completed turn is not settled while its exit status is still
+        // absent. Keep observing that same receipt; do not report success or
+        // an output defect merely because finalization is pending.
+        let terminal = watch_terminal_state(run.state.as_str()) && !completion_awaiting_host(&run);
         if terminal {
-            let report = WatchReport::build(&receipt, &value, &run, &run.state, run.cause.clone());
+            let (state, cause, code) = settled_watch_outcome(&run);
+            let report = WatchReport::build(&receipt, &value, &run, &state, cause);
             print_watch_report(&report, json_output)?;
-            return Ok(match run.state.as_str() {
-                STATE_COMPLETED => 0,
-                _ => 1,
-            });
+            return Ok(code);
         }
         let ended = match &run.host {
             Some(host) => observation::host_ended(host),
@@ -2682,19 +2685,18 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
             None => observation::now_ms() > run.updated_ms + HOST_GRACE.as_millis() as u64,
         };
         if ended {
-            let cause = match &run.host {
-                Some(_) => {
-                    "the recorded session host is no longer running and no terminal event was recorded"
-                }
-                None => "no session host was ever observed for this run",
+            let cause = if completion_awaiting_host(&run) {
+                "the native turn completed but the host ended before retaining its exit status and final result; finalization did not complete; the exact exit code is unknown".to_owned()
+            } else {
+                let cause = match &run.host {
+                    Some(_) => {
+                        "the recorded session host is no longer running and no terminal event was recorded"
+                    }
+                    None => "no session host was ever observed for this run",
+                };
+                format!("{cause}; the exact exit code is unknown")
             };
-            let report = WatchReport::build(
-                &receipt,
-                &value,
-                &run,
-                STATE_INTERRUPTED,
-                Some(format!("{cause}; the exact exit code is unknown")),
-            );
+            let report = WatchReport::build(&receipt, &value, &run, STATE_INTERRUPTED, Some(cause));
             print_watch_report(&report, json_output)?;
             return Ok(1);
         }
@@ -2704,9 +2706,9 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
             return Ok(WATCH_EXIT_WAITING);
         }
         if Instant::now() >= deadline {
-            // The deadline must not hide an established waiting state: read
-            // the newest receipt once, so a request recorded at the boundary
-            // is the actionable result instead of a timeout.
+            // The deadline must not hide an established waiting state or a
+            // finalization that landed on this boundary: read the newest
+            // receipt once, so either is the result instead of a timeout.
             if let Some((fresh, fresh_run, waiting)) =
                 waiting_at_deadline(&receipt, owner.as_deref())
             {
@@ -2714,17 +2716,28 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
                 print_watch_report(&report, json_output)?;
                 return Ok(WATCH_EXIT_WAITING);
             }
-            let report = WatchReport::build(
-                &receipt,
-                &value,
-                &run,
-                &run.state,
-                Some(format!(
+            let (value, run) =
+                reread_native_run(&receipt, owner.as_deref()).unwrap_or((value, run));
+            if watch_terminal_state(run.state.as_str()) && !completion_awaiting_host(&run) {
+                let (state, cause, code) = settled_watch_outcome(&run);
+                let report = WatchReport::build(&receipt, &value, &run, &state, cause);
+                print_watch_report(&report, json_output)?;
+                return Ok(code);
+            }
+            let cause = if completion_awaiting_host(&run) {
+                format!(
+                    "watch timed out after {}s while completion finalization was still pending (recorded state {}): the native turn completed but the host has not retained its exit status and final result; the run was left working and was not stopped or replayed. Rerun watch, or inspect the detail locator",
+                    timeout.as_secs(),
+                    run.state
+                )
+            } else {
+                format!(
                     "watch timed out after {}s while the run was still {}; rerun watch, or inspect the detail locator",
                     timeout.as_secs(),
                     run.state
-                )),
-            );
+                )
+            };
+            let report = WatchReport::build(&receipt, &value, &run, &run.state, Some(cause));
             print_watch_report(&report, json_output)?;
             return Ok(2);
         }
@@ -2766,17 +2779,7 @@ fn waiting_at_deadline(
     receipt: &Path,
     owner: Option<&str>,
 ) -> Option<(serde_json::Value, RunObservation, WaitingHold)> {
-    let bytes = fs::read(receipt).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let run = RunObservation::from_receipt(&value)?;
-    if run.coverage != COVERAGE_NATIVE {
-        return None;
-    }
-    if let (Some(owner), Some(recorded)) = (owner, value["slot"]["owner"].as_str())
-        && recorded != owner
-    {
-        return None;
-    }
+    let (value, run) = reread_native_run(receipt, owner)?;
     let waiting = waiting_hold(&run, &value)?;
     Some((value, run, waiting))
 }
@@ -2794,6 +2797,79 @@ fn watch_terminal_state(state: &str) -> bool {
             | observation::STATE_PARTIAL_STOP
     )
 }
+
+/// A completed native turn whose host has not yet recorded an exit status.
+/// Receipt-view success is a recorded zero exit ([`conversation_state_of`]);
+/// until that exit exists, watch keeps observing this same run. A missing exit
+/// is not an output defect and not success.
+fn completion_awaiting_host(run: &RunObservation) -> bool {
+    run.state == STATE_COMPLETED && run.exit_code.is_none()
+}
+
+/// Settled watch outcome of a terminal receipt.
+///
+/// Success is only the recorded zero exit plus a readable nonempty final
+/// result, the same exit rule receipt view uses for a completed conversation.
+/// A recorded zero exit whose result is missing or empty is an output defect.
+/// Any other terminal state keeps its recorded cause and the unsuccessful exit.
+fn settled_watch_outcome(run: &RunObservation) -> (String, Option<String>, i32) {
+    if run.state != STATE_COMPLETED {
+        return (run.state.clone(), run.cause.clone(), 1);
+    }
+    if run.exit_code == Some(0) {
+        let cause = match observation::final_message(run.result.as_deref()) {
+            observation::FinalMessage::Present => {
+                return (STATE_COMPLETED.to_owned(), run.cause.clone(), 0);
+            }
+            observation::FinalMessage::Empty => {
+                "the final result is empty; an empty completion is an output defect, not evidence of model, authentication or quota unavailability"
+            }
+            observation::FinalMessage::Missing => {
+                "the recorded successful exit has no readable final result; a missing or unusable final message is an output defect, not successful completion"
+            }
+        };
+        return (
+            STATE_DEFECT.to_owned(),
+            Some(recorded_defect_cause(cause, run.cause.as_deref())),
+            1,
+        );
+    }
+    let cause = run
+        .cause
+        .clone()
+        .filter(|cause| !cause.trim().is_empty())
+        .unwrap_or_else(|| "the run completed without a zero exit code".to_owned());
+    (run.state.clone(), Some(cause), 1)
+}
+
+fn recorded_defect_cause(base: &str, recorded: Option<&str>) -> String {
+    match recorded.map(str::trim).filter(|cause| !cause.is_empty()) {
+        Some(cause) => format!("{base}; {cause}"),
+        None => base.to_owned(),
+    }
+}
+
+/// One more read at the watch deadline. A reply hold or a finalized outcome
+/// recorded on this boundary is the result; a failed read leaves the caller
+/// with the observation it already has.
+fn reread_native_run(
+    receipt: &Path,
+    owner: Option<&str>,
+) -> Option<(serde_json::Value, RunObservation)> {
+    let bytes = fs::read(receipt).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let run = RunObservation::from_receipt(&value)?;
+    if run.coverage != COVERAGE_NATIVE {
+        return None;
+    }
+    if let (Some(owner), Some(recorded)) = (owner, value["slot"]["owner"].as_str())
+        && recorded != owner
+    {
+        return None;
+    }
+    Some((value, run))
+}
+
 fn print_watch_report(report: &WatchReport, json_output: bool) -> io::Result<()> {
     if json_output {
         println!(
