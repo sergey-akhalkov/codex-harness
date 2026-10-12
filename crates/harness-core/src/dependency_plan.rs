@@ -119,7 +119,7 @@ fn parse_release(spec: &Value, body: &[u8]) -> Result<Parsed, &'static str> {
         Some("serena") => parse_pypi(package, text),
         Some("nuphus" | "python") => parse_npm(package, text),
         Some("rust") => parse_rust_channel(text),
-        Some("delphi") => parse_github_release(package, text),
+        Some("delphi" | "cpp") => parse_github_release(package, text),
         _ => Err("unsupported-metadata-source"),
     }
 }
@@ -207,7 +207,7 @@ fn parse_rust_channel(text: &str) -> Result<Parsed, &'static str> {
 /// package identity is fixed by the exact catalogue mapping, and only the
 /// tag supplies a version.
 fn parse_github_release(package: &str, text: &str) -> Result<Parsed, &'static str> {
-    if package != "pascal-language-server" {
+    if !matches!(package, "pascal-language-server" | "clangd") {
         return Err("metadata-package-mismatch");
     }
     let value: Value = serde_json::from_str(text).map_err(|_| "metadata-unparseable")?;
@@ -465,6 +465,8 @@ fn plan_item(spec: &Value, installed: &Value, release: Value) -> Value {
         ("preserve-and-audit", Some("unknown"))
     } else if !same_identity {
         ("preserve-and-audit", Some("package-identity-mismatch"))
+    } else if spec["reuse_only"] == true {
+        ("reuse", Some("held-reuse-only-policy"))
     } else if !checked {
         (
             "metadata-unresolved",
@@ -548,6 +550,28 @@ fn consumers(record: &Value) -> Consumers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reuse_only_backend_never_requests_provisioning_or_update() {
+        let spec = json!({"id":"cpp","package":"clangd","required":false,"reuse_only":true});
+        let mut installed = json!({"identity":"clangd","status":"adopted","version":"22.1.6"});
+        for release in [
+            json!({"state":"unresolved"}),
+            json!({"state":"checked","version":"23.0.0"}),
+        ] {
+            assert_eq!(plan_item(&spec, &installed, release)["action"], "reuse");
+        }
+        installed["status"] = json!("missing");
+        assert_eq!(
+            plan_item(&spec, &installed, Value::Null)["action"],
+            "conditional-absent"
+        );
+        installed["status"] = json!("ambiguous");
+        assert_eq!(
+            plan_item(&spec, &installed, Value::Null)["action"],
+            "preserve-and-audit"
+        );
+    }
 
     fn spec(id: &str) -> Value {
         match id {

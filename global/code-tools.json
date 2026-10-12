@@ -139,6 +139,38 @@
       ],
       "provision": "Reuse-only: adopt the observed shared pasls installation with its matching FPC prerequisites; never download or update it during a session. Discovery rejects missing or ambiguous prerequisites and absent or invalid version records. Startup checks recorded paths exist; observed fingerprints do not establish arbitrary content integrity.",
       "verification": "Managed Serena session on owned legacy Pascal sources with the pinned PP/FPCDIR: symbol overview, definition and references with stated FPC/CodeTools limits; no clean-compilation or Delphi-SDK claim."
+    },
+    {
+      "id": "cpp",
+      "name": "C++",
+      "required": false,
+      "backend": "clangd",
+      "serena_id": "cpp",
+      "package": "clangd",
+      "manager": "opencode-cache",
+      "source": "https://github.com/clangd/clangd",
+      "metadata": "https://api.github.com/repos/clangd/clangd/releases/latest",
+      "runtime": [
+        "project C++ compiler and headers"
+      ],
+      "project_inputs": [
+        "compile_commands.json",
+        ".clangd",
+        "include paths"
+      ],
+      "extensions": [
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx"
+      ],
+      "provision": "Reuse-only: adopt an unambiguous existing versioned clangd installation from the shared OpenCode cache. Never download or update this backend. Directory versions and fingerprints are observations, not upstream integrity or semantic readiness.",
+      "verification": "Project compiler flags, cross-file symbols/definition/references; diagnostic and clearance.",
+      "reuse_only": true
     }
   ],
   "retired_language_candidates": [
@@ -222,37 +254,6 @@
       ],
       "provision": "Reuse existing Serena PSES cache and its analyzer; acquire official release bundle on explicit install/update.",
       "verification": "PowerShell project navigation, syntax/analyzer error and clearance."
-    },
-    {
-      "id": "cpp",
-      "name": "C++",
-      "required": true,
-      "backend": "clangd",
-      "serena_id": "cpp",
-      "package": "clangd",
-      "manager": "opencode-cache",
-      "source": "https://github.com/clangd/clangd",
-      "metadata": "https://api.github.com/repos/clangd/clangd/releases/latest",
-      "runtime": [
-        "project C++ compiler and headers"
-      ],
-      "project_inputs": [
-        "compile_commands.json",
-        ".clangd",
-        "include paths"
-      ],
-      "extensions": [
-        ".c",
-        ".cc",
-        ".cpp",
-        ".cxx",
-        ".h",
-        ".hh",
-        ".hpp",
-        ".hxx"
-      ],
-      "provision": "Reuse the existing OpenCode clangd binary; official release archive only on explicit install/update.",
-      "verification": "Project compiler flags, cross-file symbols/definition/references; diagnostic and clearance."
     },
     {
       "id": "csharp",

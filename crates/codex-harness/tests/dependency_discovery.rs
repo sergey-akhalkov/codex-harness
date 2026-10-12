@@ -126,7 +126,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
     assert_eq!(report["read_only"], true);
     assert_eq!(report["network_requested"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 6);
     for item in items {
         assert_eq!(item["release"]["state"], "unresolved");
         assert!(item["release"]["version"].is_null());
@@ -166,7 +166,7 @@ fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptan
     assert_eq!(report["model_calls"], 0);
     assert_eq!(report["read_only"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 7);
     for item in items {
         assert_eq!(
             item["release"]["state"], "checked",
@@ -177,7 +177,7 @@ fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptan
         // The reuse-only Pascal row is accepted as absent instead of planned
         // for provisioning; managed rows with an install route stay
         // install-required until they are adopted.
-        let expected = if item["id"] == "delphi" {
+        let expected = if item["id"] == "delphi" || item["id"] == "cpp" {
             "conditional-absent"
         } else {
             "install-required"
@@ -204,9 +204,9 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["processes_started"], 0);
     assert_eq!(report["model_calls"], 0);
-    assert_eq!(report["languages"].as_array().unwrap().len(), 3);
+    assert_eq!(report["languages"].as_array().unwrap().len(), 4);
     assert_eq!(report["mcp"].as_array().unwrap().len(), 2);
-    for id in ["serena", "nuphus", "python", "rust", "delphi"] {
+    for id in ["serena", "nuphus", "python", "rust", "delphi", "cpp"] {
         assert_eq!(record(&report, id)["status"], "missing", "{id}: {report}");
     }
     assert!(!fixture.home.exists());
@@ -241,6 +241,40 @@ fn discover_omits_retired_codegraph_without_mutating_or_downloading() {
         "not-requested; explicit lifecycle operation required"
     );
     assert_eq!(report["processes_started"], 0);
+}
+
+#[test]
+fn cpp_discovery_reuses_one_version_and_preserves_ambiguous_installations() {
+    let fixture = Fixture::new();
+    let cache = fixture.home.join(".cache/opencode/bin");
+    let binary = cache.join("clangd_22.1.6/bin/clangd.exe");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::write(&binary, b"inert shared clangd; must not execute").unwrap();
+    let report = fixture.observe(&["--no-process-environment"]);
+    let cpp = record(&report, "cpp");
+    assert_eq!(cpp["status"], "adopted", "{cpp}");
+    assert_eq!(cpp["version"], "22.1.6");
+    assert_eq!(cpp["serena_id"], "cpp");
+    assert_eq!(
+        Path::new(cpp["command"][0].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        binary.canonicalize().unwrap()
+    );
+    assert_eq!(cpp["health"]["identity_verified"], false);
+    assert_eq!(report["processes_started"], 0);
+    let other = cache.join("clangd_23.0.1/bin/clangd.exe");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::write(&other, b"second inert installation").unwrap();
+    let ambiguous = fixture.observe(&["--no-process-environment"]);
+    assert_eq!(record(&ambiguous, "cpp")["status"], "ambiguous");
+    assert!(binary.is_file() && other.is_file());
+    fs::remove_file(other).unwrap();
+    fs::remove_file(binary).unwrap();
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "cpp")["status"],
+        "missing"
+    );
 }
 
 #[test]
