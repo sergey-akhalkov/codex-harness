@@ -18,6 +18,8 @@ Forward the existing `APPDATA` value into the broker alongside its other explici
 
 A bounded predeployment call to the existing Serena package, using the generated configuration and the broker's minimal environment plus `APPDATA`, loaded the real C# project, read a method and found its cross-file callers. Explicit file diagnostics contained only a style suggestion; missing dependency/type errors disappeared. This precheck does not replace final verification through the installed managed entry point.
 
+Final delivery repeated those observations through the installed managed entry point with the client-lifetime fix: symbol overview, method body, five cross-file callers and explicit file diagnostics succeeded. The inspected file reported only IDE0305 information. Existing consumer binary bytes stayed unchanged; this is navigation and inspected-file analysis evidence, not whole-solution compilation or conformance evidence.
+
 ## Risks / Trade-offs
 
 Support is bounded to the installed Roslyn net10.0 Windows x64 layout and compatible .NET 10 runtimes. Unsupported layouts remain unavailable. Existing multiple server versions remain ambiguous rather than selecting an arbitrary version. A runtime file inventory cannot establish successful startup, so actual solution acceptance follows lifecycle delivery.
