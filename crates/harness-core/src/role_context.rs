@@ -66,9 +66,15 @@ fn invalid(message: impl std::fmt::Display) -> io::Error {
 /// Read only ordinary owned source paths. All memberships and role inputs are
 /// validated, so incomplete delivery fails before starting any conversation.
 pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
-    let root = source_root.canonicalize()?;
+    let root = source_root
+        .canonicalize()
+        .map_err(|error| invalid(format!("cannot resolve the kit checkout: {error}")))?;
+    let source = |relative: &str| -> io::Result<PathBuf> {
+        inventory::owned_source(&root, relative)
+            .map_err(|error| invalid(format!("cannot resolve {relative}: {error}")))
+    };
     let read = |relative: &str| -> io::Result<String> {
-        inventory::text(&inventory::owned_source(&root, relative)?)
+        inventory::text(&source(relative)?)
             .map_err(|error| invalid(format!("cannot read {relative}: {error}")))
     };
     let manifest: inventory::Manifest = serde_json::from_str(&read("global/kit.json")?)
@@ -85,7 +91,7 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
         ));
     }
     let common = read(&manifest.instructions)?;
-    let common_path = inventory::owned_source(&root, &manifest.instructions)?.canonicalize()?;
+    let common_path = source(&manifest.instructions)?.canonicalize()?;
     let profile: toml::Table =
         toml::from_str(read(&manifest.profile)?.trim_start_matches('\u{feff}'))
             .map_err(|_| invalid("invalid owned profile"))?;
@@ -93,7 +99,7 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
     let mut bodies = BTreeMap::new();
     let mut role_paths = BTreeSet::new();
     for (key, value) in &descriptor.roles {
-        let path = inventory::owned_source(&root, &value.instructions)?;
+        let path = source(&value.instructions)?;
         let canonical = path.canonicalize()?;
         if canonical == common_path || !role_paths.insert(canonical) {
             return Err(invalid("each role needs its own instruction source"));
@@ -118,7 +124,7 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
         }
     }
     let mut skills = Vec::new();
-    let skill_root = inventory::owned_source(&root, &manifest.skills)?;
+    let skill_root = source(&manifest.skills)?;
     for entry in fs::read_dir(skill_root)? {
         let entry = entry?;
         let path = entry.path();
@@ -315,6 +321,18 @@ mod tests {
         assert_ne!(
             executor.revision,
             resolve(root.path(), Role::Executor).unwrap().revision
+        );
+    }
+
+    #[test]
+    fn missing_role_input_names_the_source_and_recovery_action() {
+        let root = fixture();
+        fs::remove_file(root.path().join("global/roles/executor.md")).unwrap();
+        let error = resolve(root.path(), Role::Lead).unwrap_err().to_string();
+        assert!(error.contains("global/roles/executor.md"), "{error}");
+        assert!(
+            error.contains("repair") || error.contains("update"),
+            "{error}"
         );
     }
 
