@@ -4,6 +4,8 @@
 
 See proposal.md. The CLI constructs one absolute deadline from the managed registration's `--connection-seconds 86400`. The Serena proxy uses it for input, request budgets and output, so expiry closes STDIO. A live baseline with a 90-second limit completed initialization, kept client input open and exited after 90.24 seconds with `Serena proxy deadline expired` and exit code 2. A 2-second cold-start attempt failed before initialization and is not the expiry reproducer.
 
+The installed Nuphus entry point reproduces the same failure with an eight-second limit: initialization succeeds at 0.17 seconds, client input remains open, and the proxy naturally exits with code 2 after 8.17 seconds (`MCP connection deadline expired`; the input worker reports a deadline and confirms its join).
+
 ## Goals / Non-Goals
 
 Keep open managed Serena and Nuphus connections usable across long conversations and returns after idle periods. Preserve existing finite operation budgets, bounded cleanup, broker/worker lifecycle and explicit finite-lifetime probes. This repair does not add a client reconnection service.
@@ -29,5 +31,7 @@ Run focused baseline/candidate checks, install the immutable candidate through t
 ## Verification and existing limitations
 
 The native CLI comparison exercises a two-second finite connection and an unlimited connection that receives requests after three seconds, then exits on client EOF. Pipe regressions verify delayed data, EOF, cancellation and unchanged bounded I/O. The focused CLI, registration and pipe suites pass. With an explicit adopted registry, `cargo test --locked -p codex-harness --test serena_stdio --jobs 2 -- --ignored --test-threads=1` passes all five real-package checks, including semantic edit/readback, independent roots and transport recovery without replaying edits.
+
+An installed external-project check initializes and activates Serena, reads symbols, keeps the same client open for 310 seconds, observes the original idle worker exit, and reads symbols again without reactivation. The route is preserved and client EOF exits with code 0. This exercises worker retirement and return; it is not a 24-hour soak test.
 
 The full repository gates are not clean: controlled base/candidate checks retain the same formatting differences in `serena_acceptance.rs` and `serena_configuration.rs`, Clippy errors in `task_worktree.rs`, five orchestration tests tied to the configured executor profile and a token-audit cache test failure. These are outside the changed files and are not counted as passing gates. Changed Rust files pass their formatting check; focused regression acceptance remains separate from these existing failures. An explicit Serena diagnostic query returned an empty object, which does not establish fresh, complete analysis.
