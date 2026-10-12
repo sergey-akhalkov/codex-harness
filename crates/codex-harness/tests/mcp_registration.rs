@@ -814,7 +814,7 @@ fn isolated_apply_accepts_native_serena_proxy_and_keeps_foreign_servers() {
             "--source-root",
             root.path(),
             "--connection-seconds",
-            "86400"
+            "0"
         ],
         "env": {"CODEX_HOME": home},
         "startup_timeout_sec": 30,
@@ -844,6 +844,12 @@ fn isolated_apply_accepts_native_serena_proxy_and_keeps_foreign_servers() {
         "{servers}"
     );
     assert_eq!(servers["serena"]["args"][1], "serena");
+    let serena_args = servers["serena"]["args"].as_array().unwrap();
+    let seconds = serena_args
+        .iter()
+        .position(|value| value == "--connection-seconds")
+        .expect("serena connection budget");
+    assert_eq!(serena_args[seconds + 1], "0", "{servers}");
     assert!(servers.get("graphify").is_none(), "{servers}");
     assert!(servers.get("codegraph").is_none(), "{servers}");
     assert_eq!(servers["nuphus"]["args"][5], "nuphus");

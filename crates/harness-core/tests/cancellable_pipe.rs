@@ -156,6 +156,73 @@ fn blocked_read_cancels_while_peer_writer_stays_open() {
 }
 
 #[test]
+fn indefinite_read_waits_for_delayed_data_then_reports_eof() {
+    let (read, write) = anonymous_pipe(PIPE_BUFFER).unwrap();
+    let cancel = Cancellation::default();
+    let mut reader = CancellablePipe::reader(read, cancel.clone()).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker_cancel = cancel.clone();
+    let worker = thread::spawn(move || {
+        let first = reader.read_indefinite(1024, &worker_cancel);
+        sender.send(first).unwrap();
+        let second = reader.read_indefinite(1024, &worker_cancel);
+        sender.send(second).unwrap();
+        reader.close(deadline(5_000)).unwrap();
+    });
+    // Pending input stays pending across the former poll window: an indefinite
+    // read has no deadline to trip.
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(400)).is_err(),
+        "indefinite read returned before any input arrived"
+    );
+    let mut writer = CancellablePipe::writer(write, cancel.clone()).unwrap();
+    writer
+        .write_all(b"delayed\n", deadline(5_000), &cancel)
+        .unwrap();
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        b"delayed\n".to_vec()
+    );
+    // Peer EOF ends the pending read instead of leaving it blocked.
+    drop(writer);
+    match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+        Err(PipeIoError::EndOfFile) => {}
+        other => panic!("expected EOF after the peer writer closed, got {other:?}"),
+    }
+    worker.join().unwrap();
+}
+
+#[test]
+fn indefinite_read_cancellation_joins_the_worker() {
+    let (read, write) = anonymous_pipe(PIPE_BUFFER).unwrap();
+    let cancel = Cancellation::default();
+    let mut reader = CancellablePipe::reader(read, cancel.clone()).unwrap();
+    let cancel_flag = cancel.clone();
+    let helper = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(80));
+        cancel_flag.cancel();
+    });
+    let begin = Instant::now();
+    let error = reader.read_indefinite(8, &cancel).unwrap_err();
+    helper.join().unwrap();
+    let elapsed = begin.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "cancelled indefinite read took {elapsed:?}"
+    );
+    assert_cancelled(error, reader.io_started());
+    assert!(reader.io_started(), "fixture cancelled before entering I/O");
+    assert_eq!(
+        unsafe { GetFileType(write.as_raw_handle()) },
+        FILE_TYPE_PIPE
+    );
+    reader.close(deadline(5_000)).unwrap();
+}
+
+#[test]
 fn blocked_write_cancels_while_peer_does_not_drain() {
     let (read, write) = anonymous_pipe(64).unwrap();
     let cancel = Cancellation::default();

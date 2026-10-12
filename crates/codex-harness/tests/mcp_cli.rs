@@ -17,6 +17,11 @@ fn native_mcp_options_fail_before_opening_a_connection_or_creating_state() {
         vec!["mcp", "nuphus", "--executable"],
         vec!["mcp", "nuphus", "--unknown", "x"],
         vec!["mcp", "nuphus", "--connection-seconds", "0"],
+        // `0` is the Serena unlimited mode: an incomplete invocation still
+        // fails on its missing inputs, and out-of-range bounds stay rejected.
+        vec!["mcp", "serena", "--connection-seconds", "0"],
+        vec!["mcp", "serena", "--connection-seconds", "86401"],
+        vec!["mcp", "serena", "--connection-seconds", "abc"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
             .current_dir(root.path())

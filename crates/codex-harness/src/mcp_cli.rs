@@ -81,7 +81,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
 fn serena(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp serena --serena FILE --registry FILE --codex-home DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS\nServe one Serena stdio connection as a client of the authenticated shared broker for that CODEX_HOME. The adopted Serena console entry point runs with a generated harness-owned home that pins every adopted language backend, so a session never provisions or updates a package. Forwarded native arguments come from the selected catalogue. Requests are serialized per project worker; the generated home carries the managed tool exclusions and connection prompt, so the worker's own catalogue and guidance are forwarded unchanged."
+            "codex-harness mcp serena --serena FILE --registry FILE --codex-home DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS\nServe one Serena stdio connection as a client of the authenticated shared broker for that CODEX_HOME. `--connection-seconds 0` keeps the connection available for its client's lifetime, while a positive value bounds it; requests, response writes and cleanup keep their own finite budgets either way. The adopted Serena console entry point runs with a generated harness-owned home that pins every adopted language backend, so a session never provisions or updates a package. Forwarded native arguments come from the selected catalogue. Requests are serialized per project worker; the generated home carries the managed tool exclusions and connection prompt, so the worker's own catalogue and guidance are forwarded unchanged."
         );
         return Ok(0);
     }
@@ -114,7 +114,7 @@ fn serena(args: &[OsString]) -> io::Result<i32> {
         .get(&OsString::from("--connection-seconds"))
         .and_then(|value| value.to_str())
         .and_then(|value| value.parse().ok())
-        .filter(|value| (1..=86400).contains(value))
+        .filter(|value| *value <= 86400)
         .ok_or_else(invalid)?;
     let source_root = path("--source-root")?;
     let catalogue_path = source_root.join("global/code-tools.json");
@@ -136,14 +136,17 @@ fn serena(args: &[OsString]) -> io::Result<i32> {
     };
     let (input, output) = mcp_stdio::standard_files()?;
     let cancellation = Cancellation::default();
-    let deadline = Deadline::after(Duration::from_secs(seconds))?;
+    let lifetime = match seconds {
+        0 => None,
+        seconds => Some(Deadline::after(Duration::from_secs(seconds))?),
+    };
     harness_core::serena_stdio::serve(
         configuration,
         arguments,
         input,
         output,
         &cancellation,
-        deadline,
+        lifetime,
     )?;
     Ok(0)
 }

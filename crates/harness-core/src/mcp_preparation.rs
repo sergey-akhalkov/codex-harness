@@ -113,7 +113,9 @@ fn serena_registration(
             "--registry", registry_path,
             "--codex-home", home,
             "--source-root", source,
-            "--connection-seconds", "86400"],
+            // Unlimited connection: the managed client owns the lifetime while
+            // every request, write and cleanup keeps its finite budget.
+            "--connection-seconds", "0"],
         "env": {"CODEX_HOME": home},
         "startup_timeout_sec": 30,
         "tool_timeout_sec": 660,
@@ -317,7 +319,11 @@ mod tests {
         assert!(arguments.contains(&"--registry"));
         assert!(arguments.contains(&"--codex-home"));
         assert!(arguments.contains(&"--source-root"));
-        assert!(arguments.contains(&"--connection-seconds"));
+        let seconds = arguments
+            .iter()
+            .position(|value| *value == "--connection-seconds")
+            .expect("connection budget argument");
+        assert_eq!(arguments[seconds + 1], "0", "{arguments:?}");
         assert_eq!(
             registration["env"]["CODEX_HOME"],
             home.to_string_lossy().into_owned()
@@ -371,6 +377,8 @@ mod tests {
             nuphus["args"][9],
             home.join("harness/nuphus").to_string_lossy().into_owned()
         );
+        // The Serena repair leaves the sibling Nuphus registration bounded.
+        assert_eq!(nuphus["args"][13], "86400");
 
         // A locally rewritten variant without the audited original keeps the
         // current seam instead of pinning an unaudited executable.

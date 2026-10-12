@@ -238,18 +238,38 @@ impl CancellablePipe {
         deadline: Deadline,
         cancellation: &Cancellation,
     ) -> Result<Vec<u8>, PipeIoError> {
+        self.read_inner(max, Some(deadline), cancellation)
+    }
+
+    /// Wait without a caller deadline for the next chunk: the read stays
+    /// pending until data arrives, the peer reaches EOF, or cancellation is
+    /// observed. Owners with an explicit operation budget keep `read`.
+    pub fn read_indefinite(
+        &mut self,
+        max: usize,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<u8>, PipeIoError> {
+        self.read_inner(max, None, cancellation)
+    }
+
+    fn read_inner(
+        &mut self,
+        max: usize,
+        limit: Option<Deadline>,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<u8>, PipeIoError> {
         self.require_read()?;
         if max == 0 || max > READ_CHUNK {
             return Err(PipeIoError::Unsupported {
                 reason: format!("read size {max} is outside 1..={READ_CHUNK}"),
             });
         }
-        match self.submit(Command::Read { max }, deadline, cancellation)? {
+        match self.submit(Command::Read { max }, limit, cancellation)? {
             Reply::Bytes(bytes) => Ok(bytes),
             Reply::Written(_) => Err(PipeIoError::Io(
                 "pipe reader returned a write result".into(),
             )),
-            Reply::Failed(error) => Err(self.finish_stop(error, deadline)),
+            Reply::Failed(error) => Err(self.finish_stop(error)),
         }
     }
 
@@ -269,12 +289,12 @@ impl CancellablePipe {
             Command::Write {
                 bytes: bytes.to_vec(),
             },
-            deadline,
+            Some(deadline),
             cancellation,
         )? {
             Reply::Written(count) => Ok(count),
             Reply::Bytes(_) => Err(PipeIoError::Io("pipe writer returned a read result".into())),
-            Reply::Failed(error) => Err(self.finish_stop(error, deadline)),
+            Reply::Failed(error) => Err(self.finish_stop(error)),
         }
     }
 
@@ -330,41 +350,41 @@ impl CancellablePipe {
     fn submit(
         &mut self,
         command: Command,
-        deadline: Deadline,
+        limit: Option<Deadline>,
         cancellation: &Cancellation,
     ) -> Result<Reply, PipeIoError> {
-        if let Err(error) = check_stop(deadline, cancellation, &self.cancel) {
-            return Err(self.finish_stop(error, deadline));
+        if let Err(error) = check_stop(limit, cancellation, &self.cancel) {
+            return Err(self.finish_stop(error));
         }
         let commands = self
             .commands
             .as_ref()
             .ok_or_else(|| PipeIoError::Io("pipe worker commands closed".into()))?;
-        if let Err(error) = send_bounded(commands, command, deadline, cancellation, &self.cancel) {
-            return Err(self.finish_stop(error, deadline));
+        if let Err(error) = send_bounded(commands, command, limit, cancellation, &self.cancel) {
+            return Err(self.finish_stop(error));
         }
         let replies = self
             .replies
             .as_ref()
             .ok_or_else(|| PipeIoError::Io("pipe worker replies closed".into()))?;
         loop {
-            if let Err(error) = check_stop(deadline, cancellation, &self.cancel) {
-                return Err(self.finish_stop(error, deadline));
+            if let Err(error) = check_stop(limit, cancellation, &self.cancel) {
+                return Err(self.finish_stop(error));
             }
-            match replies.recv_timeout(JOIN_POLL.min(deadline.remaining())) {
+            let wait = limit.map_or(JOIN_POLL, |deadline| JOIN_POLL.min(deadline.remaining()));
+            match replies.recv_timeout(wait) {
                 Ok(reply) => return Ok(reply),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(self.finish_stop(
-                        PipeIoError::Io("pipe worker disconnected before reply".into()),
-                        deadline,
-                    ));
+                    return Err(self.finish_stop(PipeIoError::Io(
+                        "pipe worker disconnected before reply".into(),
+                    )));
                 }
             }
         }
     }
 
-    fn finish_stop(&mut self, error: PipeIoError, _deadline: Deadline) -> PipeIoError {
+    fn finish_stop(&mut self, error: PipeIoError) -> PipeIoError {
         request_stop(&self.shared);
         let cleanup =
             Deadline::after(Duration::from_secs(2)).expect("bounded pipe cleanup duration");
@@ -711,16 +731,18 @@ fn interrupt_worker(shared: &Shared) {
 fn send_bounded(
     commands: &SyncSender<Command>,
     command: Command,
-    deadline: Deadline,
+    limit: Option<Deadline>,
     caller: &Cancellation,
     stored: &Cancellation,
 ) -> Result<(), PipeIoError> {
     loop {
-        check_stop(deadline, caller, stored)?;
+        check_stop(limit, caller, stored)?;
         match commands.try_send(clone_command(&command)) {
             Ok(()) => return Ok(()),
             Err(mpsc::TrySendError::Full(_)) => {
-                std::thread::sleep(JOIN_POLL.min(deadline.remaining()));
+                std::thread::sleep(
+                    limit.map_or(JOIN_POLL, |deadline| JOIN_POLL.min(deadline.remaining())),
+                );
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 return Err(PipeIoError::Io("pipe worker command channel closed".into()));
@@ -739,7 +761,7 @@ fn clone_command(command: &Command) -> Command {
 }
 
 fn check_stop(
-    deadline: Deadline,
+    limit: Option<Deadline>,
     caller: &Cancellation,
     stored: &Cancellation,
 ) -> Result<(), PipeIoError> {
@@ -748,7 +770,7 @@ fn check_stop(
             worker_joined: false,
         });
     }
-    if deadline.expired() {
+    if limit.is_some_and(|deadline| deadline.expired()) {
         return Err(PipeIoError::DeadlineExpired {
             worker_joined: false,
         });

@@ -560,6 +560,16 @@ impl Proxy {
         project: &Path,
         console: &Path,
     ) -> Self {
+        Self::start_with_seconds(codex_home, registry, project, console, "900")
+    }
+
+    fn start_with_seconds(
+        codex_home: &Path,
+        registry: &Path,
+        project: &Path,
+        console: &Path,
+        seconds: &str,
+    ) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
             .arg("mcp")
             .arg("serena")
@@ -572,7 +582,7 @@ impl Proxy {
             .arg("--source-root")
             .arg(repo())
             .arg("--connection-seconds")
-            .arg("900")
+            .arg(seconds)
             .current_dir(project)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1290,4 +1300,104 @@ fn shared_broker_keeps_independent_roots_and_replaces_changed_configuration() {
         retirement,
         broker_launch::Retirement::Pending { .. }
     ));
+}
+
+/// Synthetic adopted registry for the managed stdio lifetime regressions. The
+/// console is only a file: without an initialize, the proxy never contacts a
+/// broker, so the transport itself is what the test exercises.
+fn synthetic_adopted_registry(root: &Path) -> (PathBuf, PathBuf) {
+    let console = root.join("serena.exe");
+    fs::write(&console, b"fixture console").unwrap();
+    let registry = root.join("code-tools.json");
+    fs::write(
+        &registry,
+        serde_json::to_vec(&json!({
+            "mcp": [{
+                "id": "serena",
+                "status": "adopted",
+                "paths": {"console_entrypoint": console}
+            }],
+            "languages": [{
+                "id": "rust", "serena_id": "rust", "status": "adopted",
+                "paths": {"executable": console}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    (registry, console)
+}
+
+/// The finite comparison window shared by the lifetime regression pair: the
+/// bounded case must expire inside it while its client keeps input open, and
+/// the unlimited case must survive it and keep serving requests.
+const FINITE_WINDOW_SECONDS: u64 = 2;
+
+#[test]
+fn finite_connection_expires_for_an_open_client_within_the_comparison_window() {
+    let root = tempfile::tempdir().unwrap();
+    let (registry, console) = synthetic_adopted_registry(root.path());
+    let codex_home = root.path().join("codex-home");
+    let seconds = FINITE_WINDOW_SECONDS.to_string();
+    let started = Instant::now();
+    let mut proxy =
+        Proxy::start_with_seconds(&codex_home, &registry, root.path(), &console, &seconds);
+    let limit = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = proxy.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < limit,
+            "bounded Serena connection did not expire: {:?}",
+            proxy.stderr.lock().unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(2), "proxy exit: {status:?}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1_500),
+        "bounded connection exited before its window: {elapsed:?}"
+    );
+    let stderr = proxy.stderr.lock().unwrap().clone();
+    assert!(
+        stderr
+            .iter()
+            .any(|line| line.contains("Serena proxy deadline expired")),
+        "{stderr:?}"
+    );
+    // The client input was never closed, so the exit is the finite connection
+    // age: the recorded baseline behaviour that managed clients must no longer
+    // inherit.
+}
+
+#[test]
+fn unlimited_managed_connection_survives_delayed_input_and_serves_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let (registry, console) = synthetic_adopted_registry(root.path());
+    let codex_home = root.path().join("codex-home");
+    let mut proxy = Proxy::start_with_seconds(&codex_home, &registry, root.path(), &console, "0");
+    // Delayed input: stay idle past the finite comparison window.
+    thread::sleep(Duration::from_secs(FINITE_WINDOW_SECONDS + 1));
+    assert!(
+        proxy.child.try_wait().unwrap().is_none(),
+        "managed connection expired while its client stayed open: {:?}",
+        proxy.stderr.lock().unwrap()
+    );
+    // Requests keep being served after the former expiry point. They carry no
+    // initialize, so the transport answers them without contacting a broker.
+    let reply = proxy.request(1, "tools/list", json!({}));
+    assert_eq!(reply["id"], 1, "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must initialize first"),
+        "{reply}"
+    );
+    let later = proxy.request(2, "tools/list", json!({}));
+    assert_eq!(later["id"], 2, "{later}");
+    // Closing the client terminates the proxy without an orphan transport.
+    proxy.finish();
 }
