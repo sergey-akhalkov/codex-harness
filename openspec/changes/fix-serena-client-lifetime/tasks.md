@@ -3,8 +3,8 @@
 ## 1. Transport repair
 
 - [x] 1.1 Reproduce the finite-lifetime baseline with a successful native MCP initialization and open client input; record natural exit, error and elapsed time in the design.
-- [ ] 1.2 Add unlimited Serena connection mode with cancellable input and finite operation/cleanup budgets; native tests must cover delayed input, EOF, cancellation, retained finite mode and bounded timeout behavior.
-- [ ] 1.3 Generate unlimited managed Serena registrations and document the reconnect boundary; verify registration/CLI checks and relevant documentation links.
+- [x] 1.2 Add unlimited Serena connection mode with cancellable input and finite operation/cleanup budgets; native tests must cover delayed input, EOF, cancellation, retained finite mode and bounded timeout behavior.
+- [x] 1.3 Generate unlimited managed Serena registrations and document the reconnect boundary; verify registration/CLI checks and relevant documentation links.
 
 ## 2. Integration and delivery
 

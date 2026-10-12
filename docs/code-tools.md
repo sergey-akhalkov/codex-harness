@@ -12,6 +12,16 @@ for manual inspection or deletion.
 Start a new Codex session to load current registrations. Existing sessions keep
 previously loaded catalogues until restart.
 
+Managed Serena connections use `--connection-seconds 0`: their STDIO lifetime
+follows the client, so leaving a conversation open or returning after a long
+pause does not expire its transport. Individual requests, response writes,
+cleanup and idle project workers retain their finite limits. A positive
+`--connection-seconds` value remains an explicit finite-lifetime probe option.
+If an older proxy has already returned `Transport closed` after its former
+24-hour limit, reconnect Serena in its owning client, or restart and resume
+that client, once after updating the installation. Repeated activation calls
+cannot reopen an already closed STDIO connection.
+
 ## Selecting tools in everyday work
 
 The [global MCP selection rules](../global/principles-of-work.md#mcp-tool-selection)

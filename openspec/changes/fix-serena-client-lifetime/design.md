@@ -24,3 +24,9 @@ Keep open managed Serena connections usable across long conversations and return
 ## Migration Plan
 
 Run focused baseline/candidate checks, install the immutable candidate through the normal lifecycle, update the Serena registration and validate installation ownership. Exercise the installed entry point from an external project. Preserve the lifecycle recovery receipt and report the one-time reconnection boundary.
+
+## Verification and existing limitations
+
+The native CLI comparison exercises a two-second finite connection and an unlimited connection that receives requests after three seconds, then exits on client EOF. Pipe regressions verify delayed data, EOF, cancellation and unchanged bounded I/O. The focused CLI, registration and pipe suites pass. With an explicit adopted registry, `cargo test --locked -p codex-harness --test serena_stdio --jobs 2 -- --ignored --test-threads=1` passes all five real-package checks, including semantic edit/readback, independent roots and transport recovery without replaying edits.
+
+The full repository gates are not clean: controlled base/candidate checks retain the same formatting differences in `serena_acceptance.rs` and `serena_configuration.rs`, Clippy errors in `task_worktree.rs`, five orchestration tests tied to the configured executor profile and a token-audit cache test failure. These are outside the changed files and are not counted as passing gates. Changed Rust files pass their formatting check; focused regression acceptance remains separate from these existing failures. An explicit Serena diagnostic query returned an empty object, which does not establish fresh, complete analysis.
