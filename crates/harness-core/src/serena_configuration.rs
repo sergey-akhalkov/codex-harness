@@ -108,6 +108,20 @@ pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Val
             setting["pp"] = json!(fpc.to_string_lossy().into_owned());
             setting["fpcdir"] = json!(source.to_string_lossy().into_owned());
         }
+        if serena_id == "csharp" {
+            // Roslyn resolves its dependency provider before using ls_base_cmd.
+            // Pin its cache lookup as well, so it reuses the adopted DLL.
+            let version = record["version"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| unavailable("missing adopted Roslyn version"))?;
+            setting["csharp_language_server_version"] = json!(version);
+            setting["runtime_dependencies"] = json!([{
+                "id": "CSharpLanguageServer",
+                "platform_id": "win-x64",
+                "binary_name": base[1].to_string_lossy(),
+            }]);
+        }
         settings.insert(serena_id.to_owned(), setting.clone());
         // The retired seam mapped several Serena ids onto one adopted backend
         // (for example both `python` and `python_basedpyright`).
@@ -147,6 +161,20 @@ pub(crate) fn pasls_directory(registry: &Value) -> io::Result<Option<PathBuf>> {
         "language server executable",
     )?;
     Ok(executable.parent().map(Path::to_path_buf))
+}
+
+/// The adopted .NET host must also be discoverable by Roslyn's dependency
+/// provider before it uses the pinned language-server command.
+pub(crate) fn csharp_directory(registry: &Value) -> io::Result<Option<PathBuf>> {
+    let Some(record) = registry["languages"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == "csharp"))
+        .filter(|record| adopted(record))
+    else {
+        return Ok(None);
+    };
+    let host = required_file(record["paths"]["dotnet"].as_str(), ".NET host")?;
+    Ok(host.parent().map(Path::to_path_buf))
 }
 
 fn launch_setting(base: &[PathBuf], args: &[String]) -> Value {
@@ -610,7 +638,7 @@ mod tests {
         fs::write(&host, b"inert").unwrap();
         fs::write(&server, b"inert").unwrap();
         let registry = json!({"languages":[{
-            "id":"csharp","serena_id":"csharp","status":"adopted",
+            "id":"csharp","serena_id":"csharp","status":"adopted","version":"5.11.0",
             "paths":{"dotnet":host,"entrypoint":server,"runtime_root":runtime}
         }]});
         let settings = ls_specific_settings(&registry).unwrap();
@@ -622,8 +650,30 @@ mod tests {
             settings["csharp"]["ls_args"],
             json!(["--stdio", "--logLevel=Information"])
         );
+        assert_eq!(
+            settings["csharp"]["csharp_language_server_version"],
+            "5.11.0"
+        );
+        assert_eq!(
+            settings["csharp"]["runtime_dependencies"],
+            json!([{"id":"CSharpLanguageServer","platform_id":"win-x64",
+                "binary_name":local_path(&server).unwrap()}])
+        );
+        assert_eq!(
+            csharp_directory(&registry).unwrap(),
+            Some(local_path(root.path()).unwrap())
+        );
+        let mut missing_version = registry.clone();
+        missing_version["languages"][0]["version"] = Value::Null;
+        assert!(ls_specific_settings(&missing_version).is_err());
         fs::write(root.path().join("Example.csproj"), b"<Project />").unwrap();
         ensure_supported_languages(&registry, root.path()).unwrap();
+        fs::remove_file(&host).unwrap();
+        assert!(csharp_directory(&registry).is_err());
+        fs::write(&host, b"inert").unwrap();
+        let mut absent = registry.clone();
+        absent["languages"][0]["status"] = json!("absent");
+        assert!(csharp_directory(&absent).unwrap().is_none());
         fs::remove_file(&server).unwrap();
         assert!(ls_specific_settings(&registry).is_err());
         fs::write(&server, b"inert").unwrap();

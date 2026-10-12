@@ -161,17 +161,21 @@ fn base_environment(
         .env
         .insert("PIP_REQUIRE_VIRTUALENV".into(), Some("1".into()));
     command.env.insert("UV_NO_CACHE".into(), Some("1".into()));
-    // The pascal backend resolves `pasls` from PATH before its per-home cache
-    // and would otherwise download a copy into the owned home; the adopted
-    // shared directory keeps session startup download-free. A recorded but
-    // vanished installation is refused instead of falling back to provisioning.
-    if let Some(directory) = crate::serena_configuration::pasls_directory(inventory)? {
-        let mut paths = directory.into_os_string();
-        paths.push(";");
+    // These providers inspect PATH before using their pinned launch commands.
+    // Only validated adopted installations precede the inherited environment.
+    let mut paths: Vec<_> = [
+        crate::serena_configuration::pasls_directory(inventory)?,
+        crate::serena_configuration::csharp_directory(inventory)?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !paths.is_empty() {
         if let Some(existing) = std::env::var_os("PATH") {
-            paths.push(existing);
+            paths.extend(std::env::split_paths(&existing));
         }
-        command.env.insert("PATH".into(), Some(paths));
+        let path = std::env::join_paths(paths).map_err(io::Error::other)?;
+        command.env.insert("PATH".into(), Some(path));
     }
     Ok(())
 }
