@@ -190,7 +190,8 @@ fn names_path(entry: &toml::Value, path: &Path) -> bool {
 
 impl ResolvedRole {
     /// `retained` is the applicable native user/project layer, excluding the
-    /// owned portable defaults. Return only role-owned overrides. Foreign skill
+    /// owned portable defaults. Return only native dotted leaf overrides, so
+    /// callers cannot replace the surrounding skills table. Foreign skill
     /// entries and their unknown fields survive; allowed skills are never enabled.
     /// Explicit later native CLI overrides retain their native precedence.
     pub fn native_overrides(&self, retained: &toml::Table) -> io::Result<toml::Table> {
@@ -204,7 +205,14 @@ impl ResolvedRole {
             Some(toml::Value::Array(values)) => values.clone(),
             Some(_) => return Err(invalid("skills.config must be an array")),
         };
-        for skill in self.skills.iter().filter(|skill| !skill.allowed) {
+        for skill in &self.skills {
+            let explicitly_disabled = entries.iter().any(|entry| {
+                names_path(entry, &skill.path)
+                    && entry.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+            });
+            if skill.allowed && !explicitly_disabled {
+                continue;
+            }
             let mut present = false;
             for entry in entries
                 .iter_mut()
@@ -232,10 +240,7 @@ impl ResolvedRole {
                 "developer_instructions".into(),
                 join_instructions(&self.developer_instructions, instruction(retained)?).into(),
             ),
-            (
-                "skills".into(),
-                toml::Value::Table(toml::Table::from_iter([("config".into(), entries.into())])),
-            ),
+            ("skills.config".into(), entries.into()),
         ]))
     }
 }
@@ -337,6 +342,34 @@ mod tests {
     }
 
     #[test]
+    fn role_selection_never_reenables_a_disable_retained_from_another_layer() {
+        let root = fixture();
+        let role = resolve(root.path(), Role::Lead).unwrap();
+        let path = role.skills[0].path.to_string_lossy();
+        let entries = [false, true]
+            .into_iter()
+            .map(|enabled| {
+                toml::Value::Table(toml::Table::from_iter([
+                    ("path".into(), path.as_ref().into()),
+                    ("enabled".into(), enabled.into()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let retained = toml::Table::from_iter([(
+            "skills".into(),
+            toml::Value::Table(toml::Table::from_iter([("config".into(), entries.into())])),
+        )]);
+        let overrides = role.native_overrides(&retained).unwrap();
+        let entries = overrides["skills.config"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["enabled"].as_bool() == Some(false))
+        );
+    }
+
+    #[test]
     fn invalid_retained_configuration_is_not_silently_replaced() {
         let root = fixture();
         let role = resolve(root.path(), Role::Executor).unwrap();
@@ -391,13 +424,13 @@ mod tests {
             overrides["developer_instructions"].as_str().unwrap(),
             "Shared developer\n\nExecutor responsibility\n\nUser guidance"
         );
-        let config = overrides["skills"]["config"].as_array().unwrap();
+        let config = overrides["skills.config"].as_array().unwrap();
         assert_eq!(config.len(), 3);
         assert_eq!(config[0], before["skills"]["config"][0]);
         assert_eq!(config[1]["enabled"].as_bool(), Some(false));
         assert_eq!(config[2]["enabled"].as_bool(), Some(false));
         let empty = role.native_overrides(&toml::Table::new()).unwrap();
-        let entries = empty["skills"]["config"].as_array().unwrap();
+        let entries = empty["skills.config"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(names_path(&entries[0], &coordinate.path));
     }

@@ -56,6 +56,76 @@ pub fn overrides(
     Ok(result)
 }
 
+/// Retain context settings for responsibility-role composition. Callers pass
+/// their already-resolved native profile and explicit session overrides; this
+/// function never chooses a profile, model, provider or effort.
+///
+/// Developer text follows user < profile < trusted project < explicit session.
+/// Skill entries are retained across those layers: native 0.162.1 prompt
+/// discovery honors user disables even when config/read reports the project's
+/// replacement array. Passing only that effective array would re-enable skills.
+pub fn retained_role_config(
+    codex_home: &Path,
+    working_directory: &Path,
+    profile: Option<&toml::Table>,
+    session: &toml::Table,
+) -> io::Result<toml::Table> {
+    let user = read_user(codex_home)?;
+    let mut trust = user.clone();
+    if let Some(profile) = profile {
+        merge_tables(&mut trust, profile);
+    }
+    merge_tables(&mut trust, session);
+    let project = trusted_project_config(&trust, working_directory)?;
+    let mut retained = toml::Table::new();
+    let mut skills = Vec::new();
+    for layer in std::iter::once(&user)
+        .chain(profile)
+        .chain(project.as_ref())
+        .chain(std::iter::once(session))
+    {
+        if let Some(value) = layer.get("developer_instructions") {
+            if !value.is_str() {
+                return Err(io::Error::other("developer_instructions must be text"));
+            }
+            retained.insert("developer_instructions".into(), value.clone());
+        }
+        if let Some(value) = layer.get("skills") {
+            let table = value
+                .as_table()
+                .ok_or_else(|| io::Error::other("skills must be a table"))?;
+            if let Some(value) = table.get("config") {
+                let entries = value
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("skills.config must be an array"))?;
+                for entry in entries {
+                    if !skills.contains(entry) {
+                        skills.push(entry.clone());
+                    }
+                }
+            }
+        }
+    }
+    retained.insert(
+        "skills".into(),
+        toml::Value::Table(toml::Table::from_iter([("config".into(), skills.into())])),
+    );
+    Ok(retained)
+}
+
+fn merge_tables(target: &mut toml::Table, source: &toml::Table) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(toml::Value::Table(target)), toml::Value::Table(source)) => {
+                merge_tables(target, source);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// Resolve the model and reasoning effort a plain session start in
 /// `working_directory` would use. The applicable trusted-project file wins
 /// over the user configuration; the portable shared file remains the lowest
@@ -261,6 +331,65 @@ fn leaves<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_role_layers_keep_native_precedence_and_all_explicit_disables() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        let project_key = toml::Value::String(path_key(&project));
+        let user_text = format!(
+            "developer_instructions = 'user'\nmodel = 'untouched'\n[projects.{project_key}]\ntrust_level = 'trusted'\n[[skills.config]]\npath = '/user/SKILL.md'\nenabled = false\n"
+        );
+        let project_text = "developer_instructions = 'project'\n[[skills.config]]\npath = '/project/SKILL.md'\nenabled = false\n";
+        fs::write(home.join("config.toml"), &user_text).unwrap();
+        fs::write(project.join(".codex/config.toml"), project_text).unwrap();
+        let profile = parse("developer_instructions = 'profile'").unwrap();
+        let explicit = parse("developer_instructions = 'explicit'").unwrap();
+        let retained =
+            retained_role_config(&home, &project, Some(&profile), &toml::Table::new()).unwrap();
+        assert_eq!(retained["developer_instructions"].as_str(), Some("project"));
+        assert_eq!(retained["skills"]["config"].as_array().unwrap().len(), 2);
+        assert!(!retained.contains_key("model"));
+        let retained = retained_role_config(&home, &project, Some(&profile), &explicit).unwrap();
+        assert_eq!(
+            retained["developer_instructions"].as_str(),
+            Some("explicit")
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            user_text
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(".codex/config.toml")).unwrap(),
+            project_text
+        );
+    }
+
+    #[test]
+    fn retained_role_configuration_ignores_untrusted_project_and_rejects_bad_arrays() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        fs::write(home.join("config.toml"), "developer_instructions = 'user'").unwrap();
+        fs::write(
+            project.join(".codex/config.toml"),
+            "developer_instructions = 'untrusted'",
+        )
+        .unwrap();
+        let profile = parse("developer_instructions = 'profile'").unwrap();
+        let retained =
+            retained_role_config(&home, &project, Some(&profile), &toml::Table::new()).unwrap();
+        assert_eq!(retained["developer_instructions"].as_str(), Some("profile"));
+        let invalid = parse("skills.config = 'invalid'").unwrap();
+        assert!(retained_role_config(&home, &project, None, &invalid).is_err());
+    }
+
     #[test]
     fn live_policy_local_preferences_and_leaf_arguments() {
         let root = tempfile::tempdir().unwrap();
