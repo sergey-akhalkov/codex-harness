@@ -1,10 +1,12 @@
 # Kit-owned role routing. Native `codex --profile <id>` names must exist on the
 # target installation; missing names and non-positive limits are errors.
-# `default` is the native session without an explicit profile flag.
+# `default` is the native session without an explicit profile flag, running the
+# shared GPT-6 Astra default at `xhigh`; `ds` is the local DeepSeek V4.1 Flash
+# profile at `max`. No xAI/Z.AI fallback is used.
 schema = 1
 lead_profile = "default"
-successor_lead_profile = "zai"
-executor_profiles = ["xai"]
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
 # Also sizes the harness-owned executor worktree pool: dispatch creates,
 # synchronizes and binds sibling slots `<repository-name>-wt1` .. `-wtN`, and
 # refuses dispatch when all are held by live sessions instead of allocating

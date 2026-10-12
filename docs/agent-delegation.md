@@ -2,8 +2,8 @@
 
 Selection has two paths; never mix them. Ordinary in-session subagents take
 explicit `model` and supported `reasoning_effort` parameters per assignment;
-GPT normally leads, Z.AI handles substantial text/code execution, and Grok
-handles visual and suitable routine work. Kit executor dispatch takes no
+GPT-6 Astra at `xhigh` leads, and DeepSeek V4.1-Flash at `max` executes
+delegated work; xAI and Z.AI models are not used. Kit executor dispatch takes no
 per-assignment model or effort: it runs exactly the configured executor
 profiles, and the profile's configured model and reasoning effort are that
 assignment's complete explicit selection. The kit configures one executor,
@@ -14,20 +14,24 @@ file per effort or activity is unnecessary. Supported efforts differ by
 model; verify the effective binding instead of assuming every level exists on
 every route.
 
+The DeepSeek profile must set `[features] code_mode = false`: its
+[Responses API](https://api-docs.deepseek.com/guides/responses_api/) accepts
+`apply_patch` as a custom tool but rejects Code Mode's `exec`. Ordinary command
+and function tools remain available. Keep this compatibility setting in the
+local `ds.config.toml` profile; the shared default can keep Code Mode enabled.
+
 The removed Astra names migrate to these direct arguments. This table preserves
 their former meaning; it does not prescribe an effort for every new assignment.
 
 | Former purpose | Retired name | Model argument | Effort argument |
 | --- | --- | --- | --- |
-| Backup middle when Grok is unavailable | `middle_backup` | `gpt-6-astra` | `high` |
+| Backup middle for a hard slice | `middle_backup` | `gpt-6-astra` | `high` |
 | Main session; a separate hard slice when needed | `senior` | `gpt-6-astra` | `xhigh` |
 | Rare consultation on a hard intellectual blocker | `principal` | `gpt-6-astra` | `max` |
 
 For example, use an ordinary agent with `model="gpt-6-astra"` and
-`reasoning_effort="high"` instead of `agent_type="middle_backup"`. The same
-parameter selection applies to enabled external models. Use `codex --profile xai` with `grok-4.7` / `xhigh` instead of any subscription
-middle preset. Those OpenCodex role files are retired. The former
-`grok_reviewer` remains retired.
+`reasoning_effort="high"` instead of `agent_type="middle_backup"`. Those
+OpenCodex role files are retired. The former `grok_reviewer` remains retired.
 
 Every active conversation needs its own visible terminal surface with a
 distinct title - a dedicated tab in the same terminal, a pane or a window -
@@ -59,8 +63,8 @@ Synthetic example (not a live consumer):
 ```toml
 schema = 1
 lead_profile = "default"
-successor_lead_profile = "xai"
-executor_profiles = ["xai"]
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
 max_concurrent_executors = 4
 ```
 
@@ -461,12 +465,12 @@ be performed directly by the parent when a worker would add overhead. The
 own when to reconsider the method, including successive different failures in
 one unlearned layer.
 
-If Grok is missing from the catalogue or an access, model or quota error is
-returned, the parent briefly reports the cause and chooses an available capable
-route with explicit binding. A retry is justified by changed circumstances; do not recheck the
-same error on every step. Inspect saved partial work before reassignment. A
-transport error is not a reason for Astra max consultation. There is no mandatory
-escalation ladder.
+If an assigned model is missing from the catalogue or an access, model or quota
+error is returned, the parent briefly reports the cause and continues on the
+configured route; it neither substitutes a provider silently nor falls back to
+xAI/Z.AI. A retry is justified by changed circumstances; do not recheck the
+same error on every step. Inspect saved partial work before reassignment. There
+is no mandatory escalation ladder.
 
 ## Global connection and limits
 
@@ -496,14 +500,12 @@ Do not stop the proxy from a session that uses it.
 
 ## Subscriptions and auxiliary calls
 
-All assigned OpenAI models belong to Astra. Adapter search is explicitly aimed
-at Grok 4.6 through xAI OAuth; the automatic vision helper is off. Grok 4.6
-supports its own image input. If a selected model lacks a capability, that must
+All assigned OpenAI models belong to Astra. The xAI and Z.AI routes remain
+installed but are not used for assigned work; the automatic vision helper is
+off. If a selected model lacks a capability, that must
 become a visible limit or a separate explicit assignment, not a hidden ChatGPT
 quota borrow. Routing settings are owned by the native subscription lifecycle
 described in [subscription models](subscription-models.md).
-Grok `xhigh` support is described in the
-[official reasoning contract](https://docs.x.ai/developers/model-capabilities/text/reasoning).
 
 Paid API keys, purchases and hidden model substitution are not enabled. Astra
 backup spends the same ChatGPT subscription as the parent. An unknown remaining
