@@ -13,9 +13,10 @@ use std::{
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn fixture() -> PathBuf {
@@ -86,7 +87,7 @@ fn native_nuphus_stdio_repairs_schema_bounds_screenshots_and_expires_refs() {
             server_input,
             server_output,
             &Cancellation::default(),
-            Deadline::after(Duration::from_secs(60)).unwrap(),
+            Some(Deadline::after(Duration::from_secs(60)).unwrap()),
         )
     });
     let mut writer = std::io::BufWriter::new(client_write);
@@ -240,6 +241,250 @@ fn native_nuphus_rejects_unreviewed_digest_before_serving() {
     );
 }
 
+/// The finite comparison window shared by the lifetime regression pair: the
+/// bounded case must expire inside it while its client keeps input open, and
+/// the unlimited case must survive it and keep serving requests.
+const FINITE_WINDOW_SECONDS: u64 = 3;
+
+struct CliNuphus {
+    child: Child,
+    responses: mpsc::Receiver<String>,
+    stderr: Arc<Mutex<Vec<String>>>,
+    started: Instant,
+}
+
+impl CliNuphus {
+    /// Spawn the real CLI entry point against the owned probe fixture. The
+    /// audited-original gate compares only the recorded digest, so the fixture
+    /// stands in for the package, and a matching catalogue cache keeps the
+    /// handshake and tools/list local: the regression exercises connection
+    /// lifetime, not a worker start.
+    fn start(root: &Path, connection_seconds: &str) -> Self {
+        let home = root.join("home");
+        let account = root.join("account");
+        let source = root.join("source");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&account).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let digest = build_identity::hash_file(&fixture()).unwrap();
+        fs::write(
+            account.join("nuphus-catalogue.json"),
+            serde_json::to_vec(&json!({
+                "identity": digest,
+                "tools": [{
+                    "name": "fixture_echo",
+                    "description": "fixture",
+                    "inputSchema": {"type": "object", "properties": {}}
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .arg("mcp")
+            .arg("nuphus")
+            .arg("--executable")
+            .arg(fixture())
+            .arg("--expected-digest")
+            .arg(digest)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--account")
+            .arg(&account)
+            .arg("--source-root")
+            .arg(&source)
+            .arg("--idle-seconds")
+            .arg("60")
+            .arg("--connection-seconds")
+            .arg(connection_seconds)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("nuphus proxy spawn");
+        let stdout = child.stdout.take().unwrap();
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let error_lines = Arc::clone(&stderr);
+        let error_stream = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            let reader = BufReader::new(error_stream);
+            for line in reader.lines().map_while(Result::ok) {
+                let mut lines = error_lines.lock().unwrap();
+                lines.push(line);
+                if lines.len() > 40 {
+                    lines.remove(0);
+                }
+            }
+        });
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if sender.send(line).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            child,
+            responses: receiver,
+            stderr,
+            started: Instant::now(),
+        }
+    }
+
+    fn write_line(&mut self, value: &Value) {
+        let stdin = self.child.stdin.as_mut().expect("proxy stdin");
+        writeln!(stdin, "{value}")
+            .and_then(|_| stdin.flush())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "proxy write failed: {error}; stderr: {:?}",
+                    self.stderr.lock().unwrap()
+                )
+            });
+    }
+
+    fn notify(&mut self, method: &str, params: Value) {
+        self.write_line(&json!({"jsonrpc":"2.0","method":method,"params":params}));
+    }
+
+    fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.write_line(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
+        self.response(id)
+    }
+
+    fn response(&mut self, id: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match self.responses.recv_timeout(Duration::from_millis(200)) {
+                Ok(line) => {
+                    let value: Value = serde_json::from_str(line.trim()).unwrap();
+                    if value["id"] == json!(id) {
+                        return value;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "nuphus proxy closed before answering request {id}; stderr: {:?}",
+                    self.stderr.lock().unwrap()
+                ),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+        panic!("nuphus proxy request {id} timed out");
+    }
+
+    /// Wait for a natural exit while the client input stays open.
+    fn wait_for_exit(&mut self, limit: Duration) -> ExitStatus {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "nuphus proxy did not exit; stderr: {:?}",
+                self.stderr.lock().unwrap()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Close the client input and require a clean exit.
+    fn finish(mut self) {
+        drop(self.child.stdin.take());
+        let status = self.wait_for_exit(Duration::from_secs(30));
+        assert!(
+            status.success(),
+            "proxy exit: {status:?}; stderr: {:?}",
+            self.stderr.lock().unwrap()
+        );
+    }
+}
+
+#[test]
+fn nuphus_finite_connection_expires_for_an_open_client_within_the_comparison_window() {
+    let root = tempfile::tempdir().unwrap();
+    let seconds = FINITE_WINDOW_SECONDS.to_string();
+    let mut proxy = CliNuphus::start(root.path(), &seconds);
+    let reply = proxy.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2024-11-05",
+            "capabilities":{},
+            "clientInfo":{"name":"nuphus-lifetime","version":"0.1.0"}
+        }),
+    );
+    assert_eq!(
+        reply["result"]["serverInfo"]["name"], "harness-nuphus",
+        "{reply}"
+    );
+    let status = proxy.wait_for_exit(Duration::from_secs(20));
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "stderr: {:?}",
+        proxy.stderr.lock().unwrap()
+    );
+    let elapsed = proxy.started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1_500),
+        "bounded connection exited before its window: {elapsed:?}"
+    );
+    let stderr = proxy.stderr.lock().unwrap().clone();
+    assert!(
+        stderr
+            .iter()
+            .any(|line| line.contains("MCP connection deadline expired")),
+        "{stderr:?}"
+    );
+    // The client input was never closed, so the exit is the finite connection
+    // age that managed Nuphus clients must no longer inherit.
+}
+
+#[test]
+fn nuphus_unlimited_managed_connection_survives_delayed_input_and_serves_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let mut proxy = CliNuphus::start(root.path(), "0");
+    let reply = proxy.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2024-11-05",
+            "capabilities":{},
+            "clientInfo":{"name":"nuphus-lifetime","version":"0.1.0"}
+        }),
+    );
+    assert_eq!(
+        reply["result"]["serverInfo"]["name"], "harness-nuphus",
+        "{reply}"
+    );
+    proxy.notify("notifications/initialized", json!({}));
+    // Delayed input: stay idle past the finite comparison window.
+    thread::sleep(Duration::from_secs(FINITE_WINDOW_SECONDS + 1));
+    assert!(
+        proxy.child.try_wait().unwrap().is_none(),
+        "managed connection expired while its client stayed open: {:?}",
+        proxy.stderr.lock().unwrap()
+    );
+    let listed = proxy.request(2, "tools/list", json!({}));
+    assert_eq!(listed["id"], 2, "{listed}");
+    assert_eq!(
+        listed["result"]["tools"][0]["name"], "fixture_echo",
+        "{listed}"
+    );
+    let later = proxy.request(3, "ping", json!({}));
+    assert_eq!(later["id"], 3, "{later}");
+    // Closing the client terminates the proxy without an orphan transport.
+    proxy.finish();
+}
+
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -284,7 +529,7 @@ fn native_nuphus_owned_browser_on_actual_tool() {
             server_input,
             server_output,
             &Cancellation::default(),
-            Deadline::after(Duration::from_secs(180)).unwrap(),
+            Some(Deadline::after(Duration::from_secs(180)).unwrap()),
         )
     });
     let mut writer = std::io::BufWriter::new(client_write);

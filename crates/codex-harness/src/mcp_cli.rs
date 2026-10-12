@@ -154,7 +154,7 @@ fn serena(args: &[OsString]) -> io::Result<i32> {
 fn nuphus(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp nuphus --executable FILE --expected-digest DIGEST --codex-home DIRECTORY --account DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS [--idle-seconds SECONDS] [--server-name NAME]\nServe one Nuphus stdio connection through the audited original binary. Handshake and tools/list stay local when the account catalogue cache matches that digest. Browser tools use a private CDP endpoint unless NUPHUS_MCP_BROWSER_CDP_URL is already set; desktop tools take the account-wide admission lock. Live global registration remains a later lifecycle task."
+            "codex-harness mcp nuphus --executable FILE --expected-digest DIGEST --codex-home DIRECTORY --account DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS [--idle-seconds SECONDS] [--server-name NAME]\nServe one Nuphus stdio connection through the audited original binary. `--connection-seconds 0` keeps the connection available for its client's lifetime, while a positive value bounds it; requests, response writes, worker startup and cleanup keep their own finite budgets either way. Handshake and tools/list stay local when the account catalogue cache matches that digest. Browser tools use a private CDP endpoint unless NUPHUS_MCP_BROWSER_CDP_URL is already set; desktop tools take the account-wide admission lock. Live global registration remains a later lifecycle task."
         );
         return Ok(0);
     }
@@ -190,7 +190,7 @@ fn nuphus(args: &[OsString]) -> io::Result<i32> {
         .get(&OsString::from("--connection-seconds"))
         .and_then(|value| value.to_str())
         .and_then(|value| value.parse().ok())
-        .filter(|value| (1..=86400).contains(value))
+        .filter(|value| *value <= 86400)
         .ok_or_else(invalid)?;
     let idle = match options.get(&OsString::from("--idle-seconds")) {
         None => None,
@@ -230,8 +230,11 @@ fn nuphus(args: &[OsString]) -> io::Result<i32> {
     };
     let (input, output) = mcp_stdio::standard_files()?;
     let cancellation = Cancellation::default();
-    let deadline = Deadline::after(Duration::from_secs(seconds))?;
-    harness_core::nuphus_stdio::serve(configuration, input, output, &cancellation, deadline)?;
+    let lifetime = match seconds {
+        0 => None,
+        seconds => Some(Deadline::after(Duration::from_secs(seconds))?),
+    };
+    harness_core::nuphus_stdio::serve(configuration, input, output, &cancellation, lifetime)?;
     Ok(0)
 }
 

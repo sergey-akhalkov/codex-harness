@@ -153,7 +153,10 @@ fn nuphus_registration(
             "--codex-home", home,
             "--account", home.join("harness/nuphus"),
             "--source-root", source,
-            "--connection-seconds", "86400"],
+            // Unlimited connection: the managed client owns the lifetime while
+            // every request, write, worker startup and cleanup keeps its finite
+            // budget. A positive value remains the explicit bounded mode.
+            "--connection-seconds", "0"],
         "env": {"CODEX_HOME": home},
         "startup_timeout_sec": 30,
         "tool_timeout_sec": 660,
@@ -377,8 +380,8 @@ mod tests {
             nuphus["args"][9],
             home.join("harness/nuphus").to_string_lossy().into_owned()
         );
-        // The Serena repair leaves the sibling Nuphus registration bounded.
-        assert_eq!(nuphus["args"][13], "86400");
+        // Nuphus uses the same unlimited connection mode as Serena.
+        assert_eq!(nuphus["args"][13], "0");
 
         // A locally rewritten variant without the audited original keeps the
         // current seam instead of pinning an unaudited executable.

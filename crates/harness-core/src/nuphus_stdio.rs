@@ -583,14 +583,17 @@ fn worker_command(
     command
 }
 
-/// Serve one Nuphus stdio connection. The connection deadline is an explicit
-/// maximum chosen by its owner. Live global registration remains a later task.
+/// Serve one Nuphus stdio connection. `None` keeps the connection available
+/// for its client's lifetime; `Some(deadline)` is an explicit maximum chosen by
+/// a bounded owner. Request deadlines, response writes, worker startup,
+/// cleanup and browser/desktop isolation keep their own finite budgets either
+/// way. Live global registration remains a later task.
 pub fn serve(
     configuration: Configuration,
     input: File,
     output: File,
     cancellation: &Cancellation,
-    deadline: Deadline,
+    lifetime: Option<Deadline>,
 ) -> io::Result<()> {
     let digest = verify_original(&configuration.executable, &configuration.expected_digest)?;
     fs::create_dir_all(&configuration.account)?;
@@ -720,17 +723,18 @@ pub fn serve(
     };
     let definitions = adapt_catalogue(tools)?;
     let session = Session::new("harness-nuphus", definitions)?;
-    let served = mcp_stdio::serve_fallible(session, input, output, cancellation, deadline, {
-        let worker = Arc::clone(&worker);
-        move |operation: Operation| {
-            worker.call(
-                &operation.name,
-                operation.arguments.clone(),
-                operation.deadline,
-                &operation.cancellation,
-            )
-        }
-    });
+    let served =
+        mcp_stdio::serve_fallible_with_lifetime(session, input, output, cancellation, lifetime, {
+            let worker = Arc::clone(&worker);
+            move |operation: Operation| {
+                worker.call(
+                    &operation.name,
+                    operation.arguments.clone(),
+                    operation.deadline,
+                    &operation.cancellation,
+                )
+            }
+        });
     let closed = worker.close();
     if let Some(browser) = owned {
         let _ = browser.lock().unwrap().reclaim();
