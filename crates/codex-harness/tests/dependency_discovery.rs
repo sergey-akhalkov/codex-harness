@@ -126,7 +126,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
     assert_eq!(report["read_only"], true);
     assert_eq!(report["network_requested"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 7);
     for item in items {
         assert_eq!(item["release"]["state"], "unresolved");
         assert!(item["release"]["version"].is_null());
@@ -168,6 +168,11 @@ fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptan
     let items = report["items"].as_array().unwrap();
     assert_eq!(items.len(), 7);
     for item in items {
+        if item["id"] == "csharp" {
+            assert_eq!(item["release"]["state"], "unresolved");
+            assert_eq!(item["action"], "conditional-absent");
+            continue;
+        }
         assert_eq!(
             item["release"]["state"], "checked",
             "{}: {}",
@@ -204,9 +209,11 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["processes_started"], 0);
     assert_eq!(report["model_calls"], 0);
-    assert_eq!(report["languages"].as_array().unwrap().len(), 4);
+    assert_eq!(report["languages"].as_array().unwrap().len(), 5);
     assert_eq!(report["mcp"].as_array().unwrap().len(), 2);
-    for id in ["serena", "nuphus", "python", "rust", "delphi", "cpp"] {
+    for id in [
+        "serena", "nuphus", "python", "rust", "delphi", "cpp", "csharp",
+    ] {
         assert_eq!(record(&report, id)["status"], "missing", "{id}: {report}");
     }
     assert!(!fixture.home.exists());
@@ -241,6 +248,78 @@ fn discover_omits_retired_codegraph_without_mutating_or_downloading() {
         "not-requested; explicit lifecycle operation required"
     );
     assert_eq!(report["processes_started"], 0);
+}
+
+#[test]
+fn csharp_discovery_requires_matching_metadata_runtime_and_unambiguous_server() {
+    let fixture = Fixture::new();
+    let observe = || fixture.observe(&["--include-process-environment"]);
+    assert_eq!(record(&observe(), "csharp")["status"], "missing");
+    fs::write(
+        fixture.bin.join("dotnet.exe"),
+        b"inert runtime host; never executed",
+    )
+    .unwrap();
+    let runtime = fixture.bin.join("shared/Microsoft.NETCore.App/10.0.11");
+    fs::create_dir_all(&runtime).unwrap();
+    for name in ["coreclr.dll", "System.Private.CoreLib.dll"] {
+        fs::write(runtime.join(name), b"inert runtime inventory").unwrap();
+    }
+    let cache = fixture
+        .home
+        .join(".serena/language_servers/static/CSharpLanguageServer");
+    let make_server =
+        |version: &str| {
+            let root = cache.join(format!("roslyn-{version}/tools/net10.0/win-x64"));
+            fs::create_dir_all(&root).unwrap();
+            let server = root.join("Microsoft.CodeAnalysis.LanguageServer.dll");
+            fs::write(&server, b"inert Roslyn; never executed").unwrap();
+            fs::write(
+                server.with_extension("runtimeconfig.json"),
+                serde_json::to_vec(&json!({
+                    "runtimeOptions":{"tfm":"net10.0",
+                        "framework":{"name":"Microsoft.NETCore.App","version":"10.0.0"}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(server.with_extension("deps.json"), serde_json::to_vec(&json!({
+            "libraries":{format!("Microsoft.CodeAnalysis.LanguageServer/{version}-fixture"):{}}
+        })).unwrap()).unwrap();
+            server
+        };
+    let server = make_server("5.11.0");
+    let report = observe();
+    let row = record(&report, "csharp");
+    assert_eq!(row["status"], "adopted", "{row}");
+    assert_eq!(row["version"], "5.11.0");
+    assert_eq!(row["serena_id"], "csharp");
+    assert_eq!(row["command"][2], "--stdio");
+    assert_eq!(row["health"]["identity_verified"], false);
+    assert_eq!(report["processes_started"], 0);
+    assert_eq!(
+        Path::new(row["paths"]["entrypoint"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        server.canonicalize().unwrap()
+    );
+    assert_eq!(
+        record(&fixture.observe(&["--no-process-environment"]), "csharp")["status"],
+        "missing"
+    );
+    fs::remove_file(runtime.join("coreclr.dll")).unwrap();
+    assert_eq!(record(&observe(), "csharp")["status"], "missing");
+    fs::write(runtime.join("coreclr.dll"), b"inert").unwrap();
+    fs::write(
+        server.with_extension("deps.json"),
+        br#"{"libraries":{"Other/5.11.0":{}}}"#,
+    )
+    .unwrap();
+    assert_eq!(record(&observe(), "csharp")["status"], "missing");
+    make_server("5.11.0");
+    let other = make_server("5.12.0");
+    assert_eq!(record(&observe(), "csharp")["status"], "ambiguous");
+    assert!(server.is_file() && other.is_file());
 }
 
 #[test]

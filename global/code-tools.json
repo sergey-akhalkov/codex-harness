@@ -141,6 +141,22 @@
       "verification": "Managed Serena session on owned legacy Pascal sources with the pinned PP/FPCDIR: symbol overview, definition and references with stated FPC/CodeTools limits; no clean-compilation or Delphi-SDK claim."
     },
     {
+      "id": "csharp",
+      "name": "C#",
+      "required": false,
+      "backend": "roslyn",
+      "serena_id": "csharp",
+      "package": "roslyn-language-server.win-x64",
+      "manager": "serena-cache",
+      "source": "https://github.com/dotnet/roslyn",
+      "runtime": ["existing .NET 10 host", "project .NET SDK"],
+      "project_inputs": [".sln", ".slnx", ".csproj", "global.json"],
+      "extensions": [".cs"],
+      "provision": "Reuse-only: adopt an unambiguous Roslyn net10.0 Windows x64 server from the shared Serena cache with matching dependency metadata and an existing compatible .NET host. Never provision during MCP sessions.",
+      "verification": "Actual solution symbols, bodies and references; explicit diagnostic availability and freshness; native compilation remains separate.",
+      "reuse_only": true
+    },
+    {
       "id": "cpp",
       "name": "C++",
       "required": false,
@@ -254,31 +270,6 @@
       ],
       "provision": "Reuse existing Serena PSES cache and its analyzer; acquire official release bundle on explicit install/update.",
       "verification": "PowerShell project navigation, syntax/analyzer error and clearance."
-    },
-    {
-      "id": "csharp",
-      "name": "C#",
-      "required": true,
-      "backend": "roslyn",
-      "serena_id": "csharp",
-      "package": "roslyn-language-server.win-x64",
-      "manager": "nuget",
-      "source": "https://github.com/dotnet/roslyn",
-      "metadata": "https://api.nuget.org/v3-flatcontainer/roslyn-language-server.win-x64/index.json",
-      "runtime": [
-        "project .NET SDK",
-        ".NET runtime compatible with the selected Roslyn server (10.0 for Roslyn 5.11)"
-      ],
-      "project_inputs": [
-        ".sln",
-        ".csproj",
-        "global.json"
-      ],
-      "extensions": [
-        ".cs"
-      ],
-      "provision": "Reuse the existing compatible Roslyn server, including a verified editor install; otherwise official NuGet package in shared Serena cache. Preserve project SDK choice.",
-      "verification": "Actual solution symbols/definition/references, compiler diagnostic and clearance."
     },
     {
       "id": "json",

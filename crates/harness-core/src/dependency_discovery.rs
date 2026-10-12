@@ -287,6 +287,7 @@ impl Discovery {
                     ("languages", "rust") => ("rust-analyzer", "rustup"),
                     ("languages", "delphi") => ("pascal-language-server", "serena-cache"),
                     ("languages", "cpp") => ("clangd", "opencode-cache"),
+                    ("languages", "csharp") => ("roslyn-language-server.win-x64", "serena-cache"),
                     _ => return Err(package::invalid()),
                 };
                 if !ids.insert(id)
@@ -573,6 +574,133 @@ impl Discovery {
         Ok(candidates)
     }
 
+    fn csharp(&self) -> io::Result<Vec<Value>> {
+        let cache = local_path(&self.serena.join("CSharpLanguageServer"))?;
+        let mut candidates = Vec::new();
+        for directory in directories(&cache)? {
+            let Some(version) = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("roslyn-"))
+                .and_then(dotted_version)
+            else {
+                continue;
+            };
+            let root = local_path(&directory)?;
+            if !package::contained(&root, &cache) {
+                continue;
+            }
+            let server = package::package_file(
+                &root,
+                "tools/net10.0/win-x64/Microsoft.CodeAnalysis.LanguageServer.dll",
+            )?;
+            let config = server.with_extension("runtimeconfig.json");
+            let deps_path = server.with_extension("deps.json");
+            let Some(runtime) = package::read_json(&config)? else {
+                continue;
+            };
+            let Some(deps) = package::read_json(&deps_path)? else {
+                continue;
+            };
+            let framework = &runtime["runtimeOptions"]["framework"];
+            let Some(required) = framework["version"]
+                .as_str()
+                .and_then(|text| {
+                    text.split('.')
+                        .map(str::parse::<u32>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok()
+                })
+                .filter(|parts| parts.len() == 3 && parts[0] == 10)
+            else {
+                continue;
+            };
+            let identity = format!("Microsoft.CodeAnalysis.LanguageServer/{version}");
+            let matching_metadata = deps["libraries"].as_object().is_some_and(|libraries| {
+                libraries.keys().any(|key| {
+                    key == &identity
+                        || key
+                            .strip_prefix(&identity)
+                            .is_some_and(|suffix| suffix.starts_with('-'))
+                })
+            });
+            if !server.is_file()
+                || framework["name"] != "Microsoft.NETCore.App"
+                || runtime["runtimeOptions"]["tfm"] != "net10.0"
+                || !matching_metadata
+            {
+                continue;
+            }
+            let mut host = None;
+            for path in &self.paths {
+                let executable = path.join("dotnet.exe");
+                if !executable.is_file() {
+                    continue;
+                }
+                for installed in directories(&path.join("shared/Microsoft.NETCore.App"))? {
+                    let Some(parts) = installed
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|text| {
+                            text.split('.')
+                                .map(str::parse::<u32>)
+                                .collect::<Result<Vec<_>, _>>()
+                                .ok()
+                        })
+                        .filter(|parts| {
+                            parts.len() == 3
+                                && parts[0] == required[0]
+                                && parts[1] == required[1]
+                                && parts >= &required
+                        })
+                    else {
+                        continue;
+                    };
+                    let runtime_root = local_path(&installed)?;
+                    let host_root = local_path(path)?;
+                    if !package::contained(&runtime_root, &host_root)
+                        || !runtime_root.join("coreclr.dll").is_file()
+                        || !runtime_root.join("System.Private.CoreLib.dll").is_file()
+                    {
+                        continue;
+                    }
+                    host = Some((
+                        local_path(&executable)?,
+                        runtime_root,
+                        format!("{}.{}.{}", parts[0], parts[1], parts[2]),
+                    ));
+                    break;
+                }
+                if host.is_some() {
+                    break;
+                }
+            }
+            let Some((dotnet, runtime_root, runtime_version)) = host else {
+                continue;
+            };
+            let server_hash = package::fingerprint(&server)?;
+            let host_hash = package::fingerprint(&dotnet)?;
+            candidates.push(json!({
+                "manager":"serena-cache", "version":version,
+                "executable":dotnet, "command":[dotnet,server,"--stdio","--logLevel=Information"],
+                "paths":{"dotnet":dotnet,"entrypoint":server,"runtime_root":runtime_root},
+                "installation_root":root, "status":"adopted",
+                "ownership":"adopted-shared", "update_safe":false,
+                "health":{"installed":true,"identity_verified":false,"integrity":"unknown",
+                    "callable":null,"checked_operations":[]},
+                "provenance":{"metadata":deps_path,"runtime_configuration":config},
+                "evidence":[
+                    {"kind":"entrypoint-fingerprint","path":server,"sha256":server_hash},
+                    {"kind":"runtime-host-fingerprint","path":dotnet,"sha256":host_hash},
+                    {"kind":"matching-dependency-metadata","version":version,"path":deps_path},
+                    {"kind":"runtime-inventory","version":runtime_version,"path":runtime_root},
+                    {"kind":"limitation","detail":"Matching cache metadata and observed fingerprints do not establish upstream integrity, runtime startup or solution readiness."}
+                ]
+            }));
+        }
+        Ok(candidates)
+    }
+
     fn record(&self, spec: &Value, group: &str) -> Value {
         let result = match spec["id"].as_str().unwrap() {
             "serena" => uv(spec, &self.uv, self.full),
@@ -594,6 +722,7 @@ impl Discovery {
             "rust" => self.rust(),
             "delphi" => self.pascal(),
             "cpp" => self.clangd(),
+            "csharp" => self.csharp(),
             _ => unreachable!(),
         };
         let base = package::base(spec);

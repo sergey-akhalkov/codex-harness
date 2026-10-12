@@ -68,7 +68,8 @@ selection, not the full capabilities of pre-existing shared packages.
 | Rust | Explicit Serena navigation using the adopted rust-analyzer; enabled in this repository's Serena project configuration | Automatic diagnostics remain disabled; use Cargo checks for acceptance |
 | Pascal / Delphi sources | Serena 1.7.0 with the adopted shared pasls installation and its matching FPC prerequisites pinned as `PP`/`FPCDIR`: symbol overview, definitions and cross-unit references on legacy Pascal units, with stated FPC/CodeTools limits | Automatic diagnostics remain disabled; FPC/CodeTools navigation does not establish Delphi SDK support or clean compilation |
 | C++ | Serena with an adopted shared clangd: symbol discovery, bodies, cross-file references and suitable semantic edits; configure the project's compiler flags and headers | Reuse-only; automatic diagnostics remain disabled; use native checks for compilation acceptance |
-| Other historical candidates | None selected | Retired from managed discovery, including TypeScript, JavaScript, PowerShell, C#, JSON, Markdown, TOML, XML, CMake, Bash, YAML, QML, HTML and CSS |
+| C# | Serena with an adopted shared Roslyn net10.0 Windows x64 server and compatible existing .NET 10 host: explicit solution symbols, bodies and references | Reuse-only; actual solution acceptance is required; automatic diagnostics remain disabled and explicit diagnostic freshness is reported separately |
+| Other historical candidates | None selected | Retired from managed discovery, including TypeScript, JavaScript, PowerShell, JSON, Markdown, TOML, XML, CMake, Bash, YAML, QML, HTML and CSS |
 
 Python remains in dependency discovery because Serena's startup guard requires
 its verified backend; BasedPyright registry updates are held

@@ -69,22 +69,33 @@ pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Val
             continue;
         }
         let paths = &record["paths"];
-        let (base, args) = match (paths["node"].as_str(), paths["entrypoint"].as_str()) {
-            (Some(node), Some(entry)) => (
+        let (base, args) = if serena_id == "csharp" {
+            required_directory(paths["runtime_root"].as_str(), "CSharp runtime")?;
+            (
                 vec![
-                    required_file(Some(node), "Node runtime")?,
-                    required_file(Some(entry), "language server entrypoint")?,
+                    required_file(paths["dotnet"].as_str(), ".NET host")?,
+                    required_file(paths["entrypoint"].as_str(), "Roslyn server DLL")?,
                 ],
-                vec!["--stdio".to_owned()],
-            ),
-            _ => {
-                let executable = paths["executable"]
-                    .as_str()
-                    .or_else(|| record["executable"].as_str());
-                (
-                    vec![required_file(executable, "language server executable")?],
-                    Vec::new(),
-                )
+                vec!["--stdio".to_owned(), "--logLevel=Information".to_owned()],
+            )
+        } else {
+            match (paths["node"].as_str(), paths["entrypoint"].as_str()) {
+                (Some(node), Some(entry)) => (
+                    vec![
+                        required_file(Some(node), "Node runtime")?,
+                        required_file(Some(entry), "language server entrypoint")?,
+                    ],
+                    vec!["--stdio".to_owned()],
+                ),
+                _ => {
+                    let executable = paths["executable"]
+                        .as_str()
+                        .or_else(|| record["executable"].as_str());
+                    (
+                        vec![required_file(executable, "language server executable")?],
+                        Vec::new(),
+                    )
+                }
             }
         };
         let mut setting = launch_setting(&base, &args);
@@ -585,6 +596,39 @@ mod tests {
         let error = ls_specific_settings(&registry).unwrap_err();
         assert!(error.to_string().contains("missing adopted Node runtime"));
         assert!(!error.to_string().contains("gone"));
+    }
+
+    #[test]
+    fn csharp_launch_pins_host_dll_arguments_and_refuses_missing_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("dotnet.exe");
+        let server = root
+            .path()
+            .join("Microsoft.CodeAnalysis.LanguageServer.dll");
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::write(&host, b"inert").unwrap();
+        fs::write(&server, b"inert").unwrap();
+        let registry = json!({"languages":[{
+            "id":"csharp","serena_id":"csharp","status":"adopted",
+            "paths":{"dotnet":host,"entrypoint":server,"runtime_root":runtime}
+        }]});
+        let settings = ls_specific_settings(&registry).unwrap();
+        assert_eq!(
+            settings["csharp"]["ls_base_cmd"],
+            json!([local_path(&host).unwrap(), local_path(&server).unwrap()])
+        );
+        assert_eq!(
+            settings["csharp"]["ls_args"],
+            json!(["--stdio", "--logLevel=Information"])
+        );
+        fs::write(root.path().join("Example.csproj"), b"<Project />").unwrap();
+        ensure_supported_languages(&registry, root.path()).unwrap();
+        fs::remove_file(&server).unwrap();
+        assert!(ls_specific_settings(&registry).is_err());
+        fs::write(&server, b"inert").unwrap();
+        fs::remove_dir(&runtime).unwrap();
+        assert!(ls_specific_settings(&registry).is_err());
     }
 
     #[test]

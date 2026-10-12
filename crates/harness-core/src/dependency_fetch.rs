@@ -48,6 +48,11 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
             "serena-cache",
             "https://api.github.com/repos/zen010101/pascal-language-server/releases/latest",
         ),
+        Some("csharp") => (
+            "roslyn-language-server.win-x64",
+            "serena-cache",
+            "https://api.nuget.org/v3-flatcontainer/roslyn-language-server.win-x64/index.json",
+        ),
         Some("cpp") => (
             "clangd",
             "opencode-cache",
