@@ -337,7 +337,15 @@ impl Client {
         cancel: &Cancellation,
     ) -> io::Result<Value> {
         let mut environment = BTreeMap::new();
-        for key in ["SystemRoot", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"] {
+        // NuGet/MSBuild requires APPDATA even when package assets already exist.
+        for key in [
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "APPDATA",
+        ] {
             if let Ok(value) = std::env::var(key) {
                 environment.insert(key.into(), value);
             }
