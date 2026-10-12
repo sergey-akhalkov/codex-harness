@@ -67,7 +67,8 @@ selection, not the full capabilities of pre-existing shared packages.
 | Python | Serena 1.7.0, LSP backend basedpyright 1.39.10: symbol discovery, definitions, cross-file references, suitable symbol/body and matching-text edits; actual error diagnostics with stated uncertainty | Automatic rejected; empty diagnostics do not prove clean current analysis |
 | Rust | Explicit Serena navigation using the adopted rust-analyzer; enabled in this repository's Serena project configuration | Automatic diagnostics remain disabled; use Cargo checks for acceptance |
 | Pascal / Delphi sources | Serena 1.7.0 with the adopted shared pasls installation and its matching FPC prerequisites pinned as `PP`/`FPCDIR`: symbol overview, definitions and cross-unit references on legacy Pascal units, with stated FPC/CodeTools limits | Automatic diagnostics remain disabled; FPC/CodeTools navigation does not establish Delphi SDK support or clean compilation |
-| Other historical candidates | None selected | Retired from managed discovery, including TypeScript, JavaScript, PowerShell, C++, C#, JSON, Markdown, TOML, XML, CMake, Bash, YAML, QML, HTML and CSS |
+| C++ | Serena with an adopted shared clangd: symbol discovery, bodies, cross-file references and suitable semantic edits; configure the project's compiler flags and headers | Reuse-only; automatic diagnostics remain disabled; use native checks for compilation acceptance |
+| Other historical candidates | None selected | Retired from managed discovery, including TypeScript, JavaScript, PowerShell, C#, JSON, Markdown, TOML, XML, CMake, Bash, YAML, QML, HTML and CSS |
 
 Python remains in dependency discovery because Serena's startup guard requires
 its verified backend; BasedPyright registry updates are held
@@ -87,6 +88,24 @@ remain available.
 
 Specialized controller or CNC source formats are not a managed language set.
 Extension presence does not prove a compatible language server.
+
+C++ discovery adopts one existing `clangd_<version>/bin/clangd.exe` under
+the user's shared OpenCode cache. Missing or ambiguous installations remain
+unavailable; neither discovery, dependency planning nor sessions download or
+update clangd. A directory version and observed fingerprint are not upstream
+integrity verification. The managed gateway pins the adopted executable and
+maps CMake/Visual C++ projects to Serena's `cpp` identifier. Configure a nested
+C++ root with its own `.serena/project.yml` (`language_servers: [cpp]`) and an
+actual compilation database, optionally selected through `.clangd`. Do not
+reuse a build tree containing another machine's absolute paths. Explicit empty
+diagnostics alone do not prove complete analysis or a clean native build.
+MSVC databases can omit the system paths supplied through `INCLUDE`. Managed
+workers use an isolated environment, so provide the actual MSVC/SDK system
+include paths in the consuming project's clangd configuration when needed.
+Verify them through the managed session: an ordinary shell's successful clangd
+check does not prove that the worker can resolve the same headers. A semantic
+declaration request exercises the parsed translation unit; an immediate empty
+diagnostic result can precede completion of clangd's asynchronous analysis.
 
 ## Source and local state
 
@@ -252,8 +271,8 @@ connected. It checks the verified candidate before changing installation links,
 then the installed manager after delivery. Failure produces a nonzero exit and
 a failed verification receipt; a preflight failure leaves the installation
 unchanged. The check uses the adopted Serena, rust-analyzer and basedpyright in
-owned temporary Rust and Python projects, exercising symbol overview, body
-lookup, a semantic edit and semantic/disk readback. No package is installed and
+owned temporary Rust and Python projects (plus adopted Pascal and C++), exercising symbol overview, body
+lookup, a semantic edit and semantic/disk readback, with cross-file C++ references. No package is installed and
 no user project is modified. Run it directly with:
 
 ```powershell

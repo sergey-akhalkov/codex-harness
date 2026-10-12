@@ -48,6 +48,11 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
             "serena-cache",
             "https://api.github.com/repos/zen010101/pascal-language-server/releases/latest",
         ),
+        Some("cpp") => (
+            "clangd",
+            "opencode-cache",
+            "https://api.github.com/repos/clangd/clangd/releases/latest",
+        ),
         _ => return Err("unsupported-metadata-source"),
     };
     if spec["package"] != package || spec["manager"] != manager {

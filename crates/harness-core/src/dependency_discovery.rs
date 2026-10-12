@@ -286,6 +286,7 @@ impl Discovery {
                     ("languages", "python") => ("basedpyright", "npm"),
                     ("languages", "rust") => ("rust-analyzer", "rustup"),
                     ("languages", "delphi") => ("pascal-language-server", "serena-cache"),
+                    ("languages", "cpp") => ("clangd", "opencode-cache"),
                     _ => return Err(package::invalid()),
                 };
                 if !ids.insert(id)
@@ -536,6 +537,42 @@ impl Discovery {
         ])
     }
 
+    fn clangd(&self) -> io::Result<Vec<Value>> {
+        let cache = local_path(&self.home.join(".cache/opencode/bin"))?;
+        let mut candidates = Vec::new();
+        for directory in directories(&cache)? {
+            let Some(version) = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("clangd_"))
+                .and_then(dotted_version)
+            else {
+                continue;
+            };
+            let root = local_path(&directory)?;
+            let executable = package::package_file(&root, "bin/clangd.exe")?;
+            if !package::contained(&root, &cache) || !executable.is_file() {
+                continue;
+            }
+            let hash = package::fingerprint(&executable)?;
+            candidates.push(json!({
+                "manager":"opencode-cache", "version":version,
+                "executable":executable, "command":[executable],
+                "paths":{"executable":executable}, "installation_root":root,
+                "status":"adopted", "ownership":"adopted-shared", "update_safe":false,
+                "health":{"installed":true,"identity_verified":false,"integrity":"unknown",
+                    "callable":null,"checked_operations":[]},
+                "provenance":{"resolved_path":executable},
+                "evidence":[
+                    {"kind":"executable-fingerprint","path":executable,"sha256":hash},
+                    {"kind":"directory-version-label","value":version},
+                    {"kind":"limitation","detail":"A cache directory version and observed fingerprint do not establish upstream integrity or semantic readiness."}
+                ]
+            }));
+        }
+        Ok(candidates)
+    }
+
     fn record(&self, spec: &Value, group: &str) -> Value {
         let result = match spec["id"].as_str().unwrap() {
             "serena" => uv(spec, &self.uv, self.full),
@@ -556,6 +593,7 @@ impl Discovery {
                 }),
             "rust" => self.rust(),
             "delphi" => self.pascal(),
+            "cpp" => self.clangd(),
             _ => unreachable!(),
         };
         let base = package::base(spec);

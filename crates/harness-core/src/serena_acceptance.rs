@@ -100,11 +100,23 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
         if pascal_adopted {
             languages.push("pascal");
         }
+        if inventory["languages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| row["id"] == "cpp" && row["status"] == "adopted")
+        {
+            languages.push("cpp");
+        }
         let mut exercised: Vec<&str> = Vec::new();
         for language in languages {
             let project = state.path().join(language);
             fs::create_dir_all(project.join(".serena"))?;
-            let encoding = if language == "pascal" { "cp1251" } else { "utf-8" };
+            let encoding = if language == "pascal" {
+                "cp1251"
+            } else {
+                "utf-8"
+            };
             fs::write(
                 project.join(".serena/project.yml"),
                 format!(
@@ -121,6 +133,22 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
                     "src/lib.rs",
                     b"pub fn acceptance_value() -> i32 { 7101 }\n".to_vec(),
                     "pub fn acceptance_value() -> i32 { 7102 }".to_owned(),
+                )
+            } else if language == "cpp" {
+                fs::write(project.join("compile_flags.txt"), "-std=c++17\n")?;
+                fs::write(
+                    project.join("CMakeLists.txt"),
+                    "# owned acceptance fixture\n",
+                )?;
+                fs::write(project.join("value.h"), "int acceptance_value();\n")?;
+                fs::write(
+                    project.join("caller.cpp"),
+                    "#include \"value.h\"\nint caller() { return acceptance_value(); }\n",
+                )?;
+                (
+                    "value.cpp",
+                    b"#include \"value.h\"\nint acceptance_value() { return 7101; }\n".to_vec(),
+                    "int acceptance_value() { return 7102; }".to_owned(),
                 )
             } else if language == "pascal" {
                 (
@@ -183,6 +211,32 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
                 found.contains("7101"),
                 "Serena symbol body is stale or missing",
             )?;
+            if language == "cpp" {
+                // Open the real caller before asking the server for references;
+                // no timing assumption about background indexing is needed.
+                call(
+                    client,
+                    route,
+                    &initialize,
+                    "get_symbols_overview",
+                    json!({"relative_path":"caller.cpp","max_answer_chars":2000}),
+                    deadline,
+                    &cancel,
+                )?;
+                let references = call(
+                    client,
+                    route,
+                    &initialize,
+                    "find_referencing_symbols",
+                    json!({"relative_path":relative,"name_path":"acceptance_value","max_answer_chars":3800}),
+                    deadline,
+                    &cancel,
+                )?;
+                require(
+                    references.contains("caller"),
+                    "Serena C++ cross-file reference missing",
+                )?;
+            }
             call(
                 client,
                 route,
@@ -213,11 +267,9 @@ pub fn verify(source: &Path, registry: &Path) -> io::Result<Value> {
             )?;
             exercised.push(language);
         }
-        Ok(
-            json!({"status":"semantic-ready","languages":exercised,
+        Ok(json!({"status":"semantic-ready","languages":exercised,
             "checks":["symbol-overview","symbol-body","semantic-edit","semantic-readback","disk-readback"],
-            "manager_sha256":crate::build_identity::hash_file(&std::env::current_exe()?)?}),
-        )
+            "manager_sha256":crate::build_identity::hash_file(&std::env::current_exe()?)?}))
     })();
     let cleanup = (|| {
         for client in &clients {

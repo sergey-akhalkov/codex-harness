@@ -93,8 +93,7 @@ pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Val
         // source tree need their own entries next to the launch command.
         if serena_id == "pascal" {
             let fpc = required_file(paths["fpc"].as_str(), "FPC compiler driver")?;
-            let source =
-                required_directory(paths["fpc_source"].as_str(), "FPC source directory")?;
+            let source = required_directory(paths["fpc_source"].as_str(), "FPC source directory")?;
             setting["pp"] = json!(fpc.to_string_lossy().into_owned());
             setting["fpcdir"] = json!(source.to_string_lossy().into_owned());
         }
@@ -168,7 +167,7 @@ const MARKERS: &[(&str, Option<&str>)] = &[
     ("Gemfile", Some("ruby")),
     ("pubspec.yaml", Some("dart")),
     ("mix.exs", Some("elixir")),
-    ("CMakeLists.txt", Some("clangd")),
+    ("CMakeLists.txt", Some("cpp")),
 ];
 
 /// Extension-shaped project declarations (for example `*.csproj` or `*.sln`).
@@ -177,7 +176,7 @@ const PROJECT_EXTENSIONS: &[(&str, &str)] = &[
     ("sln", "csharp"),
     ("dpr", "pascal"),
     ("lpr", "pascal"),
-    ("vcxproj", "clangd"),
+    ("vcxproj", "cpp"),
 ];
 
 fn skipped(name: &str) -> bool {
@@ -589,6 +588,31 @@ mod tests {
     }
 
     #[test]
+    fn cpp_project_markers_require_the_adopted_cpp_backend() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("clangd.exe");
+        fs::write(&executable, b"inert fixture").unwrap();
+        let registry = json!({"languages":[{
+            "id":"cpp", "serena_id":"cpp", "status":"adopted",
+            "paths":{"executable":executable}
+        }]});
+        let settings = ls_specific_settings(&registry).unwrap();
+        assert_eq!(
+            settings["cpp"]["ls_base_cmd"],
+            json!([local_path(&executable).unwrap()])
+        );
+        for marker in ["CMakeLists.txt", "app.vcxproj"] {
+            let project = root.path().join(marker.replace('.', "_"));
+            fs::create_dir(&project).unwrap();
+            fs::write(project.join(marker), b"fixture").unwrap();
+            ensure_supported_languages(&registry, &project).unwrap();
+            assert!(ensure_supported_languages(&json!({"languages":[]}), &project).is_err());
+        }
+        fs::remove_file(executable).unwrap();
+        assert!(ls_specific_settings(&registry).is_err());
+    }
+
+    #[test]
     fn pascal_adoption_pins_pasls_and_its_fpc_prerequisites() {
         let root = tempfile::tempdir().unwrap();
         let relative = Path::new("PascalLanguageServer");
@@ -597,7 +621,10 @@ mod tests {
             .path()
             .join(relative)
             .join("prerequisites/fpc-3.2.2/bin/i386-win32/fpc.exe");
-        let source = root.path().join(relative).join("prerequisites/fpc-3.2.2/source");
+        let source = root
+            .path()
+            .join(relative)
+            .join("prerequisites/fpc-3.2.2/source");
         fs::create_dir_all(pasls.parent().unwrap()).unwrap();
         fs::create_dir_all(fpc.parent().unwrap()).unwrap();
         fs::create_dir_all(&source).unwrap();
@@ -615,7 +642,10 @@ mod tests {
         let fpc = local_path(&fpc).unwrap();
         let source = local_path(&source).unwrap();
         assert_eq!(settings["pascal"]["pp"], json!(fpc.to_string_lossy()));
-        assert_eq!(settings["pascal"]["fpcdir"], json!(source.to_string_lossy()));
+        assert_eq!(
+            settings["pascal"]["fpcdir"],
+            json!(source.to_string_lossy())
+        );
         assert_eq!(
             settings["pascal"]["ls_base_cmd"],
             json!([local_path(&pasls).unwrap().to_string_lossy()])
