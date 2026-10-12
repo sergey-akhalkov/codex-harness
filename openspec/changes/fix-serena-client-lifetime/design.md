@@ -6,13 +6,14 @@ See proposal.md. The CLI constructs one absolute deadline from the managed regis
 
 ## Goals / Non-Goals
 
-Keep open managed Serena connections usable across long conversations and returns after idle periods. Preserve existing finite operation budgets, bounded cleanup, broker/worker lifecycle and explicit finite-lifetime probes. This repair does not change Nuphus transport behavior or add a client reconnection service.
+Keep open managed Serena and Nuphus connections usable across long conversations and returns after idle periods. Preserve existing finite operation budgets, bounded cleanup, broker/worker lifecycle and explicit finite-lifetime probes. This repair does not add a client reconnection service.
 
 ## Decisions
 
-- Use an explicit unlimited connection mode (`--connection-seconds 0`) for managed Serena registrations. Preserve positive limits for deliberately bounded callers and fixtures. Do not substitute a larger arbitrary maximum or an idle-session timeout: both eventually break an open conversation when its user returns.
+- Use an explicit unlimited connection mode (`--connection-seconds 0`) for managed Serena and Nuphus registrations. Preserve positive limits for deliberately bounded callers and fixtures. Do not substitute a larger arbitrary maximum or an idle-session timeout: both eventually break an open conversation when its user returns.
 - Reuse the cancellable pipe and broker owners. Add the smallest cancellation-aware indefinite input wait needed by Serena, while retaining finite request, write and cleanup deadlines. Do not recreate the pipe after a timed-out read, which can lose partially consumed bytes, and do not generalize all process deadlines unnecessarily.
 - Keep the existing 240-second request cap, finite response writes and cleanup, fixed project routing, worker pool limits, idle retirement and uncertain-mutation protections. Unlimited transport age does not grant unlimited execution.
+- Extend the shared STDIO serving owner for Nuphus using the existing cancellable indefinite pipe read. Preserve its finite request/session deadlines, lazy worker startup and retirement, browser isolation and desktop admission. Other bounded STDIO callers retain their existing API behavior where practical.
 - Use native protocol/pipe regressions with owned synthetic endpoints for fast deterministic expiry, cancellation and EOF coverage, then verify real installed activation and symbol navigation outside the kit checkout.
 
 ## Risks / Trade-offs
@@ -23,7 +24,7 @@ Keep open managed Serena connections usable across long conversations and return
 
 ## Migration Plan
 
-Run focused baseline/candidate checks, install the immutable candidate through the normal lifecycle, update the Serena registration and validate installation ownership. Exercise the installed entry point from an external project. Preserve the lifecycle recovery receipt and report the one-time reconnection boundary.
+Run focused baseline/candidate checks, install the immutable candidate through the normal lifecycle, update both managed registrations and validate installation ownership. Exercise installed Serena from an external project and Nuphus through a read-only native tool request. Preserve the lifecycle recovery receipt and report the one-time reconnection boundary.
 
 ## Verification and existing limitations
 
