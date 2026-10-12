@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-10-04**.
+Last updated: **2026-10-12**.
 
 ## Public pack
 
@@ -209,6 +209,20 @@ fixtures, diagnostics, audit and recovery data. The [portable principles](../glo
 own the policy and the [working-principles specification](../openspec/specs/global-working-principles/spec.md#requirement-research-precedes-substantive-design-and-implementation)
 owns its scenarios. No new skill, report protocol or recurring review ritual is
 required.
+
+**2026-10-12, confirmed (user decision):** Interface obviousness is a universal
+obligation for UI/UX, CLI, APIs, methods, functions, libraries, configuration,
+tools, instructions and agent workflows: interface owners carry routine
+preparation, coordination, validation and completion, and usability is judged
+on the complete everyday lifecycle, not command count or an agent's ability to
+overcome difficulty. Newly evidenced material friction and concrete improvement
+opportunities are surfaced with their consequence while reports can still
+change the work; a workflow that materially compounds waste or unreliability is
+escalated with an evidenced remedy instead of repeated workaround. The
+[portable principles](../global/principles-of-work.md#developer-experience) own
+the policy; the
+[working-principles specification](../openspec/specs/global-working-principles/spec.md)
+owns its scenarios.
 
 ## Official Codex CLI
 
@@ -579,9 +593,12 @@ portable defaults disable the Apps feature while machine-local values win;
 per-model default effort is max for zai/glm-5.3 and xhigh for
 xai/grok-4.6 and Astra when no explicit effort is selected; the portable
 principles stay at most 24 KiB with every normative rule preserved (24,320
-bytes after the 2026-09-26 trim). Removing the locally installed GitHub plugin is a
-machine-local action, not a kit requirement. Screenshot policy was already
-fixed separately and stays unchanged.
+bytes after the 2026-09-26 trim; 24,469 bytes on 2026-10-12 after the
+enforce-obvious-interfaces-and-friction-escalation consolidation, within that
+bound).
+Removing the locally installed GitHub plugin is a machine-local action, not a
+kit requirement. Screenshot policy was already fixed separately and stays
+unchanged.
 
 Operational notes from the 2026-09-15 activation: the transitional dependency
 layer cannot stage BasedPyright updates, so registry drift now resolves as
