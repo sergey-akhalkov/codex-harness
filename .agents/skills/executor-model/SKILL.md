@@ -1,6 +1,6 @@
 ---
 name: executor-model
-description: Switch the model used by kit executors in one action by pointing executor_profiles in checkout orchestration.toml files at an installed Codex profile, then show the resolved model/effort. Use when the user asks to change the executor/delegation model (for example "executors to ds/deepseek/xai/zai") or wants it done instantly.
+description: Switch the model used by kit executors in one action by pointing executor_profiles in checkout orchestration.toml files at an installed Codex profile, then show the resolved model/effort. Use when the user asks to change the executor/delegation model (for example "executors to deepseek") or wants it done instantly.
 ---
 
 # Executor model switch (one action)
@@ -50,7 +50,7 @@ what is installed), prints the resolved model/provider/effort, rewrites only
 the `executor_profiles` line in every named checkout, and reads each change
 back with file and line.
 
-- `-ProfileId` accepts any installed profile (`ds`, `xai`, `zai`, ...). If the
+- `-ProfileId` accepts any installed profile (for example `ds`). If the
   user names a model slug instead, find the profile whose `<id>.config.toml`
   (or `[profiles.<id>]` section in `config.toml`) sets that `model =` value and
   run the script with that profile id.

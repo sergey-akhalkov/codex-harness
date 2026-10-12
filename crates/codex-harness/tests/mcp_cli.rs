@@ -16,7 +16,14 @@ fn native_mcp_options_fail_before_opening_a_connection_or_creating_state() {
         vec!["mcp", "apply-registration", "--unknown", "x"],
         vec!["mcp", "nuphus", "--executable"],
         vec!["mcp", "nuphus", "--unknown", "x"],
+        // `0` is the unlimited mode for both managed connections: an
+        // incomplete invocation still fails on its missing inputs, and
+        // out-of-range or non-numeric bounds stay rejected (the complete
+        // argument-set checks live in the Nuphus lifetime regression).
         vec!["mcp", "nuphus", "--connection-seconds", "0"],
+        vec!["mcp", "serena", "--connection-seconds", "0"],
+        vec!["mcp", "serena", "--connection-seconds", "86401"],
+        vec!["mcp", "serena", "--connection-seconds", "abc"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
             .current_dir(root.path())
@@ -39,6 +46,43 @@ fn native_mcp_options_fail_before_opening_a_connection_or_creating_state() {
     assert!(help.stderr.is_empty());
     assert!(String::from_utf8_lossy(&help.stdout).contains("serena"));
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn nuphus_connection_seconds_validation_rejects_invalid_bounds_before_serving() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("nuphus-fixture.exe");
+    fs::write(&executable, b"fixture").unwrap();
+    let digest = harness_core::build_identity::hash_file(&executable).unwrap();
+    for seconds in ["86401", "abc", "-1", ""] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .current_dir(root.path())
+            .args(["mcp", "nuphus"])
+            .arg("--executable")
+            .arg(&executable)
+            .arg("--expected-digest")
+            .arg(&digest)
+            .arg("--codex-home")
+            .arg(root.path().join("home"))
+            .arg("--account")
+            .arg(root.path().join("account"))
+            .arg("--source-root")
+            .arg(root.path())
+            .arg("--connection-seconds")
+            .arg(seconds)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{seconds:?}");
+        assert!(output.stdout.is_empty(), "{seconds:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid native MCP command options"),
+            "{seconds:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Every rejected invocation stops before serving state exists; the account
+    // directory is created only after option validation.
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
 #[test]

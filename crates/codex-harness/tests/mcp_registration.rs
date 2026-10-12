@@ -814,7 +814,7 @@ fn isolated_apply_accepts_native_serena_proxy_and_keeps_foreign_servers() {
             "--source-root",
             root.path(),
             "--connection-seconds",
-            "86400"
+            "0"
         ],
         "env": {"CODEX_HOME": home},
         "startup_timeout_sec": 30,
@@ -844,6 +844,12 @@ fn isolated_apply_accepts_native_serena_proxy_and_keeps_foreign_servers() {
         "{servers}"
     );
     assert_eq!(servers["serena"]["args"][1], "serena");
+    let serena_args = servers["serena"]["args"].as_array().unwrap();
+    let seconds = serena_args
+        .iter()
+        .position(|value| value == "--connection-seconds")
+        .expect("serena connection budget");
+    assert_eq!(serena_args[seconds + 1], "0", "{servers}");
     assert!(servers.get("graphify").is_none(), "{servers}");
     assert!(servers.get("codegraph").is_none(), "{servers}");
     assert_eq!(servers["nuphus"]["args"][5], "nuphus");
@@ -851,4 +857,79 @@ fn isolated_apply_accepts_native_serena_proxy_and_keeps_foreign_servers() {
     let text = fs::read_to_string(home.join("config.toml")).unwrap();
     assert!(text.contains("retain my comment"), "{text}");
     assert!(text.contains("untouched.exe"), "{text}");
+}
+
+#[test]
+fn isolated_apply_accepts_native_nuphus_unlimited_and_preserves_serena_unlimited() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    let _package = shared_package(root.path(), "shared-package");
+    let console = root.path().join("serena.exe");
+    fs::write(&console, b"fixture console").unwrap();
+    let original = root.path().join("nuphus-mcp.exe");
+    fs::write(&original, b"fixture original").unwrap();
+    let digest = harness_core::build_identity::hash_file(&original).unwrap();
+    let native = json!({
+        "serena": {
+            "command": env!("CARGO_BIN_EXE_codex-harness"),
+            "args": [
+                "mcp", "serena",
+                "--serena", console,
+                "--registry", home.join("harness/code-tools.json"),
+                "--codex-home", home,
+                "--source-root", root.path(),
+                "--connection-seconds", "0"
+            ],
+            "env": {"CODEX_HOME": home},
+            "startup_timeout_sec": 30,
+            "tool_timeout_sec": 660
+        },
+        "nuphus": {
+            "command": env!("CARGO_BIN_EXE_codex-harness"),
+            "args": [
+                "mcp", "nuphus",
+                "--executable", original,
+                "--expected-digest", digest,
+                "--codex-home", home,
+                "--account", home.join("harness/nuphus"),
+                "--source-root", root.path(),
+                "--connection-seconds", "0"
+            ],
+            "env": {"CODEX_HOME": home},
+            "startup_timeout_sec": 30,
+            "tool_timeout_sec": 660
+        }
+    });
+    let connected = run_apply(
+        &home,
+        "Install",
+        &["--retained-registrations-json", &native.to_string()],
+    );
+    assert_eq!(connected["status"], "connected", "{connected}");
+    let servers = servers(&home);
+    for name in ["serena", "nuphus"] {
+        assert_eq!(servers[name]["args"][1], name, "{servers}");
+        let args = servers[name]["args"].as_array().unwrap();
+        let position = args
+            .iter()
+            .position(|value| value == "--connection-seconds")
+            .unwrap_or_else(|| panic!("{name} connection budget: {servers}"));
+        assert_eq!(args[position + 1], "0", "{name}: {servers}");
+    }
+    // The receipt records the same unlimited projections.
+    let receipt: Value = serde_json::from_slice(
+        &fs::read(home.join("harness/code-tools-registration.json")).unwrap(),
+    )
+    .unwrap();
+    for name in ["serena", "nuphus"] {
+        let recorded = receipt["registrations"][name]["args"].as_array().unwrap();
+        let position = recorded
+            .iter()
+            .position(|value| value == "--connection-seconds")
+            .unwrap_or_else(|| panic!("{name} receipt budget: {receipt}"));
+        assert_eq!(recorded[position + 1], "0", "{name}: {receipt}");
+    }
+    let text = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(text.contains("retain my comment"), "{text}");
+    assert_eq!(servers["foreign"]["command"], "untouched.exe");
 }

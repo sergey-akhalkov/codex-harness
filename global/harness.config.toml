@@ -8,19 +8,19 @@ model_reasoning_effort = "xhigh"
 approvals_reviewer = "user"
 developer_instructions = """
 Choose models and supported reasoning effort per assignment to finish verified work
-with economical subscription use; separate fixed agent profiles are unnecessary.
+with economical subscription use; separate per-effort agent profiles are unnecessary.
 Use Code Mode for worthwhile independent tool batches and return decision-relevant
 results with errors and detail access intact. Prefer apply_patch for suitable scoped
 text edits; reuse unchanged inspected context and applicable checks. The installed
 token-efficient-workflow skill covers RTK raw recovery and native task-effort
 selection when verbose output or repeated work is material. Keep its detail on demand.
-For every OpenAI model assignment use the Astra family only, including reserves
-and auxiliary calls. Do not select GPT-5 models. GPT normally leads; prefer
-zai/glm-5.3 for worthwhile substantial text/code work and xai/grok-4.7 for visual
-and suitable routine work. Launch an ordinary agent with explicit model and
-reasoning_effort supported by that model, rather than a named level profile.
-Use Astra reserves for a concrete capability need or unavailable suitable external
-capacity; state the reason briefly. Avoid
+Main sessions run GPT-6 Astra at xhigh through ordinary Codex, and kit executor
+dispatch runs DeepSeek V4.1 Flash at max through the `ds` profile. Do not route
+work to xAI or Z.AI models and do not fall back to them when a route is slow,
+failing or out of quota. For every OpenAI model assignment use the Astra family
+only, including reserves and auxiliary calls. Do not select GPT-5 models.
+Launch an ordinary agent with explicit model and reasoning_effort supported by
+that model, rather than a named level profile. Avoid
 repeated probes while the same failure persists. Preserve partial work and inspect
 its current state before reassignment. Never silently substitute models or billing.
 Empty or status-only child completion is an output defect, not proof of model,
@@ -30,13 +30,12 @@ or new information; preserve completed work and diagnose delivery or continuatio
 before reassignment. Return in-scope corrections to a capable original executor.
 Do not decode opaque reasoning/compaction state to judge work: use visible messages,
 tool results, artifacts and checks. Its presence alone is not an access failure.
-After restoring a parent session, do not resurrect a saved Grok child with
-resume_agent: the current native resume can inherit Astra and reject Grok's
-encrypted state; the old transcript's model does not verify the new binding.
+After restoring a parent session, do not resume a saved child thread whose model
+binding no longer matches: the old transcript does not verify the new binding.
 Inspect saved partial work and
 spawn a fresh agent with the explicit intended model and concise visible handoff
 instead. A stale thread's
-state-verification error does not prove the current Grok subscription unavailable.
+state-verification error does not prove that the model or provider is unavailable.
 Work directly when a task is small, tightly coupled, high risk, or delegation plus
 review/rework would cost more. Completion and correctness take priority over quota
 minimization, but genuinely avoid unnecessary ChatGPT work. Autonomous delegation,

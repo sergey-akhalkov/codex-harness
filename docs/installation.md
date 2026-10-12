@@ -46,10 +46,11 @@ relocated checkout. The component selectors are mutually exclusive:
 
 ## Prerequisites
 
-- Windows x64 with a Rust MSVC toolchain, Cargo, the MSVC C++ linker and the
+- Windows x64 with PowerShell 7, a Rust MSVC toolchain (Rust 1.98 or later),
+  Cargo, the MSVC C++ linker and the
   Windows SDK. Workspace dependencies are locked in `Cargo.lock`.
-- Installed Codex CLI. The compatibility baseline is **0.153.4**; **0.154.0** is
-  the current verified upstream. Installation resolves the real executable and
+- Installed Codex CLI. The compatibility baseline is **0.153.4**; the global
+  installation lifecycle also passed with **0.162.0**. Installation resolves the real executable and
   performs a model-free startup handoff before committing.
 - OpenSpec CLI **1.12.0 or later** for the included OpenSpec skills.
 - Permission to create symbolic links: enable Windows Developer Mode or use a
@@ -62,6 +63,93 @@ handled by the explicit [code-tool lifecycle](code-tools.md); ordinary startup
 and Check never provision or download packages.
 
 ## Install and verify
+
+### First installation on a new machine
+
+Complete prerequisites before starting the immutable build. Reuse existing
+tools and preserve the user's CLI, authentication and local settings. Run the
+commands below in the owner's **PowerShell 7**, not Windows PowerShell 5.1.
+An execution tool's requested shell is not proof of its actual runtime:
+check `$PSVersionTable.PSVersion`; if a host still launches 5.1, invoke the
+existing `pwsh.exe -NoProfile -Command ...` explicitly. Do not install a second
+PowerShell distribution to work around that host.
+
+1. Check `Get-Command pwsh, cargo, rustup, node, npm, openspec, codex` and their
+   versions. Open a new terminal after installing prerequisites. A running
+   terminal retains its old PATH even after a successful installer.
+2. On a machine without a compiler, install Microsoft's Visual Studio Build
+   Tools with the **Desktop development with C++** workload and Windows SDK,
+   then install Rust's MSVC toolchain. A GUI bootstrapper returning immediately
+   does not mean installation finished: wait for its setup process and check
+   the final result. `vswhere -latest -products * -requires
+   Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`
+   must resolve an installation; the selected SDK must contain x64
+   `kernel32.lib` and `ucrt.lib`. See the official
+   [Rust installation guide](https://doc.rust-lang.org/book/ch01-01-installation.html)
+   and [PowerShell installation guide](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows).
+   When acquiring installers or archives, verify the vendor signature or
+   published digest before execution. Keep bootstrap downloads outside the kit.
+3. Install OpenSpec with `npm install --global @fission-ai/openspec` if absent.
+   For code tools, prepare uv, Python, Serena, basedpyright and rust-analyzer
+   before `deploy --all`. The native component adopts these shared packages;
+   registering an MCP is not a replacement for installing its runtime.
+
+The following dependency set passed global delivery and real Rust/Python
+Serena semantic checks on 2026-10-09: PowerShell 7.6.6, Rust 1.99.0, Node.js
+24.21.0 LTS, OpenSpec 1.14.1, uv 0.12.24, Python 3.13.16, Serena 1.7.0 and
+basedpyright 1.40.2. This is observed installation evidence, not a promise
+about every language or future upstream release. With Node.js and uv already
+installed, the explicit preparation commands are:
+
+```powershell
+uv python install 3.13
+uv python update-shell
+uv tool install 'serena-agent==1.7.0'
+rustup component add rust-analyzer rust-src
+npm install --global --ignore-scripts 'basedpyright@1.40.2'
+npm install --global --ignore-scripts '@nuphus/nuphus-mcp@0.2.2'
+```
+
+Reuse compatible existing packages instead of reinstalling them. Nuphus
+**0.2.2** is the adapter-audited version: a newer npm `latest` may be refused
+by `dependencies apply` with a compatibility-audit error. Do not bypass that
+audit. The pinned npm install skips package scripts and includes the native
+platform package and companion DLL; the harness validates the original
+binary when preparing its connection. `dependencies discover --source KIT
+--user-home USER` is the model-free way to confirm package discovery.
+`dependencies plan` adds release metadata; inspect per-item results rather
+than assuming all dependencies are ready from a command's exit code alone.
+See the [code-tool lifecycle](code-tools.md#explicit-lifecycle) for capability
+acceptance and conditional language support.
+
+The pack defaults to ordinary Codex / GPT-6 Astra at `xhigh` for the lead and
+successor, and to the local `ds` profile (DeepSeek V4.1 Flash at `max`) for
+executors. Before installation, inspect `global/orchestration.toml`: `default`
+requires no separate profile, while any other role profile must already exist
+locally. A missing successor profile can fail core Check even when ordinary
+Codex and the executor profile work. Connecting the subscription component
+does not authorize a provider or create a user's Z.AI profile. Choose billing
+routes explicitly; see [subscription setup](subscription-models.md).
+
+For a first installation, when `codex-harness` is not yet on PATH, bootstrap
+the manager with Cargo's ordinary development profile and let **deploy**
+publish the optimized immutable release build:
+
+```powershell
+$kit = (Resolve-Path .).Path
+$state = Join-Path $env:LOCALAPPDATA 'codex-harness-native'
+cargo run --locked --jobs 2 -p codex-harness -- deploy --source $kit --state $state --all
+```
+
+This avoids a separate optimized bootstrap followed by another optimized
+publication build. The delivered binaries remain immutable release artifacts;
+never install links to `target/debug` or `target/release`. Do not start a
+second build/deploy against the same state while the first one owns it.
+Build output may be quiet while Cargo optimizes: retain the process handle
+and inspect `STATE/staging/<candidate>/cargo.log` when needed. Silence or a
+poll timeout is not evidence that the operation stopped.
+
+### Everyday delivery and update
 
 Everyday delivery and update are one command. It builds an immutable
 candidate from the checkout, installs or updates the core connection with
@@ -90,7 +178,7 @@ no-Cargo situations; `install`, `update` and `check` never compile.
 Build an immutable candidate from the checkout, then run the candidate manager:
 
 ```powershell
-cargo run --release --locked -p codex-harness -- build --source . --state "$env:LOCALAPPDATA\codex-harness-native"
+cargo run --locked --jobs 2 -p codex-harness -- build --source . --state "$env:LOCALAPPDATA\codex-harness-native"
 # The command prints the immutable build directory, e.g. state\builds\<identity>.
 & <build>\codex-harness.exe install --core-only --source . --build <build> --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE" --preview
 & <build>\codex-harness.exe install --core-only --source . --build <build> --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
@@ -133,6 +221,62 @@ Install the remaining components with the same candidate:
 & <build>\codex-harness.exe install --board-only --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
 & <build>\codex-harness.exe install --subscriptions-only --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
 ```
+
+### Completion and targeted recovery
+
+Read the final delivery receipt: require `status = deployed`, the intended
+`build_identity`, every requested component's `ok = true`,
+`verification.executor_probe_ok = true`, and, with code tools connected,
+`verification.serena.status = semantic-ready`. A `partial` receipt means
+installation has changed state but verification is unfinished. Preserve that
+state and investigate the reported error; do not reset a valid installation
+because an acceptance probe failed.
+
+If Serena reports `overview missed the fixture symbol`, inspect the retained
+evidence path and the worker log under its `codex-home/harness/serena-home`.
+An empty symbol result is not success. In the observed first-start failure,
+rust-analyzer did not signal readiness within 120 seconds; the same backend
+subsequently analyzed the retained project and the unchanged semantic probe
+passed. Check `rustup component list --installed` for `rust-src`, run
+`rust-analyzer analysis-stats <evidence>/rust` to establish backend readiness,
+then rerun the bounded semantic check after the prerequisite or readiness
+condition changed:
+
+```powershell
+codex-harness mcp serena-check --source $kit --registry "$env:USERPROFILE/.codex/harness/code-tools.json"
+codex-harness deploy --source $kit --all
+```
+
+Keep the failed evidence; repeated empty results require diagnosis, not a
+retry loop or a weaker assertion. A verified unchanged build is reused by
+deploy, so this recovery does not require another full compilation.
+
+Finally open a new PowerShell 7 terminal **outside the kit checkout**:
+
+```powershell
+Get-Command codex, codex-harness
+codex --version
+codex mcp list --json
+rtk --version
+bd --version
+codex-harness check --core-only --codex-home "$env:USERPROFILE/.codex" --user-home $env:USERPROFILE
+```
+
+Both Codex commands must resolve under `CODEX_HOME/harness/bin`, and the MCP
+list must show enabled `serena` and `nuphus` when code tools were requested.
+Restart Codex sessions that loaded the old MCP/configuration. Persistent User
+PATH is not injected into existing terminal processes: if an automation host
+must refresh its current process, preserve its host-specific tool paths rather
+than overwriting PATH with only User/Machine values. An explicit absolute path
+to the upstream Codex executable bypasses the harness launcher.
+
+CPU-policy warnings are separate from launcher/configuration success. A host
+Job hierarchy can refuse account-job placement while ordinary Codex still
+launches once. Check the reported enforcement and restart boundary and test
+from a plain interactive shell; a configured 75% policy is not proof of kernel
+enforcement. See [Shared CPU policy](#shared-cpu-policy). Installation and these
+checks make no model/provider calls; external subscription authorization remains
+an explicit separate step.
 
 ## What is connected
 

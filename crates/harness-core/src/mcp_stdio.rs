@@ -47,13 +47,13 @@ fn send_input(
     sender: &SyncSender<Input>,
     mut input: Input,
     stop: &Cancellation,
-    deadline: Deadline,
+    lifetime: Option<Deadline>,
 ) -> io::Result<()> {
     loop {
         if stop.is_cancelled() {
             return Ok(());
         }
-        if deadline.expired() {
+        if lifetime.is_some_and(|lifetime| lifetime.expired()) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "MCP input deadline exceeded",
@@ -64,7 +64,7 @@ fn send_input(
             Err(TrySendError::Full(returned)) => input = returned,
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
-        thread::sleep(POLL.min(deadline.remaining()));
+        thread::sleep(lifetime.map_or(POLL, |lifetime| POLL.min(lifetime.remaining())));
     }
 }
 
@@ -72,13 +72,19 @@ fn input_worker(
     file: File,
     sender: SyncSender<Input>,
     stop: Cancellation,
-    deadline: Deadline,
+    lifetime: Option<Deadline>,
 ) -> io::Result<()> {
     let mut pipe = CancellablePipe::reader(file, stop.clone())?;
     let mut decoder = Decoder::default();
     let result = (|| {
         loop {
-            let bytes = match pipe.read(READ_CHUNK, deadline, &stop) {
+            // A finite connection bounds each read by what remains of its
+            // lifetime; an unlimited one waits until data, EOF or cancellation.
+            let incoming = match lifetime {
+                Some(deadline) => pipe.read(READ_CHUNK, deadline, &stop),
+                None => pipe.read_indefinite(READ_CHUNK, &stop),
+            };
+            let bytes = match incoming {
                 Ok(bytes) => bytes,
                 Err(PipeIoError::EndOfFile) => Vec::new(),
                 Err(PipeIoError::Cancelled {
@@ -92,7 +98,7 @@ fn input_worker(
             }
             decoder.push(&bytes)?;
             while let Some(message) = decoder.next_message()? {
-                send_input(&sender, Input::Message(message), &stop, deadline)?;
+                send_input(&sender, Input::Message(message), &stop, lifetime)?;
                 if stop.is_cancelled() {
                     return Ok(false);
                 }
@@ -103,7 +109,7 @@ fn input_worker(
         .close(Deadline::after(CLEANUP)?)
         .map_err(io::Error::from);
     match (result, cleanup) {
-        (Ok(true), Ok(())) => send_input(&sender, Input::Eof, &stop, deadline),
+        (Ok(true), Ok(())) => send_input(&sender, Input::Eof, &stop, lifetime),
         (Ok(false), Ok(())) => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
         (Ok(_), Err(cleanup)) => Err(cleanup),
@@ -118,9 +124,12 @@ fn emit(
     pipe: &mut CancellablePipe,
     message: Message,
     stop: &Cancellation,
-    connection_deadline: Deadline,
+    lifetime: Option<Deadline>,
 ) -> io::Result<()> {
-    let deadline = Deadline::after(WRITE_TIMEOUT.min(connection_deadline.remaining()))?;
+    let budget = lifetime.map_or(WRITE_TIMEOUT, |lifetime| {
+        WRITE_TIMEOUT.min(lifetime.remaining())
+    });
+    let deadline = Deadline::after(budget)?;
     let bytes = message.encode()?;
     for chunk in bytes.chunks(READ_CHUNK) {
         pipe.write_all(chunk, deadline, stop)?;
@@ -180,11 +189,37 @@ where
 /// after cancellation or EOF. Only a successfully reclaimed operation may
 /// produce a normal tool result and release the scheduler's active slot.
 pub fn serve_fallible<F>(
-    mut session: Session,
+    session: Session,
     input: File,
     output: File,
     cancellation: &Cancellation,
     deadline: Deadline,
+    handler: F,
+) -> io::Result<()>
+where
+    F: Fn(Operation) -> io::Result<Value> + Send + Sync + 'static,
+{
+    serve_fallible_with_lifetime(
+        session,
+        input,
+        output,
+        cancellation,
+        Some(deadline),
+        handler,
+    )
+}
+
+/// Serve one connection with an explicit lifetime. `None` keeps the connection
+/// available while its client keeps the input open: input waits indefinitely
+/// for data, EOF or cancellation, while request deadlines, response writes,
+/// queue backpressure and cleanup keep their own finite budgets. A finite
+/// `Some(deadline)` is the existing maximum connection lifetime.
+pub fn serve_fallible_with_lifetime<F>(
+    mut session: Session,
+    input: File,
+    output: File,
+    cancellation: &Cancellation,
+    lifetime: Option<Deadline>,
     handler: F,
 ) -> io::Result<()>
 where
@@ -196,7 +231,7 @@ where
             "MCP serving cancelled before start",
         ));
     }
-    if deadline.expired() {
+    if lifetime.is_some_and(|lifetime| lifetime.expired()) {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "MCP connection deadline expired",
@@ -210,7 +245,7 @@ where
         let stop = stop.clone();
         thread::Builder::new()
             .name("mcp-input-dispatch".into())
-            .spawn(move || input_worker(input, sender, stop, deadline))
+            .spawn(move || input_worker(input, sender, stop, lifetime))
     };
     let reader = match reader {
         Ok(reader) => reader,
@@ -236,14 +271,14 @@ where
                     "MCP serving cancelled",
                 ));
             }
-            if deadline.expired() {
+            if lifetime.is_some_and(|lifetime| lifetime.expired()) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "MCP connection deadline expired",
                 ));
             }
             for reply in session.tick()? {
-                emit(&mut writer, reply, &stop, deadline)?;
+                emit(&mut writer, reply, &stop, lifetime)?;
             }
             if task.as_ref().is_some_and(|task| task.worker.is_finished()) {
                 let task = task.take().unwrap();
@@ -252,7 +287,7 @@ where
                     .join()
                     .map_err(|_| failed("MCP tool worker panicked; cleanup not confirmed"))??;
                 if let Some(reply) = session.complete(&task.id, response)? {
-                    emit(&mut writer, reply, &stop, deadline)?;
+                    emit(&mut writer, reply, &stop, lifetime)?;
                 }
             }
             if let Some(operation) = session.next_operation() {
@@ -266,7 +301,7 @@ where
             match receiver.recv_timeout(POLL) {
                 Ok(Input::Message(message)) => {
                     if let Some(reply) = session.receive(message)? {
-                        emit(&mut writer, reply, &stop, deadline)?;
+                        emit(&mut writer, reply, &stop, lifetime)?;
                     }
                 }
                 Ok(Input::Eof) => return Ok(()),

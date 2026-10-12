@@ -230,10 +230,13 @@ redundant kit presets with their obsolete references; preserve user-owned agents
 and `.agents/skills`. Responsibilities are assignments, not permanent agent files.
 The [delegation guide](agent-delegation.md) owns the migration from former names.
 
-The accepted subscription workflow keeps GPT as the normal lead, uses Z.AI for
-substantial senior text/code execution and temporary leadership after GPT quota
-exhaustion, and Grok for visual and suitable routine work. Effort names are
-model-specific; do not promise unsupported combinations or silently substitute.
+**2026-10-12, confirmed:** the default orchestration runs the lead and successor
+as ordinary Codex / GPT-6 Astra at `xhigh` (`default`), and executors through
+the local `ds` profile (DeepSeek V4.1 Flash at `max`). xAI and Z.AI models are
+no longer used and no fallback routes to them. This supersedes the earlier
+default routing of executors and succession to external subscriptions. Effort
+names are model-specific; do not promise unsupported combinations or silently
+substitute.
 
 Every active conversation needs its own visible terminal surface with a
 distinct title: lead, workers and any model-backed helpers. Show assignment,

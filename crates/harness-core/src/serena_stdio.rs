@@ -66,11 +66,15 @@ impl<'a> Proxy<'a> {
         configuration: Configuration,
         arguments: &'a [OsString],
         cwd: &'a Path,
-        deadline: Deadline,
+        lifetime: Option<Deadline>,
         cancellation: &Cancellation,
     ) -> io::Result<Self> {
         Ok(Self {
-            client: serena_broker::Client::new(configuration, deadline, cancellation)?,
+            client: serena_broker::Client::new(
+                configuration,
+                Self::deadline(lifetime)?,
+                cancellation,
+            )?,
             arguments,
             cwd,
             initialize: None,
@@ -87,15 +91,22 @@ impl<'a> Proxy<'a> {
         self.client.disconnect()
     }
 
-    fn deadline(connection: Deadline) -> io::Result<Deadline> {
-        Deadline::after(connection.remaining().min(REQUEST))
+    /// Every broker operation gets its own fresh finite budget: a finite
+    /// connection caps it by what remains, and an unlimited connection still
+    /// bounds each operation by the request cap. Connection age never becomes
+    /// an operation deadline.
+    fn deadline(lifetime: Option<Deadline>) -> io::Result<Deadline> {
+        match lifetime {
+            Some(lifetime) => Deadline::after(lifetime.remaining().min(REQUEST)),
+            None => Deadline::after(REQUEST),
+        }
     }
 
     fn handle(
         &mut self,
         message: &Message,
         cancel: &Cancellation,
-        connection: Deadline,
+        lifetime: Option<Deadline>,
     ) -> io::Result<Value> {
         let id = message
             .id()
@@ -114,7 +125,7 @@ impl<'a> Proxy<'a> {
                     self.arguments,
                     self.cwd,
                     self.initialize.as_ref().expect("just stored"),
-                    Self::deadline(connection)?,
+                    Self::deadline(lifetime)?,
                     cancel,
                 )?;
                 self.route = Some(response["route"].clone());
@@ -129,7 +140,7 @@ impl<'a> Proxy<'a> {
                 &params,
                 &route,
                 &initialize,
-                Self::deadline(connection)?,
+                Self::deadline(lifetime)?,
                 cancel,
             )?;
             self.route = Some(response["route"].clone());
@@ -149,21 +160,24 @@ impl<'a> Proxy<'a> {
     }
 }
 
-/// Serve one stdio connection as a shared-broker proxy. The connection
-/// deadline is an explicit maximum chosen by its owner.
+/// Serve one stdio connection as a shared-broker proxy. A lifetime of `None`
+/// keeps the connection available until its client closes the input or the
+/// owner cancels; `Some(deadline)` is an explicit maximum chosen by a bounded
+/// owner. Requests, response writes and cleanup each keep their own finite
+/// budget, so an unlimited connection age never grants unlimited execution.
 pub fn serve(
     configuration: Configuration,
     arguments: Vec<OsString>,
     input: File,
     output: File,
     cancellation: &Cancellation,
-    deadline: Deadline,
+    lifetime: Option<Deadline>,
 ) -> io::Result<()> {
     let cwd = std::env::current_dir()?;
     let stop = Cancellation::default();
     let mut reader = CancellablePipe::reader(input, stop.clone())?;
     let mut writer = CancellablePipe::writer(output, stop.clone())?;
-    let mut proxy = Proxy::new(configuration, &arguments, &cwd, deadline, cancellation)?;
+    let mut proxy = Proxy::new(configuration, &arguments, &cwd, lifetime, cancellation)?;
     let mut decoder = Decoder::default();
     let result = (|| -> io::Result<()> {
         loop {
@@ -173,7 +187,7 @@ pub fn serve(
                     "Serena proxy cancelled",
                 ));
             }
-            if deadline.expired() {
+            if lifetime.is_some_and(|lifetime| lifetime.expired()) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "Serena proxy deadline expired",
@@ -184,19 +198,23 @@ pub fn serve(
                     "jsonrpc":"2.0",
                     "method":"notifications/tools/list_changed"
                 }))?)?;
-                emit(&mut writer, &notice, &stop, deadline)?;
+                emit(&mut writer, &notice, &stop, lifetime)?;
             }
             while let Some(message) = decoder.next_message()? {
                 if message.id().is_none() {
                     // Notifications are not forwarded, matching the seam.
                     continue;
                 }
-                let response = proxy.handle(&message, cancellation, deadline)?;
+                let response = proxy.handle(&message, cancellation, lifetime)?;
                 let encoded = serde_json::to_vec(&response)?;
                 let parsed = Message::parse(&encoded)?;
-                emit(&mut writer, &parsed, &stop, deadline)?;
+                emit(&mut writer, &parsed, &stop, lifetime)?;
             }
-            match reader.read(READ_CHUNK, deadline, cancellation) {
+            let incoming = match lifetime {
+                Some(deadline) => reader.read(READ_CHUNK, deadline, cancellation),
+                None => reader.read_indefinite(READ_CHUNK, cancellation),
+            };
+            match incoming {
                 Ok(bytes) => {
                     if bytes.is_empty() {
                         return Ok(());
@@ -251,9 +269,10 @@ fn emit(
     pipe: &mut CancellablePipe,
     message: &Message,
     stop: &Cancellation,
-    connection: Deadline,
+    lifetime: Option<Deadline>,
 ) -> io::Result<()> {
-    let deadline = Deadline::after(CLEANUP.min(connection.remaining()))?;
+    let budget = lifetime.map_or(CLEANUP, |lifetime| CLEANUP.min(lifetime.remaining()));
+    let deadline = Deadline::after(budget)?;
     let bytes = message.encode()?;
     for chunk in bytes.chunks(READ_CHUNK) {
         pipe.write_all(chunk, deadline, stop)?;
