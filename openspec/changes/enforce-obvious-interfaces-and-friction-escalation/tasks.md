@@ -1,0 +1,21 @@
+# Tasks
+
+## 1. Consolidate the owned policy and guidance
+
+- [ ] 1.1 Update `global/principles-of-work.md` in the existing interface experience, dissent, environment and adaptive-work sections to express all five delta requirements. Verify coverage against every delta scenario and preservation of affected existing obligations; consolidate overlapping prose and measure the final UTF-8 file at no more than 24 KiB without increasing either existing size limit.
+- [ ] 1.2 Record the confirmed universal-interface and timely-escalation preference in the existing engineering-judgment section of `docs/project-decisions.md`, and reconcile `docs/global-instructions.md` where delivery or verification needs clarification. Verify one normative owner per rule, working local references, no private consumer details and no changes to protected OpenSpec workflow files or consuming-project implementation.
+- [ ] 1.3 Run `openspec validate enforce-obvious-interfaces-and-friction-escalation --strict --no-interactive`, `harness-source-check --root .` and `git diff --check`; inspect the scoped source/doc diff for preserved authority, acceptance, recovery and informed-user-choice behavior. Resolve failures caused by this change and distinguish unrelated findings; do not add wording-mirroring tests or run unrelated application suites.
+
+## 2. Verify global consumption and actual behavior
+
+- [ ] 2.1 Verify the revised source through the existing global instruction link and fresh native contexts in two working directories, including an external consumer with project instructions, using the established global-delivery procedure. Confirm effective instruction loading and unchanged unrelated settings; preserve the distinction between fresh loading and already-running sessions, and retain evidence in the existing local verification owner without starting hidden model conversations.
+- [ ] 2.2 Exercise a bounded real task outside this checkout using an existing installed tool on owned inputs, with observable preparation or coordination burden and unchanged independently checked parent acceptance. Inspect actual messages and subsequent actions for prompt feedback, an authorized correction or justified escalation, valid reuse and complete recovery. Retain the applicable baseline/comparison and complete costs required by the existing external-use acceptance; leave missing or inconclusive evidence explicitly unfinished rather than substituting a simulated success or a claimed general speedup.
+- [ ] 2.3 Validate the remaining delta scenarios with bounded counterexamples covering a programmatic contract, a one-command facade with manual prerequisites, an incomplete supported entry point, a cheap correction, a material scope decision, an informed interim choice, necessary full checks and interrupted recovery. Reuse valid existing checks, distinguish reasoning-only scenarios from executed use, and verify that no case weakens authority, invents permission gates, repeats objections without new facts or silently continues unsupported repetition.
+
+## 3. Accept the integrated instruction change
+
+- [ ] 3.1 Review the final requirement-to-evidence coverage in the existing change/verification owner and confirm the external task's accepted result. Close only actually satisfied tasks, retain unresolved behavioral limits and deferred improvements with their triggers, and rerun affected checks only if corrections or changed inputs invalidate their results.
+
+## Workflow follow-up
+
+- Synchronize the delta and archive through the supported OpenSpec workflow when requested after implementation acceptance; preserve unrelated active changes and all existing requirements.
