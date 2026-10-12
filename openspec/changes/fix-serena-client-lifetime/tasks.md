@@ -10,5 +10,5 @@
 ## 2. Integration and delivery
 
 - [x] 2.1 Run affected native pipe, Serena broker, Nuphus and STDIO checks, including real package activation, routing and idle retirement; retain exact commands and outcomes. Serena real-package checks and installed idle-return verification have passed; Nuphus focused suites and the optional real-package check have passed, with the earlier browser-load failure recorded in the design.
-- [ ] 2.2 Deploy the combined immutable candidate through the global lifecycle, update both managed registrations, validate ownership and exercise installed Serena activation plus symbol navigation outside this checkout and a read-only Nuphus tool request. Serena deployment and external verification have passed.
-- [ ] 2.3 Reconcile task/spec state and report completed checks and any one-time reconnection needed by an already closed client.
+- [x] 2.2 Deploy the combined immutable candidate through the global lifecycle, update both managed registrations, validate ownership and exercise installed Serena activation plus symbol navigation outside this checkout and a read-only Nuphus tool request.
+- [x] 2.3 Reconcile task/spec state and report completed checks and any one-time reconnection needed by an already closed client.
