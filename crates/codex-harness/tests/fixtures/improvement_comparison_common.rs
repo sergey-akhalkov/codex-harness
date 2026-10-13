@@ -8,11 +8,11 @@
 //! settles and consumes it on `resume`. No check here contacts a model or a
 //! provider.
 //!
-//! Shared fixtures for `improvement_comparison_a` and `improvement_comparison_b`.
+//! Shared fixtures for the deadline-split `improvement_comparison_a`, `improvement_comparison_b` and `improvement_comparison_c` targets.
 #![cfg(windows)]
-// Cargo also discovers this file as an empty integration-test crate. The
-// installed route excludes it. These allows cover that crate and helpers used
-// by only one of the two including targets.
+// This module lives under `fixtures/`, so Cargo does not discover it as a
+// route target. These allows cover helpers used by only one of the two
+// including targets.
 #![allow(dead_code, unused_imports)]
 
 use harness_core::{build_identity, task_worktree};

@@ -436,10 +436,20 @@ fn pooled_spawn_defaults_to_the_native_tui_and_qualifies_both_spellings() {
         "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
     )
     .unwrap();
+    // One stable owner keeps the same held binding across the presentation
+    // spellings; a fresh owner would need its own pool position.
     for (extra, mode, presentation) in [
-        (&[][..], "tui", "native-tui"),
-        (&["--mode", "tui"][..], "tui", "native-tui"),
-        (&["--mode", "exec"][..], "exec", "native-inline"),
+        (&["--owner", "exec-present"][..], "tui", "native-tui"),
+        (
+            &["--owner", "exec-present", "--mode", "tui"][..],
+            "tui",
+            "native-tui",
+        ),
+        (
+            &["--owner", "exec-present", "--mode", "exec"][..],
+            "exec",
+            "native-inline",
+        ),
     ] {
         let out = fixture.spawn(extra);
         let text = output_text(&out);
@@ -546,10 +556,7 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
     let other = fixture.spawn(&["--owner", "exec-other"]);
     let text = output_text(&other);
     assert!(text.contains("no free slot in the pool of 1"), "{text}");
-    assert!(
-        text.contains("occupied by live session exec-live"),
-        "{text}"
-    );
+    assert!(text.contains("held by task 'exec-live'"), "{text}");
     let same = fixture.spawn(&["--owner", "exec-live"]);
     assert!(
         output_text(&same).contains("is already live in slot 1"),
@@ -557,9 +564,28 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
         output_text(&same)
     );
     assert!(host.wait().unwrap().success());
-    // The host exited: the same slot is reclaimable instead of multiplying.
+    // The host exited, but the durable task binding stays held: only an
+    // explicit reviewed release returns the position to the pool.
     let next = fixture.spawn(&["--owner", "exec-other"]);
-    assert!(!next.status.success());
+    let text = output_text(&next);
+    assert!(!next.status.success(), "{text}");
+    assert!(text.contains("held by task 'exec-live'"), "{text}");
+    assert_eq!(fixture.record(1)["owner"], "exec-live");
+    let released = fixture.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "liveness check complete",
+    ]);
+    assert!(
+        output_text(&released).contains("released as discarded"),
+        "{}",
+        output_text(&released)
+    );
+    // The released position serves the next owner without multiplying trees.
+    assert!(!fixture.spawn(&["--owner", "exec-other"]).status.success());
     assert_eq!(fixture.record(1)["owner"], "exec-other");
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
     fixture.drop();
@@ -567,70 +593,29 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
 
 #[test]
 fn pending_startup_claim_is_not_replaced_before_the_host_lease() {
-    overlap_while_fetch_is_held("startup-other", "exec-hold", "exec-other");
-    overlap_while_fetch_is_held("startup-same", "exec-hold", "exec-hold");
+    pending_claim_refuses_a_contender("startup-other", "exec-hold", "exec-other");
+    pending_claim_refuses_a_contender("startup-same", "exec-hold", "exec-hold");
 }
 
-fn installed_git() -> PathBuf {
-    let output = Command::new("where.exe").arg("git").output().unwrap();
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .map(str::trim)
-        .find(|line| line.to_ascii_lowercase().ends_with("git.exe"))
-        .map(PathBuf::from)
-        .expect("git.exe")
-}
-
-/// Hold the first dispatch on `git fetch` after its claim. The second dispatch
-/// starts only after that gate file exists; the loop only observes the gate.
-fn overlap_while_fetch_is_held(name: &str, owner_a: &str, owner_b: &str) {
+/// A dispatch's position stays exclusive from its claim until a host lease
+/// exists. This test process takes the only position through the same core
+/// call the dispatcher uses, so the record carries the pending startup
+/// reservation a stopped mid-startup dispatch would have written; the
+/// contender then runs the real CLI against it.
+fn pending_claim_refuses_a_contender(name: &str, owner_a: &str, owner_b: &str) {
     let fixture = Fixture::new(name, 1);
-    let gate = fixture.root.join("gate");
-    fs::create_dir_all(&gate).unwrap();
-    fs::write(gate.join("hold"), b"hold\n").unwrap();
-    let stand_in = gate.join("git.cmd");
-    fs::write(
-        &stand_in,
-        r#"@echo off
-setlocal
-if /I "%~1"=="fetch" (
-  >"%HARNESS_SPAWN_GATE%\entered.txt" echo entered
-  :wait
-  if exist "%HARNESS_SPAWN_GATE%\hold" (
-    ping -n 2 127.0.0.1 >nul
-    goto wait
-  )
-)
-"%HARNESS_SPAWN_GIT%" %*
-exit /b %ERRORLEVEL%
-"#,
+    let startup = harness_core::task_worktree::current_startup_reservation()
+        .expect("this test process is the live startup reservation");
+    harness_core::task_worktree::acquire_task_for_startup(
+        &fixture.home,
+        &fixture.source,
+        1,
+        owner_a,
+        None,
+        &startup,
+        &|_| false,
     )
-    .unwrap();
-    let mut path = std::ffi::OsString::from(&gate);
-    path.push(";");
-    path.push(std::env::var_os("PATH").unwrap_or_default());
-    let mut first = fixture.spawn_command();
-    first
-        .args(["--exec", "first assignment", "--owner", owner_a])
-        .env("PATH", &path)
-        .env("HARNESS_SPAWN_GATE", &gate)
-        .env("HARNESS_SPAWN_GIT", installed_git())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut first = first.spawn().unwrap();
-    let entered = gate.join("entered.txt");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !entered.is_file() {
-        assert!(
-            first.try_wait().unwrap().is_none(),
-            "first dispatch exited before the post-claim fetch gate"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "first dispatch did not reach the post-claim fetch gate"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    .expect("the first acquisition takes the only position");
     let during = fixture.record(1);
     assert_eq!(during["owner"], owner_a, "{during}");
     assert!(during["startup"].is_object(), "{during}");
@@ -654,9 +639,6 @@ exit /b %ERRORLEVEL%
         "contender replaced the pending claim: {after}"
     );
     assert_eq!(after["startup"]["pid"], during["startup"]["pid"], "{after}");
-    let _ = fs::remove_file(gate.join("hold"));
-    let _ = first.kill();
-    let _ = first.wait();
     fixture.drop();
 }
 
@@ -1081,17 +1063,25 @@ fn resume_rebinds_the_interrupted_slot_without_resetting_partial_work() {
         output_text(&again)
     );
     assert!(partial.is_file());
-    // Another owner is refused with both identities named, and the tree keeps
-    // its partial work.
+    // The former owner is gone, so an explicit resume as another session
+    // rebinds the same task binding: the checkout, generation handle and
+    // partial work survive without a reset.
     let other = fixture.resume(&["--owner", "exec-ds-9"]);
     let text = output_text(&other);
-    assert!(!other.status.success(), "{text}");
     assert!(
-        text.contains("bound to session exec-ds-52 instead of exec-ds-9"),
+        text.contains("installed Codex launcher is missing"),
         "{text}"
     );
+    assert!(text.contains("owner=exec-ds-9"), "{text}");
     assert!(partial.is_file());
-    assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
+    let record = fixture.record(1);
+    assert_eq!(record["owner"], "exec-ds-9");
+    assert_eq!(record["task"], "exec-ds-52");
+    assert_eq!(
+        git_output(&slot, &["rev-parse", "HEAD"]),
+        head,
+        "rebinding must not resynchronize the slot"
+    );
     fixture.drop();
 }
 
@@ -1213,9 +1203,30 @@ fn pooled_dispatch_records_the_mapping_and_reuses_the_same_slot_after_interrupti
     assert!(!second.status.success());
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
     assert_eq!(fixture.record(1)["owner"], "exec-1");
-    // A later session reuses the same slot path as well.
+    // A different owner never bypasses the held task: until the held binding
+    // is released, the position stays with exec-1.
     let third = fixture.spawn(&["--owner", "exec-2"]);
-    assert!(!third.status.success());
+    let text = output_text(&third);
+    assert!(!third.status.success(), "{text}");
+    assert!(text.contains("held by task 'exec-1'"), "{text}");
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+    assert_eq!(fixture.record(1)["owner"], "exec-1");
+    // Only an explicit reviewed release returns the position; the next owner
+    // then reuses the same slot path.
+    let released = fixture.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "interrupted assignment reviewed",
+    ]);
+    assert!(
+        output_text(&released).contains("released as discarded"),
+        "{}",
+        output_text(&released)
+    );
+    assert!(!fixture.spawn(&["--owner", "exec-2"]).status.success());
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
     let record = fixture.record(1);
     assert_eq!(record["state"], "occupied");
@@ -1238,14 +1249,10 @@ fn exhausted_pool_aborts_with_a_concrete_cause_and_no_new_tree() {
     assert!(text.contains("no free slot in the pool of 4"), "{text}");
     for index in 1..=4 {
         assert!(
-            text.contains(&format!("slot {index} holds local or untracked changes")),
+            text.contains(&format!("slot {index} is held by task 'exec-{index}'")),
             "{text}"
         );
     }
-    assert!(
-        text.contains("merge or explicitly discard them before reuse"),
-        "{text}"
-    );
     assert!(
         !text.contains("worktree warning"),
         "the limit warning is replaced by the pool-invariant refusal: {text}"
@@ -1258,9 +1265,17 @@ fn exhausted_pool_aborts_with_a_concrete_cause_and_no_new_tree() {
         !fixture.slot(5).exists(),
         "an exhausted pool never registers another tree"
     );
-    // Preserved slots report their reason instead of being silently reused.
+    // Each held binding keeps its unreviewed work and reports its own state
+    // instead of being silently reset and reused.
+    for index in 1..=4 {
+        assert!(
+            fixture.slot(index).join("work.txt").is_file(),
+            "held work stays in slot {index}"
+        );
+    }
     let listed = fixture.pool();
-    assert!(listed.contains("state=awaiting-review"), "{listed}");
+    assert!(listed.contains("state=occupied"), "{listed}");
+    assert!(listed.contains("task=exec-1"), "{listed}");
     assert!(listed.contains("tree=dirty"), "{listed}");
     fixture.drop();
 }
@@ -1602,7 +1617,7 @@ fn two_leads_sharing_a_checkout_keep_explicit_profiles_on_the_shell_path() {
         let recorded_source = text
             .split("source=")
             .nth(1)
-            .and_then(|rest| rest.lines().next())
+            .and_then(|rest| rest.split(" repository=").next())
             .unwrap_or("")
             .trim();
         assert!(
@@ -2021,8 +2036,12 @@ fn lead_start_reports_its_options_and_refuses_unusable_ones() {
 
 #[test]
 fn missing_or_blank_lead_id_refuses_before_a_model_request() {
-    let fixture = Fixture::new("lead-missing", 1);
-    let mut missing = fixture.spawn_command();
+    // Each refusal gets its own fixture. A refused dispatch has already
+    // acquired its durable task binding, and a held binding is not reclaimed
+    // through process liveness: only an explicit release returns that
+    // position, so the second refusal is checked in a fresh pool.
+    let missing_fixture = Fixture::new("lead-missing", 1);
+    let mut missing = missing_fixture.spawn_command();
     missing.env_remove("CODEX_THREAD_ID");
     missing.args(["--exec", "assignment text"]);
     let missing = missing.output().unwrap();
@@ -2034,7 +2053,13 @@ fn missing_or_blank_lead_id_refuses_before_a_model_request() {
         !text.contains("installed Codex launcher is missing"),
         "{text}"
     );
-    let mut blank = fixture.spawn_command();
+    let held = missing_fixture.pool();
+    assert!(held.contains("task=exec-ds-"), "{held}");
+    assert!(held.contains("state=occupied"), "{held}");
+    missing_fixture.drop();
+
+    let blank_fixture = Fixture::new("lead-blank", 1);
+    let mut blank = blank_fixture.spawn_command();
     blank.env("CODEX_THREAD_ID", " \t");
     blank.args(["--exec", "assignment text"]);
     let blank = blank.output().unwrap();
@@ -2046,7 +2071,7 @@ fn missing_or_blank_lead_id_refuses_before_a_model_request() {
         !text.contains("installed Codex launcher is missing"),
         "{text}"
     );
-    fixture.drop();
+    blank_fixture.drop();
 }
 
 #[test]

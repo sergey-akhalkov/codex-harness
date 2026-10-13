@@ -43,6 +43,8 @@ mod source_diagnostics_view;
 #[cfg(windows)]
 mod subscription_login_cli;
 #[cfg(windows)]
+mod worktree_cli;
+#[cfg(windows)]
 mod xai_responses_probe_cli;
 #[cfg(windows)]
 mod xai_responses_shim_cli;
@@ -314,6 +316,9 @@ fn run() -> io::Result<i32> {
         println!(
             "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--base REV] [--owner ID] (--exec PROMPT|- | --assignment FILE)\ncodex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor succeed --request PATH"
         );
+        println!(
+            "codex-harness worktree acquire|continue|list|release --task ID [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY] (one repository's shared harness worktree pool for ordinary tasks; --source supplies the kit configuration and defaults to the installed kit source, --repository defaults to it; release adds --disposition merged|discarded --reason TEXT [--base REV] [--handle HANDLE]; no model dispatch)"
+        );
         println!("codex-harness lead message [--text TEXT | --file FILE] [--notify]");
         println!(
             "codex-harness improve start|status|select|stop|resume --run DIRECTORY ... (explicit private improvement run; see improve --help)"
@@ -466,6 +471,11 @@ fn run() -> io::Result<i32> {
     if args[0] == "executor" {
         verify_runtime()?;
         return executor_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "worktree" {
+        verify_runtime()?;
+        return worktree_cli::run(&args[1..]);
     }
     #[cfg(windows)]
     if args[0] == "lead" {

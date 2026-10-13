@@ -1,8 +1,8 @@
-//! Native dispatch, short real-operation and nuisance-control checks split
-//! from `improvement_comparison`.
+//! Native dispatch, short real-operation, calibration and nuisance-control
+//! checks split from `improvement_comparison`.
 #![cfg(windows)]
 
-#[path = "improvement_comparison_common.rs"]
+#[path = "fixtures/improvement_comparison_common.rs"]
 mod improvement_comparison_common;
 use improvement_comparison_common::*;
 
@@ -1698,5 +1698,597 @@ fn an_unverifiable_measured_response_is_classified_and_not_repaired() {
         load_json(&fault_path)["class"],
         "work-started-unverified",
         "the classification stays bound to the frozen plan"
+    );
+}
+
+/// Identical runtimes plus one known external idle delay: the raw accounting
+/// keeps the delay, the adjusted view excludes exactly its verified blocked
+/// interval once, no deduction is invented for the unblocked arm, and the
+/// queue-only difference is not reported as a gain or a regression.
+#[test]
+fn calibration_idle_delay_is_retained_and_deducted_without_a_false_effect() {
+    let _serial = INSTALL.lock().unwrap();
+    let delay_seconds = 6.0;
+    let delay_ms = 6_000;
+    let session = session_id("calibration-delay-baseline");
+    let mut baseline = ControlledArm::new("baseline", "baseline", &session, "solved");
+    baseline.sleep_ms = 3_000;
+    baseline.started_offset_seconds = 9.0;
+    baseline.window_seconds = 20.0;
+    baseline.commands = vec![controlled_command(
+        "call_heavy_blocked_1",
+        delay_ms + 1_500,
+        1_500,
+        true,
+    )];
+    let candidate_session = session_id("calibration-delay-candidate");
+    let mut candidate = ControlledArm::new("candidate", "candidate", &candidate_session, "solved");
+    candidate.sleep_ms = 3_000;
+    candidate.started_offset_seconds = 3.0;
+    candidate.window_seconds = 12.0;
+    candidate.commands = vec![controlled_command("call_build_1", 3_500, 1_500, false)];
+    let fixture = controlled_pair("calibration-delay", true, baseline, candidate);
+
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let baseline_attempt = attempt_of_arm(&report, "baseline");
+    let candidate_attempt = attempt_of_arm(&report, "candidate");
+    let baseline_infra = &baseline_attempt["infrastructure"];
+    let candidate_infra = &candidate_attempt["infrastructure"];
+
+    // Raw retention: the observed elapsed keeps the injected delay and is
+    // never rewritten by the adjustment.
+    let baseline_observed = baseline_infra["observed_seconds"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("the baseline observed time is retained: {report}"));
+    let candidate_observed = candidate_infra["observed_seconds"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("the candidate observed time is retained: {report}"));
+    assert!(
+        baseline_observed - candidate_observed > delay_seconds - 2.0,
+        "the raw observed difference must retain the injected delay: {baseline_infra} {candidate_infra}"
+    );
+    let unit = &report["units"][0];
+    let raw_delta = unit["effect"]["baseline_seconds"]
+        .as_f64()
+        .zip(unit["effect"]["candidate_seconds"].as_f64())
+        .map(|(baseline, candidate)| baseline - candidate);
+    assert!(
+        raw_delta.is_some_and(|delta| delta > delay_seconds - 2.0),
+        "the retained unit effect keeps the raw difference: {unit}"
+    );
+
+    // Bounded adjustment: only the verified blocked interval is excluded,
+    // once, and the identity observed = adjusted + excluded holds exactly.
+    let deducted = baseline_infra["deductible_seconds"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("the deduction is retained: {baseline_infra}"));
+    assert!(
+        (delay_seconds - 0.1..=delay_seconds).contains(&deducted),
+        "the deductible portion must be the verified blocked interval, not less or more: {baseline_infra}"
+    );
+    assert_eq!(
+        candidate_infra["deductible_ns"], 0,
+        "an unblocked arm must keep no deduction: {candidate_infra}"
+    );
+    let adjusted_high = baseline_infra["adjusted_high_seconds"].as_f64().unwrap();
+    let adjusted_low = baseline_infra["adjusted_low_seconds"].as_f64().unwrap();
+    let unresolved = baseline_infra["unresolved_seconds"].as_f64().unwrap();
+    assert!(
+        (baseline_observed - deducted - adjusted_high).abs() < 1e-6,
+        "the raw time must stay adjusted + excluded: {baseline_infra}"
+    );
+    assert!(
+        (adjusted_high - adjusted_low - unresolved).abs() < 1e-6 && unresolved < 0.2,
+        "the observed error bound stays visible and small: {baseline_infra}"
+    );
+    assert!(
+        baseline_observed - adjusted_high > 5.0,
+        "the injected interval must be excluded once: {baseline_infra}"
+    );
+    assert!(
+        (adjusted_high - candidate_observed).abs() < 4.0,
+        "the adjusted baseline must return to the identical-work time within the observed bound: {baseline_infra} {candidate_infra}"
+    );
+
+    // The attribution record binds the deduction to the predeclared rule,
+    // lineage, cause and retained evidence; nothing is claimed unbound.
+    let attribution = &baseline_attempt["attribution"];
+    assert_eq!(
+        attribution["rule_version"],
+        harness_core::infrastructure_accounting::RULE_VERSION,
+        "{attribution}"
+    );
+    assert_eq!(
+        attribution["lineage"],
+        harness_core::infrastructure_accounting::MEASUREMENT_LINEAGE,
+        "{attribution}"
+    );
+    assert_eq!(attribution["replay"], "reproduced", "{attribution}");
+    assert_eq!(
+        attribution["reconciliation"]["elapsed"]["status"], "consistent",
+        "{attribution}"
+    );
+    assert!(
+        attribution["exclusions"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["kind"] == "deducted" && item["cause"] == "unrelated-external-blocking"
+            })
+        }),
+        "the deduction keeps its cause and evidence: {attribution}"
+    );
+
+    // No false effect: the queue-only difference cannot become a gain or a
+    // regression, and the decision names the attribution instead.
+    assert_ne!(
+        decision["decision"], "adopt",
+        "a queue-only difference must not be adopted: {decision}"
+    );
+    assert_eq!(decision["decision"], "inconclusive", "{decision}");
+    let reasons = evaluation_reasons(&evaluation);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("attributed to excluded external waiting")),
+        "the verdict must name the queue-only attribution: {reasons:?}"
+    );
+    assert!(
+        !reasons
+            .iter()
+            .any(|reason| reason.contains("materially regressed")),
+        "the delay must not be reported as a regression: {reasons:?}"
+    );
+}
+
+/// Real added work stays attributable: an arm that records a redundant build
+/// and polling commands keeps their cost in both raw and adjusted accounting,
+/// nothing is deducted for its own granted work, and the added burden cannot
+/// be normalized into a supported improvement.
+#[test]
+fn calibration_controls_preserve_extra_work_without_normalizing_it_away() {
+    let _serial = INSTALL.lock().unwrap();
+    let baseline = granted_arm(
+        "baseline",
+        "calibration-extra-baseline",
+        2.0,
+        &[("call_build_1", 2_500, 1_000)],
+    );
+    let candidate = granted_arm(
+        "candidate",
+        "calibration-extra-candidate",
+        7.0,
+        &[
+            ("call_build_1", 7_500, 5_500),
+            ("call_build_extra_1", 5_000, 3_500),
+            ("call_poll_1", 2_500, 2_000),
+        ],
+    );
+    let fixture = controlled_pair("calibration-extra-work", true, baseline, candidate);
+
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let baseline_attempt = attempt_of_arm(&report, "baseline");
+    let candidate_attempt = attempt_of_arm(&report, "candidate");
+    for (name, attempt) in [
+        ("baseline", baseline_attempt),
+        ("candidate", candidate_attempt),
+    ] {
+        let infra = &attempt["infrastructure"];
+        assert_eq!(
+            infra["deductible_ns"], 0,
+            "{name}: granted own work must not be deducted: {attempt}"
+        );
+        assert_eq!(
+            infra["coverage"], "measured",
+            "{name}: the granted-work trace is fully measured: {attempt}"
+        );
+        assert!(
+            (infra["adjusted_high_seconds"].as_f64().unwrap()
+                - infra["observed_seconds"].as_f64().unwrap())
+            .abs()
+                < 1e-6,
+            "{name}: adjusted time keeps the own-work cost: {attempt}"
+        );
+    }
+    // The added build and polling work stays visible in the arm's own
+    // counters and in the measured time.
+    let baseline_observed = baseline_attempt["infrastructure"]["observed_seconds"]
+        .as_f64()
+        .unwrap();
+    let candidate_observed = candidate_attempt["infrastructure"]["observed_seconds"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        candidate_observed - baseline_observed > 1.5,
+        "the extra admitted work must stay in the measured time: {baseline_attempt} {candidate_attempt}"
+    );
+    assert_eq!(
+        candidate_attempt["tool_operations"], 3,
+        "{candidate_attempt}"
+    );
+    assert_eq!(baseline_attempt["tool_operations"], 1, "{baseline_attempt}");
+    let activity = candidate_attempt["infrastructure_capture"]["activity"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        activity.len(),
+        3,
+        "every recorded command stays placed: {candidate_attempt}"
+    );
+    // The added burden is a measured regression of the treatment, never an
+    // adopted improvement.
+    assert_eq!(decision["decision"], "reject", "{decision}");
+    let reasons = evaluation_reasons(&evaluation);
+    assert!(
+        reasons.iter().any(|reason| reason.contains("regressed")
+            || reason.contains("does not meet the predeclared meaningful threshold")),
+        "the added burden decides the verdict: {reasons:?}"
+    );
+    let selected = &report["units"][0]["infrastructure_effect"];
+    assert!(
+        selected["candidate_high_seconds"].as_f64().unwrap()
+            > selected["baseline_low_seconds"].as_f64().unwrap(),
+        "the adjusted view keeps the added cost: {selected}"
+    );
+}
+
+/// A real cache benefit remains an attributable treatment effect: an arm that
+/// avoids a redundant rebuild is measurably faster in raw and adjusted
+/// accounting, nothing is deducted for either arm's granted work, and the
+/// supported effect is preserved through the decision.
+#[test]
+fn calibration_controls_preserve_a_real_cache_benefit() {
+    let _serial = INSTALL.lock().unwrap();
+    let baseline = granted_arm(
+        "baseline",
+        "calibration-cache-baseline",
+        9.0,
+        &[
+            ("call_build_1", 9_500, 7_500),
+            ("call_rebuild_1", 7_000, 5_500),
+        ],
+    );
+    let candidate = granted_arm(
+        "candidate",
+        "calibration-cache-candidate",
+        2.0,
+        &[("call_build_1", 2_500, 1_500)],
+    );
+    let fixture = controlled_pair("calibration-cache-benefit", true, baseline, candidate);
+
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let baseline_attempt = attempt_of_arm(&report, "baseline");
+    let candidate_attempt = attempt_of_arm(&report, "candidate");
+    for (name, attempt) in [
+        ("baseline", baseline_attempt),
+        ("candidate", candidate_attempt),
+    ] {
+        assert_eq!(
+            attempt["infrastructure"]["deductible_ns"], 0,
+            "{name}: a granted build is not a deductable wait: {attempt}"
+        );
+    }
+    assert_eq!(
+        baseline_attempt["tool_operations"], 2,
+        "the baseline records its redundant rebuild: {baseline_attempt}"
+    );
+    assert_eq!(
+        candidate_attempt["tool_operations"], 1,
+        "the candidate records the avoided rebuild: {candidate_attempt}"
+    );
+    let selected = &report["units"][0]["infrastructure_effect"];
+    assert!(
+        selected["candidate_high_seconds"].as_f64().unwrap()
+            < selected["baseline_low_seconds"].as_f64().unwrap(),
+        "the avoided work must be visible in the adjusted view: {selected}"
+    );
+    assert_eq!(
+        decision["decision"], "adopt",
+        "the supported cache benefit must survive the decision: {evaluation} {decision}"
+    );
+}
+
+/// A quality failure stays an acceptance failure: a faster candidate whose
+/// solution fails the independent oracle cannot be adopted, whatever its
+/// measured time says, and the retained failure stays inspectable.
+#[test]
+fn calibration_controls_keep_a_quality_failure_as_rejection() {
+    let _serial = INSTALL.lock().unwrap();
+    let baseline = granted_arm(
+        "baseline",
+        "calibration-quality-baseline",
+        3.0,
+        &[("call_build_1", 3_500, 1_500)],
+    );
+    let mut candidate = granted_arm(
+        "candidate",
+        "calibration-quality-candidate",
+        1.0,
+        &[("call_build_1", 1_500, 500)],
+    );
+    candidate.solution = "broken";
+    let fixture = controlled_pair("calibration-quality-failure", true, baseline, candidate);
+
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let candidate_attempt = attempt_of_arm(&report, "candidate");
+    assert_eq!(
+        candidate_attempt["checks"][0]["passed"], false,
+        "the failing acceptance stays retained: {candidate_attempt}"
+    );
+    let oracle = load_json(&fixture.arm_dir("candidate").join("oracle.json"));
+    assert_eq!(oracle["checker_executed"], true, "{oracle}");
+    assert_eq!(oracle["passed"], false, "{oracle}");
+    assert_eq!(decision["decision"], "reject", "{decision}");
+    let reasons = evaluation_reasons(&evaluation);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("independent acceptance failed")),
+        "the acceptance failure decides the verdict: {reasons:?}"
+    );
+    assert_eq!(
+        evaluation["quality"], "unmeasurable",
+        "a failed candidate acceptance is an unmeasurable quality result, never a benefit: {evaluation}"
+    );
+}
+
+/// Unusable evidence cannot claim a complete correction: a dropped measured
+/// bound and an unverified ownership association each keep the raw delay
+/// visible, produce no deduction, widen the adjusted range with an explicit
+/// gap and leave the decision inconclusive instead of inventing precision.
+#[test]
+fn calibration_controls_expose_a_dropped_boundary_and_unverified_ownership() {
+    let _serial = INSTALL.lock().unwrap();
+    let baseline = delayed_arm(
+        "baseline",
+        "calibration-defect-boundary-baseline",
+        6_000,
+        ControlledDefect::BoundaryDropped,
+    );
+    let candidate = delayed_arm(
+        "candidate",
+        "calibration-defect-ownership-candidate",
+        6_000,
+        ControlledDefect::OwnershipUnverified,
+    );
+    let fixture = controlled_pair("calibration-defects-one", true, baseline, candidate);
+
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let baseline_infra = &attempt_of_arm(&report, "baseline")["infrastructure"];
+    let candidate_infra = &attempt_of_arm(&report, "candidate")["infrastructure"];
+    // The raw delay is retained even though nothing may be corrected.
+    for (name, infra) in [("baseline", baseline_infra), ("candidate", candidate_infra)] {
+        assert!(
+            infra["observed_seconds"].as_f64().unwrap() > 6.0,
+            "{name}: the raw delay stays visible: {infra}"
+        );
+        assert_eq!(
+            infra["deductible_ns"], 0,
+            "{name}: unusable evidence must not deduct: {infra}"
+        );
+        assert_ne!(
+            infra["coverage"], "measured",
+            "{name}: the correction cannot claim measured coverage: {infra}"
+        );
+        assert!(
+            infra["unresolved_seconds"].as_f64().unwrap() > 0.0,
+            "{name}: the missing correction stays a visible unresolved bound: {infra}"
+        );
+        assert_ne!(infra["proven_zero_queue"], true, "{name}: {infra}");
+    }
+    let baseline_gaps = baseline_infra["gaps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        baseline_gaps.iter().any(|gap| gap
+            .as_str()
+            .is_some_and(|gap| gap.contains("endpoint_unknown"))),
+        "the dropped measured bound is named: {baseline_infra}"
+    );
+    let candidate_gaps = candidate_infra["gaps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        candidate_gaps.iter().any(|gap| gap
+            .as_str()
+            .is_some_and(|gap| gap.contains("queue_not_independently_blocked"))),
+        "the unverified ownership keeps the queue uncovered and named: {candidate_infra}"
+    );
+    assert_eq!(decision["decision"], "inconclusive", "{decision}");
+    let reasons = evaluation_reasons(&evaluation);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("attribution gaps could move")),
+        "the verdict states the attribution gap: {reasons:?}"
+    );
+}
+
+/// A record from another clock domain and an overflowed trace both stop the
+/// correction: nothing is deducted outside the attempt's clock domain, the
+/// truncation stays explicit, and no complete correction or zero missing cost
+/// is claimed.
+#[test]
+fn calibration_controls_expose_a_misaligned_clock_and_overflowed_detail() {
+    let _serial = INSTALL.lock().unwrap();
+    let baseline = delayed_arm(
+        "baseline",
+        "calibration-defect-clock-baseline",
+        6_000,
+        ControlledDefect::ClockMisaligned,
+    );
+    let mut candidate = granted_arm(
+        "candidate",
+        "calibration-overflow-candidate",
+        2.0,
+        &[("call_build_1", 2_500, 1_500)],
+    );
+    candidate.overflow = true;
+    let fixture = controlled_pair("calibration-defects-two", true, baseline, candidate);
+
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let baseline_infra = &attempt_of_arm(&report, "baseline")["infrastructure"];
+    let candidate_infra = &attempt_of_arm(&report, "candidate")["infrastructure"];
+    assert!(
+        baseline_infra["observed_seconds"].as_f64().unwrap() > 6.0,
+        "the raw delay stays visible: {baseline_infra}"
+    );
+    assert_eq!(
+        baseline_infra["deductible_ns"], 0,
+        "another clock domain cannot authorize a deduction: {baseline_infra}"
+    );
+    let gaps = baseline_infra["gaps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.as_str().is_some_and(|gap| gap.contains("wrong_domain"))),
+        "the misaligned clock domain is named: {baseline_infra}"
+    );
+    assert_eq!(
+        candidate_infra["detail_overflow"], true,
+        "{candidate_infra}"
+    );
+    assert_eq!(
+        candidate_infra["activity_overflow"], true,
+        "{candidate_infra}"
+    );
+    let overflow_gaps = candidate_infra["gaps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        overflow_gaps.iter().any(|gap| gap
+            .as_str()
+            .is_some_and(|gap| gap.contains("raw_detail_overflow")))
+            && overflow_gaps.iter().any(|gap| gap
+                .as_str()
+                .is_some_and(|gap| gap.contains("compact_activity_overflow"))),
+        "the overflow is named, not silently repaired: {candidate_infra}"
+    );
+    assert_eq!(decision["decision"], "inconclusive", "{decision}");
+    let reasons = evaluation_reasons(&evaluation);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("attribution gaps could move")),
+        "the verdict states the attribution gap: {reasons:?}"
+    );
+}
+
+/// Calibration results are not inherited across changed inputs: a policy
+/// rewritten after its declaration refuses every dependent advance, and a
+/// retained adjusted view that no longer reduces from its retained native
+/// trace (whether the collector input or the view changed) is contaminated
+/// evidence that cannot support an adoption.
+#[test]
+fn calibration_reuse_is_invalidated_by_changed_inputs() {
+    let _serial = INSTALL.lock().unwrap();
+    let baseline = granted_arm(
+        "baseline",
+        "calibration-reuse-baseline",
+        5.0,
+        &[
+            ("call_build_1", 5_500, 3_500),
+            ("call_rebuild_1", 3_000, 1_500),
+        ],
+    );
+    let candidate = granted_arm(
+        "candidate",
+        "calibration-reuse-candidate",
+        2.0,
+        &[("call_build_1", 2_500, 1_500)],
+    );
+    // Declare the calibration binding before the run, then prove a changed
+    // calibration contract cannot govern the retained evidence.
+    let fixture = Fixture::new("calibration-reuse");
+    let binding = harness_core::infrastructure_accounting::binding_clause(
+        harness_core::infrastructure_accounting::MetricView::WorkEfficiency,
+        harness_core::infrastructure_accounting::Mechanism::None,
+    );
+    let mut policy: Value = load_json(&fixture.policy);
+    policy["uncertainty"] = json!(binding);
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let dispatch = fixture.resume();
+    assert!(dispatch.status.success(), "{}", text(&dispatch));
+
+    // A rewritten calibration identity after the declaration refuses the
+    // dependent advance instead of being silently re-frozen.
+    let mut rewritten: Value = load_json(&fixture.policy);
+    rewritten["uncertainty"] = json!("unknown evidence stays inconclusive");
+    fs::write(
+        &fixture.policy,
+        serde_json::to_vec_pretty(&rewritten).unwrap(),
+    )
+    .unwrap();
+    let refused = fixture.resume();
+    let output = text(&refused);
+    assert!(refused.status.success(), "{output}");
+    assert!(
+        output.contains("policy changed after its declaration"),
+        "a changed calibration identity must refuse the advance: {output}"
+    );
+    // Restoring the declared policy resumes the same retained evidence.
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    seed_controlled_arm(&fixture, &baseline);
+    let settle = fixture.resume();
+    assert!(settle.status.success(), "{}", text(&settle));
+
+    // The completed baseline row retains the calibration view the declared
+    // rule derived from its native capture - the retained result a later
+    // resume may only reuse while its collector, rule and clock inputs stay
+    // valid. The capture is then changed (the granted admission is retained
+    // as an unrelated wait without measured endpoints), so the retained view
+    // no longer reduces from the changed input. The decision must refuse it
+    // instead of inheriting the earlier calibration.
+    let row_path = fixture.arm_dir("baseline").join("row.json");
+    let mut row: Value = load_json(&row_path);
+    row["infrastructure"] = harness_core::outcome_report::replay_attempt(&row)
+        .expect("the retained native capture reduces under the declared rule");
+    row["infrastructure_capture"]["admissions"][0]["class"] = json!("unrelated_wait");
+    fs::write(&row_path, serde_json::to_vec_pretty(&row).unwrap()).unwrap();
+    seed_controlled_arm(&fixture, &candidate);
+    let decided = fixture.resume();
+    let output = text(&decided);
+    assert!(decided.status.success(), "{output}");
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    let decision = load_json(&fixture.run.join("comparison/decision.json"));
+    let baseline_attempt = attempt_of_arm(&report, "baseline");
+    assert_eq!(
+        baseline_attempt["attribution"]["replay"], "mismatch",
+        "the changed retained evidence must not reproduce: {baseline_attempt}"
+    );
+    assert_ne!(decision["decision"], "adopt", "{decision}");
+    assert_eq!(decision["decision"], "inconclusive", "{decision}");
+    let reasons = evaluation_reasons(&evaluation);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("does not reproduce")),
+        "the contaminated evidence is named as the reason: {reasons:?}"
+    );
+    assert!(
+        baseline_attempt["infrastructure"]["observed_seconds"]
+            .as_f64()
+            .is_some(),
+        "the raw observed evidence stays retained: {baseline_attempt}"
     );
 }

@@ -249,7 +249,7 @@ fn missing_slot_names_the_dispatch_that_creates_it() {
     let text = output_text(&out);
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("is missing"), "{text}");
-    assert!(text.contains("executor spawn --source"), "{text}");
+    assert!(text.contains("executor spawn --repository"), "{text}");
     assert!(text.contains("create and synchronize"), "{text}");
     assert!(!fixture.slot.exists());
     assert!(!fixture.root.join("home").exists());
