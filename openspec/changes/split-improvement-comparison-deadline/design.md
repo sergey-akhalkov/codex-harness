@@ -4,7 +4,7 @@ See [proposal.md](proposal.md). The suite is one integration target with 40+ tes
 
 ## Decision
 
-Split at a stable module boundary into two targets sharing fixture code through a `common` module (or `#[path]` include), minimizing diff churn. Choose the boundary so each target's observed serialized duration stays under 1500 s (deadline minus observed admission variance margin). CI and the `ci_workflow` equality contract list exactly the resulting target set.
+Split at a stable module boundary into three deadline-sized targets (`improvement_comparison_a`, `_b`, `_c`) sharing fixture code through one `common` module, minimizing diff churn. Choose the boundary so each target's observed serialized duration stays under 1500 s (deadline minus observed admission variance margin). CI and the `ci_workflow` equality contract list exactly the resulting target set. The normative requirement is "more than one" target; the count moved from two to three when the measured two-target green total could not meet <1500 s per target (see Measured boundary).
 
 ## Measured boundary (recorded 2026-10-13)
 
@@ -13,6 +13,8 @@ The intermediate 36-test a target finished in 1671.50 s, over the 1500 s budget,
 A complete-green attempt on 2026-10-13 (readiness fix 465691e, same heavy account) was terminated by the 1800 s command deadline after 28 of the 29 a tests passed, the last in flight; all seven former poison cascades executed for real and passed. The failed-run numbers above therefore understate the green cost: under that load the complete green a run did not finish inside the 1800 s command deadline (test time alone exceeded 1769 s), so it cannot meet the 1500 s budget. Re-derive the boundary from per-target green timings; if the two-target green total stays >=3000 s, <1500 s per target is infeasible for two targets and the split shape needs a lead decision.
 
 No measured run of the pre-split single target is retained from this session; that baseline remains open and no history is reconstructed.
+
+Boundary re-derivation (2026-10-13, lead decision): the retained green attempt already showed the two-target total cannot stay under 3000 s, so "<1500 s each" is infeasible for two targets; the lead authorized three targets. The suite was re-split into `improvement_comparison_a` (16 tests), `improvement_comparison_b` (21) and `improvement_comparison_c` (13 moved tests) with byte-identical bodies; coverage parity re-verified (50 = 16+21+13; 0 duplicates, 0 missing, 0 extra, 0 body mismatches) and the workflow plus `ci_workflow` equality contract list all three. The three complete green runs are the acceptance case for this boundary; no green three-target numbers are recorded yet.
 
 ## Experiment selection
 
@@ -32,10 +34,10 @@ Stopping: one predeclared matched pair, failures retained without retry
 
 ## Migration Plan
 
-1. Extract shared fixtures into a module included by both targets.
+1. Extract shared fixtures into a module included by all three targets.
 2. Move tests across the boundary; keep names identical.
-3. Update the workflow and equality contract; run both targets end-to-end under heavy.
+3. Update the workflow and equality contract; run all three targets end-to-end under heavy.
 
 ## Open Questions
 
-None; the boundary choice is measured, not debated. The 2026-10-13 green attempt falsified the recorded boundary's margin, so the boundary is being re-derived from per-target green timings; see Measured boundary.
+None; the boundary choice is measured, not debated. The 2026-10-13 green attempt falsified the two-target margin, so the lead authorized the re-split into three deadline-sized targets under the unchanged normative requirement; the three complete green runs remain the acceptance case. See Measured boundary.

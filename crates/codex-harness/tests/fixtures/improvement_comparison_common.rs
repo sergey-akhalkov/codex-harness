@@ -8,7 +8,7 @@
 //! settles and consumes it on `resume`. No check here contacts a model or a
 //! provider.
 //!
-//! Shared fixtures for `improvement_comparison_a` and `improvement_comparison_b`.
+//! Shared fixtures for the deadline-split `improvement_comparison_a`, `improvement_comparison_b` and `improvement_comparison_c` targets.
 #![cfg(windows)]
 // This module lives under `fixtures/`, so Cargo does not discover it as a
 // route target. These allows cover helpers used by only one of the two
