@@ -834,9 +834,16 @@ creates a bounded observation; `list`, `ledger` and `candidates` inspect it.
 `ledger` also reports the item's pacing observations, applicable pacing
 decisions and benefit-gate default from the same native bd comments.
 `triage --decisions FILE` applies caller-selected grouping/kinds, counts distinct
-reporter/episode votes, excludes diagnostic votes and enforces the configured
+reporter/episode votes, excludes diagnostic and derived-evidence votes and enforces the configured
 batch limit. Every command identifies its limits; an explicit `--source KIT`
 overrides the installed kit's configuration.
+
+Use `record --kind derived-evidence` for an analysis of another report. Keep
+`--episode` equal to the source episode and identify the analyst in `--reporter`;
+retain the bounded evidence reference in the observation. Triage preserves this
+provenance with `counted=false reason=derived-evidence`, including when analysis
+arrives before the original report or is merged and retried. It grants no
+implementation authority and does not satisfy a promotion's vote threshold.
 
 `promote` records an explicit backlog, OpenSpec or sanitized kit-backlog route.
 The OpenSpec route validates an existing change created through the project's
