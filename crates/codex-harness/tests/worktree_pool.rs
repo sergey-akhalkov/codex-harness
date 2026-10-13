@@ -1011,7 +1011,7 @@ fn ordinary_and_executor_tasks_share_one_pool_view() {
 /// inactive run keeps capacity without consuming concurrency.
 #[test]
 fn executor_concurrency_gates_dispatch_apart_from_free_pool_slots() {
-    let fixture = Fixture::new("admission", 4, 1);
+    let fixture = Fixture::new("admission", 4, 2);
     // An ordinary held task consumes capacity, never executor concurrency.
     let acquired = succeeded(fixture.worktree(&["acquire", "--task", "t1"]));
     assert!(acquired.contains("worktree acquire: slot=1"), "{acquired}");
@@ -1020,13 +1020,17 @@ fn executor_concurrency_gates_dispatch_apart_from_free_pool_slots() {
     let first = refused(fixture.spawn(&["--owner", "exec-a"]));
     assert!(first.contains("executor slot: index=2"), "{first}");
     assert!(first.contains("task=exec-a"), "{first}");
-    // A live host for exec-a fills the concurrency of one; the two free
-    // positions still do not grant executor-b another active run.
     fixture.record_live_lease(&fixture.source, 2, "exec-a");
-    let refused_run = refused(fixture.spawn(&["--owner", "exec-b"]));
+    let second = refused(fixture.spawn(&["--owner", "exec-b"]));
+    assert!(second.contains("executor slot: index=3"), "{second}");
+    assert!(second.contains("task=exec-b"), "{second}");
+    fixture.record_live_lease(&fixture.source, 3, "exec-b");
+    // Two active executor bindings fill admission independently of the four
+    // pool positions: the remaining free position cannot admit a third run.
+    let refused_run = refused(fixture.spawn(&["--owner", "exec-c"]));
     assert!(
         refused_run.contains(
-            "executor concurrency is full: 1 of 1 active runs (max_concurrent_executors)"
+            "executor concurrency is full: 2 of 2 active runs (max_concurrent_executors)"
         ),
         "{refused_run}"
     );
@@ -1035,17 +1039,18 @@ fn executor_concurrency_gates_dispatch_apart_from_free_pool_slots() {
         "{refused_run}"
     );
     assert!(
-        !fixture.slot(3).exists(),
+        !fixture.slot(4).exists(),
         "the refused dispatch allocated nothing"
     );
     // The host exiting frees concurrency, not capacity: exec-a's binding
     // stays held and the next dispatch takes the next free position.
     fixture.remove_lease(&fixture.source, 2);
-    let second = refused(fixture.spawn(&["--owner", "exec-b"]));
-    assert!(second.contains("executor slot: index=3"), "{second}");
-    assert!(second.contains("task=exec-b"), "{second}");
+    let third = refused(fixture.spawn(&["--owner", "exec-c"]));
+    assert!(third.contains("executor slot: index=4"), "{third}");
+    assert!(third.contains("task=exec-c"), "{third}");
     assert_eq!(fixture.record(&fixture.source, 2)["task"], "exec-a");
     assert_eq!(fixture.record(&fixture.source, 3)["task"], "exec-b");
+    assert_eq!(fixture.record(&fixture.source, 4)["task"], "exec-c");
     fixture.drop();
 }
 
