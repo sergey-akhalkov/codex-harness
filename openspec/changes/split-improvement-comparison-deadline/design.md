@@ -10,6 +10,8 @@ Split at a stable module boundary into two targets sharing fixture code through 
 
 The intermediate 36-test a target finished in 1671.50 s, over the 1500 s budget, so the 7 calibration tests moved across the boundary (bodies byte-identical). The rebalanced targets then measured 1294.93 s (a) and 1099.39 s (b), serialized through `codex-harness heavy`. These are retained failed-run measurements: a passed 21 tests and failed 8, while b passed 19 and failed 2, including mutex-poison cascades that did not exercise their assertions. They do not establish the duration or acceptance of complete green targets.
 
+A complete-green attempt on 2026-10-13 (readiness fix 465691e, same heavy account) was terminated by the 1800 s command deadline after 28 of the 29 a tests passed, the last in flight; all seven former poison cascades executed for real and passed. The failed-run numbers above therefore understate the green cost: green a is >= ~1830 s under that load, over the 1500 s budget. Re-derive the boundary from per-target green timings; if the two-target green total stays >=3000 s, <1500 s per target is infeasible for two targets and the split shape needs a lead decision.
+
 No measured run of the pre-split single target is retained from this session; that baseline remains open and no history is reconstructed.
 
 ## Experiment selection
@@ -36,4 +38,4 @@ Stopping: one predeclared matched pair, failures retained without retry
 
 ## Open Questions
 
-None; the boundary choice is measured, not debated.
+None; the boundary choice is measured, not debated. The 2026-10-13 green attempt falsified the recorded boundary's margin, so the boundary is being re-derived from per-target green timings; see Measured boundary.
