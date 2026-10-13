@@ -50,6 +50,8 @@ pub enum ReporterKind {
     Lead,
     Executor,
     AutomatedDiagnostic,
+    /// Analysis of an existing episode, never an independent vote.
+    DerivedEvidence,
 }
 
 impl ReporterKind {
@@ -58,6 +60,7 @@ impl ReporterKind {
             Self::Lead => "lead",
             Self::Executor => "executor",
             Self::AutomatedDiagnostic => "diagnostic",
+            Self::DerivedEvidence => "derived-evidence",
         }
     }
 
@@ -67,6 +70,7 @@ impl ReporterKind {
             "lead" => Ok(Self::Lead),
             "executor" => Ok(Self::Executor),
             "diagnostic" | "automated-diagnostic" => Ok(Self::AutomatedDiagnostic),
+            "derived-evidence" => Ok(Self::DerivedEvidence),
             _ => Err(invalid(format!("unknown reporter kind {value}"))),
         }
     }
@@ -131,6 +135,7 @@ pub enum VoteReason {
     Counted,
     Repeat,
     AutomatedDiagnostic,
+    DerivedEvidence,
 }
 
 impl VoteReason {
@@ -139,6 +144,7 @@ impl VoteReason {
             Self::Counted => "counted",
             Self::Repeat => "repeat",
             Self::AutomatedDiagnostic => "automated-diagnostic",
+            Self::DerivedEvidence => "derived-evidence",
         }
     }
 
@@ -147,6 +153,7 @@ impl VoteReason {
             "counted" => Some(Self::Counted),
             "repeat" => Some(Self::Repeat),
             "automated-diagnostic" => Some(Self::AutomatedDiagnostic),
+            "derived-evidence" => Some(Self::DerivedEvidence),
             _ => None,
         }
     }
@@ -467,6 +474,12 @@ pub struct RoutedReport {
 }
 
 pub fn decide_vote(existing: &[VoteRecord], candidate: &VoteCandidate) -> VoteDecision {
+    if candidate.kind == ReporterKind::DerivedEvidence {
+        return VoteDecision {
+            counted: false,
+            reason: VoteReason::DerivedEvidence,
+        };
+    }
     if candidate.kind == ReporterKind::AutomatedDiagnostic {
         return VoteDecision {
             counted: false,
