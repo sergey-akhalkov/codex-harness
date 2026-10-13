@@ -2565,6 +2565,286 @@ fn catalogue_role_composes_developer_text_and_memberships_onto_the_native_read()
     );
 }
 
+/// The selected profile travels with the composed role context: the profile
+/// installed as `selected` disables the shared kit skill, so the composed
+/// `skills.config` the native read receives keeps it disabled even though the
+/// executor role allows it, while `other` leaves it enabled and profile
+/// routing values never compose. The reported role context names role,
+/// profile and revision without changing with the profile, and nothing on
+/// disk changes. Fixture-only composition evidence through the real catalogue
+/// entry point: the discovery double records the exact composed context; the
+/// installed native CLI's consumption of it is covered by the explicit native
+/// probe that follows.
+#[test]
+fn catalogue_role_profile_keeps_the_selected_profiles_context_and_disablement() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-profile-")
+        .tempdir()
+        .unwrap();
+    let case = root.path().join("case");
+    let home = root.path().join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let source = synthetic_role_build::kit_source(root.path());
+    let build = synthetic_role_build::recorded_build(root.path(), &source);
+    synthetic_role_build::register(&home, root.path(), &build);
+    let shared = source.join("skills/shared/SKILL.md");
+    let shared_canonical = shared.canonicalize().unwrap();
+    let coordinate = source
+        .join("skills/coordinate/SKILL.md")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        home.join("selected.config.toml"),
+        format!(
+            "model = \"fixture-selected-routing\"\ndeveloper_instructions = \"Selected profile guidance\"\n\n[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(shared.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("other.config.toml"),
+        "model = \"fixture-other-routing\"\n",
+    )
+    .unwrap();
+    let before: Vec<(PathBuf, Vec<u8>)> = [
+        home.join("selected.config.toml"),
+        home.join("other.config.toml"),
+        source.join("global/roles.toml"),
+        shared.clone(),
+    ]
+    .into_iter()
+    .map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    })
+    .collect();
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    let catalogue = |profile: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command
+            .args(["skills", "catalogue", "--case"])
+            .arg(&case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", "executor"])
+            .env("HARNESS_LAUNCH_FIXTURE_MODE", "discovery")
+            .env("HARNESS_DISCOVERY_FIXTURE", "init-error");
+        if let Some(profile) = profile {
+            command.args(["--profile", profile]);
+        }
+        command.output().unwrap()
+    };
+    let revision = |stdout: &str| {
+        stdout
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("role_context=role=executor;profile=")
+                    .and_then(|rest| rest.split_once(";revision="))
+                    .map(|(_, revision)| revision.to_owned())
+            })
+            .expect("the catalogue reports the composed role context")
+    };
+
+    let (selected_args, selected_out) = refused_catalogue_context(&catalogue(Some("selected")));
+    assert!(
+        selected_out.starts_with("role_context=role=executor;profile=selected;revision="),
+        "{selected_out}"
+    );
+    assert!(
+        !selected_args.iter().any(|argument| {
+            argument.starts_with("model=")
+                || argument.starts_with("model_provider=")
+                || argument.starts_with("model_reasoning_effort=")
+        }),
+        "profile routing values never compose onto the catalogue: {selected_args:?}"
+    );
+    let selected_developer = selected_args
+        .iter()
+        .find(|argument| argument.starts_with("developer_instructions="))
+        .expect("the executor developer text travels as an override");
+    assert!(
+        selected_developer.contains("Fixture executor responsibility"),
+        "{selected_developer}"
+    );
+    assert!(
+        selected_developer.contains("Selected profile guidance"),
+        "{selected_developer}"
+    );
+    let selected_config = selected_args
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the skill context travels as an override");
+    assert!(
+        composed_disablement(selected_config, &shared_canonical),
+        "the selected profile's disablement reaches the composed context: {selected_config}"
+    );
+    assert!(
+        composed_disablement(selected_config, &coordinate),
+        "the executor memberships stay composed: {selected_config}"
+    );
+
+    let (other_args, other_out) = refused_catalogue_context(&catalogue(Some("other")));
+    assert!(
+        other_out.starts_with("role_context=role=executor;profile=other;revision="),
+        "{other_out}"
+    );
+    let other_config = other_args
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the skill context travels as an override");
+    assert!(
+        !composed_disablement(other_config, &shared_canonical),
+        "another profile leaves the shared skill enabled: {other_config}"
+    );
+    assert!(
+        composed_disablement(other_config, &coordinate),
+        "the executor memberships stay composed: {other_config}"
+    );
+
+    let (plain_args, plain_out) = refused_catalogue_context(&catalogue(None));
+    assert!(
+        plain_out.starts_with("role_context=role=executor;profile=none;revision="),
+        "{plain_out}"
+    );
+    let plain_config = plain_args
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the skill context travels as an override");
+    assert!(
+        !composed_disablement(plain_config, &shared_canonical),
+        "without a selected profile no profile layer composes: {plain_config}"
+    );
+
+    let selected_revision = revision(&selected_out);
+    assert_eq!(
+        selected_revision,
+        revision(&other_out),
+        "{selected_out}{other_out}"
+    );
+    assert_eq!(
+        selected_revision,
+        revision(&plain_out),
+        "{selected_out}{plain_out}"
+    );
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .args(["--role", "executor", "--profile", "absent"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing.stdout),
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(
+        text.contains("role context for --role executor --profile absent")
+            && text.contains("is not installed"),
+        "a profile that is not installed refuses instead of composing nothing: {text}"
+    );
+
+    let without_role = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .args(["--profile", "selected"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        without_role.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&without_role.stderr)
+    );
+    let without_role_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&without_role.stdout),
+        String::from_utf8_lossy(&without_role.stderr)
+    );
+    assert!(
+        without_role_text.contains("pass --role lead|executor"),
+        "profile context without a role refuses instead of guessing one: {without_role_text}"
+    );
+
+    for (path, bytes) in &before {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            bytes,
+            "{} changed",
+            path.display()
+        );
+    }
+}
+
+/// The composed `-c` argument pairs and stdout of one refused fixture
+/// discovery, read from the private evidence root the command names on stderr.
+fn refused_catalogue_context(output: &std::process::Output) -> (Vec<String>, String) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let evidence = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("native skill discovery failed; private evidence: "))
+        .expect("the refused discovery names its private evidence root")
+        .trim()
+        .to_owned();
+    let request: Value =
+        serde_json::from_slice(&fs::read(Path::new(&evidence).join("request.json")).unwrap())
+            .unwrap();
+    let arguments = request["arguments"]
+        .as_array()
+        .expect("the recorded request carries its arguments")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("recorded arguments are text")
+                .to_owned()
+        })
+        .collect();
+    (
+        arguments,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+/// Whether one composed `skills.config` argument disables `path`.
+fn composed_disablement(config: &str, path: &Path) -> bool {
+    let composed: toml::Value =
+        toml::from_str(config).expect("the composed skills.config parses as TOML");
+    composed
+        .get("skills")
+        .and_then(|skills| skills.get("config"))
+        .and_then(toml::Value::as_array)
+        .expect("the composed context carries a skills.config array")
+        .iter()
+        .any(|entry| {
+            entry
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .and_then(|value| Path::new(value).canonicalize().ok())
+                .is_some_and(|value| value == path)
+                && entry.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+        })
+}
+
 #[test]
 #[ignore = "explicit installed native CLI app-server skills/list; no model"]
 fn catalogue_reports_the_native_effective_set_with_kit_identity() {
@@ -2681,6 +2961,88 @@ fn catalogue_reports_the_native_effective_set_with_kit_identity() {
     assert!(
         bounded.contains("route=codex-harness skills catalogue --limit 1048576"),
         "{bounded}"
+    );
+}
+
+/// Explicit native probe: the installed CLI consumes the composed profile
+/// layer, so the project skill a selected profile disables is not reported
+/// enabled in that profile's catalogue while another profile reports it
+/// enabled, and the composed role context names the selected profile
+/// model-free. The installed native CLI and its launcher registration are
+/// required; no model call is made.
+#[test]
+#[ignore = "explicit installed native CLI app-server skills/list; no model"]
+fn catalogue_role_profile_native_read_consumes_the_selected_profiles_disablement() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-profile-native-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!(
+        "skill catalogue role profile native evidence: {}",
+        root.display()
+    );
+    let case = root.join("case");
+    let home = root.join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let source = synthetic_role_build::kit_source(&root);
+    let build = synthetic_role_build::recorded_build(&root, &source);
+    synthetic_role_build::register(&home, &root, &build);
+    let skill = case.join(".agents/skills/profile_probe/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(
+        &skill,
+        "---\nname: profile_probe\ndescription: fixture\n---\nFixture profile probe",
+    )
+    .unwrap();
+    fs::write(
+        home.join("selected.config.toml"),
+        format!(
+            "[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(skill.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(home.join("other.config.toml"), "# no profile layers\n").unwrap();
+    let upstream = registered_upstream(&live_codex_home());
+    let catalogue = |profile: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .args(["skills", "catalogue", "--case"])
+            .arg(&case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", "executor", "--profile", profile])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let selected = catalogue("selected");
+    fs::write(root.join("catalogue-selected.txt"), selected.as_bytes()).unwrap();
+    assert!(
+        selected.contains("role_context=role=executor;profile=selected;revision="),
+        "{selected}"
+    );
+    assert!(
+        !selected.contains("name=profile_probe;scope=repo;enabled=true;"),
+        "the selected profile disables the probe skill: {selected}"
+    );
+    let other = catalogue("other");
+    fs::write(root.join("catalogue-other.txt"), other.as_bytes()).unwrap();
+    assert!(
+        other.contains("role_context=role=executor;profile=other;revision="),
+        "{other}"
+    );
+    assert!(
+        other.contains("name=profile_probe;scope=repo;enabled=true;"),
+        "another profile keeps the probe skill enabled: {other}"
     );
 }
 

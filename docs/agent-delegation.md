@@ -191,12 +191,18 @@ recording reports `role context: unrecorded`: it stays usable, and the next
 fresh dispatch, resume or restart records the current role.
 
 Inspect a composition without a model call:
-`codex-harness skills catalogue --role lead|executor` applies the installed
-build's resolved role to the native skill read and refuses when those role
-inputs are missing instead of reporting a set the managed session would not
-see. The `codex-harness check` report lists each role as `resolved` with its
-revision or as a `gap` naming the exact missing input; a gap blocks only the
-sessions whose role inputs are missing and fails nothing else.
+`codex-harness skills catalogue --role lead|executor [--profile ID]`
+applies the installed build's resolved role to the native skill read and
+refuses when those role inputs are missing instead of reporting a set the
+managed session would not see. Passing `--profile ID` selects the native
+profile layer the managed session selected (the installed profile file or
+its `profiles.<name>` table; `default` adds nothing), so its retained
+context, including a skill that profile disables, reaches the composed
+native read; the command reports
+`role_context=role=...;profile=...;revision=...` and composes no model
+routing. The `codex-harness check` report lists each role as `resolved` with
+its revision or as a `gap` naming the exact missing input; a gap blocks
+only the sessions whose role inputs are missing and fails nothing else.
 
 ## Executor utilization
 
