@@ -594,8 +594,16 @@ impl View {
             window: None,
         };
         loop {
-            if !process.is_running()? || Instant::now() >= until {
-                return Err(unavailable());
+            if let Some(code) = process.exit_code()? {
+                return Err(io::Error::other(format!(
+                    "conversation launcher exited before its window became ready: exit code {code} (0x{code:08X}); suspend new model dispatch"
+                )));
+            }
+            if Instant::now() >= until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "conversation window did not become ready before the deadline; suspend new model dispatch",
+                ));
             }
             if unsafe {
                 EnumWindows(
