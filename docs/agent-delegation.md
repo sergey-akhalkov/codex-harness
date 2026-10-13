@@ -349,6 +349,22 @@ tasks to the older host's expired-session cleanup. The current reader accepts
 legacy records without rewriting them during inspection; an authorized state
 transition writes the protected format.
 
+Reducing `worktree_pool_size` below a held position refuses new acquisition;
+status and continuation keep the held task visible and recoverable. Restore
+the previous capacity or finish and explicitly release those tasks before
+acquiring more work. A failed release leaves its binding held with the cause;
+resolve that cause and retry the release instead of deleting its record.
+
+Retiring a pool directory is separate from reusable release. Preserve and
+integrate its result (or explicitly discard it), release the task through the
+harness, then use `git worktree remove -- PATH` for that exact listed directory
+when its ignored caches are no longer needed. Keep the released ownership
+record. A later acquisition can recreate the same configured position; it
+does not allocate a replacement outside capacity. For a registered but missing
+directory, first resolve the preserved work and verify the path is really
+absent, then follow the reported `git worktree prune` remedy. A held binding
+still requires its own recovery; pruning is not task release.
+
 ## Observed executor lifecycle
 
 Spawn, resume and restart present the managed conversation in the native Codex TUI; explicit `--mode exec` uses the same observed lifecycle with the native inline TUI, not an unobserved launcher. The host records `dispatch-accepted`, `native-start`, `running`, `completed`, `failed`, `defect` and `interrupted` in `$CODEX_HOME/harness/executor-pool/spawn-<N>.json`, with the exact native session, final-message locator and bounded detail file. A created tab is not a native start, frontend exit is not a finished turn, and historical receipts keep their recorded coverage.

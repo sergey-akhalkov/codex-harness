@@ -774,6 +774,34 @@ fn ordinary_task_lifecycle_reuses_the_same_checkout_and_keeps_ignored_caches() {
     assert!(!slot.join("scratch.txt").exists());
     assert!(slot.join("cache/artifact.bin").is_file());
     assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), merged);
+    // Retirement is a separate explicit Git action after release: the task
+    // result stays integrated while this owned tree and its regenerable cache
+    // are removed. Retain the released ownership record for recovery.
+    git(
+        &fixture.source,
+        &["worktree", "remove", "--", slot.to_str().unwrap()],
+    );
+    assert!(!slot.exists());
+    assert_eq!(
+        fs::read_to_string(fixture.source.join("work.txt")).unwrap(),
+        "task work\n"
+    );
+    assert_eq!(
+        git_output(&fixture.source, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1
+    );
+    let retired = succeeded(fixture.worktree(&["list"]));
+    assert!(retired.contains("presence=absent state=free"), "{retired}");
+    let recreated = succeeded(fixture.worktree(&["acquire", "--task", "t3"]));
+    assert!(
+        recreated.contains(&format!("slot=1 path={}", slot.display())),
+        "{recreated}"
+    );
+    assert!(!slot.join("cache/artifact.bin").exists());
+    assert!(!fixture.slot(2).exists());
     fixture.drop();
 }
 
