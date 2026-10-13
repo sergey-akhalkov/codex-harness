@@ -17,6 +17,8 @@ pub struct CheckReport {
     pub lead_profile: Option<String>,
     pub successor_lead_profile: Option<String>,
     pub executor_profiles: Vec<String>,
+    pub max_concurrent_executors: Option<u32>,
+    pub worktree_pool_size: Option<u32>,
     pub vote_threshold: Option<u32>,
     pub worktree_limit: Option<u32>,
     /// Loop guidance skills delivered into the user skill root.
@@ -77,6 +79,10 @@ pub fn check(
             .as_ref()
             .map(|value| value.executor_profiles.clone())
             .unwrap_or_default(),
+        max_concurrent_executors: config.as_ref().map(|value| value.max_concurrent_executors),
+        worktree_pool_size: config
+            .as_ref()
+            .map(orchestration_config::worktree_pool_size),
         vote_threshold: config.as_ref().map(|value| value.vote_threshold),
         worktree_limit: config.as_ref().map(|value| value.worktree_limit),
         guidance,
@@ -111,10 +117,12 @@ pub fn disconnect_preserves_private(
 ) -> io::Result<PreservationReport> {
     let store = task_store::store_dir(codex_home);
     let worktrees = codex_home.join("worktrees");
+    let pool = codex_home.join("harness/executor-pool");
     let mut preserved = Vec::new();
     for (path, name) in [
         (&store, "task-store"),
         (&worktrees, "worktrees"),
+        (&pool, "executor-pool"),
         (&user_home.join(".agents/skills"), "skills"),
     ] {
         match fs::metadata(path) {
@@ -170,6 +178,11 @@ mod tests {
     fn preview_check_does_not_write_and_disconnect_keeps_stopped_checkpoints() {
         let root = tempfile::tempdir().unwrap();
         let source = kit_source(root.path());
+        let config_path = source.join("global/orchestration.toml");
+        let mut config: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        config.insert("max_concurrent_executors".into(), 2.into());
+        config.insert("worktree_pool_size".into(), 4.into());
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
         let home = root.path().join("home");
         let user = root.path().join("user");
         installed_profiles(&home);
@@ -183,10 +196,16 @@ mod tests {
         let connected = check(&source, &home, &user, false).unwrap();
         assert_eq!(connected.status, "Orchestration connected");
         assert_eq!(connected.executor_profiles, ["ds"]);
+        assert_eq!(connected.max_concurrent_executors, Some(2));
+        assert_eq!(connected.worktree_pool_size, Some(4));
         assert_eq!(connected.vote_threshold, Some(3));
         assert_eq!(connected.guidance, ["team-lead", "board-workflow"]);
         assert!(connected.guidance_missing.is_empty());
         assert_eq!(connected.board_version, None);
+        config.remove("worktree_pool_size");
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let legacy = check(&source, &home, &user, true).unwrap();
+        assert_eq!(legacy.worktree_pool_size, Some(2));
         let mut record = TaskRecord {
             schema: 1,
             id: "live".into(),
