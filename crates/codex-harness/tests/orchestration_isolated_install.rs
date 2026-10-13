@@ -114,6 +114,14 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         fs::read_link(user_home.join(".agents/skills/board-workflow")).unwrap(),
         source.join(".agents/skills/board-workflow")
     );
+    assert!(
+        !user_home.join(".agents/skills/isolated-worktree").exists(),
+        "the retired isolated-worktree skill is no longer delivered"
+    );
+    assert!(
+        !source.join(".agents/skills/isolated-worktree").exists(),
+        "the retired skill is no longer part of the kit source"
+    );
     let skill = fs::read_to_string(user_home.join(".agents/skills/team-lead/SKILL.md")).unwrap();
     assert!(skill.contains("name: team-lead"));
     // A fresh session discovers the delivered workflow, not a stub: the
@@ -410,12 +418,154 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "{}",
         failed("worktree acquire", &acquired)
     );
+    let pool_line = String::from_utf8_lossy(&acquired.stdout).into_owned();
+    assert!(
+        pool_line.contains("capacity=4"),
+        "the installed configuration supplies the explicit pool capacity: {pool_line}"
+    );
+    assert!(
+        pool_line.contains("account=configured("),
+        "capacity comes from the installed configuration, not a fallback: {pool_line}"
+    );
     let held =
         task_worktree::continue_task(&codex_home, &task_repo, "retained-work", None).unwrap();
     fs::write(held.path.join("owned.txt"), b"partial tracked work\n").unwrap();
     fs::write(held.path.join("new.txt"), b"partial untracked work\n").unwrap();
     fs::create_dir_all(held.path.join("cache")).unwrap();
     fs::write(held.path.join("cache/ready"), b"prepared\n").unwrap();
+
+    // An installed update while the task is held keeps the binding, its
+    // partial work and its ignored cache; the retired skill stays absent.
+    let updated = core_install::connect(&request, false).unwrap();
+    assert_eq!(updated.status, "connected");
+    assert!(
+        !user_home.join(".agents/skills/isolated-worktree").exists(),
+        "an update does not re-advertise the retired skill"
+    );
+    let after_update = task_worktree::continue_task(
+        &codex_home,
+        &task_repo,
+        "retained-work",
+        held.handle.as_deref(),
+    )
+    .unwrap();
+    assert_eq!(after_update.path, held.path);
+    assert_eq!(after_update.base, held.base);
+    assert_eq!(after_update.handle, held.handle);
+    for (relative, expected) in [
+        ("owned.txt", "partial tracked work\n"),
+        ("new.txt", "partial untracked work\n"),
+        ("cache/ready", "prepared\n"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(held.path.join(relative)).unwrap(),
+            expected,
+            "an installed update must preserve {relative}"
+        );
+    }
+
+    // Conflicting ownership: a different requested base for the held task is
+    // refused before any reset and the held files survive the refusal.
+    fs::write(task_repo.join("owned.txt"), b"next base\n").unwrap();
+    board_git(&task_repo, &["add", "owned.txt"]);
+    board_git(&task_repo, &["commit", "-qm", "next base"]);
+    let next_base = {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&task_repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let conflicted = run(
+        &codex_home.join("harness/bin/codex-harness.exe"),
+        &task_repo,
+        &[
+            "worktree",
+            "acquire",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+            "--repository",
+            task_repo.to_str().unwrap(),
+            "--task",
+            "retained-work",
+            "--base",
+            next_base.as_str(),
+        ],
+    );
+    assert_eq!(
+        conflicted.status.code(),
+        Some(2),
+        "{}",
+        failed("conflicting-base acquire", &conflicted)
+    );
+    let stderr = String::from_utf8_lossy(&conflicted.stderr).into_owned();
+    assert!(stderr.contains("conflicts with the binding"), "{stderr}");
+    for (relative, expected) in [
+        ("owned.txt", "partial tracked work\n"),
+        ("new.txt", "partial untracked work\n"),
+        ("cache/ready", "prepared\n"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(held.path.join(relative)).unwrap(),
+            expected,
+            "a refused conflicting base must preserve {relative}"
+        );
+    }
+
+    // Unsupported record versions: an ownership schema this build does not
+    // support refuses with the record bytes intact, and restoring the record
+    // recovers the same binding. The discriminator is the protection an older
+    // host sees during rollback: it refuses the record instead of treating the
+    // held task as a free expired session.
+    let record_path = task_worktree::slot_record_path(&codex_home, &task_repo, held.index).unwrap();
+    let record = fs::read(&record_path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&record).unwrap();
+    assert_eq!(
+        value["ownershipSchema"], 2,
+        "new records publish the protected discriminator"
+    );
+    value["ownershipSchema"] = serde_json::json!(999);
+    let unsupported = serde_json::to_vec(&value).unwrap();
+    fs::write(&record_path, &unsupported).unwrap();
+    let refused = run(
+        &codex_home.join("harness/bin/codex-harness.exe"),
+        &task_repo,
+        &[
+            "worktree",
+            "continue",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+            "--repository",
+            task_repo.to_str().unwrap(),
+            "--task",
+            "retained-work",
+        ],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "{}",
+        failed("unsupported-record continue", &refused)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(stderr.contains("declares ownership schema 999"), "{stderr}");
+    assert_eq!(
+        fs::read(&record_path).unwrap(),
+        unsupported,
+        "the refused record is preserved byte-for-byte"
+    );
+    fs::write(&record_path, &record).unwrap();
+    let recovered = task_worktree::continue_task(
+        &codex_home,
+        &task_repo,
+        "retained-work",
+        held.handle.as_deref(),
+    )
+    .unwrap();
+    assert_eq!(recovered.path, held.path);
+    assert_eq!(recovered.handle, held.handle);
 
     let disconnected =
         core_disconnect::disconnect(&codex_home, &user_home, &user_home, false).unwrap();

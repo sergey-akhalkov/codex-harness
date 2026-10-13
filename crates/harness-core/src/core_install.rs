@@ -595,6 +595,17 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
     let manifest: crate::inventory::Manifest =
         serde_json::from_slice(&fs::read(request.source.join("global/kit.json"))?)
             .map_err(|_| conflict())?;
+    // Preserve the former executor-derived pool capacity as an explicit
+    // setting before the first publication effect: after the capacity split a
+    // missing setting would otherwise leave the installed pool sized by a
+    // limit later changes to executor admission could silently move.
+    if let Some(capacity) =
+        crate::orchestration_lifecycle::materialize_pool_capacity(&request.source)?
+    {
+        eprintln!(
+            "orchestration worktree_pool_size materialized as {capacity}; the pool no longer follows max_concurrent_executors"
+        );
+    }
     let conflicts =
         crate::profile_state::migrate(&request.source.join(manifest.profile), &request.codex_home)?;
     if conflicts > 0 {

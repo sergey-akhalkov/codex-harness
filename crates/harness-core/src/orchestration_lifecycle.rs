@@ -182,6 +182,126 @@ pub fn disconnect_preserves_private(
     })
 }
 
+/// Materialize the explicit `worktree_pool_size` setting for a configuration
+/// written before the capacity split, so install and update preserve the
+/// former executor-derived pool capacity without selecting the compatibility
+/// `worktree_limit`. Only the missing setting is added: the executor limit,
+/// every other user choice, comments and layout stay untouched. An explicit
+/// setting is never rewritten, and a file this build cannot parse or an
+/// effective value outside the supported pool range is left as it is for the
+/// installation check to report. Returns the capacity written, if any.
+pub fn materialize_pool_capacity(source: &Path) -> io::Result<Option<u32>> {
+    let path = source.join("global/orchestration.toml");
+    let bytes = match fs::read(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(bytes) => bytes,
+    };
+    let Ok(config) = orchestration_config::parse(&bytes) else {
+        return Ok(None);
+    };
+    if config.worktree_pool_size.is_some() {
+        return Ok(None);
+    }
+    let capacity = config.max_concurrent_executors;
+    if capacity == 0 || capacity > crate::task_worktree::MAX_POOL_SLOTS {
+        return Ok(None);
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    let Some(candidate) = materialized_capacity_text(&text, capacity) else {
+        return Ok(None);
+    };
+    stage_preserving(&path, candidate.as_bytes())?;
+    Ok(Some(capacity))
+}
+
+/// Candidate texts that add the explicit setting with the least disturbance:
+/// directly after the executor limit it derives from, else at the end of the
+/// file. A candidate is used only after re-parsing to exactly the original
+/// configuration plus the new setting.
+fn materialized_capacity_text(text: &str, capacity: u32) -> Option<String> {
+    let original = orchestration_config::parse(text.as_bytes()).ok()?;
+    let mut expected = original;
+    expected.worktree_pool_size = Some(capacity);
+    let mut candidates = Vec::new();
+    if let Some(inserted) = insert_after_executor_limit(text, capacity) {
+        candidates.push(inserted);
+    }
+    candidates.push(append_pool_setting(text, capacity));
+    candidates.into_iter().find(|candidate| {
+        orchestration_config::parse(candidate.as_bytes())
+            .map(|parsed| parsed == expected)
+            .unwrap_or(false)
+    })
+}
+
+fn insert_after_executor_limit(text: &str, capacity: u32) -> Option<String> {
+    let mut candidate = String::with_capacity(text.len() + 256);
+    let mut inserted = false;
+    for line in text.split_inclusive('\n') {
+        candidate.push_str(line);
+        let is_executor_limit = !inserted
+            && line
+                .trim_start()
+                .strip_prefix("max_concurrent_executors")
+                .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if is_executor_limit {
+            let ending = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            if !line.ends_with('\n') {
+                candidate.push_str(ending);
+            }
+            candidate.push_str(&pool_setting_block(capacity, ending));
+            inserted = true;
+        }
+    }
+    inserted.then_some(candidate)
+}
+
+fn append_pool_setting(text: &str, capacity: u32) -> String {
+    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut candidate = text.to_owned();
+    if !candidate.is_empty() && !candidate.ends_with('\n') {
+        candidate.push_str(ending);
+    }
+    candidate.push_str(&format!("worktree_pool_size = {capacity}{ending}"));
+    candidate
+}
+
+fn pool_setting_block(capacity: u32, ending: &str) -> String {
+    let mut block = String::new();
+    for comment in [
+        "# Managed worktree capacity, materialized by installation from the former",
+        "# executor-derived value; it no longer follows max_concurrent_executors.",
+    ] {
+        block.push_str(comment);
+        block.push_str(ending);
+    }
+    block.push_str(&format!("worktree_pool_size = {capacity}"));
+    block.push_str(ending);
+    block
+}
+
+/// Replace one file through same-directory staged bytes so an interrupted
+/// write cannot truncate the user's configuration.
+fn stage_preserving(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("orchestration.toml");
+    let staged = directory.join(format!("{name}.materialize-{}.tmp", std::process::id()));
+    fs::write(&staged, bytes)?;
+    match fs::rename(&staged, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +555,84 @@ mod tests {
         assert!(!executor.is_empty());
         assert_ne!(lead, executor);
         assert!(states.iter().all(|state| state.cause.is_none()));
+    }
+
+    fn legacy_text(executor_limit: u32) -> String {
+        format!(
+            "schema = 1\n# user comment retained\nlead_profile = \"default\"\n\
+             successor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\n\
+             max_concurrent_executors = {executor_limit}\nvote_threshold = 3\n\
+             incubator_size_cap = 32\nfeedback_batch_limit = 8\nworktree_limit = 6\n"
+        )
+    }
+
+    #[test]
+    fn installation_materializes_legacy_pool_capacity_without_touching_choices() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kit_source(root.path());
+        let path = source.join("global/orchestration.toml");
+        fs::write(&path, legacy_text(2)).unwrap();
+        assert_eq!(materialize_pool_capacity(&source).unwrap(), Some(2));
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# user comment retained"), "{written}");
+        let config = orchestration_config::parse(written.as_bytes()).unwrap();
+        assert_eq!(config.worktree_pool_size, Some(2));
+        assert_eq!(orchestration_config::worktree_pool_size(&config), 2);
+        assert_eq!(config.max_concurrent_executors, 2);
+        assert_eq!(
+            config.worktree_limit, 6,
+            "the compatibility worktree_limit is never selected as capacity"
+        );
+        assert_eq!(materialize_pool_capacity(&source).unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+    }
+
+    #[test]
+    fn explicit_or_unreadable_capacity_configuration_is_left_as_it_is() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kit_source(root.path());
+        let path = source.join("global/orchestration.toml");
+        let shipped = fs::read(&path).unwrap();
+        assert_eq!(materialize_pool_capacity(&source).unwrap(), None);
+        assert_eq!(fs::read(&path).unwrap(), shipped);
+        for invalid in [0, 33] {
+            let text = legacy_text(invalid);
+            fs::write(&path, &text).unwrap();
+            assert_eq!(materialize_pool_capacity(&source).unwrap(), None);
+            assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+        }
+        fs::write(&path, b"not toml [").unwrap();
+        assert_eq!(materialize_pool_capacity(&source).unwrap(), None);
+        assert_eq!(fs::read(&path).unwrap(), b"not toml [");
+        let empty = root.path().join("without-configuration");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(materialize_pool_capacity(&empty).unwrap(), None);
+    }
+
+    #[test]
+    fn materialization_handles_crlf_and_a_missing_trailing_newline() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kit_source(root.path());
+        let path = source.join("global/orchestration.toml");
+        fs::write(&path, legacy_text(3).replace('\n', "\r\n")).unwrap();
+        assert_eq!(materialize_pool_capacity(&source).unwrap(), Some(3));
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("worktree_pool_size = 3\r\n"), "{written}");
+        assert_eq!(
+            orchestration_config::parse(written.as_bytes())
+                .unwrap()
+                .worktree_pool_size,
+            Some(3)
+        );
+        fs::write(&path, legacy_text(4).trim_end_matches('\n')).unwrap();
+        assert_eq!(materialize_pool_capacity(&source).unwrap(), Some(4));
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            orchestration_config::parse(written.as_bytes())
+                .unwrap()
+                .worktree_pool_size,
+            Some(4)
+        );
     }
 
     fn walkdir(root: &Path) -> Vec<String> {

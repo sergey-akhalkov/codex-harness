@@ -6,7 +6,6 @@ shared_skills = [
   "board-workflow",
   "cargo-fast",
   "harness-deploy",
-  "isolated-worktree",
   "openspec-apply-change",
   "project-memory",
   "project-verification",

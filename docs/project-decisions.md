@@ -659,6 +659,22 @@ its `target/` gigabytes, and
 [executor worktrees](agent-delegation.md#executor-worktrees) documents the
 supported operation and limits.
 
+**2026-10-13, confirmed:** one shared pool serves ordinary isolated tasks and
+executor dispatch in a repository. Pool capacity is the explicit, independent
+`worktree_pool_size` (shipped as four) rather than `max_concurrent_executors`,
+and `worktree_limit` remains compatibility-only. Install and update
+materialize the explicit setting for a configuration written before the
+capacity split, preserving its former effective capacity and never selecting
+the compatibility limit; afterwards, executor-limit changes cannot resize the
+pool. Pool records publish the `ownershipSchema: 2` discriminator so an older
+harness refuses upgraded records before applying its liveness rules, keeping
+held tasks unavailable to it during rollback; deleting ownership records is
+not a rollback procedure. The standalone `isolated-worktree` skill and its
+disposable-tree recipe are retired now that the installed common task path
+passed, with the surviving guidance maintained in the pool guide and the
+team-lead skill. Change:
+[unify reusable worktree pool](../openspec/changes/unify-reusable-worktree-pool/proposal.md).
+
 **2026-09-19, confirmed:** the feedback loop's kit-level backlog is the kit
 checkout's own `bd` board, addressed explicitly by the lead session
 (`bd -C <kit>`). Promoting a kit concern copies only kit-level summary and
