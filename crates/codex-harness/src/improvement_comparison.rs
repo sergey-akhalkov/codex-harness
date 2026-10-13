@@ -4686,8 +4686,15 @@ fn advance_direct_operation(
             .as_ref()
             .map(|state| state.arm(arm).clone())
             .unwrap_or_default();
-        if arm_state.condition.is_some() {
-            return Ok(());
+        if let Some(condition) = arm_state.condition.clone() {
+            return block(
+                run,
+                notes,
+                format!(
+                    "the {} direct operation did not enter the comparison: {condition}; the retained execution is preserved and never replayed automatically",
+                    arm.as_str()
+                ),
+            );
         }
         if arm_state.row.is_none() {
             if retained_row_without_state(run, arm) {
