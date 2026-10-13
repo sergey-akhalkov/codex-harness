@@ -190,9 +190,10 @@ instead of hosting a conversation without its responsibility role.
 Each control receipt records the role, its owned revision and what a
 continued predecessor recorded. Resume and restart re-resolve the role at the
 new dispatch, record it and report the effective state honestly
-(`role context: ...`): new turns compose the role text the receipt names,
-while the predecessor's earlier turns keep the revision they ran under and
-are never claimed to have loaded newer text. A receipt written before role
+(`role context: ...`): a fresh start consumes the role text the receipt
+names, while a resumed native thread keeps the developer text saved at its
+start (skills the live catalogue gained still refresh), and no turn is
+claimed to have loaded newer text. A receipt written before role
 recording reports `role context: unrecorded`: it stays usable, and the next
 fresh dispatch, resume or restart records the current role.
 

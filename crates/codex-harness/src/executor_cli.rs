@@ -419,8 +419,10 @@ fn host_lead_session(
     // The lead role is resolved from the installed build's recorded source
     // before the app-server starts; a missing owned role input refuses this
     // host with its exact cause and starts nothing. A resumed conversation
-    // reports that the earlier revision was not recorded: the new text
-    // applies to this host's turns only, never retroactively.
+    // reports that the earlier revision was not recorded: the current
+    // revision's text reaches turns only through a fresh conversation,
+    // because a resumed native thread keeps the developer text saved at its
+    // start.
     let role = native_launcher::role_launch(
         &request.codex_home,
         &request.source,
@@ -448,7 +450,7 @@ fn host_lead_session(
         role.role.label(),
         role.revision,
         if request.session.is_some() {
-            "unrecorded (the earlier host's revision was not recorded; new turns use this revision)"
+            "unrecorded (the earlier host's revision was not recorded; a fresh start consumes this revision, while a resumed native thread keeps the developer text saved at its start)"
         } else {
             "none"
         }
@@ -1289,9 +1291,10 @@ struct ControlReceipt {
 }
 
 /// One recorded role composition. `previous` describes the continued
-/// predecessor session only: its turns were produced under that revision (or
-/// before role recording at all), and the current revision reaches them only
-/// as context for new turns, never retroactively.
+/// predecessor dispatch only: it recorded that revision. A resumed native
+/// thread keeps the developer text saved at its start, so the current
+/// revision's text reaches turns only through a fresh conversation, and
+/// nothing is retroactive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RoleReceipt {
@@ -1318,7 +1321,7 @@ impl RoleReceipt {
         let previous = match &self.previous {
             None => "none".to_owned(),
             Some(previous) if previous.recorded => format!(
-                "recorded revision={} (the continued session's earlier turns were produced under that revision, not this one)",
+                "recorded revision={} (the predecessor dispatch recorded that revision; a fresh conversation consumes this revision, while a resumed native thread keeps the developer text saved at its start)",
                 previous.revision.as_deref().unwrap_or("unrecorded")
             ),
             Some(_) => {
@@ -1907,7 +1910,7 @@ fn launch_bound(
             .as_ref()
             .map(|previous| if previous.recorded {
                 format!(
-                    " previous={} (the continued session's earlier turns keep the revision they ran under)",
+                    " previous={} (the predecessor dispatch recorded that revision; a fresh start consumes this revision, while a resumed thread keeps the developer text saved at its start)",
                     previous.revision.as_deref().unwrap_or("unrecorded")
                 )
             } else {
@@ -8121,8 +8124,8 @@ mod tests {
 
     /// The role record round-trips through the receipt JSON exactly as the
     /// dispatch resolved it, and the one-line summary distinguishes this
-    /// conversation's effective revision from what a continued predecessor ran
-    /// under, without implying the old turns loaded the new text.
+    /// conversation's effective revision from what the continued predecessor
+    /// dispatch recorded, without implying turns loaded text they did not.
     #[test]
     fn role_receipts_round_trip_and_summarize_effective_and_previous_revisions() {
         let value = json!({
@@ -8158,8 +8161,8 @@ mod tests {
         assert!(summary.contains("revision=new-revision"), "{summary}");
         assert!(summary.contains("old-revision"), "{summary}");
         assert!(
-            summary.contains("not this one"),
-            "the summary must not imply the old turns loaded the new text: {summary}"
+            summary.contains("keeps the developer text saved at its start"),
+            "the summary must not imply resumed turns loaded newer text: {summary}"
         );
 
         // A receipt written before role recording applies nothing and reports

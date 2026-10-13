@@ -32,6 +32,21 @@ const EXPECTED_LEN: u64 = 307_150_128;
 const PINNED_SOURCE: &str = "installed-cli-0.155.0";
 const LATE_SKILL: &str = "skill_catalog_late_refresh_probe";
 const LATE_MARKER: &str = "SKILL_CATALOG_LATE_REFRESH_MARKER_7f3c2a91";
+/// Explicit native resume probe markers: the executor role text before and
+/// after the kit source change, and the project skills the resume must
+/// reconcile. Kept distinct from every other probe's names.
+const RESUME_ROLE_ALPHA: &str = "RESUME_ROLE_TEXT_ALPHA_9d21";
+const RESUME_ROLE_BRAVO: &str = "RESUME_ROLE_TEXT_BRAVO_5fe8";
+const RESUME_EARLY_SKILL: &str = "resume_probe_early";
+const RESUME_LATE_SKILL: &str = "resume_probe_late";
+const RESUME_UNRELATED_SKILL: &str = "resume_probe_unrelated";
+
+/// Explicit native catalogue probe names for the repository scope, the
+/// explicit shared-skill disablement and the env-pinned canary farm. Kept
+/// distinct from every other probe's names.
+const CATALOGUE_PROJECT_SKILL: &str = "project_probe";
+const CATALOGUE_USER_UNRELATED_SKILL: &str = "user_unrelated";
+const CATALOGUE_EXPLICITLY_DISABLED_SKILL: &str = "cargo-fast";
 
 fn write_json(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
@@ -125,6 +140,61 @@ fn write_skill_described(dir: &Path, name: &str, description: &str, marker: &str
         ),
     )
     .unwrap();
+}
+
+/// The synthetic managed home both role probes run with: the `ds` profile
+/// mirrors the ds/deepseek-flash/deepseek/max binding with only its transport
+/// pointed at the canned local Responses server, and the base configuration
+/// trusts the owned workspace. `extra` appends probe-specific configuration.
+fn write_role_probe_home(home: &Path, case: &Path, canned: &CannedResponses, extra: &str) {
+    fs::write(
+        home.join("ds.config.toml"),
+        format!(
+            "model = \"deepseek-flash\"\nmodel_provider = \"deepseek\"\nmodel_reasoning_effort = \"max\"\n\n[features]\ncode_mode = false\n\n[model_providers.deepseek]\nname = \"Canned role probe Responses\"\nbase_url = \"{}\"\nenv_key = \"{API_KEY_ENV}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n",
+            canned.base_url()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[windows]\nsandbox = \"unelevated\"\n\n[features]\nhooks = false\napps = false\nmemories = false\ngoals = false\nplugins = false\nskill_search = true\n\n[projects.{}]\ntrust_level = \"trusted\"\n{extra}",
+            json_escape(case)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({"auth_mode": "apikey", "OPENAI_API_KEY": API_KEY}))
+            .unwrap(),
+    )
+    .unwrap();
+}
+
+/// The `-c` composition the managed host applies for one role: the profile
+/// overrides first, then the role launch composition from the recorded build.
+fn role_args(
+    home: &Path,
+    case: &Path,
+    role: harness_core::role_context::Role,
+) -> (String, Vec<std::ffi::OsString>) {
+    let profile = harness_core::orchestration_config::profile_config(home, "ds").unwrap();
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    for config in harness_core::orchestration_config::profile_config_overrides(home, "ds").unwrap()
+    {
+        args.push("-c".into());
+        args.push(config.into());
+    }
+    let launch = harness_core::native_launcher::role_launch(
+        home,
+        case,
+        Some(&profile),
+        &toml::Table::new(),
+        role,
+    )
+    .unwrap();
+    args.extend(launch.args.iter().map(std::ffi::OsString::from));
+    (launch.revision, args)
 }
 
 fn git_identity(root: &Path) {
@@ -3046,6 +3116,830 @@ fn catalogue_role_profile_native_read_consumes_the_selected_profiles_disablement
     );
 }
 
+/// Explicit native probe: two simultaneously running managed role catalogues
+/// in one synthetic installation, after one sequential catalogue warms the
+/// shared home: on installed 0.162.1 two simultaneous first initializations
+/// of one fresh home race and one exits with `failed to initialize state
+/// runtime`, while a deployed home is already initialized. The recorded
+/// build source is this checkout and the case lives in its integration-test
+/// target tmp area, so the native repository scope lists this checkout's
+/// classified `.agents/skills` at the canonical paths the role resolution
+/// uses: the lead-only kit skills must stay disabled for the executor
+/// catalogue while they stay enabled for the lead, every shared kit skill
+/// outside the explicit disablement stays enabled, one explicitly disabled
+/// shared skill stays disabled for both roles, and the unclassified project
+/// skill stays enabled for both. The installed native CLI resolves its user
+/// farm from the real OS profile and ignores the USERPROFILE/HOME pins
+/// (observed on 0.162.1), so the env-pinned farm is a canary that must stay
+/// undiscovered and untouched; deployment-world user-scope disablement
+/// remains a global-deployment gate. Neither role may rewrite the synthetic
+/// configuration or the session-local home. The installed native CLI
+/// performs the catalogue read; no model call is made.
+#[test]
+#[ignore = "explicit installed native CLI skills/list over the workspace kit source; no model"]
+fn catalogue_role_sessions_keep_independent_user_contexts() {
+    // The installed native CLI refuses helper aliases and the sqlite state
+    // runtime under the system temporary directory, so the fixture root
+    // lives in the integration-test target tmp area instead of TEMP.
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-sessions-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .keep();
+    println!("skill catalogue role sessions evidence: {}", root.display());
+    let case = root.join("case");
+    let home = root.join("codex");
+    let user = root.join("user");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&user).unwrap();
+    // The recorded build source is the workspace kit checkout itself, so the
+    // recorded role classification resolves the same canonical skill paths
+    // the native repository scope reports for the case below.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let explicitly_disabled = source
+        .join(".agents/skills")
+        .join(CATALOGUE_EXPLICITLY_DISABLED_SKILL)
+        .join("SKILL.md");
+    assert!(
+        explicitly_disabled.is_file(),
+        "the workspace kit must classify the probe skill: {}",
+        explicitly_disabled.display()
+    );
+    let build = synthetic_role_build::recorded_build(&root, &source);
+    synthetic_role_build::register(&home, &root, &build);
+
+    let project = case.join(format!(".agents/skills/{CATALOGUE_PROJECT_SKILL}"));
+    write_skill(&project, CATALOGUE_PROJECT_SKILL, "PROJECT_MARKER");
+
+    // Env-pinned canary farm: 0.162.1 resolves the user farm from the real OS
+    // profile, so this skill must stay undiscovered and the tree untouched.
+    let farm = user.join(".agents/skills");
+    fs::create_dir_all(&farm).unwrap();
+    write_skill(
+        &farm.join(CATALOGUE_USER_UNRELATED_SKILL),
+        CATALOGUE_USER_UNRELATED_SKILL,
+        "USER_UNRELATED_MARKER",
+    );
+
+    // One shared kit skill is explicitly disabled for this session through
+    // the selected profile layer; both role catalogues must preserve that
+    // disablement for the canonical path the role resolution classifies.
+    fs::write(
+        home.join("ds.config.toml"),
+        format!(
+            "[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(explicitly_disabled.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(home.join("config.toml"), "approval_policy = \"never\"\n").unwrap();
+
+    let upstream = registered_upstream(&live_codex_home());
+    let config_before = (
+        fs::read(home.join("config.toml")).unwrap(),
+        fs::read(home.join("ds.config.toml")).unwrap(),
+    );
+    let user_before = tree_paths(&user);
+
+    let catalogue = |role: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command
+            .args(["skills", "catalogue", "--case"])
+            .arg(&case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", role, "--profile", "ds", "--limit", "1048576"]);
+        command.env("USERPROFILE", &user);
+        command.env("HOME", &user);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command
+    };
+    // The installed native CLI initializes its per-home sqlite state lazily:
+    // two app-server processes opening one fresh home at the same instant race
+    // and one exits with `failed to initialize state runtime` (observed on
+    // 0.162.1). A deployed home is already initialized, so one sequential
+    // catalogue warms the shared home through the same entry point and the
+    // two simultaneous role reads then start against the deployed shape.
+    let warm = catalogue("lead").output().unwrap();
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    fs::write(root.join("catalogue-warm.txt"), &warm.stdout).unwrap();
+    let lead = catalogue("lead").spawn().unwrap();
+    let executor = catalogue("executor").spawn().unwrap();
+    let lead = lead.wait_with_output().unwrap();
+    let executor = executor.wait_with_output().unwrap();
+    assert!(
+        lead.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lead.stderr)
+    );
+    assert!(
+        executor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executor.stderr)
+    );
+    let lead_text = String::from_utf8_lossy(&lead.stdout).into_owned();
+    let executor_text = String::from_utf8_lossy(&executor.stdout).into_owned();
+    fs::write(root.join("catalogue-lead.txt"), lead_text.as_bytes()).unwrap();
+    fs::write(
+        root.join("catalogue-executor.txt"),
+        executor_text.as_bytes(),
+    )
+    .unwrap();
+
+    // Expectations come from the kit descriptor itself: shared skills belong
+    // to both roles, the lead-only skills must stay disabled for the
+    // executor, and the explicitly disabled shared skill stays disabled for
+    // both roles without re-enabling anything.
+    let descriptor: toml::Value =
+        toml::from_str(&fs::read_to_string(source.join("global/roles.toml")).unwrap()).unwrap();
+    let names = |value: &toml::Value| -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let shared = names(&descriptor["shared_skills"]);
+    let lead_only = names(&descriptor["roles"]["lead"]["skills"]);
+    let executor_only = names(&descriptor["roles"]["executor"]["skills"]);
+    let entry = |text: &str, name: &str, scope: &str| -> Option<bool> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("name={name};scope={scope};")))
+            .map(|line| line.starts_with(&format!("name={name};scope={scope};enabled=true;")))
+    };
+    let repo_disabled = |text: &str| -> usize {
+        text.lines()
+            .filter(|line| line.contains(";scope=repo;") && line.contains(";enabled=false;"))
+            .count()
+    };
+    for (role, text) in [
+        ("lead", lead_text.as_str()),
+        ("executor", executor_text.as_str()),
+    ] {
+        assert!(
+            text.contains(&format!("role_context=role={role};profile=ds;revision=")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("omitted="),
+            "--limit 1048576 must deliver every effective entry for {role}: {text}"
+        );
+        assert!(
+            entry(text, CATALOGUE_PROJECT_SKILL, "repo") == Some(true),
+            "the unclassified project skill stays enabled for {role}: {text}"
+        );
+        assert!(
+            entry(text, CATALOGUE_EXPLICITLY_DISABLED_SKILL, "repo") == Some(false),
+            "the explicit disablement is preserved for {role}: {text}"
+        );
+        assert!(
+            !text.contains(CATALOGUE_USER_UNRELATED_SKILL),
+            "the env-pinned farm stays undiscovered for {role}: {text}"
+        );
+        for name in &shared {
+            if name.as_str() == CATALOGUE_EXPLICITLY_DISABLED_SKILL {
+                continue;
+            }
+            assert!(
+                entry(text, name, "repo") == Some(true),
+                "the shared kit skill {name} stays enabled for {role}: {text}"
+            );
+        }
+    }
+    for name in &lead_only {
+        assert!(
+            entry(lead_text.as_str(), name, "repo") == Some(true),
+            "the lead catalogue keeps {name}: {lead_text}"
+        );
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(false),
+            "the lead-owned {name} stays disabled for the executor: {executor_text}"
+        );
+    }
+    for name in &executor_only {
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(true),
+            "the executor catalogue keeps {name}: {executor_text}"
+        );
+    }
+    assert_eq!(
+        repo_disabled(&lead_text),
+        1,
+        "only the explicit disablement is disabled for the lead: {lead_text}"
+    );
+    assert_eq!(
+        repo_disabled(&executor_text),
+        lead_only.len() + 1,
+        "only the explicit and lead-owned disablements are disabled for the executor: {executor_text}"
+    );
+
+    let config_after = (
+        fs::read(home.join("config.toml")).unwrap(),
+        fs::read(home.join("ds.config.toml")).unwrap(),
+    );
+    assert_eq!(
+        config_before, config_after,
+        "the role catalogues must not rewrite the synthetic configuration"
+    );
+    assert_eq!(
+        user_before,
+        tree_paths(&user),
+        "the role catalogues must not write the session-local user home"
+    );
+}
+/// Sorted relative paths of one directory tree; link entries are listed but
+/// not followed, so a session-local home can be compared before and after an
+/// external catalogue read.
+fn tree_paths(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, path: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let child = entry.path();
+            out.push(
+                child
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            if entry.file_type().unwrap().is_dir() {
+                walk(root, &child, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Explicit native probe of what installed 0.162.1 actually consumes for a
+/// managed resume. Fresh starts consume the composed role text and the live
+/// skill selection. A resumed thread keeps the developer text saved at its
+/// start and retains the skill entries saved then, while skills added later
+/// are picked up from the live surface; neither `config.developer_instructions`
+/// nor `developerInstructions`
+/// on `thread/resume` changes the consumed developer text: the configuration
+/// variants produce byte-identical requests. The current revision's text
+/// reaches turns only through a fresh conversation, which the restart
+/// contrast captures. The installed native CLI is driven over stdio with the
+/// same `-c` composition the managed host applies: profile `ds` mirrors the
+/// ds/deepseek-flash/deepseek/max binding with only its transport pointed at
+/// the canned local Responses server, and the role `-c` pairs come from the
+/// same `role_launch` composer the managed host uses. Captured model request
+/// bodies prove what each fresh and resumed turn actually consumed. No
+/// billed model call and no shared configuration write.
+#[test]
+#[ignore = "explicit installed native CLI app-server over stdio + canned local Responses; no live model"]
+fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue() {
+    let upstream = registered_upstream(&live_codex_home());
+    assert!(upstream.is_absolute() && upstream.is_file());
+    let version = Command::new(&upstream).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    assert!(
+        version.contains("0.162.1"),
+        "unexpected native CLI: {version}"
+    );
+
+    let evidence = tempfile::Builder::new()
+        .prefix("native-resume-role-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("native resume role evidence: {}", evidence.display());
+    let case = evidence.join("case");
+    let home = evidence.join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    git_identity(&case);
+    let source = synthetic_role_build::kit_source(&evidence);
+    fs::write(
+        source.join("global/executor.md"),
+        format!("Fixture executor responsibility\n\n{RESUME_ROLE_ALPHA}\n"),
+    )
+    .unwrap();
+    let build = synthetic_role_build::recorded_build(&evidence, &source);
+    synthetic_role_build::register(&home, &evidence, &build);
+    let skills = case.join(".agents/skills");
+    write_skill(
+        &skills.join(RESUME_EARLY_SKILL),
+        RESUME_EARLY_SKILL,
+        "RESUME_EARLY_MARKER",
+    );
+    write_skill(
+        &skills.join(RESUME_UNRELATED_SKILL),
+        RESUME_UNRELATED_SKILL,
+        "RESUME_UNRELATED_MARKER",
+    );
+
+    let canned = CannedResponses::spawn(&evidence).unwrap();
+    write_role_probe_home(&home, &case, &canned, "");
+
+    let (lead_revision, lead_args) =
+        role_args(&home, &case, harness_core::role_context::Role::Lead);
+    let lead_body = {
+        let mut lead = RoleAppServer::spawn(&upstream, &home, &case, &lead_args, false, None);
+        lead.initialize();
+        let thread = lead.thread_start(&case);
+        let body = turn_and_capture(&mut lead, &thread, &canned, 1);
+        lead.shutdown();
+        body
+    };
+
+    let (start_revision, mut start_args) =
+        role_args(&home, &case, harness_core::role_context::Role::Executor);
+    start_args.push("-c".into());
+    start_args.push("agents.enabled=false".into());
+    let mut threads = Vec::new();
+    let mut start_bodies = Vec::new();
+    {
+        let mut executor = RoleAppServer::spawn(&upstream, &home, &case, &start_args, true, None);
+        executor.initialize();
+        for expected in 2..=4 {
+            let thread = executor.thread_start(&case);
+            let body = turn_and_capture(&mut executor, &thread, &canned, expected);
+            threads.push(thread);
+            start_bodies.push(body);
+        }
+        executor.shutdown();
+    }
+
+    fs::write(
+        source.join("global/executor.md"),
+        format!("Fixture executor responsibility\n\n{RESUME_ROLE_BRAVO}\n"),
+    )
+    .unwrap();
+    let build = synthetic_role_build::recorded_build(&evidence, &source);
+    synthetic_role_build::register(&home, &evidence, &build);
+    let bravo_text =
+        harness_core::role_context::resolve(&source, harness_core::role_context::Role::Executor)
+            .unwrap()
+            .developer_instructions;
+    assert!(bravo_text.contains(RESUME_ROLE_BRAVO));
+    fs::remove_dir_all(skills.join(RESUME_EARLY_SKILL)).unwrap();
+    write_skill(
+        &skills.join(RESUME_LATE_SKILL),
+        RESUME_LATE_SKILL,
+        "RESUME_LATE_MARKER",
+    );
+
+    let (resume_revision, mut resume_args) =
+        role_args(&home, &case, harness_core::role_context::Role::Executor);
+    assert_ne!(
+        resume_revision, start_revision,
+        "changing the owned role text must change the resolved revision"
+    );
+    resume_args.push("-c".into());
+    resume_args.push("agents.enabled=false".into());
+    let variants = [
+        ("threadId", json!({"threadId": threads[0]})),
+        (
+            "config",
+            json!({"threadId": threads[1], "config": {"developer_instructions": bravo_text}}),
+        ),
+        (
+            "developerInstructions",
+            json!({"threadId": threads[2], "developerInstructions": bravo_text}),
+        ),
+    ];
+    let mut resume_answers = Vec::new();
+    let mut resume_bodies = Vec::new();
+    let restart_body = {
+        let mut executor = RoleAppServer::spawn(&upstream, &home, &case, &resume_args, true, None);
+        executor.initialize();
+        for (index, (variant, params)) in variants.iter().enumerate() {
+            let answer = executor.call("thread/resume", params.clone());
+            resume_answers.push(json!({
+                "variant": variant,
+                "cwd": answer["thread"]["cwd"].clone(),
+                "instructionSources": answer
+                    .get("instructionSources")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }));
+            let body = turn_and_capture(&mut executor, &threads[index], &canned, 5 + index);
+            resume_bodies.push(body);
+        }
+        // A fresh conversation on the same live session consumes the current
+        // revision: the restart carries the bravo text and the live skill
+        // selection, while the resumed threads above keep the text and the
+        // early entry saved at their start.
+        let restart_thread = executor.thread_start(&case);
+        let restart_body = turn_and_capture(&mut executor, &restart_thread, &canned, 8);
+        executor.shutdown();
+        restart_body
+    };
+
+    for (name, body) in start_bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| (format!("executor-start-{index}.body.json"), body))
+        .chain(std::iter::once(("lead.body.json".to_owned(), &lead_body)))
+        .chain(std::iter::once((
+            "restart-contrast.body.json".to_owned(),
+            &restart_body,
+        )))
+        .chain(
+            resume_bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| (format!("resume-{index}.body.json"), body)),
+        )
+    {
+        fs::write(evidence.join(name), body.as_bytes()).unwrap();
+    }
+
+    let report = json!({
+        "evidence": evidence,
+        "upstream": {
+            "path": upstream,
+            "version": version,
+            "sha256": build_identity::hash_file(&upstream).unwrap(),
+            "bytes": fs::metadata(&upstream).unwrap().len(),
+        },
+        "binding": {
+            "profile": "ds",
+            "model": "deepseek-flash",
+            "provider": "deepseek",
+            "reasoning_effort": "max",
+        },
+        "revisions": {
+            "lead": lead_revision,
+            "executor_start": start_revision,
+            "executor_resume": resume_revision,
+        },
+        "lead": described(&lead_body),
+        "executor_start": start_bodies.iter().map(|body| described(body)).collect::<Vec<_>>(),
+        "executor_resume": resume_bodies.iter().map(|body| described(body)).collect::<Vec<_>>(),
+        "restart": described(&restart_body),
+        "resume_answers": resume_answers,
+    });
+    write_json(&evidence.join("report.json"), &report);
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    assert_eq!(report["lead"]["lead_text"], true);
+    assert_eq!(report["lead"]["executor_text"], false);
+    assert_eq!(report["lead"]["multi_agent"], true);
+    for (index, start) in report["executor_start"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(start["alpha"], true, "start body {index}");
+        assert_eq!(start["executor_text"], true, "start body {index}");
+        assert_eq!(start["early"], true, "start body {index}");
+        assert_eq!(start["late"], false, "start body {index}");
+        assert_eq!(start["unrelated"], true, "start body {index}");
+        assert_eq!(
+            start["spawn_agent"], false,
+            "an executor session must not advertise agent spawning: {start}"
+        );
+        assert_eq!(
+            start["multi_agent"], false,
+            "an executor session must not advertise the orchestration tool: {start}"
+        );
+    }
+    for (index, resume) in report["executor_resume"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            resume["alpha"], true,
+            "resumed turn {index} must keep the developer text saved at its start: {resume}"
+        );
+        assert_eq!(
+            resume["bravo"], false,
+            "a resumed thread must not load the newer role text retroactively: {resume}"
+        );
+        assert_eq!(
+            resume["early"], true,
+            "the entry saved at the start stays in the saved selection: {resume}"
+        );
+        assert_eq!(
+            resume["late"], true,
+            "the live catalogue supplies skills added after the start: {resume}"
+        );
+        assert_eq!(resume["unrelated"], true, "resumed turn {index}: {resume}");
+        assert_eq!(
+            resume["spawn_agent"], false,
+            "an executor session must not advertise agent spawning: {resume}"
+        );
+        assert_eq!(
+            resume["multi_agent"], false,
+            "an executor session must not advertise the orchestration tool: {resume}"
+        );
+    }
+    let resumed = report["executor_resume"].as_array().unwrap();
+    assert_eq!(
+        resumed[0], resumed[1],
+        "config.developer_instructions must not change the consumed text"
+    );
+    assert_eq!(
+        resumed[1], resumed[2],
+        "developerInstructions must not change the consumed text"
+    );
+    for entry in report["resume_answers"].as_array().unwrap() {
+        assert_eq!(
+            entry["cwd"].as_str().map(str::to_lowercase),
+            case.to_str().map(str::to_lowercase),
+            "thread/resume keeps the session workspace: {entry}"
+        );
+        assert!(
+            entry["instructionSources"].is_array(),
+            "thread/resume reports instruction sources as a list: {entry}"
+        );
+    }
+    assert_eq!(
+        report["restart"]["bravo"], true,
+        "a fresh conversation consumes the current role text"
+    );
+    assert_eq!(
+        report["restart"]["alpha"], false,
+        "a fresh conversation drops the predecessor role text"
+    );
+    assert_eq!(report["restart"]["executor_text"], true);
+    assert_eq!(
+        report["restart"]["early"], false,
+        "a fresh conversation drops the removed skill entry"
+    );
+    assert_eq!(report["restart"]["late"], true);
+    assert_eq!(report["restart"]["unrelated"], true);
+    assert_eq!(report["restart"]["spawn_agent"], false);
+    assert_eq!(report["restart"]["multi_agent"], false);
+}
+
+/// One native app-server child driven over stdio JSON-RPC, the same protocol
+/// the managed control connection speaks over its WebSocket. Stdout is
+/// drained on a reader thread; only matching request answers are consumed.
+struct RoleAppServer {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    transcript: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    diagnostics: std::sync::Arc<std::sync::Mutex<String>>,
+    next_id: u64,
+}
+
+impl RoleAppServer {
+    fn spawn(
+        exe: &Path,
+        home: &Path,
+        case: &Path,
+        args: &[std::ffi::OsString],
+        executor: bool,
+        user_home: Option<&Path>,
+    ) -> Self {
+        let mut command = Command::new(exe);
+        command.arg("app-server");
+        command.args(args);
+        command.current_dir(case);
+        command.env("CODEX_HOME", home);
+        if let Some(user_home) = user_home {
+            // Native skill discovery resolves the user farm from the OS home,
+            // not CODEX_HOME; the probe pins it to a session-local directory.
+            command.env("USERPROFILE", user_home);
+            command.env("HOME", user_home);
+        }
+        command.env(API_KEY_ENV, API_KEY);
+        command.env("PATH", filtered_path());
+        command.env_remove("OPENAI_API_KEY");
+        command.env_remove("CODEX_API_KEY");
+        // The managed host strips a leaked parent identity before the
+        // app-server starts; the probe must not attach to this session.
+        command.env_remove("CODEX_SESSION_ID");
+        command.env_remove("CODEX_THREAD_ID");
+        command.env_remove("HARNESS_EXECUTOR_RUN");
+        if executor {
+            command.env("HARNESS_EXECUTOR_SESSION", "1");
+        } else {
+            command.env_remove("HARNESS_EXECUTOR_SESSION");
+        }
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (sender, lines) = std::sync::mpsc::channel();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let transcript = std::sync::Arc::clone(&transcript);
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    transcript.lock().unwrap().push(line.clone());
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let diagnostics = std::sync::Arc::clone(&diagnostics);
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = stderr.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buffer[..read]));
+                }
+            });
+        }
+        Self {
+            child,
+            stdin,
+            lines,
+            transcript,
+            diagnostics,
+            next_id: 0,
+        }
+    }
+
+    fn write(&mut self, value: &Value) {
+        use std::io::Write;
+        let stdin = self.stdin.as_mut().expect("app-server stdin is open");
+        writeln!(stdin, "{value}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.write(&json!({"id": id, "method": method, "params": params}));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self.lines.recv_timeout(remaining).unwrap_or_else(|_| {
+                panic!(
+                    "{method} was not answered; stderr:\n{}\nstdout tail:\n{}",
+                    self.diagnostics.lock().unwrap(),
+                    self.tail()
+                )
+            });
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                if let Some(error) = value.get("error") {
+                    panic!("{method} was rejected: {error}");
+                }
+                return value.get("result").cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
+
+    fn initialize(&mut self) {
+        self.call(
+            "initialize",
+            json!({
+                "clientInfo": {"name": "harness-role-resume-probe", "version": "1"},
+                "capabilities": {"experimentalApi": true},
+            }),
+        );
+        self.write(&json!({"method": "initialized"}));
+    }
+
+    fn thread_start(&mut self, case: &Path) -> String {
+        let started = self.call(
+            "thread/start",
+            json!({
+                "cwd": case,
+                "allowProviderModelFallback": false,
+                "model": "deepseek-flash",
+                "modelProvider": "deepseek",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "config": {"model_reasoning_effort": "max"},
+            }),
+        );
+        started["thread"]["id"]
+            .as_str()
+            .expect("thread/start answers with a thread identity")
+            .to_owned()
+    }
+
+    fn turn(&mut self, thread: &str) {
+        self.call(
+            "turn/start",
+            json!({
+                "threadId": thread,
+                "input": [{"type": "text", "text": RESUME_PROMPT}],
+            }),
+        );
+    }
+
+    fn tail(&self) -> String {
+        let transcript = self.transcript.lock().unwrap();
+        let start = transcript.len().saturating_sub(12);
+        transcript[start..].join("\n")
+    }
+
+    fn shutdown(mut self) {
+        self.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if self.child.try_wait().unwrap().is_some() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// Submits one turn on `thread` and returns the raw body of the model request
+/// it produced. `expected` is the one-based count of canned Resume requests,
+/// so captures are attributed to turns by their exact order.
+fn turn_and_capture(
+    server: &mut RoleAppServer,
+    thread: &str,
+    canned: &CannedResponses,
+    expected: usize,
+) -> String {
+    server.turn(thread);
+    let captured = canned.wait_for(Duration::from_secs(120), |requests| {
+        requests
+            .iter()
+            .filter(|request| request.kind == RequestKind::Resume)
+            .count()
+            >= expected
+    });
+    assert!(
+        captured,
+        "turn {expected} produced no captured model request"
+    );
+    canned
+        .requests()
+        .into_iter()
+        .filter(|request| request.kind == RequestKind::Resume)
+        .nth(expected - 1)
+        .expect("captured model request")
+        .body
+}
+
+/// The observable consumption markers of one captured model request.
+fn described(body: &str) -> Value {
+    let tools: Vec<String> = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value["tools"].as_array().map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        tool["name"]
+                            .as_str()
+                            .or_else(|| tool["function"]["name"].as_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    json!({
+        "alpha": body.contains(RESUME_ROLE_ALPHA),
+        "bravo": body.contains(RESUME_ROLE_BRAVO),
+        "lead_text": body.contains("Fixture lead responsibility"),
+        "executor_text": body.contains("Fixture executor responsibility"),
+        "early": body.contains(RESUME_EARLY_SKILL),
+        "late": body.contains(RESUME_LATE_SKILL),
+        "unrelated": body.contains(RESUME_UNRELATED_SKILL),
+        "shared": body.contains("- shared:"),
+        "coordinate": body.contains("- coordinate:"),
+        "project_probe": body.contains(&format!("- {CATALOGUE_PROJECT_SKILL}:")),
+        "user_unrelated": body.contains(&format!("- {CATALOGUE_USER_UNRELATED_SKILL}:")),
+        "spawn_agent": tools.iter().any(|name| name.contains("spawn")),
+        "multi_agent": tools.iter().any(|name| name.contains("multi_agent")),
+        "tools": tools,
+    })
+}
 fn live_codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
