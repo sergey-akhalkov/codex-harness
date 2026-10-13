@@ -443,11 +443,11 @@ mod tests {
         let home = root.path().join("home");
         let user = root.path().join("user");
         installed_profiles(&home);
-        fs::remove_file(home.join("zai.config.toml")).unwrap();
-        let before = fs::read(home.join("ds.config.toml")).unwrap();
+        fs::remove_file(home.join("ds.config.toml")).unwrap();
+        let before = fs::read(home.join("zai.config.toml")).unwrap();
         let error = check(&source, &home, &user, false).unwrap_err();
-        assert!(error.to_string().contains("profile 'zai' is not installed"));
-        assert_eq!(fs::read(home.join("ds.config.toml")).unwrap(), before);
+        assert!(error.to_string().contains("profile 'ds' is not installed"));
+        assert_eq!(fs::read(home.join("zai.config.toml")).unwrap(), before);
         assert!(!user.exists());
     }
 
