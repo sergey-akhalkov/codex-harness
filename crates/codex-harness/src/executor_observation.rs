@@ -2482,28 +2482,29 @@ pub(crate) mod evidence {
         Ok(())
     }
 
-    /// Writes the caller-owned `evidence` state under its top-level key,
-    /// preserving every other field of the receipt under the receipt lock.
-    fn persist_state(path: &Path, state: &EvidenceState) -> io::Result<()> {
+    /// Merges the caller-owned `evidence` state under its top-level key,
+    /// preserving every other field of the receipt. The caller already holds
+    /// the receipt lock: claim and acknowledgment read, decide and write in
+    /// one locked section, so a transition can never be applied to a state a
+    /// concurrent writer has since replaced.
+    fn persist_state_under_lock(path: &Path, state: &EvidenceState) -> io::Result<()> {
         let field = serde_json::to_value(state).map_err(io::Error::other)?;
-        with_receipt_lock(path, || {
-            let mut document = match read_receipt_value(path) {
-                Ok(document) => document,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
-                Err(error) => return Err(error),
-            };
-            if !document.is_object() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "the evidence state receipt {} is not a JSON object; refusing to overwrite it",
-                        path.display()
-                    ),
-                ));
-            }
-            document["evidence"] = field.clone();
-            write_receipt(path, &document)
-        })
+        let mut document = match read_receipt_value(path) {
+            Ok(document) => document,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
+            Err(error) => return Err(error),
+        };
+        if !document.is_object() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the evidence state receipt {} is not a JSON object; refusing to overwrite it",
+                    path.display()
+                ),
+            ));
+        }
+        document["evidence"] = field;
+        write_receipt(path, &document)
     }
 
     fn advance_cursor(state: &mut EvidenceState, ids: &[String]) -> usize {
@@ -2520,6 +2521,48 @@ pub(crate) mod evidence {
         ids.len()
     }
 
+    /// Applies the run scoping every state transition shares: a state written
+    /// for another generation is reset instead of carrying a cursor, an
+    /// active batch or a last acknowledgment across runs. Returns whether the
+    /// reset changed the state and must be persisted.
+    fn prepare_generation(
+        state: &mut EvidenceState,
+        run_generation: &str,
+        notes: &mut CoverageNotes,
+        reset_noted: &mut bool,
+    ) -> bool {
+        let mut changed = false;
+        if state.schema == 0 {
+            state.schema = EVIDENCE_SCHEMA;
+            changed = true;
+        }
+        if state.generation != run_generation {
+            if !state.generation.is_empty() && !*reset_noted {
+                notes.note(
+                    "state",
+                    format!(
+                        "the recorded evidence state observed run generation {} while this claim observes {}; its cursor, active batch and last acknowledgment were reset for the new run instead of being applied to another run",
+                        state.generation, run_generation
+                    ),
+                );
+                *reset_noted = true;
+            }
+            *state = EvidenceState {
+                schema: EVIDENCE_SCHEMA,
+                generation: run_generation.to_owned(),
+                ..EvidenceState::default()
+            };
+            changed = true;
+        }
+        changed
+    }
+
+    /// The source name one retained identity belongs to: the `source` segment
+    /// of the `source|slot|id|phase` identity written by [`identity`].
+    fn identity_source(id: &str) -> &str {
+        id.split_once('|').map(|(source, _)| source).unwrap_or(id)
+    }
+
     /// Claims one bounded batch of new evidence for one run generation.
     ///
     /// An unchanged pass reports [`EvidenceClaim::NoNewEvidence`] with the
@@ -2527,208 +2570,278 @@ pub(crate) mod evidence {
     /// while a batch is in flight reports its identity instead of gathering,
     /// so exactly one analysis batch is authoritative at a time; arrivals
     /// during that analysis are gathered by the next claim.
+    ///
+    /// The state transition is atomic in the receipt's own lock: the state is
+    /// read and scoped in a short locked phase, the native records are
+    /// gathered outside it (a slow conversation or file read never blocks a
+    /// concurrent receipt write), and the final phase re-reads the state
+    /// under the lock before deciding. Two concurrent claims can therefore
+    /// never both start a batch, and a stale read can never overwrite a
+    /// transition a concurrent writer installed meanwhile.
     pub(crate) fn claim(request: &EvidenceRequest<'_>) -> io::Result<EvidenceClaim> {
-        let document = read_document(request.state_receipt)?;
-        let mut state = state_from_document(&document)?;
-        refuse_newer_schema(&state)?;
         let mut notes = CoverageNotes::default();
-        let mut state_dirty = false;
-        if state.schema == 0 {
-            state.schema = EVIDENCE_SCHEMA;
-            state_dirty = true;
+        let mut reset_noted = false;
+        let under_way = with_receipt_lock(
+            request.state_receipt,
+            || -> io::Result<Option<EvidenceClaim>> {
+                let document = read_document(request.state_receipt)?;
+                let mut state = state_from_document(&document)?;
+                refuse_newer_schema(&state)?;
+                prepare_generation(
+                    &mut state,
+                    request.run_generation,
+                    &mut notes,
+                    &mut reset_noted,
+                );
+                Ok(state
+                    .active
+                    .as_ref()
+                    .map(|active| EvidenceClaim::BatchInFlight {
+                        batch_id: active.batch_id.clone(),
+                        created_ms: active.created_ms,
+                    }))
+            },
+        )?;
+        if let Some(under_way) = under_way {
+            return Ok(under_way);
         }
-        if state.generation != request.run_generation {
-            if !state.generation.is_empty() {
+        let gathered = gather(request, &mut notes);
+        with_receipt_lock(request.state_receipt, || -> io::Result<EvidenceClaim> {
+            let document = read_document(request.state_receipt)?;
+            let mut state = state_from_document(&document)?;
+            refuse_newer_schema(&state)?;
+            let state_dirty = prepare_generation(
+                &mut state,
+                request.run_generation,
+                &mut notes,
+                &mut reset_noted,
+            );
+            if let Some(active) = &state.active {
+                return Ok(EvidenceClaim::BatchInFlight {
+                    batch_id: active.batch_id.clone(),
+                    created_ms: active.created_ms,
+                });
+            }
+            if state.cursor_evicted {
                 notes.note(
-                    "state",
+                    "retention",
                     format!(
-                        "the recorded evidence state observed run generation {} while this claim observes {}; its cursor, active batch and last acknowledgment were reset for the new run instead of being applied to another run",
-                        state.generation, request.run_generation
+                        "the acknowledged-identity cursor reached its {EVIDENCE_CURSOR_LIMIT}-entry bound and older identities were evicted; evidence older than the retained window can be offered again instead of staying trusted as consumed"
                     ),
                 );
             }
-            state = EvidenceState {
-                schema: EVIDENCE_SCHEMA,
-                generation: request.run_generation.to_owned(),
-                ..EvidenceState::default()
-            };
-            state_dirty = true;
-        }
-        if let Some(active) = &state.active {
-            return Ok(EvidenceClaim::BatchInFlight {
-                batch_id: active.batch_id.clone(),
-                created_ms: active.created_ms,
+            let visible: BTreeSet<String> = gathered.events.iter().map(identity).collect();
+            // The cursor keeps an acknowledged identity while it is still
+            // visible this pass and also while its source could not be read:
+            // a missing read is not permanent eviction, so a temporarily
+            // unreadable source cannot cause its evidence to be offered
+            // again. Only an identity absent from a source whose reads
+            // completed this pass has aged out of every bounded window that
+            // can present it, so it is dropped instead of carried forever.
+            let acknowledged = state.cursor.len();
+            let mut retained_gap = 0usize;
+            let mut retained_gap_example: Option<String> = None;
+            state.cursor.retain(|id| {
+                if visible.contains(id) {
+                    return true;
+                }
+                if gathered.covered.contains(identity_source(id)) {
+                    return false;
+                }
+                retained_gap += 1;
+                if retained_gap_example.is_none() {
+                    retained_gap_example = Some(id.clone());
+                }
+                true
             });
-        }
-        if state.cursor_evicted {
-            notes.note(
-                "retention",
-                format!(
-                    "the acknowledged-identity cursor reached its {EVIDENCE_CURSOR_LIMIT}-entry bound and older identities were evicted; evidence older than the retained window can be offered again instead of staying trusted as consumed"
-                ),
-            );
-        }
-        let gathered = gather(request, &mut notes);
-        let visible: BTreeSet<String> = gathered.events.iter().map(identity).collect();
-        if !state.released.is_empty() {
-            let missing: Vec<&String> = state
-                .released
-                .iter()
-                .filter(|id| !visible.contains(*id))
-                .collect();
-            if !missing.is_empty() {
+            let cursor_pruned = state.cursor.len() != acknowledged;
+            if retained_gap > 0 {
+                notes.note(
+                    "retention",
+                    format!(
+                        "{retained_gap} acknowledged identities could not be read from their source this pass (for example {}); a missing read never evicts acknowledged evidence, so they stay retained instead of being offered again",
+                        retained_gap_example.as_deref().unwrap_or("")
+                    ),
+                );
+            }
+            // A released identity is satisfied once this pass presents it
+            // again; it stays recoverable while its source is unreadable and
+            // is only dropped when a completed read shows it aged out of
+            // every bounded window that can present it.
+            let released = state.released.len();
+            let mut released_gap = 0usize;
+            let mut released_gap_example: Option<String> = None;
+            state.released.retain(|id| {
+                if visible.contains(id) {
+                    return false;
+                }
+                if gathered.covered.contains(identity_source(id)) {
+                    return false;
+                }
+                released_gap += 1;
+                if released_gap_example.is_none() {
+                    released_gap_example = Some(id.clone());
+                }
+                true
+            });
+            let released_changed = state.released.len() != released;
+            if released_gap > 0 {
                 notes.note(
                     "replay",
                     format!(
-                        "{} identities released by an unknown outcome are no longer readable (for example {}); they are neither advanced nor silently dropped",
-                        missing.len(),
-                        missing[0]
+                        "{released_gap} identities released by an unknown outcome are not readable this pass (for example {}); they are neither advanced nor silently dropped and are re-offered once their source is readable again",
+                        released_gap_example.as_deref().unwrap_or("")
                     ),
                 );
             }
-        }
-        // The cursor keeps exactly the acknowledged identities still visible
-        // this pass: evidence that aged out of every bounded window cannot be
-        // offered again, so it is dropped instead of carried forever, and an
-        // acknowledged event that is still visible is never offered again.
-        let acknowledged = state.cursor.len();
-        state.cursor.retain(|id| visible.contains(id));
-        let cursor_pruned = state.cursor.len() != acknowledged;
-        let cursor: BTreeSet<&String> = state.cursor.iter().collect();
-        let mut seen = BTreeSet::new();
-        let mut events: Vec<(String, EvidenceEvent)> = Vec::new();
-        for event in gathered.events {
-            let id = identity(&event);
-            if cursor.contains(&id) || !seen.insert(id.clone()) {
-                continue;
+            let cursor: BTreeSet<&String> = state.cursor.iter().collect();
+            let mut seen = BTreeSet::new();
+            let mut events: Vec<(String, EvidenceEvent)> = Vec::new();
+            for event in gathered.events {
+                let id = identity(&event);
+                if cursor.contains(&id) || !seen.insert(id.clone()) {
+                    continue;
+                }
+                events.push((id, event));
             }
-            events.push((id, event));
-        }
-        let coverage = notes.finish();
-        if events.is_empty() {
-            if state_dirty || cursor_pruned || !state.released.is_empty() {
-                state.released.clear();
-                persist_state(request.state_receipt, &state)?;
+            let coverage = notes.finish();
+            if events.is_empty() {
+                if state_dirty || cursor_pruned || released_changed {
+                    persist_state_under_lock(request.state_receipt, &state)?;
+                }
+                return Ok(EvidenceClaim::NoNewEvidence {
+                    contexts: gathered.contexts,
+                    coverage,
+                });
             }
-            return Ok(EvidenceClaim::NoNewEvidence {
+            let limit = request.max_events.clamp(1, EVIDENCE_MAX_BATCH);
+            let pending = events.len().saturating_sub(limit) as u64;
+            events.truncate(limit);
+            let ids: Vec<String> = events.iter().map(|(id, _)| id.clone()).collect();
+            let chosen: Vec<EvidenceEvent> = events.into_iter().map(|(_, event)| event).collect();
+            state.batches += 1;
+            let batch_id = format!("batch-{}", state.batches);
+            let created_ms = now_ms();
+            state.active = Some(ActiveBatch {
+                batch_id: batch_id.clone(),
+                created_ms,
+                ids,
+            });
+            persist_state_under_lock(request.state_receipt, &state)?;
+            Ok(EvidenceClaim::Ready(EvidenceBatch {
+                batch_id,
+                run_generation: request.run_generation.to_owned(),
+                created_ms,
+                pending,
+                events: chosen,
                 contexts: gathered.contexts,
                 coverage,
-            });
-        }
-        let limit = request.max_events.clamp(1, EVIDENCE_MAX_BATCH);
-        let pending = events.len().saturating_sub(limit) as u64;
-        events.truncate(limit);
-        let ids: Vec<String> = events.iter().map(|(id, _)| id.clone()).collect();
-        let chosen: Vec<EvidenceEvent> = events.into_iter().map(|(_, event)| event).collect();
-        state.batches += 1;
-        let batch_id = format!("batch-{}", state.batches);
-        let created_ms = now_ms();
-        state.active = Some(ActiveBatch {
-            batch_id: batch_id.clone(),
-            created_ms,
-            ids,
-        });
-        state.released.clear();
-        persist_state(request.state_receipt, &state)?;
-        Ok(EvidenceClaim::Ready(EvidenceBatch {
-            batch_id,
-            run_generation: request.run_generation.to_owned(),
-            created_ms,
-            pending,
-            events: chosen,
-            contexts: gathered.contexts,
-            coverage,
-        }))
+            }))
+        })
     }
 
     /// Acknowledges the active batch. A retained finding or an explicit
     /// no-finding result advances the cursor over exactly the identities the
     /// batch carried; an unknown outcome releases the batch without advancing
     /// the cursor, so the same evidence is offered again instead of skipped.
+    ///
+    /// The whole read-validate-write sequence runs in the receipt's own
+    /// locked section, so an acknowledgment that raced a newer claim, a
+    /// generation reset or another acknowledgment is decided against the
+    /// state that is actually recorded instead of overwriting it from a
+    /// stale read. Nothing here performs a native conversation read, so the
+    /// lock is held only around local file work.
     pub(crate) fn acknowledge(
         request: &EvidenceRequest<'_>,
         batch_id: &str,
         ack: &EvidenceAck,
     ) -> io::Result<EvidenceAckOutcome> {
-        let mut state = read_state(request.state_receipt)?;
-        refuse_newer_schema(&state)?;
-        if state.generation != request.run_generation {
-            let recorded = if state.generation.is_empty() {
-                "no recorded run".to_owned()
-            } else {
-                state.generation.clone()
-            };
-            return Ok(EvidenceAckOutcome::Refused {
-                reason: format!(
-                    "the recorded evidence state observes run generation {recorded} instead of {}; nothing was advanced",
-                    request.run_generation
-                ),
-            });
-        }
-        let Some(active) = state.active.as_ref() else {
-            return Ok(EvidenceAckOutcome::Refused {
-                reason: "no evidence batch is active; nothing was advanced".to_owned(),
-            });
-        };
-        if active.batch_id != batch_id {
-            return Ok(EvidenceAckOutcome::Refused {
-                reason: format!(
-                    "the active evidence batch is {} instead of {batch_id}; nothing was advanced",
-                    active.batch_id
-                ),
-            });
-        }
-        let active = state.active.take().expect("the active batch was checked");
-        let now = now_ms();
-        let outcome = match ack {
-            EvidenceAck::Finding { reference } if reference.trim().is_empty() => {
-                state.active = Some(active);
-                return Ok(EvidenceAckOutcome::Refused {
-                    reason: "a retained finding must name its board record; nothing was advanced"
-                        .to_owned(),
-                });
-            }
-            EvidenceAck::Finding { reference } => {
-                let acked = advance_cursor(&mut state, &active.ids);
-                state.last_ack = Some(LastAck {
-                    batch_id: active.batch_id.clone(),
-                    outcome: "finding".to_owned(),
-                    reference: Some(excerpt(reference, EVIDENCE_DETAIL_BYTES)),
-                    ms: now,
-                });
-                EvidenceAckOutcome::Advanced {
-                    acked,
-                    no_finding: false,
+        with_receipt_lock(
+            request.state_receipt,
+            || -> io::Result<EvidenceAckOutcome> {
+                let document = read_document(request.state_receipt)?;
+                let mut state = state_from_document(&document)?;
+                refuse_newer_schema(&state)?;
+                if state.generation != request.run_generation {
+                    let recorded = if state.generation.is_empty() {
+                        "no recorded run".to_owned()
+                    } else {
+                        state.generation.clone()
+                    };
+                    return Ok(EvidenceAckOutcome::Refused {
+                        reason: format!(
+                            "the recorded evidence state observes run generation {recorded} instead of {}; nothing was advanced",
+                            request.run_generation
+                        ),
+                    });
                 }
-            }
-            EvidenceAck::NoFinding => {
-                let acked = advance_cursor(&mut state, &active.ids);
-                state.last_ack = Some(LastAck {
-                    batch_id: active.batch_id.clone(),
-                    outcome: "no-finding".to_owned(),
-                    reference: None,
-                    ms: now,
-                });
-                EvidenceAckOutcome::Advanced {
-                    acked,
-                    no_finding: true,
+                let Some(active) = state.active.as_ref() else {
+                    return Ok(EvidenceAckOutcome::Refused {
+                        reason: "no evidence batch is active; nothing was advanced".to_owned(),
+                    });
+                };
+                if active.batch_id != batch_id {
+                    return Ok(EvidenceAckOutcome::Refused {
+                        reason: format!(
+                            "the active evidence batch is {} instead of {batch_id}; nothing was advanced",
+                            active.batch_id
+                        ),
+                    });
                 }
-            }
-            EvidenceAck::Unknown { reason } => {
-                state.released = active.ids.clone();
-                state.last_ack = Some(LastAck {
-                    batch_id: active.batch_id.clone(),
-                    outcome: "unknown".to_owned(),
-                    reference: Some(excerpt(reason, EVIDENCE_DETAIL_BYTES)),
-                    ms: now,
-                });
-                EvidenceAckOutcome::Preserved {
-                    reason: reason.clone(),
-                }
-            }
-        };
-        persist_state(request.state_receipt, &state)?;
-        Ok(outcome)
+                let active = state.active.take().expect("the active batch was checked");
+                let now = now_ms();
+                let outcome = match ack {
+                    EvidenceAck::Finding { reference } if reference.trim().is_empty() => {
+                        // Nothing was persisted, so the taken batch is simply
+                        // dropped with the refused transition.
+                        return Ok(EvidenceAckOutcome::Refused {
+                        reason: "a retained finding must name its board record; nothing was advanced"
+                            .to_owned(),
+                    });
+                    }
+                    EvidenceAck::Finding { reference } => {
+                        let acked = advance_cursor(&mut state, &active.ids);
+                        state.last_ack = Some(LastAck {
+                            batch_id: active.batch_id.clone(),
+                            outcome: "finding".to_owned(),
+                            reference: Some(excerpt(reference, EVIDENCE_DETAIL_BYTES)),
+                            ms: now,
+                        });
+                        EvidenceAckOutcome::Advanced {
+                            acked,
+                            no_finding: false,
+                        }
+                    }
+                    EvidenceAck::NoFinding => {
+                        let acked = advance_cursor(&mut state, &active.ids);
+                        state.last_ack = Some(LastAck {
+                            batch_id: active.batch_id.clone(),
+                            outcome: "no-finding".to_owned(),
+                            reference: None,
+                            ms: now,
+                        });
+                        EvidenceAckOutcome::Advanced {
+                            acked,
+                            no_finding: true,
+                        }
+                    }
+                    EvidenceAck::Unknown { reason } => {
+                        state.released = active.ids.clone();
+                        state.last_ack = Some(LastAck {
+                            batch_id: active.batch_id.clone(),
+                            outcome: "unknown".to_owned(),
+                            reference: Some(excerpt(reason, EVIDENCE_DETAIL_BYTES)),
+                            ms: now,
+                        });
+                        EvidenceAckOutcome::Preserved {
+                            reason: reason.clone(),
+                        }
+                    }
+                };
+                persist_state_under_lock(request.state_receipt, &state)?;
+                Ok(outcome)
+            },
+        )
     }
 
     /// Bounded coverage notes of one pass: the list never grows past
@@ -2774,6 +2887,25 @@ pub(crate) mod evidence {
     struct Gathered {
         events: Vec<EvidenceEvent>,
         contexts: Vec<EvidenceContext>,
+        /// Source names whose bounded reads completed this pass. An identity
+        /// absent from a covered source has aged out of every window that can
+        /// present it; a source missing here had a failed or skipped read
+        /// this pass, so absence proves nothing and must never evict an
+        /// acknowledged or released identity.
+        covered: BTreeSet<String>,
+    }
+
+    /// One raw-detail read: the bounded events it could present and whether
+    /// every read it attempted over the retained tail succeeded. A failed
+    /// metadata, open or read step leaves `readable` false, so the pass proves
+    /// nothing about an identity's absence and retained identities stay
+    /// instead of being evicted by a temporary loss. A capped, partial or
+    /// malformed tail is still a completed read of the retained window: it is
+    /// reported through the coverage notes and the stable gap event and never
+    /// presented as progress.
+    struct DetailRead {
+        events: Vec<EvidenceEvent>,
+        readable: bool,
     }
 
     // ------------------------------------------------------------ gathering
@@ -2811,11 +2943,14 @@ pub(crate) mod evidence {
     /// One claim's collection pass over one run generation: the spawned run its
     /// pool records name, the control conversations beside its receipt and its
     /// retained raw detail stream. Every failure to read evidence is a coverage
-    /// note on this pass, never a silent success.
+    /// note on this pass, never a silent success. A search, receipt or
+    /// conversation that could not be read covers nothing, so the identities
+    /// it would have carried are never treated as aged out.
     fn gather(request: &EvidenceRequest<'_>, notes: &mut CoverageNotes) -> Gathered {
         let mut gathered = Gathered {
             events: Vec::new(),
             contexts: Vec::new(),
+            covered: BTreeSet::new(),
         };
         let receipts =
             match executor_message::matching_receipts(request.home, request.run_generation) {
@@ -2864,7 +2999,10 @@ pub(crate) mod evidence {
     }
     /// Reads one spawned run's records: its assignment context, its run
     /// lifecycle event, both recorded message directions, the executor and
-    /// lead control conversations and the raw detail tail.
+    /// lead control conversations and the raw detail tail. Every readable
+    /// source is recorded as covered for this pass; a source whose read
+    /// failed or was skipped is not, so the retention rule in `claim` cannot
+    /// mistake its missing identities for aged-out evidence.
     fn gather_receipt(
         request: &EvidenceRequest<'_>,
         receipt: &Path,
@@ -2901,7 +3039,10 @@ pub(crate) mod evidence {
             .contexts
             .push(context_of(&document, slot, &observation));
         gathered.events.push(run_event(slot, &observation));
+        gathered.covered.insert("run".to_owned());
 
+        let messages_are_an_array = document["messages"].is_array();
+        let lead_messages_are_an_array = document["leadMessages"].is_array();
         let messages = document["messages"].as_array().cloned().unwrap_or_default();
         let lead_messages = document["leadMessages"]
             .as_array()
@@ -2940,6 +3081,7 @@ pub(crate) mod evidence {
                 notes,
             )
         };
+        let executor_readable = executor.is_some();
         if let Some(read) = &executor {
             gathered.events.extend(read.events.iter().cloned());
         }
@@ -2969,6 +3111,7 @@ pub(crate) mod evidence {
                 notes,
             )
         };
+        let lead_readable = lead.is_some();
         if let Some(read) = &lead {
             gathered.events.extend(read.events.iter().cloned());
         }
@@ -2979,16 +3122,40 @@ pub(crate) mod evidence {
             notes,
         ));
 
-        match observation.detail.as_deref() {
+        let detail_readable = match observation.detail.as_deref() {
             Some(detail) => {
-                gathered
-                    .events
-                    .extend(collect_detail(detail, slot, &observation, notes));
+                let read = collect_detail(detail, slot, &observation, notes);
+                let readable = read.readable;
+                gathered.events.extend(read.events);
+                readable
             }
-            None => notes.note(
-                "detail",
-                "the recorded observation carries no raw detail stream; visible tool and message content beyond the recorded conversations is unavailable".to_owned(),
-            ),
+            None => {
+                notes.note(
+                    "detail",
+                    "the recorded observation carries no raw detail stream; visible tool and message content beyond the recorded conversations is unavailable".to_owned(),
+                );
+                false
+            }
+        };
+
+        // An identity is only evictable when every read that can present it
+        // completed this pass: the executor conversation and the detail tail
+        // both present `executor-item`, and both must have been read for its
+        // absence to mean the identity aged out.
+        if executor_readable && detail_readable {
+            gathered.covered.insert("executor-item".to_owned());
+        }
+        if lead_readable {
+            gathered.covered.insert("lead-item".to_owned());
+        }
+        if messages_are_an_array {
+            gathered.covered.insert("message-to-executor".to_owned());
+        }
+        if lead_messages_are_an_array {
+            gathered.covered.insert("message-to-lead".to_owned());
+        }
+        if detail_readable {
+            gathered.covered.insert("gap".to_owned());
         }
     }
 
@@ -3658,12 +3825,16 @@ pub(crate) mod evidence {
     /// as progress; a stream at its retention bound emits one stable gap
     /// event whose text states that a capped or stale tail proves no idle or
     /// stalled executor - newer visible work may simply be beyond the cap.
+    /// `readable` is false only when a read step failed, so absence from a
+    /// temporarily unreadable stream never evicts retained identities; a
+    /// capped, partial or malformed tail is still a completed read of the
+    /// retained window and is reported through the coverage notes.
     fn collect_detail(
         detail: &Path,
         slot: u64,
         observation: &RunObservation,
         notes: &mut CoverageNotes,
-    ) -> Vec<EvidenceEvent> {
+    ) -> DetailRead {
         let mut events = Vec::new();
         let length = match fs::metadata(detail) {
             Ok(metadata) => metadata.len(),
@@ -3675,7 +3846,10 @@ pub(crate) mod evidence {
                         detail.display()
                     ),
                 );
-                return events;
+                return DetailRead {
+                    events,
+                    readable: false,
+                };
             }
         };
         let truncated = observation.detail_truncated || length >= MAX_STREAM_BYTES;
@@ -3690,7 +3864,10 @@ pub(crate) mod evidence {
                         detail.display()
                     ),
                 );
-                return events;
+                return DetailRead {
+                    events,
+                    readable: false,
+                };
             }
         };
         if start > 0 {
@@ -3705,7 +3882,10 @@ pub(crate) mod evidence {
                     detail.display()
                 ),
             );
-            return events;
+            return DetailRead {
+                events,
+                readable: false,
+            };
         }
         let mut tail = String::from_utf8_lossy(&bytes).into_owned();
         let mut partial = 0u64;
@@ -3814,7 +3994,10 @@ pub(crate) mod evidence {
         if truncated {
             events.push(truncated_gap_event(detail, slot, length, observation));
         }
-        events
+        DetailRead {
+            events,
+            readable: true,
+        }
     }
 
     /// The one gap event a capped detail stream emits. Its identity is stable,
@@ -6045,6 +6228,290 @@ mod tests {
                 .to_string()
                 .contains("refusing to advance unfinished evidence"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn evidence_concurrent_claims_never_start_two_batches() {
+        let home = tempfile::tempdir().unwrap();
+        let detail = home.path().join("detail.jsonl");
+        fs::write(
+            &detail,
+            evidence_detail(&[evidence_message_line("a1", "only visible work")]),
+        )
+        .unwrap();
+        let observation = evidence_running(&detail);
+        evidence_seed_run(home.path(), "gen-race", 1, &observation);
+        let _conversations = evidence_quiet_conversations(home.path());
+
+        let state = home.path().join("state.json");
+        let request = evidence_request(home.path(), "gen-race", &state);
+        // Holding the receipt lock stops both claims from persisting until
+        // both have read the initial state, so a claim that decides outside
+        // the lock lets each of them start its own batch.
+        let claims = std::thread::scope(|scope| {
+            let handles = with_receipt_lock(&state, || {
+                let first = scope.spawn(|| evidence::claim(&request));
+                let second = scope.spawn(|| evidence::claim(&request));
+                std::thread::sleep(Duration::from_millis(800));
+                Ok::<_, io::Error>((first, second))
+            })
+            .unwrap();
+            [
+                handles.0.join().unwrap().unwrap(),
+                handles.1.join().unwrap().unwrap(),
+            ]
+        });
+        let ready: Vec<&evidence::EvidenceBatch> = claims
+            .iter()
+            .filter_map(|claim| match claim {
+                evidence::EvidenceClaim::Ready(batch) => Some(batch),
+                _ => None,
+            })
+            .collect();
+        let in_flight: Vec<&String> = claims
+            .iter()
+            .filter_map(|claim| match claim {
+                evidence::EvidenceClaim::BatchInFlight { batch_id, .. } => Some(batch_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ready.len(),
+            1,
+            "two concurrent claims must yield exactly one batch: {claims:?}"
+        );
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "the concurrent claim that lost must report the active batch: {claims:?}"
+        );
+        assert_eq!(
+            in_flight[0], &ready[0].batch_id,
+            "the losing claim names the batch that won"
+        );
+        let recorded = evidence_read_state(home.path());
+        assert_eq!(recorded["evidence"]["batches"], 1, "{recorded}");
+        assert_eq!(
+            recorded["evidence"]["active"]["batchId"],
+            ready[0].batch_id.as_str()
+        );
+    }
+
+    #[test]
+    fn evidence_acknowledgment_cannot_overwrite_a_newer_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let detail = home.path().join("detail.jsonl");
+        fs::write(
+            &detail,
+            evidence_detail(&[evidence_message_line("a1", "only visible work")]),
+        )
+        .unwrap();
+        let observation = evidence_running(&detail);
+        evidence_seed_run(home.path(), "gen-stale", 1, &observation);
+        let _conversations = evidence_quiet_conversations(home.path());
+
+        let first = evidence_ready(home.path(), "gen-stale");
+        let state = home.path().join("state.json");
+        let request = evidence_request(home.path(), "gen-stale", &state);
+        let finding = evidence::EvidenceAck::Finding {
+            reference: "codex-harness-8me.1.2".to_owned(),
+        };
+        // The acknowledgment starts while the receipt lock is held, and a
+        // newer generation-identical batch replaces the active one before it
+        // can persist. A stale read must be refused against the recorded
+        // state instead of overwriting the newer batch.
+        let outcome = std::thread::scope(|scope| {
+            let acknowledge = with_receipt_lock(&state, || {
+                let acknowledge =
+                    scope.spawn(|| evidence::acknowledge(&request, &first.batch_id, &finding));
+                std::thread::sleep(Duration::from_millis(500));
+                let mut document = read_receipt_value(&state).unwrap();
+                document["evidence"]["batches"] = json!(2);
+                document["evidence"]["active"] = json!({
+                    "batchId": "batch-2",
+                    "createdMs": 42,
+                    "ids": ["run|1|run|running"],
+                });
+                write_receipt(&state, &document).unwrap();
+                Ok::<_, io::Error>(acknowledge)
+            })
+            .unwrap();
+            acknowledge.join().unwrap().unwrap()
+        });
+        let evidence::EvidenceAckOutcome::Refused { reason } = outcome else {
+            panic!(
+                "a stale acknowledgment must be refused instead of overwriting a newer batch: {outcome:?}"
+            );
+        };
+        assert!(reason.contains("batch-2"), "{reason}");
+        let recorded = evidence_read_state(home.path());
+        assert_eq!(
+            recorded["evidence"]["batches"], 2,
+            "the newer claim's state survives: {recorded}"
+        );
+        assert_eq!(recorded["evidence"]["active"]["batchId"], "batch-2");
+        assert_eq!(recorded["evidence"]["cursor"], json!([]));
+        assert!(
+            recorded["evidence"]["lastAck"].is_null(),
+            "the refused acknowledgment retains nothing: {recorded}"
+        );
+    }
+
+    #[test]
+    fn evidence_temporary_unreadable_source_never_replays_acknowledged_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let detail = home.path().join("detail.jsonl");
+        fs::write(
+            &detail,
+            evidence_detail(&[evidence_message_line("a1", "only visible work")]),
+        )
+        .unwrap();
+        let observation = evidence_running(&detail);
+        evidence_seed_run(home.path(), "gen-gap", 1, &observation);
+        let _conversations = evidence_quiet_conversations(home.path());
+        let state = home.path().join("state.json");
+        // An unrelated field of the same receipt must survive every merge.
+        fs::write(
+            &state,
+            serde_json::to_vec(&json!({"sibling": {"kept": true}})).unwrap(),
+        )
+        .unwrap();
+
+        let first = evidence_ready(home.path(), "gen-gap");
+        evidence_event(&first, "a1");
+        let outcome = evidence_acknowledge(
+            home.path(),
+            "gen-gap",
+            &first.batch_id,
+            &evidence::EvidenceAck::NoFinding,
+        );
+        assert!(matches!(
+            outcome,
+            evidence::EvidenceAckOutcome::Advanced { .. }
+        ));
+
+        // The detail stream becomes temporarily unreadable - rotation, a
+        // rename or an access failure - while its acknowledged evidence
+        // still exists. The pass may not evict it or offer it as new.
+        let hidden = home.path().join("detail.jsonl.hidden");
+        fs::rename(&detail, &hidden).unwrap();
+        let request = evidence_request(home.path(), "gen-gap", &state);
+        match evidence::claim(&request).unwrap() {
+            evidence::EvidenceClaim::NoNewEvidence { .. } => {}
+            other => panic!(
+                "an unreadable source must not present its acknowledged evidence as new: {other:?}"
+            ),
+        }
+        let recorded = evidence_read_state(home.path());
+        assert_eq!(
+            recorded["sibling"]["kept"], true,
+            "unrelated receipt fields survive the state merge: {recorded}"
+        );
+        let cursor: Vec<&str> = recorded["evidence"]["cursor"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            cursor.iter().any(|id| id.ends_with("|a1|completed")),
+            "an acknowledged identity stays retained while its source is unreadable: {recorded}"
+        );
+
+        // Restoring the source must not replay what is still acknowledged.
+        fs::rename(&hidden, &detail).unwrap();
+        match evidence::claim(&request).unwrap() {
+            evidence::EvidenceClaim::NoNewEvidence { .. } => {}
+            other => panic!(
+                "restoring a temporarily unreadable source must not replay acknowledged evidence: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn evidence_unknown_release_is_not_cleared_while_its_source_is_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        let detail = home.path().join("detail.jsonl");
+        fs::write(
+            &detail,
+            evidence_detail(&[evidence_message_line("a1", "only visible work")]),
+        )
+        .unwrap();
+        let observation = evidence_running(&detail);
+        evidence_seed_run(home.path(), "gen-release", 1, &observation);
+        let _conversations = evidence_quiet_conversations(home.path());
+
+        let first = evidence_ready(home.path(), "gen-release");
+        evidence_event(&first, "a1");
+        let outcome = evidence_acknowledge(
+            home.path(),
+            "gen-release",
+            &first.batch_id,
+            &evidence::EvidenceAck::Unknown {
+                reason: "the analysis failed before it retained a finding".to_owned(),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            evidence::EvidenceAckOutcome::Preserved { .. }
+        ));
+
+        // The only source of a1 becomes unreadable while its release is
+        // pending; the pass must keep the release recoverable instead of
+        // clearing it because the identity happened to be invisible.
+        let hidden = home.path().join("detail.jsonl.hidden");
+        fs::rename(&detail, &hidden).unwrap();
+        let state = home.path().join("state.json");
+        let request = evidence_request(home.path(), "gen-release", &state);
+        let second = match evidence::claim(&request).unwrap() {
+            evidence::EvidenceClaim::Ready(batch) => batch,
+            other => panic!("the still-readable run event is new evidence: {other:?}"),
+        };
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["run"]
+        );
+        let recorded = evidence_read_state(home.path());
+        let released: Vec<&str> = recorded["evidence"]["released"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            released.iter().any(|id| id.ends_with("|a1|completed")),
+            "an unknown-released identity stays recoverable while its source is unreadable: {recorded}"
+        );
+        assert!(
+            second.coverage.iter().any(|note| note.source == "replay"),
+            "the pending release is reported honestly: {:?}",
+            second.coverage
+        );
+
+        // Acknowledge the re-offered run event, restore the source and the
+        // released evidence is offered again instead of skipped.
+        let outcome = evidence_acknowledge(
+            home.path(),
+            "gen-release",
+            &second.batch_id,
+            &evidence::EvidenceAck::NoFinding,
+        );
+        assert!(matches!(
+            outcome,
+            evidence::EvidenceAckOutcome::Advanced { .. }
+        ));
+        fs::rename(&hidden, &detail).unwrap();
+        let third = evidence_ready(home.path(), "gen-release");
+        evidence_event(&third, "a1");
+        let recorded = evidence_read_state(home.path());
+        let released: Vec<&str> = recorded["evidence"]["released"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !released.iter().any(|id| id.ends_with("|a1|completed")),
+            "the release is satisfied once its evidence is offered again: {recorded}"
         );
     }
 }
