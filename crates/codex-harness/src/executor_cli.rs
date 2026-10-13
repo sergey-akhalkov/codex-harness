@@ -936,7 +936,11 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
     refuse_a_live_owner(&codex_home, &repository, &owner)?;
     // Resuming or restarting reactivates the recorded run on its own slot;
     // it consumes executor concurrency like any other run, so a full
-    // allowance is reported before the slot is touched.
+    // allowance is reported before the slot is touched. The admission
+    // decision and the startup reservation at the end of this section are
+    // one atomic step under the pool admission lock; the lock never covers
+    // the upstream read or the launch below.
+    let admission = task_worktree::begin_pool_admission(&codex_home, &repository)?;
     admit_executor_run(&request, Some(slot))?;
     let live = |owner: &str| owner_live(&codex_home, &repository, owner);
     // A durable task binding continues through the common task owner,
@@ -985,6 +989,7 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
         }
     };
     task_worktree::hold_startup_reservation(&codex_home, &repository, index, &owner)?;
+    drop(admission);
     let (remote, branch) = task_worktree::upstream(&path)?;
     let binding = SlotBinding {
         index,
@@ -1948,7 +1953,12 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
         .any(|slot| slot.state == task_worktree::TaskState::Free);
     if let (Some(task), Some(handle)) = (request.task, request.handle) {
         // The handoff rebinds the task's held position to this session: it
-        // starts an executor run, so it is admitted like any other.
+        // starts an executor run, so it is admitted like any other; the
+        // admission decision and the rebinding's startup reservation are one
+        // atomic step under the pool admission lock, held to the end of this
+        // branch.
+        let _admission =
+            task_worktree::begin_pool_admission(request.codex_home, request.repository)?;
         admit_executor_run(
             request,
             held_binding(&inventory, task).map(|slot| slot.index),
@@ -1966,7 +1976,9 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
     let held = held_binding(&inventory, request.owner).map(|slot| slot.index);
     // A dispatch lands on a free position or continues this owner's held
     // binding; when the pool can place it nowhere, the pool core reports its
-    // own capacity refusal and executor admission must not shadow it.
+    // own capacity refusal and executor admission must not shadow it. This
+    // first check refuses before the upstream refresh below; the admission
+    // lock then re-decides it atomically with the startup reservation.
     if held.is_some() || free_position {
         admit_executor_run(request, held)?;
     }
@@ -1986,6 +1998,14 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
             }
         },
     };
+    // The upstream refresh stays outside every pool lock; the admission
+    // decision and the claim below are one atomic step, so two simultaneous
+    // dispatches cannot both count an empty allowance and then claim
+    // different free slots.
+    let admission = task_worktree::begin_pool_admission(request.codex_home, request.repository)?;
+    if held.is_some() || free_position {
+        admit_executor_run(request, held)?;
+    }
     let slot = task_worktree::acquire_task_for_startup(
         request.codex_home,
         request.repository,
@@ -2004,6 +2024,7 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
         slot.index,
         request.owner,
     )?;
+    drop(admission);
     Ok(bound_slot(slot, fetched))
 }
 

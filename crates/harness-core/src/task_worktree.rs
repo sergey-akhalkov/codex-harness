@@ -787,6 +787,48 @@ fn lock_slot(
     }
 }
 
+/// Bound for the pool-wide admission lock. It covers the executor admission
+/// decision and the startup reservation that carries it, including first-time
+/// slot materialization; it never spans an upstream fetch, a host attach or a
+/// model conversation.
+const POOL_ADMISSION_LOCK_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn pool_admission_lock_path(codex_home: &Path, source: &Path) -> io::Result<PathBuf> {
+    Ok(pool_state_dir(codex_home, source)?.join("admission.lock"))
+}
+
+/// Serialize the executor admission decision with the startup reservation it
+/// authorizes: while this guard is held, no other dispatch can pass the
+/// admission gate and publish a startup claim, so "the allowance is full" and
+/// "this process reserved its run" are one atomic step. Process exit releases
+/// the lock like every other pool lock.
+pub struct PoolAdmissionGuard {
+    _lock: crate::process::ExclusiveFileLock,
+}
+
+/// Take the pool-wide admission lock for one dispatch. The caller counts the
+/// active runs and records the startup reservation before dropping the guard;
+/// the guard is never held across an upstream fetch, a host attach or a model
+/// conversation.
+pub fn begin_pool_admission(codex_home: &Path, source: &Path) -> io::Result<PoolAdmissionGuard> {
+    let path = pool_admission_lock_path(codex_home, source)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let deadline = crate::process::Deadline::after(POOL_ADMISSION_LOCK_BOUND)?;
+    match crate::process::ExclusiveFileLock::acquire(
+        &path,
+        deadline,
+        &crate::process::Cancellation::default(),
+    ) {
+        Ok(lock) => Ok(PoolAdmissionGuard { _lock: lock }),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(pool_error(&format!(
+            "executor admission stayed locked by another dispatch for {POOL_ADMISSION_LOCK_BOUND:?}; refusing to decide admission concurrently"
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
 /// Identity of this process as a startup reservation. Inspection failure is
 /// returned rather than claiming a slot that later recovery cannot attribute.
 #[cfg(windows)]

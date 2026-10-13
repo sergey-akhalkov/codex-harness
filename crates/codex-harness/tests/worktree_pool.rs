@@ -8,8 +8,10 @@
 use serde_json::Value;
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 fn manager() -> PathBuf {
@@ -145,6 +147,69 @@ impl Fixture {
         let mut args = vec!["spawn", "--profile", "ds", "--exec", "assignment text"];
         args.extend_from_slice(extra);
         self.executor(&args)
+    }
+
+    /// The same fresh dispatch as [`Fixture::spawn`], started without waiting
+    /// so a check can hold the pool admission lock across its admission phase.
+    fn spawn_child(&self, extra: &[&str]) -> Child {
+        let mut args = vec!["spawn", "--profile", "ds", "--exec", "assignment text"];
+        args.extend_from_slice(extra);
+        self.executor_child(&args)
+    }
+
+    /// One `executor ...` process started without waiting; its piped output is
+    /// read once it exits.
+    fn executor_child(&self, extra: &[&str]) -> Child {
+        let mut command = lead_command();
+        command.args(["executor"]);
+        command.args(extra);
+        command.args([
+            "--source",
+            self.source.to_str().unwrap(),
+            "--codex-home",
+            self.home.to_str().unwrap(),
+        ]);
+        command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// A live canned host lease for a position that may still have no slot
+    /// record. The admission gate counts it as an active run while this check
+    /// process stays alive; the returned path is the file to delete when the
+    /// run is meant to end.
+    fn seed_live_lease(&self, repository: &Path, index: u32, owner: &str) -> PathBuf {
+        let state = harness_core::task_worktree::pool_state_dir(&self.home, repository).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = harness_core::process_service::ServiceProcess::observe(
+            std::process::id(),
+            &program,
+            0,
+            &user,
+        )
+        .unwrap()
+        .identity();
+        let path = state.join(format!("lease-{index}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": 1,
+                "owner": owner,
+                "index": index,
+                "path": self.slot(index).to_string_lossy(),
+                "pid": identity.pid,
+                "created": identity.creation_time,
+                "program": program.to_string_lossy()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
     }
 
     /// The recorded slot mapping, loaded from the kit-local task state exactly
@@ -294,6 +359,67 @@ fn succeeded(out: Output) -> String {
 fn refused(out: Output) -> String {
     assert!(!out.status.success(), "{}", output_text(&out));
     output_text(&out)
+}
+
+/// Read one exited check child's captured output; the pipes are drained after
+/// the exit is observed, so a full pipe buffer cannot block the check.
+fn read_output(child: &mut Child) -> Output {
+    let status = child.wait().unwrap();
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout).unwrap();
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr).unwrap();
+    }
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// Wait for one running dispatch, failing with its output instead of hanging
+/// when it outruns the bound.
+fn wait_bounded(child: &mut Child, bound: Duration, context: &str) -> Output {
+    let deadline = Instant::now() + bound;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return read_output(child);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = read_output(child);
+            panic!(
+                "{context}: dispatch did not exit within {bound:?}: {}",
+                output_text(&out)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// While a check holds the pool admission lock, no dispatch may finish its
+/// admission phase. A finish before the lock is released means the admission
+/// decision and the startup reservation it authorizes were published as two
+/// separate steps.
+fn assert_blocked_while_held(children: &mut [Child], settle: Duration, context: &str) {
+    let deadline = Instant::now() + settle;
+    while Instant::now() < deadline {
+        for (position, child) in children.iter_mut().enumerate() {
+            if child.try_wait().unwrap().is_some() {
+                let out = read_output(child);
+                panic!(
+                    "{context}: dispatch {position} finished while the pool admission lock \
+                     was held, so admission and the startup reservation are not one atomic \
+                     step: {}",
+                    output_text(&out)
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn file_url(path: &Path) -> String {
@@ -732,6 +858,158 @@ fn executor_concurrency_gates_dispatch_apart_from_free_pool_slots() {
     assert!(second.contains("task=exec-b"), "{second}");
     assert_eq!(fixture.record(&fixture.source, 2)["task"], "exec-a");
     assert_eq!(fixture.record(&fixture.source, 3)["task"], "exec-b");
+    fixture.drop();
+}
+
+/// Admission and its startup reservation are one atomic step: the pool-wide
+/// admission lock parks a dispatch after its courtesy check but before the
+/// decisive count, so simultaneous dispatches cannot both count the allowance
+/// as free and then claim different positions. The same gate serves fresh
+/// spawn, handoff and continuation, while an allowance that is actually free
+/// still admits one independent startup.
+///
+/// The check holds the admission lock exactly as a competing dispatch would.
+/// A dispatch that finishes while the lock is held proves the decision and
+/// the reservation were published separately: the uncorrected candidate let
+/// both simultaneous dispatches pass admission, claim the two free positions
+/// and stop only at the missing launcher.
+#[test]
+fn simultaneous_dispatch_admission_is_atomic_with_the_startup_reservation() {
+    let fixture = Fixture::new("admission-atomic", 2, 1);
+    let state =
+        harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
+    let slot_record = |index: u32| state.join(format!("slot-{index}.json"));
+    let lease = |index: u32| state.join(format!("lease-{index}.json"));
+
+    // Two simultaneous fresh dispatches are started while this check holds
+    // the admission lock. Neither may claim a position, publish a host lease
+    // or finish its pool work before the lock is released.
+    let guard =
+        harness_core::task_worktree::begin_pool_admission(&fixture.home, &fixture.source).unwrap();
+    let mut children = vec![
+        fixture.spawn_child(&["--owner", "exec-a"]),
+        fixture.spawn_child(&["--owner", "exec-b"]),
+    ];
+    let settle = Duration::from_secs(3);
+    assert_blocked_while_held(&mut children, settle, "fresh spawn pair");
+    assert!(
+        !slot_record(1).exists() && !slot_record(2).exists(),
+        "a dispatch published a slot claim while the admission lock was held"
+    );
+    assert!(
+        !lease(1).exists() && !lease(2).exists(),
+        "a dispatch published a host lease while the admission lock was held"
+    );
+
+    // A live run fills the concurrency of one while the gate is still held:
+    // both parked dispatches passed their courtesy check on an empty
+    // allowance and must refuse once released, because the decisive count
+    // happens under the guard, after the allowance changed.
+    let seeded = fixture.seed_live_lease(&fixture.source, 1, "exec-seed");
+    drop(guard);
+    for (position, child) in children.iter_mut().enumerate() {
+        let text = refused(wait_bounded(
+            child,
+            Duration::from_secs(30),
+            &format!("fresh spawn {position}"),
+        ));
+        assert!(
+            text.contains(
+                "executor concurrency is full: 1 of 1 active runs (max_concurrent_executors)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("slot 1 is running 'exec-seed'"), "{text}");
+        assert!(
+            !text.contains("installed Codex launcher is missing"),
+            "an over-limit dispatch reached the launcher: {text}"
+        );
+    }
+    assert!(
+        !slot_record(1).exists() && !slot_record(2).exists(),
+        "a refused dispatch claimed a pool position"
+    );
+
+    // The holder gone, the same allowance admits one independent startup:
+    // the gate serializes the decision, it does not consume capacity.
+    fs::remove_file(&seeded).unwrap();
+    let admitted = refused(fixture.spawn(&["--owner", "exec-a"]));
+    assert!(admitted.contains("executor slot: index=1"), "{admitted}");
+    assert!(
+        admitted.contains("installed Codex launcher is missing"),
+        "{admitted}"
+    );
+    assert_eq!(fixture.record(&fixture.source, 1)["owner"], "exec-a");
+
+    // Continuation parks at the same gate over its recorded binding: the
+    // exact slot, owner and partial work are untouched while the lock is
+    // held, and the resume is admitted once the lock is released.
+    let partial = fixture.slot(1).join("partial.txt");
+    fs::write(&partial, "partial assignment work\n").unwrap();
+    let guard =
+        harness_core::task_worktree::begin_pool_admission(&fixture.home, &fixture.source).unwrap();
+    let mut resumed = fixture.executor_child(&[
+        "resume",
+        "--slot",
+        "1",
+        "--owner",
+        "exec-a",
+        "--session",
+        "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+        "--exec",
+        "continue the interrupted assignment",
+    ]);
+    assert_blocked_while_held(std::slice::from_mut(&mut resumed), settle, "continuation");
+    assert_eq!(fixture.record(&fixture.source, 1)["owner"], "exec-a");
+    drop(guard);
+    let text = refused(wait_bounded(
+        &mut resumed,
+        Duration::from_secs(30),
+        "continuation",
+    ));
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains("owner=exec-a"), "{text}");
+    assert!(partial.is_file(), "continuation must preserve partial work");
+
+    // Handoff parks at the same gate too: the ordinary task's position keeps
+    // its checkout and partial work across the handed-off dispatch.
+    let acquired = succeeded(fixture.worktree(&["acquire", "--task", "t1"]));
+    assert!(acquired.contains("worktree acquire: slot=2"), "{acquired}");
+    let handle = fixture.handle(&fixture.source, 2);
+    let partial_handoff = fixture.slot(2).join("partial-handoff.txt");
+    fs::write(&partial_handoff, "partial handoff work\n").unwrap();
+    let guard =
+        harness_core::task_worktree::begin_pool_admission(&fixture.home, &fixture.source).unwrap();
+    let mut handoff =
+        fixture.spawn_child(&["--task", "t1", "--handle", &handle, "--owner", "exec-hand"]);
+    assert_blocked_while_held(std::slice::from_mut(&mut handoff), settle, "handoff");
+    assert_eq!(fixture.record(&fixture.source, 2)["owner"], "t1");
+    drop(guard);
+    let text = refused(wait_bounded(
+        &mut handoff,
+        Duration::from_secs(30),
+        "handoff",
+    ));
+    assert!(
+        text.contains(&format!(
+            "executor slot: index=2 path={} base=",
+            fixture.slot(2).display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("owner=exec-hand"), "{text}");
+    assert!(text.contains("task=t1"), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(
+        partial_handoff.is_file(),
+        "handoff must preserve partial work"
+    );
     fixture.drop();
 }
 
