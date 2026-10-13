@@ -6,7 +6,6 @@ use std::process::{Command, ExitStatus};
 use std::{
     io,
     path::Path,
-    ptr::null_mut,
     thread,
     time::{Duration, Instant},
 };
@@ -862,6 +861,7 @@ pub fn layout(count: usize) -> io::Result<Vec<Bounds>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr::null_mut;
     #[test]
     fn named_running_child_caption_is_ready_without_waiting_for_its_model() {
         assert!(loaded_title("Executor 1 | workspace", "Executor 1 | "));
