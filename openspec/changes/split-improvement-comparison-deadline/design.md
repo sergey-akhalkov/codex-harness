@@ -6,6 +6,12 @@ See [proposal.md](proposal.md). The suite is one integration target with 40+ tes
 
 Split at a stable module boundary into two targets sharing fixture code through a `common` module (or `#[path]` include), minimizing diff churn. Choose the boundary so each target's observed serialized duration stays under 1500 s (deadline minus observed admission variance margin). CI and the `ci_workflow` equality contract list exactly the resulting target set.
 
+## Measured boundary (recorded 2026-10-13)
+
+The intermediate 36-test a target finished in 1671.50 s, over the 1500 s budget, so the 7 calibration tests moved across the boundary (bodies byte-identical). The rebalanced targets then measured 1294.93 s (a) and 1099.39 s (b), serialized through `codex-harness heavy`; both are retained measurements, not projections.
+
+No measured run of the pre-split single target is retained from this session; that baseline remains open and no history is reconstructed.
+
 ## Experiment selection
 
 Method: paired-implementations
