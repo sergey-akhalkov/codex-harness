@@ -8,7 +8,7 @@ Split at a stable module boundary into two targets sharing fixture code through 
 
 ## Measured boundary (recorded 2026-10-13)
 
-The intermediate 36-test a target finished in 1671.50 s, over the 1500 s budget, so the 7 calibration tests moved across the boundary (bodies byte-identical). The rebalanced targets then measured 1294.93 s (a) and 1099.39 s (b), serialized through `codex-harness heavy`; both are retained measurements, not projections.
+The intermediate 36-test a target finished in 1671.50 s, over the 1500 s budget, so the 7 calibration tests moved across the boundary (bodies byte-identical). The rebalanced targets then measured 1294.93 s (a) and 1099.39 s (b), serialized through `codex-harness heavy`. These are retained failed-run measurements: a passed 21 tests and failed 8, while b passed 19 and failed 2, including mutex-poison cascades that did not exercise their assertions. They do not establish the duration or acceptance of complete green targets.
 
 No measured run of the pre-split single target is retained from this session; that baseline remains open and no history is reconstructed.
 
