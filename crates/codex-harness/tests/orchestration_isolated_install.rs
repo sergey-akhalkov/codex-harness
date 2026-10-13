@@ -333,11 +333,31 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     fs::write(task_repo.join("owned.txt"), b"initial\n").unwrap();
     board_git(&task_repo, &["add", ".gitignore", "owned.txt"]);
     board_git(&task_repo, &["commit", "-qm", "owned task base"]);
+    // Enter through the installed CLI in a consumer with no kit configuration.
+    // Source and capacity must come from the installation, not this fixture.
+    let acquired = run(
+        &codex_home.join("harness/bin/codex-harness.exe"),
+        &task_repo,
+        &[
+            "worktree",
+            "acquire",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+            "--repository",
+            task_repo.to_str().unwrap(),
+            "--task",
+            "retained-work",
+            "--base",
+            "HEAD",
+        ],
+    );
+    assert!(
+        acquired.status.success(),
+        "{}",
+        failed("worktree acquire", &acquired)
+    );
     let held =
-        task_worktree::acquire_task(&codex_home, &task_repo, 3, "retained-work", None, &|_| {
-            false
-        })
-        .unwrap();
+        task_worktree::continue_task(&codex_home, &task_repo, "retained-work", None).unwrap();
     fs::write(held.path.join("owned.txt"), b"partial tracked work\n").unwrap();
     fs::write(held.path.join("new.txt"), b"partial untracked work\n").unwrap();
     fs::create_dir_all(held.path.join("cache")).unwrap();
