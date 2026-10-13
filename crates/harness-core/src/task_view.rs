@@ -27,8 +27,8 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{
         EnumWindows, GW_HWNDPREV, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent,
         GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, SPI_GETWORKAREA, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER,
-        SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, SystemParametersInfoW,
+        IsWindowVisible, SPI_GETWORKAREA, SW_RESTORE, SetForegroundWindow, ShowWindow,
+        SwitchToThisWindow, SystemParametersInfoW,
     },
 };
 
@@ -552,12 +552,6 @@ fn presentation_window(window: HWND) -> HWND {
     }
 }
 
-fn directly_owned_window(window: usize, expected_pid: u32) -> bool {
-    let mut pid = 0;
-    let found = unsafe { GetWindowThreadProcessId(window as HWND, &mut pid) } != 0;
-    found && pid == expected_pid
-}
-
 unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
     // EnumWindows invokes this synchronously; the stack record outlives the call.
     let search = unsafe { &mut *(parameter as *mut FindWindow) };
@@ -659,26 +653,8 @@ impl View {
                     window,
                 };
                 view.snapshot()?;
-                // The readiness surface can be a terminal window shared with
-                // the desktop session; only a console surface owned directly
-                // by this launcher is positioned by the requested bounds.
-                if directly_owned_window(window, view.identity().pid) {
-                    if unsafe {
-                        SetWindowPos(
-                            window as HWND,
-                            null_mut(),
-                            bounds.x,
-                            bounds.y,
-                            bounds.width,
-                            bounds.height,
-                            SWP_NOACTIVATE,
-                        )
-                    } == 0
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                view.snapshot()?;
+                // Observe the surface created by the terminal. Conversation
+                // visibility does not authorize rearranging desktop windows.
                 return Ok(view);
             }
             thread::sleep(Duration::from_millis(25));
@@ -687,30 +663,6 @@ impl View {
 
     pub fn identity(&self) -> ProcessIdentity {
         self.process.identity()
-    }
-
-    pub(crate) fn place(&self, bounds: Bounds) -> io::Result<()> {
-        if !directly_owned_window(self.window, self.identity().pid) {
-            // A terminal-hosted presentation is a window of the shared
-            // desktop session; placing it would rearrange a surface this view
-            // does not own. Readiness keeps using the presentation as it is.
-            return Ok(());
-        }
-        if unsafe {
-            SetWindowPos(
-                self.window as HWND,
-                null_mut(),
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     pub fn is_running(&self) -> io::Result<bool> {
@@ -933,8 +885,8 @@ mod tests {
         assert!(five[4].y >= five[2].y);
     }
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, SW_HIDE, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-        WS_POPUP, WS_VISIBLE,
+        CreateWindowExW, DestroyWindow, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+        ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
     };
 
     struct OwnedWindow(HWND);

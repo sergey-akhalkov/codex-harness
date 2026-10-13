@@ -682,11 +682,6 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
                 if request.slot >= placements.len() {
                     placements = crate::task_view::layout(request.slot + 1)?;
                 }
-                if request.slot == 3 {
-                    let mut previous = placements[0];
-                    previous.height /= 2;
-                    view.place(previous)?;
-                }
                 let mut next = CommandSpec::new(command.get_program());
                 next.env.clone_from(&tui.env);
                 next.current_dir = Some(
