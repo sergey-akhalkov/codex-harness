@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-10-12**.
+Last updated: **2026-10-13**.
 
 ## Public pack
 
@@ -592,10 +592,7 @@ with an unrestricted context);
 portable defaults disable the Apps feature while machine-local values win;
 per-model default effort is max for zai/glm-5.3 and xhigh for
 xai/grok-4.6 and Astra when no explicit effort is selected; the portable
-principles stay at most 24 KiB with every normative rule preserved (24,320
-bytes after the 2026-09-26 trim; 24,469 bytes on 2026-10-12 after the
-enforce-obvious-interfaces-and-friction-escalation consolidation, within that
-bound).
+principles stay at most 24 KiB with every normative rule preserved.
 Removing the locally installed GitHub plugin is a machine-local action, not a
 kit requirement. Screenshot policy was already fixed separately and stays
 unchanged.
