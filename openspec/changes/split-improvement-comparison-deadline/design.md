@@ -14,7 +14,7 @@ A complete-green attempt on 2026-10-13 (readiness fix 465691e, same heavy accoun
 
 No measured run of the pre-split single target is retained from this session; that baseline remains open and no history is reconstructed.
 
-Boundary re-derivation (2026-10-13, lead decision): the retained green attempt already showed the two-target total cannot stay under 3000 s, so "<1500 s each" is infeasible for two targets; the lead authorized three targets. The suite was re-split into `improvement_comparison_a` (16 tests), `improvement_comparison_b` (21) and `improvement_comparison_c` (13 moved tests) with byte-identical bodies; coverage parity re-verified (50 = 16+21+13; 0 duplicates, 0 missing, 0 extra, 0 body mismatches) and the workflow plus `ci_workflow` equality contract list all three. The three complete green runs are the acceptance case for this boundary; no green three-target numbers are recorded yet.
+Boundary re-derivation (2026-10-13, lead decision): the retained green attempt already showed the two-target total cannot stay under 3000 s, so "<1500 s each" is infeasible for two targets; the lead authorized three targets. The suite was re-split into `improvement_comparison_a` (16 tests), `improvement_comparison_b` (21) and `improvement_comparison_c` (13 moved tests) with byte-identical bodies; coverage parity re-verified (50 = 16+21+13; 0 duplicates, 0 missing, 0 extra, 0 body mismatches) and the workflow plus `ci_workflow` equality contract list all three. Complete green runs recorded 2026-10-13 on candidate 730b599 (default heavy account, serialized): a finished 16 passed in 895.07 s, c 13 passed in 933.31 s and b 21 passed in 1201.51 s; every whole target stayed under the 1500 s budget.
 
 ## Experiment selection
 
