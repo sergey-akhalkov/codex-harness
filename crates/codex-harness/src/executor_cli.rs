@@ -2007,10 +2007,14 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
         admit_executor_run(request, held)?;
     }
     // The admission decision, the pool claim and the startup reservation
-    // are one atomic step under the guard. The slow worktree
-    // preparation stays outside it: a reserved position already excludes
-    // rivals through the live startup reservation, so independent
-    // startups prepare concurrently within the allowance.
+    // are one atomic step under the guard. The slow worktree preparation
+    // stays outside it: a reserved position already excludes rivals through
+    // the live startup reservation, so independent startups prepare
+    // concurrently within the allowance. Walked positions are not repaired
+    // here either: `repair_walked_slots` is false, so no cold checkout
+    // preparation runs under the shared guard, while the position this
+    // dispatch claims is still materialized by `prepare_task_startup` after
+    // the guard is released.
     let begin = task_worktree::begin_task_startup(
         request.codex_home,
         request.repository,
@@ -2018,6 +2022,7 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
         request.owner,
         base.as_deref(),
         Some(&startup),
+        false,
         &live,
     )?;
     // A continued binding records no startup reservation through the claim

@@ -2122,7 +2122,12 @@ fn acquire_task_with(
     is_live: &dyn Fn(&str) -> bool,
     startup: Option<&StartupReservation>,
 ) -> io::Result<TaskSlot> {
-    let begin = begin_task_startup(codex_home, source, size, task, base, startup, is_live)?;
+    // The ordinary acquisition path has no shared admission guard to keep
+    // short, so walking past a recorded position still materializes it: a
+    // held binding whose checkout was pruned through keeps its directory
+    // instead of being reported as vanished, which is what lets the recorded
+    // release recover it.
+    let begin = begin_task_startup(codex_home, source, size, task, base, startup, true, is_live)?;
     prepare_task_startup(codex_home, source, size, begin)
 }
 
@@ -2149,6 +2154,16 @@ pub enum TaskStartup {
 /// existing binding is returned, or a position is claimed with this process's
 /// startup reservation. Checkout creation, reset and binding stay out of the
 /// guard, so independent startups prepare within the allowance.
+///
+/// `repair_walked_slots` materializes recorded positions walked before the
+/// claimed one, which is how the ordinary worktree commands keep a pruned
+/// held checkout recoverable. A caller whose admission guard is shared with
+/// other dispatches passes `false`: no cold checkout preparation runs under
+/// that guard, and the claimed position is still materialized by
+/// `prepare_task_startup` after the guard is released.
+// The pool startup contract is one positional parameter family; the boolean
+// only selects walk repair.
+#[allow(clippy::too_many_arguments)]
 pub fn begin_task_startup(
     codex_home: &Path,
     source: &Path,
@@ -2156,6 +2171,7 @@ pub fn begin_task_startup(
     task: &str,
     base: Option<&str>,
     startup: Option<&StartupReservation>,
+    repair_walked_slots: bool,
     is_live: &dyn Fn(&str) -> bool,
 ) -> io::Result<TaskStartup> {
     if task.trim().is_empty() {
@@ -2198,6 +2214,11 @@ pub fn begin_task_startup(
         // handling and recovery: a missing registered position is refused with
         // its prune remedy, and a recorded position is materialized so a held
         // binding keeps its directory instead of being reported as vanished.
+        // The materialization only happens where the caller asked for walk
+        // repair: the worktree commands repair a pruned held checkout, while
+        // a guarded executor dispatch leaves that checkout work to the
+        // successful preparation owner so nothing cold runs under the shared
+        // admission guard.
         match slot.presence {
             SlotPresence::RegisteredMissing => {
                 return Err(pool_error(&format!(
@@ -2221,7 +2242,7 @@ pub fn begin_task_startup(
         // its materialization is preparation and stays outside the caller's
         // admission guard, so only recorded positions are created here.
         let recorded = load_record_at(&layout, slot.index)?.is_some();
-        if recorded {
+        if recorded && repair_walked_slots {
             create_slot(&pool, slot.index)?;
         }
         match claim_task_slot(codex_home, &pool, slot.index, task, is_live, startup)? {
@@ -2274,12 +2295,10 @@ pub fn begin_task_startup(
             // acquisition stops with the recorded reason.
             TaskSlotClaim::InFlightSameTask(reason) => return Err(pool_error(&reason)),
             TaskSlotClaim::Unavailable(refusal) => {
-                // A record-less position can still lose a claim race between
-                // the record check and the claim; the refused position is
-                // then materialized, as the un-split walk did.
-                if !recorded {
-                    create_slot(&pool, slot.index)?;
-                }
+                // A refused position is owned by its successful claimant,
+                // whose preparation materializes it outside any admission
+                // guard; this walk never brings a rival position into
+                // existence.
                 refusals.push(refusal.reason);
             }
         }

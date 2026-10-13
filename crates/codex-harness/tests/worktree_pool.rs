@@ -11,7 +11,10 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -393,6 +396,91 @@ fn capture_command(mut command: Command, root: &Path) -> CapturedChild {
         child,
         stdout: Some(stdout),
         stderr: Some(stderr),
+    }
+}
+
+/// The compiled Rust checkout gate used by the gated-preparation checks: the
+/// post-checkout adapter forwards to this binary, which owns the start marker
+/// and the bounded wait. Compiled once per test binary with the toolchain
+/// that already builds this test, so no product entry point and no external
+/// dependency is involved.
+fn gate_executable() -> &'static Path {
+    static GATE: OnceLock<PathBuf> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("worktree-pool-gate-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let source = root.join("worktree_pool_gate.rs");
+        fs::write(&source, include_str!("fixtures/worktree_pool_gate.rs")).unwrap();
+        let executable = root.join("worktree-pool-gate.exe");
+        let compiled = Command::new(gate_rustc())
+            .arg(&source)
+            .arg("--edition=2024")
+            .arg("-o")
+            .arg(&executable)
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .output()
+            .expect("rustc runs");
+        assert!(
+            compiled.status.success(),
+            "worktree pool gate fixture did not compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        assert!(executable.is_file(), "{}", executable.display());
+        executable
+    })
+}
+
+/// The `rustc` already used to build this test: the first `where.exe` hit, or
+/// the user toolchain location as the fallback.
+fn gate_rustc() -> PathBuf {
+    let output = Command::new("where.exe")
+        .arg("rustc.exe")
+        .output()
+        .expect("where.exe runs");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("USERPROFILE").expect("USERPROFILE");
+            PathBuf::from(home).join(".cargo/bin/rustc.exe")
+        })
+}
+
+/// Install the post-checkout gate adapter: it only forwards to the compiled
+/// Rust gate, so all marker and wait behavior stays in the fixture.
+fn install_gate_hook(fixture: &Fixture) {
+    let hooks = fixture.source.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let adapter = [
+        "#!/bin/sh",
+        "if [ -n \"$WORKTREE_POOL_TEST_GATE_EXE\" ]; then",
+        "  exec \"$WORKTREE_POOL_TEST_GATE_EXE\" \"$@\"",
+        "fi",
+        "exit 0",
+    ]
+    .join("\n");
+    fs::write(hooks.join("post-checkout"), format!("{adapter}\n")).unwrap();
+}
+
+/// Release the gated preparation on unwind, so a panicking check cannot leave
+/// the owned gate blocked. Declared after the children it gates, so the
+/// release file is written before those children are killed and reaped.
+struct GateHold(PathBuf);
+
+impl GateHold {
+    fn new(path: &Path) -> Self {
+        Self(path.to_path_buf())
+    }
+}
+
+impl Drop for GateHold {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release\n");
     }
 }
 
@@ -1113,6 +1201,125 @@ fn simultaneous_dispatch_admission_is_atomic_with_the_startup_reservation() {
     fixture.drop();
 }
 
+/// Behavioral admission control: with one allowance and two free positions, a
+/// second simultaneous dispatch must be refused while the first dispatch is
+/// held inside its checkout preparation. The pre-correction candidate prepares
+/// the checkout before its claim records the startup reservation, so a rival
+/// passes the allowance while the first dispatch is still held in preparation:
+/// the same oracle observes that excess admission (two active admissions under
+/// a one-run allowance) on the preserved executable and at most one admission
+/// after the correction. A second dispatch that neither observes the refusal
+/// nor acquires a pool position is reported as an invalid control input, never
+/// as race evidence.
+#[test]
+fn one_allowance_admits_one_dispatch_while_a_preparation_is_held() {
+    let fixture = Fixture::new("admission-held", 2, 1);
+    install_gate_hook(&fixture);
+    let started = fixture.root.join("preparation-started");
+    let gate = fixture.root.join("preparation-gate");
+    // The first dispatch's checkout preparation is gated; the second dispatch
+    // receives no gate variables and must be refused by the concurrency limit
+    // alone while the first preparation is still held.
+    let mut first = fixture.executor_child_with_env(
+        &[
+            "spawn",
+            "--profile",
+            "ds",
+            "--exec",
+            "assignment text",
+            "--owner",
+            "exec-a",
+        ],
+        &[
+            (
+                "WORKTREE_POOL_TEST_GATE_EXE",
+                gate_executable().to_str().unwrap(),
+            ),
+            ("WORKTREE_POOL_TEST_GATE", gate.to_str().unwrap()),
+            ("WORKTREE_POOL_TEST_STARTED", started.to_str().unwrap()),
+        ],
+    );
+    let _gate_hold = GateHold::new(&gate);
+    wait_for_file(
+        &mut first,
+        &started,
+        Duration::from_secs(30),
+        "slot 1 preparation",
+    );
+    assert!(
+        first.try_wait().is_none(),
+        "the first dispatch left preparation before the gate was released"
+    );
+
+    // The second simultaneous dispatch must be refused by the admission that
+    // the first dispatch's recorded startup reservation backs.
+    let mut second = fixture.executor_child(&[
+        "spawn",
+        "--profile",
+        "ds",
+        "--exec",
+        "assignment text",
+        "--owner",
+        "exec-b",
+    ]);
+    let second_text = refused(wait_bounded(
+        &mut second,
+        Duration::from_secs(60),
+        "second dispatch",
+    ));
+    if !second_text.contains("executor concurrency is full") {
+        if second_text.contains("executor slot: index=") {
+            panic!(
+                "the second dispatch escaped admission while the first dispatch was held \
+                 inside its checkout preparation, so the pool admitted two active runs \
+                 under the one-run allowance: {second_text}"
+            );
+        }
+        panic!(
+            "the second dispatch neither observed the concurrency refusal nor acquired a \
+             pool position, so this run is not admission-race evidence: {second_text}"
+        );
+    }
+    assert!(
+        second_text.contains(
+            "executor concurrency is full: 1 of 1 active runs (max_concurrent_executors)"
+        ),
+        "{second_text}"
+    );
+    assert!(
+        second_text.contains("slot 1 is running 'exec-a'"),
+        "{second_text}"
+    );
+    assert!(
+        !second_text.contains("installed Codex launcher is missing"),
+        "an over-limit dispatch reached the launcher: {second_text}"
+    );
+    assert!(
+        !fixture.slot(2).exists(),
+        "a refused dispatch allocated another position"
+    );
+    assert!(
+        first.try_wait().is_none(),
+        "the first preparation must stay held until the gate is released"
+    );
+
+    fs::write(&gate, "release\n").unwrap();
+    let first_text = refused(wait_bounded(
+        &mut first,
+        Duration::from_secs(60),
+        "held dispatch",
+    ));
+    assert!(
+        first_text.contains("executor slot: index=1"),
+        "the gated dispatch must complete on its reserved position: {first_text}"
+    );
+    assert!(
+        first_text.contains("installed Codex launcher is missing"),
+        "{first_text}"
+    );
+    fixture.drop();
+}
+
 #[test]
 fn offline_acquisitions_resolve_local_bases_without_fetching() {
     let fixture = Fixture::new("offline", 2, 8);
@@ -1536,28 +1743,14 @@ fn stale_generations_and_superseded_releases_are_refused() {
 #[test]
 fn independent_startup_progresses_while_another_preparation_is_slow() {
     let fixture = Fixture::new("slow-prep", 2, 2);
-    // The checkout hook gates only dispatches that receive the gate variables:
-    // the first dispatch's `git worktree add` stops inside its preparation
-    // while this check keeps that process and its reservation alive. The
-    // in-hook bound releases an orphaned hook even if the check itself dies.
-    let hooks = fixture.source.join(".git/hooks");
-    fs::create_dir_all(&hooks).unwrap();
+    // The compiled Rust gate holds only dispatches that receive the gate
+    // variables: the first dispatch's `git worktree add` stops inside its
+    // preparation while this check keeps that process and its reservation
+    // alive. The fixture's own bound releases an orphaned gate even if the
+    // check itself dies, and the hook adapter only forwards to it.
+    install_gate_hook(&fixture);
     let started = fixture.root.join("preparation-started");
     let gate = fixture.root.join("preparation-gate");
-    let hook = [
-        "#!/bin/sh",
-        "if [ -n \"$WORKTREE_POOL_TEST_GATE\" ]; then",
-        "  echo started > \"$WORKTREE_POOL_TEST_STARTED\"",
-        "  n=0",
-        "  while [ ! -f \"$WORKTREE_POOL_TEST_GATE\" ] && [ $n -lt 450 ]; do",
-        "    sleep 0.2",
-        "    n=$((n+1))",
-        "  done",
-        "fi",
-        "exit 0",
-    ]
-    .join("\n");
-    fs::write(hooks.join("post-checkout"), format!("{hook}\n")).unwrap();
     // Slot 2 is materialized up front: the second dispatch is not gated, and
     // two simultaneous `git worktree add` runs would race on the shared
     // worktree bookkeeping.
@@ -1583,10 +1776,15 @@ fn independent_startup_progresses_while_another_preparation_is_slow() {
             "exec-a",
         ],
         &[
+            (
+                "WORKTREE_POOL_TEST_GATE_EXE",
+                gate_executable().to_str().unwrap(),
+            ),
             ("WORKTREE_POOL_TEST_GATE", gate.to_str().unwrap()),
             ("WORKTREE_POOL_TEST_STARTED", started.to_str().unwrap()),
         ],
     );
+    let _gate_hold = GateHold::new(&gate);
     // The reservation must be recorded before the slow preparation starts:
     // that is what excludes rivals while the admission guard is released.
     let state =
