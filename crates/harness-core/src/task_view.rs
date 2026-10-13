@@ -552,6 +552,12 @@ fn presentation_window(window: HWND) -> HWND {
     }
 }
 
+fn directly_owned_window(window: usize, expected_pid: u32) -> bool {
+    let mut pid = 0;
+    let found = unsafe { GetWindowThreadProcessId(window as HWND, &mut pid) } != 0;
+    found && pid == expected_pid
+}
+
 unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
     // EnumWindows invokes this synchronously; the stack record outlives the call.
     let search = unsafe { &mut *(parameter as *mut FindWindow) };
@@ -653,19 +659,24 @@ impl View {
                     window,
                 };
                 view.snapshot()?;
-                if unsafe {
-                    SetWindowPos(
-                        window as HWND,
-                        null_mut(),
-                        bounds.x,
-                        bounds.y,
-                        bounds.width,
-                        bounds.height,
-                        SWP_NOACTIVATE,
-                    )
-                } == 0
-                {
-                    return Err(io::Error::last_os_error());
+                // The readiness surface can be a terminal window shared with
+                // the desktop session; only a console surface owned directly
+                // by this launcher is positioned by the requested bounds.
+                if directly_owned_window(window, view.identity().pid) {
+                    if unsafe {
+                        SetWindowPos(
+                            window as HWND,
+                            null_mut(),
+                            bounds.x,
+                            bounds.y,
+                            bounds.width,
+                            bounds.height,
+                            SWP_NOACTIVATE,
+                        )
+                    } == 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 view.snapshot()?;
                 return Ok(view);
@@ -679,6 +690,12 @@ impl View {
     }
 
     pub(crate) fn place(&self, bounds: Bounds) -> io::Result<()> {
+        if !directly_owned_window(self.window, self.identity().pid) {
+            // A terminal-hosted presentation is a window of the shared
+            // desktop session; placing it would rearrange a surface this view
+            // does not own. Readiness keeps using the presentation as it is.
+            return Ok(());
+        }
         if unsafe {
             SetWindowPos(
                 self.window as HWND,
