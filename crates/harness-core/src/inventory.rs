@@ -68,7 +68,7 @@ fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
 
-fn text(path: &Path) -> io::Result<String> {
+pub(crate) fn text(path: &Path) -> io::Result<String> {
     let mut bytes = Vec::new();
     fs::File::open(path)?
         .take(TEXT_LIMIT + 1)
@@ -89,7 +89,7 @@ fn simple_name(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
 }
 
-fn descriptor_name(path: &Path, skill: bool) -> io::Result<String> {
+pub(crate) fn descriptor_name(path: &Path, skill: bool) -> io::Result<String> {
     let body = text(path)?;
     if !skill {
         let document: toml::Table = toml::from_str(body.trim_start_matches('\u{feff}'))
@@ -142,7 +142,7 @@ fn descriptor_name(path: &Path, skill: bool) -> io::Result<String> {
     Ok(names.remove(0))
 }
 
-fn owned_source(root: &Path, relative: &str) -> io::Result<PathBuf> {
+pub(crate) fn owned_source(root: &Path, relative: &str) -> io::Result<PathBuf> {
     let relative = Path::new(relative);
     if relative.as_os_str().is_empty()
         || relative
