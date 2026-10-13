@@ -788,9 +788,8 @@ fn lock_slot(
 }
 
 /// Bound for the pool-wide admission lock. It covers the executor admission
-/// decision and the startup reservation that carries it, including first-time
-/// slot materialization; it never spans an upstream fetch, a host attach or a
-/// model conversation.
+/// decision and the startup reservation that carries it. Checkout preparation,
+/// upstream fetches, host attachment and model conversations stay outside it.
 const POOL_ADMISSION_LOCK_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn pool_admission_lock_path(codex_home: &Path, source: &Path) -> io::Result<PathBuf> {
