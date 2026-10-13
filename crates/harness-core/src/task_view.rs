@@ -532,6 +532,26 @@ struct FindWindow {
     window: Option<usize>,
 }
 
+/// The visible surface presenting a launcher-owned console. Windows Terminal
+/// hosts a console created for another process behind the terminal window of
+/// that session: the console's pseudo console window is owned by the client
+/// and parented to that terminal window, the same console-to-terminal
+/// identity `console_terminal_window` uses for this process's own session. A
+/// directly owned visible window (classic console host) is its own
+/// presentation.
+fn presentation_window(window: HWND) -> HWND {
+    let parent = unsafe { GetParent(window) };
+    if !parent.is_null()
+        && terminal_window(parent)
+        && unsafe { IsWindowVisible(parent) } != 0
+        && unsafe { IsIconic(parent) } == 0
+    {
+        parent
+    } else {
+        window
+    }
+}
+
 unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
     // EnumWindows invokes this synchronously; the stack record outlives the call.
     let search = unsafe { &mut *(parameter as *mut FindWindow) };
@@ -540,7 +560,7 @@ unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
         && pid == search.pid
         && unsafe { IsWindowVisible(window) } != 0
     {
-        search.window = Some(window as usize);
+        search.window = Some(presentation_window(window) as usize);
     }
     1
 }
@@ -615,6 +635,18 @@ impl View {
                 return Err(io::Error::last_os_error());
             }
             if let Some(window) = search.window {
+                // A visible owned console can be enumerated while the system
+                // is still sizing it. That empty surface is not a dispatch
+                // readiness failure: keep polling until it has real bounds,
+                // the launcher exits or the deadline is reached.
+                match visible_bounds(window, process.identity().pid) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 let view = Self {
                     _job: job,
                     process,
@@ -700,6 +732,41 @@ fn loaded_title(caption: &str, expected: &str) -> bool {
         && chars.as_str().starts_with(expected)
 }
 
+/// Whether `window` is the terminal presentation of a console whose client is
+/// the exact process `expected_pid`: a top-level window owned by that process
+/// is parented to it, the same console-to-terminal identity
+/// `console_terminal_window` uses for this process's own session.
+fn console_presentation_of(window: usize, expected_pid: u32) -> bool {
+    struct Presentation {
+        pid: u32,
+        presentation: HWND,
+        hosted: bool,
+    }
+    unsafe extern "system" fn find_anchor(window: HWND, parameter: LPARAM) -> i32 {
+        let search = unsafe { &mut *(parameter as *mut Presentation) };
+        let mut pid = 0;
+        if unsafe { GetWindowThreadProcessId(window, &mut pid) } != 0
+            && pid == search.pid
+            && unsafe { GetParent(window) } == search.presentation
+        {
+            search.hosted = true;
+        }
+        1
+    }
+    let mut search = Presentation {
+        pid: expected_pid,
+        presentation: window as HWND,
+        hosted: false,
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_anchor),
+            (&mut search as *mut Presentation) as LPARAM,
+        );
+    }
+    search.hosted
+}
+
 fn visible_bounds(window: usize, expected_pid: u32) -> io::Result<Bounds> {
     let window = window as HWND;
     let mut pid = 0;
@@ -711,7 +778,12 @@ fn visible_bounds(window: usize, expected_pid: u32) -> io::Result<Bounds> {
     }
     let visible = unsafe { IsWindowVisible(window) } != 0;
     let minimized = unsafe { IsIconic(window) } != 0;
-    if pid != expected_pid || !visible || minimized {
+    // The launcher owns its console, but the visible surface can belong to the
+    // terminal host presenting it; the console still counts as owned when a
+    // live window of the exact launcher process is parented to that surface.
+    let owned = pid == expected_pid
+        || (terminal_window(window) && console_presentation_of(window as usize, expected_pid));
+    if !owned || !visible || minimized {
         return Err(io::Error::other(format!(
             "conversation window is unavailable: owner pid={pid}, expected pid={expected_pid}, visible={visible}, minimized={minimized}; suspend new model dispatch"
         )));
@@ -721,10 +793,16 @@ fn visible_bounds(window: usize, expected_pid: u32) -> io::Result<Bounds> {
         return Err(io::Error::last_os_error());
     }
     if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
-        return Err(io::Error::other(format!(
-            "conversation window is unavailable: empty bounds ({}, {}, {}, {}); suspend new model dispatch",
-            bounds.left, bounds.top, bounds.right, bounds.bottom
-        )));
+        // A found, visible, owned window can still be sized by the system after
+        // it is enumerated. Startup readiness polls this state through
+        // WouldBlock; every dispatch recheck refuses it with the same message.
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "conversation window is unavailable: empty bounds ({}, {}, {}, {}); suspend new model dispatch",
+                bounds.left, bounds.top, bounds.right, bounds.bottom
+            ),
+        ));
     }
     Ok(Bounds {
         x: bounds.left,
