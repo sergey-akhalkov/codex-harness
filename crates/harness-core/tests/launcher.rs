@@ -56,11 +56,56 @@ fn role_context_preserves_native_inputs_and_maintenance_boundaries() {
     let output = with_context_overrides(&args, &overrides);
     let separator = output.iter().position(|value| value == "--").unwrap();
     assert_eq!(&output[separator..], &argv(&["--", "-p", "prompt"]));
-    assert_eq!(&output[..separator - 2], &args[..args.len() - 3]);
+    let command = output.iter().position(|value| value == "exec").unwrap();
+    assert_eq!(&output[command..], &argv(&["exec", "--", "-p", "prompt"]));
     let effective = context_arguments(&output, cwd).unwrap().unwrap();
+    assert_eq!(effective.cwd, context.cwd);
+    assert_eq!(effective.profile, context.profile);
     assert_eq!(
         effective.overrides.last().unwrap(),
         "developer_instructions=\"composed\""
+    );
+}
+
+#[test]
+fn role_configs_share_root_scope_without_consuming_other_option_values() {
+    use harness_core::launcher::with_context_overrides;
+    let args = argv(&[
+        "-c",
+        "approval_policy='never'",
+        "debug",
+        "prompt-input",
+        "--config=sandbox_mode='danger-full-access'",
+        "--model",
+        "-custom-model",
+        "--",
+        "-c",
+        "literal prompt",
+    ]);
+    let overrides = toml::Table::from_iter([("developer_instructions".into(), "composed".into())]);
+    let output = with_context_overrides(&args, &overrides);
+    let command = output.iter().position(|value| value == "debug").unwrap();
+    assert_eq!(
+        &output[command..],
+        &argv(&[
+            "debug",
+            "prompt-input",
+            "--model",
+            "-custom-model",
+            "--",
+            "-c",
+            "literal prompt",
+        ])
+    );
+    assert_eq!(
+        &output[..command],
+        &argv(&[
+            "-c",
+            "approval_policy='never'",
+            "--config=sandbox_mode='danger-full-access'",
+            "-c",
+            "developer_instructions=\"composed\"",
+        ])
     );
 }
 

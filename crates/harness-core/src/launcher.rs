@@ -435,18 +435,38 @@ pub fn context_arguments(args: &[OsString], cwd: &Path) -> io::Result<Option<Con
     Ok(Some(result))
 }
 
-/// The composed role includes explicit user context. Place it after those
-/// overrides but before a native prompt separator, preserving every input.
+/// Keep all config overrides in the root command's argument scope. Native
+/// subcommand config vectors replace the root vector, so appending role
+/// settings after `exec` or `debug prompt-input` loses shared defaults.
+/// Explicit configs retain encounter order; composed context wins last.
 pub fn with_context_overrides(args: &[OsString], overrides: &toml::Table) -> Vec<OsString> {
-    let at = args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(args.len());
-    let mut result = args[..at].to_vec();
+    let mut result = Vec::new();
+    let mut command = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            command.extend_from_slice(&args[i..]);
+            break;
+        }
+        let config = option(arg, "--config") || arg.starts_with("-c");
+        let start = i;
+        if image(arg) {
+            skip_images(args, &mut i);
+        } else if VALUES.contains(&arg) && i + 1 < args.len() {
+            i += 1;
+        }
+        i += 1;
+        if config {
+            result.extend_from_slice(&args[start..i]);
+        } else {
+            command.extend_from_slice(&args[start..i]);
+        }
+    }
     for (key, value) in overrides {
         result.extend(["-c".into(), format!("{key}={value}").into()]);
     }
-    result.extend_from_slice(&args[at..]);
+    result.extend(command);
     result
 }
 
