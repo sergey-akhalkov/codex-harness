@@ -584,7 +584,9 @@ receipt (`slot`, `path`, `presence`, `state`, `base`, `task`, `handle`,
 release must present after any reassignment. Repeating acquire for a held
 task returns the same binding; a different requested base refuses as a
 conflict, and capacity is `worktree_pool_size`, falling back to
-`max_concurrent_executors` when the configuration omits it. Continue returns
+`max_concurrent_executors` when the configuration omits it; install and update
+materialize that former effective capacity as the explicit setting before
+publication, and `worktree_limit` is compatibility-only. Continue returns
 the held binding; a stale handle, a released binding or a live foreign
 session refuses with its cause. List reports every configured position plus
 registered-missing and foreign directories for lead review. Release records

@@ -78,8 +78,8 @@ runs DeepSeek V4.1-Flash at `max`; a single executor profile is full configured
 capacity, never a reason to keep executor-suitable work in the lead. Routing
 wording that seems to demand another model or per-task arguments is reported as
 a discrepancy while dispatch proceeds; only a launcher-reported failure blocks
-dispatch. `max_concurrent_executors` also sizes the executor worktree pool, and
-`executor spawn` - not the lead - allocates its slots.
+dispatch. `worktree_pool_size` sizes the shared worktree pool independently of
+that executor limit, and `executor spawn` - not the lead - allocates its slots.
 
 ## Board setup
 
@@ -345,7 +345,7 @@ integrated state, never over it - diff and merge checkboxes and deltas instead
 of copying files wholesale.
 
 Executor slots are pool-owned, not task-owned: the pool never grows past
-`max_concurrent_executors`, and slots are reused while conversations are not.
+`worktree_pool_size`, and slots are reused while conversations are not.
 Return a finished slot to the pool through the explicit release path, which
 records your disposition before anything is destroyed:
 

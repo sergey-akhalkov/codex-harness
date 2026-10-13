@@ -815,4 +815,60 @@ fn escape(text: &str) -> String {
         assert!(!tree.cpu.join("cpu-budget.json").exists());
         assert!(!tree.source.join("target").exists());
     }
+
+    #[test]
+    fn install_update_materialize_legacy_pool_capacity_without_moving_other_settings() {
+        let tree = tree();
+        let home = tree.root.join("codex-pool");
+        let user = tree.root.join("user-pool");
+        let config = tree.source.join("global/orchestration.toml");
+        fs::write(
+            &config,
+            "# user comment retained\nschema = 1\nlead_profile = \"default\"\n\
+             successor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\n\
+             max_concurrent_executors = 2\nvote_threshold = 3\n\
+             incubator_size_cap = 32\nfeedback_batch_limit = 8\nworktree_limit = 6\n",
+        )
+        .unwrap();
+        let legacy = fs::read(&config).unwrap();
+
+        let preview = lifecycle(&tree, "install", true, &home, &user, &tree.upstream);
+        assert_eq!(preview["status"], "preview");
+        assert_eq!(fs::read(&config).unwrap(), legacy, "preview writes nothing");
+
+        let installed = lifecycle(&tree, "install", false, &home, &user, &tree.upstream);
+        assert_eq!(installed["status"], "connected");
+        let materialized = fs::read_to_string(&config).unwrap();
+        assert!(
+            materialized.contains("# user comment retained"),
+            "{materialized}"
+        );
+        assert!(
+            materialized.contains("max_concurrent_executors = 2"),
+            "{materialized}"
+        );
+        assert!(
+            materialized.contains("worktree_pool_size = 2"),
+            "{materialized}"
+        );
+        assert!(
+            materialized.contains("worktree_limit = 6"),
+            "{materialized}"
+        );
+        assert_eq!(
+            harness_core::orchestration_config::parse(materialized.as_bytes())
+                .unwrap()
+                .worktree_pool_size,
+            Some(2),
+            "the legacy configuration's effective capacity is preserved explicitly"
+        );
+
+        let updated = lifecycle(&tree, "update", false, &home, &user, &tree.replacement);
+        assert_eq!(updated["status"], "connected");
+        assert_eq!(
+            fs::read(&config).unwrap(),
+            materialized.as_bytes(),
+            "a later update leaves the materialized setting and every user choice as they are"
+        );
+    }
 }

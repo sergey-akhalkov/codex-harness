@@ -58,10 +58,12 @@ worktree pool's directory capacity. Installation check rejects a missing
 profile or a non-positive limit without substituting another route. `default`
 is the native session with no `--profile` flag. Other names must exist as
 `CODEX_HOME/<name>.config.toml` or `[profiles.<name>]`. Pool capacity comes
-from `worktree_pool_size`; a configuration that omits it - every configuration
-written before the capacity split, including the shipped defaults until
-installation materializes the explicit setting - keeps its previous capacity,
-derived from `max_concurrent_executors`.
+from `worktree_pool_size`, independent of `max_concurrent_executors`; the
+shipped default is four for each, and `worktree_limit` stays
+compatibility-only. Install and update materialize the explicit setting for a
+configuration written before the capacity split - including a checkout still
+carrying the old shipped defaults - writing its former effective capacity
+before publication so later executor-limit changes cannot resize the pool.
 
 Synthetic example (not a live consumer):
 
@@ -520,7 +522,8 @@ effects and return or recovery behavior.
 Two independent slices can run in parallel on non-overlapping files or separate
 worktrees. Shared desktops, services, installed applications and devices need
 one owner, isolated allocation or serialized interaction; worktrees isolate
-files only. Preserve aggregate resource limits across workers. The parent does
+files only, not credentials, services, ports or databases. Preserve aggregate
+resource limits across workers. The parent does
 useful independent work without repeating the investigation, then checks the
 returned result, validity conditions and unresolved restoration or dependencies.
 
