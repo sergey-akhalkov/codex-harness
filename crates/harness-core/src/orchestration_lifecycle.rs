@@ -2,7 +2,8 @@
 //! The check is the loop-delivery report a fresh external session's install
 //! is verified against: configured roles and limits, the guidance skills the
 //! workflow is discovered through, and the board tool when it is connected.
-use crate::{orchestration_config, task_store};
+use crate::role_context::Role;
+use crate::{orchestration_config, role_context, task_store};
 use serde::Serialize;
 use std::{fs, io, path::Path};
 
@@ -21,6 +22,8 @@ pub struct CheckReport {
     pub worktree_pool_size: Option<u32>,
     pub vote_threshold: Option<u32>,
     pub worktree_limit: Option<u32>,
+    /// Responsibility roles resolved from the kit checkout's owned sources.
+    pub roles: Vec<RoleState>,
     /// Loop guidance skills delivered into the user skill root.
     pub guidance: Vec<String>,
     /// Guidance a fresh session would not discover; `--core-only Install`
@@ -37,6 +40,45 @@ pub struct PreservationReport {
     pub mutated: bool,
     /// Private loop evidence this rollback left in place.
     pub preserved: Vec<&'static str>,
+}
+
+/// One responsibility role in the lifecycle report. A gap names its exact
+/// cause and fails nothing else: the check reports what the installation
+/// would deliver, and a missing role input is a delivery gap for its owner,
+/// not a reason to withhold the other facts. Successive dispatches resolve
+/// the then-current sources; a resolved revision here is this checkout's, not
+/// a retroactive claim about earlier sessions.
+#[derive(Debug, Serialize)]
+pub struct RoleState {
+    pub role: &'static str,
+    /// `resolved` when the role's owned inputs all read, `gap` otherwise.
+    pub status: &'static str,
+    /// The owned revision of exactly the inputs this role resolved.
+    pub revision: Option<String>,
+    /// The exact cause when the role could not resolve.
+    pub cause: Option<String>,
+}
+
+/// Resolve both roles read-only. A missing role source or manifest is
+/// reported with the input it names; it never fails this check.
+fn role_states(source: &Path) -> Vec<RoleState> {
+    [Role::Lead, Role::Executor]
+        .into_iter()
+        .map(|role| match role_context::resolve(source, role) {
+            Ok(resolved) => RoleState {
+                role: role.label(),
+                status: "resolved",
+                revision: Some(resolved.revision),
+                cause: None,
+            },
+            Err(error) => RoleState {
+                role: role.label(),
+                status: "gap",
+                revision: None,
+                cause: Some(error.to_string()),
+            },
+        })
+        .collect()
 }
 
 pub fn check(
@@ -85,6 +127,7 @@ pub fn check(
             .map(orchestration_config::worktree_pool_size),
         vote_threshold: config.as_ref().map(|value| value.vote_threshold),
         worktree_limit: config.as_ref().map(|value| value.worktree_limit),
+        roles: role_states(source),
         guidance,
         guidance_missing,
         board_version: board_version(codex_home)?,
@@ -297,6 +340,97 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{}: {error}", skill.display()));
             assert!(text.contains(&format!("name: {name}")), "{name}");
         }
+    }
+
+    fn role_kit(root: &Path) -> PathBuf {
+        let source = root.join("source");
+        for dir in [source.join("skills/shared"), source.join("skills/coordinate")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            source.join("global/kit.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "profile_name": "harness",
+                "profile": "global/profile.toml",
+                "instructions": "global/instructions.md",
+                "skills": "skills",
+                "agents": "global/agents",
+                "hooks": "global/hooks.json",
+                "token_hooks": "global/token-hooks.json"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for (path, body) in [
+            (
+                "global/profile.toml",
+                "developer_instructions = 'Fixture shared developer'\n",
+            ),
+            ("global/instructions.md", "Fixture common safeguards"),
+            ("global/lead.md", "Fixture lead responsibility"),
+            ("global/executor.md", "Fixture executor responsibility"),
+            (
+                "skills/shared/SKILL.md",
+                "---\nname: shared\ndescription: fixture\n---\nFixture shared skill",
+            ),
+            (
+                "skills/coordinate/SKILL.md",
+                "---\nname: coordinate\ndescription: fixture\n---\nFixture lead skill",
+            ),
+            (
+                "global/roles.toml",
+                "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n",
+            ),
+        ] {
+            fs::write(source.join(path), body).unwrap();
+        }
+        source
+    }
+
+    #[test]
+    fn a_gap_role_reports_the_missing_input_without_failing_the_check() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kit_source(root.path());
+        let home = root.path().join("home");
+        let user = root.path().join("user");
+        installed_profiles(&home);
+        let report = check(&source, &home, &user, true).unwrap();
+        assert_eq!(
+            report
+                .roles
+                .iter()
+                .map(|state| (state.role, state.status))
+                .collect::<Vec<_>>(),
+            [("lead", "gap"), ("executor", "gap")]
+        );
+        for state in &report.roles {
+            assert!(state.revision.is_none(), "{}", state.role);
+            let cause = state.cause.as_deref().unwrap();
+            assert!(cause.contains("global/kit.json"), "{}: {cause}", state.role);
+        }
+        assert_eq!(report.model_calls, 0);
+        assert!(!report.mutated);
+    }
+
+    #[test]
+    fn role_states_carry_each_role_owned_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let source = role_kit(root.path());
+        let states = role_states(&source);
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| (state.role, state.status))
+                .collect::<Vec<_>>(),
+            [("lead", "resolved"), ("executor", "resolved")]
+        );
+        let lead = states[0].revision.clone().unwrap();
+        let executor = states[1].revision.clone().unwrap();
+        assert!(!lead.is_empty());
+        assert!(!executor.is_empty());
+        assert_ne!(lead, executor);
+        assert!(states.iter().all(|state| state.cause.is_none()));
     }
 
     fn walkdir(root: &Path) -> Vec<String> {

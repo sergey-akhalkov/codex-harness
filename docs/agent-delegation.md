@@ -97,11 +97,12 @@ model/effort selection and `executor spawn` accepts no per-assignment override
 by design. If any instruction appears to demand one for executor dispatch, that
 demand belongs to ordinary in-session agents: dispatch the configured profile
 and report the discrepancy. Only a launcher- or installation-check-reported
-failure - missing profile, stale build, no free slot, fetch failure - blocks
-dispatch, with its exact cause and remedy; never a routing-rule interpretation,
-the single executor profile or unknown quota. Quota succession looks up the
-successor profile's model in the native catalog; the verified handoff seed
-stays a configured binding, not a hardcoded provider role.
+failure - missing profile, missing role inputs, stale build, no free slot,
+fetch failure - blocks dispatch, with its exact cause and remedy; never a
+routing-rule interpretation, the single executor profile or unknown quota.
+Quota succession looks up the successor profile's model in the native
+catalog; the verified handoff seed stays a configured binding, not a
+hardcoded provider role.
 
 Spawn opens the assignment in a new tab of the lead's own Windows Terminal
 window when the lead already runs there (`WT_SESSION`). Windows Terminal has no
@@ -163,6 +164,39 @@ stop. Activation comes from a user request or from the main session's own
 judgement for parallelizable work that repays orchestration; ordinary
 sessions without that activation spawn nothing, and an executor reports a
 further delegation need to the lead instead of widening orchestration.
+
+## Managed responsibility roles
+
+A managed session resolves its responsibility role from the source root its
+installed build recorded - [roles.toml](../global/roles.toml) and the
+fragments it names in the kit checkout - through the runtime's shared role
+resolver, then composes the result with the applicable native user, project,
+profile and session context before any model request. `executor spawn`,
+`resume`, `run` and `succeed` resolve the executor role; a lead session opened
+through the harness resolves the lead role. The consuming checkout never needs
+to own kit role assets, and native precedence is preserved: an explicit user
+`--profile` still wins, retained explicit skill disables and unrelated or
+project skills stay untouched, and no shared user configuration is mutated.
+Missing or inconsistent role inputs refuse with their exact cause before any
+launcher or model request; a dispatch keeps its slot bound and recoverable
+instead of hosting a conversation without its responsibility role.
+
+Each control receipt records the role, its owned revision and what a
+continued predecessor recorded. Resume and restart re-resolve the role at the
+new dispatch, record it and report the effective state honestly
+(`role context: ...`): new turns compose the role text the receipt names,
+while the predecessor's earlier turns keep the revision they ran under and
+are never claimed to have loaded newer text. A receipt written before role
+recording reports `role context: unrecorded`: it stays usable, and the next
+fresh dispatch, resume or restart records the current role.
+
+Inspect a composition without a model call:
+`codex-harness skills catalogue --role lead|executor` applies the installed
+build's resolved role to the native skill read and refuses when those role
+inputs are missing instead of reporting a set the managed session would not
+see. The `codex-harness check` report lists each role as `resolved` with its
+revision or as a `gap` naming the exact missing input; a gap blocks only the
+sessions whose role inputs are missing and fails nothing else.
 
 ## Executor utilization
 

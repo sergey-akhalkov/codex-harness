@@ -1,5 +1,6 @@
 //! Model-free skill-evolution helpers.
 
+use harness_core::role_context::Role;
 use serde_json::json;
 use skill_evolution::isolation::{self, Request};
 use skill_evolution::{catalogue, delivery, identity, ledger, session, usage};
@@ -26,7 +27,7 @@ const CATALOGUE_LIMIT: u64 = 16 * 1024;
 const COMMANDS: [(&str, &str); 5] = [
     (
         "catalogue",
-        "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps; raw native evidence stays in a private temporary root and a missing native read reports unavailable rather than a local scan. --limit accepts 1024-1048576 bytes (default 16384); rerun with a larger --limit for omitted entries.",
+        "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--role lead|executor] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps; raw native evidence stays in a private temporary root and a missing native read reports unavailable rather than a local scan. --role composes the installed build's recorded responsibility role (developer text and skill memberships) onto the native read exactly as a managed session receives it, so the catalogue shows that role's effective set; it refuses when the role inputs are missing instead of reporting a different set. --limit accepts 1024-1048576 bytes (default 16384); rerun with a larger --limit for omitted entries.",
     ),
     (
         "isolate",
@@ -105,11 +106,24 @@ fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
         None => default_codex_home()?.canonicalize()?,
     };
     let upstream = opts.remove("--upstream").map(PathBuf::from);
+    let role = match opts.remove("--role") {
+        Some(value) if value == "lead" => Some(Role::Lead),
+        Some(value) if value == "executor" => Some(Role::Executor),
+        Some(_) => return Err(invalid()),
+        None => None,
+    };
     let timeout = number(opts.remove("--timeout"))?.unwrap_or(CATALOGUE_TIMEOUT);
     let limit = number(opts.remove("--limit"))?.unwrap_or(CATALOGUE_LIMIT);
     if !opts.is_empty() || !(1..=300).contains(&timeout) || !(1024..=1024 * 1024).contains(&limit) {
         return Err(invalid());
     }
+    // An explicitly requested role is resolved from the installed build's
+    // recorded source before the native read; a missing role input refuses the
+    // command instead of reporting a set that managed sessions would not see.
+    let extra = match role {
+        Some(role) => role_extra_args(&home, &case, role)?,
+        None => Vec::new(),
+    };
     let private = tempfile::Builder::new()
         .prefix("codex-skills-catalogue-")
         .tempdir()?;
@@ -121,6 +135,7 @@ fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
         &case,
         &home,
         upstream.as_deref(),
+        &extra,
         timeout,
         limit as usize,
         &root,
@@ -186,10 +201,31 @@ fn registered_upstream(home: &Path) -> io::Result<PathBuf> {
 }
 
 #[cfg_attr(not(windows), allow(unused_variables))]
+/// The `-c` pairs one explicitly requested role composes onto the native read:
+/// the installed build's resolved developer text and skill memberships,
+/// rendered exactly as the managed host renders them for its app-server child.
+fn role_extra_args(home: &Path, case: &Path, role: Role) -> io::Result<Vec<String>> {
+    harness_core::native_launcher::role_launch(
+        home,
+        case,
+        None,
+        &toml::Table::new(),
+        role,
+    )
+    .map(|launch| launch.args)
+    .map_err(|error| {
+        io::Error::other(format!(
+            "role context for --role {}: {error}; the catalogue refuses to report a set the managed session would not see",
+            role.label()
+        ))
+    })
+}
+
 fn native_catalogue(
     case: &Path,
     home: &Path,
     upstream: Option<&Path>,
+    extra: &[String],
     timeout: u64,
     limit: usize,
     root: &Path,
@@ -216,7 +252,7 @@ fn native_catalogue(
                 case,
                 working_directory: case,
                 home,
-                extra: &[],
+                extra,
                 root,
                 timeout: Duration::from_secs(timeout),
                 output_limit: 16 * 1024 * 1024,

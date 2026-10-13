@@ -8,8 +8,10 @@
 //! limits and every declared path are checked against the allocated checkout
 //! before a launcher process opens a model conversation, and the rendered
 //! brief carries the actual checkout, the committed base and the exact
-//! relative paths together with the executor's own work cycle and the compact
-//! evidence result the consumer expects back.
+//! relative paths together with the compact evidence result the consumer
+//! expects back. Standing responsibility guidance - the work cycle, base
+//! verification and the heavy-command lane - reaches a managed session once
+//! through its role context and is not restated in the brief.
 //!
 //! This module owns the installed exchange guidance for both dispatch paths:
 //! the structured brief renders it with the declared consumer, and a free-text
@@ -215,6 +217,11 @@ impl Assignment {
 /// Validates the declared paths and renders the brief the session receives.
 /// The same function serves dispatch and the model-free `executor assignment`
 /// path, so a lead can exercise the exact rendering without a model request.
+/// The brief carries the task-specific contract - outcome, checkout, base,
+/// owned paths, checks, consumer, feedback address and extra boundaries - and
+/// the compact result the consumer expects back. Standing responsibility
+/// guidance (work cycle, base verification, the heavy-command lane) reaches a
+/// managed session through its role context, so it is not restated here.
 pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Result<String> {
     assignment.validate_paths(context.checkout)?;
     let consumer = consumer_text(assignment);
@@ -246,15 +253,6 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
     push_list(&mut text, "invariants", &assignment.invariants);
     push_list(&mut text, "acceptance", &assignment.acceptance);
     push_lead_channel(&mut text, consumer, &escalations);
-    text.push_str(
-        "work cycle (yours): read the declared inputs yourself - source bodies are supplied only when reading is unavailable - investigate the current source and callers before editing, implement the outcome you own, run the applicable checks through the real entry point, then correct your own local errors and repeat.\n",
-    );
-    text.push_str(
-        "Before editing, verify the checkout is at the base above (git rev-parse HEAD) and report a mismatch instead of editing. Choose the installed skills this assignment needs and announce their first use. Keep every change inside the checkout and leave partial work resumable for a continuation.\n",
-    );
-    text.push_str(
-        "Run heavy builds and checks through codex-harness heavy -- PROGRAM ARGS. It queues against the shared account budget without a lead grant; keep the default account and budget unless the assignment explicitly authorizes another. Ordinary source reads and edits need no heavy-command slot.\n",
-    );
     text.push_str(
         &format!(
             "When the outcome is complete, report a compact result: done and remaining work, the checkout and base you worked from, the exact files touched, how each acceptance item was verified with the checks actually run, limitations, the decision you need from {consumer}, and where the full detail lives.\n"
@@ -647,17 +645,11 @@ mod tests {
         assert!(text.contains("- the named check passes"));
         assert!(text.contains(&format!("source: {}", source.display())));
         assert_eq!(text.matches("source:").count(), 1, "{text}");
-        assert!(
-            text.contains("verify the checkout is at the base above"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Choose the installed skills this assignment needs"),
-            "{text}"
-        );
-        // The result consumer, the escalation boundaries and the executor's
-        // own cycle are part of the rendered contract, not of the caller's
-        // prose.
+        // The result consumer and the escalation boundaries are part of the
+        // rendered contract, not of the caller's prose. Standing responsibility
+        // guidance (work cycle, base verification, the heavy-command lane)
+        // reaches a managed session through its role context instead of being
+        // restated in the brief.
         assert!(
             text.contains(&format!("consumer: {DEFAULT_CONSUMER}")),
             "{text}"
@@ -672,10 +664,16 @@ mod tests {
                 "{boundary}\n{text}"
             );
         }
-        assert!(
-            text.contains("work cycle (yours): read the declared inputs yourself"),
-            "{text}"
-        );
+        // The standing work-cycle, base-verification and heavy-command text is
+        // not restated in the brief: a managed session receives it once
+        // through its role context.
+        for standing in [
+            "work cycle (yours)",
+            "verify the checkout is at the base above",
+            "Run heavy builds and checks through codex-harness heavy",
+        ] {
+            assert!(!text.contains(standing), "{standing}\n{text}");
+        }
         assert!(
             text.contains("report a compact result: done and remaining work"),
             "{text}"
@@ -923,8 +921,8 @@ mod tests {
         .unwrap();
         let start = text.find("escalate to").expect("the rule is rendered");
         let end = text
-            .find("work cycle (yours)")
-            .expect("the executor's cycle follows the rule");
+            .find("When the outcome is complete, report a compact result")
+            .expect("the compact result the consumer expects follows the rule");
         let rendered = &text[start..end];
         assert_eq!(rendered.matches("escalate to").count(), 1, "{rendered}");
         assert!(

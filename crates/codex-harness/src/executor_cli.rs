@@ -9,8 +9,10 @@ use harness_core::orchestration_config::executor_session_args;
 use harness_core::orchestration_config::{
     self, EXECUTOR_SESSION_ENV, ProfileBinding, executor_profile, load,
 };
+use harness_core::native_launcher;
 use harness_core::process::{Job, Limits, StopReason};
 use harness_core::process_service::ServiceProcess;
+use harness_core::role_context::Role;
 use harness_core::task_control::ControlConnection;
 use harness_core::task_succession::{
     self, Boundary, NativeFacts, Reload, ReloadExpectation, Request as SuccessionRequest,
@@ -414,6 +416,40 @@ fn host_lead_session(
         plan.args.push("-c".into());
         plan.args.push(config.into());
     }
+    // The lead role is resolved from the installed build's recorded source
+    // before the app-server starts; a missing owned role input refuses this
+    // host with its exact cause and starts nothing. A resumed conversation
+    // reports that the earlier revision was not recorded: the new text
+    // applies to this host's turns only, never retroactively.
+    let role = native_launcher::role_launch(
+        &request.codex_home,
+        &request.source,
+        Some(&orchestration_config::profile_config(&request.codex_home, profile)?),
+        &toml::Table::new(),
+        Role::Lead,
+    )
+    .map_err(|error| {
+        invalid(&format!(
+            "lead role context: {error}; no app-server child was started; repair the registered build and its owned kit role sources (global/roles.toml and global/roles/*.md) before starting"
+        ))
+    })?;
+    plan.args.extend(role.args.iter().cloned().map(OsString::from));
+    plan.env
+        .insert("HARNESS_CONTEXT_ROLE".into(), Some(role.role.label().into()));
+    plan.env.insert(
+        "HARNESS_CONTEXT_REVISION".into(),
+        Some(role.revision.clone().into()),
+    );
+    println!(
+        "lead role context: role={} revision={} previous={}",
+        role.role.label(),
+        role.revision,
+        if request.session.is_some() {
+            "unrecorded (the earlier host's revision was not recorded; new turns use this revision)"
+        } else {
+            "none"
+        }
+    );
     println!(
         "lead session: profile={profile} model={} provider={} effort={} cwd={}",
         bound.model.as_deref().unwrap_or("default"),
@@ -958,6 +994,7 @@ fn continuation_route(
         presentation: NativePresentation::NativeTui,
         port: None,
         resume_session,
+        role: None,
     }))
 }
 
@@ -1133,6 +1170,70 @@ struct ControlReceipt {
     /// this session instead of creating another conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_session: Option<String>,
+    /// The responsibility-role composition resolved before anything launched:
+    /// the role, the owned revision it resolved at and the exact `-c` pairs
+    /// the host applies to its app-server child. Absent on a receipt written
+    /// before role recording existed; recovery is a fresh dispatch, resume or
+    /// restart, which records the current role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<RoleReceipt>,
+}
+
+/// One recorded role composition. `previous` describes the continued
+/// predecessor session only: its turns were produced under that revision (or
+/// before role recording at all), and the current revision reaches them only
+/// as context for new turns, never retroactively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RoleReceipt {
+    role: String,
+    revision: String,
+    args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<PreviousRole>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PreviousRole {
+    /// Whether the predecessor receipt recorded a role at all.
+    recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+}
+
+impl RoleReceipt {
+    /// The honest one-line report of the effective role: what this
+    /// conversation runs under now, and what the continued session ran under.
+    fn summary(&self) -> String {
+        let previous = match &self.previous {
+            None => "none".to_owned(),
+            Some(previous) if previous.recorded => format!(
+                "recorded revision={} (the continued session's earlier turns were produced under that revision, not this one)",
+                previous.revision.as_deref().unwrap_or("unrecorded")
+            ),
+            Some(_) => {
+                "unrecorded (the continued session's role predates role recording)".to_owned()
+            }
+        };
+        format!(
+            "role={} revision={} previous={previous}",
+            self.role, self.revision
+        )
+    }
+}
+
+/// The recorded role of one receipt document. A receipt written before role
+/// recording returns `None`: the host applies nothing and reports the role as
+/// unrecorded instead of inventing or re-resolving one at host time.
+fn role_from_receipt(value: &serde_json::Value) -> io::Result<Option<RoleReceipt>> {
+    let role = &value["control"]["role"];
+    if role.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(role.clone())
+        .map(Some)
+        .map_err(|error| invalid(&format!("dispatch receipt role context is invalid: {error}")))
 }
 
 /// Record schema of the control route inside one dispatch receipt.
@@ -1160,6 +1261,13 @@ impl HostRoute {
 
     fn presentation_label(&self) -> &'static str {
         self.control().presentation.as_str()
+    }
+
+    /// Records the role composition the dispatch resolved before launching.
+    fn set_role(&mut self, role: RoleReceipt) {
+        match self {
+            Self::Control(control) => control.role = Some(role),
+        }
     }
 }
 
@@ -1249,6 +1357,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         presentation: request.mode.presentation(),
         port: None,
         resume_session: None,
+        role: None,
     }));
     Ok(PreparedDispatch {
         binding,
@@ -1581,7 +1690,7 @@ fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Er
 fn launch_bound(
     request: &Dispatch,
     binding: &SlotBinding,
-    route: HostRoute,
+    mut route: HostRoute,
     bound: &ProfileBinding,
     paths: &RunPaths,
 ) -> io::Result<i32> {
@@ -1617,6 +1726,29 @@ fn launch_bound(
             binding.owner
         )));
     }
+    // The managed role composition is resolved from the installed build's
+    // recorded source before anything launches: missing or inconsistent owned
+    // role inputs refuse the dispatch here, with the slot still bound and
+    // reused by the next dispatch and with no launcher or model request,
+    // instead of hosting a conversation without its responsibility role.
+    let role = executor_role_receipt(request, binding, &paths.receipt)?;
+    println!(
+        "executor role context: role={} revision={}{}",
+        role.role,
+        role.revision,
+        role.previous
+            .as_ref()
+            .map(|previous| if previous.recorded {
+                format!(
+                    " previous={} (the continued session's earlier turns keep the revision they ran under)",
+                    previous.revision.as_deref().unwrap_or("unrecorded")
+                )
+            } else {
+                " previous=unrecorded (the continued session predates role recording)".to_owned()
+            })
+            .unwrap_or_default()
+    );
+    route.set_role(role);
     // Managed spellings, including exact-session resume and fresh restart,
     // record native coverage. A legacy launcher receipt still records coverage
     // when its mode is observed exec; it does not guess an identity for a
@@ -1661,6 +1793,73 @@ fn launch_bound(
             &launcher, request, binding, &receipt, bound, &route, &shell, &run, &lead,
         )
     }
+}
+
+/// The managed executor role resolved before launch. The installed build's
+/// recorded source supplies the owned role inputs; a missing or inconsistent
+/// input refuses the dispatch with the exact cause, keeping the slot bound for
+/// the next dispatch and making no launcher or model request.
+fn executor_role_receipt(
+    request: &Dispatch,
+    binding: &SlotBinding,
+    receipt: &Path,
+) -> io::Result<RoleReceipt> {
+    let profile = orchestration_config::profile_config(request.codex_home, request.profile)?;
+    let launch = native_launcher::role_launch(
+        request.codex_home,
+        &binding.path,
+        Some(&profile),
+        &toml::Table::new(),
+        Role::Executor,
+    )
+    .map_err(|error| {
+        invalid(&format!(
+            "executor role context: {error}; slot {} stays bound to {} and is reused by the next dispatch, no launcher or model request was made; repair the registered build and its owned kit role sources (global/roles.toml and global/roles/*.md) before dispatching",
+            binding.index, binding.owner
+        ))
+    })?;
+    Ok(RoleReceipt {
+        role: launch.role.label().to_owned(),
+        revision: launch.revision,
+        args: launch.args,
+        previous: previous_role(receipt, request.resumed_session.is_some())?,
+    })
+}
+
+/// What the continued predecessor session recorded about its role. Only a
+/// resume or restart asks; a fresh spawn continues nothing and records no
+/// predecessor claim. The predecessor receipt is read before this dispatch
+/// replaces it.
+fn previous_role(receipt: &Path, continues_session: bool) -> io::Result<Option<PreviousRole>> {
+    if !continues_session {
+        return Ok(None);
+    }
+    let bytes = match fs::read(receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(PreviousRole {
+                recorded: false,
+                revision: None,
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the dispatch receipt {} continues a session but is not JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    Ok(Some(match role_from_receipt(&value)? {
+        Some(role) => PreviousRole {
+            recorded: true,
+            revision: Some(role.revision),
+        },
+        None => PreviousRole {
+            recorded: false,
+            revision: None,
+        },
+    }))
 }
 
 /// The observable outcome of slot allocation: the lead reads the mapping here
@@ -2178,6 +2377,11 @@ struct WatchReport {
     session: Option<String>,
     checkout: Option<String>,
     base: Option<String>,
+    /// The responsibility role this run continues under, for a control-backed
+    /// receipt: the effective role and revision plus what the continued
+    /// session recorded. Absent for receipts that run the launcher directly,
+    /// which composes the role itself.
+    role: Option<String>,
     changed: Option<ChangedReport>,
     returned: Option<String>,
     returned_bytes: Option<u64>,
@@ -2206,6 +2410,18 @@ impl WatchReport {
             .as_deref()
             .and_then(|checkout| changed_report(checkout, base.as_deref()));
         let returned = run.result.as_deref().and_then(read_returned);
+        let role = if value
+            .get("control")
+            .is_some_and(|control| !control.is_null())
+        {
+            Some(match role_from_receipt(value) {
+                Ok(Some(role)) => role.summary(),
+                Ok(None) => "unrecorded (receipt written before role recording; resume or restart records the current role)".to_owned(),
+                Err(error) => format!("invalid ({error})"),
+            })
+        } else {
+            None
+        };
         Self {
             state: state.to_owned(),
             cause,
@@ -2214,6 +2430,7 @@ impl WatchReport {
             session: run.recorded_session().map(str::to_owned),
             checkout: checkout.map(|path| path.display().to_string()),
             base,
+            role,
             changed,
             returned: returned.as_ref().map(|(text, _, _)| text.clone()),
             returned_bytes: returned.as_ref().map(|(_, bytes, _)| *bytes),
@@ -2257,6 +2474,9 @@ impl WatchReport {
             self.owner.as_deref().unwrap_or("-"),
             self.session.as_deref().unwrap_or("-")
         ));
+        if let Some(role) = &self.role {
+            text.push_str(&format!("role: {role}\n"));
+        }
         text.push_str(&format!(
             "checkout: {} base: {}\n",
             self.checkout.as_deref().unwrap_or("unavailable"),
@@ -2343,6 +2563,7 @@ impl WatchReport {
             "session": self.session,
             "checkout": self.checkout,
             "base": self.base,
+            "role": self.role,
             "changedFiles": self.changed.as_ref().map(|changed| json!({
                 "count": changed.count(),
                 "committed": changed.committed,
@@ -3539,6 +3760,28 @@ fn run_control_receipt(
     {
         plan.args.push("-c".into());
         plan.args.push(config.into());
+    }
+    // The role composition recorded at dispatch travels to the app-server
+    // child exactly as it was resolved, after the profile overrides so the
+    // owned developer text and skill memberships win, and the child's own
+    // environment names the effective role and revision. A receipt written
+    // before role recording applies nothing and is reported as unrecorded
+    // rather than re-resolved at host time.
+    match role_from_receipt(value)? {
+        Some(role) => {
+            plan.args
+                .extend(role.args.iter().cloned().map(OsString::from));
+            plan.env
+                .insert("HARNESS_CONTEXT_ROLE".into(), Some(role.role.clone().into()));
+            plan.env.insert(
+                "HARNESS_CONTEXT_REVISION".into(),
+                Some(role.revision.clone().into()),
+            );
+            println!("role context: {}", role.summary());
+        }
+        None => println!(
+            "role context: unrecorded (this receipt was written before role recording); the app-server child starts without owned role text, and resume or restart of this slot records the current role"
+        ),
     }
     plan.env.insert("PATH".into(), Some(shell.path.clone()));
     if let Some(generation) = value["originatingLead"]["runGeneration"]
@@ -7372,20 +7615,33 @@ mod tests {
         let observed =
             RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
         let exec = root.join("spawn-1.json");
+        // The dispatch resolves the managed role before launch and records it
+        // on the route: this is the exact record the host applies later.
+        let mut route = HostRoute::Control(Box::new(ControlReceipt {
+            schema: CONTROL_SCHEMA,
+            assignment: assignment.to_owned(),
+            original_assignment: None,
+            identity: BoundIdentity::resolve(&bound),
+            presentation: NativePresentation::NativeInline,
+            port: None,
+            resume_session: None,
+            role: None,
+        }));
+        route.set_role(RoleReceipt {
+            role: "executor".into(),
+            revision: "fixture-revision".into(),
+            args: vec![
+                "-c".into(),
+                "developer_instructions=Executor text".into(),
+            ],
+            previous: None,
+        });
         save_receipt(
             &exec,
             Path::new(r"C:\home\harness\bin\codex.exe"),
             "ds",
             SpawnMode::Exec,
-            &HostRoute::Control(Box::new(ControlReceipt {
-                schema: CONTROL_SCHEMA,
-                assignment: assignment.to_owned(),
-                original_assignment: None,
-                identity: BoundIdentity::resolve(&bound),
-                presentation: NativePresentation::NativeInline,
-                port: None,
-                resume_session: None,
-            })),
+            &route,
             &bound,
             None,
             "windows-terminal-tab",
@@ -7410,6 +7666,15 @@ mod tests {
         );
         assert_eq!(value["control"]["schema"], 1, "{value}");
         assert_eq!(value["control"]["assignment"], assignment, "{value}");
+        let recorded = role_from_receipt(&value).unwrap().unwrap();
+        assert_eq!(recorded.role, "executor");
+        assert_eq!(recorded.revision, "fixture-revision");
+        assert_eq!(
+            recorded.args,
+            ["-c", "developer_instructions=Executor text"],
+            "the exact composed pairs are recorded for the host: {value}"
+        );
+        assert!(recorded.previous.is_none(), "{value}");
         assert_eq!(value["control"]["identity"]["profile"], "ds", "{value}");
         assert_eq!(value["control"]["identity"]["model"], "deepseek-flash");
         assert_eq!(value["control"]["identity"]["modelProvider"], "deepseek");
@@ -7436,6 +7701,7 @@ mod tests {
                 presentation: NativePresentation::NativeTui,
                 port: None,
                 resume_session: None,
+                role: None,
             })),
             &bound,
             None,
@@ -7450,9 +7716,143 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&tui).unwrap()).unwrap();
         assert_eq!(value["mode"], "tui");
         assert_eq!(value["control"]["presentation"], "native-tui");
+        assert!(
+            value["control"].get("role").is_none(),
+            "a receipt without a resolved role omits the field instead of inventing one: {value}"
+        );
         assert_eq!(value["args"], json!([]), "{value}");
         assert_eq!(value["observation"]["coverage"], "native");
         assert_eq!(value["control"]["assignment"], assignment);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The role record round-trips through the receipt JSON exactly as the
+    /// dispatch resolved it, and the one-line summary distinguishes this
+    /// conversation's effective revision from what a continued predecessor ran
+    /// under, without implying the old turns loaded the new text.
+    #[test]
+    fn role_receipts_round_trip_and_summarize_effective_and_previous_revisions() {
+        let value = json!({
+            "control": {
+                "schema": 1,
+                "role": {
+                    "role": "executor",
+                    "revision": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "args": ["-c", "developer_instructions=Executor text"]
+                }
+            }
+        });
+        let role = role_from_receipt(&value).unwrap().unwrap();
+        assert_eq!(role.role, "executor");
+        assert_eq!(role.args, ["-c", "developer_instructions=Executor text"]);
+        assert!(role.previous.is_none());
+        let summary = role.summary();
+        assert!(summary.contains("role=executor"), "{summary}");
+        assert!(summary.contains("revision=0123456789abcdef"), "{summary}");
+        assert!(summary.contains("previous=none"), "{summary}");
+
+        let resumed = json!({
+            "control": {
+                "role": {
+                    "role": "executor",
+                    "revision": "new-revision",
+                    "args": [],
+                    "previous": {"recorded": true, "revision": "old-revision"}
+                }
+            }
+        });
+        let summary = role_from_receipt(&resumed).unwrap().unwrap().summary();
+        assert!(summary.contains("revision=new-revision"), "{summary}");
+        assert!(summary.contains("old-revision"), "{summary}");
+        assert!(
+            summary.contains("not this one"),
+            "the summary must not imply the old turns loaded the new text: {summary}"
+        );
+
+        // A receipt written before role recording applies nothing and reports
+        // that instead of re-resolving a role at host time.
+        assert!(
+            role_from_receipt(&json!({"control": {"schema": 1}}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(role_from_receipt(&json!({})).unwrap().is_none());
+
+        // A damaged record is refused instead of being silently ignored.
+        let error = role_from_receipt(&json!({"control": {"role": {"role": "executor"}}}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("dispatch receipt role context is invalid"),
+            "{error}"
+        );
+    }
+
+    /// The predecessor role is read from the receipt this dispatch is about to
+    /// replace: a recorded revision is reported honestly, a receipt written
+    /// before role recording (or one that never existed) reports unrecorded,
+    /// and a fresh spawn continues nothing and makes no predecessor claim.
+    #[test]
+    fn previous_role_is_read_before_the_receipt_is_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "executor-previous-role-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("spawn-1.json");
+        assert!(previous_role(&receipt, false).unwrap().is_none());
+        fs::write(&receipt, json!({"schema": 1}).to_string()).unwrap();
+        let previous = previous_role(&receipt, true).unwrap().unwrap();
+        assert!(!previous.recorded);
+        assert!(previous.revision.is_none());
+        fs::write(
+            &receipt,
+            json!({"control": {"role": {"role": "executor", "revision": "kept-revision", "args": []}}})
+                .to_string(),
+        )
+        .unwrap();
+        let previous = previous_role(&receipt, true).unwrap().unwrap();
+        assert!(previous.recorded);
+        assert_eq!(previous.revision.as_deref(), Some("kept-revision"));
+        let absent = previous_role(&root.join("absent.json"), true).unwrap().unwrap();
+        assert!(!absent.recorded, "a missing receipt records no role");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A watched control-backed receipt reports the role it continues under:
+    /// the recorded summary, an explicit unrecorded marker for receipts
+    /// written before role recording, and nothing for receipts that run the
+    /// launcher directly, which composes the role itself.
+    #[test]
+    fn watch_reports_the_recorded_role_and_marks_legacy_receipts_unrecorded() {
+        let root =
+            std::env::temp_dir().join(format!("executor-watch-role-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("spawn-1.json");
+        let run =
+            RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
+        let recorded = json!({
+            "control": {"role": {"role": "executor", "revision": "watch-revision", "args": []}}
+        });
+        let report = WatchReport::build(&receipt, &recorded, &run, STATE_ACCEPTED, None);
+        let text = report.text();
+        assert!(
+            text.contains("role: role=executor revision=watch-revision previous=none"),
+            "{text}"
+        );
+        assert_eq!(
+            report.json()["role"],
+            json!("role=executor revision=watch-revision previous=none")
+        );
+        let legacy = json!({"control": {"schema": 1}});
+        let report = WatchReport::build(&receipt, &legacy, &run, STATE_ACCEPTED, None);
+        let text = report.text();
+        assert!(text.contains("role: unrecorded"), "{text}");
+        let direct = json!({"mode": "exec"});
+        let report = WatchReport::build(&receipt, &direct, &run, STATE_ACCEPTED, None);
+        assert!(report.role.is_none(), "{}", report.text());
         let _ = fs::remove_dir_all(&root);
     }
 

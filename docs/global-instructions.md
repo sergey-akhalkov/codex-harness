@@ -37,12 +37,21 @@ remain part of guidance-load accounting; moving text does not establish a
 reduction or a behavioral improvement.
 
 The ordinary local launcher resolves the role before startup and composes it
-with the applicable native profile, project and session context. Maintenance
-commands and remote attachments retain their existing path. Managed executor
-application, removal of the renderer's old standing guidance, recovery and
-global acceptance remain unfinished in
-[the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md).
-Source and fixture checks do not establish installed consumption.
+with the applicable native profile, project and session context. Managed
+dispatch, resume, restart, run and succeed resolve the executor role, and the
+harness-hosted lead session resolves the lead role; the control receipt
+records the role and its owned revision and reports both on resume or restart,
+so older turns are never claimed to have loaded newer text. A receipt written
+before role recording reports `role context: unrecorded` until a fresh
+dispatch, resume or restart records the current role. The renderer no longer
+restates the standing responsibility guidance - it reaches a managed session
+once through its role context - while the brief keeps the task-specific
+outcome, checkout, base, owned paths, checks, consumer, feedback address and
+extra boundaries. Maintenance commands and remote attachments retain their
+existing path. Installed consumption, real-task acceptance and global
+delivery remain unfinished in
+[the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md);
+source and fixture checks do not establish effective consumption.
 
 ## Update and scope
 

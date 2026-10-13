@@ -294,14 +294,16 @@ fn dry_run_renders_the_bound_checkout_base_and_exact_paths() {
     assert!(text.contains("- existing_child.rs"), "{text}");
     assert!(text.contains("- crates/new/module.rs"), "{text}");
     assert!(text.contains("- the synthetic check passes"), "{text}");
-    assert!(
-        text.contains("verify the checkout is at the base above"),
-        "{text}"
-    );
-    assert!(
-        text.contains("Choose the installed skills this assignment needs"),
-        "{text}"
-    );
+    // Standing responsibility guidance (work cycle, base verification, the
+    // heavy-command lane) reaches a managed session through its role context
+    // and is not restated in the brief.
+    for standing in [
+        "work cycle (yours)",
+        "verify the checkout is at the base above",
+        "Choose the installed skills this assignment needs",
+    ] {
+        assert!(!text.contains(standing), "{standing}\n{text}");
+    }
     // The check is read-only: the slot keeps exactly the state it had and no
     // state root is written.
     assert_eq!(
@@ -376,8 +378,8 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "{text}"
     );
     assert!(
-        text.contains("work cycle (yours): read the declared inputs yourself"),
-        "{text}"
+        !text.contains("work cycle (yours)"),
+        "standing guidance reaches a managed session through its role context, not the brief: {text}"
     );
     assert!(
         text.contains("report a compact result: done and remaining work"),

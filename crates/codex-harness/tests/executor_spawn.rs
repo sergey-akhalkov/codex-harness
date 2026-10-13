@@ -29,6 +29,9 @@ use windows_sys::Win32::{
     },
 };
 
+#[path = "fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
+
 /// Documented JOB_OBJECT_QUERY right (winnt.h); windows-sys does not export the
 /// job access rights. A query-only handle can neither assign, configure nor
 /// terminate the object it opens.
@@ -1089,6 +1092,72 @@ fn resume_rebinds_the_interrupted_slot_without_resetting_partial_work() {
     );
     assert!(partial.is_file());
     assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
+    fixture.drop();
+}
+
+/// A dispatch whose installed build cannot supply the executor role refuses
+/// before any launcher or model request, names the exact missing input, keeps
+/// the slot bound and stays recoverable by the next dispatch.
+#[test]
+fn pooled_spawn_refuses_missing_role_inputs_before_any_launcher_or_shell() {
+    let fixture = Fixture::new("role-preflight", 1);
+    // The launcher file exists, so the refusal below can only come from the
+    // role preflight, which resolves before the shell diagnostic spawns it.
+    fs::create_dir_all(fixture.home.join("harness/bin")).unwrap();
+    fs::write(
+        fixture.home.join("harness/bin/codex.exe"),
+        b"not an executable",
+    )
+    .unwrap();
+
+    // No launch registration is installed: the refusal names that exact file,
+    // and the dispatch stops inside the managed path, after the pool work and
+    // before any shell or host.
+    let refused = fixture.spawn(&["--owner", "exec-role"]);
+    let text = output_text(&refused);
+    assert!(!refused.status.success(), "{text}");
+    assert!(text.contains("executor presentation:"), "{text}");
+    assert!(text.contains("executor role context:"), "{text}");
+    assert!(
+        text.contains("no native launch registration is installed"),
+        "{text}"
+    );
+    assert!(text.contains("native-launch.json"), "{text}");
+    assert!(text.contains("slot 1 stays bound to exec-role"), "{text}");
+    assert!(
+        !text.contains("executor shell:"),
+        "the shell diagnostic must not run before the role resolves: {text}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(pooled_receipt_path(&fixture.home, 1)).unwrap()).unwrap();
+    assert!(
+        receipt["control"].is_null(),
+        "no host ran, so no control receipt was written: {receipt}"
+    );
+    let partial = fixture.slot(1).join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+
+    // The registration is installed, but the recorded build's owned executor
+    // role source is missing: the refusal names that exact source, and the
+    // interrupted slot keeps its partial work for the next dispatch.
+    let source = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &source);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+    fs::remove_file(source.join("global/executor.md")).unwrap();
+    let refused = fixture.spawn(&["--owner", "exec-role"]);
+    let text = output_text(&refused);
+    assert!(!refused.status.success(), "{text}");
+    assert!(text.contains("executor role context:"), "{text}");
+    assert!(text.contains("global/executor.md"), "{text}");
+    assert!(text.contains("slot 1 stays bound to exec-role"), "{text}");
+    assert!(!text.contains("executor shell:"), "{text}");
+    assert!(
+        partial.is_file(),
+        "the interrupted slot keeps its partial work: {text}"
+    );
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+    assert_eq!(fixture.record(1)["state"], "occupied");
+    assert_eq!(fixture.record(1)["owner"], "exec-role");
     fixture.drop();
 }
 

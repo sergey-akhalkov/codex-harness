@@ -2051,6 +2051,66 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
     assert!(watched_text.contains(FINAL), "{watched_text}");
 }
 
+/// A dispatch receipt that recorded a responsibility role applies it to the
+/// hosted conversation: the host reports the effective role and its revision,
+/// and the ordinary control route still completes the run.
+#[test]
+fn a_recorded_role_composition_reaches_the_hosted_conversation() {
+    let pooled = Pooled::new("role-recorded", Answer::Result(thread_start_answer()), true);
+    let mut receipt = pooled.receipt();
+    receipt["control"]["role"] = json!({
+        "role": "executor",
+        "revision": "fixture-revision",
+        "args": [
+            "-c",
+            "developer_instructions=\"Fixture executor responsibility\""
+        ]
+    });
+    fs::write(
+        &pooled.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the assignment reaches the thread under the recorded role",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("role context: role=executor revision=fixture-revision previous=none"),
+        "{text}"
+    );
+    assert!(text.contains("state: turn completed (completed)"), "{text}");
+    assert!(text.contains("result: completed"), "{text}");
+}
+
+/// A receipt written before role recording applies no owned role text and says
+/// so; the conversation still hosts and completes, and a later resume or
+/// restart records the current role on its own dispatch.
+#[test]
+fn a_legacy_receipt_without_a_recorded_role_still_hosts_and_reports_unrecorded() {
+    let pooled = Pooled::new("role-legacy", Answer::Result(thread_start_answer()), true);
+    assert!(pooled.receipt()["control"]["role"].is_null());
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the assignment reaches the thread with no recorded role",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("role context: unrecorded"),
+        "a legacy receipt reports its unrecorded role instead of inventing one: {text}"
+    );
+    assert!(text.contains("result: completed"), "{text}");
+}
+
 /// The non-DeepSeek identity the cache-guard dispatches run with: support is
 /// proven at runtime, so no vendor name may be required to monitor a run or to
 /// stop a losing one.

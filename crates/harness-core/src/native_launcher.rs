@@ -224,6 +224,68 @@ pub fn codex_home() -> io::Result<PathBuf> {
     home.canonicalize()
 }
 
+/// One composed responsibility role for a managed native invocation: the role
+/// itself, the owned revision its inputs resolved at, and the exact
+/// `-c key=value` argument pairs that carry its developer text and skill
+/// memberships. The pairs render exactly as the ordinary launcher renders its
+/// composed context, so a recorded plan and the launcher apply one mechanism.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RoleLaunch {
+    pub role: crate::role_context::Role,
+    pub revision: String,
+    pub args: Vec<String>,
+}
+
+/// Compose one responsibility role for a managed native invocation from the
+/// source root the selected installed build recorded. Fails before any model
+/// request when the registration, the build record or the owned role inputs
+/// are missing, incomplete or inconsistent; no partial composition is
+/// returned and nothing is mutated.
+pub fn role_launch(
+    home: &Path,
+    working_directory: &Path,
+    profile: Option<&toml::Table>,
+    session: &toml::Table,
+    role: crate::role_context::Role,
+) -> io::Result<RoleLaunch> {
+    let registration_path = home.join("harness/native-launch.json");
+    let mut bytes = Vec::new();
+    File::open(&registration_path)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "no native launch registration is installed at {} ({error}); install or repair the registered build before starting a managed session",
+                registration_path.display()
+            ))
+        })?
+        .take(REGISTRATION_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > REGISTRATION_LIMIT {
+        return Err(fail("native launch registration exceeds its bound"));
+    }
+    let registration: Registration = serde_json::from_slice(&bytes)
+        .map_err(|_| fail("invalid native launch registration; explicit repair is required"))?;
+    let (selected, _shared, _digest) = registered_runtime(&registration)?;
+    let record = build_identity::read_record(&selected)?;
+    let resolved = crate::role_context::resolve(&record.source_root, role)?;
+    let retained = crate::portable_config::retained_role_config(
+        home,
+        working_directory,
+        profile,
+        session,
+    )?;
+    let overrides = resolved.native_overrides(&retained)?;
+    let args = launcher::with_context_overrides(&[], &overrides)
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    Ok(RoleLaunch {
+        role,
+        revision: resolved.revision,
+        args,
+    })
+}
+
 /// Registration is produced by explicit installation. Ordinary launch performs
 /// no discovery, compilation, package acquisition or registration mutation.
 fn prepared_command(
@@ -3053,6 +3115,198 @@ mod tests {
         let error = command(&fixture.launcher, &fixture.home, &args).unwrap_err();
         assert!(error.to_string().contains("global/executor.md"), "{error}");
         assert!(command(&fixture.launcher, &fixture.home, &["--help".into()]).is_ok());
+    }
+
+    /// The managed `role_launch` and the ordinary launcher share one resolver:
+    /// for the same installed build and working directory, each role composes
+    /// its own developer text and records the owned revision of exactly the
+    /// inputs it read. A change to one role's text moves that role's revision
+    /// only.
+    #[test]
+    fn role_launch_composes_each_role_from_the_recorded_build() {
+        let fixture = Fixture::new();
+        let cwd = fixture.root.join("source");
+        let lead = role_launch(
+            &fixture.home,
+            &cwd,
+            None,
+            &toml::Table::new(),
+            crate::role_context::Role::Lead,
+        )
+        .unwrap();
+        let executor = role_launch(
+            &fixture.home,
+            &cwd,
+            None,
+            &toml::Table::new(),
+            crate::role_context::Role::Executor,
+        )
+        .unwrap();
+        assert_eq!(lead.role, crate::role_context::Role::Lead);
+        assert_eq!(executor.role, crate::role_context::Role::Executor);
+        assert_ne!(lead.revision, executor.revision);
+        assert_eq!(
+            lead.revision,
+            role_launch(
+                &fixture.home,
+                &cwd,
+                None,
+                &toml::Table::new(),
+                crate::role_context::Role::Lead,
+            )
+            .unwrap()
+            .revision,
+            "an unchanged role resolves to the same revision"
+        );
+        let lead_text = effective_developer(&lead.args, &cwd);
+        assert!(
+            lead_text.contains("Fixture lead responsibility"),
+            "{lead_text}"
+        );
+        assert!(
+            !lead_text.contains("Fixture executor responsibility"),
+            "{lead_text}"
+        );
+        let executor_text = effective_developer(&executor.args, &cwd);
+        assert!(
+            executor_text.contains("Fixture executor responsibility"),
+            "{executor_text}"
+        );
+        assert!(
+            !executor_text.contains("Fixture lead responsibility"),
+            "{executor_text}"
+        );
+        fs::write(
+            fixture.root.join("source/global/executor.md"),
+            "Changed executor responsibility",
+        )
+        .unwrap();
+        let changed = role_launch(
+            &fixture.home,
+            &cwd,
+            None,
+            &toml::Table::new(),
+            crate::role_context::Role::Executor,
+        )
+        .unwrap();
+        assert_ne!(executor.revision, changed.revision);
+        assert_eq!(
+            lead.revision,
+            role_launch(
+                &fixture.home,
+                &cwd,
+                None,
+                &toml::Table::new(),
+                crate::role_context::Role::Lead,
+            )
+            .unwrap()
+            .revision,
+            "the other role's revision is independent"
+        );
+    }
+
+    /// A missing owned role input or launch registration refuses the
+    /// composition before any model request and names the exact input.
+    /// Resolution validates every role's owned inputs, so an incomplete kit
+    /// refuses both roles instead of returning a partial composition.
+    #[test]
+    fn role_launch_refuses_missing_role_inputs_and_registration() {
+        let fixture = Fixture::new();
+        let cwd = fixture.root.join("source");
+        fs::remove_file(fixture.root.join("source/global/executor.md")).unwrap();
+        let error = role_launch(
+            &fixture.home,
+            &cwd,
+            None,
+            &toml::Table::new(),
+            crate::role_context::Role::Executor,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("global/executor.md"), "{error}");
+        let error = role_launch(
+            &fixture.home,
+            &cwd,
+            None,
+            &toml::Table::new(),
+            crate::role_context::Role::Lead,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("global/executor.md"),
+            "an incomplete kit refuses both roles: {error}"
+        );
+        fs::remove_file(fixture.home.join("harness/native-launch.json")).unwrap();
+        let error = role_launch(
+            &fixture.home,
+            &cwd,
+            None,
+            &toml::Table::new(),
+            crate::role_context::Role::Lead,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("no native launch registration is installed"),
+            "{error}"
+        );
+        assert!(error.contains("native-launch.json"), "{error}");
+    }
+
+    /// The composition keeps ordinary native precedence (user < profile <
+    /// session for developer text) and carries only the owned developer text
+    /// and skill memberships: model, provider and effort are never overridden
+    /// by the role.
+    #[test]
+    fn role_launch_preserves_explicit_profile_and_session_guidance() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.home.join("custom.config.toml"),
+            "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'high'\ndeveloper_instructions = 'Profile guidance'\n",
+        )
+        .unwrap();
+        let session: toml::Table =
+            toml::from_str("developer_instructions = 'Session guidance'").unwrap();
+        let profile =
+            crate::orchestration_config::profile_config(&fixture.home, "custom").unwrap();
+        let launch = role_launch(
+            &fixture.home,
+            &fixture.root.join("source"),
+            Some(&profile),
+            &session,
+            crate::role_context::Role::Lead,
+        )
+        .unwrap();
+        let args: Vec<OsString> = launch.args.iter().map(OsString::from).collect();
+        let context = launcher::context_arguments(&args, &fixture.root)
+            .unwrap()
+            .unwrap();
+        let effective = crate::portable_config::context_overrides(&context.overrides).unwrap();
+        let developer = effective["developer_instructions"].as_str().unwrap();
+        assert!(
+            developer.contains("Fixture lead responsibility"),
+            "{developer}"
+        );
+        assert!(developer.contains("Session guidance"), "{developer}");
+        assert!(!developer.contains("Profile guidance"), "{developer}");
+        assert!(!developer.contains("Fixture executor responsibility"), "{developer}");
+        assert!(!effective.contains_key("model"), "{effective:?}");
+        assert!(!effective.contains_key("model_reasoning_effort"), "{effective:?}");
+    }
+
+    /// The effective owned developer text of a composed role argument list,
+    /// read back through the same native context parser the launcher uses.
+    fn effective_developer(args: &[String], cwd: &Path) -> String {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let context = launcher::context_arguments(&args, cwd)
+            .unwrap()
+            .unwrap();
+        crate::portable_config::context_overrides(&context.overrides).unwrap()
+            ["developer_instructions"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     #[test]

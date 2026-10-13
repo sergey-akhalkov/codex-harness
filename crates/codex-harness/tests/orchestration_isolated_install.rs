@@ -154,6 +154,28 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert_eq!(delivery.guidance, ["team-lead", "board-workflow"]);
     assert!(delivery.guidance_missing.is_empty());
     assert_eq!(delivery.executor_profiles, ["ds"]);
+    assert_eq!(
+        delivery
+            .roles
+            .iter()
+            .map(|state| (state.role, state.status))
+            .collect::<Vec<_>>(),
+        [("lead", "resolved"), ("executor", "resolved")],
+        "the role inputs this checkout owns resolve for delivery"
+    );
+    let role_revision = |role: &str| {
+        delivery
+            .roles
+            .iter()
+            .find(|state| state.role == role)
+            .and_then(|state| state.revision.clone())
+            .unwrap()
+    };
+    let lead_revision = role_revision("lead");
+    let executor_revision = role_revision("executor");
+    assert!(!lead_revision.is_empty());
+    assert!(!executor_revision.is_empty());
+    assert_ne!(lead_revision, executor_revision);
     let configured = orchestration_config::load(&source).unwrap();
     assert_eq!(
         delivery.max_concurrent_executors,

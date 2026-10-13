@@ -6,6 +6,8 @@
 mod native_sampling;
 #[path = "fixtures/skill_catalog_responses.rs"]
 mod skill_catalog_responses;
+#[path = "fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
 
 use harness_core::{
     build_identity,
@@ -2446,6 +2448,121 @@ fn catalogue_without_native_discovery_is_explicit_and_never_scans() {
     assert!(
         !text.contains("local_probe"),
         "unavailable native discovery must not fall back to a local scan: {text}"
+    );
+}
+
+/// An explicitly requested role resolves before the native read: a home whose
+/// installed build cannot supply the role refuses with the exact missing
+/// input instead of reporting a set the managed session would not see.
+#[test]
+fn catalogue_role_refuses_missing_role_inputs_before_the_native_read() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-refusal-")
+        .tempdir()
+        .unwrap();
+    let case = root.path().join("case");
+    let home = root.path().join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .args(["--role", "lead"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a role the installed build cannot supply refuses the command"
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("role context for --role lead"), "{text}");
+    assert!(
+        text.contains("no native launch registration is installed"),
+        "{text}"
+    );
+}
+
+/// The role the catalogue composes onto the native read reaches the discovery
+/// child exactly as a managed session's host renders it: the owned developer
+/// text and the skill memberships travel as `-c` pairs on the app-server
+/// invocation. The discovery double fails its first request on purpose, so
+/// the private evidence root with the exact request survives for reading.
+#[test]
+fn catalogue_role_composes_developer_text_and_memberships_onto_the_native_read() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-composition-")
+        .tempdir()
+        .unwrap();
+    let case = root.path().join("case");
+    let home = root.path().join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let source = synthetic_role_build::kit_source(root.path());
+    let build = synthetic_role_build::recorded_build(root.path(), &source);
+    synthetic_role_build::register(&home, root.path(), &build);
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .arg("--upstream")
+        .arg(&upstream)
+        .args(["--role", "executor"])
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "discovery")
+        .env("HARNESS_DISCOVERY_FIXTURE", "init-error")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let evidence = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("native skill discovery failed; private evidence: "))
+        .expect("the refused discovery names its private evidence root")
+        .trim()
+        .to_owned();
+    let request: Value = serde_json::from_slice(
+        &fs::read(Path::new(&evidence).join("request.json")).unwrap(),
+    )
+    .unwrap();
+    let arguments: Vec<&str> = request["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(arguments[0], "app-server", "{arguments:?}");
+    assert_eq!(arguments[1], "--stdio", "{arguments:?}");
+    let developer = arguments
+        .iter()
+        .find(|argument| argument.starts_with("developer_instructions="))
+        .expect("the executor developer text travels as an override");
+    assert!(
+        developer.contains("Fixture executor responsibility"),
+        "{developer}"
+    );
+    let memberships = arguments
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the role's skill memberships travel as an override");
+    assert!(memberships.contains("coordinate"), "{memberships}");
+    assert!(memberships.contains("SKILL.md"), "{memberships}");
+    assert!(memberships.contains("enabled = false"), "{memberships}");
+    assert!(
+        !memberships.contains("shared"),
+        "an allowed shared skill stays enabled: {memberships}"
     );
 }
 
