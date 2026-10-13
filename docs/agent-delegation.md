@@ -187,15 +187,19 @@ Missing or inconsistent role inputs refuse with their exact cause before any
 launcher or model request; a dispatch keeps its slot bound and recoverable
 instead of hosting a conversation without its responsibility role.
 
-Each control receipt records the role, its owned revision and what a
+Each control receipt records the role, the revision this dispatch resolved,
+the developer text a native thread is known to save (`saved`) and what a
 continued predecessor recorded. Resume and restart re-resolve the role at the
 new dispatch, record it and report the effective state honestly
-(`role context: ...`): a fresh start consumes the role text the receipt
-names, while a resumed native thread keeps the developer text saved at its
-start (skills the live catalogue gained still refresh), and no turn is
-claimed to have loaded newer text. A receipt written before role
-recording reports `role context: unrecorded`: it stays usable, and the next
-fresh dispatch, resume or restart records the current role.
+(`role context: role=... revision=... saved=... previous=...`): a fresh start
+or restart consumes the role text the current dispatch resolved, while a
+resumed native thread keeps the developer text saved at its start, carried
+forward unchanged across repeated resumes (skills the live catalogue gained
+still refresh); no report names the freshly resolved revision as text a
+resumed thread loaded. A replaced receipt whose original saved text is not
+reliably recorded reports `saved=unrecorded`, and a receipt written before
+role recording reports `role context: unrecorded`: both stay usable, and the
+next fresh dispatch, resume or restart records the current role.
 
 Inspect a composition without a model call:
 `codex-harness skills catalogue --role lead|executor [--profile ID]`

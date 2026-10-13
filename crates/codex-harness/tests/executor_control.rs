@@ -2081,7 +2081,9 @@ fn a_recorded_role_composition_reaches_the_hosted_conversation() {
     let text = output_text(&output);
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(
-        text.contains("role context: role=executor revision=fixture-revision previous=none"),
+        text.contains(
+            "role context: role=executor revision=fixture-revision saved=fixture-revision previous=none"
+        ),
         "{text}"
     );
     assert!(text.contains("state: turn completed (completed)"), "{text}");

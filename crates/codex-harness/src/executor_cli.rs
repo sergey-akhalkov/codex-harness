@@ -1290,11 +1290,15 @@ struct ControlReceipt {
     role: Option<RoleReceipt>,
 }
 
-/// One recorded role composition. `previous` describes the continued
-/// predecessor dispatch only: it recorded that revision. A resumed native
-/// thread keeps the developer text saved at its start, so the current
-/// revision's text reaches turns only through a fresh conversation, and
-/// nothing is retroactive.
+/// One recorded role composition. `revision` is what this dispatch resolved
+/// from the current sources: the text a fresh conversation consumes. `saved`
+/// is the developer text the native conversation actually keeps: a fresh
+/// start or restart loads `revision`, while a resume keeps the text saved at
+/// the thread's start, carried forward unchanged across repeated resumes.
+/// `previous` is the predecessor dispatch's own record and is never presented
+/// as the saved text. A receipt without `saved` keeps explicit uncertainty
+/// for a continued thread (see `known_saved`); it is never presented as
+/// having consumed this dispatch's freshly resolved revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RoleReceipt {
@@ -1303,6 +1307,8 @@ struct RoleReceipt {
     args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous: Option<PreviousRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1315,23 +1321,68 @@ struct PreviousRole {
 }
 
 impl RoleReceipt {
-    /// The honest one-line report of the effective role: what this
-    /// conversation runs under now, and what the continued session ran under.
-    fn summary(&self) -> String {
-        let previous = match &self.previous {
-            None => "none".to_owned(),
+    /// The saved-developer-text fact of this composition: what the native
+    /// conversation actually keeps. A resumed thread keeps the text saved at
+    /// its start while its live catalogue still refreshes, so a carried saved
+    /// revision is never folded into the freshly resolved one; an unknown
+    /// original text is reported as unrecorded instead of guessed.
+    fn saved_clause(&self) -> String {
+        let known = self.known_saved();
+        match known.as_deref() {
+            Some(saved) if saved == self.revision.as_str() => format!("saved={saved}"),
+            Some(saved) => format!(
+                "saved={saved} (this thread keeps the developer text saved at its start while its live catalogue still refreshes; a fresh conversation consumes revision {})",
+                self.revision
+            ),
+            None => format!(
+                "saved=unrecorded (the developer text saved at this thread's start is not reliably recorded; a fresh conversation consumes revision {})",
+                self.revision
+            ),
+        }
+    }
+
+    /// The predecessor-dispatch fact of this composition: the revision the
+    /// continued dispatch resolved at its own start, named as that dispatch's
+    /// record and never as the text the current conversation runs under.
+    fn previous_clause(&self) -> String {
+        match &self.previous {
+            None => "previous=none".to_owned(),
             Some(previous) if previous.recorded => format!(
-                "recorded revision={} (the predecessor dispatch recorded that revision; a fresh conversation consumes this revision, while a resumed native thread keeps the developer text saved at its start)",
+                "previous=recorded revision={} (the predecessor dispatch recorded that revision)",
                 previous.revision.as_deref().unwrap_or("unrecorded")
             ),
-            Some(_) => {
-                "unrecorded (the continued session's role predates role recording)".to_owned()
-            }
-        };
+            Some(_) => "previous=unrecorded (the continued session's role predates role recording)"
+                .to_owned(),
+        }
+    }
+
+    /// The honest one-line report of the effective role: the freshly resolved
+    /// revision, the developer text actually saved in this conversation, and
+    /// what the continued predecessor dispatch recorded.
+    fn summary(&self) -> String {
         format!(
-            "role={} revision={} previous={previous}",
-            self.role, self.revision
+            "role={} revision={} {} {}",
+            self.role,
+            self.revision,
+            self.saved_clause(),
+            self.previous_clause()
         )
+    }
+
+    /// The developer text this composition is known to keep: the persisted
+    /// saved revision, or, for a receipt written before that field existed,
+    /// the resolved revision of a fresh start (`previous` none), whose text
+    /// that start consumed. A continued receipt without either record stays
+    /// unknown: its freshly resolved revision is not claimed as saved.
+    fn known_saved(&self) -> Option<String> {
+        if let Some(saved) = &self.saved {
+            return Some(saved.clone());
+        }
+        if self.previous.is_none() {
+            Some(self.revision.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -1901,22 +1952,21 @@ fn launch_bound(
     // role inputs refuse the dispatch here, with the slot still bound and
     // reused by the next dispatch and with no launcher or model request,
     // instead of hosting a conversation without its responsibility role.
-    let role = executor_role_receipt(request, binding, &paths.receipt)?;
+    // A resume attaches to the saved native thread and keeps its developer
+    // text; a restart starts a fresh conversation that consumes this
+    // dispatch's resolved text. Only resume marks route resume_session.
+    let role = executor_role_receipt(
+        request,
+        binding,
+        &paths.receipt,
+        route.control().resume_session.is_some(),
+    )?;
     println!(
-        "executor role context: role={} revision={}{}",
+        "executor role context: role={} revision={} {} {}",
         role.role,
         role.revision,
-        role.previous
-            .as_ref()
-            .map(|previous| if previous.recorded {
-                format!(
-                    " previous={} (the predecessor dispatch recorded that revision; a fresh start consumes this revision, while a resumed thread keeps the developer text saved at its start)",
-                    previous.revision.as_deref().unwrap_or("unrecorded")
-                )
-            } else {
-                " previous=unrecorded (the continued session predates role recording)".to_owned()
-            })
-            .unwrap_or_default()
+        role.saved_clause(),
+        role.previous_clause()
     );
     route.set_role(role);
     // Managed spellings, including exact-session resume and fresh restart,
@@ -1968,11 +2018,15 @@ fn launch_bound(
 /// The managed executor role resolved before launch. The installed build's
 /// recorded source supplies the owned role inputs; a missing or inconsistent
 /// input refuses the dispatch with the exact cause, keeping the slot bound for
-/// the next dispatch and making no launcher or model request.
+/// the next dispatch and making no launcher or model request. A native resume
+/// (`resumes_saved_thread`) keeps the developer text saved at the continued
+/// thread's start, so the receipt persists that text's known revision instead
+/// of overwriting it with this dispatch's freshly resolved one.
 fn executor_role_receipt(
     request: &Dispatch,
     binding: &SlotBinding,
     receipt: &Path,
+    resumes_saved_thread: bool,
 ) -> io::Result<RoleReceipt> {
     let profile = orchestration_config::profile_config(request.codex_home, request.profile)?;
     let launch = native_launcher::role_launch(
@@ -1988,29 +2042,48 @@ fn executor_role_receipt(
             binding.index, binding.owner
         ))
     })?;
+    let (previous, saved) = continued_role(
+        receipt,
+        request.resumed_session.is_some(),
+        resumes_saved_thread,
+        &launch.revision,
+    )?;
     Ok(RoleReceipt {
         role: launch.role.label().to_owned(),
         revision: launch.revision,
         args: launch.args,
-        previous: previous_role(receipt, request.resumed_session.is_some())?,
+        previous,
+        saved,
     })
 }
 
-/// What the continued predecessor session recorded about its role. Only a
-/// resume or restart asks; a fresh spawn continues nothing and records no
-/// predecessor claim. The predecessor receipt is read before this dispatch
-/// replaces it.
-fn previous_role(receipt: &Path, continues_session: bool) -> io::Result<Option<PreviousRole>> {
+/// What a continued dispatch reads from the receipt it is about to replace:
+/// the predecessor dispatch claim for honest reporting and, when the native
+/// conversation is resumed rather than restarted, the developer text that
+/// conversation is known to keep. A restart starts a fresh conversation, so
+/// it consumes this dispatch's resolved text. A fresh spawn continues nothing
+/// and records no predecessor claim. A missing or pre-recording receipt
+/// records no saved text for a resume, while a restart still consumes this
+/// dispatch's resolved text.
+fn continued_role(
+    receipt: &Path,
+    continues_session: bool,
+    resumes_saved_thread: bool,
+    resolved: &str,
+) -> io::Result<(Option<PreviousRole>, Option<String>)> {
     if !continues_session {
-        return Ok(None);
+        return Ok((None, Some(resolved.to_owned())));
     }
     let bytes = match fs::read(receipt) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(Some(PreviousRole {
-                recorded: false,
-                revision: None,
-            }));
+            return Ok((
+                Some(PreviousRole {
+                    recorded: false,
+                    revision: None,
+                }),
+                restart_saved(resumes_saved_thread, resolved),
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -2020,16 +2093,41 @@ fn previous_role(receipt: &Path, continues_session: bool) -> io::Result<Option<P
             receipt.display()
         ))
     })?;
-    Ok(Some(match role_from_receipt(&value)? {
-        Some(role) => PreviousRole {
-            recorded: true,
-            revision: Some(role.revision),
-        },
-        None => PreviousRole {
-            recorded: false,
-            revision: None,
-        },
-    }))
+    Ok(match role_from_receipt(&value)? {
+        Some(role) => {
+            let saved = if resumes_saved_thread {
+                role.known_saved()
+            } else {
+                Some(resolved.to_owned())
+            };
+            (
+                Some(PreviousRole {
+                    recorded: true,
+                    revision: Some(role.revision),
+                }),
+                saved,
+            )
+        }
+        None => (
+            Some(PreviousRole {
+                recorded: false,
+                revision: None,
+            }),
+            restart_saved(resumes_saved_thread, resolved),
+        ),
+    })
+}
+
+/// The saved developer text of a restart: a restarted conversation is a
+/// fresh start that loads this dispatch's resolved text, whatever the
+/// replaced receipt recorded. A resume keeps the receipt's known text
+/// instead, which is `None` when that text is not reliably recorded.
+fn restart_saved(resumes_saved_thread: bool, resolved: &str) -> Option<String> {
+    if resumes_saved_thread {
+        None
+    } else {
+        Some(resolved.to_owned())
+    }
 }
 
 /// The observable outcome of slot allocation: the lead reads the mapping here
@@ -8031,6 +8129,7 @@ mod tests {
             revision: "fixture-revision".into(),
             args: vec!["-c".into(), "developer_instructions=Executor text".into()],
             previous: None,
+            saved: Some("fixture-revision".into()),
         });
         save_receipt(
             &exec,
@@ -8071,6 +8170,11 @@ mod tests {
             "the exact composed pairs are recorded for the host: {value}"
         );
         assert!(recorded.previous.is_none(), "{value}");
+        assert_eq!(
+            recorded.saved.as_deref(),
+            Some("fixture-revision"),
+            "a fresh dispatch persists the text it consumed as saved: {value}"
+        );
         assert_eq!(value["control"]["identity"]["profile"], "ds", "{value}");
         assert_eq!(value["control"]["identity"]["model"], "deepseek-flash");
         assert_eq!(value["control"]["identity"]["modelProvider"], "deepseek");
@@ -8123,9 +8227,9 @@ mod tests {
     }
 
     /// The role record round-trips through the receipt JSON exactly as the
-    /// dispatch resolved it, and the one-line summary distinguishes this
-    /// conversation's effective revision from what the continued predecessor
-    /// dispatch recorded, without implying turns loaded text they did not.
+    /// dispatch resolved it, and the one-line summary distinguishes the
+    /// freshly resolved source revision from the saved developer text, never
+    /// reporting text a resumed thread did not load.
     #[test]
     fn role_receipts_round_trip_and_summarize_effective_and_previous_revisions() {
         let value = json!({
@@ -8142,12 +8246,48 @@ mod tests {
         assert_eq!(role.role, "executor");
         assert_eq!(role.args, ["-c", "developer_instructions=Executor text"]);
         assert!(role.previous.is_none());
+        assert!(role.saved.is_none());
+        // A receipt written before saved-revision recording, from a fresh
+        // start (`previous` none), is reliably known to keep its resolved
+        // revision: that start consumed exactly that text.
+        assert_eq!(
+            role.known_saved().as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
         let summary = role.summary();
         assert!(summary.contains("role=executor"), "{summary}");
         assert!(summary.contains("revision=0123456789abcdef"), "{summary}");
+        assert!(summary.contains("saved=0123456789abcdef"), "{summary}");
         assert!(summary.contains("previous=none"), "{summary}");
 
         let resumed = json!({
+            "control": {
+                "role": {
+                    "role": "executor",
+                    "revision": "new-revision",
+                    "args": [],
+                    "previous": {"recorded": true, "revision": "old-revision"},
+                    "saved": "saved-revision"
+                }
+            }
+        });
+        let summary = role_from_receipt(&resumed).unwrap().unwrap().summary();
+        assert!(summary.contains("revision=new-revision"), "{summary}");
+        assert!(summary.contains("saved=saved-revision"), "{summary}");
+        assert!(
+            !summary.contains("saved=new-revision"),
+            "the freshly resolved revision must not be reported as the saved text: {summary}"
+        );
+        assert!(
+            summary.contains("keeps the developer text saved at its start"),
+            "the summary must not imply resumed turns loaded newer text: {summary}"
+        );
+        assert!(summary.contains("old-revision"), "{summary}");
+
+        // A receipt without a persisted saved revision and without a fresh
+        // start to trust (`previous` present) keeps explicit uncertainty
+        // instead of claiming the freshly resolved text.
+        let ambiguous = json!({
             "control": {
                 "role": {
                     "role": "executor",
@@ -8157,13 +8297,9 @@ mod tests {
                 }
             }
         });
-        let summary = role_from_receipt(&resumed).unwrap().unwrap().summary();
-        assert!(summary.contains("revision=new-revision"), "{summary}");
-        assert!(summary.contains("old-revision"), "{summary}");
-        assert!(
-            summary.contains("keeps the developer text saved at its start"),
-            "the summary must not imply resumed turns loaded newer text: {summary}"
-        );
+        let summary = role_from_receipt(&ambiguous).unwrap().unwrap().summary();
+        assert!(summary.contains("saved=unrecorded"), "{summary}");
+        assert!(summary.contains("not reliably recorded"), "{summary}");
 
         // A receipt written before role recording applies nothing and reports
         // that instead of re-resolving a role at host time.
@@ -8184,35 +8320,228 @@ mod tests {
         );
     }
 
-    /// The predecessor role is read from the receipt this dispatch is about to
-    /// replace: a recorded revision is reported honestly, a receipt written
-    /// before role recording (or one that never existed) reports unrecorded,
-    /// and a fresh spawn continues nothing and makes no predecessor claim.
+    /// A continued dispatch reads the receipt it is about to replace: the
+    /// predecessor claim for honest reporting, and, when the native thread is
+    /// resumed rather than restarted, the developer text that thread is known
+    /// to keep. Everything not reliably known stays unrecorded.
     #[test]
-    fn previous_role_is_read_before_the_receipt_is_replaced() {
+    fn continued_role_reads_the_predecessor_claim_and_the_known_saved_text() {
         let root =
-            std::env::temp_dir().join(format!("executor-previous-role-{}", std::process::id()));
+            std::env::temp_dir().join(format!("executor-continued-role-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let receipt = root.join("spawn-1.json");
-        assert!(previous_role(&receipt, false).unwrap().is_none());
+
+        // A fresh spawn continues nothing and consumes its own resolved text.
+        let (previous, saved) = continued_role(&receipt, false, false, "fresh-text").unwrap();
+        assert!(previous.is_none());
+        assert_eq!(saved.as_deref(), Some("fresh-text"));
+
+        // A resume of a missing receipt records no predecessor and no saved
+        // text; a restart still consumes this dispatch's resolved text.
+        let (previous, saved) = continued_role(&receipt, true, true, "resolved").unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert!(saved.is_none());
+        let (previous, saved) = continued_role(&receipt, true, false, "restarted-text").unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert_eq!(saved.as_deref(), Some("restarted-text"));
+
         fs::write(&receipt, json!({"schema": 1}).to_string()).unwrap();
-        let previous = previous_role(&receipt, true).unwrap().unwrap();
-        assert!(!previous.recorded);
-        assert!(previous.revision.is_none());
+        let (previous, saved) = continued_role(&receipt, true, true, "resolved").unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert!(saved.is_none(), "a legacy receipt records no saved text");
+        let (previous, saved) = continued_role(&receipt, true, false, "restarted-text").unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert_eq!(
+            saved.as_deref(),
+            Some("restarted-text"),
+            "a restart consumes the current revision even when the replaced receipt predates role recording"
+        );
+
+        // A restart starts a fresh conversation: it consumes this dispatch's
+        // resolved text while still naming the predecessor's own record.
         fs::write(
             &receipt,
-            json!({"control": {"role": {"role": "executor", "revision": "kept-revision", "args": []}}})
+            json!({"control": {"role": {"role": "executor", "revision": "kept-revision", "args": [], "saved": "kept-revision"}}})
                 .to_string(),
         )
         .unwrap();
-        let previous = previous_role(&receipt, true).unwrap().unwrap();
+        let (previous, saved) = continued_role(&receipt, true, false, "restarted-text").unwrap();
+        let previous = previous.unwrap();
         assert!(previous.recorded);
         assert_eq!(previous.revision.as_deref(), Some("kept-revision"));
-        let absent = previous_role(&root.join("absent.json"), true)
-            .unwrap()
-            .unwrap();
-        assert!(!absent.recorded, "a missing receipt records no role");
+        assert_eq!(saved.as_deref(), Some("restarted-text"));
+
+        // A resume keeps the predecessor's persisted saved text.
+        let (previous, saved) = continued_role(&receipt, true, true, "resolved-later").unwrap();
+        assert!(previous.unwrap().recorded);
+        assert_eq!(saved.as_deref(), Some("kept-revision"));
+
+        // A receipt written before saved-revision recording is trusted only
+        // when it was a fresh start (no predecessor), whose resolved revision
+        // is exactly the text it consumed.
+        let old_fresh = root.join("old-fresh.json");
+        fs::write(
+            &old_fresh,
+            json!({"control": {"role": {"role": "executor", "revision": "original-revision", "args": []}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (_, saved) = continued_role(&old_fresh, true, true, "resolved-later").unwrap();
+        assert_eq!(saved.as_deref(), Some("original-revision"));
+
+        // A continued old-format receipt cannot distinguish a resume from a
+        // restart: its original saved text stays explicitly unknown.
+        let old_continued = root.join("old-continued.json");
+        fs::write(
+            &old_continued,
+            json!({"control": {"role": {"role": "executor", "revision": "dispatch-revision", "args": [], "previous": {"recorded": true, "revision": "even-earlier"}}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (previous, saved) =
+            continued_role(&old_continued, true, true, "resolved-later").unwrap();
+        assert!(previous.unwrap().recorded);
+        assert!(
+            saved.is_none(),
+            "an ambiguous old record must not claim a saved revision"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Start R0, resume after R1 and R2 source edits, then restart: the
+    /// persisted receipt must keep naming the original saved developer text
+    /// across repeated resumes and never report the freshly resolved revision
+    /// as consumed by a resumed thread. A restart starts a fresh conversation
+    /// and does adopt the current revision.
+    #[test]
+    fn saved_role_revision_survives_repeated_resumes_and_restart_adopts_current_text() {
+        let root = std::env::temp_dir().join(format!("executor-saved-role-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("spawn-1.json");
+        let bound = ProfileBinding {
+            profile: "ds".into(),
+            model: Some("deepseek-flash".into()),
+            model_provider: Some("deepseek".into()),
+            reasoning_effort: Some("max".into()),
+        };
+        let shell = crate::executor_shell::PreparedShell {
+            path: r"C:\Tools\PowerShell\7".into(),
+            executable: PathBuf::from(r"C:\Tools\PowerShell\7\pwsh.exe"),
+            version: "PowerShell 7.6.6".into(),
+            sandbox_mode: "danger-full-access".into(),
+        };
+        let lead = control::OriginatingLead {
+            schema: control::ORIGINATING_LEAD_SCHEMA,
+            thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2302".into(),
+            run_generation: "test-run-generation".into(),
+            dispatcher: control::DispatcherIdentity {
+                pid: std::process::id(),
+                creation_time: 1,
+                program: PathBuf::from(r"C:\home\lead\codex.exe"),
+            },
+        };
+        let observed =
+            RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
+        // Each step is the dispatch accounting exactly as executor_role_receipt
+        // applies it, persisted through the real receipt writer and read back.
+        let dispatch =
+            |continues_session: bool, resumes_saved_thread: bool, resolved: &str| -> RoleReceipt {
+                let (previous, saved) =
+                    continued_role(&receipt, continues_session, resumes_saved_thread, resolved)
+                        .unwrap();
+                let mut route = HostRoute::Control(Box::new(ControlReceipt {
+                    schema: CONTROL_SCHEMA,
+                    assignment: "Continue the outcome.".into(),
+                    original_assignment: None,
+                    identity: BoundIdentity::resolve(&bound),
+                    presentation: NativePresentation::NativeTui,
+                    port: None,
+                    resume_session: None,
+                    role: None,
+                }));
+                route.set_role(RoleReceipt {
+                    role: "executor".into(),
+                    revision: resolved.into(),
+                    args: vec!["-c".into(), "developer_instructions=Executor text".into()],
+                    previous,
+                    saved,
+                });
+                save_receipt(
+                    &receipt,
+                    Path::new(r"C:\home\harness\bin\codex.exe"),
+                    "ds",
+                    SpawnMode::Exec,
+                    &route,
+                    &bound,
+                    None,
+                    "windows-terminal-tab",
+                    None,
+                    None,
+                    &shell,
+                    &observed,
+                    &lead,
+                )
+                .unwrap();
+                role_from_receipt(&serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap())
+                    .unwrap()
+                    .unwrap()
+            };
+
+        let spawned = dispatch(false, false, "revision-r0");
+        assert_eq!(spawned.saved.as_deref(), Some("revision-r0"));
+        assert!(spawned.previous.is_none());
+        assert!(spawned.summary().contains("saved=revision-r0"));
+
+        let first = dispatch(true, true, "revision-r1");
+        assert_eq!(first.revision, "revision-r1");
+        assert_eq!(
+            first.saved.as_deref(),
+            Some("revision-r0"),
+            "a resume keeps the text saved at the thread's start"
+        );
+        assert_eq!(
+            first.previous.as_ref().unwrap().revision.as_deref(),
+            Some("revision-r0")
+        );
+        let summary = first.summary();
+        assert!(summary.contains("saved=revision-r0"), "{summary}");
+        assert!(!summary.contains("saved=revision-r1"), "{summary}");
+        assert!(
+            summary.contains("fresh conversation consumes revision revision-r1"),
+            "{summary}"
+        );
+
+        let second = dispatch(true, true, "revision-r2");
+        assert_eq!(
+            second.saved.as_deref(),
+            Some("revision-r0"),
+            "repeated resumes must not drop the original saved revision"
+        );
+        assert_eq!(
+            second.previous.as_ref().unwrap().revision.as_deref(),
+            Some("revision-r1"),
+            "the predecessor claim stays the immediately continued dispatch's record"
+        );
+        let summary = second.summary();
+        assert!(summary.contains("revision=revision-r2"), "{summary}");
+        assert!(summary.contains("saved=revision-r0"), "{summary}");
+        assert!(!summary.contains("saved=revision-r2"), "{summary}");
+
+        let restarted = dispatch(true, false, "revision-r3");
+        assert_eq!(
+            restarted.saved.as_deref(),
+            Some("revision-r3"),
+            "a restart starts a fresh conversation that consumes the current revision"
+        );
+        assert_eq!(
+            restarted.previous.as_ref().unwrap().revision.as_deref(),
+            Some("revision-r2")
+        );
+
+        let resumed_after_restart = dispatch(true, true, "revision-r4");
+        assert_eq!(resumed_after_restart.saved.as_deref(), Some("revision-r3"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -8233,12 +8562,14 @@ mod tests {
         let report = WatchReport::build(&receipt, &recorded, &run, STATE_ACCEPTED, None);
         let text = report.text();
         assert!(
-            text.contains("role: role=executor revision=watch-revision previous=none"),
+            text.contains(
+                "role: role=executor revision=watch-revision saved=watch-revision previous=none"
+            ),
             "{text}"
         );
         assert_eq!(
             report.json()["role"],
-            json!("role=executor revision=watch-revision previous=none")
+            json!("role=executor revision=watch-revision saved=watch-revision previous=none")
         );
         let legacy = json!({"control": {"schema": 1}});
         let report = WatchReport::build(&receipt, &legacy, &run, STATE_ACCEPTED, None);
