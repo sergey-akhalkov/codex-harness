@@ -428,6 +428,215 @@ fn pooled_spawn_derives_and_synchronizes_a_slot_before_launch() {
     fixture.drop();
 }
 
+/// An explicit base resolves locally and is never fetched: the dispatch binds
+/// the exact commit even when the configured upstream is gone, the record and
+/// checkout carry that base, and an unknown revision is refused before any
+/// claim or launcher stage. The held binding then continues through resume
+/// with the remote still unreachable.
+#[test]
+fn explicit_base_binds_the_exact_local_commit_offline_and_unknown_revisions_are_refused() {
+    let fixture = Fixture::new("explicit-base", 1);
+    // A commit that exists only in the local object store: the upstream never
+    // received it, so a fetch-based resolution would fail or pick another
+    // commit; success below proves local-only resolution.
+    fs::write(fixture.source.join("local-base.txt"), "local base\n").unwrap();
+    git(&fixture.source, &["add", "local-base.txt"]);
+    git(&fixture.source, &["commit", "-qm", "local base"]);
+    let commit = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("gone.git")),
+        ],
+    );
+    let spawned = fixture.spawn(&["--owner", "exec-local", "--base", &commit]);
+    let text = output_text(&spawned);
+    assert!(!spawned.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "the dispatch must bind its slot before the launcher: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "executor slot: index=1 path={} base={commit} owner=exec-local",
+            fixture.slot(1).display()
+        )),
+        "{text}"
+    );
+    // Without --repository the target defaults to the source checkout.
+    assert!(
+        text.contains(&format!(
+            "source={} repository={}",
+            fixture.source.display(),
+            fixture.source.display()
+        )),
+        "{text}"
+    );
+    let slot = fixture.slot(1);
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    assert_eq!(fixture.record(1)["owner"], "exec-local");
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+
+    // An unknown revision is refused as a local-resolution failure before any
+    // claim: the held record and the registered checkout stay untouched.
+    let record_path = fixture.record_path(1);
+    let before = fs::read(&record_path).unwrap();
+    let unknown = fixture.spawn(&[
+        "--owner",
+        "exec-other",
+        "--base",
+        "0000000000000000000000000000000000000000",
+    ]);
+    let text = output_text(&unknown);
+    assert!(!unknown.status.success(), "{text}");
+    assert!(text.contains("is not a commit available locally"), "{text}");
+    assert!(
+        text.contains("an explicit base never fetches from a remote"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("executor presentation:"),
+        "a refused base must stop before the presentation: {text}"
+    );
+    assert_eq!(
+        fs::read(&record_path).unwrap(),
+        before,
+        "the refused base mutated the held record"
+    );
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+
+    // The held binding continues exactly: resume keeps the explicit base and
+    // the partial work with the upstream still unreachable.
+    let partial = slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+    let mut command = lead_command();
+    command.args([
+        "executor",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "exec-local",
+        "--session",
+        "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+        "--exec",
+        "continue the interrupted assignment",
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("base={commit}")), "{text}");
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    fixture.drop();
+}
+
+/// A fresh dispatch needs the configured upstream: when the required fetch
+/// fails it aborts before any claim or reset, leaving the released slot, its
+/// record and its ignored cache exactly as they were; restoring the remote
+/// lets the next dispatch resolve the upstream default and reuse that slot.
+#[test]
+fn a_required_upstream_fetch_failure_leaves_the_released_slot_untouched() {
+    let fixture = Fixture::new("fetch-failure", 1);
+    assert!(!fixture.spawn(&["--owner", "exec-1"]).status.success());
+    let slot = fixture.slot(1);
+    fs::create_dir_all(slot.join("cache")).unwrap();
+    fs::write(slot.join("cache/artifact"), "warm\n").unwrap();
+    let released_head = git_output(&slot, &["rev-parse", "HEAD"]);
+    let released = fixture.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "interrupted assignment reviewed",
+    ]);
+    assert!(
+        output_text(&released).contains("released as discarded"),
+        "{}",
+        output_text(&released)
+    );
+    let record_path = fixture.record_path(1);
+    let record_before = fs::read(&record_path).unwrap();
+
+    // The dispatch requires the upstream refresh; the configured remote is
+    // gone and the upstream moved on, so only a fetch could select the base.
+    let upstream = fixture.advance_upstream("upstream.txt");
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("gone.git")),
+        ],
+    );
+    let failed = fixture.spawn(&["--owner", "exec-2"]);
+    let text = output_text(&failed);
+    assert!(!failed.status.success(), "{text}");
+    assert!(text.contains("upstream fetch of 'origin' failed"), "{text}");
+    assert!(
+        text.contains("no base is selected from stale state"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("executor presentation:")
+            && !text.contains("installed Codex launcher is missing"),
+        "the fetch failure must abort before any launcher or model stage: {text}"
+    );
+    assert_eq!(
+        fs::read(&record_path).unwrap(),
+        record_before,
+        "the failed fetch mutated the released record"
+    );
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), released_head);
+    assert!(
+        slot.join("cache/artifact").is_file(),
+        "the released slot's ignored cache is preserved"
+    );
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+
+    // Restoring the configured remote lets the next dispatch resolve the
+    // upstream default and reuse the same position.
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("remote.git")),
+        ],
+    );
+    let retried = fixture.spawn(&["--owner", "exec-2"]);
+    let text = output_text(&retried);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("base={upstream}")), "{text}");
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), upstream);
+    assert_eq!(fixture.record(1)["owner"], "exec-2");
+    assert_eq!(fixture.record(1)["base"], upstream.as_str());
+    assert!(
+        slot.join("cache/artifact").is_file(),
+        "reuse keeps the slot's ignored cache"
+    );
+    fixture.drop();
+}
+
 #[test]
 fn pooled_spawn_defaults_to_the_native_tui_and_qualifies_both_spellings() {
     let fixture = Fixture::new("presentation", 1);
