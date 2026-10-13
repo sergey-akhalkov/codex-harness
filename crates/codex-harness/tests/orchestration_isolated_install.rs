@@ -7,7 +7,7 @@
 
 use harness_core::{
     board_lifecycle, build_identity, core_disconnect, core_install, installation_state::PathScope,
-    orchestration_lifecycle,
+    orchestration_config, orchestration_lifecycle, task_worktree,
 };
 use std::{
     collections::BTreeMap,
@@ -154,6 +154,15 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert_eq!(delivery.guidance, ["team-lead", "board-workflow"]);
     assert!(delivery.guidance_missing.is_empty());
     assert_eq!(delivery.executor_profiles, ["ds"]);
+    let configured = orchestration_config::load(&source).unwrap();
+    assert_eq!(
+        delivery.max_concurrent_executors,
+        Some(configured.max_concurrent_executors)
+    );
+    assert_eq!(
+        delivery.worktree_pool_size,
+        Some(orchestration_config::worktree_pool_size(&configured))
+    );
     assert_eq!(
         delivery.board_version, None,
         "the board is a separate component"
@@ -292,9 +301,56 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "archived board evidence survives rollback: {evidence}"
     );
 
+    // A real held task and its checkout outlive removal of the installation.
+    let task_repo = root_path.join("retained-task");
+    fs::create_dir_all(&task_repo).unwrap();
+    board_git(&task_repo, &["init", "-q"]);
+    board_git(&task_repo, &["config", "user.email", "task@example.test"]);
+    board_git(&task_repo, &["config", "user.name", "Task Fixture"]);
+    fs::write(task_repo.join(".gitignore"), b"cache/\n").unwrap();
+    fs::write(task_repo.join("owned.txt"), b"initial\n").unwrap();
+    board_git(&task_repo, &["add", ".gitignore", "owned.txt"]);
+    board_git(&task_repo, &["commit", "-qm", "owned task base"]);
+    let held =
+        task_worktree::acquire_task(&codex_home, &task_repo, 3, "retained-work", None, &|_| {
+            false
+        })
+        .unwrap();
+    fs::write(held.path.join("owned.txt"), b"partial tracked work\n").unwrap();
+    fs::write(held.path.join("new.txt"), b"partial untracked work\n").unwrap();
+    fs::create_dir_all(held.path.join("cache")).unwrap();
+    fs::write(held.path.join("cache/ready"), b"prepared\n").unwrap();
+
     let disconnected =
         core_disconnect::disconnect(&codex_home, &user_home, &user_home, false).unwrap();
     assert_eq!(disconnected.status, "disconnected");
+    assert!(
+        disconnected
+            .orchestration
+            .preserved
+            .contains(&"executor-pool")
+    );
+    let continued = task_worktree::continue_task(
+        &codex_home,
+        &task_repo,
+        "retained-work",
+        held.handle.as_deref(),
+    )
+    .unwrap();
+    assert_eq!(continued.path, held.path);
+    assert_eq!(continued.base, held.base);
+    assert_eq!(continued.handle, held.handle);
+    for (relative, expected) in [
+        ("owned.txt", "partial tracked work\n"),
+        ("new.txt", "partial untracked work\n"),
+        ("cache/ready", "prepared\n"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(continued.path.join(relative)).unwrap(),
+            expected,
+            "disconnect must preserve {relative}"
+        );
+    }
     assert!(
         disconnected.orchestration.preserved.contains(&"skills"),
         "the skill source stays readable for the next install"

@@ -594,8 +594,16 @@ impl View {
             window: None,
         };
         loop {
-            if !process.is_running()? || Instant::now() >= until {
-                return Err(unavailable());
+            if let Some(code) = process.exit_code()? {
+                return Err(io::Error::other(format!(
+                    "conversation launcher exited before its window became ready: exit code {code} (0x{code:08X}); suspend new model dispatch"
+                )));
+            }
+            if Instant::now() >= until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "conversation window did not become ready before the deadline; suspend new model dispatch",
+                ));
             }
             if unsafe {
                 EnumWindows(
@@ -666,8 +674,10 @@ impl View {
 
     /// Recheck before dispatch. A saved HWND or a live process alone is insufficient.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
-        if !self.process.is_running()? {
-            return Err(unavailable());
+        if let Some(code) = self.process.exit_code()? {
+            return Err(io::Error::other(format!(
+                "conversation window is unavailable: launcher exited with code {code} (0x{code:08X}) before its snapshot; suspend new model dispatch"
+            )));
         }
         Ok(Snapshot {
             process: self.process.identity(),
@@ -693,19 +703,28 @@ fn loaded_title(caption: &str, expected: &str) -> bool {
 fn visible_bounds(window: usize, expected_pid: u32) -> io::Result<Bounds> {
     let window = window as HWND;
     let mut pid = 0;
-    if unsafe { GetWindowThreadProcessId(window, &mut pid) } == 0
-        || pid != expected_pid
-        || unsafe { IsWindowVisible(window) } == 0
-        || unsafe { IsIconic(window) } != 0
-    {
-        return Err(unavailable());
+    if unsafe { GetWindowThreadProcessId(window, &mut pid) } == 0 {
+        return Err(io::Error::other(format!(
+            "conversation window identity query failed: {}; suspend new model dispatch",
+            io::Error::last_os_error()
+        )));
+    }
+    let visible = unsafe { IsWindowVisible(window) } != 0;
+    let minimized = unsafe { IsIconic(window) } != 0;
+    if pid != expected_pid || !visible || minimized {
+        return Err(io::Error::other(format!(
+            "conversation window is unavailable: owner pid={pid}, expected pid={expected_pid}, visible={visible}, minimized={minimized}; suspend new model dispatch"
+        )));
     }
     let mut bounds = RECT::default();
     if unsafe { GetWindowRect(window, &mut bounds) } == 0 {
         return Err(io::Error::last_os_error());
     }
     if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
-        return Err(unavailable());
+        return Err(io::Error::other(format!(
+            "conversation window is unavailable: empty bounds ({}, {}, {}, {}); suspend new model dispatch",
+            bounds.left, bounds.top, bounds.right, bounds.bottom
+        )));
     }
     Ok(Bounds {
         x: bounds.left,
@@ -725,7 +744,9 @@ pub fn three_windows() -> io::Result<[Bounds; 3]> {
     let width = work.right - work.left;
     let height = work.bottom - work.top;
     if width < 2 || height < 2 {
-        return Err(unavailable());
+        return Err(io::Error::other(format!(
+            "conversation window layout is unavailable: work area is {width} by {height}; suspend new model dispatch"
+        )));
     }
     let left = width / 2;
     let top = height / 2;
