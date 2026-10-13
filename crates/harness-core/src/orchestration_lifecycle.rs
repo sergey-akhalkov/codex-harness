@@ -345,6 +345,7 @@ mod tests {
     fn role_kit(root: &Path) -> PathBuf {
         let source = root.join("source");
         for dir in [
+            source.join("global"),
             source.join("skills/shared"),
             source.join("skills/coordinate"),
         ] {
