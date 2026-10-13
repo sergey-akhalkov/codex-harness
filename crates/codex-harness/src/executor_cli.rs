@@ -2006,26 +2006,42 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
     if held.is_some() || free_position {
         admit_executor_run(request, held)?;
     }
-    let slot = task_worktree::acquire_task_for_startup(
+    // The admission decision, the pool claim and the startup reservation
+    // are one atomic step under the guard. The slow worktree
+    // preparation stays outside it: a reserved position already excludes
+    // rivals through the live startup reservation, so independent
+    // startups prepare concurrently within the allowance.
+    let begin = task_worktree::begin_task_startup(
         request.codex_home,
         request.repository,
         request.pool_size,
         request.owner,
         base.as_deref(),
-        &startup,
+        Some(&startup),
         &live,
     )?;
-    // A continued binding already existed, so the claim path wrote no startup
-    // reservation for this process; hold one so the interval before the host
-    // lease is not reclaimable by another dispatch.
+    // A continued binding records no startup reservation through the claim
+    // path, so every successful begin holds one here, still under the guard:
+    // the interval before the host lease can never be reclaimed by another
+    // dispatch, and preparation runs with no unreserved gap.
+    let index = match &begin {
+        task_worktree::TaskStartup::Held(slot) => slot.index,
+        task_worktree::TaskStartup::Reserved { slot, .. } => slot.index,
+    };
     task_worktree::hold_startup_reservation(
         request.codex_home,
         request.repository,
-        slot.index,
+        index,
         request.owner,
     )?;
     drop(admission);
-    Ok(bound_slot(slot, fetched))
+    let prepared = task_worktree::prepare_task_startup(
+        request.codex_home,
+        request.repository,
+        request.pool_size,
+        begin,
+    )?;
+    Ok(bound_slot(prepared, fetched))
 }
 
 /// The upstream pair one receipt reports: the refreshed pair of a default

@@ -8,14 +8,19 @@
 use serde_json::Value;
 use std::{
     fs,
-    io::Read,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
+/// The compiled manager used by the checks, or an explicitly supplied one so
+/// the same oracle can run against a preserved pre-correction executable.
 fn manager() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
+    std::env::var_os("HARNESS_POOL_TEST_MANAGER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_codex-harness")))
 }
 
 /// A command that does not inherit the caller's session identity, so the
@@ -151,15 +156,22 @@ impl Fixture {
 
     /// The same fresh dispatch as [`Fixture::spawn`], started without waiting
     /// so a check can hold the pool admission lock across its admission phase.
-    fn spawn_child(&self, extra: &[&str]) -> Child {
+    fn spawn_child(&self, extra: &[&str]) -> CapturedChild {
         let mut args = vec!["spawn", "--profile", "ds", "--exec", "assignment text"];
         args.extend_from_slice(extra);
         self.executor_child(&args)
     }
 
-    /// One `executor ...` process started without waiting; its piped output is
-    /// read once it exits.
-    fn executor_child(&self, extra: &[&str]) -> Child {
+    /// One `executor ...` process started without waiting; its stdout and
+    /// stderr are captured to check-owned files, so a panicking check still
+    /// kills and reaps exactly the child it started.
+    fn executor_child(&self, extra: &[&str]) -> CapturedChild {
+        self.executor_child_with_env(extra, &[])
+    }
+
+    /// [`Fixture::executor_child`] with extra environment variables for the
+    /// dispatch, used to route a controlled gate into a checkout hook.
+    fn executor_child_with_env(&self, extra: &[&str], env: &[(&str, &str)]) -> CapturedChild {
         let mut command = lead_command();
         command.args(["executor"]);
         command.args(extra);
@@ -170,11 +182,10 @@ impl Fixture {
             self.home.to_str().unwrap(),
         ]);
         command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        capture_command(command, &self.root)
     }
 
     /// A live canned host lease for a position that may still have no slot
@@ -361,36 +372,101 @@ fn refused(out: Output) -> String {
     output_text(&out)
 }
 
-/// Read one exited check child's captured output; the pipes are drained after
-/// the exit is observed, so a full pipe buffer cannot block the check.
-fn read_output(child: &mut Child) -> Output {
-    let status = child.wait().unwrap();
-    let mut stdout = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_end(&mut stdout).unwrap();
+/// Configure one command whose stdout and stderr are captured to files the
+/// check owns. A full pipe buffer can never deadlock the check: the files are
+/// private to this process and are read after the child exits or is killed.
+fn capture_command(mut command: Command, root: &Path) -> CapturedChild {
+    static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed);
+    let stdout = root.join(format!("child-{}-{sequence}-out.log", std::process::id()));
+    let stderr = root.join(format!("child-{}-{sequence}-err.log", std::process::id()));
+    let _ = fs::remove_file(&stdout);
+    let _ = fs::remove_file(&stderr);
+    let out = fs::File::create(&stdout).unwrap();
+    let err = fs::File::create(&stderr).unwrap();
+    let child = command
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap();
+    CapturedChild {
+        child,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
     }
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_end(&mut stderr).unwrap();
+}
+
+/// One check-owned child with file-captured output. Dropping it kills and
+/// reaps the child, so a panicking check never leaves an owned process or a
+/// blocked hook behind; unrelated processes are never signalled.
+struct CapturedChild {
+    child: Child,
+    stdout: Option<PathBuf>,
+    stderr: Option<PathBuf>,
+}
+
+impl CapturedChild {
+    /// Whether the child already exited without reaping it.
+    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().unwrap()
     }
-    Output {
-        status,
-        stdout,
-        stderr,
+
+    /// The captured output of the child. The caller must have observed an
+    /// exit or killed it: output still arriving is not part of this read.
+    fn collect_output(&mut self) -> Output {
+        let status = match self.child.try_wait().unwrap() {
+            Some(status) => status,
+            None => self.child.wait().unwrap(),
+        };
+        let stdout = self
+            .stdout
+            .as_ref()
+            .map(|path| fs::read(path).unwrap_or_default())
+            .unwrap_or_default();
+        let stderr = self
+            .stderr
+            .as_ref()
+            .map(|path| fs::read(path).unwrap_or_default())
+            .unwrap_or_default();
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// Kill and reap this check-owned child.
+    fn kill_and_reap(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for CapturedChild {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+        if let Some(path) = self.stdout.take() {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = self.stderr.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
 /// Wait for one running dispatch, failing with its output instead of hanging
 /// when it outruns the bound.
-fn wait_bounded(child: &mut Child, bound: Duration, context: &str) -> Output {
+fn wait_bounded(child: &mut CapturedChild, bound: Duration, context: &str) -> Output {
     let deadline = Instant::now() + bound;
     loop {
-        if child.try_wait().unwrap().is_some() {
-            return read_output(child);
+        if child.try_wait().is_some() {
+            return child.collect_output();
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let out = read_output(child);
+            child.kill_and_reap();
+            let out = child.collect_output();
             panic!(
                 "{context}: dispatch did not exit within {bound:?}: {}",
                 output_text(&out)
@@ -404,12 +480,12 @@ fn wait_bounded(child: &mut Child, bound: Duration, context: &str) -> Output {
 /// admission phase. A finish before the lock is released means the admission
 /// decision and the startup reservation it authorizes were published as two
 /// separate steps.
-fn assert_blocked_while_held(children: &mut [Child], settle: Duration, context: &str) {
+fn assert_blocked_while_held(children: &mut [CapturedChild], settle: Duration, context: &str) {
     let deadline = Instant::now() + settle;
     while Instant::now() < deadline {
         for (position, child) in children.iter_mut().enumerate() {
-            if child.try_wait().unwrap().is_some() {
-                let out = read_output(child);
+            if child.try_wait().is_some() {
+                let out = child.collect_output();
                 panic!(
                     "{context}: dispatch {position} finished while the pool admission lock \
                      was held, so admission and the startup reservation are not one atomic \
@@ -417,6 +493,30 @@ fn assert_blocked_while_held(children: &mut [Child], settle: Duration, context: 
                     output_text(&out)
                 );
             }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Poll one child-captured file until it exists or the bound elapses. The
+/// child is killed on failure so an unanswered wait cannot leak it.
+fn wait_for_file(child: &mut CapturedChild, path: &Path, bound: Duration, context: &str) -> String {
+    let deadline = Instant::now() + bound;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => return text,
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("{context}: {} is unreadable: {error}", path.display()),
+        }
+        if Instant::now() >= deadline {
+            child.kill_and_reap();
+            let out = child.collect_output();
+            panic!(
+                "{context}: {} did not appear within {bound:?}: {}",
+                path.display(),
+                output_text(&out)
+            );
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -1424,5 +1524,149 @@ fn stale_generations_and_superseded_releases_are_refused() {
         "second generation completed",
     ]));
     assert!(release.contains("released; slot=1"), "{release}");
+    fixture.drop();
+}
+
+/// Serialization control: with pool capacity and executor allowance both two,
+/// a second eligible dispatch must make its own progress while the first one
+/// is inside a slow checkout preparation. The shared admission step ends at
+/// the startup reservation, so a build that keeps the admission lock across
+/// preparation blocks this second startup until the first one finishes; this
+/// check bounds that wait and reports the blocked startup instead of hanging.
+#[test]
+fn independent_startup_progresses_while_another_preparation_is_slow() {
+    let fixture = Fixture::new("slow-prep", 2, 2);
+    // The checkout hook gates only dispatches that receive the gate variables:
+    // the first dispatch's `git worktree add` stops inside its preparation
+    // while this check keeps that process and its reservation alive. The
+    // in-hook bound releases an orphaned hook even if the check itself dies.
+    let hooks = fixture.source.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let started = fixture.root.join("preparation-started");
+    let gate = fixture.root.join("preparation-gate");
+    let hook = [
+        "#!/bin/sh",
+        "if [ -n \"$WORKTREE_POOL_TEST_GATE\" ]; then",
+        "  echo started > \"$WORKTREE_POOL_TEST_STARTED\"",
+        "  n=0",
+        "  while [ ! -f \"$WORKTREE_POOL_TEST_GATE\" ] && [ $n -lt 450 ]; do",
+        "    sleep 0.2",
+        "    n=$((n+1))",
+        "  done",
+        "fi",
+        "exit 0",
+    ]
+    .join("\n");
+    fs::write(hooks.join("post-checkout"), format!("{hook}\n")).unwrap();
+    // Slot 2 is materialized up front: the second dispatch is not gated, and
+    // two simultaneous `git worktree add` runs would race on the shared
+    // worktree bookkeeping.
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            fixture.slot(2).to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let mut first = fixture.executor_child_with_env(
+        &[
+            "spawn",
+            "--profile",
+            "ds",
+            "--exec",
+            "assignment text",
+            "--owner",
+            "exec-a",
+        ],
+        &[
+            ("WORKTREE_POOL_TEST_GATE", gate.to_str().unwrap()),
+            ("WORKTREE_POOL_TEST_STARTED", started.to_str().unwrap()),
+        ],
+    );
+    // The reservation must be recorded before the slow preparation starts:
+    // that is what excludes rivals while the admission guard is released.
+    let state =
+        harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
+    let record = state.join("slot-1.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let reserved = fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| value["task"] == "exec-a" && value["startup"].is_object());
+        if reserved {
+            break;
+        }
+        if Instant::now() >= deadline {
+            first.kill_and_reap();
+            panic!("slot 1 did not record the exec-a startup reservation before preparation");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    wait_for_file(
+        &mut first,
+        &started,
+        Duration::from_secs(30),
+        "slot 1 preparation",
+    );
+    assert!(
+        first.try_wait().is_none(),
+        "the first dispatch left preparation before the gate was released"
+    );
+
+    // The second independent startup must claim its own position and finish
+    // its dispatch attempt while the first preparation is still held.
+    let mut second = fixture.executor_child(&[
+        "spawn",
+        "--profile",
+        "ds",
+        "--exec",
+        "assignment text",
+        "--owner",
+        "exec-b",
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while second.try_wait().is_none() {
+        if Instant::now() >= deadline {
+            panic!(
+                "the second eligible startup did not finish while the first preparation \
+                 was held; the admission step must end at the startup reservation"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let second_text = refused(second.collect_output());
+    assert!(
+        second_text.contains("executor slot: index=2"),
+        "the second eligible startup must claim its own position while the first \
+         preparation is held: {second_text}"
+    );
+    assert!(
+        second_text.contains("installed Codex launcher is missing"),
+        "{second_text}"
+    );
+    assert!(
+        first.try_wait().is_none(),
+        "the first dispatch stopped being prepared before the gate was released"
+    );
+
+    fs::write(&gate, "release\n").unwrap();
+    let released = refused(wait_bounded(
+        &mut first,
+        Duration::from_secs(60),
+        "slot 1 spawn",
+    ));
+    assert!(
+        released.contains("executor slot: index=1"),
+        "the gated dispatch must complete on its reserved position: {released}"
+    );
+    assert!(
+        released.contains("installed Codex launcher is missing"),
+        "{released}"
+    );
     fixture.drop();
 }

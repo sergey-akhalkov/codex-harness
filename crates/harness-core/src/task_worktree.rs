@@ -2122,6 +2122,42 @@ fn acquire_task_with(
     is_live: &dyn Fn(&str) -> bool,
     startup: Option<&StartupReservation>,
 ) -> io::Result<TaskSlot> {
+    let begin = begin_task_startup(codex_home, source, size, task, base, startup, is_live)?;
+    prepare_task_startup(codex_home, source, size, begin)
+}
+
+/// The outcome of beginning one executor startup: either the task already
+/// holds a binding that continues in place, or a pool position was claimed
+/// with this process's startup reservation and still has to be prepared.
+#[derive(Debug)]
+pub enum TaskStartup {
+    /// The task's durable binding already exists; the caller records its own
+    /// startup reservation with `hold_startup_reservation` and dispatches.
+    Held(TaskSlot),
+    /// A position was claimed and the startup reservation is part of the
+    /// record. `prepare_task_startup` materializes and binds it.
+    Reserved {
+        task: String,
+        slot: PoolSlot,
+        exact: String,
+        handle: String,
+    },
+}
+
+/// Begin one task startup without touching its checkout. Under the caller's
+/// pool admission guard this is the atomic step: the pool is reconciled, an
+/// existing binding is returned, or a position is claimed with this process's
+/// startup reservation. Checkout creation, reset and binding stay out of the
+/// guard, so independent startups prepare within the allowance.
+pub fn begin_task_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    task: &str,
+    base: Option<&str>,
+    startup: Option<&StartupReservation>,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskStartup> {
     if task.trim().is_empty() {
         return Err(pool_error(
             "a task acquisition requires a non-empty task identity",
@@ -2132,7 +2168,7 @@ fn acquire_task_with(
     let requested = explicit.then_some(exact.as_str());
     reconcile_slots(codex_home, &pool, is_live)?;
     if let Some(binding) = find_task_binding(codex_home, &pool, task, requested)? {
-        return Ok(binding);
+        return Ok(TaskStartup::Held(binding));
     }
     // Capacity reduction is refused before new acquisition: positions beyond
     // the configured size still hold owned work, so the pool is full at its
@@ -2155,17 +2191,39 @@ fn acquire_task_with(
             "worktree_pool_size {size} is below the recorded positions still holding tasks ({held}); release or explicitly retire those bindings before acquiring another task"
         )));
     }
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
     let mut refusals = Vec::new();
     for slot in &pool.slots {
-        if slot.presence == SlotPresence::RegisteredMissing {
-            return Err(pool_error(&format!(
-                "slot {} {} is registered but missing; run `git worktree prune` in {} and retry",
-                slot.index,
-                slot.path.display(),
-                pool.source.display()
-            )));
+        // Positions walked before the claimed one keep their existing presence
+        // handling and recovery: a missing registered position is refused with
+        // its prune remedy, and a recorded position is materialized so a held
+        // binding keeps its directory instead of being reported as vanished.
+        match slot.presence {
+            SlotPresence::RegisteredMissing => {
+                return Err(pool_error(&format!(
+                    "slot {} {} is registered but missing; run `git worktree prune` in {} and retry",
+                    slot.index,
+                    slot.path.display(),
+                    pool.source.display()
+                )));
+            }
+            SlotPresence::Foreign => {
+                return Err(pool_error(&format!(
+                    "slot {} {} exists but is not a worktree of {}; it is never replaced, move it aside or reconfigure the pool",
+                    slot.index,
+                    slot.path.display(),
+                    pool.source.display()
+                )));
+            }
+            SlotPresence::Registered | SlotPresence::Absent => {}
         }
-        create_slot(&pool, slot.index)?;
+        // The first position without a record is the one this startup claims;
+        // its materialization is preparation and stays outside the caller's
+        // admission guard, so only recorded positions are created here.
+        let recorded = load_record_at(&layout, slot.index)?.is_some();
+        if recorded {
+            create_slot(&pool, slot.index)?;
+        }
         match claim_task_slot(codex_home, &pool, slot.index, task, is_live, startup)? {
             TaskSlotClaim::Claimed(record) => {
                 let Some(handle) = record.handle.clone() else {
@@ -2185,54 +2243,106 @@ fn acquire_task_with(
                 if record.state == SlotState::Occupied {
                     if record.base.as_deref() == Some(exact.as_str()) {
                         // A binding completed between the lookup and the claim.
-                        return Ok(TaskSlot::from_record(
+                        return Ok(TaskStartup::Held(TaskSlot::from_record(
                             &record,
                             slot.index,
                             slot.path.clone(),
                             slot.presence,
-                        ));
+                        )));
                     }
-                    // A concurrent acquisition bound this task at another base;
-                    // never reset a binding that may already hold work.
+                    // A concurrent acquisition bound this task at another
+                    // base; never reset a binding that may already hold work.
                     return Err(pool_error(&format!(
                         "task '{task}' is bound concurrently in slot {} at base {}; retry to continue the recorded binding",
                         slot.index,
                         record.base.as_deref().unwrap_or("none")
                     )));
                 }
-                if let Err(error) = reset_slot_to(codex_home, &pool, slot.index, &exact) {
-                    // Bookkeeping is best-effort: the preparation failure is
-                    // the reported cause, and the slot is not advertised as
-                    // free while it still holds unverified state.
-                    let _ = abort_task_claim(
-                        codex_home,
-                        &pool,
-                        slot.index,
-                        task,
-                        &handle,
-                        error.to_string(),
-                    );
-                    return Err(error);
-                }
-                let bound = bind_task_slot(codex_home, &pool, slot.index, task, &handle, &exact)?;
-                return Ok(TaskSlot::from_record(
-                    &bound,
-                    slot.index,
-                    slot.path.clone(),
-                    slot.presence,
-                ));
+                return Ok(TaskStartup::Reserved {
+                    task: task.to_owned(),
+                    slot: PoolSlot {
+                        index: slot.index,
+                        path: slot.path.clone(),
+                        presence: slot.presence,
+                    },
+                    exact,
+                    handle,
+                });
             }
             // The same task is already acquiring or holding a position; it
             // must never be walked on to a second slot, so the whole pool
             // acquisition stops with the recorded reason.
             TaskSlotClaim::InFlightSameTask(reason) => return Err(pool_error(&reason)),
-            TaskSlotClaim::Unavailable(refusal) => refusals.push(refusal.reason),
+            TaskSlotClaim::Unavailable(refusal) => {
+                // A record-less position can still lose a claim race between
+                // the record check and the claim; the refused position is
+                // then materialized, as the un-split walk did.
+                if !recorded {
+                    create_slot(&pool, slot.index)?;
+                }
+                refusals.push(refusal.reason);
+            }
         }
     }
     Err(pool_error(&format!(
         "no free slot in the pool of {size} (worktree_pool_size): {}",
         refusals.join("; ")
     )))
+}
+
+pub fn prepare_task_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    startup: TaskStartup,
+) -> io::Result<TaskSlot> {
+    let (task, slot, exact, handle) = match startup {
+        TaskStartup::Held(slot) => return Ok(slot),
+        TaskStartup::Reserved {
+            task,
+            slot,
+            exact,
+            handle,
+        } => (task, slot, exact, handle),
+    };
+    // The pool is re-read so the receipt reports the position's current
+    // presence; positions are fixed by the configured size, so this only
+    // refreshes the registry facts.
+    let pool = pool(source, size)?;
+    // The claim already excluded rivals; materialization, reset and binding
+    // run outside the admission guard so an independent startup prepares
+    // within the allowance. A failed preparation aborts this claim so the
+    // position is not advertised as free while it still holds unverified
+    // state, and the preparation failure stays the reported cause.
+    if let Err(error) = create_slot(&pool, slot.index) {
+        let _ = abort_task_claim(
+            codex_home,
+            &pool,
+            slot.index,
+            &task,
+            &handle,
+            error.to_string(),
+        );
+        return Err(error);
+    }
+    if let Err(error) = reset_slot_to(codex_home, &pool, slot.index, &exact) {
+        let _ = abort_task_claim(
+            codex_home,
+            &pool,
+            slot.index,
+            &task,
+            &handle,
+            error.to_string(),
+        );
+        return Err(error);
+    }
+    let bound = bind_task_slot(codex_home, &pool, slot.index, &task, &handle, &exact)?;
+    Ok(TaskSlot::from_record(
+        &bound,
+        slot.index,
+        slot.path,
+        slot.presence,
+    ))
 }
 
 pub fn continue_task(
