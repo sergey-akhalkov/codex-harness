@@ -2533,10 +2533,9 @@ fn catalogue_role_composes_developer_text_and_memberships_onto_the_native_read()
         .expect("the refused discovery names its private evidence root")
         .trim()
         .to_owned();
-    let request: Value = serde_json::from_slice(
-        &fs::read(Path::new(&evidence).join("request.json")).unwrap(),
-    )
-    .unwrap();
+    let request: Value =
+        serde_json::from_slice(&fs::read(Path::new(&evidence).join("request.json")).unwrap())
+            .unwrap();
     let arguments: Vec<&str> = request["arguments"]
         .as_array()
         .unwrap()

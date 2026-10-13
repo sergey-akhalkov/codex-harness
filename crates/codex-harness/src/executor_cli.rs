@@ -4,12 +4,12 @@
 //! succession, OFAP 4.1).
 #![cfg(windows)]
 
+use harness_core::native_launcher;
 #[cfg(test)]
 use harness_core::orchestration_config::executor_session_args;
 use harness_core::orchestration_config::{
     self, EXECUTOR_SESSION_ENV, ProfileBinding, executor_profile, load,
 };
-use harness_core::native_launcher;
 use harness_core::process::{Job, Limits, StopReason};
 use harness_core::process_service::ServiceProcess;
 use harness_core::role_context::Role;
@@ -430,12 +430,15 @@ fn host_lead_session(
     )
     .map_err(|error| {
         invalid(&format!(
-            "lead role context: {error}; no app-server child was started; repair the registered build and its owned kit role sources (global/roles.toml and global/roles/*.md) before starting"
+            "lead role context: {error}; no app-server child was started; repair the registered build, global/roles.toml and the role files it names before starting"
         ))
     })?;
-    plan.args.extend(role.args.iter().cloned().map(OsString::from));
-    plan.env
-        .insert("HARNESS_CONTEXT_ROLE".into(), Some(role.role.label().into()));
+    plan.args
+        .extend(role.args.iter().cloned().map(OsString::from));
+    plan.env.insert(
+        "HARNESS_CONTEXT_ROLE".into(),
+        Some(role.role.label().into()),
+    );
     plan.env.insert(
         "HARNESS_CONTEXT_REVISION".into(),
         Some(role.revision.clone().into()),
@@ -1233,7 +1236,11 @@ fn role_from_receipt(value: &serde_json::Value) -> io::Result<Option<RoleReceipt
     }
     serde_json::from_value(role.clone())
         .map(Some)
-        .map_err(|error| invalid(&format!("dispatch receipt role context is invalid: {error}")))
+        .map_err(|error| {
+            invalid(&format!(
+                "dispatch receipt role context is invalid: {error}"
+            ))
+        })
 }
 
 /// Record schema of the control route inside one dispatch receipt.
@@ -1814,7 +1821,7 @@ fn executor_role_receipt(
     )
     .map_err(|error| {
         invalid(&format!(
-            "executor role context: {error}; slot {} stays bound to {} and is reused by the next dispatch, no launcher or model request was made; repair the registered build and its owned kit role sources (global/roles.toml and global/roles/*.md) before dispatching",
+            "executor role context: {error}; slot {} stays bound to {} and is reused by the next dispatch, no launcher or model request was made; repair the registered build, global/roles.toml and the role files it names before dispatching",
             binding.index, binding.owner
         ))
     })?;
@@ -3771,8 +3778,10 @@ fn run_control_receipt(
         Some(role) => {
             plan.args
                 .extend(role.args.iter().cloned().map(OsString::from));
-            plan.env
-                .insert("HARNESS_CONTEXT_ROLE".into(), Some(role.role.clone().into()));
+            plan.env.insert(
+                "HARNESS_CONTEXT_ROLE".into(),
+                Some(role.role.clone().into()),
+            );
             plan.env.insert(
                 "HARNESS_CONTEXT_REVISION".into(),
                 Some(role.revision.clone().into()),
@@ -7630,10 +7639,7 @@ mod tests {
         route.set_role(RoleReceipt {
             role: "executor".into(),
             revision: "fixture-revision".into(),
-            args: vec![
-                "-c".into(),
-                "developer_instructions=Executor text".into(),
-            ],
+            args: vec!["-c".into(), "developer_instructions=Executor text".into()],
             previous: None,
         });
         save_receipt(
@@ -7794,10 +7800,8 @@ mod tests {
     /// and a fresh spawn continues nothing and makes no predecessor claim.
     #[test]
     fn previous_role_is_read_before_the_receipt_is_replaced() {
-        let root = std::env::temp_dir().join(format!(
-            "executor-previous-role-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("executor-previous-role-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let receipt = root.join("spawn-1.json");
@@ -7815,7 +7819,9 @@ mod tests {
         let previous = previous_role(&receipt, true).unwrap().unwrap();
         assert!(previous.recorded);
         assert_eq!(previous.revision.as_deref(), Some("kept-revision"));
-        let absent = previous_role(&root.join("absent.json"), true).unwrap().unwrap();
+        let absent = previous_role(&root.join("absent.json"), true)
+            .unwrap()
+            .unwrap();
         assert!(!absent.recorded, "a missing receipt records no role");
         let _ = fs::remove_dir_all(&root);
     }
@@ -7826,13 +7832,11 @@ mod tests {
     /// launcher directly, which composes the role itself.
     #[test]
     fn watch_reports_the_recorded_role_and_marks_legacy_receipts_unrecorded() {
-        let root =
-            std::env::temp_dir().join(format!("executor-watch-role-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("executor-watch-role-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let receipt = root.join("spawn-1.json");
-        let run =
-            RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
+        let run = RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
         let recorded = json!({
             "control": {"role": {"role": "executor", "revision": "watch-revision", "args": []}}
         });

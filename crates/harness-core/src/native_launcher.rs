@@ -268,12 +268,8 @@ pub fn role_launch(
     let (selected, _shared, _digest) = registered_runtime(&registration)?;
     let record = build_identity::read_record(&selected)?;
     let resolved = crate::role_context::resolve(&record.source_root, role)?;
-    let retained = crate::portable_config::retained_role_config(
-        home,
-        working_directory,
-        profile,
-        session,
-    )?;
+    let retained =
+        crate::portable_config::retained_role_config(home, working_directory, profile, session)?;
     let overrides = resolved.native_overrides(&retained)?;
     let args = launcher::with_context_overrides(&[], &overrides)
         .iter()
@@ -3268,8 +3264,7 @@ mod tests {
         .unwrap();
         let session: toml::Table =
             toml::from_str("developer_instructions = 'Session guidance'").unwrap();
-        let profile =
-            crate::orchestration_config::profile_config(&fixture.home, "custom").unwrap();
+        let profile = crate::orchestration_config::profile_config(&fixture.home, "custom").unwrap();
         let launch = role_launch(
             &fixture.home,
             &fixture.root.join("source"),
@@ -3290,18 +3285,22 @@ mod tests {
         );
         assert!(developer.contains("Session guidance"), "{developer}");
         assert!(!developer.contains("Profile guidance"), "{developer}");
-        assert!(!developer.contains("Fixture executor responsibility"), "{developer}");
+        assert!(
+            !developer.contains("Fixture executor responsibility"),
+            "{developer}"
+        );
         assert!(!effective.contains_key("model"), "{effective:?}");
-        assert!(!effective.contains_key("model_reasoning_effort"), "{effective:?}");
+        assert!(
+            !effective.contains_key("model_reasoning_effort"),
+            "{effective:?}"
+        );
     }
 
     /// The effective owned developer text of a composed role argument list,
     /// read back through the same native context parser the launcher uses.
     fn effective_developer(args: &[String], cwd: &Path) -> String {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-        let context = launcher::context_arguments(&args, cwd)
-            .unwrap()
-            .unwrap();
+        let context = launcher::context_arguments(&args, cwd).unwrap().unwrap();
         crate::portable_config::context_overrides(&context.overrides).unwrap()
             ["developer_instructions"]
             .as_str()

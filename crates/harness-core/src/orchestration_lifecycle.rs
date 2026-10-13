@@ -344,7 +344,10 @@ mod tests {
 
     fn role_kit(root: &Path) -> PathBuf {
         let source = root.join("source");
-        for dir in [source.join("skills/shared"), source.join("skills/coordinate")] {
+        for dir in [
+            source.join("skills/shared"),
+            source.join("skills/coordinate"),
+        ] {
             fs::create_dir_all(dir).unwrap();
         }
         fs::write(
