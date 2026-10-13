@@ -4,6 +4,9 @@ use std::{collections::BTreeSet, fs, io, path::Path};
 
 const SCHEMA: u32 = 1;
 const MAX_EXECUTORS: u32 = 32;
+/// Largest supported managed pool; matches `task_worktree::MAX_POOL_SLOTS`, so
+/// any valid configured value is also a valid pool size.
+const MAX_POOL_SIZE: u32 = crate::task_worktree::MAX_POOL_SLOTS;
 const DEFAULT_VOTE_THRESHOLD: u32 = 3;
 const DEFAULT_INCUBATOR_CAP: u32 = 32;
 const DEFAULT_FEEDBACK_BATCH: u32 = 8;
@@ -17,6 +20,13 @@ pub struct Orchestration {
     pub successor_lead_profile: String,
     pub executor_profiles: Vec<String>,
     pub max_concurrent_executors: u32,
+    /// Independent managed worktree pool capacity (see
+    /// `isolated-worktree-workflow`). Omitted in configurations written before
+    /// the capacity split, where the pool was sized by
+    /// `max_concurrent_executors`; installation materializes the former
+    /// effective value as an explicit setting.
+    #[serde(default)]
+    pub worktree_pool_size: Option<u32>,
     #[serde(default = "default_vote_threshold")]
     pub vote_threshold: u32,
     #[serde(default = "default_incubator_cap")]
@@ -62,6 +72,16 @@ pub struct SuccessorChoice {
 
 pub fn load(source_root: &Path) -> io::Result<Orchestration> {
     parse(&fs::read(source_root.join("global/orchestration.toml"))?)
+}
+
+/// Effective managed worktree pool capacity. An explicit setting always wins;
+/// a configuration written before the capacity split derived the pool from
+/// `max_concurrent_executors`, so that value is preserved until the
+/// installation materializes the explicit setting.
+pub fn worktree_pool_size(config: &Orchestration) -> u32 {
+    config
+        .worktree_pool_size
+        .unwrap_or(config.max_concurrent_executors)
 }
 
 pub fn profile_args(profile: &str) -> io::Result<Vec<String>> {
@@ -248,6 +268,13 @@ pub fn validate(config: &Orchestration, installed: &BTreeSet<String>) -> io::Res
             "orchestration max_concurrent_executors must be a positive integer at most 32",
         ));
     }
+    if let Some(pool) = config.worktree_pool_size
+        && (pool == 0 || pool > MAX_POOL_SIZE)
+    {
+        return Err(invalid(&format!(
+            "orchestration worktree_pool_size must be a positive integer at most {MAX_POOL_SIZE}"
+        )));
+    }
     if config.vote_threshold < 2 || config.vote_threshold > MAX_EXECUTORS {
         return Err(invalid(
             "orchestration vote_threshold must be at least 2 and at most 32",
@@ -400,6 +427,7 @@ mod tests {
             successor_lead_profile: "xai".into(),
             executor_profiles: vec!["xai".into()],
             max_concurrent_executors: 2,
+            worktree_pool_size: None,
             vote_threshold: 3,
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
@@ -418,6 +446,7 @@ mod tests {
             successor_lead_profile: "xai".into(),
             executor_profiles: vec!["xai".into()],
             max_concurrent_executors: 0,
+            worktree_pool_size: None,
             vote_threshold: 3,
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
@@ -436,6 +465,7 @@ mod tests {
             successor_lead_profile: "xai".into(),
             executor_profiles: vec!["xai".into()],
             max_concurrent_executors: 2,
+            worktree_pool_size: None,
             vote_threshold: 1,
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
@@ -590,22 +620,82 @@ mod tests {
     #[test]
     fn successor_choice_uses_configured_profile_model() {
         let config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
-        assert_eq!(config.successor_lead_profile, "zai");
+        assert_eq!(config.successor_lead_profile, "default");
         let root =
             std::env::temp_dir().join(format!("orchestration-successor-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("zai.config.toml"),
-            "model = 'glm-5.3'\nmodel_provider = 'zai'\n",
-        )
-        .unwrap();
+        fs::write(root.join("config.toml"), "model = 'gpt-6-astra'\n").unwrap();
         let choice = successor_choice(&config, &root).unwrap();
-        assert_eq!(choice.profile, "zai");
-        assert_eq!(choice.model, "glm-5.3");
+        assert_eq!(choice.profile, "default");
+        assert_eq!(choice.model, "gpt-6-astra");
         persist_successor(&root, &choice).unwrap();
         let saved: SuccessorChoice =
             serde_json::from_slice(&fs::read(root.join("successor.json")).unwrap()).unwrap();
-        assert_eq!(saved.model, "glm-5.3");
+        assert_eq!(saved.model, "gpt-6-astra");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shipped_defaults_materialize_independent_pool_capacity() {
+        let config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
+        assert_eq!(config.max_concurrent_executors, 4);
+        assert_eq!(config.worktree_pool_size, Some(4));
+        assert_eq!(worktree_pool_size(&config), 4);
+    }
+
+    #[test]
+    fn legacy_omission_keeps_the_executor_derived_capacity() {
+        let config = parse(
+            br#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
+max_concurrent_executors = 5
+vote_threshold = 3
+incubator_size_cap = 32
+feedback_batch_limit = 8
+worktree_limit = 6
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.worktree_pool_size, None);
+        assert_eq!(
+            worktree_pool_size(&config),
+            5,
+            "the compatibility worktree_limit never sizes the pool"
+        );
+        validate(&config, &installed(&["default", "ds"])).unwrap();
+    }
+
+    #[test]
+    fn explicit_pool_capacity_is_validated_and_independent() {
+        let mut config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
+        config.worktree_pool_size = Some(6);
+        assert_eq!(worktree_pool_size(&config), 6);
+        config.max_concurrent_executors = 2;
+        assert_eq!(
+            worktree_pool_size(&config),
+            6,
+            "changing executor concurrency never resizes the pool"
+        );
+        config.worktree_pool_size = Some(0);
+        let error = validate(&config, &installed(&["default", "ds"])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("worktree_pool_size must be a positive integer"),
+            "{error}"
+        );
+        config.worktree_pool_size = Some(33);
+        let error = validate(&config, &installed(&["default", "ds"])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("worktree_pool_size must be a positive integer"),
+            "{error}"
+        );
+        config.worktree_pool_size = None;
+        validate(&config, &installed(&["default", "ds"])).unwrap();
     }
 }
