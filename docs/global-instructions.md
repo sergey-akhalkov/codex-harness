@@ -53,6 +53,13 @@ delivery remain unfinished in
 [the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md);
 source and fixture checks do not establish effective consumption.
 
+The launcher keeps configuration overrides in the native root argument scope,
+before the subcommand, with explicit values in encounter order and composed
+role context last. Codex CLI 0.162.1 replaces the root configuration vector
+when overrides appear after a subcommand; appending role settings there can
+drop unrelated defaults such as permissions. The launcher argument checks and
+the isolated installation's native startup check cover this boundary.
+
 ## Update and scope
 
 Edit the canonical file in the repository. A new session reads the current text
