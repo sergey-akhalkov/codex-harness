@@ -149,7 +149,7 @@ pub fn is_git_checkout(path: &Path) -> io::Result<bool> {
 /// Largest supported pool; matches the orchestration `worktree_pool_size`
 /// bound, so a configured value is always a valid pool size.
 pub const MAX_POOL_SLOTS: u32 = 32;
-const SLOT_STATE_SCHEMA: u32 = 1;
+const SLOT_STATE_SCHEMA: u32 = 2;
 const CLAIM_ATTEMPTS: u32 = 4;
 
 /// Where a pool position stands in the source checkout's worktree registry.
@@ -482,6 +482,10 @@ pub enum ReservationLiveness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlotRecord {
+    // Legacy readers require `schema` and ignore unknown fields. Renaming the
+    // required discriminator makes them refuse these records instead of
+    // treating durable tasks as expired executor sessions after rollback.
+    #[serde(rename = "ownershipSchema", alias = "schema")]
     pub schema: u32,
     pub source: PathBuf,
     pub index: u32,
@@ -669,13 +673,16 @@ fn refuse_record_conflict(layout: &SlotStateLayout, index: u32) -> io::Result<()
 
 fn read_slot_record(path: &Path, index: u32) -> io::Result<SlotRecord> {
     let bytes = fs::read(path)?;
-    let record: SlotRecord = serde_json::from_slice(&bytes).map_err(|error| {
+    let mut record: SlotRecord = serde_json::from_slice(&bytes).map_err(|error| {
         pool_error(&format!(
             "slot record {} is unreadable ({error}); the lead resolves or removes it",
             path.display()
         ))
     })?;
     validate_slot_record(path, index, &record)?;
+    // Read legacy records without rewriting or relocating them. The next
+    // already-authorized state transition publishes the current format.
+    record.schema = SLOT_STATE_SCHEMA;
     Ok(record)
 }
 
@@ -684,7 +691,7 @@ fn read_slot_record(path: &Path, index: u32) -> io::Result<SlotRecord> {
 /// and only while a task holds the slot; any other shape would let an
 /// operation misread durable ownership, so it is refused without mutation.
 fn validate_slot_record(path: &Path, index: u32, record: &SlotRecord) -> io::Result<()> {
-    if record.schema != SLOT_STATE_SCHEMA {
+    if !matches!(record.schema, 1 | SLOT_STATE_SCHEMA) {
         return Err(pool_error(&format!(
             "slot record {} declares ownership schema {}; this build supports schema {SLOT_STATE_SCHEMA} and refuses to operate on the unsupported durable binding - the lead resolves or removes the record",
             path.display(),
@@ -5916,7 +5923,7 @@ mod tests {
         let path = slot_record_path(&home, &up.source, 1).unwrap();
         let mut record: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        record["schema"] = serde_json::json!(999);
+        record["ownershipSchema"] = serde_json::json!(999);
         let unsupported = serde_json::to_vec(&record).unwrap();
         fs::write(&path, &unsupported).unwrap();
 
@@ -6561,16 +6568,11 @@ mod tests {
         );
     }
 
-    /// The record shape published before durable task bindings (historical
-    /// base `4f2ff08`). This documents the rollback boundary rather than
-    /// endorsing it: such a build parses a current task record, serde ignores
-    /// the added fields, and its session rules see only `owner`, so a
-    /// downgrade could treat a held task as an ownerless slot. The current
-    /// build instead validates schema, position and binding invariants and
-    /// refuses unsupported shapes, and the installation adapter owns gating a
-    /// rollback across this boundary.
+    /// Legacy readers (historical base `4f2ff08`) ignore added task fields and
+    /// even an increased schema number. They must fail to deserialize the
+    /// required discriminator, before applying executor-session liveness.
     #[test]
-    fn a_legacy_reader_cannot_see_a_durable_task_binding() {
+    fn a_legacy_reader_refuses_a_durable_task_binding() {
         let root = tempfile::tempdir().unwrap();
         let up = upstream(root.path());
         let home = root.path().join("home");
@@ -6587,7 +6589,23 @@ mod tests {
             owner: Option<String>,
             base: Option<String>,
         }
-        let legacy: LegacySlotRecord = serde_json::from_slice(&bytes).unwrap();
+        let error = serde_json::from_slice::<LegacySlotRecord>(&bytes)
+            .err()
+            .expect("an older reader must refuse current ownership records");
+        assert!(error.to_string().contains("missing field `schema`"));
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ownershipSchema"], SLOT_STATE_SCHEMA);
+        assert!(value.get("schema").is_none());
+
+        // A number-only bump would not protect the held task: the historical
+        // decoder still accepts it and sees no durable ownership contract.
+        let mut number_only = value.clone();
+        number_only
+            .as_object_mut()
+            .unwrap()
+            .remove("ownershipSchema");
+        number_only["schema"] = serde_json::json!(SLOT_STATE_SCHEMA);
+        let legacy: LegacySlotRecord = serde_json::from_value(number_only).unwrap();
         assert_eq!(legacy.schema, SLOT_STATE_SCHEMA);
         assert_eq!(
             legacy.owner.as_deref(),
@@ -6599,7 +6617,6 @@ mod tests {
             SlotState::Occupied,
             "the legacy reader sees a completed session claim, not a task binding"
         );
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["task"].as_str(), Some("task-1"));
         assert_eq!(
             legacy.base.as_deref(),
@@ -6616,6 +6633,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("without its generation handle"), "{error}");
+    }
+
+    #[test]
+    fn legacy_record_upgrade_preserves_binding_and_files_until_owned_transition() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let dead = |_: &str| false;
+        let held = acquire_task(&home, &up.source, 1, "retained-task", Some(&base), &dead).unwrap();
+        fs::write(held.path.join("untracked.txt"), "retained input").unwrap();
+        let path = slot_record_path(&home, &up.source, 1).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("ownershipSchema");
+        legacy["schema"] = serde_json::json!(1);
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let loaded = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        assert_eq!(loaded.schema, SLOT_STATE_SCHEMA);
+        let continued =
+            continue_task(&home, &up.source, "retained-task", held.handle.as_deref()).unwrap();
+        assert_eq!(continued.path, held.path);
+        assert_eq!(continued.base, held.base);
+        assert_eq!(continued.handle, held.handle);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "reads do not rewrite state"
+        );
+
+        let handed = handoff_task_to_session(
+            &home,
+            &up.source,
+            "retained-task",
+            held.handle.as_deref().unwrap(),
+            "executor-after-update",
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(handed.path, held.path);
+        assert_eq!(handed.base, held.base);
+        assert_eq!(
+            fs::read_to_string(held.path.join("untracked.txt")).unwrap(),
+            "retained input"
+        );
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["ownershipSchema"], SLOT_STATE_SCHEMA);
+        assert!(upgraded.get("schema").is_none());
     }
 
     #[test]
