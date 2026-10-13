@@ -14,4 +14,4 @@ Observed problem: a single `cargo test --locked -p codex-harness --test improvem
 
 ## Impact
 
-Tests and CI only; no production behavior changes. The change is the candidate treatment A of the improvement-loop comparison recorded on its Beads card; its benefit is measured on the linked workload, not claimed from the split alone.
+The packaging changes tests and CI. Exercising the full coverage also required separately recorded corrections to existing window readiness, terminal placement and blocked-comparison handling; their runtime delivery remains with the existing harness owners. The change is the candidate treatment A of the improvement-loop comparison recorded on its Beads card. The complete native runs verify the deadline and coverage requirements; the broader paired workload comparison remains open and is not claimed from the split alone.

@@ -1,10 +1,10 @@
 ## Context
 
-See [proposal.md](proposal.md). The suite is one integration target with 40+ tests; several real-control tests run 60-250 s each serialized.
+See [proposal.md](proposal.md). The comparison coverage grew beyond one command's deadline; several real-control tests take 60-250 s each serialized. The accepted candidate packaging contains 50 tests across three targets.
 
 ## Decision
 
-Split at a stable module boundary into three deadline-sized targets (`improvement_comparison_a`, `_b`, `_c`) sharing fixture code through one `common` module, minimizing diff churn. Choose the boundary so each target's observed serialized duration stays under 1500 s (deadline minus observed admission variance margin). CI and the `ci_workflow` equality contract list exactly the resulting target set. The normative requirement is "more than one" target; the count moved from two to three when the measured two-target green total could not meet <1500 s per target (see Measured boundary).
+Split at a stable module boundary into three deadline-sized targets (`improvement_comparison_a`, `_b`, `_c`) sharing fixture code through one `common` module, minimizing diff churn. Choose the boundary so each target's observed serialized duration stays under 1500 s (deadline minus observed admission variance margin). CI and the `ci_workflow` equality contract list exactly the resulting target set. The normative requirement is "more than one" target; the count moved from two to three after the earlier A boundary exceeded the command deadline (see Measured boundary).
 
 ## Measured boundary (recorded 2026-10-13)
 
@@ -14,7 +14,7 @@ A complete-green attempt on 2026-10-13 (readiness fix 465691e, same heavy accoun
 
 No measured run of the pre-split single target is retained from this session; that baseline remains open and no history is reconstructed.
 
-Boundary re-derivation (2026-10-13, lead decision): the retained green attempt already showed the two-target total cannot stay under 3000 s, so "<1500 s each" is infeasible for two targets; the lead authorized three targets. The suite was re-split into `improvement_comparison_a` (16 tests), `improvement_comparison_b` (21) and `improvement_comparison_c` (13 moved tests) with byte-identical bodies; coverage parity re-verified (50 = 16+21+13; 0 duplicates, 0 missing, 0 extra, 0 body mismatches) and the workflow plus `ci_workflow` equality contract list all three. Complete green runs recorded 2026-10-13 on candidate 730b599 (default heavy account, serialized): a finished 16 passed in 895.07 s, c 13 passed in 933.31 s and b 21 passed in 1201.51 s; every whole target stayed under the 1500 s budget.
+Boundary re-derivation (2026-10-13, lead decision): the old A boundary exceeded its deadline, so three targets were selected to provide measured headroom without another diagnostic full run. No complete two-target green total was measured. The suite was re-split into `improvement_comparison_a` (16 tests), `improvement_comparison_b` (21) and `improvement_comparison_c` (13 moved tests) with byte-identical bodies; coverage parity re-verified (50 = 16+21+13; 0 duplicates, 0 missing, 0 extra, 0 body mismatches) and the workflow plus `ci_workflow` equality contract list all three. Complete green runs recorded 2026-10-13 on candidate 730b599 (default heavy account, serialized): a finished 16 passed in 895.07 s, c 13 passed in 933.31 s and b 21 passed in 1201.51 s; every whole target stayed under the 1500 s budget.
 
 ## Experiment selection
 
@@ -29,7 +29,7 @@ Stopping: one predeclared matched pair, failures retained without retry
 
 ## Risks
 
-- Split boundary hides a cross-module shared-state dependency -> both targets still run in CI and the full local set; the workload oracle requires the complete set green.
+- Split boundary hides a cross-module shared-state dependency -> all three targets still run in CI and the full local set; the workload oracle requires the complete set green.
 - CI target list drift -> the equality contract test fails on any mismatch.
 
 ## Migration Plan
@@ -40,4 +40,4 @@ Stopping: one predeclared matched pair, failures retained without retry
 
 ## Open Questions
 
-None; the boundary choice is measured, not debated. The 2026-10-13 green attempt falsified the two-target margin, so the lead authorized the re-split into three deadline-sized targets under the unchanged normative requirement; the three complete green runs remain the acceptance case. See Measured boundary.
+The target boundary is verified by the three complete green runs. The predeclared paired-implementation experiment above remains open: these native checks do not establish an end-to-end agent-work cost comparison against the unsplit baseline. Failed historical runs remain evidence of their actual exercised scope.
