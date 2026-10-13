@@ -207,6 +207,53 @@ fn git_identity(root: &Path) {
     fs::write(root.join("README.md"), "skill catalog refresh workspace\n").unwrap();
 }
 
+fn git_command(dir: &Path) -> Command {
+    let mut command =
+        Command::new(std::env::var_os("HARNESS_GIT").unwrap_or_else(|| "git.exe".into()));
+    command.current_dir(dir);
+    command
+}
+
+/// One linked worktree of the real kit repository, created for one explicit
+/// native probe and removed best-effort on drop. The registration lives in
+/// the shared repository, so cleanup runs even when the probe panics.
+struct LinkedKitWorktree {
+    repo: PathBuf,
+    path: PathBuf,
+}
+
+impl LinkedKitWorktree {
+    fn add(repo: &Path, path: &Path) -> Self {
+        let output = git_command(repo)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "linked worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self {
+            repo: repo.to_path_buf(),
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for LinkedKitWorktree {
+    fn drop(&mut self) {
+        let _ = git_command(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .status();
+        let _ = git_command(&self.repo).args(["worktree", "prune"]).status();
+        if self.path.exists() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 fn contains_marker(body: &str, marker: &str) -> bool {
     body.contains(marker)
         || body.contains(
@@ -3383,6 +3430,225 @@ fn tree_paths(root: &Path) -> Vec<String> {
     walk(root, root, &mut out);
     out.sort();
     out
+}
+
+/// Explicit native probe: a managed executor catalogue must stay free of
+/// lead-only kit skills across every validated copy of the same kit
+/// repository. The recorded build source is this checkout while the case is
+/// a fresh linked worktree of the same repository, so the native repository
+/// scope discovers the lead-only skill at the case checkout and the real
+/// user farm discovers the main checkout copy; both must report
+/// enabled=false for the executor while shared skills stay enabled in both
+/// scopes and the same catalogue for the lead keeps the lead-only skill
+/// enabled, proving the filter is role selection and not a blanket path or
+/// name disable. An unrelated case carrying a same-name project skill stays
+/// enabled. The explicit disablement recorded at the canonical source path
+/// must also reach the case and user copies. The installed native CLI
+/// performs every catalogue read; no model call is made.
+#[test]
+#[ignore = "explicit installed native CLI skills/list over a linked worktree of the kit source; no model"]
+fn catalogue_role_executor_disables_lead_skills_across_linked_worktree_copies() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-linked-worktree-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .keep();
+    println!(
+        "skill catalogue linked worktree evidence: {}",
+        root.display()
+    );
+    let home = root.join("codex");
+    fs::create_dir_all(&home).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let linked = root.join("linked");
+    let linked_worktree = LinkedKitWorktree::add(&source, &linked);
+    let build = synthetic_role_build::recorded_build(&root, &source);
+    synthetic_role_build::register(&home, &root, &build);
+
+    // Expectations come from the kit descriptor itself: shared skills belong
+    // to both roles and the lead-only skills must stay absent for the
+    // executor.
+    let descriptor: toml::Value =
+        toml::from_str(&fs::read_to_string(source.join("global/roles.toml")).unwrap()).unwrap();
+    let names = |value: &toml::Value| -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let shared = names(&descriptor["shared_skills"]);
+    let lead_only = names(&descriptor["roles"]["lead"]["skills"]);
+    let explicitly_disabled = source
+        .join(".agents/skills")
+        .join(CATALOGUE_EXPLICITLY_DISABLED_SKILL)
+        .join("SKILL.md");
+    assert!(
+        explicitly_disabled.is_file(),
+        "the workspace kit must classify the probe skill: {}",
+        explicitly_disabled.display()
+    );
+    fs::write(
+        home.join("ds.config.toml"),
+        format!(
+            "[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(explicitly_disabled.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(home.join("config.toml"), "approval_policy = \"never\"\n").unwrap();
+
+    let upstream = registered_upstream(&live_codex_home());
+    let catalogue = |role: &str, case: &Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command
+            .args(["skills", "catalogue", "--case"])
+            .arg(case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", role, "--profile", "ds", "--limit", "1048576"]);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command.output().unwrap()
+    };
+    let executor = catalogue("executor", &linked);
+    assert!(
+        executor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executor.stderr)
+    );
+    let executor_text = String::from_utf8_lossy(&executor.stdout).into_owned();
+    fs::write(
+        root.join("catalogue-executor-linked.txt"),
+        executor_text.as_bytes(),
+    )
+    .unwrap();
+    let lead = catalogue("lead", &linked);
+    assert!(
+        lead.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lead.stderr)
+    );
+    let lead_text = String::from_utf8_lossy(&lead.stdout).into_owned();
+    fs::write(root.join("catalogue-lead-linked.txt"), lead_text.as_bytes()).unwrap();
+
+    let entry = |text: &str, name: &str, scope: &str| -> Option<bool> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("name={name};scope={scope};")))
+            .map(|line| line.starts_with(&format!("name={name};scope={scope};enabled=true;")))
+    };
+    for (role, text) in [
+        ("executor", executor_text.as_str()),
+        ("lead", lead_text.as_str()),
+    ] {
+        assert!(
+            text.contains(&format!("role_context=role={role};profile=ds;revision=")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("omitted="),
+            "--limit 1048576 must deliver every effective entry for {role}: {text}"
+        );
+    }
+    for name in &lead_only {
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(false),
+            "the case checkout copy of lead-only {name} must be disabled: {executor_text}"
+        );
+        assert!(
+            entry(executor_text.as_str(), name, "user") == Some(false),
+            "the user-farm copy of lead-only {name} must be disabled: {executor_text}"
+        );
+        assert!(
+            !executor_text.lines().any(|line| {
+                line.starts_with(&format!("name={name};")) && line.contains(";enabled=true;")
+            }),
+            "no discovered copy of {name} may stay enabled for the executor: {executor_text}"
+        );
+        assert!(
+            entry(lead_text.as_str(), name, "repo") == Some(true),
+            "the lead keeps {name}: {lead_text}"
+        );
+    }
+    for name in &shared {
+        if name == CATALOGUE_EXPLICITLY_DISABLED_SKILL {
+            continue;
+        }
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(true),
+            "the shared skill {name} stays available in the case checkout: {executor_text}"
+        );
+        assert!(
+            entry(executor_text.as_str(), name, "user") == Some(true),
+            "the shared skill {name} stays available in the user farm: {executor_text}"
+        );
+    }
+    for (role, text) in [
+        ("executor", executor_text.as_str()),
+        ("lead", lead_text.as_str()),
+    ] {
+        assert!(
+            entry(text, CATALOGUE_EXPLICITLY_DISABLED_SKILL, "repo") == Some(false),
+            "the explicit disablement reaches the case checkout for {role}: {text}"
+        );
+        assert!(
+            entry(text, CATALOGUE_EXPLICITLY_DISABLED_SKILL, "user") == Some(false),
+            "the explicit disablement reaches the user farm for {role}: {text}"
+        );
+    }
+
+    // An unrelated case carrying a same-name project skill must stay enabled:
+    // no foreign path may be disabled by name or similarity.
+    let foreign_case = root.join("foreign");
+    fs::create_dir_all(&foreign_case).unwrap();
+    write_skill(
+        &foreign_case.join(".agents/skills").join(&lead_only[0]),
+        &lead_only[0],
+        "FOREIGN_SAME_NAME_MARKER",
+    );
+    let foreign = catalogue("executor", &foreign_case);
+    assert!(
+        foreign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&foreign.stderr)
+    );
+    let foreign_text = String::from_utf8_lossy(&foreign.stdout).into_owned();
+    fs::write(
+        root.join("catalogue-executor-foreign.txt"),
+        foreign_text.as_bytes(),
+    )
+    .unwrap();
+    // Discovery from inside the kit checkout surfaces both the canonical kit
+    // copy and the case copy at repo scope; only the case copy stays enabled,
+    // and the canonical kit copy stays disabled for the executor.
+    let foreign_path = foreign_case.to_string_lossy().into_owned();
+    let kit_path = source
+        .join(".agents/skills")
+        .join(&lead_only[0])
+        .to_string_lossy()
+        .into_owned();
+    let path_entry = |text: &str, name: &str, path: &str, enabled: bool| {
+        text.lines().any(|line| {
+            line.starts_with(&format!("name={name};"))
+                && line.contains(&format!(";enabled={enabled};"))
+                && line.contains(path)
+        })
+    };
+    assert!(
+        path_entry(foreign_text.as_str(), &lead_only[0], &foreign_path, true),
+        "an unrelated same-name project skill stays enabled: {foreign_text}"
+    );
+    assert!(
+        path_entry(foreign_text.as_str(), &lead_only[0], &kit_path, false),
+        "the canonical kit copy stays disabled for the executor: {foreign_text}"
+    );
+    drop(linked_worktree);
 }
 
 /// Explicit native probe of what installed 0.162.1 actually consumes for a
