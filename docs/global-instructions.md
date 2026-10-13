@@ -27,7 +27,7 @@ developer guidance and repeated executor briefs:
 | Native routing restrictions, Code Mode/RTK use, opaque-state and desktop safeguards | [Shared developer guidance](../global/harness.config.toml) |
 | Activation, decomposition, assignment snapshots and exact paths, model selection, supervision, succession, visibility, integration and acceptance | [Lead responsibility](../global/roles/lead.md) |
 | The executor's local implementation/check/correction cycle, base verification, standing return boundaries, feedback waiting and result evidence | [Executor responsibility](../global/roles/executor.md) |
-| Task objective, actual checkout/base, owned paths, invariants, acceptance, consumer and additional boundaries | [Assignment renderer](../crates/codex-harness/src/executor_assignment.rs) |
+| Task objective, actual checkout/base, owned paths, invariants, acceptance, consumer, concrete feedback address and additional boundaries | [Assignment renderer](../crates/codex-harness/src/executor_assignment.rs) |
 
 The source checker resolves both roles with the runtime's shared Rust resolver
 and rejects missing/escaping sources and unclassified managed skills. The

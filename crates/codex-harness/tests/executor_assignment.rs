@@ -294,13 +294,18 @@ fn dry_run_renders_the_bound_checkout_base_and_exact_paths() {
     assert!(text.contains("- existing_child.rs"), "{text}");
     assert!(text.contains("- crates/new/module.rs"), "{text}");
     assert!(text.contains("- the synthetic check passes"), "{text}");
+    assert!(
+        text.contains("feedback: return the result and any decision you escalate to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
+        "{text}"
+    );
     // Standing responsibility guidance (work cycle, base verification, the
-    // heavy-command lane) reaches a managed session through its role context
-    // and is not restated in the brief.
+    // heavy-command lane, the compact result shape) reaches a managed session
+    // through its role context and is not restated in the brief.
     for standing in [
         "work cycle (yours)",
         "verify the checkout is at the base above",
         "Choose the installed skills this assignment needs",
+        "report a compact result: done and remaining work",
     ] {
         assert!(!text.contains(standing), "{standing}\n{text}");
     }
@@ -346,11 +351,12 @@ fn missing_inputs_traversal_and_absolute_paths_are_rejected() {
     fixture.drop();
 }
 
-/// The result consumer and the escalation boundaries reach the exact brief
-/// the installed render path prints: an existing schema-1 document keeps
-/// working with the dispatching lead as the consumer, and a declared consumer
-/// or trigger is carried beside the standing boundaries instead of replacing
-/// them.
+/// The result consumer, the concrete feedback address and the declared
+/// additional boundaries reach the exact brief the installed render path
+/// prints: an existing schema-1 document keeps working with the dispatching
+/// lead as the consumer, and a declared consumer or trigger is carried beside
+/// the feedback address while the standing boundaries stay owned by the
+/// executor role fragment.
 #[test]
 fn consumer_and_escalation_reach_the_rendered_brief() {
     let fixture = Fixture::new("contract");
@@ -366,25 +372,27 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "{text}"
     );
     assert!(
-        text.contains("escalate to the lead that dispatched this assignment"),
+        text.contains(
+            "escalate to the lead that dispatched this assignment (additional boundaries)"
+        ),
         "{text}"
     );
     assert!(
-        text.contains("- a change to the agreed outcome or scope"),
+        text.contains("feedback: return the result and any decision you escalate to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
         "{text}"
     );
-    assert!(
-        text.contains("- a concrete dependency you cannot obtain"),
-        "{text}"
-    );
-    assert!(
-        !text.contains("work cycle (yours)"),
-        "standing guidance reaches a managed session through its role context, not the brief: {text}"
-    );
-    assert!(
-        text.contains("report a compact result: done and remaining work"),
-        "{text}"
-    );
+    // Standing boundaries, waiting behavior and the compact result shape stay
+    // owned by the executor role fragment: none of them is copied into the
+    // brief.
+    for standing in [
+        "- a change to the agreed outcome or scope",
+        "- a concrete dependency you cannot obtain",
+        "work cycle (yours)",
+        "no polling, keep-alive loop or resume",
+        "report a compact result: done and remaining work",
+    ] {
+        assert!(!text.contains(standing), "{standing}\n{text}");
+    }
 
     // Declared consumer and additional triggers travel with the standing ones.
     let declared = fixture.assignment_with(
@@ -407,7 +415,7 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "{text}"
     );
     assert!(
-        text.contains("escalate to the lead of epic sample-3mu"),
+        text.contains("escalate to the lead of epic sample-3mu (additional boundaries)"),
         "{text}"
     );
     assert!(
@@ -415,12 +423,12 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "{text}"
     );
     assert!(
-        text.contains("- a material architecture or design change"),
+        text.contains("feedback: return the result and any decision you escalate to the lead of epic sample-3mu through codex-harness lead message (short --text fallback)."),
         "{text}"
     );
     assert!(
-        text.contains("the decision you need from the lead of epic sample-3mu"),
-        "{text}"
+        !text.contains("- a material architecture or design change"),
+        "standing boundaries stay with the role fragment: {text}"
     );
     fixture.drop();
 }

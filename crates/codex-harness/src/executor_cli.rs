@@ -7160,9 +7160,9 @@ mod tests {
     }
 
     /// Free text renders through the instruction owner: the caller's words stay
-    /// first and the installed rule follows, so `--exec` carries the lead
-    /// channel, the waiting behavior and the answer-required watch result
-    /// without the caller repeating them or teaching address discovery.
+    /// first and the small task contract follows, so `--exec` carries the
+    /// consumer and the concrete feedback address without the caller repeating
+    /// them and without restating the role-owned standing guidance.
     #[test]
     fn free_text_assignment_renders_the_executor_assignment_guidance() {
         let root = std::env::temp_dir().join(format!("executor-free-text-{}", std::process::id()));
@@ -7208,21 +7208,19 @@ mod tests {
             "a streamed or typed assignment renders one brief"
         );
         assert!(
-            text.contains("by piping codex-harness lead message"),
+            text.contains("feedback: return the result and any decision you escalate to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
             "{text}"
         );
-        assert!(
-            text.contains("asks for a reply unless --notify marks a notice that needs none"),
-            "{text}"
-        );
-        assert!(
-            text.contains("An executor watch result of 3 means answer that request"),
-            "{text}"
-        );
-        assert!(
-            text.contains("durable blockers, decisions and results stay on the bd issue"),
-            "{text}"
-        );
+        // Standing exchange guidance is owned by the executor role fragment
+        // and is not restated in the rendered brief.
+        for standing in [
+            "by piping codex-harness lead message",
+            "An executor watch result of 3 means answer that request",
+            "durable blockers, decisions and results stay on the bd issue",
+            "report a compact result: done and remaining work",
+        ] {
+            assert!(!text.contains(standing), "{standing}\n{text}");
+        }
         assert!(!text.contains("--session"), "{text}");
         let _ = fs::remove_dir_all(root);
     }
