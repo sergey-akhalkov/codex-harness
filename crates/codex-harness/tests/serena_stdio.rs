@@ -50,6 +50,144 @@ fn native_semantic_acceptance_checks_real_backends_and_edit_readback() {
 }
 
 #[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY with adopted pasls"]
+fn pascal_startup_skips_eager_build_copy_index_and_keeps_navigation() {
+    let registry = PathBuf::from(
+        std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit adopted registry"),
+    );
+    let root = tempfile::Builder::new()
+        .prefix("harness-pascal-startup-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!(
+        "Pascal startup evidence (retained on failure): {}",
+        root.display()
+    );
+    let project = root.join("project");
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(project.join(".serena")).unwrap();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(project.join(".build/copy")).unwrap();
+    fs::write(
+        project.join(".serena/project.yml"),
+        "project_name: pascal-startup\nlanguage_servers: [pascal]\nencoding: utf-8\nignored_paths: ['.build/**']\n",
+    ).unwrap();
+    fs::write(
+        project.join("src/values.pas"),
+        "unit values;\ninterface\nfunction acceptance_value: Integer;\nimplementation\nfunction acceptance_value: Integer;\nbegin\n  acceptance_value := 7101;\nend;\nend.\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/caller.pas"),
+        "unit caller;\ninterface\nuses values;\nfunction consume: Integer;\nimplementation\nfunction consume: Integer;\nbegin\n  consume := acceptance_value;\nend;\nend.\n",
+    ).unwrap();
+    fs::write(
+        project.join(".build/copy/ignored_copy.pas"),
+        "unit ignored_copy;\ninterface\nimplementation\nfunction ignored_marker: Integer;\nbegin\n  ignored_marker := 9919;\nend;\nend.\n",
+    )
+    .unwrap();
+    let cleanup = OwnedBroker(codex_home.clone());
+    let mut proxy = Proxy::start(&root, &codex_home, &registry, &project, &adopted_console());
+    let reply = proxy.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "pascal-startup-regression", "version": "1"}
+        }),
+    );
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let mut id = 1;
+    let mut call = |name: &str, arguments: Value| {
+        id += 1;
+        let reply = proxy.request(
+            id,
+            "tools/call",
+            json!({"name": name, "arguments": arguments}),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        reply["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect::<String>()
+    };
+    let overview = call(
+        "get_symbols_overview",
+        json!({"relative_path":"src/values.pas","depth":1,"max_answer_chars":3800}),
+    );
+    assert!(overview.contains("acceptance_value"), "{overview}");
+    let found = call(
+        "find_symbol",
+        json!({"name_path_pattern":"acceptance_value","include_body":true,
+            "max_matches":4,"max_answer_chars":3800}),
+    );
+    assert!(
+        found.contains("7101") && found.contains("values.pas"),
+        "{found}"
+    );
+    let ignored = call(
+        "find_symbol",
+        json!({"name_path_pattern":"ignored_marker","max_matches":1,"max_answer_chars":1000}),
+    );
+    assert!(
+        !ignored.contains("9919") && !ignored.contains("ignored_copy.pas"),
+        "{ignored}"
+    );
+    call(
+        "get_symbols_overview",
+        json!({"relative_path":"src/caller.pas","depth":1,"max_answer_chars":3800}),
+    );
+    let references = call(
+        "find_referencing_symbols",
+        json!({"relative_path":"src/values.pas","name_path":"interface/acceptance_value","max_answer_chars":3800}),
+    );
+    assert!(
+        references.contains("consume") && references.contains("caller.pas"),
+        "{references}"
+    );
+
+    // Inspect the real server's load events, not just the generated setting.
+    // A tiny ignored copy reproduces the erroneous eager load without inducing OOM.
+    let mut pending = vec![codex_home.join("harness/serena-home/workers")];
+    let mut logs = String::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_name().to_string_lossy().starts_with("mcp_") {
+                logs.push_str(&fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+    }
+    assert!(
+        logs.contains("Language server initialization completed"),
+        "missing startup evidence: {}",
+        root.display()
+    );
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("Reloaded") && line.contains("values.pas")),
+        "missing positive load evidence: {}",
+        root.display()
+    );
+    assert!(
+        !logs
+            .lines()
+            .any(|line| line.contains("Reloaded") && line.contains("ignored_copy.pas")),
+        "pasls eagerly loaded an ignored build copy; evidence: {}",
+        root.display()
+    );
+    proxy.finish();
+    drop(cleanup);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn native_semantic_acceptance_fails_on_missing_dependencies() {
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("registry.json");
