@@ -301,6 +301,60 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "ordinary session must start the installed launcher: {text}"
     );
 
+    // A version response is not context consumption. Inspect a fresh native
+    // context in the outside project through the installed launcher as well.
+    let project_guidance = "Owned outside-project instruction marker";
+    fs::write(workspace.join("AGENTS.md"), project_guidance).unwrap();
+    let prompt = Command::new(codex_home.join("harness/bin/codex.exe"))
+        .current_dir(&workspace)
+        .env("CODEX_HOME", &codex_home)
+        .env("USERPROFILE", &user_home)
+        .env("HOME", &user_home)
+        .env("APPDATA", user_home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", user_home.join("AppData/Local"))
+        .env("TEMP", user_home.join("AppData/Local/Temp"))
+        .env("TMP", user_home.join("AppData/Local/Temp"))
+        .args(["debug", "prompt-input"])
+        .output()
+        .unwrap();
+    assert!(
+        prompt.status.success(),
+        "{}",
+        failed("outside prompt", &prompt)
+    );
+    let messages: serde_json::Value = serde_json::from_slice(&prompt.stdout).unwrap();
+    let context = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .filter_map(|content| content["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\r\n", "\n");
+    for relative in ["global/principles-of-work.md", "global/roles/lead.md"] {
+        let expected = fs::read_to_string(source.join(relative))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            context.contains(expected.trim()),
+            "outside context omits {relative}"
+        );
+    }
+    assert!(
+        context.contains(project_guidance),
+        "outside project guidance is missing"
+    );
+    let executor_guidance = fs::read_to_string(source.join("global/roles/executor.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        !context.contains(executor_guidance.trim()),
+        "lead loaded the executor role"
+    );
+    assert!(context.contains("danger-full-access"));
+    assert!(context.contains("Approval policy is currently never"));
+
     board_lifecycle::disconnect(&board_on).unwrap();
     assert!(
         !codex_home.join("harness/bin/bd.exe").exists(),
