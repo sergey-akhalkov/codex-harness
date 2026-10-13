@@ -64,7 +64,13 @@ pub(crate) fn stop_cache_run(
         value["slot"]["owner"].as_str(), tracker.observation.session.as_deref()) {
         (Some(source), Some(slot), Some(owner), Some(session)) => {
             let home = harness_core::native_launcher::codex_home()?;
-            format!("Lead action required: review preserved partial work, then start a NEW session for the original assignment in the SAME worktree with `codex-harness executor restart --source {} --codex-home {} --slot {slot} --owner {} --session {}`. Do not use spawn/release/reset or resume the expensive history; if this recurs, investigate before another restart", quote(source), quote(&home.to_string_lossy()), quote(owner), quote(session))
+            let repository = value["slot"]["repository"].as_str().unwrap_or(source);
+            let repository_flag = if source.eq_ignore_ascii_case(repository) {
+                String::new()
+            } else {
+                format!(" --repository {}", quote(repository))
+            };
+            format!("Lead action required: review preserved partial work, then start a NEW session for the original assignment in the SAME worktree with `codex-harness executor restart --source {} --codex-home {} --slot {slot} --owner {} --session {}{repository_flag}`. Do not use spawn/release/reset or resume the expensive history; if this recurs, investigate before another restart", quote(source), quote(&home.to_string_lossy()), quote(owner), quote(session))
         }
         _ => "Lead action required: preserve partial work and start a new conversation in the same checkout for the original task; this receipt has no verified pool address for executor restart".to_owned(),
     };

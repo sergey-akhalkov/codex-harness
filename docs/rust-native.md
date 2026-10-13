@@ -558,6 +558,51 @@ CPU or call a model. What incomplete activation and the disconnect notice mean
 is in [installation](installation.md#shared-cpu-policy). The decision is in
 [project decisions](project-decisions.md#shared-agent-cpu-budget).
 
+## Shared worktree pool commands
+
+`codex-harness worktree acquire|continue|list|release` operates one
+repository's shared harness worktree pool for ordinary tasks without starting
+a conversation, through the same durable task owner executor dispatch uses.
+`--source` names the kit/configuration checkout whose
+`global/orchestration.toml` supplies the pool capacity (default: the installed
+kit source recorded under `--codex-home`); `--repository` names the
+independent target repository (default: `--source`), which needs only to be a
+Git checkout - a consuming repository carries no kit configuration.
+
+```powershell
+codex-harness worktree acquire --task ID [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY] [--base REV]
+codex-harness worktree continue --task ID [--handle HANDLE] [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY]
+codex-harness worktree list [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY]
+codex-harness worktree release --task ID --disposition merged|discarded --reason TEXT [--handle HANDLE] [--base REV] [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY]
+```
+
+Acquire resolves the exact committed base locally and never fetches: the
+target's HEAD by default, or the explicit `--base` commit; an unknown base
+fails closed with that rule named. It prints the pool line and the slot
+receipt (`slot`, `path`, `presence`, `state`, `base`, `task`, `handle`,
+`owner`, `disposition`, `reason`). The handle is the recorded generation a
+release must present after any reassignment. Repeating acquire for a held
+task returns the same binding; a different requested base refuses as a
+conflict, and capacity is `worktree_pool_size`, falling back to
+`max_concurrent_executors` when the configuration omits it. Continue returns
+the held binding; a stale handle, a released binding or a live foreign
+session refuses with its cause. List reports every configured position plus
+registered-missing and foreign directories for lead review. Release records
+`merged` or `discarded` with its reason, resets the position to the committed
+base for reuse while retaining ignored caches, and preserves a position that
+cannot reset safely with exit 2.
+
+Executor dispatch consumes the same pool: `executor spawn` accepts
+`--repository REPO` (default `--source`) and `--task ID --handle HANDLE` to
+hand a held ordinary task to the session without a reset or a second tree.
+Dispatch is admitted against `max_concurrent_executors`, separately from the
+pool: an active run holds concurrency while its host lease is live or its
+startup claim still excludes other dispatches, a held or suspended task keeps
+only its pool position, and a refusal names the active runs without allocating
+anything. `executor resume`, `restart`, `watch`, `message`, `stop`,
+`assignment`, `pool` and `release` accept the same `--repository` selector. `executor pool` lines
+add `repository=`, `task=` and `handle=` beside the session fields.
+
 ## Structured executor assignments
 
 `codex-harness executor spawn`, `resume` and `restart` accept `--assignment FILE` or

@@ -77,7 +77,7 @@ use super::observation::{
 use super::{
     SessionLease, invalid, lease_path, option_text, read_lease, receipt_binding, receipt_path,
 };
-use harness_core::orchestration_config;
+use harness_core::orchestration_config::{self, worktree_pool_size};
 use harness_core::process::{Cancellation, Deadline, ExclusiveFileLock, ProcessIdentity};
 use harness_core::process_service::{self, ServiceProcess};
 use harness_core::task_succession;
@@ -124,6 +124,10 @@ const STATUS_UNDELIVERED: &str = "undelivered";
 
 struct Request {
     source: PathBuf,
+    /// The target repository whose pool, slot records and receipts address
+    /// this run; it equals `source` unless `--repository` selected an
+    /// independent consuming repository.
+    repository: PathBuf,
     codex_home: PathBuf,
     slot: u32,
     owner: String,
@@ -139,6 +143,7 @@ impl Request {
     fn parse(args: &[OsString]) -> io::Result<Self> {
         let mut source = None;
         let mut codex_home = None;
+        let mut repository = None;
         let mut slot = None;
         let mut owner = None;
         let mut session = None;
@@ -156,6 +161,7 @@ impl Request {
             match key {
                 "--source" => source = Some(PathBuf::from(value)),
                 "--codex-home" => codex_home = Some(PathBuf::from(value)),
+                "--repository" => repository = Some(PathBuf::from(value)),
                 "--slot" => slot = Some(option_text(value)?),
                 "--owner" => owner = Some(option_text(value)?),
                 "--session" => session = Some(option_text(value)?),
@@ -202,6 +208,7 @@ impl Request {
                 &ExplicitAddress {
                     source,
                     codex_home,
+                    repository,
                     slot,
                     owner,
                     session,
@@ -214,10 +221,17 @@ impl Request {
         // then verified exactly as an explicitly typed value is.
         let codex_home = executor_input::codex_home(codex_home)?;
         let source = executor_input::source(source, &codex_home)?;
-        let run =
-            executor_input::resolve_run(&codex_home, &source, slot, owner.as_deref(), "message")?;
+        let repository = repository.unwrap_or_else(|| source.clone());
+        let run = executor_input::resolve_run(
+            &codex_home,
+            &repository,
+            slot,
+            owner.as_deref(),
+            "message",
+        )?;
         Ok(Self {
             source,
+            repository,
             codex_home,
             slot: run.slot,
             owner: run.owner,
@@ -259,10 +273,10 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // bound to the addressed owner, and an explicit --session must be the
     // session the receipt recorded.
     let config = orchestration_config::load(&request.source)?;
-    let layout = task_worktree::pool(&request.source, config.max_concurrent_executors)?;
+    let layout = task_worktree::pool(&request.repository, worktree_pool_size(&config))?;
     layout.slot(request.slot)?;
     let record =
-        task_worktree::load_slot_record(&request.codex_home, &request.source, request.slot)?
+        task_worktree::load_slot_record(&request.codex_home, &request.repository, request.slot)?
             .ok_or_else(|| {
                 invalid(&format!(
                     "slot {} has no recorded session binding; message addresses a dispatched run, so dispatch or resume that session first",
@@ -280,7 +294,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             )));
         }
     }
-    let receipt = receipt_path(&request.codex_home, &request.source, request.slot)?;
+    let receipt = receipt_path(&request.codex_home, &request.repository, request.slot)?;
     let bytes = fs::read(&receipt).map_err(|error| {
         invalid(&format!(
             "executor message needs the dispatch receipt {} to name the exact run: {error}; dispatch `codex-harness executor spawn` first",
@@ -360,7 +374,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             started,
         );
     }
-    let paths = ControlPaths::for_slot(&request.codex_home, &request.source, request.slot)?;
+    let paths = ControlPaths::for_slot(&request.codex_home, &request.repository, request.slot)?;
     let endpoint = match Endpoint::read(&paths.endpoint) {
         Ok(endpoint) => endpoint,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -368,10 +382,11 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 &request,
                 &receipt,
                 format!(
-                    "the run has not recorded its control endpoint yet (state {state}), so its conversation is not addressable; it may still be starting - observe it with `codex-harness executor watch --source {} --codex-home {} --slot {}` and message again once its conversation is recorded",
+                    "the run has not recorded its control endpoint yet (state {state}), so its conversation is not addressable; it may still be starting - observe it with `codex-harness executor watch --source {} --codex-home {} --slot {}{}` and message again once its conversation is recorded",
                     request.source.display(),
                     request.codex_home.display(),
-                    request.slot
+                    request.slot,
+                    executor_input::repository_flag(&request.source, &request.repository)
                 ),
                 &remedy,
                 started,
@@ -399,7 +414,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // it, and the app-server child that serves the conversation.
     let lease = read_lease(&lease_path(
         &request.codex_home,
-        &request.source,
+        &request.repository,
         request.slot,
     )?)
     .filter(|lease| lease.owner == request.owner && lease.index == request.slot);
@@ -1311,11 +1326,12 @@ fn record_attempt(receipt: &Path, entry: Value) -> io::Result<()> {
 
 fn resume_remedy(request: &Request) -> String {
     format!(
-        "codex-harness executor resume --source {} --codex-home {} --slot {} --owner {}{}",
+        "codex-harness executor resume --source {} --codex-home {} --slot {} --owner {}{}{}",
         request.source.display(),
         request.codex_home.display(),
         request.slot,
         request.owner,
+        executor_input::repository_flag(&request.source, &request.repository),
         match &request.session {
             Some(session) => format!(" --session {session}"),
             None => String::new(),
@@ -2623,6 +2639,7 @@ fn deliver_to_recorded_lead(
 struct ExplicitAddress {
     source: Option<PathBuf>,
     codex_home: Option<PathBuf>,
+    repository: Option<PathBuf>,
     slot: Option<u32>,
     owner: Option<String>,
     session: Option<String>,
@@ -2654,11 +2671,13 @@ fn retired_reply(id: &str) -> io::Error {
 /// nothing, so the refusal names that run's own recorded state and the
 /// supported continuation instead of leaving the lead to guess or address a
 /// replacement conversation.
+#[allow(clippy::too_many_arguments)]
 fn retired_reply_after_end(
     id: &str,
     state: &str,
     home: &Path,
     source: Option<&str>,
+    repository: Option<&str>,
     slot: Option<u64>,
     owner: Option<&str>,
     session: Option<&str>,
@@ -2673,8 +2692,12 @@ fn retired_reply_after_end(
                 }
             ),
             format!(
-                "`codex-harness executor resume --source {source} --codex-home {} --slot {slot} --owner {owner}{}` continues that exact recorded session",
+                "`codex-harness executor resume --source {source} --codex-home {} --slot {slot} --owner {owner}{}{}` continues that exact recorded session",
                 home.display(),
+                repository
+                    .filter(|repository| !source.eq_ignore_ascii_case(repository))
+                    .map(|repository| format!(" --repository {repository}"))
+                    .unwrap_or_default(),
                 match session {
                     Some(session) => format!(" --session {session}"),
                     None => String::new(),
@@ -2801,6 +2824,10 @@ fn reject_contradictory(explicit: &ExplicitAddress, request: &Request) -> io::Re
         .source
         .as_deref()
         .is_some_and(|path| addresses_differ(path, &request.source));
+    let repository = explicit
+        .repository
+        .as_deref()
+        .is_some_and(|path| addresses_differ(path, &request.repository));
     let home = explicit
         .codex_home
         .as_deref()
@@ -2814,7 +2841,7 @@ fn reject_contradictory(explicit: &ExplicitAddress, request: &Request) -> io::Re
         .session
         .as_deref()
         .is_some_and(|session| Some(session) != request.session.as_deref());
-    if source || home || slot || owner || session {
+    if source || repository || home || slot || owner || session {
         return Err(invalid(
             "contradictory explicit address mixed with --reply-to; refusing before any send",
         ));
@@ -2876,6 +2903,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
             state,
             &home,
             value["slot"]["source"].as_str(),
+            value["slot"]["repository"].as_str(),
             value["slot"]["index"].as_u64(),
             value["slot"]["owner"].as_str(),
             value["observation"]["session"].as_str(),
@@ -2887,6 +2915,13 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
             .as_str()
             .ok_or_else(|| retired_reply(id))?,
     );
+    // The receipt records where the run's pool lives; a receipt written before
+    // the configuration-source split records its single checkout in `source`,
+    // which was both roles.
+    let repository = value["slot"]["repository"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| source.clone());
     let worktree = PathBuf::from(value["slot"]["path"].as_str().unwrap_or(""));
     let slot = u32::try_from(
         value["slot"]["index"]
@@ -2911,7 +2946,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
             "reused slot {slot} or generation cannot receive reply {id}; refusing before any send"
         )));
     }
-    let record = task_worktree::load_slot_record(&home, &source, slot).map_err(|error| {
+    let record = task_worktree::load_slot_record(&home, &repository, slot).map_err(|error| {
         invalid(&format!(
             "reused slot {slot} cannot receive reply {id}: {error}; refusing before any send"
         ))
@@ -2923,7 +2958,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
     };
     if record.index != slot
         || record.owner.as_deref() != Some(owner.as_str())
-        || addresses_differ(&record.source, &source)
+        || addresses_differ(&record.source, &repository)
         || addresses_differ(&record.path, &worktree)
     {
         return Err(invalid(&format!(
@@ -2932,6 +2967,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
     }
     let request = Request {
         source,
+        repository,
         codex_home: home,
         slot,
         owner,
@@ -2979,10 +3015,11 @@ fn report_indeterminate(
     write_spill_detail(&mut out, recorded_spill(previous).as_ref())?;
     writeln!(
         out,
-        "next action: inspect the conversation (the run's own tab, or `codex-harness executor watch --source {} --codex-home {} --slot {}`); if the input is genuinely absent, send the correction again with a distinguishing first line, or continue the exact session with `{remedy}`",
+        "next action: inspect the conversation (the run's own tab, or `codex-harness executor watch --source {} --codex-home {} --slot {}{}`); if the input is genuinely absent, send the correction again with a distinguishing first line, or continue the exact session with `{remedy}`",
         request.source.display(),
         request.codex_home.display(),
-        request.slot
+        request.slot,
+        executor_input::repository_flag(&request.source, &request.repository)
     )?;
     writeln!(out, "receipt: {}", receipt.display())?;
     Ok(1)

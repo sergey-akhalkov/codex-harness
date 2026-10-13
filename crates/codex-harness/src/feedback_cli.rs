@@ -209,8 +209,14 @@ fn resolve_limits(options: &Options, project: &Path) -> io::Result<Limits> {
 /// limits; the current schema keeps the root at `settings.sourceRoot`. Reading
 /// is bounded and executes nothing the record names; an absent, unreadable or
 /// relocated record simply means no installed kit source is available.
-fn installed_kit_source() -> Option<PathBuf> {
-    let codex_home = harness_core::native_launcher::codex_home().ok()?;
+pub(crate) fn installed_kit_source() -> Option<PathBuf> {
+    installed_kit_source_in(&harness_core::native_launcher::codex_home().ok()?)
+}
+
+/// The same bounded record read for an explicitly resolved kit home, so
+/// generic worktree commands honor `--codex-home` without changing the
+/// launcher's own resolution.
+pub(crate) fn installed_kit_source_in(codex_home: &Path) -> Option<PathBuf> {
     let path = codex_home.join("harness/installation.json");
     let metadata = fs::metadata(&path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_INSTALLATION_BYTES {

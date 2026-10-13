@@ -865,7 +865,11 @@ fn startup_liveness(reservation: &StartupReservation) -> ReservationLiveness {
     }
 }
 
-fn startup_exclusive(reservation: &StartupReservation) -> bool {
+/// Whether a startup reservation still excludes other processes: a live or
+/// unresolved reservation does, while a confirmed-dead one does not. The
+/// executor adapter reads this to count in-flight runs for active-run
+/// admission without duplicating the reservation liveness rules.
+pub fn startup_exclusive(reservation: &StartupReservation) -> bool {
     matches!(
         startup_liveness(reservation),
         ReservationLiveness::Live | ReservationLiveness::Uncertain

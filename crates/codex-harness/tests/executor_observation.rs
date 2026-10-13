@@ -616,10 +616,6 @@ fn watch_waits_for_host_finalization_after_turn_completion() {
             "watch returned before the controlled finalization: {output}"
         );
         assert_eq!(out.status.code(), Some(0), "{output}");
-        assert!(
-            output.contains(result_text.trim()),
-            "the retained bounded result is missing: {output}"
-        );
         if json_output {
             let report: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
                 panic!("JSON watch report is not readable: {error}: {output}")
@@ -634,6 +630,12 @@ fn watch_waits_for_host_finalization_after_turn_completion() {
                 "{output}"
             );
         } else {
+            // The plain report carries the retained result verbatim; the JSON
+            // report escapes its newlines and is checked structurally above.
+            assert!(
+                output.contains(result_text.trim()),
+                "the retained bounded result is missing: {output}"
+            );
             assert!(output.contains("state=completed"), "{output}");
             assert!(output.contains(&format!("session: {session}")), "{output}");
             assert!(output.contains("exit: 0"), "{output}");
