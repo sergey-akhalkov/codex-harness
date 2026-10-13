@@ -199,7 +199,8 @@ impl ResolvedRole {
     /// owned portable defaults. Return only native dotted leaf overrides, so
     /// callers cannot replace the surrounding skills table. Foreign skill
     /// entries and their unknown fields survive; allowed skills are never enabled.
-    /// Explicit later native CLI overrides retain their native precedence.
+    /// Callers include explicit native context in `retained` and place these
+    /// composed leaves after the original overrides, before any `--` separator.
     pub fn native_overrides(&self, retained: &toml::Table) -> io::Result<toml::Table> {
         let configured = match retained.get("skills") {
             None => None,

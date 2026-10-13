@@ -113,6 +113,40 @@ pub fn retained_role_config(
     Ok(retained)
 }
 
+/// Interpret native `-c` leaves in encounter order for context composition.
+/// Values follow Codex's TOML-or-literal contract; dotted keys are literal
+/// components, not TOML key expressions. No configuration is written.
+pub fn context_overrides(values: &[String]) -> io::Result<toml::Table> {
+    let mut result = toml::Table::new();
+    for raw in values {
+        let (key, encoded) = raw
+            .split_once('=')
+            .filter(|(key, _)| !key.trim().is_empty())
+            .ok_or_else(|| io::Error::other("native context override requires key=value"))?;
+        let encoded = encoded.trim();
+        let value = toml::from_str::<toml::Table>(&format!("value = {encoded}"))
+            .ok()
+            .and_then(|mut table| table.remove("value"))
+            .unwrap_or_else(|| toml::Value::String(encoded.trim_matches(['\"', '\'']).to_owned()));
+        let mut components = key.trim().split('.').peekable();
+        let mut table = &mut result;
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                table.insert(component.to_owned(), value);
+                break;
+            }
+            let entry = table
+                .entry(component.to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if !entry.is_table() {
+                *entry = toml::Value::Table(toml::Table::new());
+            }
+            table = entry.as_table_mut().expect("table just established");
+        }
+    }
+    Ok(result)
+}
+
 fn merge_tables(target: &mut toml::Table, source: &toml::Table) {
     for (key, value) in source {
         match (target.get_mut(key), value) {
@@ -331,6 +365,26 @@ fn leaves<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_context_overrides_keep_order_tables_and_literal_values() {
+        let overrides = context_overrides(&[
+            "developer_instructions = first".into(),
+            "skills = { config = [{ path = '/owned/SKILL.md', enabled = false }], marker = 'retained' }".into(),
+            "developer_instructions = 'last = value'".into(),
+            "skills.config = [{ path = '/other/SKILL.md', enabled = false }]".into(),
+        ]).unwrap();
+        assert_eq!(
+            overrides["developer_instructions"].as_str(),
+            Some("last = value")
+        );
+        assert_eq!(overrides["skills"]["marker"].as_str(), Some("retained"));
+        assert_eq!(
+            overrides["skills"]["config"][0]["path"].as_str(),
+            Some("/other/SKILL.md")
+        );
+        assert!(context_overrides(&["missing equals".into()]).is_err());
+    }
 
     #[test]
     fn retained_role_layers_keep_native_precedence_and_all_explicit_disables() {

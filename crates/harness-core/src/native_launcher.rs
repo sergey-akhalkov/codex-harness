@@ -267,7 +267,11 @@ fn prepared_command(
     }
     let working_directory = env::current_dir()?;
     let task_args = launcher::task_arguments(args)?;
-    let preferences = session_preferences(&selected, home, &working_directory);
+    let context = launcher::context_arguments(&task_args, &working_directory)?;
+    let context_directory = context
+        .as_ref()
+        .map_or(working_directory.as_path(), |context| context.cwd.as_path());
+    let preferences = session_preferences(&selected, home, context_directory);
     let task_args = launcher::per_model_effort(
         &task_args,
         match &preferences {
@@ -295,7 +299,7 @@ fn prepared_command(
     let classified = launcher::profile_arguments(&task_args);
     let mut shared_overrides = false;
     if shared && classified.len() != task_args.len() {
-        match shared_config_args(&selected, home, &working_directory) {
+        match shared_config_args(&selected, home, context_directory) {
             Ok(overrides) => {
                 command.args(overrides);
                 shared_overrides = true;
@@ -308,7 +312,33 @@ fn prepared_command(
         notice_degraded_session(&task_args);
     }
     command.args(launcher::daemon_opt_out(&task_args, shared_overrides));
-    command.args(&task_args);
+    if shared && let Some(context) = context {
+        let record = build_identity::read_record(&selected)?;
+        let role = if env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some() {
+            crate::role_context::Role::Executor
+        } else {
+            crate::role_context::Role::Lead
+        };
+        let resolved = crate::role_context::resolve(&record.source_root, role)?;
+        let profile = context
+            .profile
+            .as_deref()
+            .map(|profile| crate::orchestration_config::profile_config(home, profile))
+            .transpose()?;
+        let session = crate::portable_config::context_overrides(&context.overrides)?;
+        let retained = crate::portable_config::retained_role_config(
+            home,
+            &context.cwd,
+            profile.as_ref(),
+            &session,
+        )?;
+        let overrides = resolved.native_overrides(&retained)?;
+        command.args(launcher::with_context_overrides(&task_args, &overrides));
+        command.env("HARNESS_CONTEXT_ROLE", role.label());
+        command.env("HARNESS_CONTEXT_REVISION", &resolved.revision);
+    } else {
+        command.args(&task_args);
+    }
     if roots.is_empty() {
         command.env_remove("HARNESS_LSP_WORKSPACE_ROOTS");
     } else {
@@ -2907,6 +2937,21 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+            for (path, body) in [
+                ("global/instructions.md", "Common fixture safeguards"),
+                ("global/lead.md", "Fixture lead responsibility"),
+                ("global/executor.md", "Fixture executor responsibility"),
+                (
+                    "skills/one/SKILL.md",
+                    "---\nname: one\ndescription: fixture\n---\nFixture skill",
+                ),
+                (
+                    "global/roles.toml",
+                    "schema = 1\nshared_skills = ['one']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n",
+                ),
+            ] {
+                fs::write(source.join(path), body).unwrap();
+            }
             let compile = root.join("compile");
             fs::create_dir_all(&compile).unwrap();
             let launcher = compile_fixture(
@@ -2972,6 +3017,42 @@ mod tests {
                 upstream,
             }
         }
+    }
+
+    #[test]
+    fn role_context_keeps_explicit_native_guidance_and_fails_before_dispatch() {
+        let fixture = Fixture::new();
+        fs::write(fixture.home.join("custom.config.toml"),
+            "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'high'\ndeveloper_instructions = 'Profile guidance'\n").unwrap();
+        let args = [
+            "--profile".into(),
+            "custom".into(),
+            "exec".into(),
+            "-c".into(),
+            "developer_instructions='Session guidance'".into(),
+            "prompt".into(),
+        ];
+        let prepared = command(&fixture.launcher, &fixture.home, &args).unwrap();
+        let actual = prepared
+            .get_args()
+            .map(|value| value.to_owned())
+            .collect::<Vec<_>>();
+        let context = launcher::context_arguments(&actual, &fixture.root)
+            .unwrap()
+            .unwrap();
+        let effective = crate::portable_config::context_overrides(&context.overrides).unwrap();
+        let developer = effective["developer_instructions"].as_str().unwrap();
+        assert!(developer.contains("Fixture lead responsibility"));
+        assert!(developer.contains("Session guidance"));
+        assert!(!developer.contains("Fixture executor responsibility"));
+        assert!(!developer.contains("Profile guidance"));
+        assert_eq!(context.profile.as_deref(), Some("custom"));
+        assert!(!effective.contains_key("model"));
+        assert!(!effective.contains_key("model_reasoning_effort"));
+        fs::remove_file(fixture.root.join("source/global/executor.md")).unwrap();
+        let error = command(&fixture.launcher, &fixture.home, &args).unwrap_err();
+        assert!(error.to_string().contains("global/executor.md"), "{error}");
+        assert!(command(&fixture.launcher, &fixture.home, &["--help".into()]).is_ok());
     }
 
     #[test]

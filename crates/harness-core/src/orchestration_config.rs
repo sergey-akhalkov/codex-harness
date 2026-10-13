@@ -165,13 +165,22 @@ pub fn profile_config_overrides(codex_home: &Path, profile: &str) -> io::Result<
     if profile == "default" {
         return Ok(Vec::new());
     }
+    let table = profile_config(codex_home, profile)?;
+    let mut overrides = Vec::new();
+    flatten_table("", &table, &mut overrides);
+    Ok(overrides)
+}
+
+/// Read a named native profile layer. The orchestration selector `default`
+/// adds no profile, but explicit native `--profile default` names a real file.
+pub fn profile_config(codex_home: &Path, profile: &str) -> io::Result<toml::Table> {
     let file = codex_home.join(format!("{profile}.config.toml"));
     let table = if file.is_file() {
         read_toml(&file)?
     } else {
         let base_path = codex_home.join("config.toml");
         if !base_path.is_file() {
-            return Ok(Vec::new());
+            return Ok(toml::Table::new());
         }
         let base = read_toml(&base_path)?;
         base.get("profiles")
@@ -181,9 +190,7 @@ pub fn profile_config_overrides(codex_home: &Path, profile: &str) -> io::Result<
             .cloned()
             .unwrap_or_default()
     };
-    let mut overrides = Vec::new();
-    flatten_table("", &table, &mut overrides);
-    Ok(overrides)
+    Ok(table)
 }
 
 fn flatten_table(prefix: &str, table: &toml::Table, overrides: &mut Vec<String>) {
@@ -516,6 +523,15 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.starts_with("projects.")),
             "keys a dotted path cannot name must not travel as overrides: {overrides:?}"
+        );
+        fs::write(
+            root.join("default.config.toml"),
+            "developer_instructions = 'named profile'",
+        )
+        .unwrap();
+        assert_eq!(
+            profile_config(&root, "default").unwrap()["developer_instructions"].as_str(),
+            Some("named profile")
         );
         assert!(
             profile_config_overrides(&root, "default")

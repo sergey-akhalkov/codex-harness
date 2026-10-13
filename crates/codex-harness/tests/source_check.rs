@@ -128,7 +128,7 @@ fn detects_shared_state_and_tracked_caches_but_allows_deleted_caches() {
 #[test]
 fn principles_limit_checks_bytes_at_the_exact_boundary() {
     let f = Fixture::new();
-    let limit = 25_088;
+    let limit = 24_576;
     // Multi-byte text makes a character-count implementation insufficient.
     f.write("global/principles-of-work.md", &"é".repeat(limit / 2));
     assert!(f.check(None).status.success());
@@ -137,7 +137,7 @@ fn principles_limit_checks_bytes_at_the_exact_boundary() {
     let bad = f.check(None);
     assert_eq!(bad.status.code(), Some(1));
     let output = String::from_utf8_lossy(&bad.stdout);
-    assert!(output.contains("principles-size-limit actual=25089 allowed=25088"));
+    assert!(output.contains("principles-size-limit actual=24577 allowed=24576"));
     assert_eq!(
         fs::read_to_string(f.repo().join("global/principles-of-work.md")).unwrap(),
         oversized
@@ -146,12 +146,60 @@ fn principles_limit_checks_bytes_at_the_exact_boundary() {
 
 fn kit_fixture() -> Fixture {
     let f = Fixture::new();
-    f.write("global/kit.json", "{}");
+    f.write(
+        "global/kit.json",
+        r#"{
+        "schema":1,"profile_name":"harness","profile":"global/harness.config.toml",
+        "instructions":"global/principles-of-work.md","skills":"fixture-skills",
+        "agents":"global/agents","hooks":"global/hooks.json","token_hooks":"global/rtk-hooks.json"
+    }"#,
+    );
     f.write("global/principles-of-work.md", "# Working principles\n");
+    f.write(
+        "global/harness.config.toml",
+        "developer_instructions = 'Shared context'\n",
+    );
+    f.write(
+        "global/roles.toml",
+        r#"schema = 1
+shared_skills = ["fixture-skill"]
+[roles.lead]
+instructions = "global/roles/lead.md"
+skills = []
+[roles.executor]
+instructions = "global/roles/executor.md"
+skills = []
+"#,
+    );
+    f.write("global/roles/lead.md", "# Lead\n");
+    f.write("global/roles/executor.md", "# Executor\n");
+    f.write(
+        "fixture-skills/fixture-skill/SKILL.md",
+        "---\nname: fixture-skill\ndescription: Owned fixture skill\n---\nFixture.\n",
+    );
     for owner in harness_core::report_owners::TOKEN_AUDIT_OWNERS {
         f.write(owner, "# Owner\n");
     }
     f
+}
+
+#[test]
+fn kit_requires_complete_role_inputs_and_classified_skills() {
+    let f = kit_fixture();
+    assert!(f.check(None).status.success());
+    fs::remove_file(f.repo().join("global/roles/executor.md")).unwrap();
+    let missing = f.check(None);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("role-context-invalid"));
+    f.write("global/roles/executor.md", "# Executor\n");
+    assert!(f.check(None).status.success());
+    f.write(
+        "fixture-skills/unclassified/SKILL.md",
+        "---\nname: unclassified\ndescription: Unclassified fixture skill\n---\nFixture.\n",
+    );
+    let unclassified = f.check(None);
+    assert_eq!(unclassified.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unclassified.stdout).contains("role-context-invalid"));
 }
 
 #[test]

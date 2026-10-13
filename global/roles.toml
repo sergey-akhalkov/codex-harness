@@ -1,0 +1,38 @@
+schema = 1
+
+# Membership controls native discovery, not authority or model routing.
+# Language, implementation, investigation and verification stay shared.
+shared_skills = [
+  "board-workflow",
+  "cargo-fast",
+  "harness-deploy",
+  "isolated-worktree",
+  "openspec-apply-change",
+  "project-memory",
+  "project-verification",
+  "reproduce-regression",
+  "rust-modern",
+  "skill-evolution",
+  "skills-usage-analysis",
+  "token-efficient-workflow",
+  "tokenomics",
+  "windows-disk-reclaim",
+]
+
+[roles.lead]
+instructions = "global/roles/lead.md"
+skills = [
+  "executor-model",
+  "openspec-archive-change",
+  "openspec-explore",
+  "openspec-propose",
+  "openspec-sync-specs",
+  "openspec-update-change",
+  "self-improvement-loop",
+  "structured-codex-run",
+  "team-lead",
+]
+
+[roles.executor]
+instructions = "global/roles/executor.md"
+skills = []

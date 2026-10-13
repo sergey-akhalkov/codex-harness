@@ -13,6 +13,37 @@ settings.
 Official discovery: [AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
 and [environment variables](https://learn.chatgpt.com/docs/config-file/environment-variables).
 
+## Responsibility source owners
+
+The role separation keeps one shared core and two responsibility fragments.
+The descriptor [global/roles.toml](../global/roles.toml) names the fragments and
+classifies every kit-managed skill once as shared or role-specific. These
+source owners preserve the obligations formerly mixed into the common text,
+developer guidance and repeated executor briefs:
+
+| Obligation | Source owner |
+| --- | --- |
+| Integrity, authority, evidence, project guidance, tools, recovery and publication boundaries | [Common principles](../global/principles-of-work.md) |
+| Native routing restrictions, Code Mode/RTK use, opaque-state and desktop safeguards | [Shared developer guidance](../global/harness.config.toml) |
+| Activation, decomposition, assignment snapshots and exact paths, model selection, supervision, succession, visibility, integration and acceptance | [Lead responsibility](../global/roles/lead.md) |
+| The executor's local implementation/check/correction cycle, base verification, standing return boundaries, feedback waiting and result evidence | [Executor responsibility](../global/roles/executor.md) |
+| Task objective, actual checkout/base, owned paths, invariants, acceptance, consumer and additional boundaries | [Assignment renderer](../crates/codex-harness/src/executor_assignment.rs) |
+
+The source checker resolves both roles with the runtime's shared Rust resolver
+and rejects missing/escaping sources and unclassified managed skills. The
+common file is limited to 24,576 UTF-8 bytes. Role and developer text, native
+skill metadata, invoked bodies, required references and generated briefs all
+remain part of guidance-load accounting; moving text does not establish a
+reduction or a behavioral improvement.
+
+The ordinary local launcher resolves the role before startup and composes it
+with the applicable native profile, project and session context. Maintenance
+commands and remote attachments retain their existing path. Managed executor
+application, removal of the renderer's old standing guidance, recovery and
+global acceptance remain unfinished in
+[the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md).
+Source and fixture checks do not establish installed consumption.
+
 ## Update and scope
 
 Edit the canonical file in the repository. A new session reads the current text
