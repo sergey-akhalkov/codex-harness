@@ -1197,13 +1197,11 @@ pub(crate) fn host_identity() -> io::Result<HostIdentity> {
     })
 }
 
-/// True when the exact recorded host process is gone: its image is missing or
-/// its pid/creation-time identity no longer runs. Unverifiable identity is
-/// treated as still running, so a watcher waits instead of guessing.
+/// True when the exact recorded host process is gone: no process with the
+/// recorded pid and creation time still runs. Unverifiable identity - a
+/// temporarily missing image path, an access failure - is treated as still
+/// running, so a watcher waits instead of guessing.
 pub(crate) fn host_ended(host: &HostIdentity) -> bool {
-    if !host.program.is_file() {
-        return true;
-    }
     let Ok(user) = harness_core::process_service::current_user() else {
         return false;
     };
@@ -6511,6 +6509,32 @@ mod tests {
         assert!(
             !released.iter().any(|id| id.ends_with("|a1|completed")),
             "the release is satisfied once its evidence is offered again: {recorded}"
+        );
+    }
+
+    /// A deploy reset can remove the launcher link while the recorded host
+    /// process keeps running; a currently missing image path must not read as
+    /// "ended" without checking the recorded pid and creation identity.
+    #[test]
+    fn a_missing_program_path_does_not_end_a_live_recorded_host() {
+        let program = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        let missing = program
+            .parent()
+            .unwrap()
+            .join(format!("removed-{}.exe", std::process::id()));
+        assert!(!missing.exists(), "the recorded path must not exist");
+        let host = HostIdentity {
+            pid: identity.pid,
+            created: identity.creation_time,
+            program: missing,
+        };
+        assert!(
+            !host_ended(&host),
+            "a temporarily missing recorded image path is not proof the live host ended"
         );
     }
 }
