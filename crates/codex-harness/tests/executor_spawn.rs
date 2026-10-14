@@ -325,6 +325,24 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// Installs the owned launcher double at the documented launcher path of the
+/// fixture home: the dispatch paths resolve `harness/bin/codex.exe`, the
+/// binary answers the model-free shell preflight, and its explicit child-only
+/// fixture mode serves the controlled app-server conversation. A hard link
+/// keeps the installed identity without copying where the volume allows.
+fn install_launcher(home: &Path, exe: &Path) {
+    let launcher = home.join("harness/bin/codex.exe");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    if fs::hard_link(exe, &launcher).is_err() {
+        fs::copy(exe, &launcher).unwrap_or_else(|error| {
+            panic!(
+                "the fixture home could not install the native CLI {}: {error}",
+                exe.display()
+            )
+        });
+    }
+}
+
 #[test]
 fn configured_executor_rejects_unlisted_profile() {
     let root = std::env::temp_dir().join(format!("executor-spawn-{}", std::process::id()));
@@ -633,6 +651,202 @@ fn a_required_upstream_fetch_failure_leaves_the_released_slot_untouched() {
     assert!(
         slot.join("cache/artifact").is_file(),
         "reuse keeps the slot's ignored cache"
+    );
+    fixture.drop();
+}
+
+/// The held check above stops at the missing launcher before any model
+/// request. With the launcher installed, the same explicit locally committed
+/// base dispatches offline through the real entry point: the hosted executor
+/// consumes the rendered assignment bound to the exact slot, base, source and
+/// owner, completes the controlled conversation and leaves its committed
+/// solution in the slot. The retained continuation then resumes the exact
+/// session with the upstream still unreachable, preserving the slot's tracked
+/// and untracked partial work without fetching or resetting anything.
+#[test]
+fn an_explicit_local_base_completes_offline_and_continuation_keeps_the_slot_work() {
+    let fixture = Fixture::new("entry-native", 1);
+    fs::write(fixture.source.join("local-base.txt"), "local base\n").unwrap();
+    git(&fixture.source, &["add", "local-base.txt"]);
+    git(&fixture.source, &["commit", "-qm", "local base"]);
+    let commit = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("gone.git")),
+        ],
+    );
+
+    // The launcher double answers the shell preflight and serves the
+    // controlled app-server child; the managed executor role resolves from
+    // the recorded synthetic kit build; and both sides report the same
+    // explicit installed route, so the served thread identity matches the
+    // binding the dispatch pins on it.
+    install_launcher(
+        &fixture.home,
+        Path::new(env!("CARGO_BIN_EXE_harness-executor-fixture")),
+    );
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.home.join("config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let kit = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &kit);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+
+    let objective = "Complete the synthetic offline entry check";
+    let assignment = fixture.root.join("entry-assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document(objective, &["README.md"], &["out/result.txt"]),
+    )
+    .unwrap();
+
+    // The exact thread the held continuation below names, so the resumed
+    // dispatch attaches to this conversation instead of starting another.
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let mut command = fixture.spawn_command();
+    command.args([
+        "--owner",
+        "exec-ds-52",
+        "--base",
+        commit.as_str(),
+        "--assignment",
+        assignment.to_str().unwrap(),
+    ]);
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env_remove("WT_SESSION");
+    let spawned = command.output().unwrap();
+    let text = output_text(&spawned);
+
+    let slot = fixture.slot(1);
+    assert_eq!(spawned.status.code(), Some(0), "{text}");
+    assert!(text.contains("host=owned-console"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "executor presentation: mode=tui presentation=native-tui model=deepseek-flash provider=deepseek effort=max cwd={}",
+            slot.display()
+        )),
+        "{text}"
+    );
+
+    // The full entry ran: the receipt carries the rendered assignment bound
+    // to this exact checkout, base, source and owner, plus the observed
+    // lifecycle of the hosted conversation and its committed work.
+    let state = pooled_state_dir(&fixture.home);
+    let receipt_path = pooled_receipt_path(&fixture.home, 1);
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    let rendered = receipt["control"]["assignment"].as_str().unwrap();
+    let expected_prefix = format!(
+        "Structured executor assignment (schema 1)\nobjective: {objective}\ncheckout: {}\nbase: {commit}\nsource: {}\nowner: exec-ds-52\n",
+        slot.display(),
+        fixture.source.display()
+    );
+    assert!(rendered.starts_with(&expected_prefix), "{rendered}");
+    assert!(rendered.contains("- README.md"), "{rendered}");
+    assert!(rendered.contains("- out/result.txt"), "{rendered}");
+    assert_eq!(receipt["slot"]["base"], commit.as_str(), "{receipt}");
+    assert_eq!(receipt["slot"]["owner"], "exec-ds-52", "{receipt}");
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(
+        fs::read_to_string(state.join("message-1.txt")).unwrap(),
+        "fixture turn completed; the committed solution is in the bound slot",
+        "the exact session's final message is the recorded result"
+    );
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(state.join("endpoint-1.json")).unwrap()).unwrap();
+    assert_eq!(endpoint["threadId"], session, "{endpoint}");
+    let detail = fs::read_to_string(state.join("stream-1.jsonl")).unwrap();
+    assert!(detail.contains("\"method\":\"thread/started\""), "{detail}");
+    assert!(detail.contains("\"method\":\"turn/completed\""), "{detail}");
+    assert_eq!(fixture.record(1)["state"], "occupied");
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+    git(
+        &slot,
+        &["merge-base", "--is-ancestor", commit.as_str(), "HEAD"],
+    );
+    assert!(
+        git_output(
+            &slot,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        )
+        .is_empty(),
+        "the completed fixture run leaves a clean slot before the interruption"
+    );
+    assert!(
+        git_output(&fixture.source, &["remote", "get-url", "origin"]).contains("gone.git"),
+        "the offline dispatch must not rewrite the configured remote"
+    );
+
+    // Interruption-shaped partial work: one tracked edit and one untracked
+    // file exist only in the slot when the lead continues the held binding.
+    fs::write(slot.join("partial-work.txt"), "partial work\n").unwrap();
+    let readme = slot.join("README.md");
+    let mut edited = fs::read_to_string(&readme).unwrap();
+    edited.push_str("carried partial edit\n");
+    fs::write(&readme, edited).unwrap();
+
+    let mut command = fixture.resume_command();
+    command.args(["--exec", "continue the interrupted assignment"]);
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env_remove("WT_SESSION");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "{text}");
+    assert!(text.contains("host=owned-console"), "{text}");
+
+    // The continuation attached to the same session with the remote still
+    // unreachable, and neither a fetch, a reset nor the controlled agent's
+    // own work disturbed the tracked and untracked partial files.
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["control"]["resumeSession"], session, "{receipt}");
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(receipt["slot"]["base"], commit.as_str(), "{receipt}");
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+    let status = git_output(
+        &slot,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    assert!(status.contains("README.md"), "{status}");
+    assert!(status.contains("partial-work.txt"), "{status}");
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
+    assert!(git_output(&fixture.source, &["remote", "get-url", "origin"]).contains("gone.git"));
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+    git(
+        &slot,
+        &["merge-base", "--is-ancestor", commit.as_str(), "HEAD"],
     );
     fixture.drop();
 }
