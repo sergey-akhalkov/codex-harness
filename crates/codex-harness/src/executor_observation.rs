@@ -2452,10 +2452,6 @@ pub(crate) mod evidence {
         }
     }
 
-    fn read_state(path: &Path) -> io::Result<EvidenceState> {
-        state_from_document(&read_document(path)?)
-    }
-
     // ------------------------------------------------------------ claim state
 
     /// The identity one event is acknowledged by: its source, slot, native
