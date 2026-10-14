@@ -370,18 +370,7 @@ impl Plan {
             .map(|s| s.path_scope)
             .or(request.path_scope)
             .unwrap_or(PathScope::User);
-        let build = build_identity::check(&request.build, Some(&request.source));
-        if !build.runtime_allowed {
-            return Err(io::Error::other(
-                "native candidate build is stale, missing or altered; explicit build required",
-            ));
-        }
-        if key(&plain(
-            &build_identity::read_record(&request.build)?.source_root,
-        )?)? != key(&plain(&request.source.canonicalize()?)?)?
-        {
-            return Err(conflict());
-        }
+        validate_candidate_build(&request.source, &request.build)?;
         let mut excluded = Vec::new();
         for binary in build_identity::BINARIES {
             excluded.push(request.build.join(binary));
@@ -573,6 +562,24 @@ impl Plan {
             planned_changes,
         })
     }
+}
+
+/// Validate the immutable candidate independently of installed link ownership.
+/// Delivery calls this before reset can remove any current connection.
+pub fn validate_candidate_build(source: &Path, build: &Path) -> io::Result<()> {
+    let report = build_identity::check(build, Some(source));
+    if !report.runtime_allowed {
+        return Err(io::Error::other(
+            "native candidate build is stale, missing or altered; explicit build required",
+        ));
+    }
+    let recorded_source = build_identity::read_record(build)?.source_root;
+    if key(&plain(&recorded_source)?)? != key(&plain(&source.canonicalize()?)?)? {
+        return Err(io::Error::other(
+            "native candidate build belongs to another source checkout; build from the requested --source before deployment; preserving installed state",
+        ));
+    }
+    Ok(())
 }
 
 /// Explicit native core connection; dependency and subscription components are
