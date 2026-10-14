@@ -1182,9 +1182,12 @@ pub(crate) fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
 
 /// The host process identity of this run. Recorded before the launcher starts
 /// so a watcher can distinguish a live run from an interrupted host without
-/// trusting a bare pid.
+/// trusting a bare pid. The executable path is canonicalized when captured:
+/// the installed launcher is a symlink a later deploy can retarget, while the
+/// running image stays the build the alias named when the host started, so
+/// only the resolved path keeps naming the exact recorded host.
 pub(crate) fn host_identity() -> io::Result<HostIdentity> {
-    let program = std::env::current_exe()?;
+    let program = std::env::current_exe()?.canonicalize()?;
     let user = harness_core::process_service::current_user()?;
     let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)?.identity();
     Ok(HostIdentity {

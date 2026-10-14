@@ -35,7 +35,13 @@ fn fixture() -> PathBuf {
 /// A dispatch invocation that does not inherit the caller's session identity
 /// or a terminal host address.
 fn lead_command() -> Command {
-    let mut command = Command::new(manager());
+    lead_command_for(&manager())
+}
+
+/// The same dispatch shape launched through an explicit program path, so a
+/// check can exercise the identity a launcher alias records.
+fn lead_command_for(program: &Path) -> Command {
+    let mut command = Command::new(program);
     command.env_remove("HARNESS_EXECUTOR_SESSION");
     // A check may run inside an executor session, whose own run marker is
     // deliberately not authority for a lead-like resume: a copied marker must
@@ -265,6 +271,44 @@ fn observed_run_records_identity_and_renders_readable_events() {
             .unwrap()
             .contains("thread.started"),
         "the bounded detail file keeps the raw stream beside the receipt"
+    );
+}
+
+#[test]
+fn alias_retarget_does_not_change_the_recorded_host_identity() {
+    let run = SeededRun::new();
+    let bin = run.root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let alias = bin.join("codex-harness.exe");
+    std::os::windows::fs::symlink_file(manager(), &alias).unwrap();
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
+    let out = lead_command_for(&alias)
+        .args(["executor", "run", "--file"])
+        .arg(&run.receipt)
+        .env("HARNESS_EXECUTOR_FIXTURE_SESSION", session)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let output = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{output}");
+    // The recorded program names the image the host actually runs, not the
+    // mutable alias it was launched through.
+    let receipt = receipt_json(&run.receipt);
+    let host = &receipt["observation"]["host"];
+    let program = PathBuf::from(host["program"].as_str().unwrap());
+    assert_eq!(
+        fs::canonicalize(&program).unwrap(),
+        fs::canonicalize(manager()).unwrap(),
+        "the recorded host program does not name the running image: {receipt}"
+    );
+    // A deploy retargets the alias while the run's host image stays the same;
+    // the recorded identity must not follow the alias to the new target.
+    fs::remove_file(&alias).unwrap();
+    std::os::windows::fs::symlink_file(fixture(), &alias).unwrap();
+    assert_eq!(
+        fs::canonicalize(&program).unwrap(),
+        fs::canonicalize(manager()).unwrap(),
+        "the recorded host identity follows a retargeted alias: {receipt}"
     );
 }
 
