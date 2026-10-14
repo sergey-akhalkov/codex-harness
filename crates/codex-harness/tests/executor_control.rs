@@ -1984,7 +1984,17 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
     assert_eq!(endpoint["schema"], 1, "{endpoint}");
     assert_eq!(endpoint["port"], pooled.server.port, "{endpoint}");
     assert_eq!(endpoint["threadId"], THREAD, "{endpoint}");
-    assert_eq!(endpoint["process"]["program"], FIXTURE, "{endpoint}");
+    // The endpoint records the child image in the host's normalized spelling,
+    // which names the same file as the compile-time fixture path; compare the
+    // resolved files rather than one separator spelling of them.
+    let recorded_program = endpoint["process"]["program"]
+        .as_str()
+        .expect("the endpoint records its child image path");
+    assert_eq!(
+        fs::canonicalize(recorded_program).unwrap(),
+        fs::canonicalize(FIXTURE).unwrap(),
+        "the endpoint names the exact fixture image: {endpoint}"
+    );
     let token = fs::read_to_string(pooled.state.join("endpoint-1.token")).unwrap();
     assert_eq!(endpoint["token"], token.trim(), "{endpoint}");
     let child_pid = endpoint["process"]["pid"].as_u64().unwrap() as u32;

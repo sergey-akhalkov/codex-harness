@@ -2514,7 +2514,10 @@ fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPath
 /// Record this process as the live host of a bound slot. A slot that was
 /// rebound to another session is refused instead of sharing the tree. Publishing
 /// the lease ends startup exclusion: the lease, not the creating process, is
-/// authoritative from this write onward.
+/// authoritative from this write onward. The lease names the canonical image
+/// of the running process: the installed launcher is a symlink a later deploy
+/// can retarget, so only the resolved path keeps naming the exact process the
+/// dispatch receipt records and the lease must agree with.
 fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
     let record = task_worktree::load_slot_record(codex_home, binding.repository(), binding.index)?
         .ok_or_else(|| {
@@ -2540,6 +2543,7 @@ fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
         )));
     }
     let program = std::env::current_exe()
+        .and_then(|program| program.canonicalize())
         .map_err(|error| invalid(&format!("executor session host path: {error}")))?;
     let user = harness_core::process_service::current_user()?;
     let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)?.identity();
@@ -8819,6 +8823,12 @@ mod tests {
         );
         write_test_slot_record(&home, &source, &binding);
         record_lease(&home, &binding).unwrap();
+        let lease = read_lease(&lease_path(&home, &source, 1).unwrap()).unwrap();
+        assert_eq!(
+            lease.program,
+            std::env::current_exe().unwrap().canonicalize().unwrap(),
+            "the lease names the canonical image the dispatch receipt records"
+        );
         assert!(
             owner_live(&home, &source, "exec-ds-7"),
             "this test process is the recorded live host"
