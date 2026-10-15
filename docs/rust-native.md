@@ -605,6 +605,38 @@ anything. `executor resume`, `restart`, `watch`, `message`, `stop`,
 `assignment`, `pool` and `release` accept the same `--repository` selector. `executor pool` lines
 add `repository=`, `task=` and `handle=` beside the session fields.
 
+### Native worktree tool suppression
+
+The native TUI hosts a dynamic `codex_worktrees` tool server into sessions,
+which competes with the common pool as a second allocator. The kit's shared
+configuration turns the native feature off (`features.worktrees = false`), a
+session start forwards that leaf as `-c features.worktrees=false`, and managed
+lead and executor frontends carry the same pair before their `resume`
+subcommand. The switch is proven against a fresh effective tool catalogue, not
+a configuration value: feature readback, skill retirement or instructing
+agents not to use the tools does not disable the surface. The opt-in installed
+check drives the installed native CLI TUI against the canned local Responses
+fixture and compares an unsuppressed control catalogue with the managed-leaf
+run: the control must expose the worktree surface and the managed run must
+expose none of it, so a control that observes nothing leaves the requirement
+open instead of passing vacuously. Request bodies and terminal transcripts
+stay in the kept evidence directory it prints.
+
+```powershell
+cargo test --locked -p codex-harness --test skill_catalog_refresh installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf --jobs 1 -- --ignored --exact --nocapture --test-threads=1
+```
+
+The `native_launcher` tests pin the launch side:
+`managed_session_starts_forward_the_worktree_tool_suppression_leaf` requires
+the forwarded leaf for TUI and non-TUI starts, while
+`explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf`
+requires an explicit machine-local `features.worktrees = true` to skip the
+conflicting shared leaf instead of fighting it, so such a session is a
+configuration conflict with the managed-pool contract rather than successful
+suppression. A conversation that started before the change keeps the tools it
+registered; the suppression applies to fresh sessions, so an existing
+conversation needs an explicit restart rather than an in-place update.
+
 ## Structured executor assignments
 
 `codex-harness executor spawn`, `resume` and `restart` accept `--assignment FILE` or

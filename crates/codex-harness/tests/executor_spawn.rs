@@ -165,6 +165,9 @@ impl Fixture {
 
     fn resume_command(&self) -> Command {
         let mut command = lead_command();
+        // The fixture child serves exactly the thread this resume names; its
+        // default identity is another thread and the dispatch would refuse it.
+        let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
         command.args([
             "executor",
             "resume",
@@ -177,8 +180,9 @@ impl Fixture {
             "--owner",
             "exec-ds-52",
             "--session",
-            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+            session,
         ]);
+        command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
         command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
         command
     }
@@ -725,6 +729,8 @@ fn an_explicit_local_base_completes_offline_and_continuation_keeps_the_slot_work
     ]);
     command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
     command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    // The fixture child serves exactly the thread the held continuation names.
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
     command.env_remove("WT_SESSION");
     let spawned = command.output().unwrap();
     let text = output_text(&spawned);

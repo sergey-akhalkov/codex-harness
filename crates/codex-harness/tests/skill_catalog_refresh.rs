@@ -3385,6 +3385,76 @@ fn tree_paths(root: &Path) -> Vec<String> {
     out
 }
 
+/// The installed native TUI registers its dynamic `codex_worktrees` tool
+/// server into ordinary sessions while the native `worktrees` feature is on.
+/// The managed selection turns that feature off through the shared
+/// configuration leaf and the managed frontend's `-c features.worktrees=false`
+/// pair. A fresh effective model-request catalogue under that selection must
+/// contain no worktree-named tool, no nested `codex_worktrees` declaration and
+/// no deferred marker. The unsuppressed control run proves the same check
+/// observes the surface while the feature is on: a control that exposes
+/// nothing leaves this check with no observation and the task open rather
+/// than passing vacuously. Driven over the installed native CLI TUI against
+/// the canned local Responses server; no billed model call and no shared
+/// configuration write.
+#[test]
+#[ignore = "explicit installed native CLI ordinary TUI + canned local Responses; no live model"]
+fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf() {
+    let upstream = registered_upstream(&live_codex_home());
+    assert!(upstream.is_absolute() && upstream.is_file());
+    let version = Command::new(&upstream).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    assert!(
+        version.contains("0.162.1"),
+        "unexpected native CLI: {version}"
+    );
+
+    let evidence = tempfile::Builder::new()
+        .prefix("native-worktree-catalogue-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("native worktree catalogue evidence: {}", evidence.display());
+
+    let control = installed_tui_catalogue(&upstream, &evidence, "control", &[]);
+    let control_fragments = worktree_fragments(&control);
+    assert!(
+        !control_fragments.is_empty(),
+        "the unsuppressed control catalogue exposed no codex_worktrees surface, so this check observed nothing and the task stays open: names {:?}",
+        control.0
+    );
+
+    let suppressed = installed_tui_catalogue(
+        &upstream,
+        &evidence,
+        "managed-leaf",
+        &["-c", "features.worktrees=false"],
+    );
+    assert!(
+        !suppressed.0.is_empty(),
+        "the managed-leaf run captured no tool catalogue; evidence {}",
+        evidence.display()
+    );
+    let suppressed_fragments = worktree_fragments(&suppressed);
+    assert!(
+        suppressed_fragments.is_empty(),
+        "features.worktrees=false left the competing worktree surface in the effective catalogue: {suppressed_fragments:?}; evidence {}",
+        evidence.display()
+    );
+    write_json(
+        &evidence.join("acceptance.json"),
+        &json!({
+            "control_fragments": control_fragments,
+            "suppressed_fragments": suppressed_fragments,
+            "control_names": control.0,
+            "suppressed_names": suppressed.0,
+        }),
+    );
+    println!(
+        "codex_worktrees control fragments {control_fragments:?}; suppressed fragments {suppressed_fragments:?}"
+    );
+}
+
 /// Explicit native probe of what installed 0.162.1 actually consumes for a
 /// managed resume. Fresh starts consume the composed role text and the live
 /// skill selection. A resumed thread keeps the developer text saved at its
@@ -3940,6 +4010,67 @@ fn described(body: &str) -> Value {
         "tools": tools,
     })
 }
+
+/// The visible tool surface of one captured model request: tool names reachable
+/// through top-level `tools` entries, `additional_tools` input namespaces and
+/// entries nested under both, plus the tool-definition text that carries any
+/// deferred declarations.
+fn tool_surface(body: &str) -> (Vec<String>, String) {
+    fn visit(items: &[Value], names: &mut Vec<String>) {
+        for item in items {
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                names.push(name.to_owned());
+            }
+            if let Some(name) = item
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            {
+                names.push(name.to_owned());
+            }
+            if let Some(nested) = item.get("tools").and_then(Value::as_array) {
+                visit(nested, names);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    let mut definitions = String::new();
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+            definitions.push_str(&tools.to_string());
+            visit(tools, &mut names);
+        }
+        if let Some(items) = value.get("input").and_then(Value::as_array) {
+            for item in items
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+            {
+                definitions.push_str(&item.to_string());
+                if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                    visit(tools, &mut names);
+                }
+            }
+        }
+    }
+    (names, definitions)
+}
+
+/// The competing native-worktree fragments of one effective tool surface: a
+/// tool whose name mentions a worktree, or the `codex_worktrees` marker when
+/// the surface defers that dynamic-tools server behind the exec orchestrator.
+fn worktree_fragments(surface: &(Vec<String>, String)) -> Vec<String> {
+    let mut fragments = surface
+        .0
+        .iter()
+        .filter(|name| name.to_lowercase().contains("worktree"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if surface.1.contains("codex_worktrees") {
+        fragments.push("deferred:codex_worktrees".to_owned());
+    }
+    fragments
+}
+
 fn live_codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -4055,8 +4186,20 @@ trust_level = "trusted"
 }
 
 fn spawn_probe_tui(exe: &Path, home: &Path, workspace: &Path) -> ConsoleSession {
+    spawn_probe_tui_args(exe, home, workspace, &[])
+}
+
+fn spawn_probe_tui_args(
+    exe: &Path,
+    home: &Path,
+    workspace: &Path,
+    extra: &[&str],
+) -> ConsoleSession {
     let mut command = CommandSpec::new(exe);
     command.args = vec!["--no-alt-screen".into()];
+    command
+        .args
+        .extend(extra.iter().map(|argument| (*argument).to_owned()));
     command.current_dir = Some(workspace.to_path_buf());
     command.env.insert(
         "CODEX_HOME".into(),
@@ -4070,6 +4213,58 @@ fn spawn_probe_tui(exe: &Path, home: &Path, workspace: &Path) -> ConsoleSession 
     spec.limits.memory_bytes = Some(512 * 1024 * 1024);
     spec.limits.cpu_percent = Some(50.0);
     ConsoleSession::spawn(spec).unwrap()
+}
+
+/// Runs one fresh installed-CLI TUI session against the canned local Responses
+/// server and returns the effective tool surface of its first model request.
+fn installed_tui_catalogue(
+    exe: &Path,
+    evidence: &Path,
+    label: &str,
+    extra: &[&str],
+) -> (Vec<String>, String) {
+    let root = evidence.join(label);
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    git_identity(&workspace);
+    let canned = CannedResponses::spawn_short(&root).unwrap();
+    write_probe_config(&home, &workspace, &canned, "", false);
+    let session = spawn_probe_tui_args(exe, &home, &workspace, extra);
+    ready_named(&session, &root, &home, &format!("WorktreeSurface{label}"));
+    send_line(&session, USER_PROMPT).unwrap();
+    let sampled = canned.wait_for(Duration::from_secs(60), |requests| {
+        requests
+            .iter()
+            .any(|request| request.kind == RequestKind::FirstSampling)
+    });
+    assert!(
+        sampled,
+        "no first sampling request in the {label} catalogue run; evidence {}",
+        root.display()
+    );
+    send_line(&session, "/quit").unwrap();
+    let _ = session
+        .wait(
+            Deadline::after(Duration::from_secs(25)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let body = canned
+        .requests()
+        .into_iter()
+        .find(|request| request.kind == RequestKind::FirstSampling)
+        .expect("captured first sampling")
+        .body;
+    fs::write(root.join("first-sampling.body.json"), &body).unwrap();
+    let surface = tool_surface(&body);
+    write_json(
+        &root.join("surface.json"),
+        &json!({"names": &surface.0, "definitions": &surface.1}),
+    );
+    surface
 }
 
 fn ready_named(session: &ConsoleSession, evidence: &Path, home: &Path, name: &str) {

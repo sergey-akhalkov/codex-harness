@@ -4209,6 +4209,10 @@ const CONTROL_CLEANUP: Duration = Duration::from_secs(10);
 /// turn's terminal state (an interrupted tool call finishing), before the run
 /// ends; an empty pump ends it sooner.
 const CONTROL_TAIL_GRACE: Duration = Duration::from_secs(1);
+/// How long the completed turn's final message is re-read before an absent
+/// message is recorded as a defect: the terminal record can be observed
+/// before `thread/read` carries the turn's items.
+const FINAL_MESSAGE_SETTLE: Duration = Duration::from_secs(1);
 /// Bearer for the owned native frontend. It is passed by environment name,
 /// never on the command line, in a receipt, or in a diagnostic.
 const FRONTEND_TOKEN_ENV: &str = "HARNESS_EXECUTOR_FRONTEND_TOKEN";
@@ -4657,7 +4661,9 @@ fn attach_owned_frontend(
 }
 
 /// Global options before `resume`. The thread id is the only positional, so
-/// the frontend cannot submit the assignment.
+/// the frontend cannot submit the assignment. Every managed frontend also
+/// turns the native worktree tools off: those tools allocate outside the
+/// shared harness pool, so the pool stays the conversation's only allocator.
 fn frontend_args(
     port: u16,
     thread_id: &str,
@@ -4669,6 +4675,8 @@ fn frontend_args(
         format!("ws://127.0.0.1:{port}"),
         "--remote-auth-token-env".into(),
         FRONTEND_TOKEN_ENV.into(),
+        "-c".into(),
+        "features.worktrees=false".into(),
     ];
     if role == FrontendRole::Executor {
         args.push("-c".into());
@@ -5004,9 +5012,11 @@ fn host_control_conversation(
     };
     let (state, _streamed_message) = state;
     // The turn's own status is terminal. The final message comes from the
-    // thread's items, never from a transport acknowledgement.
+    // thread's items, never from a transport acknowledgement, and a missing
+    // item set is re-read within the settle bound before it counts: the
+    // terminal record can be observed before the items land.
     let (final_message, cause) = match state {
-        Lifecycle::Completed => match conversation.final_message() {
+        Lifecycle::Completed => match settled_final_message(&mut conversation) {
             Ok(FinalMessage::Present(text)) => {
                 if let Err(error) = observation::write_final_message(&result, &text) {
                     return fail_with_frontend(
@@ -5295,6 +5305,24 @@ fn drive_control(
                 return Ok((outcome, streamed_message));
             }
             return Err(io::Error::other(FrontendLost));
+        }
+    }
+}
+
+/// The completed turn's final message, re-read until it settles within
+/// [`FINAL_MESSAGE_SETTLE`].
+///
+/// Only a missing message is re-read: an empty message is the turn's own
+/// recorded output and a failed read is an error; both stay final, and a
+/// message that is still missing at the bound is the recorded defect.
+fn settled_final_message(conversation: &mut Conversation) -> io::Result<FinalMessage> {
+    let until = Instant::now() + FINAL_MESSAGE_SETTLE;
+    loop {
+        match conversation.final_message()? {
+            FinalMessage::Missing if Instant::now() < until => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            settled => return Ok(settled),
         }
     }
 }
@@ -7140,6 +7168,34 @@ fn invalid(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Managed lead and executor frontends are the native TUI processes that
+    /// would register the competing `codex_worktrees` tools into a hosted
+    /// conversation. The common pool is the only allocator a managed
+    /// conversation may use, so both roles carry the native feature off
+    /// before the resume subcommand, which keeps the thread id as its only
+    /// positional.
+    #[test]
+    fn managed_frontends_suppress_the_native_worktree_tool_surface() {
+        let pair = ["-c", "features.worktrees=false"];
+        for role in [FrontendRole::Executor, FrontendRole::Lead] {
+            let args = frontend_args(1, "thread-1", NativePresentation::NativeInline, role);
+            assert!(
+                args.windows(2)
+                    .any(|window| window[0] == pair[0] && window[1] == pair[1]),
+                "{role:?} frontend args lack {pair:?}: {args:?}"
+            );
+            let resume = args
+                .iter()
+                .position(|arg| arg == "resume")
+                .unwrap_or_else(|| panic!("{role:?} frontend args lack resume: {args:?}"));
+            assert_eq!(
+                resume + 2,
+                args.len(),
+                "{role:?}: the thread id stays the only positional: {args:?}"
+            );
+        }
+    }
 
     #[test]
     fn restart_handoff_is_bounded_and_keeps_the_original_assignment_separate() {

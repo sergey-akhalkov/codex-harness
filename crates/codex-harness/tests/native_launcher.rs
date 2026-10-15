@@ -729,6 +729,110 @@ fn embedded_tui_sessions_suppress_the_daemon_fallback_warning() {
 }
 
 #[test]
+fn managed_session_starts_forward_the_worktree_tool_suppression_leaf() {
+    let f = Fixture::new();
+    // The kit's shared defaults own the managed suppression: the native
+    // worktree tools would compete with the common harness pool, so a
+    // session start forwards the feature leaf as a native CLI override.
+    fs::write(
+        f.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    let out = f.command().arg("hello").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.worktrees=false",
+            "-c",
+            "features.daemon_auto_start=false",
+            "hello"
+        ])
+    );
+
+    // Non-TUI commands share the same defaults layer and carry the leaf too;
+    // the daemon opt-out stays TUI-only.
+    let out = f.command().args(["exec", "hello"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.worktrees=false",
+            "exec",
+            "hello"
+        ])
+    );
+}
+
+#[test]
+fn explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf() {
+    let f = Fixture::new();
+    fs::write(
+        f.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    // A machine-local leaf is the explicit native choice: the shared default
+    // is skipped instead of fought, so the session keeps the native worktree
+    // tools and the re-exposed surface stays a configuration conflict for
+    // managed-pool delivery instead of a silent suppression claim.
+    fs::write(f.home.join("config.toml"), "[features]\nworktrees = true\n").unwrap();
+    let out = f.command().arg("hello").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.daemon_auto_start=false",
+            "hello"
+        ])
+    );
+
+    // An explicit profile replaces the kit's shared layer entirely, so its
+    // sessions are outside the managed-suppression claim as well.
+    let out = f.command().args(["--profile", "user"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "features.daemon_auto_start=false",
+            "--profile",
+            "user"
+        ])
+    );
+}
+
+#[test]
 fn stale_missing_altered_and_interrupted_installations_do_not_launch_or_build() {
     for mode in ["registration", "journal", "recursion"] {
         let f = Fixture::new();
