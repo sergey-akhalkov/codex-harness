@@ -2926,7 +2926,7 @@ impl WatchReport {
         {
             Some(match role_from_receipt(value) {
                 Ok(Some(role)) => role.summary(),
-                Ok(None) => "unrecorded (receipt written before role recording; resume or restart records the current role)".to_owned(),
+                Ok(None) => "unrecorded (receipt written before role recording)".to_owned(),
                 Err(error) => format!("invalid ({error})"),
             })
         } else {
