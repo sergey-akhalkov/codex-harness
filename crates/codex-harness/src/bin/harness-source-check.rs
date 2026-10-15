@@ -313,17 +313,32 @@ fn accounting_lines(
             bodies.insert(skill.name.as_str(), (skill.path.clone(), source));
         }
         let mut invoked_count = LoadCount::default();
+        let mut invoked_skills = 0usize;
         let mut local_references = 0usize;
         let mut local_reference = LoadCount::default();
         let mut external_references = 0usize;
         let mut unresolved_references = 0usize;
         if !selected.is_empty() {
-            let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+            // Repeated selections and links that point at an invoked body must
+            // not count the same text twice, so collect the distinct bodies
+            // first and exclude their files from the reference measurement.
+            let mut selected_bodies: Vec<(&Path, &str)> = Vec::new();
+            let mut invoked_files: BTreeSet<&Path> = BTreeSet::new();
             for name in selected {
-                let (parent, source) = bodies.get(name.as_str()).ok_or(INVOKED_NOT_VISIBLE)?;
+                let (skill_file, source) = bodies.get(name.as_str()).ok_or(INVOKED_NOT_VISIBLE)?;
+                if invoked_files.insert(skill_file.as_path()) {
+                    selected_bodies.push((skill_file.as_path(), source.as_str()));
+                }
+            }
+            invoked_skills = selected_bodies.len();
+            let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+            for (skill_file, source) in selected_bodies {
+                // `skill_file` names SKILL.md itself, so relative links resolve
+                // from its containing directory.
+                let directory = skill_file.parent().ok_or(ACCOUNTING_UNAVAILABLE)?;
                 let body = skill_frontmatter(source)
                     .map(|(_, body)| body)
-                    .unwrap_or(source.as_str());
+                    .unwrap_or(source);
                 invoked_count.add(LoadCount::text(body));
                 for matched in links.captures_iter(body) {
                     let raw = matched[1].trim();
@@ -344,7 +359,9 @@ fn accounting_lines(
                     if file.is_empty() {
                         continue;
                     }
-                    match parent.join(file.as_str()).canonicalize() {
+                    match directory.join(file.as_str()).canonicalize() {
+                        // An invoked body's own file is counted there, not here.
+                        Ok(target) if invoked_files.contains(target.as_path()) => {}
                         Ok(target) if target.starts_with(root) && target.is_file() => {
                             if seen.insert(target.clone()) {
                                 local_references += 1;
@@ -388,9 +405,9 @@ fn accounting_lines(
                 words: fixed.words + invoked_count.words + local_reference.words,
             };
             lines.push(format!(
-                "guidance-accounting role={} surface=invoked invoked_skills={} invoked_bytes={} invoked_words={} local_references={local_references} local_reference_bytes={} local_reference_words={} external_references={external_references} unresolved_references={unresolved_references} composed_bytes={} composed_words={}",
+                "guidance-accounting role={} surface=invoked invoked_skills={} invoked_bytes={} invoked_words={} local_references={local_references} local_reference_bytes={} local_reference_words={} external_references={external_references} unresolved_references={unresolved_references} composed_bytes={} composed_words={} reference_scope=all_links_upper_bound",
                 role.label(),
-                selected.len(),
+                invoked_skills,
                 invoked_count.bytes,
                 invoked_count.words,
                 local_reference.bytes,
@@ -439,7 +456,7 @@ fn run() -> Result<bool, &'static str> {
             }
             "--help" | "-h" => {
                 println!(
-                    "harness-source-check [--root REPOSITORY] [--private-terms LOCAL_FILE]\n  [--accounting [--invoked ROLE=NAME[,NAME]]]\nChecks existing tracked and non-ignored new files, caches, shared trust settings,\nmachine home paths in documentation/configuration, caller-supplied private terms,\nlocal inline Markdown links and the 24,576-byte portable-principles limit. Kit roots\nalso require valid role sources and skill memberships, principles and token-audit\ndocumentation owners.\nSkips fenced examples, template targets and non-text assets. Terms are one per\nline in a file outside the repository. Diagnostics omit matched text.\n--accounting also prints one reproducible guidance-load line per role for the\nfixed load (visible catalogue metadata, common core, developer text and the\nselected role fragment) and, for each declared --invoked ROLE=NAME[,NAME]\nselection, that role's invoked skill bodies after frontmatter plus their\ndeduplicated local reference files. LF-normalized bytes and whitespace words stay separate;\ngenerated briefs are measured once by the retained assignment-renderer tests.\n--accounting needs valid kit role inputs and exits 2 when its inputs are\ninvalid, after any audit findings are printed.\nExit: 0 clean, 1 findings, 2 audit unavailable.\nThis is a working-tree check, not a secret detector or Git-history audit."
+                    "harness-source-check [--root REPOSITORY] [--private-terms LOCAL_FILE]\n  [--accounting [--invoked ROLE=NAME[,NAME]]]\nChecks existing tracked and non-ignored new files, caches, shared trust settings,\nmachine home paths in documentation/configuration, caller-supplied private terms,\nlocal inline Markdown links and the 24,576-byte portable-principles limit. Kit roots\nalso require valid role sources and skill memberships, principles and token-audit\ndocumentation owners.\nSkips fenced examples, template targets and non-text assets. Terms are one per\nline in a file outside the repository. Diagnostics omit matched text.\n--accounting also prints one reproducible guidance-load line per role for the\nfixed load (visible catalogue metadata, common core, developer text and the\nselected role fragment) and, for each declared --invoked ROLE=NAME[,NAME]\nselection, that role's distinct invoked skill bodies after frontmatter plus\nevery distinct local link target as a reference upper bound: repeated names\ncount once, a link to another invoked body counts once under invoked bodies,\nand links inside linked files are not followed. Required and optional links are\nnot distinguished; every invoked line carries reference_scope=all_links_upper_bound.\nLF-normalized bytes and whitespace words stay separate;\ngenerated briefs are measured once by the retained assignment-renderer tests.\n--accounting needs valid kit role inputs and exits 2 when its inputs are\ninvalid, after any audit findings are printed.\nExit: 0 clean, 1 findings, 2 audit unavailable.\nThis is a working-tree check, not a secret detector or Git-history audit."
                 );
                 return Ok(true);
             }

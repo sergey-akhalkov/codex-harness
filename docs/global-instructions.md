@@ -40,16 +40,22 @@ reduction or a behavioral improvement.
 the fixed session load: LF-normalized UTF-8 bytes and whitespace words for the
 common core, the owned developer text, the selected role fragment and that
 role's visible catalogue metadata. `--accounting --invoked ROLE=NAME[,NAME]`
-adds the named skill bodies after frontmatter plus their deduplicated local
-reference files, counting external and unresolved targets separately; generated
-briefs stay with the retained assignment-renderer measurement, so no surface is
-counted twice. Against the pinned pre-partition baseline (24,977-byte common
+adds the distinct named skill bodies after frontmatter plus every distinct
+local link target found in those bodies as a reference upper bound
+(`reference_scope=all_links_upper_bound`): repeated names count once, a link
+that points at another invoked body is counted under invoked bodies instead of
+again as a reference, links inside linked files are not followed, and external
+or non-file targets and unresolved targets are counted separately. The line
+does not distinguish required from optional links and claims no completeness:
+the references a real task actually consumes are not derivable from skill text
+alone. Generated briefs stay with the retained assignment-renderer measurement,
+so no surface is counted twice. Against the pinned pre-partition baseline (24,977-byte common
 core, 6,669-byte developer text, 6,185-byte 23-skill catalogue; 37,831 bytes /
 4,970 words per session) the current fixed load is 30,045 bytes / 3,918 words
 for the executor (-20.6% / -21.2%), 36,419 bytes / 4,772 words for the lead
 (-3.7% / -4.0%) and 66,464 / 8,690 for the combined two-role load (-12.2% /
 -12.6%). These are source-text sizes: the comparison excludes generated
-briefs, invoked bodies and required references (measured separately and not yet
+briefs, invoked bodies and linked reference files (measured separately and not yet
 for a matched task) and establishes no semantic equivalence, quality or speed
 benefit. Semantic coverage and real-task comparisons remain open in
 [the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md).

@@ -395,6 +395,84 @@ fn accounting_counts_invoked_bodies_and_deduplicated_local_references() {
 }
 
 #[test]
+fn accounting_counts_repeated_invoked_names_once() {
+    let f = kit_fixture();
+    f.write(
+        "fixture-skills/fixture-skill/SKILL.md",
+        "---\nname: fixture-skill\ndescription: Owned fixture skill\n---\nFixture body.\n[Notes](notes.md)\n[Again](notes.md)\n[Site](https://example.com/x)\n",
+    );
+    f.write("fixture-skills/fixture-skill/notes.md", "notes\n");
+    let once = f.account(&["executor=fixture-skill"]);
+    let repeated = f.account(&["executor=fixture-skill,fixture-skill"]);
+    for measured in [&once, &repeated] {
+        assert_eq!(
+            measured.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&measured.stderr)
+        );
+    }
+    let line = |output: &Output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|line| line.starts_with("guidance-accounting role=executor surface=invoked "))
+            .expect("no executor invoked accounting line")
+            .to_owned()
+    };
+    // Repeating a name must not change the measured line.
+    assert_eq!(line(&once), line(&repeated));
+    assert_eq!(
+        accounting_field(&line(&repeated), "executor", "invoked", "invoked_skills"),
+        1
+    );
+}
+
+#[test]
+fn accounting_counts_links_across_invoked_bodies_once() {
+    let f = kit_fixture();
+    f.write(
+        "global/roles.toml",
+        "schema = 1\nshared_skills = [\"fixture-skill\", \"other-skill\"]\n[roles.lead]\ninstructions = \"global/roles/lead.md\"\nskills = [\"lead-only\"]\n[roles.executor]\ninstructions = \"global/roles/executor.md\"\nskills = []\n",
+    );
+    f.write(
+        "fixture-skills/fixture-skill/SKILL.md",
+        "---\nname: fixture-skill\ndescription: Owned fixture skill\n---\nFixture body.\n[Notes](notes.md)\n[Other](../other-skill/SKILL.md)\n[Shared](../shared.md)\n",
+    );
+    f.write("fixture-skills/fixture-skill/notes.md", "notes\n");
+    f.write(
+        "fixture-skills/other-skill/SKILL.md",
+        "---\nname: other-skill\ndescription: Other fixture skill\n---\nOther body.\n[Shared](../shared.md)\n",
+    );
+    f.write("fixture-skills/shared.md", "shared\n");
+    let measured = f.account(&["executor=fixture-skill,other-skill"]);
+    assert_eq!(
+        measured.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&measured.stderr)
+    );
+    let output = String::from_utf8_lossy(&measured.stdout).into_owned();
+    // Both bodies count once, the link into the other invoked body and the
+    // shared target do not add text again, and notes.md resolves from the
+    // invoking skill's own directory.
+    let field = |key: &str| accounting_field(&output, "executor", "invoked", key);
+    assert_eq!(field("invoked_skills"), 2);
+    assert_eq!(field("invoked_bytes"), 123);
+    assert_eq!(field("invoked_words"), 8);
+    assert_eq!(field("local_references"), 2);
+    assert_eq!(field("local_reference_bytes"), 13);
+    assert_eq!(field("local_reference_words"), 2);
+    assert_eq!(field("external_references"), 0);
+    assert_eq!(field("unresolved_references"), 0);
+    assert_eq!(field("composed_bytes"), 248);
+    assert_eq!(field("composed_words"), 25);
+    assert!(
+        output.contains("reference_scope=all_links_upper_bound"),
+        "{output}"
+    );
+}
+
+#[test]
 fn accounting_normalizes_checkout_line_endings() {
     let f = kit_fixture();
     let files = [
