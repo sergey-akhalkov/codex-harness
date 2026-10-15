@@ -189,6 +189,36 @@ fn refresh_record(f: &Fixture) {
     build_selection::activate(&f.state, build).unwrap();
 }
 
+/// Write the role sources the launcher's responsibility context resolves:
+/// the kit manifest points at `AGENTS.md` and `skills`, and the role
+/// descriptor names one instruction file per role. Fixture::new keeps the
+/// minimal launch inputs; only tests that reach session composition call this.
+fn write_role_sources(f: &Fixture) {
+    fs::create_dir_all(f.source.join("skills")).unwrap();
+    fs::create_dir_all(f.source.join("global/roles")).unwrap();
+    fs::write(f.source.join("AGENTS.md"), "fixture common guidance").unwrap();
+    fs::write(f.source.join("global/roles/lead.md"), "lead role guidance").unwrap();
+    fs::write(
+        f.source.join("global/roles/executor.md"),
+        "executor role guidance",
+    )
+    .unwrap();
+    fs::write(
+        f.source.join("global/roles.toml"),
+        concat!(
+            "schema = 1\n",
+            "shared_skills = []\n",
+            "[roles.lead]\n",
+            "instructions = \"global/roles/lead.md\"\n",
+            "skills = []\n",
+            "[roles.executor]\n",
+            "instructions = \"global/roles/executor.md\"\n",
+            "skills = []\n",
+        ),
+    )
+    .unwrap();
+}
+
 /// Bytes the launcher process has read so far, from the kernel's own
 /// per-process I/O accounting (never a file-access heuristic).
 fn process_read_bytes(child: &std::process::Child) -> u64 {
@@ -731,6 +761,7 @@ fn embedded_tui_sessions_suppress_the_daemon_fallback_warning() {
 #[test]
 fn managed_session_starts_forward_the_worktree_tool_suppression_leaf() {
     let f = Fixture::new();
+    write_role_sources(&f);
     // The kit's shared defaults own the managed suppression: the native
     // worktree tools would compete with the common harness pool, so a
     // session start forwards the feature leaf as a native CLI override.
@@ -755,6 +786,10 @@ fn managed_session_starts_forward_the_worktree_tool_suppression_leaf() {
             "features.worktrees=false",
             "-c",
             "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
             "hello"
         ])
     );
@@ -775,25 +810,56 @@ fn managed_session_starts_forward_the_worktree_tool_suppression_leaf() {
             "approval_policy=\"never\"",
             "-c",
             "features.worktrees=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
             "exec",
             "hello"
         ])
     );
-}
 
-#[test]
-fn explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf() {
-    let f = Fixture::new();
+    // The executor marker composes the executor role instead of the lead role
+    // and keeps the same shared suppression leaf alongside the single-agent
+    // switch.
+    let out = f
+        .command()
+        .env("HARNESS_EXECUTOR_SESSION", "1")
+        .arg("hello")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.worktrees=false",
+            "-c",
+            "features.daemon_auto_start=false",
+            "-c",
+            "agents.enabled=false",
+            "-c",
+            "developer_instructions=\"executor role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "hello"
+        ])
+    );
+
+    // A machine-local leaf that agrees with the shared suppression is not a
+    // conflict: the shared leaf stays skipped and no re-enable is reported.
     fs::write(
-        f.source.join("global/harness.config.toml"),
-        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+        f.home.join("config.toml"),
+        "[features]\nworktrees = false\n",
     )
     .unwrap();
-    // A machine-local leaf is the explicit native choice: the shared default
-    // is skipped instead of fought, so the session keeps the native worktree
-    // tools and the re-exposed surface stays a configuration conflict for
-    // managed-pool delivery instead of a silent suppression claim.
-    fs::write(f.home.join("config.toml"), "[features]\nworktrees = true\n").unwrap();
     let out = f.command().arg("hello").output().unwrap();
     assert!(
         out.status.success(),
@@ -808,9 +874,68 @@ fn explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf(
             "approval_policy=\"never\"",
             "-c",
             "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
             "hello"
         ])
     );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("features.worktrees"),
+        "an agreeing machine-local leaf is not a worktree-tool conflict"
+    );
+}
+
+#[test]
+fn explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf() {
+    let f = Fixture::new();
+    write_role_sources(&f);
+    fs::write(
+        f.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    // A machine-local leaf is the explicit native choice: the shared default
+    // is skipped instead of fought, so the session keeps the native worktree
+    // tools and the re-exposed surface is reported as a configuration conflict
+    // for managed-pool delivery instead of a silent suppression claim.
+    fs::write(
+        f.home.join("config.toml"),
+        "model = \"gpt-6.1-sol\"\n[features]\nworktrees = true\n[mcp_servers.demo]\ncommand = \"demo-server\"\n",
+    )
+    .unwrap();
+    let before = fs::read(f.home.join("config.toml")).unwrap();
+    let out = f.command().arg("hello").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "hello"
+        ])
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the user configuration sets features.worktrees=true")
+            && stderr.contains("compete with the shared worktree pool"),
+        "the re-enabled native worktree tools must be reported instead of lost silently: {stderr}"
+    );
+    // The explicit machine-local choice and its unrelated model and MCP
+    // settings survive the launch untouched.
+    assert_eq!(before, fs::read(f.home.join("config.toml")).unwrap());
 
     // An explicit profile replaces the kit's shared layer entirely, so its
     // sessions are outside the managed-suppression claim as well.
@@ -826,9 +951,17 @@ fn explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf(
         json!([
             "-c",
             "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
             "--profile",
             "user"
         ])
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("features.worktrees"),
+        "a profile session carries no shared suppression to conflict with"
     );
 }
 

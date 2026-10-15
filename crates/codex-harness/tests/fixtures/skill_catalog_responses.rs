@@ -34,6 +34,15 @@ pub const CHILD_PROMPT: &str =
     "Child catalogue control. Reply with SKILL_CATALOG_CHILD_OK. Do not spawn other agents.";
 pub const EARLY_SKILL: &str = "skill_catalog_early_probe";
 pub const CHILD_CALL_ID: &str = "skill-catalog-child-exec-1";
+/// The probe turn prompt: a non-special prompt so the turn classifies outside
+/// the canned turn kinds and can be repeated for bounded settle rounds.
+pub const ALL_TOOLS_PROBE_PROMPT: &str = "Canned all-tools settle probe: report the nested tool catalogue. Reply with CANNED_ALL_TOOLS_SETTLE_OK.";
+pub const ALL_TOOLS_MARKER: &str = "CANNED_ALL_TOOLS_PROBE";
+pub const ALL_TOOLS_END: &str = "CANNED_ALL_TOOLS_END";
+/// The installed CLI asks the model for a thread title after a turn starts;
+/// the probe answers that request with a plain message so a title turn never
+/// consumes a probe call or masks a probe turn.
+const TITLE_PROMPT: &str = "Generate a concise, single-line task title";
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 
@@ -77,6 +86,9 @@ struct Inner {
     root: PathBuf,
     short_exec: AtomicBool,
     spawn_child: AtomicBool,
+    all_tools_probe: AtomicBool,
+    probe_seq: AtomicUsize,
+    pending_probe: Mutex<Option<String>>,
     skill_read: Mutex<Option<String>>,
     skill_exec: Mutex<Option<String>>,
 }
@@ -112,6 +124,9 @@ impl CannedResponses {
             root: root.to_path_buf(),
             short_exec: AtomicBool::new(short_exec),
             spawn_child: AtomicBool::new(spawn_child),
+            all_tools_probe: AtomicBool::new(false),
+            probe_seq: AtomicUsize::new(0),
+            pending_probe: Mutex::new(None),
             skill_read: Mutex::new(None),
             skill_exec: Mutex::new(None),
         });
@@ -122,6 +137,17 @@ impl CannedResponses {
             inner,
             thread: Some(thread),
         })
+    }
+
+    /// Turns every probe turn into one code-mode `exec` call that reports the
+    /// runtime `ALL_TOOLS` names between markers, so the caller observes the
+    /// effective nested catalogue at the session's registration boundary
+    /// instead of the static first-request schemas. The follow-up request
+    /// that carries the exec output is answered with a plain message.
+    pub fn spawn_all_tools(root: &Path) -> io::Result<Self> {
+        let canned = Self::spawn_mode(root, true, false)?;
+        canned.inner.all_tools_probe.store(true, Ordering::SeqCst);
+        Ok(canned)
     }
 
     pub fn base_url(&self) -> String {
@@ -216,7 +242,7 @@ fn handle_connection(mut stream: TcpStream, inner: Arc<Inner>) -> io::Result<()>
     };
     persist_request(&inner.root, &captured);
     inner.requests.lock().unwrap().push(captured);
-    let (status, content_type, payload) = response_for(&method, &path, kind, &inner);
+    let (status, content_type, payload) = response_for(&method, &path, kind, &body_text, &inner);
     write_response(&mut stream, status, content_type, payload.as_bytes())
 }
 
@@ -299,6 +325,7 @@ fn response_for(
     method: &str,
     path: &str,
     kind: RequestKind,
+    body: &str,
     inner: &Inner,
 ) -> (&'static str, &'static str, String) {
     let path = path.split('?').next().unwrap_or(path);
@@ -320,6 +347,39 @@ fn response_for(
             json!({"error": {"message": "canned skill catalog fixture has no such route"}})
                 .to_string(),
         );
+    }
+    if inner.all_tools_probe.load(Ordering::SeqCst) && body.contains(TITLE_PROMPT) {
+        return (
+            "200 OK",
+            "text/event-stream",
+            message_sse("all-tools-title", "All-tools probe session", 200),
+        );
+    }
+    let probing = inner.all_tools_probe.load(Ordering::SeqCst)
+        && (kind == RequestKind::FirstSampling
+            || (kind == RequestKind::Other && body.contains(ALL_TOOLS_PROBE_PROMPT)));
+    if probing {
+        let mut pending = inner.pending_probe.lock().unwrap();
+        if let Some(call_id) = pending.clone() {
+            if probe_output_present(body, &call_id) {
+                *pending = None;
+                return (
+                    "200 OK",
+                    "text/event-stream",
+                    message_sse(
+                        &format!("all-tools-done-{call_id}"),
+                        "CANNED_ALL_TOOLS_DONE",
+                        400,
+                    ),
+                );
+            }
+        }
+        let call_id = format!(
+            "canned-all-tools-probe-{}",
+            inner.probe_seq.fetch_add(1, Ordering::SeqCst) + 1
+        );
+        *pending = Some(call_id.clone());
+        return ("200 OK", "text/event-stream", all_tools_probe_sse(&call_id));
     }
     let sse = match kind {
         RequestKind::Compact => compact_sse(),
@@ -401,6 +461,49 @@ fn child_sampling_sse() -> String {
             }
         }),
         completed("resp-child", 1_200),
+    ])
+}
+
+/// The follow-up request carries the exec output item once the session ran the
+/// probe script; the item is matched by the call id this fixture issued.
+fn probe_output_present(body: &str, call_id: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("input").and_then(Value::as_array).cloned())
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
+                    && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+            })
+        })
+}
+
+/// One code-mode `exec` call that reports the session's own runtime tool
+/// names between markers: the keys of the documented global `tools` object
+/// plus the `ALL_TOOLS` metadata entries, which name the enabled nested tools
+/// including deferred ones the static request schemas omit. Each call gets a
+/// distinct call and response id, because the runtime catalogue may change
+/// between calls.
+fn all_tools_probe_sse(call_id: &str) -> String {
+    let response_id = format!("resp-{call_id}");
+    let input = format!(
+        "const names = Object.keys(typeof tools === 'undefined' ? {{}} : tools);\n\
+         const listed = typeof ALL_TOOLS === 'undefined' ? [] : ALL_TOOLS;\n\
+         for (const entry of Object.values(listed)) names.push(typeof entry === 'string' ? entry : entry.name);\n\
+         text('{ALL_TOOLS_MARKER}' + [...new Set(names)].join('|') + '{ALL_TOOLS_END}');"
+    );
+    sse(&[
+        json!({"type": "response.created", "response": {"id": response_id.clone()}}),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": "exec",
+                "input": input
+            }
+        }),
+        completed(&response_id, 800),
     ])
 }
 

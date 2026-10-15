@@ -607,20 +607,27 @@ add `repository=`, `task=` and `handle=` beside the session fields.
 
 ### Native worktree tool suppression
 
-The native TUI hosts a dynamic `codex_worktrees` tool server into sessions,
-which competes with the common pool as a second allocator. The kit's shared
-configuration turns the native feature off (`features.worktrees = false`), a
-session start forwards that leaf as `-c features.worktrees=false`, and managed
-lead and executor frontends carry the same pair before their `resume`
-subcommand. The switch is proven against a fresh effective tool catalogue, not
-a configuration value: feature readback, skill retirement or instructing
-agents not to use the tools does not disable the surface. The opt-in installed
-check drives the installed native CLI TUI against the canned local Responses
-fixture and compares an unsuppressed control catalogue with the managed-leaf
-run: the control must expose the worktree surface and the managed run must
-expose none of it, so a control that observes nothing leaves the requirement
-open instead of passing vacuously. Request bodies and terminal transcripts
-stay in the kept evidence directory it prints.
+The native TUI hosts a dynamic `codex_worktrees` tool server into sessions
+while its `worktrees` feature is enabled, which competes with the common pool
+as a second allocator. The kit's shared configuration turns the native feature
+off (`features.worktrees = false`), a session start forwards that leaf as
+`-c features.worktrees=false`, and managed lead and executor frontends carry
+the same pair before their `resume` subcommand.
+
+The switch is proven against the effective runtime tool catalogue, not a
+configuration value, a feature readback or the static first request: the
+installed CLI defers dynamically hosted tool servers out of the first request
+schemas, so the opt-in installed check reads the session's own runtime
+catalogue. It drives the installed native CLI TUI against the canned local
+Responses fixture, has the session run code-mode `exec` calls that report the
+keys of its runtime `tools` object plus its `ALL_TOOLS` metadata, and repeats
+that up to three bounded settle rounds because tool availability can change
+between calls. An unsuppressed control run must expose a worktree-named tool
+in its runtime catalogue, and the managed-leaf run
+(`-c features.worktrees=false`) must expose none of it in the runtime
+catalogue or the session's first request surface, so a control that observes
+nothing leaves the requirement open instead of passing vacuously. Request
+bodies and terminal transcripts stay in the kept evidence directory it prints.
 
 ```powershell
 cargo test --locked -p codex-harness --test skill_catalog_refresh installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf --jobs 1 -- --ignored --exact --nocapture --test-threads=1
@@ -631,11 +638,14 @@ The `native_launcher` tests pin the launch side:
 the forwarded leaf for TUI and non-TUI starts, while
 `explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf`
 requires an explicit machine-local `features.worktrees = true` to skip the
-conflicting shared leaf instead of fighting it, so such a session is a
-configuration conflict with the managed-pool contract rather than successful
-suppression. A conversation that started before the change keeps the tools it
-registered; the suppression applies to fresh sessions, so an existing
-conversation needs an explicit restart rather than an in-place update.
+conflicting shared leaf instead of fighting it. The launcher reports that
+conflict on stderr, naming the winning configuration layer, the effective
+value and the override to remove, so such a session is a reported
+configuration conflict with the managed-pool contract rather than silent or
+successful suppression. A conversation that started before the change keeps
+the tools it registered; the suppression applies to fresh sessions, so an
+existing conversation needs an explicit restart rather than an in-place
+update.
 
 ## Structured executor assignments
 

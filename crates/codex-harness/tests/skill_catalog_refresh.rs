@@ -16,9 +16,10 @@ use harness_core::{
 };
 use serde_json::{Value, json};
 use skill_catalog_responses::{
-    API_KEY, API_KEY_ENV, CALL_ID, CHILD_CALL_ID, CHILD_PROMPT, COMPACT_PROMPT, CannedResponses,
-    EARLY_SKILL, NEXT_TURN_PROMPT, PROVIDER_ID, RESUME_PROMPT, RETIRE_PROMPT, RequestKind,
-    SUMMARY_TEXT, UNRELATED_PROMPT, USER_PROMPT,
+    ALL_TOOLS_END, ALL_TOOLS_MARKER, ALL_TOOLS_PROBE_PROMPT, API_KEY, API_KEY_ENV, CALL_ID,
+    CHILD_CALL_ID, CHILD_PROMPT, COMPACT_PROMPT, CannedResponses, EARLY_SKILL, NEXT_TURN_PROMPT,
+    PROVIDER_ID, RESUME_PROMPT, RETIRE_PROMPT, RequestKind, SUMMARY_TEXT, UNRELATED_PROMPT,
+    USER_PROMPT,
 };
 use std::{
     fs, io,
@@ -3432,18 +3433,20 @@ fn tree_paths(root: &Path) -> Vec<String> {
     out
 }
 
-/// The installed native TUI registers its dynamic `codex_worktrees` tool
-/// server into ordinary sessions while the native `worktrees` feature is on.
-/// The managed selection turns that feature off through the shared
-/// configuration leaf and the managed frontend's `-c features.worktrees=false`
-/// pair. A fresh effective model-request catalogue under that selection must
-/// contain no worktree-named tool, no nested `codex_worktrees` declaration and
-/// no deferred marker. The unsuppressed control run proves the same check
-/// observes the surface while the feature is on: a control that exposes
-/// nothing leaves this check with no observation and the task open rather
-/// than passing vacuously. Driven over the installed native CLI TUI against
-/// the canned local Responses server; no billed model call and no shared
-/// configuration write.
+/// The installed native TUI hosts a dynamic `codex_worktrees` tool server
+/// into ordinary sessions while the native `worktrees` feature is on. The
+/// static first model request can defer dynamic tool servers, so the effective
+/// catalogue is read from the running session itself: one code-mode `exec`
+/// call per bounded settle round reports the session's own `ALL_TOOLS`. The
+/// managed selection (the shared configuration leaf and the managed
+/// frontend's `-c features.worktrees=false` pair) must leave no worktree-named
+/// tool in that runtime catalogue and no `codex_worktrees` marker in the
+/// session's first-request surface. The unsuppressed control run proves the
+/// probe observes the runtime surface while the feature is on: a control that
+/// exposes nothing leaves this check with no observation and the task open
+/// rather than passing vacuously. Driven over the installed native CLI TUI
+/// against the canned local Responses server; no billed model call and no
+/// shared configuration write.
 #[test]
 #[ignore = "explicit installed native CLI ordinary TUI + canned local Responses; no live model"]
 fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf() {
@@ -3463,38 +3466,42 @@ fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_manage
         .keep();
     println!("native worktree catalogue evidence: {}", evidence.display());
 
-    let control = installed_tui_catalogue(&upstream, &evidence, "control", &[]);
-    let control_fragments = worktree_fragments(&control);
+    let control = installed_tui_all_tools(&upstream, &evidence, "control", &[], 3);
+    let control_fragments = worktree_names(&control.names);
     assert!(
-        !control_fragments.is_empty(),
-        "the unsuppressed control catalogue exposed no codex_worktrees surface, so this check observed nothing and the task stays open: names {:?}",
-        control.0
+        !control.names.is_empty() && !control_fragments.is_empty(),
+        "the unsuppressed control runtime catalogue exposed no codex_worktrees tool, so this check observed nothing and the task stays open: names {:?}; evidence {}",
+        control.names,
+        evidence.display()
     );
 
-    let suppressed = installed_tui_catalogue(
+    let suppressed = installed_tui_all_tools(
         &upstream,
         &evidence,
         "managed-leaf",
         &["-c", "features.worktrees=false"],
+        3,
     );
     assert!(
-        !suppressed.0.is_empty(),
-        "the managed-leaf run captured no tool catalogue; evidence {}",
+        !suppressed.names.is_empty(),
+        "the managed-leaf run captured no runtime catalogue; evidence {}",
         evidence.display()
     );
-    let suppressed_fragments = worktree_fragments(&suppressed);
+    let suppressed_fragments = worktree_names(&suppressed.names);
+    let surface_fragments = worktree_fragments(&suppressed.surface);
     assert!(
-        suppressed_fragments.is_empty(),
-        "features.worktrees=false left the competing worktree surface in the effective catalogue: {suppressed_fragments:?}; evidence {}",
+        suppressed_fragments.is_empty() && surface_fragments.is_empty(),
+        "features.worktrees=false left the competing worktree surface in the session: runtime {suppressed_fragments:?}, request surface {surface_fragments:?}; evidence {}",
         evidence.display()
     );
     write_json(
         &evidence.join("acceptance.json"),
         &json!({
             "control_fragments": control_fragments,
+            "control_names": control.names,
             "suppressed_fragments": suppressed_fragments,
-            "control_names": control.0,
-            "suppressed_names": suppressed.0,
+            "suppressed_names": suppressed.names,
+            "suppressed_surface_fragments": surface_fragments,
         }),
     );
     println!(
@@ -4535,6 +4542,167 @@ fn installed_tui_catalogue(
         &json!({"names": &surface.0, "definitions": &surface.1}),
     );
     surface
+}
+
+/// One runtime catalogue reading from a fresh installed-CLI TUI session: the
+/// nested-tool names the session itself reported through a code-mode `exec`
+/// call, plus the session's static first-request surface for evidence.
+struct RuntimeCatalogue {
+    names: Vec<String>,
+    surface: (Vec<String>, String),
+}
+
+/// The probe call id prefix the canned fixture issues for runtime readings.
+const PROBE_CALL_PREFIX: &str = "canned-all-tools-probe-";
+
+/// The runtime tool names one `exec` output item carries, if any. The session
+/// exchanges them as one `|`-separated marker payload, a format that a JSON
+/// string wrapper around the exec result cannot corrupt; an exec result can
+/// arrive as raw text or as content parts, so both shapes are read.
+fn probe_names(output: &Value) -> Option<Vec<String>> {
+    let mut texts: Vec<&str> = Vec::new();
+    match output {
+        Value::String(text) => texts.push(text.as_str()),
+        Value::Array(parts) => texts.extend(parts.iter().filter_map(|part| {
+            part.as_str()
+                .or_else(|| part.get("text").and_then(Value::as_str))
+        })),
+        _ => return None,
+    }
+    texts.into_iter().find_map(|text| {
+        let start = text.find(ALL_TOOLS_MARKER)? + ALL_TOOLS_MARKER.len();
+        let rest = &text[start..];
+        let end = rest.find(ALL_TOOLS_END)?;
+        let names = rest[..end]
+            .split('|')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        (!names.is_empty()).then_some(names)
+    })
+}
+
+/// Every distinct runtime catalogue reading carried by `requests`, in arrival
+/// order: the probe call id the fixture issued and the runtime tool names the
+/// session reported through that code-mode `exec` call. Later requests repeat
+/// earlier conversation items, so readings are deduplicated by call id; a new
+/// entry means the session executed a newer probe call.
+fn probe_readings(
+    requests: &[skill_catalog_responses::CapturedRequest],
+) -> Vec<(String, Vec<String>)> {
+    let mut readings: Vec<(String, Vec<String>)> = Vec::new();
+    for request in requests {
+        let Ok(body) = serde_json::from_str::<Value>(&request.body) else {
+            continue;
+        };
+        let Some(items) = body.get("input").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            if item.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
+                continue;
+            }
+            let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !call_id.starts_with(PROBE_CALL_PREFIX)
+                || readings.iter().any(|(seen, _)| seen == call_id)
+            {
+                continue;
+            }
+            if let Some(names) = item.get("output").and_then(probe_names) {
+                readings.push((call_id.to_owned(), names));
+            }
+        }
+    }
+    readings
+}
+
+/// The competing native-worktree entries of one runtime catalogue.
+fn worktree_names(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| name.to_lowercase().contains("worktree"))
+        .cloned()
+        .collect()
+}
+
+/// Runs one fresh installed-CLI TUI session against the canned local Responses
+/// server and returns the session's settled runtime nested-tool catalogue.
+/// The static first request can defer dynamic tool servers, so the probe has
+/// the session run code-mode `exec` calls that report its own runtime tool
+/// names; `rounds` bounds the settle turns, because tool availability can
+/// change between calls. A caller that observes worktree-named tools stops
+/// early; every other caller keeps probing to the round bound, so an early
+/// empty reading is never the final word for the suppressed comparison.
+fn installed_tui_all_tools(
+    exe: &Path,
+    evidence: &Path,
+    label: &str,
+    extra: &[&str],
+    rounds: usize,
+) -> RuntimeCatalogue {
+    let root = evidence.join(label);
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    git_identity(&workspace);
+    let canned = CannedResponses::spawn_all_tools(&root).unwrap();
+    write_probe_config(&home, &workspace, &canned, "", false);
+    let session = spawn_probe_tui_args(exe, &home, &workspace, extra);
+    ready_named(&session, &root, &home, &format!("RuntimeTools{label}"));
+    let mut names = Vec::new();
+    for round in 1..=rounds {
+        let before = probe_readings(&canned.requests());
+        send_line(&session, ALL_TOOLS_PROBE_PROMPT).unwrap();
+        let captured = canned.wait_for(Duration::from_secs(60), |requests| {
+            probe_readings(requests).len() > before.len()
+        });
+        assert!(
+            captured,
+            "probe round {round} ({label}) captured no runtime catalogue output; evidence {}",
+            root.display()
+        );
+        let readings = probe_readings(&canned.requests());
+        let (call_id, observed) = readings.last().expect("a captured reading is present");
+        assert!(
+            !before.iter().any(|(earlier, _)| earlier == call_id),
+            "probe round {round} ({label}) re-read an earlier probe output; evidence {}",
+            root.display()
+        );
+        names = observed.clone();
+        write_json(
+            &root.join(format!("all-tools-round-{round}.json")),
+            &json!({"call_id": call_id, "names": &names}),
+        );
+        if !worktree_names(&names).is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    send_line(&session, "/quit").unwrap();
+    let _ = session.wait(
+        Deadline::after(Duration::from_secs(25)).unwrap(),
+        &Cancellation::default(),
+        Duration::from_secs(5),
+    );
+    let first = canned
+        .requests()
+        .into_iter()
+        .find(|request| request.kind == RequestKind::FirstSampling);
+    if let Some(request) = &first {
+        fs::write(root.join("first-sampling.body.json"), &request.body).unwrap();
+    }
+    let surface = first
+        .map(|request| tool_surface(&request.body))
+        .unwrap_or_default();
+    write_json(
+        &root.join("surface.json"),
+        &json!({"names": &surface.0, "definitions": &surface.1}),
+    );
+    RuntimeCatalogue { names, surface }
 }
 
 fn ready_named(session: &ConsoleSession, evidence: &Path, home: &Path, name: &str) {

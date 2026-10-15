@@ -152,16 +152,32 @@ fn shared_config_args(
     build: &Path,
     home: &Path,
     working_directory: &Path,
-) -> io::Result<Vec<OsString>> {
+) -> io::Result<(Vec<OsString>, Vec<crate::portable_config::ShadowedDefault>)> {
     let record = build_identity::read_record(build)?;
     let bytes = std::fs::read(record.source_root.join("global/kit.json"))?;
     let manifest: crate::inventory::Manifest =
         serde_json::from_slice(&bytes).map_err(|_| fail("invalid live kit manifest"))?;
-    crate::portable_config::overrides(
+    crate::portable_config::overrides_with_shadowed(
         &record.source_root.join(manifest.profile),
         home,
         working_directory,
     )
+}
+
+/// The shared defaults turn the native `codex_worktrees` tools off in managed
+/// sessions because those tools allocate worktrees outside the shared pool. A
+/// higher-precedence layer that re-enables them is reported instead of fought:
+/// the session really will expose the competing tools.
+fn report_native_worktree_conflict(shadowed: &[crate::portable_config::ShadowedDefault]) {
+    if let Some(shadow) = shadowed.iter().find(|shadow| {
+        shadow.path == "features.worktrees" && shadow.value != toml::Value::Boolean(false)
+    }) {
+        eprintln!(
+            "codex-harness: the {} configuration sets features.worktrees={}; this session keeps the native codex_worktrees tools, which compete with the shared worktree pool; remove the override to let the shared suppression apply",
+            shadow.source.label(),
+            shadow.value
+        );
+    }
 }
 
 /// Effective native model and effort a plain session start would use, for
@@ -358,8 +374,9 @@ fn prepared_command(
     let mut shared_overrides = false;
     if shared && classified.len() != task_args.len() {
         match shared_config_args(&selected, home, context_directory) {
-            Ok(overrides) => {
+            Ok((overrides, shadowed)) => {
                 command.args(overrides);
+                report_native_worktree_conflict(&shadowed);
                 shared_overrides = true;
             }
             Err(_) => {
