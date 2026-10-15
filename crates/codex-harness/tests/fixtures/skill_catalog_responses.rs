@@ -202,7 +202,16 @@ fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => break,
+            Err(error) => {
+                // A transient accept failure, such as a client aborting
+                // during the handshake, must not end the listener while the
+                // session still runs: the next sampling request would then
+                // fail as rejected instead of reaching this fixture. Service
+                // continues until the explicit stop; the error stays visible
+                // for diagnosis.
+                eprintln!("canned responses accept error: {error}");
+                thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }

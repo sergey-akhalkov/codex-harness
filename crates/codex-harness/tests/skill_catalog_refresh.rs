@@ -12,6 +12,7 @@ mod synthetic_role_build;
 use harness_core::{
     build_identity,
     console::{ConsoleSession, ConsoleSpec},
+    native_launcher::{Registration, Upstream},
     process::{Cancellation, CommandSpec, Deadline, StopReason},
 };
 use serde_json::{Value, json};
@@ -3509,6 +3510,157 @@ fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_manage
     );
 }
 
+/// Explicit native probe: fresh managed lead and executor sessions must
+/// consume the worktree-tool suppression at the runtime tool catalogue, not
+/// merely construct argv. The real launcher binary under a recorded build
+/// whose source root is this checkout forwards single sessions to the
+/// installed native CLI against the canned local Responses server. The
+/// unsuppressed direct control exposes the competing tools, both managed
+/// roles stay free of them, a selected profile that carries no
+/// features.worktrees choice still receives the suppression default, and an
+/// explicit winning profile true is honored with a truthful conflict report
+/// at the real entry point. No global deployment and no billed model call.
+#[test]
+#[ignore = "explicit installed native CLI TUI through the real launcher + canned local Responses; no live model"]
+fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {
+    let upstream = registered_upstream(&live_codex_home());
+    assert!(upstream.is_absolute() && upstream.is_file());
+    let version = Command::new(&upstream).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    assert!(
+        version.contains("0.162.1"),
+        "unexpected native CLI: {version}"
+    );
+
+    let evidence = tempfile::Builder::new()
+        .prefix("native-managed-worktree-catalogue-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!(
+        "native managed worktree catalogue evidence: {}",
+        evidence.display()
+    );
+
+    // Positive control on the direct installed CLI: without any suppression
+    // the runtime catalogue exposes the competing tools, so a suppressed
+    // route that observed nothing cannot pass vacuously.
+    let control = installed_tui_all_tools(&upstream, &evidence, "control", &[], 3);
+    let control_fragments = worktree_names(&control.names);
+    assert!(
+        !control.names.is_empty() && !control_fragments.is_empty(),
+        "the unsuppressed control runtime catalogue exposed no codex_worktrees tool, so this check observed nothing and the task stays open: names {:?}; evidence {}",
+        control.names,
+        evidence.display()
+    );
+
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let install = record_managed_install(&evidence, &upstream, &source);
+
+    let assert_suppressed = |route: &str, catalogue: &RuntimeCatalogue| {
+        assert!(
+            !catalogue.names.is_empty(),
+            "the managed {route} run captured no runtime catalogue; evidence {}",
+            evidence.display()
+        );
+        let fragments = worktree_names(&catalogue.names);
+        assert!(
+            fragments.is_empty(),
+            "the managed {route} runtime catalogue kept the competing worktree tools: {fragments:?}; evidence {}",
+            evidence.display()
+        );
+        assert!(
+            !catalogue.transcript.contains("features.worktrees"),
+            "the managed {route} session reported a worktree conflict it does not have; evidence {}",
+            evidence.display()
+        );
+    };
+
+    let lead = managed_tui_all_tools(&install, &evidence, "managed-lead", &[], false, &[], 3);
+    assert_suppressed("lead", &lead);
+
+    let executor =
+        managed_tui_all_tools(&install, &evidence, "managed-executor", &[], true, &[], 3);
+    assert_suppressed("executor", &executor);
+
+    // Selecting a profile is not a worktree choice: a managed session whose
+    // selected profile carries no features.worktrees leaf still receives the
+    // suppression default.
+    let profiled = managed_tui_all_tools(
+        &install,
+        &evidence,
+        "managed-profile",
+        &["--profile", "no-leaf"],
+        false,
+        &[("no-leaf.config.toml", "model_reasoning_effort = \"low\"\n")],
+        3,
+    );
+    assert_suppressed("profile", &profiled);
+
+    // Only an actual winning choice is honored and reported: a profile that
+    // sets features.worktrees=true keeps the competing tools and the launcher
+    // reports the configuration conflict instead of claiming suppression.
+    let explicit = managed_tui_all_tools(
+        &install,
+        &evidence,
+        "managed-profile-true",
+        &["--profile", "explicit-leaf"],
+        false,
+        &[(
+            "explicit-leaf.config.toml",
+            "[features]\nworktrees = true\n",
+        )],
+        3,
+    );
+    assert!(
+        !explicit.names.is_empty(),
+        "the explicit true profile run captured no runtime catalogue; evidence {}",
+        evidence.display()
+    );
+    let explicit_fragments = worktree_names(&explicit.names);
+    assert!(
+        !explicit_fragments.is_empty(),
+        "an explicit winning profile true kept no competing tools, so the suppression decision and this probe disagree: names {:?}; evidence {}",
+        explicit.names,
+        evidence.display()
+    );
+    assert!(
+        explicit.transcript.contains("features.worktrees=true")
+            && explicit
+                .transcript
+                .contains("compete with the shared worktree pool"),
+        "the re-exposed native tools must be reported at the real entry point; evidence {}",
+        evidence.display()
+    );
+
+    write_json(
+        &evidence.join("acceptance.json"),
+        &json!({
+            "control_fragments": control_fragments,
+            "control_names": control.names,
+            "lead_fragments": worktree_names(&lead.names),
+            "lead_names": lead.names,
+            "executor_fragments": worktree_names(&executor.names),
+            "executor_names": executor.names,
+            "profile_fragments": worktree_names(&profiled.names),
+            "profile_names": profiled.names,
+            "explicit_fragments": explicit_fragments,
+            "explicit_names": explicit.names,
+        }),
+    );
+    println!(
+        "managed worktree catalogue: control {} tools; lead {}; executor {}; profile-no-leaf {}; profile-true {}",
+        control.names.len(),
+        lead.names.len(),
+        executor.names.len(),
+        profiled.names.len(),
+        explicit.names.len()
+    );
+}
+
 /// Explicit native probe: a managed executor catalogue must stay free of
 /// lead-only kit skills across every validated copy of the same kit
 /// repository. The recorded build source is this checkout while the case is
@@ -4492,64 +4644,14 @@ fn spawn_probe_tui_args(
     ConsoleSession::spawn(spec).unwrap()
 }
 
-/// Runs one fresh installed-CLI TUI session against the canned local Responses
-/// server and returns the effective tool surface of its first model request.
-fn installed_tui_catalogue(
-    exe: &Path,
-    evidence: &Path,
-    label: &str,
-    extra: &[&str],
-) -> (Vec<String>, String) {
-    let root = evidence.join(label);
-    let home = root.join("home");
-    let workspace = root.join("workspace");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&workspace).unwrap();
-    git_identity(&workspace);
-    let canned = CannedResponses::spawn_short(&root).unwrap();
-    write_probe_config(&home, &workspace, &canned, "", false);
-    let session = spawn_probe_tui_args(exe, &home, &workspace, extra);
-    ready_named(&session, &root, &home, &format!("WorktreeSurface{label}"));
-    send_line(&session, USER_PROMPT).unwrap();
-    let sampled = canned.wait_for(Duration::from_secs(60), |requests| {
-        requests
-            .iter()
-            .any(|request| request.kind == RequestKind::FirstSampling)
-    });
-    assert!(
-        sampled,
-        "no first sampling request in the {label} catalogue run; evidence {}",
-        root.display()
-    );
-    send_line(&session, "/quit").unwrap();
-    let _ = session
-        .wait(
-            Deadline::after(Duration::from_secs(25)).unwrap(),
-            &Cancellation::default(),
-            Duration::from_secs(5),
-        )
-        .unwrap();
-    let body = canned
-        .requests()
-        .into_iter()
-        .find(|request| request.kind == RequestKind::FirstSampling)
-        .expect("captured first sampling")
-        .body;
-    fs::write(root.join("first-sampling.body.json"), &body).unwrap();
-    let surface = tool_surface(&body);
-    write_json(
-        &root.join("surface.json"),
-        &json!({"names": &surface.0, "definitions": &surface.1}),
-    );
-    surface
-}
-
 /// One runtime catalogue reading from a fresh installed-CLI TUI session: the
 /// nested-tool names the session itself reported through a code-mode `exec`
-/// call, plus the session's static first-request surface for evidence.
+/// call, plus the session's static first-request surface and console
+/// transcript for evidence.
 struct RuntimeCatalogue {
     names: Vec<String>,
     surface: (Vec<String>, String),
+    transcript: String,
 }
 
 /// The probe call id prefix the canned fixture issues for runtime readings.
@@ -4652,7 +4754,7 @@ fn installed_tui_all_tools(
     let canned = CannedResponses::spawn_all_tools(&root).unwrap();
     write_probe_config(&home, &workspace, &canned, "", false);
     let session = spawn_probe_tui_args(exe, &home, &workspace, extra);
-    tui_all_tools_probe(&root, &home, &canned, &session, label, rounds)
+    tui_all_tools_probe(&root, &home, &canned, session, label, rounds)
 }
 
 /// The shared runtime-catalogue probe body: the session must already run
@@ -4664,7 +4766,7 @@ fn tui_all_tools_probe(
     root: &Path,
     home: &Path,
     canned: &CannedResponses,
-    session: &ConsoleSession,
+    session: ConsoleSession,
     label: &str,
     rounds: usize,
 ) -> RuntimeCatalogue {
@@ -4699,11 +4801,14 @@ fn tui_all_tools_probe(
         std::thread::sleep(Duration::from_secs(1));
     }
     send_line(&session, "/quit").unwrap();
-    let _ = session.wait(
-        Deadline::after(Duration::from_secs(25)).unwrap(),
-        &Cancellation::default(),
-        Duration::from_secs(5),
-    );
+    let transcript = session
+        .wait(
+            Deadline::after(Duration::from_secs(25)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .map(|outcome| outcome.transcript)
+        .unwrap_or_default();
     let first = canned
         .requests()
         .into_iter()
@@ -4718,7 +4823,180 @@ fn tui_all_tools_probe(
         &root.join("surface.json"),
         &json!({"names": &surface.0, "definitions": &surface.1}),
     );
-    RuntimeCatalogue { names, surface }
+    RuntimeCatalogue {
+        names,
+        surface,
+        transcript,
+    }
+}
+
+/// The recorded managed installation one runtime-catalogue route runs
+/// against: this checkout's launcher binary under a recorded build whose
+/// source root is this checkout, forwarding to the real installed native CLI.
+/// The registration lives only in the probe's own home; no global
+/// installation, deployment or configuration is read or changed.
+struct ManagedInstall {
+    launcher: PathBuf,
+    upstream: PathBuf,
+    build: PathBuf,
+    cpu_account: PathBuf,
+}
+
+/// Records one native build whose `codex.exe` is this checkout's real
+/// launcher binary, so a spawned launcher passes its own selected-build
+/// check; the remaining recorded binaries are integrity stubs. The record's
+/// source root is this checkout, so the launcher reads the live kit manifest,
+/// profile and role inputs exactly as a managed session would.
+fn managed_launcher_build(evidence: &Path, source: &Path) -> PathBuf {
+    let build = evidence.join("native-build");
+    fs::create_dir_all(&build).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_codex"), build.join("codex.exe")).unwrap();
+    for binary in build_identity::BINARIES {
+        let path = build.join(binary);
+        if !path.exists() {
+            fs::write(&path, binary.as_bytes()).unwrap();
+        }
+    }
+    let record = build_identity::BuildRecord {
+        schema: build_identity::SCHEMA,
+        source_root: source.to_path_buf(),
+        source: build_identity::source_identity(source).unwrap(),
+        rustc: "fixture".into(),
+        cargo: "fixture".into(),
+        target: "x86_64-pc-windows-msvc".into(),
+        profile: "release".into(),
+        binaries: build_identity::BINARIES
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    build_identity::hash_file(&build.join(name)).unwrap(),
+                )
+            })
+            .collect(),
+    };
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    build
+}
+
+fn record_managed_install(evidence: &Path, upstream: &Path, source: &Path) -> ManagedInstall {
+    let build = managed_launcher_build(evidence, source);
+    ManagedInstall {
+        launcher: build.join("codex.exe"),
+        upstream: upstream.to_path_buf(),
+        build,
+        cpu_account: evidence.join("cpu-account"),
+    }
+}
+
+/// Spawns one managed launcher session under the recorded build: the same
+/// console harness and canned local Responses server as the ordinary probe,
+/// with the CPU account pinned to a session-local directory so the shared
+/// machine allowance is untouched, and the executor marker set only for the
+/// executor route. A parent executor environment must not leak into the lead
+/// run, so the marker is removed explicitly for every other route.
+fn spawn_probe_tui_managed(
+    launcher: &Path,
+    home: &Path,
+    workspace: &Path,
+    extra: &[&str],
+    executor: bool,
+    cpu_account: &Path,
+) -> ConsoleSession {
+    let mut command = CommandSpec::new(launcher);
+    command.args = vec!["--no-alt-screen".into()];
+    command.args.extend(
+        extra
+            .iter()
+            .map(|argument| std::ffi::OsString::from(*argument)),
+    );
+    command.current_dir = Some(workspace.to_path_buf());
+    command.env.insert(
+        "CODEX_HOME".into(),
+        Some(home.to_path_buf().into_os_string()),
+    );
+    command.env.insert(API_KEY_ENV.into(), Some(API_KEY.into()));
+    command.env.insert("PATH".into(), Some(filtered_path()));
+    command.env.insert("OPENAI_API_KEY".into(), None);
+    command.env.insert("CODEX_API_KEY".into(), None);
+    // The probe host is itself a Codex session, so the parent's identity and
+    // harness context must not leak into the fresh managed session; a real
+    // managed launch starts from a terminal without this state.
+    command.env.insert("CODEX_SESSION_ID".into(), None);
+    command.env.insert("CODEX_THREAD_ID".into(), None);
+    command.env.insert("HARNESS_EXECUTOR_RUN".into(), None);
+    command.env.insert("HARNESS_CONTEXT_ROLE".into(), None);
+    command.env.insert("HARNESS_CONTEXT_REVISION".into(), None);
+    command.env.insert(
+        "CODEX_HARNESS_CPU_ACCOUNT".into(),
+        Some(cpu_account.to_path_buf().into_os_string()),
+    );
+    if executor {
+        command
+            .env
+            .insert("HARNESS_EXECUTOR_SESSION".into(), Some("1".into()));
+    } else {
+        command.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
+    }
+    let mut spec = ConsoleSpec::new(command);
+    spec.limits.memory_bytes = Some(512 * 1024 * 1024);
+    spec.limits.cpu_percent = Some(50.0);
+    ConsoleSession::spawn(spec).unwrap()
+}
+
+/// Runs one fresh managed launcher session against the canned local Responses
+/// server: the run's own home registers the recorded build with the real
+/// installed upstream, `home_files` supplies extra home layers such as named
+/// profile files, and the session's settled runtime nested-tool catalogue is
+/// returned.
+fn managed_tui_all_tools(
+    install: &ManagedInstall,
+    evidence: &Path,
+    label: &str,
+    extra: &[&str],
+    executor: bool,
+    home_files: &[(&str, &str)],
+    rounds: usize,
+) -> RuntimeCatalogue {
+    let root = evidence.join(label);
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(home.join("harness")).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    git_identity(&workspace);
+    write_json(
+        &home.join("harness/native-launch.json"),
+        &serde_json::to_value(Registration {
+            schema: 2,
+            state: None,
+            build: Some(install.build.clone()),
+            task_control: false,
+            upstream: Upstream {
+                executable: install.upstream.clone(),
+                sha256: build_identity::hash_file(&install.upstream).unwrap(),
+                package: None,
+            },
+        })
+        .unwrap(),
+    );
+    let canned = CannedResponses::spawn_all_tools(&root).unwrap();
+    write_probe_config(&home, &workspace, &canned, "", false);
+    for (name, body) in home_files {
+        fs::write(home.join(name), body).unwrap();
+    }
+    let session = spawn_probe_tui_managed(
+        &install.launcher,
+        &home,
+        &workspace,
+        extra,
+        executor,
+        &install.cpu_account,
+    );
+    tui_all_tools_probe(&root, &home, &canned, session, label, rounds)
 }
 
 fn ready_named(session: &ConsoleSession, evidence: &Path, home: &Path, name: &str) {

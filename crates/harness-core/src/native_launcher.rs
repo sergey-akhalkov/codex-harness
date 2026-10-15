@@ -522,7 +522,10 @@ fn prepared_command(
         notice_degraded_session(&task_args);
     }
     command.args(launcher::daemon_opt_out(&task_args, shared_overrides));
-    if shared && !degraded && let Some(context) = context {
+    if shared
+        && !degraded
+        && let Some(context) = context
+    {
         let profile = context.profile.as_deref();
         let profile_layer = profile
             .map(|profile| crate::orchestration_config::profile_config(home, profile))

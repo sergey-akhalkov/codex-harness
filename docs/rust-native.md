@@ -633,19 +633,39 @@ bodies and terminal transcripts stay in the kept evidence directory it prints.
 cargo test --locked -p codex-harness --test skill_catalog_refresh installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf --jobs 1 -- --ignored --exact --nocapture --test-threads=1
 ```
 
+The same installed check covers the managed launch path end to end:
+`installed_managed_role_tui_catalogues_drop_native_worktree_tools` records a
+build whose `codex.exe` is this checkout's real launcher and whose registered
+upstream is the installed CLI, then runs fresh managed lead, executor, no-leaf
+profile and explicit-true profile sessions against the canned Responses
+fixture. The unsuppressed control must expose a worktree-named tool; the
+managed lead and executor sessions and a managed session whose selected
+profile carries no `features.worktrees` choice must expose none, because
+selecting a profile is not a worktree choice; and an explicit winning profile
+`true` must keep the tools and print the conflict report, so the decision is
+observed at the runtime catalogue instead of inferred from argv.
+
+```powershell
+cargo test --locked -p codex-harness --test skill_catalog_refresh installed_managed_role_tui_catalogues_drop_native_worktree_tools --jobs 1 -- --ignored --exact --nocapture --test-threads=1
+```
+
 The `native_launcher` tests pin the launch side:
 `managed_session_starts_forward_the_worktree_tool_suppression_leaf` requires
 the forwarded leaf for TUI and non-TUI starts, while
-`explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf`
-requires an explicit machine-local `features.worktrees = true` to skip the
-conflicting shared leaf instead of fighting it. The launcher reports that
-conflict on stderr, naming the winning configuration layer, the effective
-value and the override to remove, so such a session is a reported
-configuration conflict with the managed-pool contract rather than silent or
-successful suppression. A conversation that started before the change keeps
-the tools it registered; the suppression applies to fresh sessions, so an
-existing conversation needs an explicit restart rather than an in-place
-update.
+`native_worktree_choice_precedence_reports_only_unsuppressed_sessions`
+exercises the installed native precedence: repeated `-c` leaves keep the last
+value, `--enable` and `--disable` re-encode as the feature leaf and win over
+`-c` regardless of encounter order, a disable wins over an enable, and only
+an explicit winning `false` establishes the suppression. Any other winning
+choice - a higher-precedence user or project replacement, an explicit profile
+leaf, a command-line `true`/`--enable`, or a value that is not a boolean and
+that the native session refuses - is reported on stderr as a configuration
+conflict instead of being fought or claimed silently. The report names the
+winning source and effective value, states the suppression decision, and is
+never a claim about an observed tool catalogue. A conversation that started
+before the change keeps the tools it registered; the suppression applies to
+fresh sessions, so an existing conversation needs an explicit restart rather
+than an in-place update.
 
 ## Structured executor assignments
 

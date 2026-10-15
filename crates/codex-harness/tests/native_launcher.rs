@@ -1128,7 +1128,9 @@ fn native_worktree_choice_precedence_reports_only_unsuppressed_sessions() {
         if *label == "disable flag" {
             let composed = report["args"].as_array().unwrap();
             assert!(
-                !composed.iter().any(|value| value == "features.worktrees=false"),
+                !composed
+                    .iter()
+                    .any(|value| value == "features.worktrees=false"),
                 "{label}: the shared leaf is skipped, not fought: {composed:?}"
             );
             assert!(
@@ -1155,10 +1157,7 @@ fn native_worktree_choice_precedence_reports_only_unsuppressed_sessions() {
         stderr.contains("the user configuration sets features.worktrees=true"),
         "{stderr}"
     );
-    let (_, stderr) = run(
-        &user,
-        &["-c", "features.worktrees=false", "hello"],
-    );
+    let (_, stderr) = run(&user, &["-c", "features.worktrees=false", "hello"]);
     assert!(
         !stderr.contains("features.worktrees"),
         "command-line false must override the earlier user true: {stderr}"
@@ -1228,9 +1227,7 @@ fn native_worktree_choice_precedence_reports_only_unsuppressed_sessions() {
         composed
             .iter()
             .any(|value| value == "features.worktrees=false")
-            && composed
-                .iter()
-                .any(|value| value == "agents.enabled=false"),
+            && composed.iter().any(|value| value == "agents.enabled=false"),
         "an executor profile session carries the suppression leaf and stays single-agent: {composed:?}"
     );
     assert!(
