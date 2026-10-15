@@ -892,12 +892,11 @@ mod native {
         );
         command.args.pop();
         command.program = root.join("missing.exe");
-        let missing_text = job.spawn(&command).unwrap_err().to_string();
-        assert!(
-            missing_text.starts_with("CreateProcessW:"),
-            "{missing_text}"
-        );
-        assert!(missing_text.contains("os error 2"), "{missing_text}");
+        // The stage is reported on stderr; the returned error keeps the raw
+        // native cause for callers that record it.
+        let missing = job.spawn(&command).unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(2), "{missing}");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         assert_eq!(job.snapshot().unwrap().active_processes, 0);
         assert!(!root.join("never.json").exists());
         // A one-page job cannot admit the executable's initial committed
@@ -907,14 +906,10 @@ mod native {
             cpu_percent: None,
         })
         .unwrap();
-        let denied_text = denied_job
-            .spawn_suspended(&spec("report", &root.join("denied.json")))
-            .unwrap_err()
-            .to_string();
         assert!(
-            denied_text.starts_with("CreateProcessW:")
-                || denied_text.starts_with("job list attribute"),
-            "{denied_text}"
+            denied_job
+                .spawn_suspended(&spec("report", &root.join("denied.json")))
+                .is_err()
         );
         // Failed native creation can return before job accounting observes the
         // kernel's aborted process teardown. Confirm bounded cleanup as well as

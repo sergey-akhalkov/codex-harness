@@ -400,10 +400,12 @@ mod windows {
         }
     }
 
-    // Name the failing native stage while preserving the error kind and the
-    // raw Win32 cause that `last_os_error` already renders as `os error N`.
-    fn stage_error(stage: &str, error: io::Error) -> io::Error {
-        io::Error::new(error.kind(), format!("{stage}: {error}"))
+    // Report the failing native stage on stderr and return the error unchanged:
+    // callers and their failure records need the original raw_os_error and
+    // source, which a string-backed replacement error would erase.
+    fn stage_note(stage: &str, error: io::Error) -> io::Error {
+        eprintln!("process: spawn stage {stage} failed: {error}");
+        error
     }
 
     // All handles passed here were newly returned by a successful native create
@@ -635,7 +637,7 @@ mod windows {
                 InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes);
             }
             if bytes == 0 {
-                return Err(stage_error(
+                return Err(stage_note(
                     "attribute list size query",
                     io::Error::last_os_error(),
                 ));
@@ -648,7 +650,7 @@ mod windows {
                     0,
                     &mut bytes,
                 ))
-                .map_err(|error| stage_error("attribute list initialization", error))?;
+                .map_err(|error| stage_note("attribute list initialization", error))?;
             }
             Ok(Self { storage })
         }
@@ -950,7 +952,7 @@ mod windows {
                     null_mut(),
                     null(),
                 ))
-                .map_err(|error| stage_error("pseudoconsole attribute", error))?;
+                .map_err(|error| stage_note("pseudoconsole attribute", error))?;
             }
         }
         // A pseudoconsole supplies its own console standard handles. Even
@@ -981,7 +983,7 @@ mod windows {
                     null_mut(),
                     null(),
                 ))
-                .map_err(|error| stage_error("standard handle list attribute", error))?;
+                .map_err(|error| stage_note("standard handle list attribute", error))?;
             }
         }
         // JOB_LIST order defines nesting: the first handle is outermost, so
@@ -996,7 +998,7 @@ mod windows {
                 null_mut(),
                 null(),
             ))
-            .map_err(|error| stage_error(&format!("job list attribute ({})", jobs.len()), error))?;
+            .map_err(|error| stage_note(&format!("job list attribute ({})", jobs.len()), error))?;
         }
         let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -1043,7 +1045,7 @@ mod windows {
                 &startup.StartupInfo,
                 &mut info,
             ))
-            .map_err(|error| stage_error("CreateProcessW", error))?;
+            .map_err(|error| stage_note("CreateProcessW", error))?;
         }
         // Creation/assignment failure above returns no running child. After
         // success, wrap both handles before any further fallible operation.
@@ -1065,7 +1067,7 @@ mod windows {
         // atomic, so either every owning job holds this process or none does.
         for job in jobs {
             let member = in_job(process.handle.as_raw_handle(), *job)
-                .map_err(|error| stage_error("job membership verification", error))?;
+                .map_err(|error| stage_note("job membership verification", error))?;
             if !member {
                 return Err(io::Error::other(
                     "created process is outside its required job list",
@@ -1726,7 +1728,7 @@ mod windows {
     /// is preserved. This never calls `SetInformationJobObject`.
     fn verify_heavy_aggregate(handle: HANDLE, name: &str, memory_bytes: usize) -> io::Result<()> {
         let snapshot = heavy_aggregate_snapshot(handle)
-            .map_err(|error| stage_error("heavy aggregate readback", error))?;
+            .map_err(|error| stage_note("heavy aggregate readback", error))?;
         let process_memory = snapshot.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0;
         if snapshot.limit_flags == JOB_OBJECT_LIMIT_JOB_MEMORY
             && !process_memory
