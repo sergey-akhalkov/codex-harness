@@ -203,7 +203,7 @@ Existing slot paths and unfinished task bindings SHALL survive migration to the 
 The installed kit SHALL deliver the common task lifecycle outside its source checkout. After that path is verified, installation SHALL retire the owned `isolated-worktree` skill and its disposable-tree recipe while preserving unrelated skills and settings. Current instructions and specifications SHALL direct managed isolation to the common pool and maintain one authoritative operational guide.
 
 #### Scenario: Installed ordinary task and executor reuse
-- **WHEN** the installed harness serves an independent repository
+- **WHEN** the installed harness serves an authorized consumer outside its source checkout, including a separate checkout of this project with an unfinished development task
 - **THEN** an ordinary task completes and releases a slot, an executor consumes that same pooled path through existing dispatch, and their actual checkout identities and preserved state satisfy the common contract
 
 #### Scenario: Skill retirement is lifecycle-owned
