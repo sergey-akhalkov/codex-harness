@@ -40,6 +40,7 @@ pub(crate) struct Handoff {
     successor: Value,
     successor_model: String,
     successor_title: String,
+    successor_effort: Option<String>,
     attached: bool,
     pending: Option<String>,
     sequence: u64,
@@ -59,21 +60,23 @@ impl Handoff {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
             Err(error) => return Err(error),
         };
-        let (successor_model, successor_title) = match read_json::<
-            crate::orchestration_config::SuccessorChoice,
-        >(&root.path().join("successor.json"))
-        {
-            Ok(choice) if choice.schema == 1 && !choice.model.is_empty() => {
-                (choice.model, choice.title)
-            }
-            Ok(_) => {
-                return Err(io::Error::other(
-                    "successor configuration is invalid; preserving leadership",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), String::new()),
-            Err(error) => return Err(error),
-        };
+        let (successor_model, successor_title, successor_effort) =
+            match read_json::<crate::orchestration_config::SuccessorChoice>(
+                &root.path().join("successor.json"),
+            ) {
+                Ok(choice) if choice.schema == 1 && !choice.model.is_empty() => {
+                    (choice.model, choice.title, choice.reasoning_effort)
+                }
+                Ok(_) => {
+                    return Err(io::Error::other(
+                        "successor configuration is invalid; preserving leadership",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (String::new(), String::new(), None)
+                }
+                Err(error) => return Err(error),
+            };
         Ok(Self {
             phase: Phase::Waiting,
             previous,
@@ -82,6 +85,7 @@ impl Handoff {
             successor: Value::Null,
             successor_model,
             successor_title,
+            successor_effort,
             attached: false,
             pending: None,
             sequence: 0,
@@ -293,7 +297,7 @@ impl Handoff {
                     rows.iter()
                         .find(|model| model["model"] == self.successor_model)
                 }) {
-                    self.effort = supported_effort(model);
+                    self.effort = supported_effort(model, self.successor_effort.as_deref());
                     if self.effort.is_none() {
                         return self.block(
                             root,
@@ -437,10 +441,12 @@ fn same_permissions(before: &Value, after: &Value) -> bool {
     .all(|key| before[key] == after[key])
 }
 
-fn supported_effort(model: &Value) -> Option<String> {
+fn supported_effort(model: &Value, declared: Option<&str>) -> Option<String> {
     let supported = model["supportedReasoningEfforts"].as_array()?;
-    [Some("high"), model["defaultReasoningEffort"].as_str()]
+    declared
         .into_iter()
+        .map(Some)
+        .chain([Some("high"), model["defaultReasoningEffort"].as_str()])
         .flatten()
         .find(|effort| {
             *effort != "ultra"
@@ -529,6 +535,7 @@ mod tests {
                 profile: "zai".into(),
                 model: "zai/glm-5.3".into(),
                 title: "Z.AI temporary lead".into(),
+                reasoning_effort: None,
             },
         )
         .unwrap();
@@ -718,7 +725,18 @@ mod tests {
     #[test]
     fn unsupported_effort_and_unreconciled_images_cannot_dispatch() {
         let model = json!({"defaultReasoningEffort":"ultra","supportedReasoningEfforts":[{"reasoningEffort":"ultra"}]});
-        assert!(supported_effort(&model).is_none());
+        assert!(supported_effort(&model, None).is_none());
+        assert!(supported_effort(&model, Some("ultra")).is_none());
+        let catalog = json!({"defaultReasoningEffort":"high","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"},{"reasoningEffort":"max"}]});
+        assert_eq!(
+            supported_effort(&catalog, Some("max")).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            supported_effort(&catalog, Some("xhigh")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(supported_effort(&catalog, None).as_deref(), Some("high"));
         assert!(visible_history(&json!({"turns":[{"items":[{"type":"userMessage","content":[{"type":"image","url":"owned-image"}]}]}]})).is_err());
     }
 }

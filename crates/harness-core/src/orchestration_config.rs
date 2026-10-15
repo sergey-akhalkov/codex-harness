@@ -68,6 +68,8 @@ pub struct SuccessorChoice {
     pub profile: String,
     pub model: String,
     pub title: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 pub fn load(source_root: &Path) -> io::Result<Orchestration> {
@@ -315,6 +317,7 @@ pub fn successor_choice(config: &Orchestration, codex_home: &Path) -> io::Result
         profile: config.successor_lead_profile.clone(),
         model,
         title: format!("{} temporary lead", config.successor_lead_profile),
+        reasoning_effort: bound.reasoning_effort,
     })
 }
 
@@ -640,10 +643,15 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("orchestration-successor-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("config.toml"), "model = 'gpt-6-astra'\n").unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'high'\n",
+        )
+        .unwrap();
         let choice = successor_choice(&config, &root).unwrap();
         assert_eq!(choice.profile, "default");
         assert_eq!(choice.model, "gpt-6-astra");
+        assert_eq!(choice.reasoning_effort.as_deref(), Some("high"));
         persist_successor(&root, &choice).unwrap();
         let saved: SuccessorChoice =
             serde_json::from_slice(&fs::read(root.join("successor.json")).unwrap()).unwrap();
