@@ -124,12 +124,9 @@ const QUEUE_REPORT_READ: u64 = 4096;
 /// The launcher registration is read with the same bound the launcher itself
 /// applies before it trusts one; a larger file is refused instead of parsed.
 const NATIVE_REGISTRATION_LIMIT: u64 = 65_536;
-/// The native queue's own rejection prefix, observed on 0.162.1 as
-/// `failed to queue session message: thread/queue/add failed: ... (code
-/// -32603)`. Only a report carrying it names a queue add the native side
-/// itself refused; every other non-zero exit stays indeterminate because the
-/// command may have applied the input before failing.
-const QUEUE_REFUSAL_MARK: &str = "failed to queue session message";
+/// The observed 0.162.1 missing-thread refusal precedes a queue effect. The
+/// generic queue-error prefix alone does not establish that nothing applied.
+const QUEUE_MISSING_THREAD_PREFIX: &str = "Error: failed to queue session message: thread/queue/add failed: failed to read thread: invalid thread-store request: no rollout found for thread id ";
 /// The inline delivery bound of one message: what is sent below it is always the
 /// literal text (a file is a correction, not a task re-send), and above it the
 /// shared spill owner delivers the complete payload as a pointer envelope. The
@@ -3141,19 +3138,21 @@ fn queue_lead_message(
                 "the native queue accepted the message for thread {thread} (exit 0: {report})"
             ),
         },
-        StopReason::Exited if report.contains(QUEUE_REFUSAL_MARK) => QueueOutcome::Refused {
-            detail: format!(
-                "the native queue refused the message for thread {thread} (exit {}: {report}); nothing was delivered",
-                outcome.process_exit_code
-            ),
-        },
+        StopReason::Exited if queue_refused_missing_thread(&report, thread) => {
+            QueueOutcome::Refused {
+                detail: format!(
+                    "the native queue refused the message for thread {thread} (exit {}: {report}); nothing was delivered",
+                    outcome.process_exit_code
+                ),
+            }
+        }
         // A non-zero exit without the native rejection mark does not prove no
         // earlier queue effect: the command may have applied the input before
         // failing. The attempt stays unresolved under its own identity
         // instead of becoming retryable.
         StopReason::Exited => QueueOutcome::Unresolved {
             detail: format!(
-                "the native queue exited {} without naming its own rejection of the queue add ({report}); whether the message reached the lead conversation is unknown",
+                "the native queue exited {} without a recognized pre-delivery refusal ({report}); whether the message reached the lead conversation is unknown",
                 outcome.process_exit_code
             ),
         },
@@ -3170,6 +3169,31 @@ fn queue_lead_message(
             ),
         },
     })
+}
+
+fn queue_refused_missing_thread(report: &str, thread: &str) -> bool {
+    report.trim() == format!("{QUEUE_MISSING_THREAD_PREFIX}{thread} (code -32603)")
+}
+
+#[cfg(test)]
+mod queue_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_exact_missing_target_proves_no_delivery() {
+        let target = "00000000-0000-4000-8000-000000000000";
+        let missing = format!("{QUEUE_MISSING_THREAD_PREFIX}{target} (code -32603)");
+        assert!(queue_refused_missing_thread(&missing, target));
+        assert!(!queue_refused_missing_thread(&missing, "another-thread"));
+        assert!(!queue_refused_missing_thread(
+            "Error: failed to queue session message: connection closed after sending the request",
+            target,
+        ));
+        assert!(!queue_refused_missing_thread(
+            &format!("{missing}\nresponse lost after another queue operation"),
+            target,
+        ));
+    }
 }
 
 /// The command's own combined report, read back within its bound. A report
