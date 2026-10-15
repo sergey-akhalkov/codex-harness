@@ -2610,6 +2610,26 @@ fn session_mark_count(home: &Path, marker: &str) -> usize {
         .count()
 }
 
+/// The delivered-message identities the running conversation's own rollout
+/// records for one marker: a delivered user message is one `response_item`
+/// message row, while the completion event beside it only reports that item.
+fn session_mark_ids(home: &Path, marker: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for row in session_lines(home) {
+        if row["type"] != "response_item"
+            || row["payload"]["type"] != "message"
+            || row["payload"]["role"] != "user"
+            || !row.to_string().contains(marker)
+        {
+            continue;
+        }
+        let id = row["payload"]["id"].as_str().unwrap_or_default();
+        let id = id.strip_prefix("msg_").unwrap_or(id);
+        ids.push(id.to_owned());
+    }
+    ids
+}
+
 /// The conversation identities the running session's own rollout meta events
 /// record: another conversation's id appearing here is a clone or resume.
 fn session_meta_ids(home: &Path) -> Vec<String> {
@@ -2656,6 +2676,44 @@ fn provider_hits(root: &Path, marker: &str) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// One recorded provider request body by its evidence file name.
+fn provider_request(root: &Path, file: &str) -> Value {
+    let body = fs::read(root.join(file)).unwrap_or_default();
+    serde_json::from_slice(&body).unwrap_or(Value::Null)
+}
+
+/// The title-generation request installed 0.162.1 issues beside a user turn:
+/// an auxiliary user item carrying the installed instruction, recognized
+/// exactly as the shared fixture recognizes it.
+fn title_generation_request(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part["text"].as_str().is_some_and(|text| {
+                            text.starts_with("Generate a concise, single-line task title")
+                        })
+                    })
+                })
+        })
+    })
+}
+
+/// The tool continuation of the managed control exchange: the native request
+/// that carries the completed `control-tool-1` proof command's own output.
+fn proof_continuation(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "control-tool-1"
+                && item["output"].as_str().is_some_and(|output| {
+                    output.contains("Process exited with code 0") && output.contains("\none")
+                })
+        })
+    })
+}
+
 fn provider_request_count(root: &Path) -> usize {
     provider_entries(root).len()
 }
@@ -2697,11 +2755,15 @@ fn count_files(dir: &Path) -> usize {
 /// control turn establishes that conversation's exact thread, and the
 /// installed `codex queue --thread <id> --message <text>` then addresses that
 /// running conversation without any endpoint, daemon or token. Delivery is the
-/// running conversation's own model request carrying the mark, together with
-/// its own stored and rendered copy; exit status, report text and process
-/// state are recorded separately and are not delivery. The whole observed
-/// record is written before any expectation, and the expectations themselves
-/// name both outcomes.
+/// running conversation's own turn request carrying the mark on its exact
+/// thread, together with its own stored and rendered copy; exit status, report
+/// text and process state are recorded separately and are not delivery.
+/// Beside each turn the running TUI issues its own native title-generation
+/// request (recognized by the installed instruction, exactly as the shared
+/// fixture recognizes it) on an ephemeral thread; those auxiliaries are
+/// classified and recorded, never counted as delivery or as a second
+/// conversation. The whole observed record is written before any expectation,
+/// and the expectations themselves name both outcomes.
 #[test]
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; starts an owned ordinary native TUI with the canned local Responses provider; no live model, no daemon, no desktop"]
 fn installed_queue_boundary_against_a_running_ordinary_tui() {
@@ -2842,13 +2904,28 @@ trust_level = "trusted"
         session_mark_count(&home, ORDINARY_TUI_CONTROL_REPLY) >= 1
             || session.transcript().contains(ORDINARY_TUI_CONTROL_REPLY)
     });
+    // The running TUI's own title-generation request for the control turn
+    // lands beside it; settle on the owned provider so the baseline covers the
+    // whole turn instead of racing that native auxiliary request.
+    let mut baseline_requests = provider_request_count(&root);
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_secs(1));
+        let settled = provider_request_count(&root);
+        if settled == baseline_requests {
+            break;
+        }
+        baseline_requests = settled;
+    }
     let entries = provider_entries(&root);
     let (_, _, thread, control_turn) = entries
         .first()
         .unwrap_or_else(|| panic!("no recorded provider request; evidence {}", root.display()))
         .clone();
+    let baseline_auxiliary = entries
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
     let meta_before = session_meta_ids(&home);
-    let baseline_requests = provider_request_count(&root);
     let sessions_before = count_files(&home.join("sessions"));
     let daemon_socket = home
         .join("app-server-control")
@@ -2881,8 +2958,24 @@ trust_level = "trusted"
     let unmanaged_hits = provider_hits(&root, ORDINARY_QUEUE_MARK);
     let delivered_without_endpoint = first_hit || !unmanaged_hits.is_empty();
     let total_after_unmanaged = provider_request_count(&root);
+    let auxiliary_after = provider_entries(&root)
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
+    let added_auxiliary = auxiliary_after.saturating_sub(baseline_auxiliary);
+    let primary_hits: Vec<(String, String, String)> = unmanaged_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread == &thread)
+        .cloned()
+        .collect();
+    let auxiliary_hits: Vec<(String, String, String)> = unmanaged_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread != &thread)
+        .cloned()
+        .collect();
     let transcript_copies = session.transcript().matches(ORDINARY_QUEUE_MARK).count();
     let rollout_copies = session_mark_count(&home, ORDINARY_QUEUE_MARK);
+    let rollout_message_ids = session_mark_ids(&home, ORDINARY_QUEUE_MARK);
     let sessions_after_unmanaged = count_files(&home.join("sessions"));
     let meta_after = session_meta_ids(&home);
     let daemon_socket_after = daemon_socket.exists();
@@ -2986,6 +3079,7 @@ trust_level = "trusted"
         },
         "baseline": {
             "providerRequests": baseline_requests,
+            "titleRequests": baseline_auxiliary,
             "sessionFiles": sessions_before,
             "sessionMetaIds": &meta_before,
             "daemonSocket": daemon_socket_before,
@@ -2994,8 +3088,12 @@ trust_level = "trusted"
             "command": &unmanaged,
             "delivered": delivered_without_endpoint,
             "providerHits": hit_json(&unmanaged_hits),
+            "primaryHits": hit_json(&primary_hits),
+            "auxiliaryTitleRequests": hit_json(&auxiliary_hits),
+            "addedTitleRequests": added_auxiliary,
             "transcriptCopies": transcript_copies,
             "rolloutCopies": rollout_copies,
+            "rolloutMessageIds": &rollout_message_ids,
             "providerRequestsTotal": total_after_unmanaged,
             "sessionFilesAfter": sessions_after_unmanaged,
             "sessionMetaIdsAfter": &meta_after,
@@ -3033,23 +3131,25 @@ trust_level = "trusted"
         identity.pid,
         root.display()
     );
-    assert!(
-        unmanaged_hits.len() <= 1,
-        "queue without an endpoint produced {} deliveries: {unmanaged_hits:?}; evidence {}",
-        unmanaged_hits.len(),
-        root.display()
-    );
-    for (file, hit_thread, _) in &unmanaged_hits {
-        assert_eq!(
-            hit_thread, &thread,
-            "{file} reached a different conversation than the running one"
+    for (file, hit_thread, _) in &auxiliary_hits {
+        assert!(
+            title_generation_request(&provider_request(&root, file)),
+            "{file} carried the queued message on thread {hit_thread} without the native title-generation shape; evidence {}",
+            root.display()
         );
     }
     assert!(
-        foreign.is_empty(),
-        "model work left the running conversation: {foreign:?}; evidence {}",
+        auxiliary_hits.len() <= 1,
+        "one delivered turn cannot add more than one native title-generation request: {auxiliary_hits:?}; evidence {}",
         root.display()
     );
+    for (file, hit_thread, _) in &foreign {
+        assert!(
+            title_generation_request(&provider_request(&root, file)),
+            "model work left the running conversation without the native title-generation shape: {file} on thread {hit_thread}; evidence {}",
+            root.display()
+        );
+    }
     assert_eq!(
         meta_after,
         meta_before,
@@ -3064,9 +3164,9 @@ trust_level = "trusted"
     );
     if delivered_without_endpoint {
         assert_eq!(
-            unmanaged_hits.len(),
+            primary_hits.len(),
             1,
-            "a live delivery must be exactly one model request carrying the mark: {unmanaged_hits:?}; evidence {}",
+            "a live delivery must be exactly one turn input on the running conversation's own thread: {primary_hits:?}; evidence {}",
             root.display()
         );
         assert!(
@@ -3074,10 +3174,23 @@ trust_level = "trusted"
             "the running conversation's own session must hold the delivered message: transcript {transcript_copies}, rollout {rollout_copies}; evidence {}",
             root.display()
         );
+        if rollout_copies >= 1 {
+            assert_eq!(
+                rollout_message_ids.len(),
+                1,
+                "the running conversation must store the delivered message exactly once: {rollout_message_ids:?}; evidence {}",
+                root.display()
+            );
+        }
+        assert!(
+            added_auxiliary <= 1,
+            "one delivered turn cannot add more than one native title-generation request: added {added_auxiliary}; evidence {}",
+            root.display()
+        );
         assert_eq!(
             total_after_unmanaged,
-            baseline_requests + 1,
-            "the delivery must be the only additional model request: {unmanaged}; evidence {}",
+            baseline_requests + 1 + added_auxiliary,
+            "the queue attempt must add only the delivered turn and at most its own native title request: {unmanaged}; evidence {}",
             root.display()
         );
         assert!(
@@ -3087,7 +3200,7 @@ trust_level = "trusted"
         );
         assert_eq!(
             closed_target["providerRequestsTotal"].as_u64(),
-            Some((baseline_requests + 1) as u64),
+            Some(total_after_unmanaged as u64),
             "the closed-target attempt added model work: {closed_target}; evidence {}",
             root.display()
         );
@@ -3134,8 +3247,9 @@ trust_level = "trusted"
         root.display()
     );
     eprintln!(
-        "ordinary-lead queue boundary: deliveredWithoutEndpoint={delivered_without_endpoint} providerHits={} transcriptCopies={transcript_copies} rolloutCopies={rollout_copies} foreignRequests={} receiverAlive={receiver_alive} receiverGoneAfterClose={receiver_gone_after_close}; evidence {}",
-        unmanaged_hits.len(),
+        "ordinary-lead queue boundary: deliveredWithoutEndpoint={delivered_without_endpoint} primaryDeliveries={} auxiliaryTitleRequests={} transcriptCopies={transcript_copies} rolloutCopies={rollout_copies} foreignRequests={} receiverAlive={receiver_alive} receiverGoneAfterClose={receiver_gone_after_close}; evidence {}",
+        primary_hits.len(),
+        auxiliary_hits.len(),
         foreign.len(),
         root.display()
     );
@@ -3144,9 +3258,11 @@ trust_level = "trusted"
 /// The separately labelled positive control for the same installed `codex
 /// queue`: one owned native app-server hosts one running conversation, and the
 /// queue command names that listener and its capability token explicitly. The
-/// closed-target arm proves the same route fails closed for a thread the
-/// receiver does not own. This receiver is managed by construction; it is not
-/// the ordinary arm.
+/// delivered message starts exactly one turn on the running thread; that
+/// turn's own sampling rounds (the queued input, then its executed proof-tool
+/// continuation) are one delivery, not duplicates. The closed-target arm
+/// proves the same route fails closed for a thread the receiver does not own.
+/// This receiver is managed by construction; it is not the ordinary arm.
 #[test]
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; owned native app-server fixture and canned Responses; no live model"]
 fn installed_queue_endpoint_reaches_its_owning_thread() {
@@ -3184,8 +3300,9 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
     let baseline_requests = provider_request_count(&root);
     let sessions_before = count_files(&home.join("sessions"));
 
-    // 1. The owning endpoint and capability token: exactly one delivery on the
-    // exact running thread, with no other model work.
+    // 1. The owning endpoint and capability token: exactly one delivered turn
+    // on the exact running thread, its proof-tool continuation included, with
+    // no other model work.
     let managed = run_native_command(
         &fixture.exe,
         &home,
@@ -3214,6 +3331,28 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
         managed["stdout"].as_str().unwrap_or_default(),
         managed["stderr"].as_str().unwrap_or_default()
     );
+    let endpoint_bodies: Vec<Value> = provider_entries(&root)
+        .into_iter()
+        .filter(|(_, request, _, _)| contains_payload(request, ENDPOINT_QUEUE_MARK))
+        .map(|(_, request, _, _)| request)
+        .collect();
+    let endpoint_turns: Vec<String> = endpoint_hits.iter().map(|(_, _, turn)| turn.clone()).fold(
+        Vec::new(),
+        |mut turns, turn| {
+            if !turns.contains(&turn) {
+                turns.push(turn);
+            }
+            turns
+        },
+    );
+    let initial_rounds = endpoint_bodies
+        .iter()
+        .filter(|request| !proof_continuation(request))
+        .count();
+    let proof_rounds = endpoint_bodies
+        .iter()
+        .filter(|request| proof_continuation(request))
+        .count();
 
     // 2. A closed target fails closed: the same endpoint, a thread this
     // receiver does not own - no delivery, no second conversation, no model
@@ -3246,7 +3385,10 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
         "marks": {"endpoint": ENDPOINT_QUEUE_MARK, "missing": MISSING_QUEUE_MARK},
         "endpoint": {
             "command": &managed,
-            "deliveryCount": endpoint_hits.len(),
+            "deliveredTurns": endpoint_turns.len(),
+            "rounds": endpoint_hits.len(),
+            "initialRounds": initial_rounds,
+            "proofRounds": proof_rounds,
             "providerHits": hit_json(&endpoint_hits),
             "receiverAfterDelivery": {
                 "id": after_managed["thread"]["id"].clone(),
@@ -3288,9 +3430,20 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
         root.display()
     );
     assert_eq!(
-        endpoint_hits.len(),
+        endpoint_turns.len(),
         1,
-        "queue delivery must happen exactly once: {endpoint_hits:?}; evidence {}",
+        "queue delivery must start exactly one turn on the running conversation: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        initial_rounds,
+        1,
+        "the queued message must enter the running turn exactly once: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert!(
+        proof_rounds >= 1,
+        "the delivered turn must continue through its own proof-tool round: {endpoint_hits:?}; evidence {}",
         root.display()
     );
     assert_eq!(
@@ -3299,8 +3452,8 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
     );
     assert_eq!(
         total_after_managed,
-        baseline_requests + 1,
-        "the delivery must be the only model request: {managed}"
+        baseline_requests + endpoint_hits.len(),
+        "the delivered turn's own rounds must be the only model work: {managed}"
     );
     assert_eq!(
         managed["exitCode"].as_i64(),
@@ -3337,6 +3490,16 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
     // Restoration: stop this fixture's own receiver through its own Job and
     // confirm the installed executable no longer runs.
     fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
+    // TerminateProcess is asynchronous: give the exact recorded identity a
+    // bounded window to disappear before it counts as still running.
+    let until = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < until
+        && ServiceProcess::inspect(fixture.server, &fixture.exe, &user)
+            .map(|process| process.is_some())
+            .unwrap_or(true)
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
     assert_process_gone(
         fixture.server,
         &fixture.exe,
@@ -3344,7 +3507,8 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
         "the queue endpoint positive control left its receiver app-server running",
     );
     eprintln!(
-        "queue endpoint positive control: endpointDeliveries={} closedTargetDeliveries={} foreignRequests={}; evidence {}",
+        "queue endpoint positive control: endpointTurns={} endpointRounds={} initialRounds={initial_rounds} proofRounds={proof_rounds} closedTargetDeliveries={} foreignRequests={}; evidence {}",
+        endpoint_turns.len(),
         endpoint_hits.len(),
         missing_hits.len(),
         foreign.len(),
