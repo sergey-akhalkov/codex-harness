@@ -51,10 +51,10 @@ the references a real task actually consumes are not derivable from skill text
 alone. Generated briefs stay with the retained assignment-renderer measurement,
 so no surface is counted twice. Against the pinned pre-partition baseline (24,977-byte common
 core, 6,669-byte developer text, 6,185-byte 23-skill catalogue; 37,831 bytes /
-4,970 words per session) the current fixed load is 30,045 bytes / 3,918 words
-for the executor (-20.6% / -21.2%), 36,419 bytes / 4,772 words for the lead
-(-3.7% / -4.0%) and 66,464 / 8,690 for the combined two-role load (-12.2% /
--12.6%). These are source-text sizes: the comparison excludes generated
+4,970 words per session) the current fixed load is 30,619 bytes / 3,997 words
+for the executor (-19.1% / -19.6%), 36,993 bytes / 4,851 words for the lead
+(-2.2% / -2.4%) and 67,612 / 8,848 for the combined two-role load (-10.6% /
+-11.0%). These are source-text sizes: the comparison excludes generated
 briefs, invoked bodies and linked reference files (measured separately and not yet
 for a matched task) and establishes no semantic equivalence, quality or speed
 benefit. Semantic coverage and real-task comparisons remain open in
