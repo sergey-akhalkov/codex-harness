@@ -4037,7 +4037,9 @@ fn tool_surface(body: &str) -> (Vec<String>, String) {
     let mut definitions = String::new();
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         if let Some(tools) = value.get("tools").and_then(Value::as_array) {
-            definitions.push_str(&tools.to_string());
+            definitions.push_str(
+                &serde_json::to_string(tools).expect("native tool definitions serialize"),
+            );
             visit(tools, &mut names);
         }
         if let Some(items) = value.get("input").and_then(Value::as_array) {
@@ -4197,9 +4199,11 @@ fn spawn_probe_tui_args(
 ) -> ConsoleSession {
     let mut command = CommandSpec::new(exe);
     command.args = vec!["--no-alt-screen".into()];
-    command
-        .args
-        .extend(extra.iter().map(|argument| (*argument).to_owned()));
+    command.args.extend(
+        extra
+            .iter()
+            .map(|argument| std::ffi::OsString::from(*argument)),
+    );
     command.current_dir = Some(workspace.to_path_buf());
     command.env.insert(
         "CODEX_HOME".into(),
