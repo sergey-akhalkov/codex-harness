@@ -2374,9 +2374,10 @@ fn lead_message_refuses_a_changed_registered_upstream_before_running_it() {
         ORDINARY_THREAD,
     );
     // The registered file exists and ends in .exe, but the installation-record
-    // digest is deliberately not its own: a replaced upstream that the normal
-    // launcher refuses. The owned double records its own start into the marker,
-    // so a launch that must not happen is observable as that file.
+    // digest is deliberately not its own: a replaced upstream that this route
+    // refuses, even though the ordinary launcher treats the changed digest as
+    // an upstream update. The owned double records its own start into the
+    // marker, so a launch that must not happen is observable as that file.
     let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
     fixture.seed_launcher_with_digest(&upstream, &"0".repeat(64));
     let marker = fixture.root().join("changed-upstream-started.txt");

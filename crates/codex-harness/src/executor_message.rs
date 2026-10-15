@@ -2159,11 +2159,14 @@ fn verify_lead_endpoint(run: &SpawnedRun, endpoint: Endpoint) -> io::Result<Lead
 /// that registration records. Only the recorded installation is authority; an
 /// environment substitution or a guessed install location is not. The
 /// registration is read with the launcher's own bound and only a supported
-/// schema with an absolute registered native executable is accepted, so a
-/// replaced upstream cannot be launched through this route where the normal
-/// launcher would refuse it. The digest itself is compared when a send is
-/// about to happen, so reading the lead conversation's own evidence never
-/// depends on the file and a reconcile is still possible without it.
+/// schema with an absolute registered native executable is accepted. This
+/// route invokes the registered binary itself to reach the lead's own store,
+/// so the recorded digest must still match the file before a send; the
+/// ordinary launcher instead treats a changed digest as an upstream update,
+/// and the installation check reports the mismatch. The digest itself is
+/// compared when a send is about to happen, so reading the lead
+/// conversation's own evidence never depends on the file and a reconcile is
+/// still possible without it.
 fn native_queue_upstream(home: &Path) -> Result<(PathBuf, String), String> {
     let path = home.join("harness/native-launch.json");
     let mut bytes = Vec::new();
@@ -2859,9 +2862,11 @@ fn deliver_to_ordinary_lead(
         )));
     }
     // A registered upstream whose own file no longer matches the digest the
-    // installation recorded is a replaced or modified executable: the normal
-    // launcher refuses that identity, and this route adds no launch authority
-    // of its own, so it refuses before anything is recorded or started.
+    // installation recorded is a replaced or modified executable. This route
+    // invokes the registered binary itself to reach the lead's own store, so
+    // the recorded identity must hold: it refuses before anything is recorded
+    // or started. The ordinary launcher instead treats a changed digest as an
+    // upstream update; the installation check reports the mismatch.
     let observed = harness_core::build_identity::hash_file(executable).map_err(|error| {
         invalid(&format!(
             "the registered native upstream {} cannot be verified ({error}); nothing was sent",
