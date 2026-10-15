@@ -659,7 +659,7 @@ trust_level = "trusted"
         serde_json::to_vec(&json!({"root":state})).unwrap(),
     )
     .unwrap();
-    reveal_conversation(&state, &upstream);
+    observe_conversation_visibility(&state, &upstream);
     if view_loss {
         exercise_view_loss(root, &state, &workspace);
     }
@@ -1311,10 +1311,7 @@ fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: 
     fs::write(workspace.join("finish-tool"), "release owned command").unwrap();
 }
 
-fn reveal_conversation(state: &Path, executable: &Path) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
-    };
+fn observe_conversation_visibility(state: &Path, executable: &Path) {
     let until = Instant::now() + WAIT;
     while !state.join("view.json").is_file() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
@@ -1323,17 +1320,8 @@ fn reveal_conversation(state: &Path, executable: &Path) {
     let snapshot: harness_core::task_view::Snapshot =
         serde_json::from_value(view["window"].clone()).unwrap();
     let user = harness_core::process_service::current_user().unwrap();
-    unsafe {
-        SetWindowPos(
-            snapshot.window as _,
-            HWND_TOP,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
+    // Visibility must come from the owning launcher. Observe it without
+    // changing window position, size, activation or stacking order.
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         if snapshot.is_visible(executable, &user).unwrap_or(false) {
