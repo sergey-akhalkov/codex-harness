@@ -4273,7 +4273,10 @@ fn installed_tui_catalogue(
 
 fn ready_named(session: &ConsoleSession, evidence: &Path, home: &Path, name: &str) {
     let ready = wait_for(session, evidence, 60, || {
-        session.transcript().contains("gpt-6-astra")
+        session
+            .transcript()
+            .to_ascii_lowercase()
+            .contains("gpt-6-astra")
     });
     assert!(
         ready,
