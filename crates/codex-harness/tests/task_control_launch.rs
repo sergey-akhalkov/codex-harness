@@ -609,7 +609,17 @@ trust_level = "trusted"
         "HARNESS_CONTROL_FIXTURE_KEY".into(),
         Some("synthetic-owned-fixture".into()),
     );
-    for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+    // This acceptance may itself run as a ds executor session; its inherited
+    // executor/session/role markers must not reach the ordinary launch under
+    // observation. Only the owned child's environment is adjusted.
+    for key in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_CONTEXT_ROLE",
+        "HARNESS_CONTEXT_REVISION",
+    ] {
         command.env.insert(key.into(), None);
     }
     let path = std::env::join_paths(
@@ -661,7 +671,7 @@ trust_level = "trusted"
     .unwrap();
     observe_conversation_visibility(&state, &upstream);
     if view_loss {
-        exercise_view_loss(root, &state, &workspace);
+        exercise_view_loss(root, &state, &workspace, &upstream);
     }
     if user_stop {
         exercise_user_stop(root, &state, &workspace);
@@ -1121,7 +1131,7 @@ fn exercise_user_stop(root: &Path, state: &Path, workspace: &Path) {
     .unwrap();
 }
 
-fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
+fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path, executable: &Path) {
     let until = Instant::now() + WAIT;
     while !(state.join("view.json").is_file() && workspace.join("proof.txt").is_file())
         && Instant::now() < until
@@ -1133,14 +1143,36 @@ fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
         "one"
     );
     let view: Value = serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
+    let snapshot: harness_core::task_view::Snapshot =
+        serde_json::from_value(view["window"].clone()).unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    // The injected fault targets only the exact conversation surface recorded
+    // by the controller, and it is validated through the owned identity check
+    // before any window is touched.
+    assert!(
+        snapshot.is_visible(executable, &user).unwrap(),
+        "the owned conversation surface must be visible before the injected loss"
+    );
+    let target = window_identity(snapshot.window);
     fs::write(
         root.join("native-entry-partial-ready.json"),
-        serde_json::to_vec(&json!({"state":state,"view":view})).unwrap(),
+        serde_json::to_vec(&json!({"state":state,"view":view,"target":target.clone()})).unwrap(),
     )
     .unwrap();
     eprintln!(
-        "native partial effect ready; minimize owned conversation: {}",
+        "native partial effect ready; minimize the owned conversation: {}",
         root.display()
+    );
+    minimize_owned_conversation(&snapshot);
+    // Observe the loss through the same owned-surface check the controller
+    // uses; the injected minimize must remove this exact surface.
+    let until = Instant::now() + WAIT;
+    while Instant::now() < until && snapshot.is_visible(executable, &user).unwrap_or(true) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !snapshot.is_visible(executable, &user).unwrap_or(true),
+        "the injected minimize must remove the owned conversation surface; inspect the target window identity"
     );
     let until = Instant::now() + WAIT;
     loop {
@@ -1186,17 +1218,28 @@ fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
     )
     .unwrap();
     eprintln!(
-        "native interruption settled; restore owned conversation: {}",
+        "native interruption settled; restore the owned conversation: {}",
         root.display()
     );
+    restore_owned_conversation(&snapshot);
+    // Record the restoration only after observing it through the same
+    // owned-surface check; an unobserved marker would fake the recovery.
     let until = Instant::now() + Duration::from_secs(90);
-    while !root.join("native-entry-view-restored.json").is_file() && Instant::now() < until {
+    while Instant::now() < until && !snapshot.is_visible(executable, &user).unwrap_or(false) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        root.join("native-entry-view-restored.json").is_file(),
-        "scoped restoration observation required"
+        snapshot.is_visible(executable, &user).unwrap_or(false),
+        "the restored conversation must be visible through the owned-surface check"
     );
+    fs::write(
+        root.join("native-entry-view-restored.json"),
+        serde_json::to_vec(
+            &json!({"schema":1,"threadId":view["threadId"],"window":snapshot.window,"observedRestored":true,"target":target}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_secs(2));
     assert!(
         !root.join("provider-2.json").exists(),
@@ -1211,6 +1254,42 @@ fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
         "the unfinished native tool must remain owned after turn interruption"
     );
     fs::write(workspace.join("finish-tool"), "release owned command").unwrap();
+}
+
+/// Bounded fault injection against the exact conversation surface recorded by
+/// the controller: the same user-visible loss a manual minimize produces.
+/// `Snapshot::is_visible` validated this handle immediately before the call,
+/// and no other window is touched.
+fn minimize_owned_conversation(snapshot: &harness_core::task_view::Snapshot) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, ShowWindow};
+    unsafe {
+        ShowWindow(snapshot.window as _, SW_MINIMIZE);
+    }
+}
+
+/// Restore the same owned surface without activating or arranging any window.
+fn restore_owned_conversation(snapshot: &harness_core::task_view::Snapshot) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
+    unsafe {
+        ShowWindow(snapshot.window as _, SW_RESTORE);
+    }
+}
+
+/// Recorded identity of a fault target so the evidence names the exact window
+/// that was minimized instead of an anonymous handle.
+fn window_identity(window: usize) -> Value {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+    let mut pid = 0;
+    let mut class = [0u16; 128];
+    let copied = unsafe {
+        GetWindowThreadProcessId(window as _, &mut pid);
+        GetClassNameW(window as _, class.as_mut_ptr(), class.len() as i32)
+    };
+    json!({
+        "window": window,
+        "ownerPid": pid,
+        "class": String::from_utf16_lossy(&class[..copied.max(0) as usize]),
+    })
 }
 
 fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: &Path) {
