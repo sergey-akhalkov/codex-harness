@@ -2053,6 +2053,281 @@ fn lead_message_refuses_a_missing_endpoint_without_starting_a_listener() {
     assert_eq!(fixture.server.connections(), 0, "{text}");
 }
 
+/// One ordinary-lead run without any recorded endpoint: the receipt the real
+/// dispatch writes, with this test process as the recorded live host (the
+/// ancestor of every sender below) and a recorded conversation thread. No
+/// endpoint record, listener or app-server is created; the ordinary route's
+/// only possible executable is whatever a test seeds into the home's own
+/// launcher registration, so a refusal that happens before a send is
+/// observable as the absence of every effect.
+struct OrdinaryFixture {
+    _root: tempfile::TempDir,
+    home: PathBuf,
+    state: PathBuf,
+    generation: String,
+}
+
+impl OrdinaryFixture {
+    fn new(name: &str, generation: &str, lead_thread: &str) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let state = home.join("harness/executor-pool").join(name);
+        fs::create_dir_all(&state).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let user = process_service::current_user().unwrap();
+        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        fs::write(
+            state.join("spawn-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "originatingLead": {
+                    "schema": 1,
+                    "threadId": lead_thread,
+                    "runGeneration": generation,
+                    "dispatcher": {
+                        "pid": identity.pid,
+                        "creationTime": identity.creation_time,
+                        "program": program.clone(),
+                    },
+                },
+                "slot": {
+                    "index": 1,
+                    "path": root.path().join("worktree"),
+                    "source": root.path().join("checkout"),
+                    "owner": OWNER,
+                },
+                "observation": {
+                    "schema": 1,
+                    "state": "running",
+                    "session": EXECUTOR_SESSION,
+                    "host": {
+                        "pid": identity.pid,
+                        "created": identity.creation_time,
+                        "program": program,
+                    },
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            _root: root,
+            home,
+            state,
+            generation: generation.to_owned(),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        self.home.parent().unwrap()
+    }
+
+    /// Seeds the kit home's own launcher registration with one upstream
+    /// executable, exactly as the installation lifecycle records it; no
+    /// process is started, and the file itself is checked only on a send.
+    fn seed_launcher(&self, upstream: &Path) {
+        let dir = self.home.join("harness");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("native-launch.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "upstream": {
+                    "executable": upstream,
+                    "sha256": "0".repeat(64),
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Records one previous attempt for a payload, merged into the receipt the
+    /// way the sender's own record writes it, and returns its content identity.
+    fn seed_attempt(&self, status: &str, kind: &str, payload: &str) -> String {
+        let content = lead_content_id_for(&self.generation, kind, payload);
+        let mut value = self.receipt();
+        value["leadMessages"] = json!([{
+            "schema": 1,
+            "id": "lead-000000000000000000000000",
+            "contentId": content,
+            "kind": kind,
+            "status": status,
+            "method": "queue",
+            "attempts": 1,
+            "detail": "recorded before this invocation",
+            "runGeneration": self.generation,
+        }]);
+        fs::write(
+            self.state.join("spawn-1.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        content
+    }
+
+    fn sender(&self, args: &[&str]) -> Output {
+        let mut command = Command::new(manager());
+        command.args(["lead", "message"]).args(args);
+        command.env("CODEX_HOME", &self.home);
+        command.env("HARNESS_EXECUTOR_RUN", &self.generation);
+        command.env("HARNESS_EXECUTOR_SESSION", "1");
+        command.env("CODEX_THREAD_ID", "most-recent-session-is-not-authority");
+        command.env_remove("HARNESS_ORIGINATING_LEAD");
+        command.env_remove("HARNESS_LEAD_THREAD");
+        command.env_remove("HARNESS_LEAD_RECIPIENT");
+        command.output().unwrap()
+    }
+
+    fn receipt(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.state.join("spawn-1.json")).unwrap()).unwrap()
+    }
+}
+
+/// The content identity `lead message` derives for one payload: SHA-256 over
+/// the generation, a separator, the kind, a separator and the exact payload,
+/// first 12 bytes as lowercase hex.
+fn lead_content_id_for(generation: &str, kind: &str, payload: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(generation.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(kind.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(payload.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("lead-content-{hex}")
+}
+
+const ORDINARY_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24d1";
+
+#[test]
+fn lead_message_refuses_an_ordinary_lead_thread_that_is_not_a_native_session_id() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-thread-shape",
+        "generation-ordinary-thread-shape",
+        "not-a-native-session-id",
+    );
+    fixture.seed_launcher(&launcher());
+    let out = fixture.sender(&["--text", "no"]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("is not a native session id"), "{text}");
+    assert!(text.contains("Nothing was sent"), "{text}");
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
+}
+
+#[test]
+fn lead_message_refuses_an_ordinary_message_that_cannot_fit_one_native_command_line() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-argv-bound",
+        "generation-ordinary-argv-bound",
+        ORDINARY_THREAD,
+    );
+    fixture.seed_launcher(&launcher());
+    let payload = "x".repeat(40_000);
+    let file = fixture.root().join("argv-bound-payload.txt");
+    fs::write(&file, payload.as_bytes()).unwrap();
+    let out = fixture.sender(&["--file", file.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("UTF-16 units"), "{text}");
+    assert!(text.contains("30000"), "{text}");
+    assert!(text.contains("nothing was truncated"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
+}
+
+#[test]
+fn lead_message_refuses_when_the_registered_native_launcher_is_missing() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-missing-upstream",
+        "generation-ordinary-missing-upstream",
+        ORDINARY_THREAD,
+    );
+    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
+    let out = fixture.sender(&["--text", "no launcher"]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("does not exist; nothing was sent"), "{text}");
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+}
+
+#[test]
+fn a_queued_ordinary_attempt_is_reconciled_instead_of_being_sent_again() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-queued-repeat",
+        "generation-ordinary-queued-repeat",
+        ORDINARY_THREAD,
+    );
+    // The registered upstream must not exist, so reaching a send would be
+    // observable as its own refusal; exit 0 with the recorded class proves the
+    // reconcile never attempted one.
+    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
+    let payload = "queued ordinary words";
+    fixture.seed_attempt("queued", "notification", payload);
+    let out = fixture.sender(&["--notify", "--text", payload]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("lead message: queued"), "{text}");
+    assert!(text.contains("nothing was sent again"), "{text}");
+    assert!(text.contains("cannot be delivered twice"), "{text}");
+    let receipt = fixture.receipt();
+    assert_eq!(receipt["leadMessages"][0]["status"], "queued", "{text}");
+    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
+}
+
+#[test]
+fn an_indeterminate_ordinary_attempt_is_reconciled_without_a_second_send() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-pending-repeat",
+        "generation-ordinary-pending-repeat",
+        ORDINARY_THREAD,
+    );
+    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
+    let payload = "possibly-delivered ordinary words";
+    fixture.seed_attempt("pending", "notification", payload);
+    let out = fixture.sender(&["--notify", "--text", payload]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("lead message: indeterminate"), "{text}");
+    assert!(text.contains("nothing was sent again"), "{text}");
+    assert!(
+        text.contains("may already be in the lead conversation"),
+        "{text}"
+    );
+    let receipt = fixture.receipt();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "indeterminate",
+        "{text}"
+    );
+}
+
+#[test]
+fn an_error_ordinary_attempt_is_retryable_as_a_new_attempt() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-error-retry",
+        "generation-ordinary-error-retry",
+        ORDINARY_THREAD,
+    );
+    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
+    let payload = "refused ordinary words";
+    fixture.seed_attempt("error", "notification", payload);
+    let out = fixture.sender(&["--notify", "--text", payload]);
+    let text = output_text(&out);
+    // The refusal below is the registered upstream's own missing-file check:
+    // the earlier error did not suppress this new attempt.
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("does not exist; nothing was sent"), "{text}");
+}
+
 #[test]
 fn lead_message_help_has_no_address_flags() {
     let out = Command::new(manager())
