@@ -9,7 +9,7 @@
 
 - [x] 2.1 Pass native formatting, affected lint/tests, real Serena integration, ownership and source hygiene checks.
 - [x] 2.2 Deploy the immutable release through the normal lifecycle and verify candidate/installed semantic receipts plus the original private consumer query.
-- [ ] 2.3 Review and commit all authorized repository changes, push them and verify the remote revision.
+- [x] 2.3 Review and commit all authorized repository changes, push them and verify the remote revision.
 
 ## Workflow follow-up
 
