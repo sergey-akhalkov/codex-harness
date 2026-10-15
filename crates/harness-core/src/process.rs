@@ -400,6 +400,12 @@ mod windows {
         }
     }
 
+    // Name the failing native stage while preserving the error kind and the
+    // raw Win32 cause that `last_os_error` already renders as `os error N`.
+    fn stage_error(stage: &str, error: io::Error) -> io::Error {
+        io::Error::new(error.kind(), format!("{stage}: {error}"))
+    }
+
     // All handles passed here were newly returned by a successful native create
     // or open call. Pseudo-handles are never wrapped in OwnedHandle.
     fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
@@ -629,7 +635,10 @@ mod windows {
                 InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes);
             }
             if bytes == 0 {
-                return Err(io::Error::last_os_error());
+                return Err(stage_error(
+                    "attribute list size query",
+                    io::Error::last_os_error(),
+                ));
             }
             let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
             unsafe {
@@ -638,7 +647,8 @@ mod windows {
                     count,
                     0,
                     &mut bytes,
-                ))?;
+                ))
+                .map_err(|error| stage_error("attribute list initialization", error))?;
             }
             Ok(Self { storage })
         }
@@ -939,7 +949,8 @@ mod windows {
                     size_of::<isize>(),
                     null_mut(),
                     null(),
-                ))?;
+                ))
+                .map_err(|error| stage_error("pseudoconsole attribute", error))?;
             }
         }
         // A pseudoconsole supplies its own console standard handles. Even
@@ -969,7 +980,8 @@ mod windows {
                     size_of_val(inherited),
                     null_mut(),
                     null(),
-                ))?;
+                ))
+                .map_err(|error| stage_error("standard handle list attribute", error))?;
             }
         }
         // JOB_LIST order defines nesting: the first handle is outermost, so
@@ -983,7 +995,8 @@ mod windows {
                 size_of_val(jobs),
                 null_mut(),
                 null(),
-            ))?;
+            ))
+            .map_err(|error| stage_error(&format!("job list attribute ({})", jobs.len()), error))?;
         }
         let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -1029,7 +1042,8 @@ mod windows {
                 directory.as_ref().map_or(null(), |d| d.as_ptr()),
                 &startup.StartupInfo,
                 &mut info,
-            ))?;
+            ))
+            .map_err(|error| stage_error("CreateProcessW", error))?;
         }
         // Creation/assignment failure above returns no running child. After
         // success, wrap both handles before any further fallible operation.
@@ -1050,7 +1064,9 @@ mod windows {
         // Verify the complete ordered list: creation-time assignment is
         // atomic, so either every owning job holds this process or none does.
         for job in jobs {
-            if !in_job(process.handle.as_raw_handle(), *job)? {
+            let member = in_job(process.handle.as_raw_handle(), *job)
+                .map_err(|error| stage_error("job membership verification", error))?;
+            if !member {
                 return Err(io::Error::other(
                     "created process is outside its required job list",
                 ));
@@ -1709,7 +1725,8 @@ mod windows {
     /// An existing named object is this account's memory-only aggregate, or it
     /// is preserved. This never calls `SetInformationJobObject`.
     fn verify_heavy_aggregate(handle: HANDLE, name: &str, memory_bytes: usize) -> io::Result<()> {
-        let snapshot = heavy_aggregate_snapshot(handle)?;
+        let snapshot = heavy_aggregate_snapshot(handle)
+            .map_err(|error| stage_error("heavy aggregate readback", error))?;
         let process_memory = snapshot.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0;
         if snapshot.limit_flags == JOB_OBJECT_LIMIT_JOB_MEMORY
             && !process_memory
