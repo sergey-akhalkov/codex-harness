@@ -41,6 +41,14 @@ const JOB_OBJECT_QUERY: u32 = 0x0004;
 
 const WAIT: Duration = Duration::from_secs(30);
 
+/// Managed-session role composition markers. The fixture kit supplies the
+/// owned developer text plus distinct lead and executor role bodies, and the
+/// canonical provider requests must show the composed lead context, including
+/// on the configured successor route, without the executor body.
+const CONTROL_COMMON_ROLE_MARKER: &str = "CONTROL_COMMON_ROLE_MARKER owned kit developer guidance";
+const CONTROL_LEAD_ROLE_MARKER: &str = "CONTROL_LEAD_ROLE_MARKER lead responsibility";
+const CONTROL_EXECUTOR_ROLE_MARKER: &str = "CONTROL_EXECUTOR_ROLE_MARKER executor responsibility";
+
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -416,6 +424,8 @@ fn native_entry(case: EntryCase) {
         workspace.clone(),
         build.clone(),
         source.join("global"),
+        source.join("global/roles"),
+        source.join("skills"),
         source.join("crates/fixture/src"),
         source.join("crates/harness-rtk/src"),
         source
@@ -436,10 +446,39 @@ fn native_entry(case: EntryCase) {
     }
     fs::write(
         source.join("global/profile.toml"),
-        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel = 'gpt-6-astra'\n",
+        format!(
+            "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel = 'gpt-6-astra'\ndeveloper_instructions = '{CONTROL_COMMON_ROLE_MARKER}'\n"
+        ),
     )
     .unwrap();
     fs::write(source.join("global/kit.json"), serde_json::to_vec(&json!({"schema":1,"profile_name":"harness","profile":"global/profile.toml","instructions":"global/instructions.md","skills":"skills","agents":"global/agents","hooks":"global/hooks.json","token_hooks":"global/token-hooks.json"})).unwrap()).unwrap();
+    // A managed session composes its role context from the kit sources, so
+    // the fixture carries the common instructions, both role bodies and the
+    // shared skill root beside the manifest.
+    fs::write(
+        source.join("global/instructions.md"),
+        "Owned fixture common instructions.\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/roles.toml"),
+        "schema = 1\nshared_skills = []\n[roles.lead]\ninstructions = 'global/roles/lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/roles/executor.md'\nskills = []\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/roles/lead.md"),
+        format!(
+            "# Lead responsibility\n\n{CONTROL_LEAD_ROLE_MARKER}: preserve the task, its constraints and acceptance.\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/roles/executor.md"),
+        format!(
+            "# Executor responsibility\n\n{CONTROL_EXECUTOR_ROLE_MARKER}: own the complete local work cycle.\n"
+        ),
+    )
+    .unwrap();
     if quota_handoff {
         fs::write(
             source.join("global/orchestration.toml"),
@@ -883,6 +922,28 @@ trust_level = "trusted"
             .exists(),
         "named conversation must not issue an auxiliary model request"
     );
+    if quota_handoff {
+        for sequence in 1..=expected_requests {
+            let body = fs::read_to_string(root.join(format!("provider-{sequence}.json"))).unwrap();
+            let route = if sequence == 1 {
+                "first refused lead"
+            } else {
+                "configured successor lead"
+            };
+            assert!(
+                body.contains(CONTROL_COMMON_ROLE_MARKER),
+                "{route} request {sequence} must carry the owned common developer text"
+            );
+            assert!(
+                body.contains(CONTROL_LEAD_ROLE_MARKER),
+                "{route} request {sequence} must carry the composed lead role text"
+            );
+            assert!(
+                !body.contains(CONTROL_EXECUTOR_ROLE_MARKER),
+                "{route} request {sequence} must not carry the executor role text"
+            );
+        }
+    }
     fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"zai/glm-5.3"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
 }
 
