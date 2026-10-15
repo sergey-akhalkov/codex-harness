@@ -311,16 +311,11 @@ pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<Origina
             "unverifiable originating lead: dispatching process image is unavailable: {error}; refusing before a model request"
         ))
     })?;
-    // Mirrors `harness_core::native_launcher::codex_home()` without its
-    // canonicalization: a missing or unusual home must not turn the whole
-    // dispatch into a different refusal, and this record is only the address
-    // a later message uses, verified again by its own consumer.
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("USERPROFILE").map(|profile| PathBuf::from(profile).join(".codex"))
-        });
+    // Resolve through the launcher owner while still in the dispatcher's cwd.
+    // A relative CODEX_HOME must not be reinterpreted in the executor checkout
+    // when it later addresses the originating conversation. An unavailable
+    // home leaves the ordinary route unavailable without changing dispatch.
+    let home = harness_core::native_launcher::codex_home().ok();
     let user = harness_core::process_service::current_user().map_err(|error| {
         invalid(format!(
             "unverifiable originating lead: dispatching process account is unavailable: {error}; refusing before a model request"
