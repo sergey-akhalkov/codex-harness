@@ -98,6 +98,17 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     let foreign = user_home.join(".agents/skills/foreign/SKILL.md");
     fs::create_dir_all(foreign.parent().unwrap()).unwrap();
     fs::write(&foreign, b"---\nname: foreign\ndescription: Kept.\n---\n").unwrap();
+    // 0.162.1 resolves the user farm from the real OS profile rather than
+    // this synthetic home, so the foreign canary above is preservation-only
+    // here. This fixture-controlled project skill lives in the catalogue's
+    // case directory and carries the discovery assertions below.
+    let foreign_project = workspace.join(".agents/skills/foreign-project/SKILL.md");
+    fs::create_dir_all(foreign_project.parent().unwrap()).unwrap();
+    fs::write(
+        &foreign_project,
+        b"---\nname: foreign-project\ndescription: Kept.\n---\n",
+    )
+    .unwrap();
 
     let report = core_install::connect(&request, false).unwrap();
     assert_eq!(report.status, "connected");
@@ -145,6 +156,11 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         fs::read_to_string(&foreign).unwrap(),
         "---\nname: foreign\ndescription: Kept.\n---\n",
         "foreign skills are preserved"
+    );
+    assert_eq!(
+        fs::read_to_string(&foreign_project).unwrap(),
+        "---\nname: foreign-project\ndescription: Kept.\n---\n",
+        "the consumer project's own skill is preserved"
     );
 
     // The orchestration configuration names machine-local profiles; kit
@@ -373,8 +389,8 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
 
     // The installed catalogue path resolves the same recorded source for
     // both roles: the owned revision is reported, the lead-only skill is
-    // disabled only for the executor, and the unrelated user skill stays in
-    // both effective sets.
+    // disabled only for the executor, and the unrelated project skill stays
+    // in both effective sets.
     let catalogue = |args: &[&str]| -> String {
         let out = Command::new(codex_home.join("harness/bin/codex-harness.exe"))
             .current_dir(&workspace)
@@ -410,19 +426,19 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         )),
         "{executor_catalogue}"
     );
-    let enabled = |text: &str, name: &str| -> bool {
-        let prefix = format!("name={name};");
+    let enabled = |text: &str, name: &str, scope: &str| -> bool {
+        let prefix = format!("name={name};scope={scope};");
         text.lines()
             .find(|line| line.starts_with(&prefix))
-            .unwrap_or_else(|| panic!("catalogue omits {name}: {text}"))
+            .unwrap_or_else(|| panic!("catalogue omits {name} in scope {scope}: {text}"))
             .contains(";enabled=true;")
     };
-    assert!(enabled(&lead_catalogue, "team-lead"));
-    assert!(enabled(&lead_catalogue, "board-workflow"));
-    assert!(enabled(&lead_catalogue, "foreign"));
-    assert!(!enabled(&executor_catalogue, "team-lead"));
-    assert!(enabled(&executor_catalogue, "board-workflow"));
-    assert!(enabled(&executor_catalogue, "foreign"));
+    assert!(enabled(&lead_catalogue, "team-lead", "user"));
+    assert!(enabled(&lead_catalogue, "board-workflow", "user"));
+    assert!(enabled(&lead_catalogue, "foreign-project", "repo"));
+    assert!(!enabled(&executor_catalogue, "team-lead", "user"));
+    assert!(enabled(&executor_catalogue, "board-workflow", "user"));
+    assert!(enabled(&executor_catalogue, "foreign-project", "repo"));
 
     board_lifecycle::disconnect(&board_on).unwrap();
     assert!(
@@ -673,6 +689,10 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "rollback removes the loop guidance links"
     );
     assert!(user_home.join(".agents/skills/foreign/SKILL.md").is_file());
+    assert!(
+        foreign_project.is_file(),
+        "rollback must not touch the consumer project's own skill"
+    );
     // Role inputs resolve from the recorded source root, not a deployed copy:
     // rollback removes the owned links but leaves role resolution intact, and
     // the reported revisions stay those of the owned sources.
