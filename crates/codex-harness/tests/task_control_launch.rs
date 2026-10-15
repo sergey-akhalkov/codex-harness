@@ -625,7 +625,7 @@ trust_level = "trusted"
     command.args = vec![
         "--no-alt-screen".into(),
         if pair {
-            "Delegate two independent owned proof tasks to Z.AI and Grok.".into()
+            "Delegate two independent owned proof tasks to the two configured ds executors.".into()
         } else if child {
             "Delegate the owned proof to one native child.".into()
         } else {

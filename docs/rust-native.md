@@ -1262,11 +1262,13 @@ transport evidence, not a native provider integration receipt.
 
 `task_admission` connects request correlation to the observed native session and
 active turn, then checks the exact conversation's registered process identity and
-visible window before forwarding. A parent's window cannot cover a child;
-interrupted turns wait and stopped tasks reject dispatch. Focused checks verify
-that missing child visibility produces no upstream connection. Only ordinary
-turn requests currently have this admission path; other request kinds are
-rejected pending explicit visibility support.
+visible window before forwarding. A conversation stays available while another
+window covers it, because on-screen tiling is not required; a hidden, minimized,
+cloaked or closed surface waits while its view is unavailable, interrupted turns
+wait, and stopped tasks reject dispatch. Focused checks verify that missing child
+visibility produces no upstream connection. Only ordinary turn requests
+currently have this admission path; other request kinds are rejected pending
+explicit visibility support.
 
 The release ordinary-entry and quota-handoff checks passed with CLI 0.154.0
 through this gate and `task_forward` into an owned synthetic upstream. They
@@ -1284,19 +1286,21 @@ successor configuration. Focused ingress checks verify rejection without any
 upstream connection and joined shutdown during an incomplete HTTP read. The
 integrated ordinary release entry check passed with native tool execution,
 visible final result, saved local route configuration and process cleanup.
-An earlier handoff observation exposed a gap: window-presence checks reported
-conversations obscured by another application as visible.
-`task_view::Watch` now also checks the client rectangle against windows above it
-and rejects cloaked conversations. An owned Windows-window test passed for
-partial/full coverage, moving the cover away and hiding it; all windows were
-destroyed by their test owner. The bounded traversal treats changing or unknown
-composition state conservatively. It uses window rectangles, so transparent or
-irregular overlays can also suspend admission. This follows the documented
-[IsWindowVisible limitation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible)
-and [window ordering contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow).
-The integrated ordinary, quota-handoff and minimize/restore release checks passed
-with this change and CLI 0.154.0. The handoff windows were observed simultaneously;
-all three checks showed the final result and verified process cleanup.
+An earlier handoff observation showed why window composition is not the
+availability signal: `IsWindowVisible` reports a style bit and stays true while
+another application covers the conversation. Availability is decided per
+conversation from its own surface: the exact registered process must be running
+and its window visible, not minimized, not cloaked and not empty. Overlap with
+another conversation, including a parent's, leaves the surface available because
+on-screen tiling is not required; a hidden, minimized, cloaked or closed surface
+suspends dispatch. An ignored owned Windows-window regression covers overlapping
+surfaces plus hidden and closed ones; all windows are destroyed by their test
+owner. This follows the documented
+[IsWindowVisible limitation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible),
+which does not report occlusion. The integrated ordinary, quota-handoff and
+minimize/restore release checks passed with the earlier coverage check on CLI
+0.154.0; the handoff windows were observed simultaneously, and all three checks
+showed the final result and verified process cleanup.
 On CLI 0.155.1, `ordinary_launcher_opens_helper_before_its_first_request`
 passed through the release entry point: lead, executor and helper panes were
 established before the helper's first model request (helper title `Helper 1`,
