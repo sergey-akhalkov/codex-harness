@@ -4652,6 +4652,22 @@ fn installed_tui_all_tools(
     let canned = CannedResponses::spawn_all_tools(&root).unwrap();
     write_probe_config(&home, &workspace, &canned, "", false);
     let session = spawn_probe_tui_args(exe, &home, &workspace, extra);
+    tui_all_tools_probe(&root, &home, &canned, &session, label, rounds)
+}
+
+/// The shared runtime-catalogue probe body: the session must already run
+/// against the canned all-tools Responses server. Each of the bounded settle
+/// rounds asks the session to report its own runtime tool names; the probe
+/// stops early only when a worktree-named tool appeared, so a suppressed
+/// comparison never accepts an early empty reading as its final word.
+fn tui_all_tools_probe(
+    root: &Path,
+    home: &Path,
+    canned: &CannedResponses,
+    session: &ConsoleSession,
+    label: &str,
+    rounds: usize,
+) -> RuntimeCatalogue {
     ready_named(&session, &root, &home, &format!("RuntimeTools{label}"));
     let mut names = Vec::new();
     for round in 1..=rounds {

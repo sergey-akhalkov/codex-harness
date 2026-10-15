@@ -165,19 +165,138 @@ fn shared_config_args(
 }
 
 /// The shared defaults turn the native `codex_worktrees` tools off in managed
-/// sessions because those tools allocate worktrees outside the shared pool. A
-/// higher-precedence layer that re-enables them is reported instead of fought:
-/// the session really will expose the competing tools.
-fn report_native_worktree_conflict(shadowed: &[crate::portable_config::ShadowedDefault]) {
-    if let Some(shadow) = shadowed.iter().find(|shadow| {
-        shadow.path == "features.worktrees" && shadow.value != toml::Value::Boolean(false)
-    }) {
-        eprintln!(
-            "codex-harness: the {} configuration sets features.worktrees={}; this session keeps the native codex_worktrees tools, which compete with the shared worktree pool; remove the override to let the shared suppression apply",
-            shadow.source.label(),
-            shadow.value
-        );
+/// sessions because those tools allocate worktrees outside the shared pool.
+/// A higher-precedence choice that is not an explicit `false` is reported
+/// instead of fought, as a configuration conflict: either the competing tools
+/// stay re-exposed, or - for a value that is not a boolean - the native
+/// session rejects the value and managed suppression cannot be established.
+/// No report claims an observed tool catalogue; it states the suppression
+/// decision the composed configuration produces.
+enum WorktreeSuppression {
+    /// The winning choice selects `features.worktrees=false`.
+    Established,
+    /// A higher-precedence layer re-exposes the competing tools.
+    ReExposed { source: String, value: toml::Value },
+    /// An explicit value the native session refuses: suppression can be
+    /// neither applied nor claimed.
+    Invalid { source: String, value: toml::Value },
+}
+
+fn worktree_selection(source: String, value: toml::Value) -> WorktreeSuppression {
+    match value.as_bool() {
+        Some(false) => WorktreeSuppression::Established,
+        Some(true) => WorktreeSuppression::ReExposed { source, value },
+        None => WorktreeSuppression::Invalid { source, value },
     }
+}
+
+fn report_native_worktree_conflict(
+    cli: Option<(String, toml::Value)>,
+    config: Option<(String, toml::Value)>,
+) {
+    let decision = if let Some((source, value)) = cli {
+        worktree_selection(source, value)
+    } else if let Some((source, value)) = config {
+        worktree_selection(source, value)
+    } else {
+        WorktreeSuppression::Established
+    };
+    match decision {
+        WorktreeSuppression::Established => {}
+        WorktreeSuppression::ReExposed { source, value } => eprintln!(
+            "codex-harness: the {source} configuration sets features.worktrees={value}; the native codex_worktrees tools stay re-exposed and compete with the shared worktree pool; remove the override or pass --disable worktrees to establish the managed suppression"
+        ),
+        WorktreeSuppression::Invalid { source, value } => eprintln!(
+            "codex-harness: the {source} configuration sets features.worktrees={value}, which is not a boolean; the native session rejects this value and managed suppression of the codex_worktrees tools cannot be established; remove the override or set features.worktrees=false"
+        ),
+    }
+}
+
+/// Explicit `features.worktrees` choices on this invocation in the installed
+/// native precedence: repeated `-c` leaves keep the last value, while
+/// `--enable` and `--disable` re-encode as `features.<name>` and win over
+/// `-c` regardless of encounter order, with a disable winning over an enable.
+fn cli_worktree_choice(
+    overrides: &[String],
+    task_args: &[OsString],
+) -> Option<(String, toml::Value)> {
+    let mut selected = None;
+    for raw in overrides {
+        let Some((key, encoded)) = raw.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "features.worktrees" {
+            continue;
+        }
+        let encoded = encoded.trim();
+        let value = toml::from_str::<toml::Table>(&format!("value = {encoded}"))
+            .ok()
+            .and_then(|mut table| table.remove("value"))
+            .unwrap_or_else(|| toml::Value::String(encoded.trim_matches(['"', '\'']).to_owned()));
+        selected = Some(value);
+    }
+    let mut enabled = false;
+    let mut disabled = false;
+    let mut i = 0;
+    while i < task_args.len() {
+        let arg = task_args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        let feature = if arg == "--enable" || arg == "--disable" {
+            let feature = task_args
+                .get(i + 1)
+                .and_then(|value| value.to_str())
+                .map(str::to_owned);
+            i += 1;
+            feature
+        } else {
+            arg.strip_prefix("--enable=")
+                .or_else(|| arg.strip_prefix("--disable="))
+                .map(str::to_owned)
+        };
+        i += 1;
+        if let Some(feature) = feature
+            && feature.trim() == "worktrees"
+        {
+            if arg.starts_with("--disable") {
+                disabled = true;
+            } else {
+                enabled = true;
+            }
+        }
+    }
+    if disabled {
+        return Some(("command-line".into(), toml::Value::Boolean(false)));
+    }
+    if enabled {
+        return Some(("command-line".into(), toml::Value::Boolean(true)));
+    }
+    selected.map(|value| ("command-line".to_owned(), value))
+}
+
+/// Drop the shared `features.worktrees` leaf from the composed overrides: the
+/// command line already selects a value, and the shared default is reported
+/// rather than fought, matching the shadow behavior for user and project
+/// replacements.
+fn without_worktree_leaf(overrides: Vec<OsString>) -> Vec<OsString> {
+    let mut result = Vec::with_capacity(overrides.len());
+    let mut i = 0;
+    while i < overrides.len() {
+        let value = overrides[i].to_str().unwrap_or("");
+        if matches!(value, "-c" | "--config")
+            && overrides
+                .get(i + 1)
+                .and_then(|next| next.to_str())
+                .is_some_and(|next| next.trim_start().starts_with("features.worktrees="))
+        {
+            i += 2;
+            continue;
+        }
+        result.push(overrides[i].clone());
+        i += 1;
+    }
+    result
 }
 
 /// Effective native model and effort a plain session start would use, for
@@ -371,15 +490,31 @@ fn prepared_command(
     let roots = launcher::additional_roots(&task_args, &working_directory);
     let mut command = Command::new(target);
     let classified = launcher::profile_arguments(&task_args);
+    // A managed session without an explicit profile is where the shared layer
+    // applies. An explicit profile replaces that layer: the shared defaults
+    // are not injected, but the session is still managed and its role context
+    // still composes below.
+    let managed = classified.len() != task_args.len();
+    let cli_worktrees = context
+        .as_ref()
+        .and_then(|context| cli_worktree_choice(&context.overrides, &task_args));
     let mut shared_overrides = false;
-    if shared && classified.len() != task_args.len() {
+    let mut degraded = !shared;
+    let mut shadowed = Vec::new();
+    if shared && managed {
         match shared_config_args(&selected, home, context_directory) {
-            Ok((overrides, shadowed)) => {
+            Ok((overrides, reported)) => {
+                shadowed = reported;
+                let overrides = if cli_worktrees.is_some() {
+                    without_worktree_leaf(overrides)
+                } else {
+                    overrides
+                };
                 command.args(overrides);
-                report_native_worktree_conflict(&shadowed);
                 shared_overrides = true;
             }
             Err(_) => {
+                degraded = true;
                 notice_degraded_session(&task_args);
             }
         }
@@ -387,7 +522,46 @@ fn prepared_command(
         notice_degraded_session(&task_args);
     }
     command.args(launcher::daemon_opt_out(&task_args, shared_overrides));
-    if shared && let Some(context) = context {
+    if shared && !degraded && let Some(context) = context {
+        let profile = context.profile.as_deref();
+        let profile_layer = profile
+            .map(|profile| crate::orchestration_config::profile_config(home, profile))
+            .transpose()?;
+        // A managed session without an explicit profile forwards the shared
+        // defaults directly, so only a higher-precedence user or project
+        // replacement is a conflict. An explicit profile replaces the shared
+        // layer but is not itself a worktree choice: when no configuration
+        // layer selects features.worktrees, the session still carries the
+        // managed suppression leaf, and only an actual winning choice is
+        // reported instead of fought.
+        let (conflict, suppression_leaf) = if managed {
+            (
+                shadowed
+                    .iter()
+                    .find(|entry| entry.path == "features.worktrees")
+                    .map(|entry| (entry.source.label().to_owned(), entry.value.clone())),
+                false,
+            )
+        } else {
+            let choice = profile
+                .map(|profile| {
+                    crate::portable_config::worktree_feature_choice(
+                        home,
+                        context.cwd.as_path(),
+                        Some((
+                            profile,
+                            profile_layer
+                                .as_ref()
+                                .expect("a named profile carries its resolved layer"),
+                        )),
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let suppression = cli_worktrees.is_none() && choice.is_none();
+            (choice, suppression)
+        };
+        report_native_worktree_conflict(cli_worktrees, conflict);
         let record = build_identity::read_record(&selected)?;
         let role = if env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some() {
             crate::role_context::Role::Executor
@@ -395,19 +569,17 @@ fn prepared_command(
             crate::role_context::Role::Lead
         };
         let resolved = crate::role_context::resolve(&record.source_root, role)?;
-        let profile = context
-            .profile
-            .as_deref()
-            .map(|profile| crate::orchestration_config::profile_config(home, profile))
-            .transpose()?;
         let session = crate::portable_config::context_overrides(&context.overrides)?;
         let retained = crate::portable_config::retained_role_config(
             home,
             &context.cwd,
-            profile.as_ref(),
+            profile_layer.as_ref(),
             &session,
         )?;
-        let overrides = resolved.native_overrides(&retained)?;
+        let mut overrides = resolved.native_overrides(&retained)?;
+        if suppression_leaf {
+            overrides.insert("features.worktrees".into(), toml::Value::Boolean(false));
+        }
         command.args(launcher::with_context_overrides(&task_args, &overrides));
         command.env("HARNESS_CONTEXT_ROLE", role.label());
         command.env("HARNESS_CONTEXT_REVISION", &resolved.revision);

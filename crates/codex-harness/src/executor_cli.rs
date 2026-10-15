@@ -4213,10 +4213,6 @@ const CONTROL_CLEANUP: Duration = Duration::from_secs(10);
 /// turn's terminal state (an interrupted tool call finishing), before the run
 /// ends; an empty pump ends it sooner.
 const CONTROL_TAIL_GRACE: Duration = Duration::from_secs(1);
-/// How long the completed turn's final message is re-read before an absent
-/// message is recorded as a defect: the terminal record can be observed
-/// before `thread/read` carries the turn's items.
-const FINAL_MESSAGE_SETTLE: Duration = Duration::from_secs(1);
 /// Bearer for the owned native frontend. It is passed by environment name,
 /// never on the command line, in a receipt, or in a diagnostic.
 const FRONTEND_TOKEN_ENV: &str = "HARNESS_EXECUTOR_FRONTEND_TOKEN";
@@ -5016,11 +5012,11 @@ fn host_control_conversation(
     };
     let (state, _streamed_message) = state;
     // The turn's own status is terminal. The final message comes from the
-    // thread's items, never from a transport acknowledgement, and a missing
-    // item set is re-read within the settle bound before it counts: the
-    // terminal record can be observed before the items land.
+    // thread's items, never from a transport acknowledgement; the surface
+    // already held the terminal record through its tail grace, so the
+    // accepted turn's items are read directly at this boundary.
     let (final_message, cause) = match state {
-        Lifecycle::Completed => match settled_final_message(&mut conversation) {
+        Lifecycle::Completed => match conversation.final_message() {
             Ok(FinalMessage::Present(text)) => {
                 if let Err(error) = observation::write_final_message(&result, &text) {
                     return fail_with_frontend(
@@ -5309,24 +5305,6 @@ fn drive_control(
                 return Ok((outcome, streamed_message));
             }
             return Err(io::Error::other(FrontendLost));
-        }
-    }
-}
-
-/// The completed turn's final message, re-read until it settles within
-/// [`FINAL_MESSAGE_SETTLE`].
-///
-/// Only a missing message is re-read: an empty message is the turn's own
-/// recorded output and a failed read is an error; both stay final, and a
-/// message that is still missing at the bound is the recorded defect.
-fn settled_final_message(conversation: &mut Conversation) -> io::Result<FinalMessage> {
-    let until = Instant::now() + FINAL_MESSAGE_SETTLE;
-    loop {
-        match conversation.final_message()? {
-            FinalMessage::Missing if Instant::now() < until => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            settled => return Ok(settled),
         }
     }
 }

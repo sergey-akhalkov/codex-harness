@@ -82,6 +82,40 @@ pub fn overrides_with_shadowed(
     Ok((result, shadowed))
 }
 
+/// The effective `features.worktrees` value the applicable native layers
+/// select, with the winning layer's own label. The shared portable file is
+/// not consulted: callers treat `None` as "no higher-precedence choice". An
+/// explicit profile layers over the base user configuration and a trusted
+/// project file over both, the same order role retention applies.
+pub fn worktree_feature_choice(
+    codex_home: &Path,
+    working_directory: &Path,
+    profile: Option<(&str, &toml::Table)>,
+) -> io::Result<Option<(String, toml::Value)>> {
+    let user = read_user(codex_home)?;
+    let mut trust = user.clone();
+    if let Some((_, table)) = profile {
+        merge_tables(&mut trust, table);
+    }
+    let project = trusted_project_config(&trust, working_directory)?;
+    let selected = |layer: Option<&toml::Table>| -> Option<toml::Value> {
+        layer?
+            .get("features")?
+            .as_table()?
+            .get("worktrees")
+            .cloned()
+    };
+    if let Some(value) = selected(project.as_ref()) {
+        return Ok(Some(("trusted-project".into(), value)));
+    }
+    if let Some((name, table)) = profile
+        && let Some(value) = selected(Some(table))
+    {
+        return Ok(Some((format!("explicit profile '{name}'"), value)));
+    }
+    Ok(selected(Some(&user)).map(|value| ("user".to_owned(), value)))
+}
+
 /// Retain context settings for responsibility-role composition. Callers pass
 /// their already-resolved native profile and explicit session overrides; this
 /// function never chooses a profile, model, provider or effort.
