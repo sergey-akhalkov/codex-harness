@@ -35,12 +35,19 @@ fn native_semantic_acceptance_checks_real_backends_and_edit_readback() {
         .into_iter()
         .flatten()
         .any(|row| row["id"] == "delphi" && row["status"] == "adopted");
-    let expected = if pascal {
-        json!(["rust", "python", "pascal"])
-    } else {
-        json!(["rust", "python"])
-    };
-    assert_eq!(report["languages"], expected);
+    let mut expected = vec!["rust", "python"];
+    if pascal {
+        expected.push("pascal");
+    }
+    if inventory["languages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| row["id"] == "cpp" && row["status"] == "adopted")
+    {
+        expected.push("cpp");
+    }
+    assert_eq!(report["languages"], json!(expected));
     assert_eq!(report["owned_state_removed"], true);
     assert_eq!(
         report["manager_sha256"],
@@ -374,14 +381,22 @@ impl Drop for OwnedBroker {
                 return Ok(());
             }
             let record: Value = serde_json::from_slice(&fs::read(path)?)?;
-            let root = BrokerRoot::open(Path::new(record["root"].as_str().unwrap()))?;
-            let outcome = broker_launch::retire(
-                &root,
-                Deadline::after(Duration::from_secs(60))?,
-                &Cancellation::default(),
-            )?;
-            if matches!(outcome, broker_launch::Retirement::Pending { .. }) {
-                return Err(std::io::Error::other("owned test broker cleanup pending"));
+            let mut locations = vec![record["root"].as_str().unwrap()];
+            if let Some(generations) = record["generations"].as_array() {
+                locations.extend(generations.iter().filter_map(|item| item["root"].as_str()));
+            }
+            locations.sort_unstable();
+            locations.dedup();
+            for location in locations {
+                let root = BrokerRoot::open(Path::new(location))?;
+                let outcome = broker_launch::retire(
+                    &root,
+                    Deadline::after(Duration::from_secs(60))?,
+                    &Cancellation::default(),
+                )?;
+                if matches!(outcome, broker_launch::Retirement::Pending { .. }) {
+                    return Err(std::io::Error::other("owned test broker cleanup pending"));
+                }
             }
             Ok(())
         })();
@@ -708,7 +723,25 @@ impl Proxy {
         console: &Path,
         seconds: &str,
     ) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        Self::start_program(
+            Path::new(env!("CARGO_BIN_EXE_codex-harness")),
+            codex_home,
+            registry,
+            project,
+            console,
+            seconds,
+        )
+    }
+
+    fn start_program(
+        program: &Path,
+        codex_home: &Path,
+        registry: &Path,
+        project: &Path,
+        console: &Path,
+        seconds: &str,
+    ) -> Self {
+        let mut child = Command::new(program)
             .arg("mcp")
             .arg("serena")
             .arg("--serena")
@@ -1538,4 +1571,88 @@ fn unlimited_managed_connection_survives_delayed_input_and_serves_requests() {
     assert_eq!(later["id"], 2, "{later}");
     // Closing the client terminates the proxy without an orphan transport.
     proxy.finish();
+}
+
+#[test]
+#[ignore = "requires HARNESS_CODE_TOOLS_REGISTRY and HARNESS_TEST_NEXT_MANAGER with a distinct native build"]
+fn open_session_restarts_its_broker_after_installed_manager_link_changes() {
+    use std::os::windows::fs::symlink_file;
+
+    let console = adopted_console();
+    let registry = PathBuf::from(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let codex_home = root.path().join("codex-home");
+    let cleanup = OwnedBroker(codex_home.clone());
+    let project = crate_project(root.path(), "delivery restart", 719);
+    let first_image = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    let next_image = PathBuf::from(
+        std::env::var_os("HARNESS_TEST_NEXT_MANAGER")
+            .expect("explicit distinct native manager build"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert_ne!(
+        harness_core::build_identity::hash_file(&first_image).unwrap(),
+        harness_core::build_identity::hash_file(&next_image).unwrap(),
+        "the replacement must be a distinct real build",
+    );
+    let installed = root.path().join("codex-harness.exe");
+    symlink_file(&first_image, &installed).unwrap();
+    let initialize = json!({
+        "protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "delivery-restart", "version": "0.1.0"}
+    });
+    let mut first =
+        Proxy::start_program(&installed, &codex_home, &registry, &project, &console, "0");
+    eprintln!(
+        "installed-link regression: initializing {}",
+        root.path().display()
+    );
+    let reply = first.request(1, "initialize", initialize.clone());
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    assert!(symbol_text(&mut first, 2).contains("719"));
+    eprintln!("installed-link regression: first semantic query passed");
+    let anchor = codex_home.join("harness/runtime/serena-broker.json");
+    let before: Value = serde_json::from_slice(&fs::read(&anchor).unwrap()).unwrap();
+
+    fs::remove_file(&installed).unwrap();
+    symlink_file(&next_image, &installed).unwrap();
+    cleanup.crash();
+    eprintln!("installed-link regression: link changed and owned broker exited");
+    let reply = first.request(
+        3,
+        "tools/call",
+        json!({
+            "name": "find_symbol", "arguments": {
+                "relative_path": "src/lib.rs", "name_path_pattern": "shared",
+                "include_body": true
+            }
+        }),
+    );
+    assert_eq!(reply["id"], 3, "{reply}");
+    assert!(
+        reply.get("error").is_none(),
+        "broker restart after delivery: {reply}"
+    );
+    assert!(reply["result"].to_string().contains("719"), "{reply}");
+
+    let mut second =
+        Proxy::start_program(&installed, &codex_home, &registry, &project, &console, "0");
+    let reply = second.request(11, "initialize", initialize);
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let after: Value = serde_json::from_slice(&fs::read(&anchor).unwrap()).unwrap();
+    let generations = after["generations"].as_array().unwrap();
+    assert_eq!(
+        generations.len(),
+        2,
+        "new session must use the new image: {after}"
+    );
+    assert_ne!(generations[0]["source"], generations[1]["source"]);
+    assert_ne!(generations[0]["root"], generations[1]["root"]);
+    assert_eq!(before["generations"][0], generations[0]);
+    assert!(symbol_text(&mut second, 12).contains("719"));
+    assert!(symbol_text(&mut first, 4).contains("719"));
+    first.finish();
+    second.finish();
+    drop(cleanup);
 }
