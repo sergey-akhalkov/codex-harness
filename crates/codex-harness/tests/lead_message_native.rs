@@ -3351,9 +3351,10 @@ fn run_harness_lead(
 /// One fabricated run identity for the production entry point: the receipt the
 /// real dispatch writes, with this test process as the recorded live host (an
 /// ancestor of every sender it runs) and the given conversation as the
-/// recorded originating lead. It starts no process and writes only its own
+/// recorded originating lead, whose own kit home is the receiver home the
+/// queue route must address. It starts no process and writes only its own
 /// owned file.
-fn write_ordinary_run_receipt(path: &Path, generation: &str, thread: &str) {
+fn write_ordinary_run_receipt(path: &Path, home: &Path, generation: &str, thread: &str) {
     let user = process_service::current_user().unwrap();
     let program = std::env::current_exe().unwrap();
     let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
@@ -3368,6 +3369,7 @@ fn write_ordinary_run_receipt(path: &Path, generation: &str, thread: &str) {
                 "schema": 1,
                 "threadId": thread,
                 "runGeneration": generation,
+                "home": home,
                 "dispatcher": {
                     "pid": identity.pid,
                     "creationTime": identity.creation_time,
@@ -3591,9 +3593,10 @@ trust_level = "trusted"
     // exact thread is the recorded originating lead.
     let state = home.join("harness/executor-pool/ordinary-lead-production");
     fs::create_dir_all(&state).unwrap();
-    write_ordinary_run_receipt(&state.join("spawn-1.json"), RUN_GENERATION, &thread);
+    write_ordinary_run_receipt(&state.join("spawn-1.json"), &home, RUN_GENERATION, &thread);
     write_ordinary_run_receipt(
         &state.join("spawn-2.json"),
+        &home,
         MISSING_GENERATION,
         MISSING_THREAD_ID,
     );

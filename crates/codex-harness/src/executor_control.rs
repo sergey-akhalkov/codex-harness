@@ -219,14 +219,24 @@ pub(crate) struct DispatcherIdentity {
 }
 
 /// Immutable originating relationship captured from the dispatching process
-/// before its session environment is cleared for the host. This record is not
-/// a lead endpoint, and a caller-supplied id or copied marker is not authority.
+/// before its session environment is cleared for the host: the conversation
+/// id, the run generation, the dispatching process's identity and, when it
+/// had one, the kit home that process ran in. The home is what lets a later
+/// addressed message reach that conversation's own store; the executor's
+/// selected home is never assumed to be the same. This record is not a lead
+/// endpoint, and a caller-supplied id or copied marker is not authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct OriginatingLead {
     pub schema: u32,
     pub thread_id: String,
     pub run_generation: String,
+    /// The kit home the dispatching process itself resolves, captured with the
+    /// rest of the relationship. Absent only when that process exposed neither
+    /// a home nor a profile to resolve one from; never guessed from the
+    /// executor's selected home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<PathBuf>,
     pub dispatcher: DispatcherIdentity,
 }
 
@@ -253,12 +263,17 @@ pub(crate) fn supplied_lead_option(key: &str) -> bool {
     )
 }
 
-/// Captures the dispatching process's own `CODEX_THREAD_ID`. The working
-/// directory is not an input: a descendant that changes directory still
-/// records this process's thread id. A copied run marker, a sibling run, a
-/// stale reference, or a caller-supplied lead id fails closed. This does not
-/// open a lead endpoint; a thread id that is merely present cannot be proved
-/// to name a live lead conversation without one.
+/// Captures the dispatching process's own `CODEX_THREAD_ID` and the kit home
+/// that process itself resolves: an explicit `CODEX_HOME`, otherwise the
+/// user's default native home, exactly as the native launcher resolves it. A
+/// later consumer must never substitute the executor's selected home for the
+/// lead's own, because dispatch accepts an explicit `--codex-home` and the
+/// two are not required to be equal. The working directory is not an input: a
+/// descendant that changes directory still records this process's thread id.
+/// A copied run marker, a sibling run, a stale reference, or a caller-supplied
+/// lead id fails closed. This does not open a lead endpoint; a thread id that
+/// is merely present cannot be proved to name a live lead conversation
+/// without one.
 pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<OriginatingLead> {
     if LEAD_OVERRIDE_ENV
         .iter()
@@ -296,6 +311,16 @@ pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<Origina
             "unverifiable originating lead: dispatching process image is unavailable: {error}; refusing before a model request"
         ))
     })?;
+    // Mirrors `harness_core::native_launcher::codex_home()` without its
+    // canonicalization: a missing or unusual home must not turn the whole
+    // dispatch into a different refusal, and this record is only the address
+    // a later message uses, verified again by its own consumer.
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|profile| PathBuf::from(profile).join(".codex"))
+        });
     let user = harness_core::process_service::current_user().map_err(|error| {
         invalid(format!(
             "unverifiable originating lead: dispatching process account is unavailable: {error}; refusing before a model request"
@@ -317,6 +342,7 @@ pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<Origina
         schema: ORIGINATING_LEAD_SCHEMA,
         thread_id: thread_id.to_owned(),
         run_generation: run_generation()?,
+        home,
         dispatcher: DispatcherIdentity {
             pid: identity.pid,
             creation_time: identity.creation_time,

@@ -2086,6 +2086,7 @@ impl OrdinaryFixture {
                     "schema": 1,
                     "threadId": lead_thread,
                     "runGeneration": generation,
+                    "home": &home,
                     "dispatcher": {
                         "pid": identity.pid,
                         "creationTime": identity.creation_time,
@@ -2125,9 +2126,23 @@ impl OrdinaryFixture {
     }
 
     /// Seeds the kit home's own launcher registration with one upstream
-    /// executable, exactly as the installation lifecycle records it; no
-    /// process is started, and the file itself is checked only on a send.
+    /// executable and its own digest when the file exists, exactly as the
+    /// installation lifecycle records it; no process is started, and the file
+    /// itself is checked only on a send.
     fn seed_launcher(&self, upstream: &Path) {
+        let digest = if upstream.is_file() {
+            harness_core::build_identity::hash_file(upstream).unwrap()
+        } else {
+            // The file does not exist, so its missing-file refusal is the
+            // first observable one and no digest can match it.
+            "0".repeat(64)
+        };
+        self.seed_launcher_with_digest(upstream, &digest);
+    }
+
+    /// Seeds the registration with an explicit recorded digest, so a
+    /// changed-upstream refusal is observable as its own case.
+    fn seed_launcher_with_digest(&self, upstream: &Path, digest: &str) {
         let dir = self.home.join("harness");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -2136,10 +2151,23 @@ impl OrdinaryFixture {
                 "schema": 1,
                 "upstream": {
                     "executable": upstream,
-                    "sha256": "0".repeat(64),
+                    "sha256": digest,
                 },
             }))
             .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Rewrites the recorded originating lead's own kit home, for the case
+    /// where that lead conversation runs in a different home than the
+    /// executor's selected one.
+    fn record_lead_home(&self, path: &Path) {
+        let mut value = self.receipt();
+        value["originatingLead"]["home"] = json!(path);
+        fs::write(
+            self.state.join("spawn-1.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
         )
         .unwrap();
     }
@@ -2169,6 +2197,13 @@ impl OrdinaryFixture {
     }
 
     fn sender(&self, args: &[&str]) -> Output {
+        self.sender_with_env(args, &[])
+    }
+
+    /// One sender invocation with extra environment for the child, e.g. to arm
+    /// the registered owned upstream so a launch that must not happen is
+    /// observable.
+    fn sender_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut command = Command::new(manager());
         command.args(["lead", "message"]).args(args);
         command.env("CODEX_HOME", &self.home);
@@ -2178,6 +2213,9 @@ impl OrdinaryFixture {
         command.env_remove("HARNESS_ORIGINATING_LEAD");
         command.env_remove("HARNESS_LEAD_THREAD");
         command.env_remove("HARNESS_LEAD_RECIPIENT");
+        for (name, value) in envs {
+            command.env(name, value);
+        }
         command.output().unwrap()
     }
 
@@ -2326,6 +2364,128 @@ fn an_error_ordinary_attempt_is_retryable_as_a_new_attempt() {
     // the earlier error did not suppress this new attempt.
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("does not exist; nothing was sent"), "{text}");
+}
+
+#[test]
+fn lead_message_refuses_a_changed_registered_upstream_before_running_it() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-changed-upstream",
+        "generation-ordinary-changed-upstream",
+        ORDINARY_THREAD,
+    );
+    // The registered file exists and ends in .exe, but the installation-record
+    // digest is deliberately not its own: a replaced upstream that the normal
+    // launcher refuses. The owned double records its own start into the marker,
+    // so a launch that must not happen is observable as that file.
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    fixture.seed_launcher_with_digest(&upstream, &"0".repeat(64));
+    let marker = fixture.root().join("changed-upstream-started.txt");
+    let out = fixture.sender_with_env(
+        &["--notify", "--text", "no changed upstream"],
+        &[("HARNESS_LAUNCH_FIXTURE_STARTED", marker.to_str().unwrap())],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("SHA-256"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
+    assert!(!marker.exists(), "a changed upstream was launched: {text}");
+}
+
+#[test]
+fn a_queue_exit_after_a_possible_effect_is_held_instead_of_being_resent() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-effect-then-exit",
+        "generation-ordinary-effect-then-exit",
+        ORDINARY_THREAD,
+    );
+    // The registered upstream is a real, digest-matching owned binary that
+    // records its own start and then exits non-zero without the native queue's
+    // rejection mark: the message may already have been applied, so the
+    // attempt must stay unresolved instead of becoming a retryable error.
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    fixture.seed_launcher(&upstream);
+    let marker = fixture.root().join("queue-effect-started.txt");
+    let payload = "possibly applied ordinary words";
+    let envs = [
+        ("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero"),
+        ("HARNESS_LAUNCH_FIXTURE_STARTED", marker.to_str().unwrap()),
+    ];
+    let out = fixture.sender_with_env(&["--notify", "--text", payload], &envs);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("lead message: indeterminate"), "{text}");
+    assert!(text.contains("unknown"), "{text}");
+    assert!(
+        marker.is_file(),
+        "the queue effect was not observable: {text}"
+    );
+    let receipt = fixture.receipt();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "indeterminate",
+        "{text}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
+
+    // The same words again must reconcile the recorded attempt instead of
+    // sending a second copy: the marker is removed first, so a repeat send is
+    // observable as its recreation.
+    fs::remove_file(&marker).unwrap();
+    let out = fixture.sender_with_env(&["--notify", "--text", payload], &envs);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("nothing was sent again"), "{text}");
+    assert!(
+        text.contains("may already be in the lead conversation"),
+        "{text}"
+    );
+    assert!(!marker.exists(), "a second copy was sent: {text}");
+    let receipt = fixture.receipt();
+    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "indeterminate",
+        "{text}"
+    );
+}
+
+#[test]
+fn lead_message_points_the_queue_at_the_recorded_lead_home_not_the_executor_home() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-two-homes",
+        "generation-ordinary-two-homes",
+        ORDINARY_THREAD,
+    );
+    // The originating lead recorded its own home, deliberately not the
+    // executor's selected one. The registered upstream is a real, digest
+    // matching owned binary that writes the arguments it receives into its own
+    // `$CODEX_HOME` before failing: where that file lands is which home the
+    // queue child was pointed at.
+    let lead_home = fixture.root().join("lead-home");
+    fs::create_dir_all(&lead_home).unwrap();
+    fixture.record_lead_home(&lead_home);
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    fixture.seed_launcher(&upstream);
+    let out = fixture.sender(&["--notify", "--text", "two homes"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("lead message: indeterminate"), "{text}");
+    let recorded =
+        fs::read_to_string(lead_home.join("frontend-argv.txt")).unwrap_or_else(|error| {
+            panic!("the queue child did not run in the recorded lead home: {error}; {text}")
+        });
+    assert!(recorded.contains("queue"), "{recorded}");
+    assert!(recorded.contains(ORDINARY_THREAD), "{recorded}");
+    assert!(
+        !fixture.home.join("frontend-argv.txt").exists(),
+        "the queue child ran in the executor's home: {text}"
+    );
+    let receipt = fixture.receipt();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "indeterminate",
+        "{text}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
 }
 
 #[test]

@@ -121,6 +121,15 @@ const ROLLOUT_TAIL_BOUND: u64 = 8 * 1024 * 1024;
 /// How much of one native queue command's own report is read back for the
 /// recorded attempt detail.
 const QUEUE_REPORT_READ: u64 = 4096;
+/// The launcher registration is read with the same bound the launcher itself
+/// applies before it trusts one; a larger file is refused instead of parsed.
+const NATIVE_REGISTRATION_LIMIT: u64 = 65_536;
+/// The native queue's own rejection prefix, observed on 0.162.1 as
+/// `failed to queue session message: thread/queue/add failed: ... (code
+/// -32603)`. Only a report carrying it names a queue add the native side
+/// itself refused; every other non-zero exit stays indeterminate because the
+/// command may have applied the input before failing.
+const QUEUE_REFUSAL_MARK: &str = "failed to queue session message";
 /// The inline delivery bound of one message: what is sent below it is always the
 /// literal text (a file is a correction, not a task re-send), and above it the
 /// shared spill owner delivers the complete payload as a pointer envelope. The
@@ -1649,6 +1658,13 @@ struct SpawnedRun {
     /// The kit home this run's records live under: the owner of the spill
     /// directory a message too large for one conversation input is written to.
     home: PathBuf,
+    /// The originating lead's own kit home, captured with the rest of the
+    /// recorded relationship. The executor's selected home is never assumed
+    /// to be the same: dispatch accepts an explicit `--codex-home`, and the
+    /// ordinary queue route must address the lead conversation's own store.
+    /// `None` when the dispatching process had neither a home nor a profile
+    /// to resolve one from.
+    lead_home: Option<PathBuf>,
     lead_thread: String,
     generation: String,
     owner: String,
@@ -1751,8 +1767,8 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
         LeadRoute::Endpoint(endpoint) => {
             deliver_to_recorded_lead(&run, endpoint, &message, previous.as_ref())
         }
-        LeadRoute::Ordinary(executable) => {
-            deliver_to_ordinary_lead(&run, executable, &message, previous.as_ref())
+        LeadRoute::Ordinary { executable, digest } => {
+            deliver_to_ordinary_lead(&run, executable, digest, &message, previous.as_ref())
         }
     }
 }
@@ -1883,6 +1899,7 @@ fn resolve_spawned_run() -> io::Result<SpawnedRun> {
     Ok(SpawnedRun {
         receipt,
         home: PathBuf::from(&home),
+        lead_home: lead.home,
         lead_thread: lead.thread_id,
         generation: lead.run_generation,
         owner: registered_text(&value["slot"]["owner"]),
@@ -2056,12 +2073,15 @@ fn parent_process_id(pid: u32) -> Option<u32> {
 
 /// The recorded delivery route of one run's originating lead: the managed
 /// endpoint its lead session recorded, or - for an ordinary lead conversation
-/// that never recorded one - the installed native CLI's own queue route. A
-/// recorded endpoint is never silently replaced by the queue route, and the
-/// queue route is never substituted for a recorded managed endpoint.
+/// that never recorded one - the installed native CLI's own queue route. The
+/// ordinary route carries the registered upstream together with the digest
+/// that same registration records, so a replaced or modified executable is
+/// refused before it is run. A recorded endpoint is never silently replaced
+/// by the queue route, and the queue route is never substituted for a
+/// recorded managed endpoint.
 enum LeadRoute {
     Endpoint(Endpoint),
-    Ordinary(PathBuf),
+    Ordinary { executable: PathBuf, digest: String },
 }
 
 fn resolve_lead_route(run: &SpawnedRun) -> io::Result<LeadRoute> {
@@ -2079,7 +2099,7 @@ fn resolve_lead_route(run: &SpawnedRun) -> io::Result<LeadRoute> {
     match Endpoint::read(&path) {
         Ok(endpoint) => verify_lead_endpoint(run, endpoint),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let executable = native_queue_upstream(&run.home).map_err(|reason| {
+            let (executable, digest) = native_queue_upstream(&run.home).map_err(|reason| {
                 fresh_launch(
                     &run.lead_thread,
                     "no lead-endpoint record exists beside the spawn receipt",
@@ -2093,7 +2113,7 @@ fn resolve_lead_route(run: &SpawnedRun) -> io::Result<LeadRoute> {
                     &reason,
                 )
             })?;
-            Ok(LeadRoute::Ordinary(executable))
+            Ok(LeadRoute::Ordinary { executable, digest })
         }
         Err(error) => Err(invalid(&format!(
             "recorded lead endpoint {} is not usable: {error}; nothing was sent and no daemon, listener, or second conversation was started",
@@ -2135,18 +2155,39 @@ fn verify_lead_endpoint(run: &SpawnedRun, endpoint: Endpoint) -> io::Result<Lead
 }
 
 /// The installed native executable the ordinary queue route runs, from this
-/// kit home's own launcher registration. Only the recorded installation is
-/// authority; an environment substitution or a guessed install location is
-/// not. The file itself is checked when it is about to be run, so reading the
-/// lead conversation's own evidence never depends on it.
-fn native_queue_upstream(home: &Path) -> Result<PathBuf, String> {
+/// kit home's own launcher registration, together with the upstream digest
+/// that registration records. Only the recorded installation is authority; an
+/// environment substitution or a guessed install location is not. The
+/// registration is read with the launcher's own bound and only a supported
+/// schema with an absolute registered native executable is accepted, so a
+/// replaced upstream cannot be launched through this route where the normal
+/// launcher would refuse it. The digest itself is compared when a send is
+/// about to happen, so reading the lead conversation's own evidence never
+/// depends on the file and a reconcile is still possible without it.
+fn native_queue_upstream(home: &Path) -> Result<(PathBuf, String), String> {
     let path = home.join("harness/native-launch.json");
-    let bytes = fs::read(&path).map_err(|error| {
-        format!(
-            "this kit home records no readable installed native launcher ({}: {error}); repair the kit installation and retry",
+    let mut bytes = Vec::new();
+    fs::File::open(&path)
+        .map_err(|error| {
+            format!(
+                "this kit home records no readable installed native launcher ({}: {error}); repair the kit installation and retry",
+                path.display()
+            )
+        })?
+        .take(NATIVE_REGISTRATION_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "the installed native launcher registration {} cannot be read ({error}); repair the kit installation and retry",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > NATIVE_REGISTRATION_LIMIT {
+        return Err(format!(
+            "the installed native launcher registration {} exceeds its bound; repair the kit installation and retry",
             path.display()
-        )
-    })?;
+        ));
+    }
     let registration: harness_core::native_launcher::Registration = serde_json::from_slice(&bytes)
         .map_err(|error| {
             format!(
@@ -2154,14 +2195,25 @@ fn native_queue_upstream(home: &Path) -> Result<PathBuf, String> {
                 path.display()
             )
         })?;
-    let executable = registration.upstream.executable;
-    if !executable.is_absolute() {
+    if registration.schema != 1 && registration.schema != 2 {
         return Err(format!(
-            "the installed native launcher registers a non-absolute upstream {}; repair the kit installation and retry",
+            "the installed native launcher registration {} names unsupported schema {}; repair the kit installation and retry",
+            path.display(),
+            registration.schema
+        ));
+    }
+    let executable = registration.upstream.executable;
+    if !executable.is_absolute()
+        || !executable
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Err(format!(
+            "the installed native launcher registers a non-absolute or non-executable upstream {}; repair the kit installation and retry",
             executable.display()
         ));
     }
-    Ok(executable)
+    Ok((executable, registration.upstream.sha256))
 }
 
 /// The recorded lead thread must be exactly the native session id shape the
@@ -2754,12 +2806,13 @@ enum QueueOutcome {
     /// The native queue command exited 0: the message is accepted for the
     /// conversation, not yet shown by it.
     Accepted { detail: String },
-    /// The native queue refused with its own exit status: a definitive result
-    /// that applied nothing and may be sent again as a new attempt.
+    /// The native queue named its own rejection of the queue add: a
+    /// definitive result that applied nothing and may be sent again as a new
+    /// attempt.
     Refused { detail: String },
-    /// The native queue did not finish within the bound: whether the message
-    /// reached the conversation is unknown, so the attempt may not be repeated
-    /// blindly.
+    /// The native queue did not finish within the bound, or exited non-zero
+    /// without its rejection mark: whether the message reached the
+    /// conversation is unknown, so the attempt may not be repeated blindly.
     Unresolved { detail: String },
 }
 
@@ -2771,6 +2824,7 @@ enum QueueOutcome {
 fn deliver_to_ordinary_lead(
     run: &SpawnedRun,
     executable: &Path,
+    digest: &str,
     message: &LeadMessage<'_>,
     previous: Option<&Value>,
 ) -> io::Result<i32> {
@@ -2789,9 +2843,34 @@ fn deliver_to_ordinary_lead(
             executor_input::INLINE_BOUND
         )));
     }
+    // The queue child must load the originating lead's own store: the
+    // executor's selected home is not the lead's home unless the dispatch
+    // recorded it, and a message that cannot be pointed at the lead
+    // conversation is refused before anything is recorded or started.
+    let Some(lead_home) = run.lead_home.as_deref() else {
+        return Err(invalid(
+            "the originating lead's own kit home was not recorded when this run was dispatched, so the native queue cannot be pointed at that conversation's own store; nothing was sent. Next action: dispatch from a lead session whose process resolves a kit home, or deliver from a lead session that records a managed endpoint",
+        ));
+    };
     if !executable.is_file() {
         return Err(invalid(&format!(
             "the installed native launcher registers {} as its upstream, and that file does not exist; nothing was sent",
+            executable.display()
+        )));
+    }
+    // A registered upstream whose own file no longer matches the digest the
+    // installation recorded is a replaced or modified executable: the normal
+    // launcher refuses that identity, and this route adds no launch authority
+    // of its own, so it refuses before anything is recorded or started.
+    let observed = harness_core::build_identity::hash_file(executable).map_err(|error| {
+        invalid(&format!(
+            "the registered native upstream {} cannot be verified ({error}); nothing was sent",
+            executable.display()
+        ))
+    })?;
+    if observed != digest {
+        return Err(invalid(&format!(
+            "the installed native launcher records upstream {} with SHA-256 {digest}, and the file's current digest is {observed}; a changed upstream is not launched through the queue route; nothing was sent. Next action: repair the kit installation, or deliver from a lead session that records a managed endpoint",
             executable.display()
         )));
     }
@@ -2806,7 +2885,7 @@ fn deliver_to_ordinary_lead(
     };
     record_lead_message(run, message, &pending)?;
     let outcome =
-        match queue_lead_message(executable, &run.home, &run.lead_thread, message.envelope) {
+        match queue_lead_message(executable, lead_home, &run.lead_thread, message.envelope) {
             Ok(outcome) => outcome,
             Err(error) => {
                 // The command could not be started or its lifecycle could not be
@@ -2835,7 +2914,7 @@ fn deliver_to_ordinary_lead(
     let attempt = match outcome {
         QueueOutcome::Accepted { detail } => {
             let evidence = ordinary_input_evidence(
-                &run.home,
+                lead_home,
                 &run.lead_thread,
                 message.id,
                 message.envelope,
@@ -2909,13 +2988,19 @@ fn reconcile_ordinary_lead(
             message.payload.len(),
         );
     }
-    let evidence = ordinary_input_evidence(
-        &run.home,
-        &run.lead_thread,
-        message.id,
-        message.envelope,
-        Instant::now() + EVIDENCE_WINDOW,
-    );
+    // The lead home was captured with the relationship; when the dispatching
+    // process recorded none, the conversation's own items cannot be read at
+    // this address, and the held attempt is reported from its own record
+    // instead of being upgraded.
+    let evidence = run.lead_home.as_deref().and_then(|lead_home| {
+        ordinary_input_evidence(
+            lead_home,
+            &run.lead_thread,
+            message.id,
+            message.envelope,
+            Instant::now() + EVIDENCE_WINDOW,
+        )
+    });
     if let Some(evidence) = evidence {
         let attempt = LeadAttempt {
             status: STATUS_DELIVERED,
@@ -2990,14 +3075,16 @@ fn reconcile_ordinary_lead(
 
 /// Runs the installed native queue command once, as an owned child under one
 /// Job with a bounded wait, and classifies the result: exit 0 is transport
-/// acceptance, a non-zero exit is the queue's own refusal, and a command whose
-/// end cannot be observed within the bound is unresolved. The command's own
-/// combined report is read back for the recorded detail. No listener, daemon
-/// or second conversation is started here, and the child tree is ended with
-/// its Job before this returns.
+/// acceptance; a non-zero exit counts as the queue's own refusal only when
+/// the command's own report carries the native rejection mark, because an
+/// arbitrary failure can follow an applied queue effect; any other non-zero
+/// exit, and any command whose end cannot be observed within the bound, is
+/// unresolved. The command's own combined report is read back for the
+/// recorded detail. No listener, daemon or second conversation is started
+/// here, and the child tree is ended with its Job before this returns.
 fn queue_lead_message(
     executable: &Path,
-    home: &Path,
+    lead_home: &Path,
     thread: &str,
     envelope: &str,
 ) -> io::Result<QueueOutcome> {
@@ -3011,7 +3098,7 @@ fn queue_lead_message(
         envelope.into(),
     ];
     spec.env
-        .insert("CODEX_HOME".into(), Some(home.as_os_str().to_owned()));
+        .insert("CODEX_HOME".into(), Some(lead_home.as_os_str().to_owned()));
     // This process is a member of an executor run; the queue command is not,
     // and a leaked conversation identity must not ride along as its native
     // identity.
@@ -3049,9 +3136,19 @@ fn queue_lead_message(
                 "the native queue accepted the message for thread {thread} (exit 0: {report})"
             ),
         },
-        StopReason::Exited => QueueOutcome::Refused {
+        StopReason::Exited if report.contains(QUEUE_REFUSAL_MARK) => QueueOutcome::Refused {
             detail: format!(
                 "the native queue refused the message for thread {thread} (exit {}: {report}); nothing was delivered",
+                outcome.process_exit_code
+            ),
+        },
+        // A non-zero exit without the native rejection mark does not prove no
+        // earlier queue effect: the command may have applied the input before
+        // failing. The attempt stays unresolved under its own identity
+        // instead of becoming retryable.
+        StopReason::Exited => QueueOutcome::Unresolved {
+            detail: format!(
+                "the native queue exited {} without naming its own rejection of the queue add ({report}); whether the message reached the lead conversation is unknown",
                 outcome.process_exit_code
             ),
         },
@@ -3124,6 +3221,12 @@ fn session_input_row(sessions: &Path, thread: &str, id: &str, envelope: &str) ->
     collect_rollouts(sessions, &mut files, 0);
     files.sort();
     for file in files.into_iter().rev() {
+        // A rollout filename carries its own conversation id, so the name
+        // narrows the candidates cheaply; it is never identity by itself: the
+        // file's own session metadata must still name the exact thread.
+        if !rollout_name_names(&file, thread) {
+            continue;
+        }
         if rollout_session(&file).as_deref() != Some(thread) {
             continue;
         }
@@ -3132,6 +3235,16 @@ fn session_input_row(sessions: &Path, thread: &str, id: &str, envelope: &str) ->
         }
     }
     None
+}
+
+/// Whether one rollout file's own name follows the native convention and
+/// carries the thread id as a substring, the same narrowing the existing
+/// successor locator uses. This only selects candidates for the metadata
+/// check that follows; it is never identity.
+fn rollout_name_names(file: &Path, thread: &str) -> bool {
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.contains(thread))
 }
 
 /// Collects the rollout files under one sessions tree, bounded in count and
@@ -3162,7 +3275,9 @@ fn collect_rollouts(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
 /// The conversation identity one rollout file's own metadata records, from its
 /// leading rows only. The filename is never consulted.
 fn rollout_session(file: &Path) -> Option<String> {
-    let mut reader = BufReader::new(fs::File::open(file).ok()?);
+    // The take bound caps the reader itself, so no single metadata line can
+    // allocate past the prefix this pass is allowed to read.
+    let mut reader = BufReader::new(fs::File::open(file).ok()?.take(ROLLOUT_META_PREFIX));
     let mut line = String::new();
     let mut read = 0u64;
     loop {
@@ -3202,7 +3317,9 @@ fn rollout_carries_input(file: &Path, id: &str, envelope: &str) -> bool {
     if start > 0 && handle.seek(io::SeekFrom::Start(start)).is_err() {
         return false;
     }
-    let mut reader = BufReader::new(handle);
+    // The take bound caps the read itself, so a file that keeps growing while
+    // this pass reads it cannot extend the pass beyond its own bound.
+    let mut reader = BufReader::new(handle.take(ROLLOUT_TAIL_BOUND));
     let mut line = String::new();
     loop {
         line.clear();

@@ -5969,7 +5969,7 @@ fn inherit_lead_endpoint(
                 note = format!("; a previous record of this slot could not be retired: {error}");
             }
             println!(
-                "executor lead channel: unavailable ({cause}); `codex-harness lead message` reports this condition and its remedy instead of sending, and this dispatch continues as before{note}. Remedy: host the lead session through `codex-harness lead start`, which records a verified endpoint for its exact thread, then dispatch again"
+                "executor lead channel: unavailable ({cause}); `codex-harness lead message` delivers to an ordinary lead conversation through the installed native CLI's own queue route when the dispatch recorded the originating lead's own kit home and that home registers a verifiable installed launcher, and it reports this condition and its remedy instead of sending when either is unavailable. This dispatch continues as before{note}. Remedy for a managed channel: host the lead session through `codex-harness lead start`, which records a verified endpoint for its exact thread, then dispatch again"
             );
         }
     }
@@ -8146,6 +8146,7 @@ mod tests {
             schema: control::ORIGINATING_LEAD_SCHEMA,
             thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2301".into(),
             run_generation: "test-run-generation".into(),
+            home: None,
             dispatcher: control::DispatcherIdentity {
                 pid: std::process::id(),
                 creation_time: 1,
@@ -8480,6 +8481,7 @@ mod tests {
             schema: control::ORIGINATING_LEAD_SCHEMA,
             thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2302".into(),
             run_generation: "test-run-generation".into(),
+            home: None,
             dispatcher: control::DispatcherIdentity {
                 pid: std::process::id(),
                 creation_time: 1,
