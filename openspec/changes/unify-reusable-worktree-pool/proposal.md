@@ -7,6 +7,7 @@ Isolated tasks currently have competing instructions for disposable Git worktree
 ## What Changes
 
 - Make the harness the sole allocator of managed task isolation, for ordinary isolated tasks, experiments, reviews and executors. Reuse the existing pool implementation rather than introduce another registry or service.
+- Disable the competing native `codex_worktrees` MCP tool surface in harness-managed ordinary, lead and executor sessions through supported Codex configuration. Verify its absence in fresh effective tool catalogues; retiring a skill or merely instructing an agent not to use the MCP is insufficient. Preserve existing worktrees and unrelated tools.
 - Separate acquiring an isolated checkout from launching an executor. Keep existing executor commands as consumers of the common lifecycle.
 - Identify one pool per Git repository across its linked worktrees. Create stable slots lazily and never exceed the configured pool capacity, including when all slots contain suspended or unreviewed work.
 - Separate `worktree_pool_size` from `max_concurrent_executors` in orchestration configuration, preserving existing installations through an explicit compatibility path.

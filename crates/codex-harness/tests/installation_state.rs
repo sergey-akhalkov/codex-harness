@@ -9,6 +9,10 @@ use std::{
     process::{Command, Output},
 };
 
+#[path = "fixtures/synthetic_role_build.rs"]
+#[allow(dead_code)]
+mod synthetic_role_build;
+
 struct Fixture {
     root: tempfile::TempDir,
     home: PathBuf,
@@ -79,6 +83,64 @@ impl Fixture {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("private version sentinel"));
         assert_eq!(fs::read(&self.state).unwrap(), expected);
     }
+}
+
+#[test]
+fn deploy_reset_rejects_a_foreign_source_build_before_removing_owned_links() {
+    let f = Fixture::new();
+    let original = synthetic_role_build::kit_source(&f.root.path().join("original"));
+    let requested = synthetic_role_build::kit_source(&f.root.path().join("requested"));
+    let build = synthetic_role_build::recorded_build(f.root.path(), &original);
+    assert_eq!(
+        harness_core::build_identity::source_identity(&original)
+            .unwrap()
+            .sha256,
+        harness_core::build_identity::source_identity(&requested)
+            .unwrap()
+            .sha256,
+        "the failure must concern the checkout path, not changed source contents"
+    );
+
+    let mut metadata = f.metadata();
+    metadata["links"].as_array_mut().unwrap().truncate(1);
+    metadata["links"][0]["owned"] = json!(true);
+    let target = PathBuf::from(metadata["links"][0]["source"].as_str().unwrap());
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, b"existing safeguards").unwrap();
+    let prior_metadata = f.write(&metadata);
+    let instructions = f.home.join("AGENTS.md");
+    symlink_file(&target, &instructions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["deploy", "--reset", "--source"])
+        .arg(&requested)
+        .arg("--build")
+        .arg(&build)
+        .arg("--codex-home")
+        .arg(&f.home)
+        .arg("--user-home")
+        .arg(&f.user)
+        .current_dir(f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read_link(&instructions).unwrap(), target);
+    assert_eq!(fs::read(&instructions).unwrap(), b"existing safeguards");
+    assert_eq!(fs::read(&f.state).unwrap(), prior_metadata);
+    assert!(
+        !fs::read_dir(f.state.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("installation.reset-"))
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("build belongs to another source checkout"),
+        "{output:?}"
+    );
 }
 
 #[test]

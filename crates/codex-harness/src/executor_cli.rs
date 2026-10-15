@@ -2514,7 +2514,10 @@ fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPath
 /// Record this process as the live host of a bound slot. A slot that was
 /// rebound to another session is refused instead of sharing the tree. Publishing
 /// the lease ends startup exclusion: the lease, not the creating process, is
-/// authoritative from this write onward.
+/// authoritative from this write onward. The lease names the canonical image
+/// of the running process: the installed launcher is a symlink a later deploy
+/// can retarget, so only the resolved path keeps naming the exact process the
+/// dispatch receipt records and the lease must agree with.
 fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
     let record = task_worktree::load_slot_record(codex_home, binding.repository(), binding.index)?
         .ok_or_else(|| {
@@ -2540,6 +2543,7 @@ fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
         )));
     }
     let program = std::env::current_exe()
+        .and_then(|program| program.canonicalize())
         .map_err(|error| invalid(&format!("executor session host path: {error}")))?;
     let user = harness_core::process_service::current_user()?;
     let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)?.identity();
@@ -2922,7 +2926,7 @@ impl WatchReport {
         {
             Some(match role_from_receipt(value) {
                 Ok(Some(role)) => role.summary(),
-                Ok(None) => "unrecorded (receipt written before role recording; resume or restart records the current role)".to_owned(),
+                Ok(None) => "unrecorded (receipt written before role recording)".to_owned(),
                 Err(error) => format!("invalid ({error})"),
             })
         } else {
@@ -7216,9 +7220,9 @@ mod tests {
     }
 
     /// Free text renders through the instruction owner: the caller's words stay
-    /// first and the installed rule follows, so `--exec` carries the lead
-    /// channel, the waiting behavior and the answer-required watch result
-    /// without the caller repeating them or teaching address discovery.
+    /// first and the small task contract follows, so `--exec` carries the
+    /// consumer and the concrete feedback address without the caller repeating
+    /// them and without restating the role-owned standing guidance.
     #[test]
     fn free_text_assignment_renders_the_executor_assignment_guidance() {
         let root = std::env::temp_dir().join(format!("executor-free-text-{}", std::process::id()));
@@ -7264,21 +7268,19 @@ mod tests {
             "a streamed or typed assignment renders one brief"
         );
         assert!(
-            text.contains("by piping codex-harness lead message"),
+            text.contains("feedback: return the result and any decision you escalate to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
             "{text}"
         );
-        assert!(
-            text.contains("asks for a reply unless --notify marks a notice that needs none"),
-            "{text}"
-        );
-        assert!(
-            text.contains("An executor watch result of 3 means answer that request"),
-            "{text}"
-        );
-        assert!(
-            text.contains("durable blockers, decisions and results stay on the bd issue"),
-            "{text}"
-        );
+        // Standing exchange guidance is owned by the executor role fragment
+        // and is not restated in the rendered brief.
+        for standing in [
+            "by piping codex-harness lead message",
+            "An executor watch result of 3 means answer that request",
+            "durable blockers, decisions and results stay on the bd issue",
+            "report a compact result: done and remaining work",
+        ] {
+            assert!(!text.contains(standing), "{standing}\n{text}");
+        }
         assert!(!text.contains("--session"), "{text}");
         let _ = fs::remove_dir_all(root);
     }
@@ -8877,6 +8879,12 @@ mod tests {
         );
         write_test_slot_record(&home, &source, &binding);
         record_lease(&home, &binding).unwrap();
+        let lease = read_lease(&lease_path(&home, &source, 1).unwrap()).unwrap();
+        assert_eq!(
+            lease.program,
+            std::env::current_exe().unwrap().canonicalize().unwrap(),
+            "the lease names the canonical image the dispatch receipt records"
+        );
         assert!(
             owner_live(&home, &source, "exec-ds-7"),
             "this test process is the recorded live host"

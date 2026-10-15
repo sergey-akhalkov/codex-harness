@@ -1,6 +1,9 @@
 //! Resolve owned responsibility guidance without changing routing or shared state.
 //! Native callers retain their applicable user/project configuration, then apply
 //! only these developer-instruction and skill-selection overrides to one session.
+//! A skill this role excludes or a user explicitly disables is also disabled at
+//! every validated copy under the repository's other registered worktrees, so a
+//! sibling checkout of this kit cannot leak the skill back into the session.
 use crate::{build_identity, inventory};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,6 +47,10 @@ struct RoleSource {
 pub struct ManagedSkill {
     pub name: String,
     pub path: PathBuf,
+    /// Validated copies of the same file at the same relative path under the
+    /// repository's other registered worktrees; native discovery may report
+    /// one of these instead of the owned source path.
+    pub aliases: Vec<PathBuf>,
     /// Membership allows discovery; this never overrides an explicit disable.
     pub allowed: bool,
 }
@@ -125,6 +132,7 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
     }
     let mut skills = Vec::new();
     let skill_root = source(&manifest.skills)?;
+    let co_roots = co_worktree_roots(&root);
     for entry in fs::read_dir(skill_root)? {
         let entry = entry?;
         let path = entry.path();
@@ -140,9 +148,12 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
                 "managed skill {name} is unclassified or duplicated"
             ))
         })?;
+        let path = path.canonicalize()?;
+        let aliases = skill_aliases(&root, &path, &co_roots);
         skills.push(ManagedSkill {
             name,
-            path: path.canonicalize()?,
+            path,
+            aliases,
             allowed: owner.is_none() || owner == Some(role),
         });
     }
@@ -194,6 +205,80 @@ fn names_path(entry: &toml::Value, path: &Path) -> bool {
         .is_some_and(|value| value == path)
 }
 
+/// Other registered checkouts of `root`'s Git repository. A managed session's
+/// case is often a sibling worktree of the kit source, and native discovery
+/// then reports the same skill file at that checkout's path; role filtering
+/// must reach those copies. Best-effort: a missing Git, a foreign source or
+/// any failure contributes no aliases and never fails resolution.
+fn co_worktree_roots(root: &Path) -> Vec<PathBuf> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut roots = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(path) = line.trim_end_matches('\r').strip_prefix("worktree ") else {
+            continue;
+        };
+        let mut candidate = PathBuf::from(path);
+        if candidate.is_relative() {
+            candidate = root.join(candidate);
+        }
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if canonical != root {
+            roots.push(canonical);
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The validated copies of one skill: the same relative path under each
+/// sibling worktree, keeping only canonical ordinary files that stay inside
+/// their checkout and differ from the owned source path.
+fn skill_aliases(root: &Path, path: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    for other in roots {
+        let candidate = other.join(relative);
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if canonical == path || !canonical.starts_with(other) || aliases.contains(&canonical) {
+            continue;
+        }
+        if build_identity::ordinary(&candidate).is_err() {
+            continue;
+        }
+        aliases.push(canonical);
+    }
+    aliases
+}
+
+/// One native disable entry for a skill file, portable across hosts.
+fn disabled_entry(path: &Path) -> toml::Value {
+    // Native 0.162.1 identifies the SKILL.md file, not its directory.
+    // Strip Windows' verbatim prefix for portable native path input.
+    let path = path.to_string_lossy();
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    toml::Value::Table(toml::Table::from_iter([
+        ("path".into(), path.into()),
+        ("enabled".into(), false.into()),
+    ]))
+}
+
 impl ResolvedRole {
     /// `retained` is the applicable native user/project layer, excluding the
     /// owned portable defaults. Return only native dotted leaf overrides, so
@@ -213,33 +298,28 @@ impl ResolvedRole {
             Some(_) => return Err(invalid("skills.config must be an array")),
         };
         for skill in &self.skills {
+            let paths = std::iter::once(&skill.path)
+                .chain(skill.aliases.iter())
+                .collect::<Vec<_>>();
             let explicitly_disabled = entries.iter().any(|entry| {
-                names_path(entry, &skill.path)
-                    && entry.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+                entry.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+                    && paths.iter().any(|path| names_path(entry, path))
             });
             if skill.allowed && !explicitly_disabled {
                 continue;
             }
-            let mut present = false;
-            for entry in entries
-                .iter_mut()
-                .filter(|entry| names_path(entry, &skill.path))
-            {
-                let table = entry
-                    .as_table_mut()
-                    .ok_or_else(|| invalid("skill configuration must be a table"))?;
-                table.insert("enabled".into(), false.into());
-                present = true;
-            }
-            if !present {
-                // Native 0.162.1 identifies the SKILL.md file, not its directory.
-                // Strip Windows' verbatim prefix for portable native path input.
-                let path = skill.path.to_string_lossy();
-                let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
-                entries.push(toml::Value::Table(toml::Table::from_iter([
-                    ("path".into(), path.into()),
-                    ("enabled".into(), false.into()),
-                ])));
+            for path in paths {
+                let mut present = false;
+                for entry in entries.iter_mut().filter(|entry| names_path(entry, path)) {
+                    let table = entry
+                        .as_table_mut()
+                        .ok_or_else(|| invalid("skill configuration must be a table"))?;
+                    table.insert("enabled".into(), false.into());
+                    present = true;
+                }
+                if !present {
+                    entries.push(disabled_entry(path));
+                }
             }
         }
         Ok(toml::Table::from_iter([
@@ -452,5 +532,123 @@ mod tests {
         let entries = empty["skills.config"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(names_path(&entries[0], &coordinate.path));
+    }
+
+    /// A repository-backed fixture: the owned source tree committed, plus one
+    /// linked worktree of the same repository carrying identical copies.
+    fn linked_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let root = fixture();
+        let parent = tempfile::tempdir().unwrap();
+        let linked = parent.path().join("linked");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.name=role fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&linked)
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git worktree add: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (root, parent, linked)
+    }
+
+    #[test]
+    fn role_filtering_reaches_identical_copies_in_linked_worktrees() {
+        let (root, parent, linked) = linked_fixture();
+        let linked = linked.canonicalize().unwrap();
+        let executor = resolve(root.path(), Role::Executor).unwrap();
+        let coordinate = executor
+            .skills
+            .iter()
+            .find(|skill| skill.name == "coordinate")
+            .unwrap();
+        let alias = linked
+            .join("skills")
+            .join("coordinate")
+            .join("SKILL.md")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(coordinate.aliases, vec![alias.clone()]);
+        let verify = executor
+            .skills
+            .iter()
+            .find(|skill| skill.name == "verify")
+            .unwrap();
+        assert_eq!(
+            verify.aliases,
+            vec![
+                linked
+                    .join("skills")
+                    .join("verify")
+                    .join("SKILL.md")
+                    .canonicalize()
+                    .unwrap()
+            ]
+        );
+
+        // An unrelated same-name tree outside the repository is never adopted.
+        let foreign = parent.path().join("foreign");
+        let foreign_skill = foreign.join("skills").join("coordinate").join("SKILL.md");
+        fs::create_dir_all(foreign_skill.parent().unwrap()).unwrap();
+        fs::write(&foreign_skill, "---\nname: coordinate\n---\nbody").unwrap();
+        let foreign_skill = foreign_skill.canonicalize().unwrap();
+        assert!(!coordinate.aliases.contains(&foreign_skill));
+
+        let retained: toml::Table = toml::from_str(&format!(
+            "[[skills.config]]\npath = {}\nenabled = true\ncustom = 'preserved'",
+            serde_json::to_string(foreign_skill.to_string_lossy().as_ref()).unwrap()
+        ))
+        .unwrap();
+        let overrides = executor.native_overrides(&retained).unwrap();
+        let config = overrides["skills.config"].as_array().unwrap();
+        assert_eq!(config.len(), 3);
+        assert_eq!(config[0], retained["skills"]["config"][0]);
+        assert!(
+            config[1..]
+                .iter()
+                .all(|entry| entry["enabled"].as_bool() == Some(false))
+        );
+        assert!(
+            config[1..]
+                .iter()
+                .any(|entry| names_path(entry, &coordinate.path))
+        );
+        assert!(config[1..].iter().any(|entry| names_path(entry, &alias)));
+        assert!(
+            config[1..]
+                .iter()
+                .all(|entry| !names_path(entry, &foreign_skill))
+        );
+
+        // The lead role keeps every copy enabled: the disablement is role
+        // selection, not a blanket same-name or same-path filter.
+        let lead = resolve(root.path(), Role::Lead).unwrap();
+        let overrides = lead.native_overrides(&toml::Table::new()).unwrap();
+        assert_eq!(overrides["skills.config"].as_array().unwrap().len(), 0);
     }
 }

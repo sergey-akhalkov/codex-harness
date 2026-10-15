@@ -131,12 +131,12 @@ TUI on the same observed lifecycle, not an unobserved launcher.
 For file-specific work, prefer `--assignment FILE` - or pipe the assignment
 into `--exec -` - instead of a long `--exec` argument; its required fields are
 `objective` (include the board id), `inputs`, `outputs`, `invariants` and
-`acceptance`, and `consumer` and `escalate` are additive. The brief itself
-carries the escalation boundaries and the compact result expected back on top
-of the rendered task-specific contract - outcome, checkout, base, owned
-paths, checks, consumer and extra boundaries. The executor's standing
-responsibility guidance - work cycle, base verification and the heavy-command
-lane - reaches a managed session once through its resolved role context, so
+`acceptance`, and `consumer` and `escalate` are additive. The brief carries
+the task contract: outcome, checkout, base, owned paths, checks, consumer,
+feedback address and additional escalation boundaries. The executor's standing
+guidance - work cycle, base verification, heavy-command lane, feedback and
+waiting rules, and compact result shape - reaches a managed session once
+through its resolved role context, so
 do not restate it in the objective. `codex-harness lead message` (piped
 content or a short `--text`) addresses the originating lead itself and holds
 the run while it waits for the answer, so an executor reports its question

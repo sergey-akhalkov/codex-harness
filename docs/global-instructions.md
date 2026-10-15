@@ -27,7 +27,7 @@ developer guidance and repeated executor briefs:
 | Native routing restrictions, Code Mode/RTK use, opaque-state and desktop safeguards | [Shared developer guidance](../global/harness.config.toml) |
 | Activation, decomposition, assignment snapshots and exact paths, model selection, supervision, succession, visibility, integration and acceptance | [Lead responsibility](../global/roles/lead.md) |
 | The executor's local implementation/check/correction cycle, base verification, standing return boundaries, feedback waiting and result evidence | [Executor responsibility](../global/roles/executor.md) |
-| Task objective, actual checkout/base, owned paths, invariants, acceptance, consumer and additional boundaries | [Assignment renderer](../crates/codex-harness/src/executor_assignment.rs) |
+| Task objective, actual checkout/base, owned paths, invariants, acceptance, consumer, concrete feedback address and additional boundaries | [Assignment renderer](../crates/codex-harness/src/executor_assignment.rs) |
 
 The source checker resolves both roles with the runtime's shared Rust resolver
 and rejects missing/escaping sources and unclassified managed skills. The
@@ -35,6 +35,30 @@ common file is limited to 24,576 UTF-8 bytes. Role and developer text, native
 skill metadata, invoked bodies, required references and generated briefs all
 remain part of guidance-load accounting; moving text does not establish a
 reduction or a behavioral improvement.
+
+`harness-source-check --accounting` prints one reproducible line per role for
+the fixed session load: LF-normalized UTF-8 bytes and whitespace words for the
+common core, the owned developer text, the selected role fragment and that
+role's visible catalogue metadata. `--accounting --invoked ROLE=NAME[,NAME]`
+adds the distinct named skill bodies after frontmatter plus every distinct
+local link target found in those bodies as a reference upper bound
+(`reference_scope=all_links_upper_bound`): repeated names count once, a link
+that points at another invoked body is counted under invoked bodies instead of
+again as a reference, links inside linked files are not followed, and external
+or non-file targets and unresolved targets are counted separately. The line
+does not distinguish required from optional links and claims no completeness:
+the references a real task actually consumes are not derivable from skill text
+alone. Generated briefs stay with the retained assignment-renderer measurement,
+so no surface is counted twice. Against the pinned pre-partition baseline (24,977-byte common
+core, 6,669-byte developer text, 6,185-byte 23-skill catalogue; 37,831 bytes /
+4,970 words per session) the current fixed load is 30,619 bytes / 3,997 words
+for the executor (-19.1% / -19.6%), 36,993 bytes / 4,851 words for the lead
+(-2.2% / -2.4%) and 67,612 / 8,848 for the combined two-role load (-10.6% /
+-11.0%). These are source-text sizes: the comparison excludes generated
+briefs, invoked bodies and linked reference files (measured separately and not yet
+for a matched task) and establishes no semantic equivalence, quality or speed
+benefit. Semantic coverage and real-task comparisons remain open in
+[the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md).
 
 The ordinary local launcher resolves the role before startup and composes it
 with the applicable native profile, project and session context. Managed

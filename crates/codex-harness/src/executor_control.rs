@@ -2264,7 +2264,7 @@ fn unresolved_reply_hold_at(receipt: &Path) -> io::Result<bool> {
     })
 }
 
-fn item_client_id(item: &Value) -> Option<&str> {
+pub(crate) fn item_client_id(item: &Value) -> Option<&str> {
     item.get("clientId")
         .or_else(|| item.get("client_id"))
         .and_then(Value::as_str)

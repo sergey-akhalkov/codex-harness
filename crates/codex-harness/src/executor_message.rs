@@ -1611,7 +1611,7 @@ codex-harness lead message [--text TEXT | --file FILE] [--notify]
   address. The default asks for a reply; --notify does not.
 ";
 
-const PAYLOAD_MARK: &str = "\n---payload---\n";
+pub(crate) const PAYLOAD_MARK: &str = "\n---payload---\n";
 const KIND_REQUEST: &str = "reply-request";
 const KIND_NOTICE: &str = "notification";
 const UNAVAILABLE: &str = "unavailable";
@@ -1870,7 +1870,7 @@ fn registered_text(value: &Value) -> String {
         .to_owned()
 }
 
-fn matching_receipts(home: &Path, marker: &str) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn matching_receipts(home: &Path, marker: &str) -> io::Result<Vec<PathBuf>> {
     let root = home.join("harness/executor-pool");
     if !root.is_dir() {
         return Ok(Vec::new());
