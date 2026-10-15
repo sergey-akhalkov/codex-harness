@@ -38,6 +38,18 @@ impl Fixture {
         }
         command.output().unwrap()
     }
+    fn account(&self, invoked: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harness-source-check"));
+        command
+            .arg("--root")
+            .arg(self.repo())
+            .arg("--accounting")
+            .current_dir(self.0.path());
+        for spec in invoked {
+            command.arg("--invoked").arg(spec);
+        }
+        command.output().unwrap()
+    }
 }
 
 #[test]
@@ -165,7 +177,7 @@ fn kit_fixture() -> Fixture {
 shared_skills = ["fixture-skill"]
 [roles.lead]
 instructions = "global/roles/lead.md"
-skills = []
+skills = ["lead-only"]
 [roles.executor]
 instructions = "global/roles/executor.md"
 skills = []
@@ -176,6 +188,10 @@ skills = []
     f.write(
         "fixture-skills/fixture-skill/SKILL.md",
         "---\nname: fixture-skill\ndescription: Owned fixture skill\n---\nFixture.\n",
+    );
+    f.write(
+        "fixture-skills/lead-only/SKILL.md",
+        "---\nname: lead-only\ndescription: Lead fixture skill\n---\nLead.\n",
     );
     for owner in harness_core::report_owners::TOKEN_AUDIT_OWNERS {
         f.write(owner, "# Owner\n");
@@ -235,4 +251,258 @@ fn kit_refuses_an_owner_link_outside_the_checkout() {
     assert_eq!(bad.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bad.stdout).contains("invalid-report-owner"));
     assert_eq!(fs::read_to_string(outside).unwrap(), "# Outside\n");
+}
+
+fn accounting_field(output: &str, role: &str, surface: &str, key: &str) -> usize {
+    let prefix = format!("guidance-accounting role={role} surface={surface} ");
+    let line = output
+        .lines()
+        .find(|line| line.starts_with(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {surface} accounting line for {role}"));
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(format!("{key}=").as_str()))
+        .unwrap_or_else(|| panic!("no {key} field"))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn accounting_reports_the_fixed_load_per_role_once() {
+    let f = kit_fixture();
+    let measured = f.account(&[]);
+    assert_eq!(
+        measured.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&measured.stderr)
+    );
+    let output = String::from_utf8_lossy(&measured.stdout);
+    assert!(
+        output.contains(concat!(
+            "guidance-accounting role=lead surface=fixed visible_skills=2 metadata_bytes=63 metadata_words=8 ",
+            "common_bytes=21 common_words=3 developer_bytes=14 developer_words=2 role_bytes=7 role_words=2 ",
+            "fixed_bytes=105 fixed_words=15"
+        )),
+        "{output}"
+    );
+    assert!(
+        output.contains(concat!(
+            "guidance-accounting role=executor surface=fixed visible_skills=1 metadata_bytes=34 metadata_words=4 ",
+            "common_bytes=21 common_words=3 developer_bytes=14 developer_words=2 role_bytes=11 role_words=2 ",
+            "fixed_bytes=80 fixed_words=11"
+        )),
+        "{output}"
+    );
+}
+
+#[test]
+fn accounting_attributes_growth_to_the_owning_role_and_surface() {
+    let f = kit_fixture();
+    // A longer executor fragment changes only the executor role surface.
+    f.write("global/roles/executor.md", "# Executor\none more rule\n");
+    let grown = f.account(&[]);
+    let output = String::from_utf8_lossy(&grown.stdout).into_owned();
+    assert_eq!(
+        accounting_field(&output, "executor", "fixed", "role_bytes"),
+        25
+    );
+    assert_eq!(
+        accounting_field(&output, "executor", "fixed", "fixed_bytes"),
+        94
+    );
+    assert_eq!(accounting_field(&output, "lead", "fixed", "role_bytes"), 7);
+    assert_eq!(
+        accounting_field(&output, "lead", "fixed", "fixed_bytes"),
+        105
+    );
+    // Shared catalogue metadata moves both roles; a lead-only skill description
+    // moves only the lead total.
+    f.write(
+        "fixture-skills/fixture-skill/SKILL.md",
+        "---\nname: fixture-skill\ndescription: Owned fixture skill plus\n---\nFixture.\n",
+    );
+    let shared = f.account(&[]);
+    let output = String::from_utf8_lossy(&shared.stdout).into_owned();
+    assert_eq!(
+        accounting_field(&output, "executor", "fixed", "metadata_bytes"),
+        39
+    );
+    assert_eq!(
+        accounting_field(&output, "lead", "fixed", "metadata_bytes"),
+        68
+    );
+    f.write(
+        "fixture-skills/lead-only/SKILL.md",
+        "---\nname: lead-only\ndescription: Lead fixture skill more\n---\nLead.\n",
+    );
+    let lead_only = f.account(&[]);
+    let output = String::from_utf8_lossy(&lead_only.stdout).into_owned();
+    assert_eq!(
+        accounting_field(&output, "executor", "fixed", "metadata_bytes"),
+        39
+    );
+    assert_eq!(
+        accounting_field(&output, "lead", "fixed", "metadata_bytes"),
+        73
+    );
+    // Bytes, not characters: a multi-byte fragment counts UTF-8 bytes.
+    f.write("global/roles/executor.md", "# Executor\n\u{e9}\n");
+    let unicode = f.account(&[]);
+    let output = String::from_utf8_lossy(&unicode.stdout).into_owned();
+    assert_eq!(
+        accounting_field(&output, "executor", "fixed", "role_bytes"),
+        14
+    );
+    assert_eq!(
+        accounting_field(&output, "executor", "fixed", "role_words"),
+        3
+    );
+}
+
+#[test]
+fn accounting_counts_invoked_bodies_and_deduplicated_local_references() {
+    let f = kit_fixture();
+    f.write(
+        "fixture-skills/fixture-skill/SKILL.md",
+        "---\nname: fixture-skill\ndescription: Owned fixture skill\n---\nFixture body.\n[Notes](notes.md)\n[Again](notes.md)\n[Site](https://example.com/x)\n",
+    );
+    f.write("fixture-skills/fixture-skill/notes.md", "notes\n");
+    let measured = f.account(&["executor=fixture-skill"]);
+    assert_eq!(
+        measured.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&measured.stderr)
+    );
+    let output = String::from_utf8_lossy(&measured.stdout);
+    assert!(
+        output.contains(concat!(
+            "guidance-accounting role=executor surface=invoked invoked_skills=1 invoked_bytes=80 invoked_words=5 ",
+            "local_references=1 local_reference_bytes=6 local_reference_words=1 external_references=1 ",
+            "unresolved_references=0 composed_bytes=166 composed_words=17"
+        )),
+        "{output}"
+    );
+    assert!(!output.contains("role=lead surface=invoked"), "{output}");
+    // A skill that is not visible to the chosen role is refused.
+    let hidden = f.account(&["executor=lead-only"]);
+    assert_eq!(hidden.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&hidden.stderr).contains("not visible to that role"),
+        "{}",
+        String::from_utf8_lossy(&hidden.stderr)
+    );
+}
+
+#[test]
+fn accounting_normalizes_checkout_line_endings() {
+    let f = kit_fixture();
+    let files = [
+        ("global/principles-of-work.md", "# Working principles\n"),
+        (
+            "global/harness.config.toml",
+            "developer_instructions = 'Shared context'\n",
+        ),
+        ("global/roles/executor.md", "# Executor\none more rule\n"),
+        (
+            "fixture-skills/fixture-skill/SKILL.md",
+            "---\nname: fixture-skill\ndescription: Owned fixture skill\n---\nFixture body.\n[Notes](notes.md)\n",
+        ),
+        ("fixture-skills/fixture-skill/notes.md", "notes\n"),
+    ];
+    for (name, body) in files {
+        f.write(name, body);
+    }
+    let lf = f.account(&["executor=fixture-skill"]);
+    assert_eq!(
+        lf.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&lf.stderr)
+    );
+    let lf_output = String::from_utf8_lossy(&lf.stdout).into_owned();
+    for (name, body) in files {
+        f.write(name, &body.replace('\n', "\r\n"));
+    }
+    let crlf = f.account(&["executor=fixture-skill"]);
+    assert_eq!(
+        crlf.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&crlf.stderr)
+    );
+    let crlf_output = String::from_utf8_lossy(&crlf.stdout).into_owned();
+    for (surface, key) in [
+        ("fixed", "fixed_bytes"),
+        ("fixed", "fixed_words"),
+        ("invoked", "invoked_bytes"),
+        ("invoked", "invoked_words"),
+        ("invoked", "local_reference_bytes"),
+        ("invoked", "local_reference_words"),
+    ] {
+        assert_eq!(
+            accounting_field(&crlf_output, "executor", surface, key),
+            accounting_field(&lf_output, "executor", surface, key),
+            "{surface} {key} changed with checkout line endings"
+        );
+    }
+}
+
+#[test]
+fn accounting_requires_a_kit_root_and_valid_role_inputs() {
+    let plain = Fixture::new();
+    plain.write("README.md", "# Plain\n");
+    let refused = plain.account(&[]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("role accounting unavailable"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let f = kit_fixture();
+    let unpaired = Command::new(env!("CARGO_BIN_EXE_harness-source-check"))
+        .arg("--root")
+        .arg(f.repo())
+        .args(["--invoked", "executor=fixture-skill"])
+        .current_dir(f.0.path())
+        .output()
+        .unwrap();
+    assert_eq!(unpaired.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unpaired.stderr).contains("--invoked requires --accounting"),
+        "{}",
+        String::from_utf8_lossy(&unpaired.stderr)
+    );
+    let wrong_role = f.account(&["planner=fixture-skill"]);
+    assert_eq!(wrong_role.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&wrong_role.stderr).contains("lead or executor"),
+        "{}",
+        String::from_utf8_lossy(&wrong_role.stderr)
+    );
+
+    fs::remove_file(f.repo().join("global/roles/executor.md")).unwrap();
+    let broken = f.account(&[]);
+    assert_eq!(broken.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&broken.stdout).contains("role-context-invalid"));
+    assert!(
+        String::from_utf8_lossy(&broken.stderr).contains("role accounting unavailable"),
+        "{}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+}
+
+#[test]
+fn accounting_keeps_findings_and_still_reports_a_valid_kit() {
+    let f = kit_fixture();
+    f.write("README.md", "[Missing](absent.md)\n");
+    let bad = f.account(&[]);
+    assert_eq!(bad.status.code(), Some(1));
+    let output = String::from_utf8_lossy(&bad.stdout);
+    assert!(output.contains("missing-local-link"), "{output}");
+    assert!(
+        output.contains("guidance-accounting role=executor surface=fixed"),
+        "{output}"
+    );
 }
