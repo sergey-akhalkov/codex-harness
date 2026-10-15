@@ -52,6 +52,24 @@ The harness SHALL provide one managed worktree pool per Git repository, shared b
 - **WHEN** tasks target two independent Git repositories
 - **THEN** each repository has its own pool and task ownership without treating a worktree of another repository as a reusable slot
 
+### Requirement: Suppress the competing native worktree tool surface
+
+Harness-managed ordinary, lead and executor sessions SHALL suppress the native `codex_worktrees` MCP surface through supported Codex configuration. Acceptance SHALL verify absence from effective tool catalogues and a working harness pool. Installation, update and recovery SHALL preserve existing worktrees and unrelated settings.
+
+#### Scenario: Fresh ordinary and executor sessions expose one allocator
+- **WHEN** the installed harness starts fresh ordinary/lead and executor sessions with the common pool selected
+- **THEN** their effective tool catalogues omit the `codex_worktrees` tools and the installed harness acquisition and reuse path remains functional
+- **AND** skill retirement, an unverified configuration value or instruction-only avoidance SHALL NOT count as disabling the tool surface
+
+#### Scenario: An existing conversation retains native tools
+- **WHEN** a saved or running conversation still exposes the native worktree tools after configuration changes
+- **THEN** inspection reports the remaining tools and the supported restart or configuration remedy, without claiming that the current conversation has been updated
+- **AND** an explicit override or host-injected surface that re-exposes the competing tools SHALL be reported as a configuration conflict rather than successful managed-pool delivery
+
+#### Scenario: Disabling the surface preserves existing work
+- **WHEN** the configuration is installed, updated or rolled back while foreign or Codex-managed worktrees exist
+- **THEN** those directories, pending changes and recovery inputs remain intact, unrelated tools retain their settings, and any limitation on inspection or recovery is exposed before dependent use
+
 ### Requirement: Hard capacity with lazy reusable slots
 
 The pool SHALL have a positive configured capacity N. It SHALL create stable slots lazily and MUST NOT create, register or replace a managed slot outside positions 1 through N. Existing suitable free slots SHALL be reused. Live, suspended, reserved and unreviewed tasks SHALL consume capacity. Exhaustion SHALL return the occupied slots and causes without allocating overflow worktrees or evicting held work.
