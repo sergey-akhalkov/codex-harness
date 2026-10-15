@@ -41,6 +41,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use harness_core::process::{Cancellation, Deadline, StopReason};
+use std::ffi::OsString;
+
+/// Ordinary-lead queue boundary markers: one per installed `codex queue`
+/// invocation, so a delivery can only be attributed to the invocation that
+/// carried its mark.
+const ORDINARY_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-NO-ENDPOINT-8me13";
+const ENDPOINT_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-ENDPOINT-8me13";
+const MISSING_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-MISSING-THREAD-8me13";
+/// A well-formed thread id the running receiver does not own.
+const MISSING_THREAD_ID: &str = "00000000-0000-4000-8000-000000000000";
+
 const WAIT: Duration = Duration::from_secs(20);
 /// One fresh dispatch runs the executor shell preflight before its session
 /// exists, so the first record takes longer than a watch step.
@@ -138,6 +150,17 @@ fn seed_launcher_registration(home: &Path) {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_version_requirement(Some("0.157.0"))
+}
+
+/// Builds the same owned fixture for the installation-record upstream binary:
+/// the ordinary-lead boundary probe must run the installed native CLI, and it
+/// records the actual version instead of requiring a historical pin.
+fn installed_fixture() -> Fixture {
+    fixture_with_version_requirement(None)
+}
+
+fn fixture_with_version_requirement(required: Option<&str>) -> Fixture {
     let exe = codex_exe();
     let owned_root = BrokerRoot::prepare().unwrap().keep();
     let root = owned_root.path();
@@ -147,10 +170,24 @@ fn fixture() -> Fixture {
     fs::create_dir(&workspace).unwrap();
     seed_launcher_registration(&home);
     let version = version_text(&exe);
-    assert!(
-        version.contains("codex-cli 0.157.0"),
-        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.157.0 binary: {version}"
-    );
+    match required {
+        Some(required) => {
+            let expected = format!("codex-cli {required}");
+            assert!(
+                version.contains(expected.as_str()),
+                "HARNESS_CONTROL_CODEX_EXE must be the installed Codex {required} binary: {version}"
+            );
+        }
+        None => {
+            let upstream = installed_upstream();
+            assert!(
+                same_executable(&exe, &upstream),
+                "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the ordinary-lead boundary probe runs the installed native CLI, not another binary",
+                exe.display(),
+                upstream.display()
+            );
+        }
+    }
     let responses = control_responses::Responses::start(root.into(), true);
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
     fs::write(
@@ -2429,5 +2466,411 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
         id_a,
         lead_a.state.display(),
         id_b
+    );
+}
+
+/// Runs one installed native command in the fixture's own home and bounded
+/// Job; the command's own report is recorded, never accepted as delivery.
+fn run_native_command(
+    fixture: &Fixture,
+    args: Vec<OsString>,
+    envs: Vec<(String, String)>,
+    label: &str,
+) -> Value {
+    let root = fixture.root.path();
+    let mut spec = command(&fixture.exe, &root.join("home"), &fixture.workspace);
+    spec.args = args;
+    for (key, value) in envs {
+        spec.env.insert(key.into(), Some(value.into()));
+    }
+    let stdout_path = root.join(format!("{label}-stdout.txt"));
+    let stderr_path = root.join(format!("{label}-stderr.txt"));
+    spec.stdout = Some(fs::File::create(&stdout_path).unwrap());
+    spec.stderr = Some(fs::File::create(&stderr_path).unwrap());
+    let job = Job::new(Limits::default()).unwrap();
+    let child = job.spawn(&spec).unwrap();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    json!({
+        "exitCode": outcome.exit_code,
+        "exited": outcome.reason == StopReason::Exited,
+        "reason": format!("{:?}", outcome.reason),
+        "stdout": excerpt(&stdout, 1500),
+        "stderr": excerpt(&stderr, 1500),
+    })
+}
+
+/// One `codex queue` invocation: the target thread is always explicit, and
+/// only the endpoint variant names the owning listener and passes the
+/// capability token through the environment of the command itself.
+fn queue_arguments(thread: &str, message: &str, endpoint: bool, port: u16) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "queue".into(),
+        "--thread".into(),
+        thread.into(),
+        "--message".into(),
+        message.into(),
+    ];
+    if endpoint {
+        args.push("--remote".into());
+        args.push(format!("ws://127.0.0.1:{port}").into());
+        args.push("--remote-auth-token-env".into());
+        args.push("HARNESS_ORDINARY_LEAD_TOKEN".into());
+    }
+    args
+}
+
+/// Every provider request the owned canned provider recorded, with the
+/// conversation identity the native request carried.
+fn provider_entries(root: &Path) -> Vec<(String, Value, String, String)> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(root).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("provider-") && name.ends_with(".json")) {
+            continue;
+        }
+        let body = fs::read(entry.path()).unwrap_or_default();
+        let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        let identity = RequestIdentity::from_request(&request)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        entries.push((name, request, identity.thread, identity.turn));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+/// Provider requests containing the marker, with the conversation identity
+/// each native request carried.
+fn provider_hits(root: &Path, marker: &str) -> Vec<(String, String, String)> {
+    provider_entries(root)
+        .into_iter()
+        .filter(|(_, request, _, _)| contains_payload(request, marker))
+        .map(|(name, _, thread, turn)| (name, thread, turn))
+        .collect()
+}
+
+fn provider_request_count(root: &Path) -> usize {
+    provider_entries(root).len()
+}
+
+/// Requests that reached a conversation other than the receiver's own: a
+/// clone, resume or second conversation appears here.
+fn foreign_provider_requests(root: &Path, thread: &str) -> Vec<(String, String, String)> {
+    provider_entries(root)
+        .into_iter()
+        .filter(|(_, _, hit_thread, _)| hit_thread != thread)
+        .map(|(name, _, hit_thread, turn)| (name, hit_thread, turn))
+        .collect()
+}
+
+fn hit_json(hits: &[(String, String, String)]) -> Vec<Value> {
+    hits.iter()
+        .map(|(file, thread, turn)| json!({"file": file, "thread": thread, "turn": turn}))
+        .collect()
+}
+
+fn count_files(dir: &Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_files(&path);
+            } else {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Establishes the installed native notification boundary for an already
+/// running ordinary CLI conversation: one owned native app-server with one
+/// running idle conversation in this CODEX_HOME, and the installed `codex
+/// queue` against it without an endpoint (the ordinary conversation's state:
+/// no listener, no daemon), with the owning endpoint and capability token, and
+/// with an endpoint but a thread this receiver does not own. Delivery is the
+/// receiver's own provider input on its exact thread together with its own
+/// thread item; exit status, report text and process state are recorded
+/// separately and are not delivery.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; owned native app-server fixture and canned Responses; no live model"]
+fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
+    let fixture = installed_fixture();
+    let root = fixture.root.path().to_path_buf();
+    let home = root.join("home");
+    let daemon_socket = home
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    let version = version_text(&fixture.exe);
+    let user = process_service::current_user().unwrap();
+    eprintln!("ordinary-lead queue boundary evidence: {}", root.display());
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let started = owner.request(
+        "thread/start",
+        json!({
+            "cwd": fixture.workspace,
+            "model": "gpt-6-astra",
+            "modelProvider": "control_fixture",
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access"
+        }),
+    );
+    let thread = started["thread"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread/start answered {started}"))
+        .to_owned();
+    let baseline = owner.request(
+        "thread/read",
+        json!({"threadId": thread, "includeTurns": true}),
+    );
+    assert_eq!(baseline["thread"]["id"], thread, "{baseline}");
+    assert_eq!(baseline["thread"]["status"]["type"], "idle", "{baseline}");
+    assert_eq!(
+        baseline.to_string().matches(ORDINARY_QUEUE_MARK).count(),
+        0,
+        "the idle conversation must not carry the mark before any queue attempt"
+    );
+    let baseline_requests = provider_request_count(&root);
+    let sessions_before = count_files(&home.join("sessions"));
+
+    // 1. The ordinary conversation's own state: the conversation runs, it has
+    // no `-listen` endpoint, and this home has no app-server daemon.
+    let unmanaged = run_native_command(
+        &fixture,
+        queue_arguments(&thread, ORDINARY_QUEUE_MARK, false, fixture.port),
+        Vec::new(),
+        "queue-no-endpoint",
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    let unmanaged_hits = provider_hits(&root, ORDINARY_QUEUE_MARK);
+    let after_unmanaged = owner.request(
+        "thread/read",
+        json!({"threadId": thread, "includeTurns": true}),
+    );
+    let received_without_endpoint = after_unmanaged
+        .to_string()
+        .matches(ORDINARY_QUEUE_MARK)
+        .count();
+    let delivered_without_endpoint = !unmanaged_hits.is_empty();
+    let daemon_socket_after_unmanaged = daemon_socket.exists();
+    let sessions_after_unmanaged = count_files(&home.join("sessions"));
+    let mut daemon_cleanup = Value::Null;
+    if daemon_socket_after_unmanaged {
+        daemon_cleanup = run_native_command(
+            &fixture,
+            vec!["app-server".into(), "daemon".into(), "stop".into()],
+            Vec::new(),
+            "daemon-stop",
+        );
+    }
+    let unmanaged_consistent = !delivered_without_endpoint || received_without_endpoint == 1;
+
+    // 2. The owning endpoint and capability token: still exactly one delivery,
+    // on the exact running thread and with no other model work.
+    let managed = run_native_command(
+        &fixture,
+        queue_arguments(&thread, ENDPOINT_QUEUE_MARK, true, fixture.port),
+        vec![(
+            "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
+            fixture.token.clone(),
+        )],
+        "queue-endpoint",
+    );
+    let managed_text = format!(
+        "{}{}",
+        managed["stdout"].as_str().unwrap_or_default(),
+        managed["stderr"].as_str().unwrap_or_default()
+    );
+    let until = Instant::now() + WAIT;
+    let mut first_hit = false;
+    while Instant::now() < until {
+        if !provider_hits(&root, ENDPOINT_QUEUE_MARK).is_empty() {
+            first_hit = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(6));
+    let endpoint_hits = provider_hits(&root, ENDPOINT_QUEUE_MARK);
+    let total_after_managed = provider_request_count(&root);
+    let after_managed = owner.request(
+        "thread/read",
+        json!({"threadId": thread, "includeTurns": true}),
+    );
+    let received_managed = after_managed
+        .to_string()
+        .matches(ENDPOINT_QUEUE_MARK)
+        .count();
+    let endpoint_consistent = endpoint_hits
+        .iter()
+        .all(|(_, hit_thread, _)| hit_thread == &thread);
+    let sessions_after_managed = count_files(&home.join("sessions"));
+
+    // 3. A thread this receiver does not own must fail closed: no delivery, no
+    // second conversation and no additional model work.
+    let missing = run_native_command(
+        &fixture,
+        queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, true, fixture.port),
+        vec![(
+            "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
+            fixture.token.clone(),
+        )],
+        "queue-missing-thread",
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    let missing_hits = provider_hits(&root, MISSING_QUEUE_MARK);
+    let total_after_missing = provider_request_count(&root);
+    let status = owner.request("thread/read", json!({"threadId": thread}));
+    let sessions_after_missing = count_files(&home.join("sessions"));
+    let foreign = foreign_provider_requests(&root, &thread);
+
+    // The complete observed record is written before any expectation: a failed
+    // assertion still leaves the receipt beside the raw provider requests.
+    let receipt = json!({
+        "schema": 1,
+        "subject": "installed native queue boundary for an already running ordinary CLI conversation",
+        "nativeVersion": version.trim(),
+        "exe": fixture.exe.to_string_lossy(),
+        "threadId": thread,
+        "marks": {
+            "ordinary": ORDINARY_QUEUE_MARK,
+            "endpoint": ENDPOINT_QUEUE_MARK,
+            "missing": MISSING_QUEUE_MARK,
+        },
+        "unmanaged": {
+            "command": unmanaged,
+            "providerHits": hit_json(&unmanaged_hits),
+            "deliveredWithoutEndpoint": delivered_without_endpoint,
+            "receiverReceivedIt": received_without_endpoint,
+            "consistent": unmanaged_consistent,
+            "daemonSocketAfter": daemon_socket_after_unmanaged,
+            "daemonCleanup": daemon_cleanup,
+            "sessionFilesDelta": sessions_after_unmanaged as i64 - sessions_before as i64,
+        },
+        "endpoint": {
+            "command": managed,
+            "deliveryCount": endpoint_hits.len(),
+            "providerHits": hit_json(&endpoint_hits),
+            "receiverCopies": received_managed,
+            "sameThread": endpoint_consistent,
+            "providerRequestsTotal": total_after_managed,
+        },
+        "missingThread": {
+            "command": missing,
+            "providerHits": hit_json(&missing_hits),
+            "providerRequestsTotal": total_after_missing,
+            "sessionFilesDelta": sessions_after_missing as i64 - sessions_after_managed as i64,
+        },
+        "providerRequestsBaseline": baseline_requests,
+        "foreignProviderRequests": hit_json(&foreign),
+        "deliveryEvidence": "the receiver's own provider request on the exact thread plus the receiver's own thread item",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+    });
+    fs::write(
+        root.join("ordinary-lead-queue-boundary.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // Expectations, checked after the record exists: the running conversation
+    // keeps its identity, the owning endpoint delivers exactly once, and every
+    // closed target fails without model or conversation work.
+    assert_eq!(
+        baseline_requests, 0,
+        "an idle running conversation must not have called a model before any queue attempt"
+    );
+    assert!(
+        unmanaged_hits.len() <= 1,
+        "queue without an endpoint produced {} deliveries: {unmanaged_hits:?}; command {unmanaged}; evidence {}",
+        unmanaged_hits.len(),
+        root.display()
+    );
+    for (file, hit_thread, _) in &unmanaged_hits {
+        assert_eq!(
+            hit_thread, &thread,
+            "{file} reached a different conversation than the running one"
+        );
+    }
+    assert!(
+        unmanaged_consistent,
+        "a provider request without the running conversation's own item means queue resumed a clone: {after_unmanaged}"
+    );
+    assert_eq!(
+        after_unmanaged["thread"]["id"], thread,
+        "the running conversation's thread identity changed: {after_unmanaged}"
+    );
+    assert!(
+        !managed_text.contains(fixture.token.as_str()),
+        "queue must not echo the capability token: {managed}"
+    );
+    assert_eq!(
+        managed["exitCode"].as_i64(),
+        Some(0),
+        "queue with the owning endpoint failed: {managed}"
+    );
+    assert!(
+        first_hit,
+        "queue with the owning endpoint did not reach the running conversation: {managed}; evidence {}",
+        root.display()
+    );
+    assert!(
+        endpoint_consistent,
+        "endpoint delivery reached another conversation: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        endpoint_hits.len(),
+        1,
+        "queue delivery must happen exactly once: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        received_managed, 1,
+        "the running conversation must hold exactly one copy of the queued message: {after_managed}"
+    );
+    assert!(
+        missing_hits.is_empty(),
+        "queue with an unowned thread id started another conversation: {missing_hits:?}; command {missing}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        status["thread"]["id"], thread,
+        "the running conversation's thread identity changed: {status}"
+    );
+    assert!(
+        foreign.is_empty(),
+        "model work left the running conversation: {foreign:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        sessions_after_missing, sessions_after_managed,
+        "a closed-target queue attempt created conversation storage"
+    );
+
+    // Restoration: stop this fixture's own receiver through its own Job and
+    // confirm the installed executable no longer runs.
+    fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
+    assert_process_gone(
+        fixture.server,
+        &fixture.exe,
+        &user,
+        "the ordinary-lead queue boundary probe left its receiver app-server running",
+    );
+    eprintln!(
+        "ordinary-lead queue boundary: deliveredWithoutEndpoint={delivered_without_endpoint} endpointDeliveries={} receiverCopies={received_managed} missingThreadDeliveries={} foreignRequests={}; evidence {}",
+        endpoint_hits.len(),
+        missing_hits.len(),
+        foreign.len(),
+        root.display()
     );
 }
