@@ -922,13 +922,16 @@ trust_level = "trusted"
             .exists(),
         "named conversation must not issue an auxiliary model request"
     );
-    if quota_handoff {
+    // The ordinary main session proves the same composed lead context for a
+    // direct tool task without delegation; the successor route must carry it
+    // from its first request. Neither may leak the executor role text.
+    if quota_handoff || matches!(case, EntryCase::Normal) {
         for sequence in 1..=expected_requests {
             let body = fs::read_to_string(root.join(format!("provider-{sequence}.json"))).unwrap();
-            let route = if sequence == 1 {
-                "first refused lead"
-            } else {
-                "configured successor lead"
+            let route = match (quota_handoff, sequence) {
+                (true, 1) => "first refused lead",
+                (true, _) => "configured successor lead",
+                (false, _) => "ordinary lead",
             };
             assert!(
                 body.contains(CONTROL_COMMON_ROLE_MARKER),
