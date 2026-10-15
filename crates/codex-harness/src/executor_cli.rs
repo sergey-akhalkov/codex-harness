@@ -4661,9 +4661,14 @@ fn attach_owned_frontend(
 }
 
 /// Global options before `resume`. The thread id is the only positional, so
-/// the frontend cannot submit the assignment. Every managed frontend also
-/// turns the native worktree tools off: those tools allocate outside the
-/// shared harness pool, so the pool stays the conversation's only allocator.
+/// the frontend cannot submit the assignment. Every managed frontend runs as
+/// a remote TUI whose conversation, including its tool catalogue, is served
+/// by the harness's app-server child; the `-c features.worktrees=false` pair
+/// pins this frontend process's own configuration to the managed default and
+/// never shadows the selected profile, which travels only to the app-server
+/// child as configuration overrides. A hosted conversation whose effective
+/// catalogue still re-exposed the competing tools would be a configuration
+/// conflict to report rather than a silently accepted suppression.
 fn frontend_args(
     port: u16,
     thread_id: &str,
@@ -7151,17 +7156,25 @@ fn invalid(message: &str) -> io::Error {
 mod tests {
     use super::*;
 
-    /// Managed lead and executor frontends are the native TUI processes that
-    /// would register the competing `codex_worktrees` tools into a hosted
-    /// conversation. The common pool is the only allocator a managed
-    /// conversation may use, so both roles carry the native feature off
-    /// before the resume subcommand, which keeps the thread id as its only
-    /// positional.
+    /// Managed lead and executor frontends are remote TUI processes whose
+    /// conversation is served by the harness's app-server child. Both roles
+    /// carry the managed `features.worktrees=false` default in the frontend's
+    /// own configuration before the resume subcommand, which keeps the thread
+    /// id as its only positional; the pair stays scoped to this process, so
+    /// the selected profile is never shadowed here.
     #[test]
     fn managed_frontends_suppress_the_native_worktree_tool_surface() {
         let pair = ["-c", "features.worktrees=false"];
         for role in [FrontendRole::Executor, FrontendRole::Lead] {
             let args = frontend_args(1, "thread-1", NativePresentation::NativeInline, role);
+            assert!(
+                args.iter().any(|arg| arg == "--remote"),
+                "{role:?} frontend args must stay a remote TUI: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "--profile"),
+                "{role:?}: the selected profile travels to the app-server child and must not be shadowed by the frontend pin: {args:?}"
+            );
             assert!(
                 args.windows(2)
                     .any(|window| window[0] == pair[0] && window[1] == pair[1]),

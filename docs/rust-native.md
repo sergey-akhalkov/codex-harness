@@ -612,7 +612,22 @@ while its `worktrees` feature is enabled, which competes with the common pool
 as a second allocator. The kit's shared configuration turns the native feature
 off (`features.worktrees = false`), a session start forwards that leaf as
 `-c features.worktrees=false`, and managed lead and executor frontends carry
-the same pair before their `resume` subcommand.
+the same pair before their `resume` subcommand. Those controller frontends
+(`lead start` / `executor host`) run as remote TUIs attached to the harness's
+app-server child, which serves the conversation; the pair pins the frontend
+process's own configuration to the managed default, while the selected
+profile and the user configuration reach the app-server child unchanged. A
+model-free probe of the installed app-server route (the same binary and
+`features.worktrees` override forms the hosted route uses) registered no
+worktree-named tool in its runtime catalogue under the feature default,
+`false` or `true`, so the exercised hosted boundary did not re-expose the
+competing tools; the remote frontend's own catalogue is not observable by
+this probe, and a fresh hosted catalogue remains an open acceptance item in
+pool task 4.4. A hosted conversation whose effective catalogue still
+re-exposed the tools would be an explicit-override or host-injected
+configuration conflict to report, not a successful suppression; the
+precedence and conflict reporting below belongs to the registered launcher
+route, where re-exposure is observable.
 
 The switch is proven against the effective runtime tool catalogue, not a
 configuration value, a feature readback or the static first request: the
@@ -633,13 +648,16 @@ bodies and terminal transcripts stay in the kept evidence directory it prints.
 cargo test --locked -p codex-harness --test skill_catalog_refresh installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf --jobs 1 -- --ignored --exact --nocapture --test-threads=1
 ```
 
-The same installed check covers the managed launch path end to end:
+The same installed check covers the launcher's forwarding route end to end:
 `installed_managed_role_tui_catalogues_drop_native_worktree_tools` records a
 build whose `codex.exe` is this checkout's real launcher and whose registered
-upstream is the installed CLI, then runs fresh managed lead, executor, no-leaf
-profile and explicit-true profile sessions against the canned Responses
-fixture. The unsuppressed control must expose a worktree-named tool; the
-managed lead and executor sessions and a managed session whose selected
+upstream is the installed CLI, then runs fresh role-marked managed sessions -
+lead, executor, a no-leaf profile and an explicit-true profile - against the
+canned Responses fixture. This is the launcher's forwarding route, whose
+locally hosted TUI is the surface this check reads; the controller-hosted
+frontends attach to a separate app-server conversation that this probe does
+not read. The unsuppressed control must expose a worktree-named tool;
+the managed lead and executor sessions and a managed session whose selected
 profile carries no `features.worktrees` choice must expose none, because
 selecting a profile is not a worktree choice; and an explicit winning profile
 `true` must keep the tools and print the conflict report, so the decision is
