@@ -1659,8 +1659,7 @@ struct SpawnedRun {
     /// recorded relationship. The executor's selected home is never assumed
     /// to be the same: dispatch accepts an explicit `--codex-home`, and the
     /// ordinary queue route must address the lead conversation's own store.
-    /// `None` when the dispatching process had neither a home nor a profile
-    /// to resolve one from.
+    /// `None` when the dispatching process could not resolve its native home.
     lead_home: Option<PathBuf>,
     lead_thread: String,
     generation: String,
@@ -3077,8 +3076,8 @@ fn reconcile_ordinary_lead(
 
 /// Runs the installed native queue command once, as an owned child under one
 /// Job with a bounded wait, and classifies the result: exit 0 is transport
-/// acceptance; a non-zero exit counts as the queue's own refusal only when
-/// the command's own report carries the native rejection mark, because an
+/// acceptance; a non-zero exit counts as a refusal only when the command
+/// reports the observed exact missing-thread rejection, because an
 /// arbitrary failure can follow an applied queue effect; any other non-zero
 /// exit, and any command whose end cannot be observed within the bound, is
 /// unresolved. The command's own combined report is read back for the
@@ -3176,24 +3175,20 @@ fn queue_refused_missing_thread(report: &str, thread: &str) -> bool {
 }
 
 #[cfg(test)]
-mod queue_refusal_tests {
-    use super::*;
-
-    #[test]
-    fn only_an_exact_missing_target_proves_no_delivery() {
-        let target = "00000000-0000-4000-8000-000000000000";
-        let missing = format!("{QUEUE_MISSING_THREAD_PREFIX}{target} (code -32603)");
-        assert!(queue_refused_missing_thread(&missing, target));
-        assert!(!queue_refused_missing_thread(&missing, "another-thread"));
-        assert!(!queue_refused_missing_thread(
-            "Error: failed to queue session message: connection closed after sending the request",
-            target,
-        ));
-        assert!(!queue_refused_missing_thread(
-            &format!("{missing}\nresponse lost after another queue operation"),
-            target,
-        ));
-    }
+#[test]
+fn only_an_exact_missing_target_proves_no_delivery() {
+    let target = "00000000-0000-4000-8000-000000000000";
+    let missing = format!("{QUEUE_MISSING_THREAD_PREFIX}{target} (code -32603)");
+    assert!(queue_refused_missing_thread(&missing, target));
+    assert!(!queue_refused_missing_thread(&missing, "another-thread"));
+    assert!(!queue_refused_missing_thread(
+        "Error: failed to queue session message: connection closed after sending the request",
+        target,
+    ));
+    assert!(!queue_refused_missing_thread(
+        &format!("{missing}\nresponse lost after another queue operation"),
+        target,
+    ));
 }
 
 /// The command's own combined report, read back within its bound. A report

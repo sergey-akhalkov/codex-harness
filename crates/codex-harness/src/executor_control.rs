@@ -232,9 +232,8 @@ pub(crate) struct OriginatingLead {
     pub thread_id: String,
     pub run_generation: String,
     /// The kit home the dispatching process itself resolves, captured with the
-    /// rest of the relationship. Absent only when that process exposed neither
-    /// a home nor a profile to resolve one from; never guessed from the
-    /// executor's selected home.
+    /// rest of the relationship. Absent when the launcher's home resolver
+    /// cannot establish it; never guessed from the executor's selected home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<PathBuf>,
     pub dispatcher: DispatcherIdentity,
