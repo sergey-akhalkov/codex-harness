@@ -64,8 +64,16 @@ jobs:
           "TMP=C:\harness-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TEMP=C:\harness-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Build the second real manager generation for installation replacement
+        run: |
+          cargo build --locked -p codex-harness --bin codex-harness --release --jobs 1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "HARNESS_TEST_NEXT_MANAGER=$((Resolve-Path target/release/codex-harness.exe).Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # This runner provisions Rust and Python; the separate Pascal startup
+      # regression requires an explicitly adopted pasls installation.
       - name: Real MCP, connection reset, broker restart, edits and semantic delivery gate
-        run: cargo test --locked -p codex-harness --test serena_stdio --jobs 1 -- --include-ignored --test-threads=1 --nocapture
+        run: cargo test --locked -p codex-harness --test serena_stdio --jobs 1 -- --include-ignored --skip pascal_startup_skips_eager_build_copy_index_and_keeps_navigation --test-threads=1 --nocapture
 
       - name: Enforce the automatic workflow contract
         run: cargo test --locked -p codex-harness --test ci_workflow --jobs 1 -- --test-threads=1
