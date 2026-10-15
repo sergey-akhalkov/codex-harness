@@ -1535,10 +1535,7 @@ trust_level = "trusted"
     spec.limits.cpu_percent = Some(50.0);
     let session = ConsoleSession::spawn(spec).unwrap();
     let ready = wait_for(&session, &evidence, 60, || {
-        session
-            .transcript()
-            .to_ascii_lowercase()
-            .contains("gpt-6-astra")
+        session.transcript().contains("gpt-6-astra")
     });
     if !ready {
         persist_partial(&evidence, &home, &canned, &session, "tui-not-ready");
