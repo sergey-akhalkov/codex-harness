@@ -216,10 +216,10 @@ impl Responses {
                 );
                 if quota == Quota::Handoff {
                     assert_eq!(
-                        request["model"], "zai/glm-5.3",
+                        request["model"], "deepseek-flash",
                         "a fresh exact successor must serve every request after GPT refusal"
                     );
-                    assert_eq!(request["reasoning"]["effort"], "high");
+                    assert_eq!(request["reasoning"]["effort"], "max");
                     assert!(request["input"].to_string().contains(
                         "Perform the owned proof command and return its consumed result."
                     ));
@@ -254,9 +254,25 @@ impl Responses {
                         item["type"] == "agent_message"
                             && item["recipient"] == "/root/control_worker_two"
                     });
-                let second_worker = second_worker || pair && request["model"] == "xai/grok-4.6";
+                // Both executors use the same configured model. Identify their
+                // actual assignment instead of conflating a model with a role.
+                let assigned = |marker: &str| {
+                    request["input"].as_array().unwrap().iter().any(|item| {
+                        (item["type"] == "agent_message" || item["role"] == "user")
+                            && item["content"].as_array().is_some_and(|content| {
+                                content.iter().any(|part| {
+                                    part["text"]
+                                        .as_str()
+                                        .is_some_and(|text| text.contains(marker))
+                                })
+                            })
+                    })
+                };
+                let second_worker = second_worker
+                    || pair
+                        && assigned("CONTROL_CHILD_ASSIGNMENT: run the second owned proof command");
                 let worker = second_worker
-                    || pair && request["model"] == "zai/glm-5.3"
+                    || pair && assigned("CONTROL_CHILD_ASSIGNMENT: run the owned proof command")
                     || request["input"].as_array().unwrap().iter().any(|item| {
                         item["type"] == "agent_message"
                             && item["recipient"] == "/root/control_worker"
@@ -287,15 +303,8 @@ impl Responses {
                 });
                 let worker = worker && !helper_worker;
                 if pair && worker {
-                    assert_eq!(
-                        request["model"],
-                        if second_worker {
-                            "xai/grok-4.6"
-                        } else {
-                            "zai/glm-5.3"
-                        }
-                    );
-                    assert_eq!(request["reasoning"]["effort"], "high");
+                    assert_eq!(request["model"], "deepseek-flash");
+                    assert_eq!(request["reasoning"]["effort"], "max");
                     let assignment = if second_worker {
                         "run the second owned proof command"
                     } else {
@@ -398,13 +407,13 @@ impl Responses {
                 } else if !direct && !worker && !helper_worker && !spawned {
                     let mut assignment = json!({"task_name":"control_worker","message":"CONTROL_CHILD_ASSIGNMENT: run the owned proof command, then consume and return its result. Do not spawn other agents."});
                     if pair {
-                        assignment["model"] = json!("zai/glm-5.3");
-                        assignment["reasoning_effort"] = json!("high");
+                        assignment["model"] = json!("deepseek-flash");
+                        assignment["reasoning_effort"] = json!("max");
                         assignment["fork_turns"] = json!("none");
                     }
                     json!({"type":"function_call","call_id":"control-spawn-1","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&assignment).unwrap()})
                 } else if pair && !worker && !second_spawned {
-                    json!({"type":"function_call","call_id":"control-spawn-2","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"task_name":"control_worker_two","model":"xai/grok-4.6","reasoning_effort":"high","fork_turns":"none","message":"CONTROL_CHILD_ASSIGNMENT: run the second owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
+                    json!({"type":"function_call","call_id":"control-spawn-2","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"task_name":"control_worker_two","model":"deepseek-flash","reasoning_effort":"max","fork_turns":"none","message":"CONTROL_CHILD_ASSIGNMENT: run the second owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
                 } else if pair && !worker {
                     let input = request["input"].as_array().unwrap();
                     let output = |call: &str| {
@@ -732,7 +741,7 @@ fn assert_successor_visible(evidence: &std::path::Path, requested_thread: &str) 
     let id = leader["threadId"].as_str().unwrap();
     assert_eq!(id, requested_thread);
     assert_ne!(initial["threadId"], id);
-    assert_eq!(leader["model"], "zai/glm-5.3");
+    assert_eq!(leader["model"], "deepseek-flash");
     assert_eq!(leader["previousThreadId"], initial["threadId"]);
     let native = view_executable(evidence);
     let user = harness_core::process_service::current_user().unwrap();

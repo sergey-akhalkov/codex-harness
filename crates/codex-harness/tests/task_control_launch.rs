@@ -92,7 +92,7 @@ fn ordinary_launcher_records_quota_refusal_without_another_gpt_request() {
 
 #[test]
 #[ignore = "requires native CLI, explicit model catalog and both native chat observations; synthetic quota handoff"]
-fn ordinary_launcher_hands_quota_refusal_to_visible_zai_lead() {
+fn ordinary_launcher_hands_quota_refusal_to_visible_ds_lead() {
     native_entry(EntryCase::QuotaHandoff);
 }
 
@@ -482,12 +482,12 @@ fn native_entry(case: EntryCase) {
     if quota_handoff {
         fs::write(
             source.join("global/orchestration.toml"),
-            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"zai\"\nexecutor_profiles = [\"zai\"]\nmax_concurrent_executors = 2\n",
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 2\n",
         )
         .unwrap();
         fs::write(
-            home.join("zai.config.toml"),
-            "model = \"zai/glm-5.3\"\nmodel_provider = \"control_fixture\"\n",
+            home.join("ds.config.toml"),
+            "model = \"deepseek-flash\"\nmodel_provider = \"control_fixture\"\nmodel_reasoning_effort = \"max\"\n",
         )
         .unwrap();
     }
@@ -944,7 +944,7 @@ trust_level = "trusted"
             );
         }
     }
-    fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"zai/glm-5.3"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
+    fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"deepseek-flash"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
 }
 
 fn pair_model_catalog(source: &Path) -> Vec<u8> {
@@ -961,10 +961,7 @@ fn pair_model_catalog(source: &Path) -> Vec<u8> {
     let models = catalog["models"].as_array_mut().unwrap();
     for (slug, display, effort) in [
         ("gpt-6-astra", "GPT-6 Astra", "low"),
-        ("glm-5.3", "Z.AI GLM-5.3", "high"),
-        ("zai/glm-5.3", "Z.AI GLM-5.3", "high"),
-        ("grok-4.6", "Grok 4.6", "high"),
-        ("xai/grok-4.6", "Grok 4.6", "high"),
+        ("deepseek-flash", "DeepSeek V4.1 Flash", "max"),
     ] {
         if !models.iter().any(|model| model["slug"] == slug) {
             models.push(json!({
