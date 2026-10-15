@@ -443,6 +443,12 @@ already existed before installation stay untouched.
 Committed core disconnect also prints the shared CPU coverage withdrawal in
 [Shared CPU policy](#shared-cpu-policy). Preview does not.
 
+Role activation has no deployed copy to roll back: managed sessions resolve
+`global/roles.toml` and the fragments it names from the recorded source root
+([What is connected](#what-is-connected)), so Disconnect removes the delivered
+links while both roles stay resolvable, and the `check` report keeps naming
+each role's revision or its exact missing input.
+
 A local operation lock serializes installation per user. Recover rolls back an
 unfinished activation or finishes journal cleanup after a durable commit;
 preserve pending journals and never delete them to unblock a service. Use the
