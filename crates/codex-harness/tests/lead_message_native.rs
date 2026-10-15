@@ -26,7 +26,9 @@ mod control_responses;
 
 use harness_core::{
     broker_state::BrokerRoot,
-    process::{CommandSpec, Job, Limits, ProcessIdentity},
+    build_identity,
+    console::{ConsoleSession, ConsoleSpec},
+    process::{Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity, StopReason},
     process_service::{self, ServiceProcess},
     task_control::ControlConnection,
     task_request::RequestIdentity,
@@ -34,12 +36,25 @@ use harness_core::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    ffi::OsString,
+    fs, io,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+/// Ordinary-lead queue boundary markers: one per installed `codex queue`
+/// invocation, so a delivery can only be attributed to the invocation that
+/// carried its mark, plus the control turn that establishes the running
+/// conversation's own thread before any queue attempt.
+const ORDINARY_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-NO-ENDPOINT-8me13";
+const ENDPOINT_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-ENDPOINT-8me13";
+const MISSING_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-MISSING-THREAD-8me13";
+const ORDINARY_TUI_CONTROL_PROMPT: &str = "ORDINARY-LEAD-TUI-CONTROL-PROMPT-8me13";
+const ORDINARY_TUI_CONTROL_REPLY: &str = "ORDINARY-LEAD-TUI-CONTROL-REPLY-8me13";
+/// A well-formed thread id the running receiver does not own.
+const MISSING_THREAD_ID: &str = "00000000-0000-4000-8000-000000000000";
 
 const WAIT: Duration = Duration::from_secs(20);
 /// One fresh dispatch runs the executor shell preflight before its session
@@ -138,6 +153,17 @@ fn seed_launcher_registration(home: &Path) {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_version_requirement(Some("0.157.0"))
+}
+
+/// Builds the same owned fixture for the installation-record upstream binary:
+/// the endpoint positive control must run the installed native CLI, and it
+/// records the actual version instead of requiring a historical pin.
+fn installed_fixture() -> Fixture {
+    fixture_with_version_requirement(None)
+}
+
+fn fixture_with_version_requirement(required: Option<&str>) -> Fixture {
     let exe = codex_exe();
     let owned_root = BrokerRoot::prepare().unwrap().keep();
     let root = owned_root.path();
@@ -147,10 +173,24 @@ fn fixture() -> Fixture {
     fs::create_dir(&workspace).unwrap();
     seed_launcher_registration(&home);
     let version = version_text(&exe);
-    assert!(
-        version.contains("codex-cli 0.157.0"),
-        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.157.0 binary: {version}"
-    );
+    match required {
+        Some(required) => {
+            let expected = format!("codex-cli {required}");
+            assert!(
+                version.contains(expected.as_str()),
+                "HARNESS_CONTROL_CODEX_EXE must be the installed Codex {required} binary: {version}"
+            );
+        }
+        None => {
+            let upstream = installed_upstream();
+            assert!(
+                same_executable(&exe, &upstream),
+                "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the ordinary-lead boundary probe runs the installed native CLI, not another binary",
+                exe.display(),
+                upstream.display()
+            );
+        }
+    }
     let responses = control_responses::Responses::start(root.into(), true);
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
     fs::write(
@@ -2429,5 +2469,1818 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
         id_a,
         lead_a.state.display(),
         id_b
+    );
+}
+
+/// Runs one installed native command in the passed home and workspace, bounded
+/// by its own Job; the command's own report is recorded, never accepted as
+/// delivery.
+fn run_native_command(
+    exe: &Path,
+    home: &Path,
+    workspace: &Path,
+    root: &Path,
+    args: Vec<OsString>,
+    envs: Vec<(String, String)>,
+    label: &str,
+) -> Value {
+    let mut spec = command(exe, home, workspace);
+    spec.args = args;
+    for (key, value) in envs {
+        spec.env.insert(key.into(), Some(value.into()));
+    }
+    let stdout_path = root.join(format!("{label}-stdout.txt"));
+    let stderr_path = root.join(format!("{label}-stderr.txt"));
+    spec.stdout = Some(fs::File::create(&stdout_path).unwrap());
+    spec.stderr = Some(fs::File::create(&stderr_path).unwrap());
+    let job = Job::new(Limits::default()).unwrap();
+    let child = job.spawn(&spec).unwrap();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    json!({
+        "exitCode": outcome.exit_code,
+        "exited": outcome.reason == StopReason::Exited,
+        "reason": format!("{:?}", outcome.reason),
+        "stdout": excerpt(&stdout, 1500),
+        "stderr": excerpt(&stderr, 1500),
+    })
+}
+
+/// One `codex queue` invocation: the target thread and the message are always
+/// explicit; only `Some(port)` names an owning listener and passes the
+/// capability token through the environment of the command itself.
+fn queue_arguments(thread: &str, message: &str, endpoint: Option<u16>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "queue".into(),
+        "--thread".into(),
+        thread.into(),
+        "--message".into(),
+        message.into(),
+    ];
+    if let Some(port) = endpoint {
+        args.push("--remote".into());
+        args.push(format!("ws://127.0.0.1:{port}").into());
+        args.push("--remote-auth-token-env".into());
+        args.push("HARNESS_ORDINARY_LEAD_TOKEN".into());
+    }
+    args
+}
+
+/// Sends one line to the owned console session the way a user would: the text,
+/// a short beat, then carriage return.
+fn send_line(session: &ConsoleSession, text: &str) -> io::Result<()> {
+    session.send(text)?;
+    std::thread::sleep(Duration::from_millis(250));
+    session.send("\r")
+}
+
+/// Polls a predicate for at most the given seconds.
+fn wait_until(seconds: u64, predicate: impl Fn() -> bool) -> bool {
+    let until = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < until {
+        if predicate() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    predicate()
+}
+
+/// The child path without the WindowsApps shims, exactly as the ordinary TUI
+/// fixture selects it.
+fn filtered_path() -> OsString {
+    let child_path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|entry| {
+            !entry.components().any(|part| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("WindowsApps")
+            })
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(child_path).unwrap()
+}
+
+fn dump_terminal(root: &Path, session: &ConsoleSession) {
+    let _ = fs::write(root.join("terminal.txt"), session.transcript());
+}
+
+/// Every conversation rollout line under the running session's own `sessions`
+/// root, one JSON value per line; the receiver's own events are read here and
+/// nowhere claimed on behalf of another conversation.
+fn session_lines(home: &Path) -> Vec<Value> {
+    fn walk(path: &Path, lines: &mut Vec<Value>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                walk(&child, lines);
+            } else if child
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                for line in fs::read_to_string(&child).unwrap_or_default().lines() {
+                    if let Ok(value) = serde_json::from_str::<Value>(line) {
+                        lines.push(value);
+                    }
+                }
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    walk(&home.join("sessions"), &mut lines);
+    lines
+}
+
+/// Rollout rows of the running conversation that carry one marker.
+fn session_mark_count(home: &Path, marker: &str) -> usize {
+    session_lines(home)
+        .iter()
+        .filter(|row| row.to_string().contains(marker))
+        .count()
+}
+
+/// The delivered-message identities the running conversation's own rollout
+/// records for one marker: a delivered user message is one `response_item`
+/// message row, while the completion event beside it only reports that item.
+fn session_mark_ids(home: &Path, marker: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for row in session_lines(home) {
+        if row["type"] != "response_item"
+            || row["payload"]["type"] != "message"
+            || row["payload"]["role"] != "user"
+            || !row.to_string().contains(marker)
+        {
+            continue;
+        }
+        let id = row["payload"]["id"].as_str().unwrap_or_default();
+        let id = id.strip_prefix("msg_").unwrap_or(id);
+        ids.push(id.to_owned());
+    }
+    ids
+}
+
+/// The conversation identities the running session's own rollout meta events
+/// record: another conversation's id appearing here is a clone or resume.
+fn session_meta_ids(home: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    for row in session_lines(home) {
+        if row["type"] != "session_meta" {
+            continue;
+        }
+        for key in ["id", "session_id"] {
+            if let Some(value) = row["payload"][key].as_str() {
+                ids.push(value.to_owned());
+            }
+        }
+    }
+    ids
+}
+
+/// Every provider request the owned canned provider recorded, with the
+/// conversation identity the native request carried.
+fn provider_entries(root: &Path) -> Vec<(String, Value, String, String)> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(root).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("provider-") && name.ends_with(".json")) {
+            continue;
+        }
+        let body = fs::read(entry.path()).unwrap_or_default();
+        let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        let identity = RequestIdentity::from_request(&request)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        entries.push((name, request, identity.thread, identity.turn));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+/// Provider requests containing the marker, with the conversation identity
+/// each native request carried.
+fn provider_hits(root: &Path, marker: &str) -> Vec<(String, String, String)> {
+    provider_entries(root)
+        .into_iter()
+        .filter(|(_, request, _, _)| contains_payload(request, marker))
+        .map(|(name, _, thread, turn)| (name, thread, turn))
+        .collect()
+}
+
+/// One recorded provider request body by its evidence file name.
+fn provider_request(root: &Path, file: &str) -> Value {
+    let body = fs::read(root.join(file)).unwrap_or_default();
+    serde_json::from_slice(&body).unwrap_or(Value::Null)
+}
+
+/// The title-generation request installed 0.162.1 issues beside a user turn:
+/// an auxiliary user item carrying the installed instruction, recognized
+/// exactly as the shared fixture recognizes it.
+fn title_generation_request(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part["text"].as_str().is_some_and(|text| {
+                            text.starts_with("Generate a concise, single-line task title")
+                        })
+                    })
+                })
+        })
+    })
+}
+
+/// The tool continuation of the managed control exchange: the native request
+/// that carries the completed `control-tool-1` proof command's own output.
+fn proof_continuation(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "control-tool-1"
+                && item["output"].as_str().is_some_and(|output| {
+                    output.contains("Process exited with code 0") && output.contains("\none")
+                })
+        })
+    })
+}
+
+fn provider_request_count(root: &Path) -> usize {
+    provider_entries(root).len()
+}
+
+/// Requests that reached a conversation other than the receiver's own: a
+/// clone, resume or second conversation appears here.
+fn foreign_provider_requests(root: &Path, thread: &str) -> Vec<(String, String, String)> {
+    provider_entries(root)
+        .into_iter()
+        .filter(|(_, _, hit_thread, _)| hit_thread != thread)
+        .map(|(name, _, hit_thread, turn)| (name, hit_thread, turn))
+        .collect()
+}
+
+fn hit_json(hits: &[(String, String, String)]) -> Vec<Value> {
+    hits.iter()
+        .map(|(file, thread, turn)| json!({"file": file, "thread": thread, "turn": turn}))
+        .collect()
+}
+
+fn count_files(dir: &Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_files(&path);
+            } else {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// The installed native queue boundary for an already running ordinary CLI
+/// conversation: one owned ordinary native TUI hosts its own embedded runtime
+/// in its own CODEX_HOME against the canned local Responses provider, one
+/// control turn establishes that conversation's exact thread, and the
+/// installed `codex queue --thread <id> --message <text>` then addresses that
+/// running conversation without any endpoint, daemon or token. Delivery is the
+/// running conversation's own turn request carrying the mark on its exact
+/// thread, together with its own stored and rendered copy; exit status, report
+/// text and process state are recorded separately and are not delivery.
+/// Beside each turn the running TUI issues its own native title-generation
+/// request (recognized by the installed instruction, exactly as the shared
+/// fixture recognizes it) on an ephemeral thread; those auxiliaries are
+/// classified and recorded, never counted as delivery or as a second
+/// conversation. The whole observed record is written before any expectation,
+/// and the expectations themselves name both outcomes.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; starts an owned ordinary native TUI with the canned local Responses provider; no live model, no daemon, no desktop"]
+fn installed_queue_boundary_against_a_running_ordinary_tui() {
+    let exe = codex_exe();
+    let upstream = installed_upstream();
+    assert!(
+        same_executable(&exe, &upstream),
+        "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the ordinary arm runs the installed native CLI, not another binary",
+        exe.display(),
+        upstream.display()
+    );
+    let version = version_text(&exe);
+    let sha = build_identity::hash_file(&exe).unwrap();
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let root = owned_root.path().to_path_buf();
+    let home = root.join("ordinary-home");
+    let workspace = root.join("ordinary-workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    eprintln!("ordinary-lead queue boundary evidence: {}", root.display());
+    let user = process_service::current_user().unwrap();
+
+    // The receiver is a real ordinary native TUI: the installed executable
+    // hosts its own embedded runtime, and every request is answered with one
+    // model-free assistant message so the control turn completes.
+    let responses = control_responses::Responses::routed(root.clone(), |_request| {
+        json!({
+            "type": "message",
+            "id": "ordinary-control-reply",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ORDINARY_TUI_CONTROL_REPLY}]
+        })
+    });
+    let trusted = serde_json::to_string(&workspace.to_string_lossy().to_lowercase()).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+model = "gpt-6-astra"
+model_provider = "control_fixture"
+model_reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "disabled"
+cli_auth_credentials_store = "file"
+[model_providers.control_fixture]
+name = "Owned ordinary TUI fixture"
+base_url = "http://127.0.0.1:{}/v1"
+wire_api = "responses"
+env_key = "HARNESS_CONTROL_FIXTURE_KEY"
+requires_openai_auth = false
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+[windows]
+sandbox = "unelevated"
+[features]
+hooks = false
+apps = false
+multi_agent = false
+multi_agent_v2 = false
+memories = false
+goals = false
+plugins = false
+skill_search = false
+skip_host_skill_discovery = true
+[analytics]
+enabled = false
+[projects.{trusted}]
+trust_level = "trusted"
+"#,
+            responses.port
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "harness-control-ordinary-tui"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut spec = command(&exe, &home, &workspace);
+    spec.args = vec!["--no-alt-screen".into()];
+    spec.env.insert("PATH".into(), Some(filtered_path()));
+    for key in [
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let mut console = ConsoleSpec::new(spec);
+    console.limits.memory_bytes = Some(512 * 1024 * 1024);
+    console.limits.cpu_percent = Some(50.0);
+    let session = ConsoleSession::spawn(console).unwrap();
+    let identity = session.identity();
+    let ready = wait_until(60, || {
+        let text = session.transcript();
+        text.contains("gpt-6-astra") || text.contains("Codex")
+    });
+    if !ready {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned ordinary TUI did not become ready; evidence {}",
+            root.display()
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
+
+    // The control turn is the running conversation's own first model input:
+    // its request identity establishes the exact receiver thread, cross
+    // recorded with the conversation's own session meta. No slash command is
+    // typed: the first composer submission is the prompt itself. If the
+    // frontend has not yet accepted Enter, one further plain Enter commits the
+    // same text the way a user would; the submission is observed as the
+    // conversation's own recorded request, never as echoed text.
+    send_line(&session, ORDINARY_TUI_CONTROL_PROMPT).unwrap();
+    let mut submit_retries = 0;
+    let mut control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    while !control_requested && submit_retries < 2 {
+        let _ = session.send("\r");
+        submit_retries += 1;
+        control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    }
+    if !control_requested {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned provider recorded no request for the control turn, so either the running conversation issued none or the fixture rejected its request identity; evidence {}",
+            root.display()
+        );
+    }
+    let control_answered = wait_until(60, || {
+        session_mark_count(&home, ORDINARY_TUI_CONTROL_REPLY) >= 1
+            || session.transcript().contains(ORDINARY_TUI_CONTROL_REPLY)
+    });
+    // The running TUI's own title-generation request for the control turn
+    // lands beside it; settle on the owned provider so the baseline covers the
+    // whole turn instead of racing that native auxiliary request.
+    let mut baseline_requests = provider_request_count(&root);
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_secs(1));
+        let settled = provider_request_count(&root);
+        if settled == baseline_requests {
+            break;
+        }
+        baseline_requests = settled;
+    }
+    let entries = provider_entries(&root);
+    let (_, _, thread, control_turn) = entries
+        .first()
+        .unwrap_or_else(|| panic!("no recorded provider request; evidence {}", root.display()))
+        .clone();
+    let baseline_auxiliary = entries
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
+    let meta_before = session_meta_ids(&home);
+    let sessions_before = count_files(&home.join("sessions"));
+    let daemon_socket = home
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    let daemon_socket_before = daemon_socket.exists();
+    eprintln!(
+        "ordinary lead queue boundary: receiver pid {} creation {} thread {thread} controlTurn {control_turn} controlAnswered {control_answered} submitRetries {submit_retries}; evidence {}",
+        identity.pid,
+        identity.creation_time,
+        root.display()
+    );
+
+    // The queue attempt against that running conversation, with this
+    // CODEX_HOME as the only locator: no endpoint, no capability token and no
+    // daemon ahead of it; the command's own report is recorded, and the mark
+    // can only be attributed to this exact invocation.
+    let unmanaged = run_native_command(
+        &exe,
+        &home,
+        &workspace,
+        &root,
+        queue_arguments(&thread, ORDINARY_QUEUE_MARK, None),
+        Vec::new(),
+        "queue-no-endpoint",
+    );
+    let first_hit = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, ORDINARY_QUEUE_MARK).is_empty()
+    });
+    std::thread::sleep(Duration::from_secs(6));
+    let unmanaged_hits = provider_hits(&root, ORDINARY_QUEUE_MARK);
+    let delivered_without_endpoint = first_hit || !unmanaged_hits.is_empty();
+    let total_after_unmanaged = provider_request_count(&root);
+    let auxiliary_after = provider_entries(&root)
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
+    let added_auxiliary = auxiliary_after.saturating_sub(baseline_auxiliary);
+    let primary_hits: Vec<(String, String, String)> = unmanaged_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread == &thread)
+        .cloned()
+        .collect();
+    let auxiliary_hits: Vec<(String, String, String)> = unmanaged_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread != &thread)
+        .cloned()
+        .collect();
+    let transcript_copies = session.transcript().matches(ORDINARY_QUEUE_MARK).count();
+    let rollout_copies = session_mark_count(&home, ORDINARY_QUEUE_MARK);
+    let rollout_message_ids = session_mark_ids(&home, ORDINARY_QUEUE_MARK);
+    let sessions_after_unmanaged = count_files(&home.join("sessions"));
+    let meta_after = session_meta_ids(&home);
+    let daemon_socket_after = daemon_socket.exists();
+    let mut daemon_cleanup = Value::Null;
+    if daemon_socket_after {
+        daemon_cleanup = run_native_command(
+            &exe,
+            &home,
+            &workspace,
+            &root,
+            vec!["app-server".into(), "daemon".into(), "stop".into()],
+            Vec::new(),
+            "daemon-stop",
+        );
+    }
+
+    // A live delivery is the only case where a closed target still needs its
+    // own refusal: the same route, a well-formed thread id the receiver does
+    // not own.
+    let mut closed_target = Value::Null;
+    let mut closed_hits: Vec<(String, String, String)> = Vec::new();
+    if delivered_without_endpoint {
+        let closed = run_native_command(
+            &exe,
+            &home,
+            &workspace,
+            &root,
+            queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, None),
+            Vec::new(),
+            "queue-missing-thread",
+        );
+        std::thread::sleep(Duration::from_secs(6));
+        closed_hits = provider_hits(&root, MISSING_QUEUE_MARK);
+        closed_target = json!({
+            "command": closed,
+            "providerHits": hit_json(&closed_hits),
+            "providerRequestsTotal": provider_request_count(&root),
+            "sessionFilesDelta": count_files(&home.join("sessions")) as i64
+                - sessions_after_unmanaged as i64,
+        });
+    }
+    let total_after_all = provider_request_count(&root);
+    let foreign = foreign_provider_requests(&root, &thread);
+    let receiver_alive = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_some())
+        .unwrap_or(false);
+
+    // Restoration: the owned receiver quits through its own console and the
+    // installed executable no longer runs afterwards.
+    dump_terminal(&root, &session);
+    let _ = send_line(&session, "/quit");
+    let console_result = session.wait(
+        Deadline::after(Duration::from_secs(25)).unwrap(),
+        &Cancellation::default(),
+        Duration::from_secs(5),
+    );
+    let console_outcome = match &console_result {
+        Ok(value) => {
+            fs::write(root.join("terminal-final.txt"), &value.transcript).unwrap();
+            json!({
+                "exited": value.outcome.reason == StopReason::Exited,
+                "outcome": value.outcome,
+                "truncated": value.output_truncated,
+            })
+        }
+        Err(error) => json!({"error": error.to_string()}),
+    };
+    // Recorded before the receipt and asserted only after it, so a failure
+    // still leaves the observed liveness beside the raw provider requests.
+    let receiver_gone_after_close = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_none())
+        .unwrap_or(false);
+
+    // The complete observed record is written before any expectation: a failed
+    // assertion still leaves the receipt beside the raw provider requests.
+    let receipt = json!({
+        "schema": 1,
+        "subject": "installed native queue against an already running ordinary embedded CLI conversation",
+        "nativeVersion": version.trim(),
+        "sha256": sha,
+        "exe": exe.to_string_lossy(),
+        "home": home.to_string_lossy(),
+        "workspace": workspace.to_string_lossy(),
+        "threadId": &thread,
+        "receiver": {
+            "pid": identity.pid,
+            "creationTime": identity.creation_time,
+            "aliveAfterAttempts": receiver_alive,
+            "goneAfterClose": receiver_gone_after_close,
+        },
+        "marks": {
+            "controlPrompt": ORDINARY_TUI_CONTROL_PROMPT,
+            "controlReply": ORDINARY_TUI_CONTROL_REPLY,
+            "queue": ORDINARY_QUEUE_MARK,
+            "closed": MISSING_QUEUE_MARK,
+        },
+        "control": {
+            "answered": control_answered,
+            "turn": control_turn,
+            "submitRetries": submit_retries,
+        },
+        "baseline": {
+            "providerRequests": baseline_requests,
+            "titleRequests": baseline_auxiliary,
+            "sessionFiles": sessions_before,
+            "sessionMetaIds": &meta_before,
+            "daemonSocket": daemon_socket_before,
+        },
+        "queueWithoutEndpoint": {
+            "command": &unmanaged,
+            "delivered": delivered_without_endpoint,
+            "providerHits": hit_json(&unmanaged_hits),
+            "primaryHits": hit_json(&primary_hits),
+            "auxiliaryTitleRequests": hit_json(&auxiliary_hits),
+            "addedTitleRequests": added_auxiliary,
+            "transcriptCopies": transcript_copies,
+            "rolloutCopies": rollout_copies,
+            "rolloutMessageIds": &rollout_message_ids,
+            "providerRequestsTotal": total_after_unmanaged,
+            "sessionFilesAfter": sessions_after_unmanaged,
+            "sessionMetaIdsAfter": &meta_after,
+            "daemonSocketAfter": daemon_socket_after,
+            "daemonCleanup": &daemon_cleanup,
+        },
+        "closedTarget": &closed_target,
+        "providerRequestsAfterAll": total_after_all,
+        "foreignProviderRequests": hit_json(&foreign),
+        "consoleOutcome": &console_outcome,
+        "deliveryEvidence": "the running conversation's own model request carrying the mark on its exact thread, with its own stored and rendered copy",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+        "limitations": "one installed version, one owned home, one receiver; the queued message is observed through the receiver's own requests and rollout",
+    });
+    fs::write(
+        root.join("ordinary-lead-queue-boundary.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // Expectations, checked after the record exists.
+    assert!(
+        baseline_requests >= 1,
+        "the control turn must be among the running conversation's own model requests before any queue attempt; evidence {}",
+        root.display()
+    );
+    assert!(
+        control_answered,
+        "the control turn must complete against the owned provider before any queue attempt; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_alive,
+        "the queue attempts must leave the running ordinary conversation alive; pid {}; evidence {}",
+        identity.pid,
+        root.display()
+    );
+    for (file, hit_thread, _) in &auxiliary_hits {
+        assert!(
+            title_generation_request(&provider_request(&root, file)),
+            "{file} carried the queued message on thread {hit_thread} without the native title-generation shape; evidence {}",
+            root.display()
+        );
+    }
+    assert!(
+        auxiliary_hits.len() <= 1,
+        "one delivered turn cannot add more than one native title-generation request: {auxiliary_hits:?}; evidence {}",
+        root.display()
+    );
+    for (file, hit_thread, _) in &foreign {
+        assert!(
+            title_generation_request(&provider_request(&root, file)),
+            "model work left the running conversation without the native title-generation shape: {file} on thread {hit_thread}; evidence {}",
+            root.display()
+        );
+    }
+    assert_eq!(
+        meta_after,
+        meta_before,
+        "the running conversation's own recorded identity changed: {meta_after:?} against {meta_before:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        sessions_after_unmanaged,
+        sessions_before,
+        "the queue attempt created conversation storage; evidence {}",
+        root.display()
+    );
+    if delivered_without_endpoint {
+        assert_eq!(
+            primary_hits.len(),
+            1,
+            "a live delivery must be exactly one turn input on the running conversation's own thread: {primary_hits:?}; evidence {}",
+            root.display()
+        );
+        assert!(
+            transcript_copies >= 1 || rollout_copies >= 1,
+            "the running conversation's own session must hold the delivered message: transcript {transcript_copies}, rollout {rollout_copies}; evidence {}",
+            root.display()
+        );
+        if rollout_copies >= 1 {
+            assert_eq!(
+                rollout_message_ids.len(),
+                1,
+                "the running conversation must store the delivered message exactly once: {rollout_message_ids:?}; evidence {}",
+                root.display()
+            );
+        }
+        assert!(
+            added_auxiliary <= 1,
+            "one delivered turn cannot add more than one native title-generation request: added {added_auxiliary}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            total_after_unmanaged,
+            baseline_requests + 1 + added_auxiliary,
+            "the queue attempt must add only the delivered turn and at most its own native title request: {unmanaged}; evidence {}",
+            root.display()
+        );
+        assert!(
+            closed_hits.is_empty(),
+            "queue with an unowned thread id started another conversation: {closed_hits:?}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            closed_target["providerRequestsTotal"].as_u64(),
+            Some(total_after_unmanaged as u64),
+            "the closed-target attempt added model work: {closed_target}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            closed_target["sessionFilesDelta"].as_i64(),
+            Some(0),
+            "the closed-target attempt created conversation storage: {closed_target}; evidence {}",
+            root.display()
+        );
+    } else {
+        assert_eq!(
+            total_after_unmanaged,
+            baseline_requests,
+            "the refused queue attempt added model work: {unmanaged}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            transcript_copies,
+            0,
+            "the running conversation rendered a mark that was never delivered; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            rollout_copies,
+            0,
+            "the running conversation stored a mark that was never delivered; evidence {}",
+            root.display()
+        );
+    }
+    assert!(
+        !daemon_socket_after || daemon_cleanup["exited"] == Value::Bool(true),
+        "a daemon appeared for the owned home and its stop was not recorded as exited: {daemon_cleanup}; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_gone_after_close,
+        "the ordinary-lead queue boundary probe left the running receiver TUI alive; pid {}; evidence {}",
+        identity.pid,
+        root.display()
+    );
+    assert!(
+        console_outcome["exited"] == Value::Bool(true),
+        "the owned ordinary TUI did not quit cleanly: {console_outcome}; evidence {}",
+        root.display()
+    );
+    eprintln!(
+        "ordinary-lead queue boundary: deliveredWithoutEndpoint={delivered_without_endpoint} primaryDeliveries={} auxiliaryTitleRequests={} transcriptCopies={transcript_copies} rolloutCopies={rollout_copies} foreignRequests={} receiverAlive={receiver_alive} receiverGoneAfterClose={receiver_gone_after_close}; evidence {}",
+        primary_hits.len(),
+        auxiliary_hits.len(),
+        foreign.len(),
+        root.display()
+    );
+}
+
+/// The value of one `key: value` line in a command's own text report.
+fn text_line(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key).map(|value| value.trim().to_owned()))
+}
+
+/// The provider request count once it stops growing: a queued turn's own
+/// request and its native title auxiliary land beside each other, and a
+/// baseline must cover the whole turn instead of racing the auxiliary.
+fn settled_provider_count(root: &Path) -> usize {
+    let mut count = provider_request_count(root);
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_secs(1));
+        let settled = provider_request_count(root);
+        if settled == count {
+            break;
+        }
+        count = settled;
+    }
+    count
+}
+
+/// One `codex-harness lead message` invocation - the production entry point -
+/// run as a bounded owned child in the passed kit home. The command's own
+/// report is recorded; it is never accepted as delivery here.
+fn run_harness_lead(
+    root: &Path,
+    home: &Path,
+    workspace: &Path,
+    generation: &str,
+    args: &[&str],
+    label: &str,
+) -> Value {
+    let mut spec = CommandSpec::new(PathBuf::from(env!("CARGO_BIN_EXE_codex-harness")));
+    spec.current_dir = Some(workspace.into());
+    let mut all: Vec<OsString> = vec!["lead".into(), "message".into()];
+    all.extend(args.iter().map(|arg| OsString::from(*arg)));
+    spec.args = all;
+    spec.env.insert("CODEX_HOME".into(), Some(home.into()));
+    spec.env
+        .insert("HARNESS_EXECUTOR_RUN".into(), Some(generation.into()));
+    spec.env
+        .insert("HARNESS_EXECUTOR_SESSION".into(), Some("1".into()));
+    // A most-recent or inherited conversation identity is not authority.
+    spec.env.insert(
+        "CODEX_THREAD_ID".into(),
+        Some("most-recent-session-is-not-authority".into()),
+    );
+    for key in [
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+        "CODEX_SESSION_ID",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    // The sender spawns the installed native queue client, which must see the
+    // owned home only: no ambient provider credential rides along, and the
+    // fixture key is what that home's own config names.
+    for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+        spec.env.insert(key.into(), None);
+    }
+    spec.env.insert(
+        "HARNESS_CONTROL_FIXTURE_KEY".into(),
+        Some("synthetic-owned-fixture".into()),
+    );
+    let stdout_path = root.join(format!("{label}-stdout.txt"));
+    let stderr_path = root.join(format!("{label}-stderr.txt"));
+    spec.stdout = Some(fs::File::create(&stdout_path).unwrap());
+    spec.stderr = Some(fs::File::create(&stderr_path).unwrap());
+    let job = Job::new(Limits::default()).unwrap();
+    let child = job.spawn(&spec).unwrap();
+    let started = Instant::now();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(Duration::from_secs(90)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    json!({
+        "exitCode": outcome.exit_code,
+        "exited": outcome.reason == StopReason::Exited,
+        "reason": format!("{:?}", outcome.reason),
+        "seconds": started.elapsed().as_secs_f64(),
+        "stdout": excerpt(&stdout, 4000),
+        "stderr": excerpt(&stderr, 1000),
+    })
+}
+
+/// One fabricated run identity for the production entry point: the receipt the
+/// real dispatch writes, with this test process as the recorded live host (an
+/// ancestor of every sender it runs) and the given conversation as the
+/// recorded originating lead, whose own kit home is the receiver home the
+/// queue route must address. It starts no process and writes only its own
+/// owned file.
+fn write_ordinary_run_receipt(path: &Path, home: &Path, generation: &str, thread: &str) {
+    let user = process_service::current_user().unwrap();
+    let program = std::env::current_exe().unwrap();
+    let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+        .unwrap()
+        .identity();
+    let state = path.parent().unwrap();
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "originatingLead": {
+                "schema": 1,
+                "threadId": thread,
+                "runGeneration": generation,
+                "home": home,
+                "dispatcher": {
+                    "pid": identity.pid,
+                    "creationTime": identity.creation_time,
+                    "program": program.clone(),
+                },
+            },
+            "slot": {
+                "index": 1,
+                "path": state.join("worktree"),
+                "source": state.join("checkout"),
+                "owner": "ordinary-lead-production",
+            },
+            "observation": {
+                "schema": 1,
+                "state": "running",
+                "session": "ordinary-lead-production-session",
+                "host": {
+                    "pid": identity.pid,
+                    "created": identity.creation_time,
+                    "program": program,
+                },
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// The production entry point over the verified native boundary: the same
+/// owned ordinary native TUI is the running receiver, and the checkout's own
+/// `codex-harness lead message` is the sender. The sender runs as a member of
+/// a fabricated run identity whose recorded live host is this test process
+/// (its own ancestor), resolves its route from the same owned kit home (no
+/// lead endpoint is recorded; the home's own launcher registration names the
+/// installed executable) and must reach the running conversation through the
+/// installed native queue. Delivery is the receiver's own stored user row and
+/// its own model request; the harness report, exit status and process state
+/// are recorded beside them and are not delivery. One message is sent first,
+/// repeated second (idempotent), then one payload above the inline bound
+/// (spill pointer), then one nonexistent target, and finally one
+/// stopped-existing target after the receiver quits. Each arm records what
+/// actually happened; the expectations name the invariants that hold for
+/// either honest classification, so neither a test name nor an assertion
+/// presumes in advance that unmanaged delivery fails.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; starts an owned ordinary native TUI with the canned local Responses provider and drives this checkout's own `codex-harness lead message`; no live model, no daemon, no desktop"]
+fn installed_queue_production_lead_message_reaches_a_running_ordinary_tui() {
+    const NOTICE_MARK: &str = "ORDINARY-LEAD-PRODUCTION-NOTICE-8me13";
+    const SPILL_MARK: &str = "ORDINARY-LEAD-PRODUCTION-SPILL-8me13";
+    const SPILL_FILLER: &str = "ORDINARY-LEAD-PRODUCTION-SPILL-FILLER-8me13";
+    const MISSING_MARK: &str = "ORDINARY-LEAD-PRODUCTION-MISSING-8me13";
+    const STOPPED_MARK: &str = "ORDINARY-LEAD-PRODUCTION-STOPPED-8me13";
+    const RUN_GENERATION: &str = "generation-ordinary-lead-production";
+    const MISSING_GENERATION: &str = "generation-ordinary-lead-missing";
+
+    let exe = codex_exe();
+    let upstream = installed_upstream();
+    assert!(
+        same_executable(&exe, &upstream),
+        "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the production arm runs the installed native queue",
+        exe.display(),
+        upstream.display()
+    );
+    let version = version_text(&exe);
+    let sha = build_identity::hash_file(&exe).unwrap();
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let root = owned_root.path().to_path_buf();
+    let home = root.join("ordinary-home");
+    let workspace = root.join("ordinary-workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    // The kit home's own launcher registration is the ordinary route's only
+    // authority for the queue executable; seeding it copies the installed
+    // record, and it starts no process.
+    seed_launcher_registration(&home);
+    let user = process_service::current_user().unwrap();
+    eprintln!(
+        "ordinary-lead production integration evidence: {}",
+        root.display()
+    );
+
+    // The receiver: a real ordinary native TUI, built exactly like the
+    // accepted boundary probe, answering every request from the canned
+    // provider.
+    let responses = control_responses::Responses::routed(root.clone(), |_request| {
+        json!({
+            "type": "message",
+            "id": "ordinary-control-reply",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ORDINARY_TUI_CONTROL_REPLY}]
+        })
+    });
+    let trusted = serde_json::to_string(&workspace.to_string_lossy().to_lowercase()).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+model = "gpt-6-astra"
+model_provider = "control_fixture"
+model_reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "disabled"
+cli_auth_credentials_store = "file"
+[model_providers.control_fixture]
+name = "Owned ordinary TUI fixture"
+base_url = "http://127.0.0.1:{}/v1"
+wire_api = "responses"
+env_key = "HARNESS_CONTROL_FIXTURE_KEY"
+requires_openai_auth = false
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+[windows]
+sandbox = "unelevated"
+[features]
+hooks = false
+apps = false
+multi_agent = false
+multi_agent_v2 = false
+memories = false
+goals = false
+plugins = false
+skill_search = false
+skip_host_skill_discovery = true
+[analytics]
+enabled = false
+[projects.{trusted}]
+trust_level = "trusted"
+"#,
+            responses.port
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "harness-control-ordinary-tui"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut spec = command(&exe, &home, &workspace);
+    spec.args = vec!["--no-alt-screen".into()];
+    spec.env.insert("PATH".into(), Some(filtered_path()));
+    for key in [
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let mut console = ConsoleSpec::new(spec);
+    console.limits.memory_bytes = Some(512 * 1024 * 1024);
+    console.limits.cpu_percent = Some(50.0);
+    let session = ConsoleSession::spawn(console).unwrap();
+    let identity = session.identity();
+    let ready = wait_until(60, || {
+        let text = session.transcript();
+        text.contains("gpt-6-astra") || text.contains("Codex")
+    });
+    if !ready {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned ordinary TUI did not become ready; evidence {}",
+            root.display()
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
+
+    // The control turn establishes the running conversation's exact thread
+    // through its own model request; the queued arms below can then be
+    // attributed only to that conversation.
+    send_line(&session, ORDINARY_TUI_CONTROL_PROMPT).unwrap();
+    let mut submit_retries = 0;
+    let mut control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    while !control_requested && submit_retries < 2 {
+        let _ = session.send("\r");
+        submit_retries += 1;
+        control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    }
+    if !control_requested {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned provider recorded no request for the control turn; evidence {}",
+            root.display()
+        );
+    }
+    let control_answered = wait_until(60, || {
+        session_mark_count(&home, ORDINARY_TUI_CONTROL_REPLY) >= 1
+            || session.transcript().contains(ORDINARY_TUI_CONTROL_REPLY)
+    });
+    let baseline_requests = settled_provider_count(&root);
+    let entries = provider_entries(&root);
+    let (_, _, thread, control_turn) = entries
+        .first()
+        .unwrap_or_else(|| panic!("no recorded provider request; evidence {}", root.display()))
+        .clone();
+    let baseline_auxiliary = entries
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
+    let meta_before = session_meta_ids(&home);
+    let sessions_before = count_files(&home.join("sessions"));
+    let daemon_socket = home
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    let daemon_socket_before = daemon_socket.exists();
+    eprintln!(
+        "ordinary lead production: receiver pid {} creation {} thread {thread} controlTurn {control_turn} baselineRequests {baseline_requests}; evidence {}",
+        identity.pid,
+        identity.creation_time,
+        root.display()
+    );
+
+    // The fabricated run identity: this test process is the recorded live
+    // host and the ancestor of every sender invocation below; the receiver's
+    // exact thread is the recorded originating lead.
+    let state = home.join("harness/executor-pool/ordinary-lead-production");
+    fs::create_dir_all(&state).unwrap();
+    write_ordinary_run_receipt(&state.join("spawn-1.json"), &home, RUN_GENERATION, &thread);
+    write_ordinary_run_receipt(
+        &state.join("spawn-2.json"),
+        &home,
+        MISSING_GENERATION,
+        MISSING_THREAD_ID,
+    );
+
+    // Arm 1: the first notification through the production entry point.
+    let notice = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--text", NOTICE_MARK],
+        "lead-notice",
+    );
+    let notice_delivered = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, NOTICE_MARK).is_empty()
+    });
+    let notice_requests = settled_provider_count(&root);
+    let notice_hits = provider_hits(&root, NOTICE_MARK);
+    let notice_primary: Vec<(String, String, String)> = notice_hits
+        .iter()
+        .filter(|(file, hit_thread, _)| {
+            hit_thread == &thread && !title_generation_request(&provider_request(&root, file))
+        })
+        .cloned()
+        .collect();
+    let notice_rollout = session_mark_count(&home, NOTICE_MARK);
+    let receiver_alive = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_some())
+        .unwrap_or(false);
+    let daemon_socket_after_notice = daemon_socket.exists();
+    let meta_after_notice = session_meta_ids(&home);
+    let sessions_after_notice = count_files(&home.join("sessions"));
+
+    // Arm 2: the same words again - a repeat must reconcile the recorded
+    // attempt, never deliver a second copy.
+    let repeat = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--text", NOTICE_MARK],
+        "lead-notice-repeat",
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let repeat_requests = provider_request_count(&root);
+    let repeat_rollout = session_mark_count(&home, NOTICE_MARK);
+    let notice_record = read_json(&state.join("spawn-1.json")).unwrap_or(Value::Null);
+
+    // Arm 3: one payload above the inline bound travels as the shared spill
+    // pointer; the complete payload is never rewritten into a command line.
+    let spill_payload = format!(
+        "{SPILL_MARK}\n{}\n{SPILL_MARK}\n",
+        SPILL_FILLER.repeat(8000)
+    );
+    let spill_file = root.join("production-spill-payload.txt");
+    fs::write(&spill_file, spill_payload.as_bytes()).unwrap();
+    let spill = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--file", spill_file.to_str().unwrap()],
+        "lead-spill",
+    );
+    let spill_delivered = wait_until(WAIT.as_secs(), || {
+        session_mark_count(&home, "larger than one conversation input") >= 1
+    });
+    let spill_requests = settled_provider_count(&root);
+    let spill_pointer_hits = provider_hits(&root, "larger than one conversation input");
+    let spill_pointer_primary = spill_pointer_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread == &thread)
+        .count();
+    let spill_inline_leak = provider_entries(&root)
+        .iter()
+        .any(|(_, request, _, _)| contains_payload(request, SPILL_FILLER));
+    let spill_path_reported = text_line(
+        spill["stdout"].as_str().unwrap_or_default(),
+        "payloadPath: ",
+    );
+    let spill_file_matches = spill_path_reported
+        .as_deref()
+        .map(|path| {
+            fs::read(path)
+                .map(|bytes| bytes == spill_payload.as_bytes())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    // Arm 4: a target the receiver does not own refuses through the same
+    // production entry point and records an honest error.
+    let missing = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        MISSING_GENERATION,
+        &["--notify", "--text", MISSING_MARK],
+        "lead-missing",
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let missing_requests = provider_request_count(&root);
+    let missing_record = read_json(&state.join("spawn-2.json")).unwrap_or(Value::Null);
+
+    // The receiver quits through its own console; the last arm addresses the
+    // same existing thread with no conversation behind it any more.
+    dump_terminal(&root, &session);
+    let _ = send_line(&session, "/quit");
+    let console_result = session.wait(
+        Deadline::after(Duration::from_secs(25)).unwrap(),
+        &Cancellation::default(),
+        Duration::from_secs(5),
+    );
+    let console_outcome = match &console_result {
+        Ok(value) => {
+            fs::write(root.join("terminal-final.txt"), &value.transcript).unwrap();
+            json!({
+                "exited": value.outcome.reason == StopReason::Exited,
+                "outcome": value.outcome,
+                "truncated": value.output_truncated,
+            })
+        }
+        Err(error) => json!({"error": error.to_string()}),
+    };
+    let receiver_gone = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_none())
+        .unwrap_or(false);
+    let meta_before_stopped = session_meta_ids(&home);
+    let before_stopped = settled_provider_count(&root);
+    let stopped = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--text", STOPPED_MARK],
+        "lead-stopped",
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    let stopped_requests = provider_request_count(&root);
+    let stopped_hits = provider_hits(&root, STOPPED_MARK);
+    let stopped_rollout = session_mark_count(&home, STOPPED_MARK);
+    let meta_after_stopped = session_meta_ids(&home);
+    let sessions_after_stopped = count_files(&home.join("sessions"));
+    let daemon_socket_after_stopped = daemon_socket.exists();
+    let receiver_still_gone = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_none())
+        .unwrap_or(false);
+
+    // The complete observed record is written before any expectation: a
+    // failed assertion still leaves this receipt beside the raw evidence.
+    let receipt = json!({
+        "schema": 1,
+        "subject": "production `codex-harness lead message` over the installed native queue against an already running ordinary embedded CLI conversation",
+        "nativeVersion": version.trim(),
+        "sha256": sha,
+        "exe": exe.to_string_lossy(),
+        "sender": env!("CARGO_BIN_EXE_codex-harness"),
+        "home": home.to_string_lossy(),
+        "workspace": workspace.to_string_lossy(),
+        "threadId": &thread,
+        "runGeneration": RUN_GENERATION,
+        "receiver": {
+            "pid": identity.pid,
+            "creationTime": identity.creation_time,
+            "aliveAfterNotice": receiver_alive,
+            "goneAfterClose": receiver_gone,
+            "stillGoneAtStoppedArm": receiver_still_gone,
+        },
+        "control": {
+            "answered": control_answered,
+            "turn": control_turn,
+            "submitRetries": submit_retries,
+        },
+        "baseline": {
+            "providerRequests": baseline_requests,
+            "titleRequests": baseline_auxiliary,
+            "sessionFiles": sessions_before,
+            "sessionMetaIds": &meta_before,
+            "daemonSocket": daemon_socket_before,
+        },
+        "notice": {
+            "command": &notice,
+            "delivered": notice_delivered,
+            "primaryHits": hit_json(&notice_primary),
+            "allHits": hit_json(&notice_hits),
+            "rolloutCopies": notice_rollout,
+            "providerRequestsAfter": notice_requests,
+            "sessionMetaIdsAfter": &meta_after_notice,
+            "sessionFilesAfter": sessions_after_notice,
+            "daemonSocketAfter": daemon_socket_after_notice,
+        },
+        "noticeRepeat": {
+            "command": &repeat,
+            "providerRequestsAfter": repeat_requests,
+            "rolloutCopies": repeat_rollout,
+            "recordedAttempt": &notice_record["leadMessages"][0],
+        },
+        "spill": {
+            "command": &spill,
+            "delivered": spill_delivered,
+            "payloadBytes": spill_payload.len(),
+            "reportedPath": spill_path_reported,
+            "reportedFileMatchesPayload": spill_file_matches,
+            "pointerPrimaryHits": spill_pointer_primary,
+            "inlinePayloadLeak": spill_inline_leak,
+            "providerRequestsAfter": spill_requests,
+        },
+        "missingTarget": {
+            "command": &missing,
+            "providerRequestsAfter": missing_requests,
+            "recordedAttempts": &missing_record["leadMessages"],
+        },
+        "stoppedTarget": {
+            "command": &stopped,
+            "providerRequestsBefore": before_stopped,
+            "providerRequestsAfter": stopped_requests,
+            "hits": hit_json(&stopped_hits),
+            "rolloutCopies": stopped_rollout,
+            "sessionMetaIdsBefore": &meta_before_stopped,
+            "sessionMetaIdsAfter": &meta_after_stopped,
+            "sessionFilesAfter": sessions_after_stopped,
+            "daemonSocketAfter": daemon_socket_after_stopped,
+        },
+        "consoleOutcome": &console_outcome,
+        "deliveryEvidence": "the addressed conversation's own stored user row and its own model request carrying the mark on its exact thread",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+        "limitations": "one installed version, one owned home, one receiver; the stopped-target arm records what the native queue actually does, and neither its classification nor its exit is presumed in advance",
+    });
+    fs::write(
+        root.join("ordinary-lead-production.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // Expectations, checked after the record exists.
+    assert!(
+        baseline_requests >= 1,
+        "the control turn must be among the running conversation's own model requests; evidence {}",
+        root.display()
+    );
+    let notice_text = format!("{}{}", notice["stdout"], notice["stderr"]);
+    assert!(
+        notice["exited"] == Value::Bool(true) && notice["exitCode"] == Value::from(0),
+        "the first notification must finish with exit 0: {notice}; evidence {}",
+        root.display()
+    );
+    assert!(
+        notice_text.contains("lead message: delivered")
+            || notice_text.contains("lead message: queued"),
+        "the first notification must be classified honestly as delivered or queued: {notice_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        notice_primary.len() == 1,
+        "the addressed conversation must issue exactly one primary request carrying the notice once: {}; evidence {}",
+        hit_json(&notice_primary),
+        root.display()
+    );
+    assert!(
+        notice_delivered && notice_rollout >= 1,
+        "the notice must be observable in the running conversation's own request and stored items: delivered={notice_delivered} rollout={notice_rollout}; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_alive,
+        "the receiver must still be running after the notice; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        meta_after_notice,
+        meta_before,
+        "no second conversation may appear while the notice is delivered; evidence {}",
+        root.display()
+    );
+    assert!(
+        !daemon_socket_after_notice && !daemon_socket_before,
+        "no daemon may appear for the owned home; evidence {}",
+        root.display()
+    );
+
+    let repeat_text = format!("{}{}", repeat["stdout"], repeat["stderr"]);
+    assert!(
+        repeat["exited"] == Value::Bool(true) && repeat["exitCode"] == Value::from(0),
+        "the repeat must finish with exit 0: {repeat}; evidence {}",
+        root.display()
+    );
+    assert!(
+        repeat_text.contains("lead message: delivered") && repeat_text.contains("nothing was sent"),
+        "the repeat must reconcile the recorded attempt instead of sending: {repeat_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        repeat_requests == notice_requests && repeat_rollout == notice_rollout,
+        "the repeat must add no model request and no stored copy: requests {notice_requests}->{repeat_requests}, rollout {notice_rollout}->{repeat_rollout}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        notice_record["leadMessages"][0]["status"],
+        "delivered",
+        "the recorded attempt must end as delivered once the conversation's own row exists; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        notice_record["leadMessages"][0]["attempts"],
+        1,
+        "the repeat must not add a second transport attempt; evidence {}",
+        root.display()
+    );
+
+    let spill_text = format!("{}{}", spill["stdout"], spill["stderr"]);
+    assert!(
+        spill["exited"] == Value::Bool(true) && spill["exitCode"] == Value::from(0),
+        "the spilled notification must finish with exit 0: {spill}; evidence {}",
+        root.display()
+    );
+    assert!(
+        spill_text.contains("lead message: delivered")
+            || spill_text.contains("lead message: queued"),
+        "the spilled notification must be classified honestly as delivered or queued: {spill_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        spill_text.contains("delivery: spill") && spill_file_matches,
+        "the spill pointer must name the harness file whose bytes are the complete payload: {spill_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        !spill_inline_leak,
+        "the complete payload must not ride inline in any model request; evidence {}",
+        root.display()
+    );
+    assert!(
+        spill_delivered && spill_pointer_primary >= 1,
+        "the pointer must be observable in the running conversation's own request on its exact thread: delivered={spill_delivered} pointerHits={spill_pointer_primary}; evidence {}",
+        root.display()
+    );
+
+    let missing_text = format!("{}{}", missing["stdout"], missing["stderr"]);
+    assert!(
+        missing["exited"] == Value::Bool(true) && missing["exitCode"] == Value::from(1),
+        "a target the receiver does not own must be refused as a recorded error: {missing}; evidence {}",
+        root.display()
+    );
+    assert!(
+        missing_text.contains("lead message: error") && missing_text.contains("refused"),
+        "the recorded error must name the native refusal: {missing_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        missing_requests == spill_requests,
+        "the nonexistent target must produce no model request: {spill_requests}->{missing_requests}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        missing_record["leadMessages"][0]["status"],
+        "error",
+        "the nonexistent target's refusal must be recorded as an error; evidence {}",
+        root.display()
+    );
+
+    let stopped_text = format!("{}{}", stopped["stdout"], stopped["stderr"]);
+    assert!(
+        receiver_gone && console_outcome["exited"] == Value::Bool(true),
+        "the owned receiver must quit through its own console before the stopped-target arm: {console_outcome}; evidence {}",
+        root.display()
+    );
+    assert!(
+        stopped["exited"] == Value::Bool(true)
+            && (stopped["exitCode"] == Value::from(0) || stopped["exitCode"] == Value::from(1)),
+        "the stopped-target arm must finish with an honest classified result, not a crash or a timeout: {stopped}; evidence {}",
+        root.display()
+    );
+    assert!(
+        stopped_hits.is_empty() && stopped_requests == before_stopped,
+        "no model request may follow a stopped target: {stopped_requests} vs {before_stopped}, hits {}; evidence {}",
+        hit_json(&stopped_hits),
+        root.display()
+    );
+    assert_eq!(
+        meta_after_stopped,
+        meta_before_stopped,
+        "a stopped target must not start a second conversation or resume a clone; evidence {}",
+        root.display()
+    );
+    assert!(
+        !daemon_socket_after_stopped,
+        "no daemon may appear for a stopped target; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_still_gone,
+        "the stopped receiver must not be resurrected; evidence {}",
+        root.display()
+    );
+    if stopped["exitCode"] == Value::from(1) {
+        assert!(
+            stopped_text.contains("lead message: error")
+                || stopped_text.contains("lead message: indeterminate"),
+            "exit 1 must carry an honest error or indeterminate class: {stopped_text}; evidence {}",
+            root.display()
+        );
+    }
+    if stopped_text.contains("lead message: delivered")
+        || stopped_text.contains("lead message: queued")
+    {
+        assert!(
+            sessions_after_stopped >= sessions_before,
+            "the stopped arm's sessions tree must not lose the receiver's own records; evidence {}",
+            root.display()
+        );
+    }
+    if stopped_text.contains("lead message: delivered") {
+        assert!(
+            stopped_rollout >= 1,
+            "a delivered claim for a stopped target must be backed by the conversation's own stored row: rollout={stopped_rollout}; evidence {}",
+            root.display()
+        );
+    }
+    eprintln!(
+        "ordinary-lead production: noticePrimary={} rollouts={notice_rollout} repeatRequests={notice_requests}->{repeat_requests} spillBytes={} pointerHits={spill_pointer_primary} missingExit={} stoppedExit={} stoppedRollout={stopped_rollout} receiverGone={receiver_gone}; evidence {}",
+        notice_primary.len(),
+        spill_payload.len(),
+        missing["exitCode"],
+        stopped["exitCode"],
+        root.display()
+    );
+}
+
+/// The separately labelled positive control for the same installed `codex
+/// queue`: one owned native app-server hosts one running conversation, and the
+/// queue command names that listener and its capability token explicitly. The
+/// delivered message starts exactly one turn on the running thread; that
+/// turn's own sampling rounds (the queued input, then its executed proof-tool
+/// continuation) are one delivery, not duplicates. The closed-target arm
+/// proves the same route fails closed for a thread the receiver does not own.
+/// This receiver is managed by construction; it is not the ordinary arm.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; owned native app-server fixture and canned Responses; no live model"]
+fn installed_queue_endpoint_reaches_its_owning_thread() {
+    let fixture = installed_fixture();
+    let root = fixture.root.path().to_path_buf();
+    let home = root.join("home");
+    let version = version_text(&fixture.exe);
+    let user = process_service::current_user().unwrap();
+    eprintln!(
+        "queue endpoint positive control evidence: {}",
+        root.display()
+    );
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let started = owner.request(
+        "thread/start",
+        json!({
+            "cwd": fixture.workspace,
+            "model": "gpt-6-astra",
+            "modelProvider": "control_fixture",
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access"
+        }),
+    );
+    let thread = started["thread"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread/start answered {started}"))
+        .to_owned();
+    // Installed 0.162.1 answers this metadata read; `includeTurns` reaches its
+    // unimplemented list_turns RPC (-32601, "list_turns is not supported yet"),
+    // so delivery is observed in the receiver's own model requests instead.
+    let baseline = owner.request("thread/read", json!({"threadId": thread}));
+    assert_eq!(baseline["thread"]["id"], thread, "{baseline}");
+    assert_eq!(baseline["thread"]["status"]["type"], "idle", "{baseline}");
+    let baseline_requests = provider_request_count(&root);
+    let sessions_before = count_files(&home.join("sessions"));
+
+    // 1. The owning endpoint and capability token: exactly one delivered turn
+    // on the exact running thread, its proof-tool continuation included, with
+    // no other model work.
+    let managed = run_native_command(
+        &fixture.exe,
+        &home,
+        &fixture.workspace,
+        &root,
+        queue_arguments(&thread, ENDPOINT_QUEUE_MARK, Some(fixture.port)),
+        vec![(
+            "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
+            fixture.token.clone(),
+        )],
+        "queue-endpoint",
+    );
+    let first_hit = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, ENDPOINT_QUEUE_MARK).is_empty()
+    });
+    std::thread::sleep(Duration::from_secs(6));
+    let endpoint_hits = provider_hits(&root, ENDPOINT_QUEUE_MARK);
+    let total_after_managed = provider_request_count(&root);
+    let after_managed = owner.request("thread/read", json!({"threadId": thread}));
+    let same_thread = endpoint_hits
+        .iter()
+        .all(|(_, hit_thread, _)| hit_thread == &thread);
+    let sessions_after_managed = count_files(&home.join("sessions"));
+    let managed_text = format!(
+        "{}{}",
+        managed["stdout"].as_str().unwrap_or_default(),
+        managed["stderr"].as_str().unwrap_or_default()
+    );
+    let endpoint_bodies: Vec<Value> = provider_entries(&root)
+        .into_iter()
+        .filter(|(_, request, _, _)| contains_payload(request, ENDPOINT_QUEUE_MARK))
+        .map(|(_, request, _, _)| request)
+        .collect();
+    let endpoint_turns: Vec<String> = endpoint_hits.iter().map(|(_, _, turn)| turn.clone()).fold(
+        Vec::new(),
+        |mut turns, turn| {
+            if !turns.contains(&turn) {
+                turns.push(turn);
+            }
+            turns
+        },
+    );
+    let initial_rounds = endpoint_bodies
+        .iter()
+        .filter(|request| !proof_continuation(request))
+        .count();
+    let proof_rounds = endpoint_bodies
+        .iter()
+        .filter(|request| proof_continuation(request))
+        .count();
+
+    // 2. A closed target fails closed: the same endpoint, a thread this
+    // receiver does not own - no delivery, no second conversation, no model
+    // work.
+    let missing = run_native_command(
+        &fixture.exe,
+        &home,
+        &fixture.workspace,
+        &root,
+        queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, Some(fixture.port)),
+        vec![(
+            "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
+            fixture.token.clone(),
+        )],
+        "queue-missing-thread",
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    let missing_hits = provider_hits(&root, MISSING_QUEUE_MARK);
+    let total_after_missing = provider_request_count(&root);
+    let status = owner.request("thread/read", json!({"threadId": thread}));
+    let sessions_after_missing = count_files(&home.join("sessions"));
+    let foreign = foreign_provider_requests(&root, &thread);
+
+    let receipt = json!({
+        "schema": 1,
+        "subject": "installed queue endpoint positive control for its owning thread (managed app-server receiver, not the ordinary arm)",
+        "nativeVersion": version.trim(),
+        "exe": fixture.exe.to_string_lossy(),
+        "threadId": &thread,
+        "marks": {"endpoint": ENDPOINT_QUEUE_MARK, "missing": MISSING_QUEUE_MARK},
+        "endpoint": {
+            "command": &managed,
+            "deliveredTurns": endpoint_turns.len(),
+            "rounds": endpoint_hits.len(),
+            "initialRounds": initial_rounds,
+            "proofRounds": proof_rounds,
+            "providerHits": hit_json(&endpoint_hits),
+            "receiverAfterDelivery": {
+                "id": after_managed["thread"]["id"].clone(),
+                "status": after_managed["thread"]["status"].clone(),
+            },
+            "sameThread": same_thread,
+            "providerRequestsTotal": total_after_managed,
+        },
+        "closedTarget": {
+            "command": &missing,
+            "providerHits": hit_json(&missing_hits),
+            "providerRequestsTotal": total_after_missing,
+            "sessionFilesDelta": sessions_after_missing as i64 - sessions_after_managed as i64,
+        },
+        "baselineProviderRequests": baseline_requests,
+        "sessionFilesBaseline": sessions_before,
+        "foreignProviderRequests": hit_json(&foreign),
+        "deliveryEvidence": "the receiver's own model request carrying the queued message on the exact thread",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+    });
+    fs::write(
+        root.join("queue-endpoint-positive-control.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        baseline_requests, 0,
+        "an idle running conversation must not have called a model before any queue attempt"
+    );
+    assert!(
+        first_hit,
+        "queue with the owning endpoint did not reach the running conversation: {managed}; evidence {}",
+        root.display()
+    );
+    assert!(
+        same_thread,
+        "endpoint delivery reached another conversation: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        endpoint_turns.len(),
+        1,
+        "queue delivery must start exactly one turn on the running conversation: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        initial_rounds,
+        1,
+        "the queued message must enter the running turn exactly once: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert!(
+        proof_rounds >= 1,
+        "the delivered turn must continue through its own proof-tool round: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        after_managed["thread"]["id"], thread,
+        "the running conversation's thread identity changed after delivery: {after_managed}"
+    );
+    assert_eq!(
+        total_after_managed,
+        baseline_requests + endpoint_hits.len(),
+        "the delivered turn's own rounds must be the only model work: {managed}"
+    );
+    assert_eq!(
+        managed["exitCode"].as_i64(),
+        Some(0),
+        "queue with the owning endpoint failed: {managed}"
+    );
+    assert!(
+        !managed_text.contains(fixture.token.as_str()),
+        "queue must not echo the capability token: {managed}"
+    );
+    assert!(
+        missing_hits.is_empty(),
+        "queue with an unowned thread id started another conversation: {missing_hits:?}; command {missing}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        total_after_missing, total_after_managed,
+        "the closed-target attempt added model work: {missing}"
+    );
+    assert_eq!(
+        status["thread"]["id"], thread,
+        "the running conversation's thread identity changed: {status}"
+    );
+    assert!(
+        foreign.is_empty(),
+        "model work left the running conversation: {foreign:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        sessions_after_missing, sessions_after_managed,
+        "a closed-target queue attempt created conversation storage"
+    );
+
+    // Restoration: stop this fixture's own receiver through its own Job and
+    // confirm the installed executable no longer runs.
+    fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
+    // TerminateProcess is asynchronous: give the exact recorded identity a
+    // bounded window to disappear before it counts as still running.
+    let until = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < until
+        && ServiceProcess::inspect(fixture.server, &fixture.exe, &user)
+            .map(|process| process.is_some())
+            .unwrap_or(true)
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_process_gone(
+        fixture.server,
+        &fixture.exe,
+        &user,
+        "the queue endpoint positive control left its receiver app-server running",
+    );
+    eprintln!(
+        "queue endpoint positive control: endpointTurns={} endpointRounds={} initialRounds={initial_rounds} proofRounds={proof_rounds} closedTargetDeliveries={} foreignRequests={}; evidence {}",
+        endpoint_turns.len(),
+        endpoint_hits.len(),
+        missing_hits.len(),
+        foreign.len(),
+        root.display()
     );
 }
