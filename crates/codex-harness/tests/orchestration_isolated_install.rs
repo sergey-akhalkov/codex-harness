@@ -98,6 +98,17 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     let foreign = user_home.join(".agents/skills/foreign/SKILL.md");
     fs::create_dir_all(foreign.parent().unwrap()).unwrap();
     fs::write(&foreign, b"---\nname: foreign\ndescription: Kept.\n---\n").unwrap();
+    // 0.162.1 resolves the user farm from the real OS profile rather than
+    // this synthetic home, so the foreign canary above is preservation-only
+    // here. This fixture-controlled project skill lives in the catalogue's
+    // case directory and carries the discovery assertions below.
+    let foreign_project = workspace.join(".agents/skills/foreign-project/SKILL.md");
+    fs::create_dir_all(foreign_project.parent().unwrap()).unwrap();
+    fs::write(
+        &foreign_project,
+        b"---\nname: foreign-project\ndescription: Kept.\n---\n",
+    )
+    .unwrap();
 
     let report = core_install::connect(&request, false).unwrap();
     assert_eq!(report.status, "connected");
@@ -146,6 +157,11 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "---\nname: foreign\ndescription: Kept.\n---\n",
         "foreign skills are preserved"
     );
+    assert_eq!(
+        fs::read_to_string(&foreign_project).unwrap(),
+        "---\nname: foreign-project\ndescription: Kept.\n---\n",
+        "the consumer project's own skill is preserved"
+    );
 
     // The orchestration configuration names machine-local profiles; kit
     // install does not create them, so the isolated home supplies the same
@@ -184,6 +200,14 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert!(!lead_revision.is_empty());
     assert!(!executor_revision.is_empty());
     assert_ne!(lead_revision, executor_revision);
+    let roles_of = |report: &orchestration_lifecycle::CheckReport| {
+        report
+            .roles
+            .iter()
+            .map(|state| (state.role, state.status, state.revision.clone()))
+            .collect::<Vec<_>>()
+    };
+    let delivered_roles = roles_of(&delivery);
     let configured = orchestration_config::load(&source).unwrap();
     assert_eq!(
         delivery.max_concurrent_executors,
@@ -313,33 +337,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     // context in the outside project through the installed launcher as well.
     let project_guidance = "Owned outside-project instruction marker";
     fs::write(workspace.join("AGENTS.md"), project_guidance).unwrap();
-    let prompt = Command::new(codex_home.join("harness/bin/codex.exe"))
-        .current_dir(&workspace)
-        .env("CODEX_HOME", &codex_home)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("APPDATA", user_home.join("AppData/Roaming"))
-        .env("LOCALAPPDATA", user_home.join("AppData/Local"))
-        .env("TEMP", user_home.join("AppData/Local/Temp"))
-        .env("TMP", user_home.join("AppData/Local/Temp"))
-        .args(["debug", "prompt-input"])
-        .output()
-        .unwrap();
-    assert!(
-        prompt.status.success(),
-        "{}",
-        failed("outside prompt", &prompt)
-    );
-    let messages: serde_json::Value = serde_json::from_slice(&prompt.stdout).unwrap();
-    let context = messages
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|message| message["content"].as_array().unwrap())
-        .filter_map(|content| content["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .replace("\r\n", "\n");
+    let context = outside_prompt(&codex_home, &user_home, &workspace, false);
     for relative in ["global/principles-of-work.md", "global/roles/lead.md"] {
         let expected = fs::read_to_string(source.join(relative))
             .unwrap()
@@ -362,6 +360,85 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     );
     assert!(context.contains("danger-full-access"));
     assert!(context.contains("Approval policy is currently never"));
+
+    // The executor side of the same installed launcher: the dispatch marker
+    // and declared executor profile select the executor role, so a second
+    // fresh context must carry the shared core and executor fragment, omit
+    // the lead-only fragment and keep the project guidance.
+    let executor_context = outside_prompt(&codex_home, &user_home, &workspace, true);
+    for relative in ["global/principles-of-work.md", "global/roles/executor.md"] {
+        let expected = fs::read_to_string(source.join(relative))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            executor_context.contains(expected.trim()),
+            "executor context omits {relative}"
+        );
+    }
+    assert!(
+        executor_context.contains(project_guidance),
+        "executor project guidance is missing"
+    );
+    let lead_guidance = fs::read_to_string(source.join("global/roles/lead.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        !executor_context.contains(lead_guidance.trim()),
+        "executor loaded the lead role"
+    );
+
+    // The installed catalogue path resolves the same recorded source for
+    // both roles: the owned revision is reported, the lead-only skill is
+    // disabled only for the executor, and the unrelated project skill stays
+    // in both effective sets.
+    let catalogue = |args: &[&str]| -> String {
+        let out = Command::new(codex_home.join("harness/bin/codex-harness.exe"))
+            .current_dir(&workspace)
+            .env("CODEX_HOME", &codex_home)
+            .env("USERPROFILE", &user_home)
+            .env("HOME", &user_home)
+            .env("APPDATA", user_home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", user_home.join("AppData/Local"))
+            .env("TEMP", user_home.join("AppData/Local/Temp"))
+            .env("TMP", user_home.join("AppData/Local/Temp"))
+            .args(["skills", "catalogue", "--limit", "1048576"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", failed("skills catalogue", &out));
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let lead_catalogue = catalogue(&["--role", "lead"]);
+    assert!(
+        lead_catalogue.starts_with(&format!(
+            "role_context=role=lead;profile=none;revision={lead_revision}\n"
+        )),
+        "{lead_catalogue}"
+    );
+    let executor_catalogue = catalogue(&["--role", "executor", "--profile", "ds"]);
+    assert!(
+        executor_catalogue.starts_with(&format!(
+            "role_context=role=executor;profile=ds;revision={executor_revision}\n"
+        )),
+        "{executor_catalogue}"
+    );
+    let enabled = |text: &str, name: &str, scope: &str| -> bool {
+        let prefix = format!("name={name};scope={scope};");
+        text.lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("catalogue omits {name} in scope {scope}: {text}"))
+            .contains(";enabled=true;")
+    };
+    assert!(enabled(&lead_catalogue, "team-lead", "user"));
+    assert!(enabled(&lead_catalogue, "board-workflow", "user"));
+    assert!(enabled(&lead_catalogue, "foreign-project", "repo"));
+    assert!(!enabled(&executor_catalogue, "team-lead", "user"));
+    assert!(enabled(&executor_catalogue, "board-workflow", "user"));
+    assert!(enabled(&executor_catalogue, "foreign-project", "repo"));
 
     board_lifecycle::disconnect(&board_on).unwrap();
     assert!(
@@ -441,6 +518,12 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert!(
         !user_home.join(".agents/skills/isolated-worktree").exists(),
         "an update does not re-advertise the retired skill"
+    );
+    let update_roles =
+        roles_of(&orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap());
+    assert_eq!(
+        update_roles, delivered_roles,
+        "an installed update keeps both roles resolving from the recorded sources"
     );
     let after_update = task_worktree::continue_task(
         &codex_home,
@@ -606,6 +689,20 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "rollback removes the loop guidance links"
     );
     assert!(user_home.join(".agents/skills/foreign/SKILL.md").is_file());
+    assert!(
+        foreign_project.is_file(),
+        "rollback must not touch the consumer project's own skill"
+    );
+    // Role inputs resolve from the recorded source root, not a deployed copy:
+    // rollback removes the owned links but leaves role resolution intact, and
+    // the reported revisions stay those of the owned sources.
+    let after_rollback =
+        orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap();
+    assert_eq!(roles_of(&after_rollback), delivered_roles);
+    assert_eq!(
+        after_rollback.guidance_missing,
+        ["team-lead", "board-workflow"]
+    );
     let config = fs::read_to_string(codex_home.join("config.toml")).unwrap();
     assert!(
         config.contains("model = 'unrelated-kept'"),
@@ -620,6 +717,45 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "rollback preserved: {:?}",
         disconnected.orchestration.preserved
     );
+}
+
+/// One fresh native context from the installed launcher outside the checkout:
+/// the ordinary lead session, or the executor session the dispatch marker and
+/// declared executor profile select. The marker is cleared explicitly first,
+/// so an ambient executor session cannot change which role is composed.
+fn outside_prompt(codex_home: &Path, user_home: &Path, workspace: &Path, executor: bool) -> String {
+    let mut command = Command::new(codex_home.join("harness/bin/codex.exe"));
+    command
+        .current_dir(workspace)
+        .env("CODEX_HOME", codex_home)
+        .env("USERPROFILE", user_home)
+        .env("HOME", user_home)
+        .env("APPDATA", user_home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", user_home.join("AppData/Local"))
+        .env("TEMP", user_home.join("AppData/Local/Temp"))
+        .env("TMP", user_home.join("AppData/Local/Temp"))
+        .env_remove("HARNESS_EXECUTOR_SESSION");
+    if executor {
+        command
+            .env("HARNESS_EXECUTOR_SESSION", "1")
+            .args(["--profile", "ds"]);
+    }
+    let prompt = command.args(["debug", "prompt-input"]).output().unwrap();
+    assert!(
+        prompt.status.success(),
+        "{}",
+        failed("outside prompt", &prompt)
+    );
+    let messages: serde_json::Value = serde_json::from_slice(&prompt.stdout).unwrap();
+    messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .filter_map(|content| content["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\r\n", "\n")
 }
 
 fn run(program: &Path, cwd: &Path, args: &[&str]) -> Output {
