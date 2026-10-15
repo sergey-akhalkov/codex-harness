@@ -1,4 +1,6 @@
 //! Owned Responses fixture for native controller acceptance; never calls a model.
+//! The model-catalogue probe a frontend may issue before its first turn is
+//! answered without a model and without a recorded request.
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -86,7 +88,10 @@ impl Responses {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(30)))
                     .unwrap();
-                let (_headers, request_body) = read_request(&mut stream);
+                let Some((_headers, request_body)) = read_request(&mut stream) else {
+                    respond_models(&mut stream);
+                    continue;
+                };
                 let request: Value = serde_json::from_slice(&request_body).unwrap();
                 let _identity = harness_core::task_request::RequestIdentity::from_request(&request)
                     .expect("native provider request must carry consistent conversation and attempt identity");
@@ -163,7 +168,10 @@ impl Responses {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                let (headers, request_body) = read_request(&mut stream);
+                let Some((headers, request_body)) = read_request(&mut stream) else {
+                    respond_models(&mut stream);
+                    continue;
+                };
                 let request: Value = serde_json::from_slice(&request_body).unwrap();
                 let identity = harness_core::task_request::RequestIdentity::from_request(&request)
                     .expect("native provider request must carry consistent conversation and attempt identity");
@@ -790,7 +798,11 @@ fn send_response(
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let (headers, body) = read_request(&mut socket);
+        let Some((headers, body)) = read_request(&mut socket) else {
+            panic!(
+                "owned gated upstream received a model-catalogue probe instead of the one Responses POST"
+            );
+        };
         assert_eq!(body, expected_body, "gate must not rewrite model request");
         let auth = headers
             .iter()
@@ -826,14 +838,50 @@ fn send_response(
     .unwrap();
 }
 
-fn read_request(stream: &mut TcpStream) -> (Vec<(String, String)>, Vec<u8>) {
+/// Answers one frontend model-catalogue probe without a model and without a
+/// recorded request; the Responses contract of this fixture is unchanged.
+fn respond_models(stream: &mut TcpStream) {
+    let body = json!({
+        "object": "list",
+        "data": [{"id": "gpt-6-astra", "object": "model", "owned_by": "canned"}]
+    })
+    .to_string();
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+}
+
+/// One accepted request: the scripted Responses POST, or the model-catalogue
+/// probe a frontend issues before its first turn (`None`).
+fn read_request(stream: &mut TcpStream) -> Option<(Vec<(String, String)>, Vec<u8>)> {
     let mut bytes = Vec::new();
     let (start, length, headers) = loop {
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
             let header = String::from_utf8(bytes[..end].to_vec()).unwrap();
+            let request_line = header.lines().next().unwrap_or_default();
+            if request_line.starts_with("GET ") {
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .split('?')
+                    .next()
+                    .unwrap_or_default();
+                assert!(
+                    path.ends_with("/models"),
+                    "unexpected fixture endpoint: {request_line}"
+                );
+                return None;
+            }
             assert!(
                 header.starts_with("POST /v1/responses "),
-                "unexpected fixture endpoint"
+                "unexpected fixture endpoint: {request_line}"
             );
             let length = header
                 .lines()
@@ -866,5 +914,5 @@ fn read_request(stream: &mut TcpStream) -> (Vec<(String, String)>, Vec<u8>) {
         assert!(count != 0, "incomplete fixture body");
         bytes.extend_from_slice(&chunk[..count]);
     }
-    (headers, bytes[start..start + length].to_vec())
+    Some((headers, bytes[start..start + length].to_vec()))
 }
