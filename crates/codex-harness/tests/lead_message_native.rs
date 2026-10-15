@@ -26,7 +26,9 @@ mod control_responses;
 
 use harness_core::{
     broker_state::BrokerRoot,
-    process::{CommandSpec, Job, Limits, ProcessIdentity},
+    build_identity,
+    console::{ConsoleSession, ConsoleSpec},
+    process::{Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity, StopReason},
     process_service::{self, ServiceProcess},
     task_control::ControlConnection,
     task_request::RequestIdentity,
@@ -34,22 +36,23 @@ use harness_core::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    ffi::OsString,
+    fs, io,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use harness_core::process::{Cancellation, Deadline, StopReason};
-use std::ffi::OsString;
-
 /// Ordinary-lead queue boundary markers: one per installed `codex queue`
 /// invocation, so a delivery can only be attributed to the invocation that
-/// carried its mark.
+/// carried its mark, plus the control turn that establishes the running
+/// conversation's own thread before any queue attempt.
 const ORDINARY_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-NO-ENDPOINT-8me13";
 const ENDPOINT_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-ENDPOINT-8me13";
 const MISSING_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-MISSING-THREAD-8me13";
+const ORDINARY_TUI_CONTROL_PROMPT: &str = "ORDINARY-LEAD-TUI-CONTROL-PROMPT-8me13";
+const ORDINARY_TUI_CONTROL_REPLY: &str = "ORDINARY-LEAD-TUI-CONTROL-REPLY-8me13";
 /// A well-formed thread id the running receiver does not own.
 const MISSING_THREAD_ID: &str = "00000000-0000-4000-8000-000000000000";
 
@@ -154,7 +157,7 @@ fn fixture() -> Fixture {
 }
 
 /// Builds the same owned fixture for the installation-record upstream binary:
-/// the ordinary-lead boundary probe must run the installed native CLI, and it
+/// the endpoint positive control must run the installed native CLI, and it
 /// records the actual version instead of requiring a historical pin.
 fn installed_fixture() -> Fixture {
     fixture_with_version_requirement(None)
@@ -2469,16 +2472,19 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
     );
 }
 
-/// Runs one installed native command in the fixture's own home and bounded
-/// Job; the command's own report is recorded, never accepted as delivery.
+/// Runs one installed native command in the passed home and workspace, bounded
+/// by its own Job; the command's own report is recorded, never accepted as
+/// delivery.
 fn run_native_command(
-    fixture: &Fixture,
+    exe: &Path,
+    home: &Path,
+    workspace: &Path,
+    root: &Path,
     args: Vec<OsString>,
     envs: Vec<(String, String)>,
     label: &str,
 ) -> Value {
-    let root = fixture.root.path();
-    let mut spec = command(&fixture.exe, &root.join("home"), &fixture.workspace);
+    let mut spec = command(exe, home, workspace);
     spec.args = args;
     for (key, value) in envs {
         spec.env.insert(key.into(), Some(value.into()));
@@ -2508,10 +2514,10 @@ fn run_native_command(
     })
 }
 
-/// One `codex queue` invocation: the target thread is always explicit, and
-/// only the endpoint variant names the owning listener and passes the
+/// One `codex queue` invocation: the target thread and the message are always
+/// explicit; only `Some(port)` names an owning listener and passes the
 /// capability token through the environment of the command itself.
-fn queue_arguments(thread: &str, message: &str, endpoint: bool, port: u16) -> Vec<OsString> {
+fn queue_arguments(thread: &str, message: &str, endpoint: Option<u16>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "queue".into(),
         "--thread".into(),
@@ -2519,13 +2525,110 @@ fn queue_arguments(thread: &str, message: &str, endpoint: bool, port: u16) -> Ve
         "--message".into(),
         message.into(),
     ];
-    if endpoint {
+    if let Some(port) = endpoint {
         args.push("--remote".into());
         args.push(format!("ws://127.0.0.1:{port}").into());
         args.push("--remote-auth-token-env".into());
         args.push("HARNESS_ORDINARY_LEAD_TOKEN".into());
     }
     args
+}
+
+/// Sends one line to the owned console session the way a user would: the text,
+/// a short beat, then carriage return.
+fn send_line(session: &ConsoleSession, text: &str) -> io::Result<()> {
+    session.send(text)?;
+    std::thread::sleep(Duration::from_millis(250));
+    session.send("\r")
+}
+
+/// Polls a predicate for at most the given seconds.
+fn wait_until(seconds: u64, predicate: impl Fn() -> bool) -> bool {
+    let until = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < until {
+        if predicate() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    predicate()
+}
+
+/// The child path without the WindowsApps shims, exactly as the ordinary TUI
+/// fixture selects it.
+fn filtered_path() -> OsString {
+    let child_path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|entry| {
+            !entry.components().any(|part| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("WindowsApps")
+            })
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(child_path).unwrap()
+}
+
+fn dump_terminal(root: &Path, session: &ConsoleSession) {
+    let _ = fs::write(root.join("terminal.txt"), session.transcript());
+}
+
+fn session_index_text(home: &Path) -> String {
+    fs::read_to_string(home.join("session_index.jsonl")).unwrap_or_default()
+}
+
+/// Every conversation rollout line under the running session's own `sessions`
+/// root, one JSON value per line; the receiver's own events are read here and
+/// nowhere claimed on behalf of another conversation.
+fn session_lines(home: &Path) -> Vec<Value> {
+    fn walk(path: &Path, lines: &mut Vec<Value>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                walk(&child, lines);
+            } else if child
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                for line in fs::read_to_string(&child).unwrap_or_default().lines() {
+                    if let Ok(value) = serde_json::from_str::<Value>(line) {
+                        lines.push(value);
+                    }
+                }
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    walk(&home.join("sessions"), &mut lines);
+    lines
+}
+
+/// Rollout rows of the running conversation that carry one marker.
+fn session_mark_count(home: &Path, marker: &str) -> usize {
+    session_lines(home)
+        .iter()
+        .filter(|row| row.to_string().contains(marker))
+        .count()
+}
+
+/// The conversation identities the running session's own rollout meta events
+/// record: another conversation's id appearing here is a clone or resume.
+fn session_meta_ids(home: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    for row in session_lines(home) {
+        if row["type"] != "session_meta" {
+            continue;
+        }
+        for key in ["id", "session_id"] {
+            if let Some(value) = row["payload"][key].as_str() {
+                ids.push(value.to_owned());
+            }
+        }
+    }
+    ids
 }
 
 /// Every provider request the owned canned provider recorded, with the
@@ -2592,27 +2695,470 @@ fn count_files(dir: &Path) -> usize {
     count
 }
 
-/// Establishes the installed native notification boundary for an already
-/// running ordinary CLI conversation: one owned native app-server with one
-/// running idle conversation in this CODEX_HOME, and the installed `codex
-/// queue` against it without an endpoint (the ordinary conversation's state:
-/// no listener, no daemon), with the owning endpoint and capability token, and
-/// with an endpoint but a thread this receiver does not own. Delivery is the
-/// receiver's own provider input on its exact thread together with its own
-/// thread item; exit status, report text and process state are recorded
-/// separately and are not delivery.
+/// The installed native queue boundary for an already running ordinary CLI
+/// conversation: one owned ordinary native TUI hosts its own embedded runtime
+/// in its own CODEX_HOME against the canned local Responses provider, one
+/// control turn establishes that conversation's exact thread, and the
+/// installed `codex queue --thread <id> --message <text>` then addresses that
+/// running conversation without any endpoint, daemon or token. Delivery is the
+/// running conversation's own model request carrying the mark, together with
+/// its own stored and rendered copy; exit status, report text and process
+/// state are recorded separately and are not delivery. The whole observed
+/// record is written before any expectation, and the expectations themselves
+/// name both outcomes.
 #[test]
-#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; owned native app-server fixture and canned Responses; no live model"]
-fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
-    let fixture = installed_fixture();
-    let root = fixture.root.path().to_path_buf();
-    let home = root.join("home");
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; starts an owned ordinary native TUI with the canned local Responses provider; no live model, no daemon, no desktop"]
+fn installed_queue_boundary_against_a_running_ordinary_tui() {
+    let exe = codex_exe();
+    let upstream = installed_upstream();
+    assert!(
+        same_executable(&exe, &upstream),
+        "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the ordinary arm runs the installed native CLI, not another binary",
+        exe.display(),
+        upstream.display()
+    );
+    let version = version_text(&exe);
+    let sha = build_identity::hash_file(&exe).unwrap();
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let root = owned_root.path().to_path_buf();
+    let home = root.join("ordinary-home");
+    let workspace = root.join("ordinary-workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    eprintln!("ordinary-lead queue boundary evidence: {}", root.display());
+    let user = process_service::current_user().unwrap();
+
+    // The receiver is a real ordinary native TUI: the installed executable
+    // hosts its own embedded runtime, and every request is answered with one
+    // model-free assistant message so the control turn completes.
+    let responses = control_responses::Responses::routed(root.clone(), |_request| {
+        json!({
+            "type": "message",
+            "id": "ordinary-control-reply",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ORDINARY_TUI_CONTROL_REPLY}]
+        })
+    });
+    let trusted = serde_json::to_string(&workspace.to_string_lossy().to_lowercase()).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+model = "gpt-6-astra"
+model_provider = "control_fixture"
+model_reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "disabled"
+cli_auth_credentials_store = "file"
+[model_providers.control_fixture]
+name = "Owned ordinary TUI fixture"
+base_url = "http://127.0.0.1:{}/v1"
+wire_api = "responses"
+env_key = "HARNESS_CONTROL_FIXTURE_KEY"
+requires_openai_auth = false
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+[windows]
+sandbox = "unelevated"
+[features]
+hooks = false
+apps = false
+multi_agent = false
+multi_agent_v2 = false
+memories = false
+goals = false
+plugins = false
+skill_search = false
+skip_host_skill_discovery = true
+[analytics]
+enabled = false
+[projects.{trusted}]
+trust_level = "trusted"
+"#,
+            responses.port
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "harness-control-ordinary-tui"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut spec = command(&exe, &home, &workspace);
+    spec.args = vec!["--no-alt-screen".into()];
+    spec.env.insert("PATH".into(), Some(filtered_path()));
+    for key in [
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let mut console = ConsoleSpec::new(spec);
+    console.limits.memory_bytes = Some(512 * 1024 * 1024);
+    console.limits.cpu_percent = Some(50.0);
+    let session = ConsoleSession::spawn(console).unwrap();
+    let identity = session.identity();
+    let ready = wait_until(60, || {
+        let text = session.transcript();
+        text.contains("gpt-6-astra") || text.contains("Codex")
+    });
+    if !ready {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned ordinary TUI did not become ready; evidence {}",
+            root.display()
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = send_line(&session, "/rename Ordinary lead queue boundary");
+    let rename_confirmed = wait_until(20, || {
+        session_index_text(&home).contains("Ordinary lead queue boundary")
+    });
+
+    // The control turn is the running conversation's own first model input:
+    // its request identity establishes the exact receiver thread, cross
+    // recorded with the conversation's own session meta.
+    send_line(&session, ORDINARY_TUI_CONTROL_PROMPT).unwrap();
+    let control_requested = wait_until(60, || root.join("provider-1.json").is_file());
+    if !control_requested {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned provider recorded no request for the control turn, so either the running conversation issued none or the fixture rejected its request identity; evidence {}",
+            root.display()
+        );
+    }
+    let control_answered = wait_until(60, || {
+        session_mark_count(&home, ORDINARY_TUI_CONTROL_REPLY) >= 1
+            || session.transcript().contains(ORDINARY_TUI_CONTROL_REPLY)
+    });
+    let entries = provider_entries(&root);
+    let (_, _, thread, control_turn) = entries
+        .first()
+        .unwrap_or_else(|| panic!("no recorded provider request; evidence {}", root.display()))
+        .clone();
+    let meta_before = session_meta_ids(&home);
+    let session_index_before = excerpt(&session_index_text(&home), 800);
+    let baseline_requests = provider_request_count(&root);
+    let sessions_before = count_files(&home.join("sessions"));
     let daemon_socket = home
         .join("app-server-control")
         .join("app-server-control.sock");
+    let daemon_socket_before = daemon_socket.exists();
+    eprintln!(
+        "ordinary lead queue boundary: receiver pid {} creation {} thread {thread} controlTurn {control_turn} controlAnswered {control_answered} renameConfirmed {rename_confirmed}; evidence {}",
+        identity.pid,
+        identity.creation_time,
+        root.display()
+    );
+
+    // The queue attempt against that running conversation, with this
+    // CODEX_HOME as the only locator: no endpoint, no capability token and no
+    // daemon ahead of it; the command's own report is recorded, and the mark
+    // can only be attributed to this exact invocation.
+    let unmanaged = run_native_command(
+        &exe,
+        &home,
+        &workspace,
+        &root,
+        queue_arguments(&thread, ORDINARY_QUEUE_MARK, None),
+        Vec::new(),
+        "queue-no-endpoint",
+    );
+    let first_hit = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, ORDINARY_QUEUE_MARK).is_empty()
+    });
+    std::thread::sleep(Duration::from_secs(6));
+    let unmanaged_hits = provider_hits(&root, ORDINARY_QUEUE_MARK);
+    let delivered_without_endpoint = first_hit || !unmanaged_hits.is_empty();
+    let total_after_unmanaged = provider_request_count(&root);
+    let transcript_copies = session.transcript().matches(ORDINARY_QUEUE_MARK).count();
+    let rollout_copies = session_mark_count(&home, ORDINARY_QUEUE_MARK);
+    let sessions_after_unmanaged = count_files(&home.join("sessions"));
+    let meta_after = session_meta_ids(&home);
+    let daemon_socket_after = daemon_socket.exists();
+    let mut daemon_cleanup = Value::Null;
+    if daemon_socket_after {
+        daemon_cleanup = run_native_command(
+            &exe,
+            &home,
+            &workspace,
+            &root,
+            vec!["app-server".into(), "daemon".into(), "stop".into()],
+            Vec::new(),
+            "daemon-stop",
+        );
+    }
+
+    // A live delivery is the only case where a closed target still needs its
+    // own refusal: the same route, a well-formed thread id the receiver does
+    // not own.
+    let mut closed_target = Value::Null;
+    let mut closed_hits: Vec<(String, String, String)> = Vec::new();
+    if delivered_without_endpoint {
+        let closed = run_native_command(
+            &exe,
+            &home,
+            &workspace,
+            &root,
+            queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, None),
+            Vec::new(),
+            "queue-missing-thread",
+        );
+        std::thread::sleep(Duration::from_secs(6));
+        closed_hits = provider_hits(&root, MISSING_QUEUE_MARK);
+        closed_target = json!({
+            "command": closed,
+            "providerHits": hit_json(&closed_hits),
+            "providerRequestsTotal": provider_request_count(&root),
+            "sessionFilesDelta": count_files(&home.join("sessions")) as i64
+                - sessions_after_unmanaged as i64,
+        });
+    }
+    let total_after_all = provider_request_count(&root);
+    let foreign = foreign_provider_requests(&root, &thread);
+    let receiver_alive = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_some())
+        .unwrap_or(false);
+
+    // Restoration: the owned receiver quits through its own console and the
+    // installed executable no longer runs afterwards.
+    dump_terminal(&root, &session);
+    let _ = send_line(&session, "/quit");
+    let console_result = session.wait(
+        Deadline::after(Duration::from_secs(25)).unwrap(),
+        &Cancellation::default(),
+        Duration::from_secs(5),
+    );
+    let console_outcome = match &console_result {
+        Ok(value) => {
+            fs::write(root.join("terminal-final.txt"), &value.transcript).unwrap();
+            json!({
+                "exited": value.outcome.reason == StopReason::Exited,
+                "outcome": value.outcome,
+                "truncated": value.output_truncated,
+            })
+        }
+        Err(error) => json!({"error": error.to_string()}),
+    };
+    // Recorded before the receipt and asserted only after it, so a failure
+    // still leaves the observed liveness beside the raw provider requests.
+    let receiver_gone_after_close = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_none())
+        .unwrap_or(false);
+
+    // The complete observed record is written before any expectation: a failed
+    // assertion still leaves the receipt beside the raw provider requests.
+    let receipt = json!({
+        "schema": 1,
+        "subject": "installed native queue against an already running ordinary embedded CLI conversation",
+        "nativeVersion": version.trim(),
+        "sha256": sha,
+        "exe": exe.to_string_lossy(),
+        "home": home.to_string_lossy(),
+        "workspace": workspace.to_string_lossy(),
+        "threadId": &thread,
+        "receiver": {
+            "pid": identity.pid,
+            "creationTime": identity.creation_time,
+            "aliveAfterAttempts": receiver_alive,
+            "goneAfterClose": receiver_gone_after_close,
+        },
+        "marks": {
+            "controlPrompt": ORDINARY_TUI_CONTROL_PROMPT,
+            "controlReply": ORDINARY_TUI_CONTROL_REPLY,
+            "queue": ORDINARY_QUEUE_MARK,
+            "closed": MISSING_QUEUE_MARK,
+        },
+        "control": {
+            "answered": control_answered,
+            "turn": control_turn,
+            "renameConfirmed": rename_confirmed,
+            "sessionIndexBefore": session_index_before,
+        },
+        "baseline": {
+            "providerRequests": baseline_requests,
+            "sessionFiles": sessions_before,
+            "sessionMetaIds": &meta_before,
+            "daemonSocket": daemon_socket_before,
+        },
+        "queueWithoutEndpoint": {
+            "command": &unmanaged,
+            "delivered": delivered_without_endpoint,
+            "providerHits": hit_json(&unmanaged_hits),
+            "transcriptCopies": transcript_copies,
+            "rolloutCopies": rollout_copies,
+            "providerRequestsTotal": total_after_unmanaged,
+            "sessionFilesAfter": sessions_after_unmanaged,
+            "sessionMetaIdsAfter": &meta_after,
+            "daemonSocketAfter": daemon_socket_after,
+            "daemonCleanup": &daemon_cleanup,
+        },
+        "closedTarget": &closed_target,
+        "providerRequestsAfterAll": total_after_all,
+        "foreignProviderRequests": hit_json(&foreign),
+        "consoleOutcome": &console_outcome,
+        "deliveryEvidence": "the running conversation's own model request carrying the mark on its exact thread, with its own stored and rendered copy",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+        "limitations": "one installed version, one owned home, one receiver; the queued message is observed through the receiver's own requests and rollout",
+    });
+    fs::write(
+        root.join("ordinary-lead-queue-boundary.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // Expectations, checked after the record exists.
+    assert!(
+        baseline_requests >= 1,
+        "the control turn must be among the running conversation's own model requests before any queue attempt; evidence {}",
+        root.display()
+    );
+    assert!(
+        control_answered,
+        "the control turn must complete against the owned provider before any queue attempt; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_alive,
+        "the queue attempts must leave the running ordinary conversation alive; pid {}; evidence {}",
+        identity.pid,
+        root.display()
+    );
+    assert!(
+        unmanaged_hits.len() <= 1,
+        "queue without an endpoint produced {} deliveries: {unmanaged_hits:?}; evidence {}",
+        unmanaged_hits.len(),
+        root.display()
+    );
+    for (file, hit_thread, _) in &unmanaged_hits {
+        assert_eq!(
+            hit_thread, &thread,
+            "{file} reached a different conversation than the running one"
+        );
+    }
+    assert!(
+        foreign.is_empty(),
+        "model work left the running conversation: {foreign:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        meta_after,
+        meta_before,
+        "the running conversation's own recorded identity changed: {meta_after:?} against {meta_before:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        sessions_after_unmanaged,
+        sessions_before,
+        "the queue attempt created conversation storage; evidence {}",
+        root.display()
+    );
+    if delivered_without_endpoint {
+        assert_eq!(
+            unmanaged_hits.len(),
+            1,
+            "a live delivery must be exactly one model request carrying the mark: {unmanaged_hits:?}; evidence {}",
+            root.display()
+        );
+        assert!(
+            transcript_copies >= 1 || rollout_copies >= 1,
+            "the running conversation's own session must hold the delivered message: transcript {transcript_copies}, rollout {rollout_copies}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            total_after_unmanaged,
+            baseline_requests + 1,
+            "the delivery must be the only additional model request: {unmanaged}; evidence {}",
+            root.display()
+        );
+        assert!(
+            closed_hits.is_empty(),
+            "queue with an unowned thread id started another conversation: {closed_hits:?}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            closed_target["providerRequestsTotal"].as_u64(),
+            Some((baseline_requests + 1) as u64),
+            "the closed-target attempt added model work: {closed_target}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            closed_target["sessionFilesDelta"].as_i64(),
+            Some(0),
+            "the closed-target attempt created conversation storage: {closed_target}; evidence {}",
+            root.display()
+        );
+    } else {
+        assert_eq!(
+            total_after_unmanaged,
+            baseline_requests,
+            "the refused queue attempt added model work: {unmanaged}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            transcript_copies,
+            0,
+            "the running conversation rendered a mark that was never delivered; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            rollout_copies,
+            0,
+            "the running conversation stored a mark that was never delivered; evidence {}",
+            root.display()
+        );
+    }
+    assert!(
+        !daemon_socket_after || daemon_cleanup["exited"] == Value::Bool(true),
+        "a daemon appeared for the owned home and its stop was not recorded as exited: {daemon_cleanup}; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_gone_after_close,
+        "the ordinary-lead queue boundary probe left the running receiver TUI alive; pid {}; evidence {}",
+        identity.pid,
+        root.display()
+    );
+    assert!(
+        console_outcome["exited"] == Value::Bool(true),
+        "the owned ordinary TUI did not quit cleanly: {console_outcome}; evidence {}",
+        root.display()
+    );
+    eprintln!(
+        "ordinary-lead queue boundary: deliveredWithoutEndpoint={delivered_without_endpoint} providerHits={} transcriptCopies={transcript_copies} rolloutCopies={rollout_copies} foreignRequests={} receiverAlive={receiver_alive} receiverGoneAfterClose={receiver_gone_after_close}; evidence {}",
+        unmanaged_hits.len(),
+        foreign.len(),
+        root.display()
+    );
+}
+
+/// The separately labelled positive control for the same installed `codex
+/// queue`: one owned native app-server hosts one running conversation, and the
+/// queue command names that listener and its capability token explicitly. The
+/// closed-target arm proves the same route fails closed for a thread the
+/// receiver does not own. This receiver is managed by construction; it is not
+/// the ordinary arm.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; owned native app-server fixture and canned Responses; no live model"]
+fn installed_queue_endpoint_reaches_its_owning_thread() {
+    let fixture = installed_fixture();
+    let root = fixture.root.path().to_path_buf();
+    let home = root.join("home");
     let version = version_text(&fixture.exe);
     let user = process_service::current_user().unwrap();
-    eprintln!("ordinary-lead queue boundary evidence: {}", root.display());
+    eprintln!(
+        "queue endpoint positive control evidence: {}",
+        root.display()
+    );
     let mut owner = Client::connect(fixture.port, &fixture.token);
     let started = owner.request(
         "thread/start",
@@ -2635,71 +3181,26 @@ fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
     );
     assert_eq!(baseline["thread"]["id"], thread, "{baseline}");
     assert_eq!(baseline["thread"]["status"]["type"], "idle", "{baseline}");
-    assert_eq!(
-        baseline.to_string().matches(ORDINARY_QUEUE_MARK).count(),
-        0,
-        "the idle conversation must not carry the mark before any queue attempt"
-    );
     let baseline_requests = provider_request_count(&root);
     let sessions_before = count_files(&home.join("sessions"));
 
-    // 1. The ordinary conversation's own state: the conversation runs, it has
-    // no `-listen` endpoint, and this home has no app-server daemon.
-    let unmanaged = run_native_command(
-        &fixture,
-        queue_arguments(&thread, ORDINARY_QUEUE_MARK, false, fixture.port),
-        Vec::new(),
-        "queue-no-endpoint",
-    );
-    std::thread::sleep(Duration::from_secs(6));
-    let unmanaged_hits = provider_hits(&root, ORDINARY_QUEUE_MARK);
-    let after_unmanaged = owner.request(
-        "thread/read",
-        json!({"threadId": thread, "includeTurns": true}),
-    );
-    let received_without_endpoint = after_unmanaged
-        .to_string()
-        .matches(ORDINARY_QUEUE_MARK)
-        .count();
-    let delivered_without_endpoint = !unmanaged_hits.is_empty();
-    let daemon_socket_after_unmanaged = daemon_socket.exists();
-    let sessions_after_unmanaged = count_files(&home.join("sessions"));
-    let mut daemon_cleanup = Value::Null;
-    if daemon_socket_after_unmanaged {
-        daemon_cleanup = run_native_command(
-            &fixture,
-            vec!["app-server".into(), "daemon".into(), "stop".into()],
-            Vec::new(),
-            "daemon-stop",
-        );
-    }
-    let unmanaged_consistent = !delivered_without_endpoint || received_without_endpoint == 1;
-
-    // 2. The owning endpoint and capability token: still exactly one delivery,
-    // on the exact running thread and with no other model work.
+    // 1. The owning endpoint and capability token: exactly one delivery on the
+    // exact running thread, with no other model work.
     let managed = run_native_command(
-        &fixture,
-        queue_arguments(&thread, ENDPOINT_QUEUE_MARK, true, fixture.port),
+        &fixture.exe,
+        &home,
+        &fixture.workspace,
+        &root,
+        queue_arguments(&thread, ENDPOINT_QUEUE_MARK, Some(fixture.port)),
         vec![(
             "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
             fixture.token.clone(),
         )],
         "queue-endpoint",
     );
-    let managed_text = format!(
-        "{}{}",
-        managed["stdout"].as_str().unwrap_or_default(),
-        managed["stderr"].as_str().unwrap_or_default()
-    );
-    let until = Instant::now() + WAIT;
-    let mut first_hit = false;
-    while Instant::now() < until {
-        if !provider_hits(&root, ENDPOINT_QUEUE_MARK).is_empty() {
-            first_hit = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let first_hit = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, ENDPOINT_QUEUE_MARK).is_empty()
+    });
     std::thread::sleep(Duration::from_secs(6));
     let endpoint_hits = provider_hits(&root, ENDPOINT_QUEUE_MARK);
     let total_after_managed = provider_request_count(&root);
@@ -2711,16 +3212,25 @@ fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
         .to_string()
         .matches(ENDPOINT_QUEUE_MARK)
         .count();
-    let endpoint_consistent = endpoint_hits
+    let same_thread = endpoint_hits
         .iter()
         .all(|(_, hit_thread, _)| hit_thread == &thread);
     let sessions_after_managed = count_files(&home.join("sessions"));
+    let managed_text = format!(
+        "{}{}",
+        managed["stdout"].as_str().unwrap_or_default(),
+        managed["stderr"].as_str().unwrap_or_default()
+    );
 
-    // 3. A thread this receiver does not own must fail closed: no delivery, no
-    // second conversation and no additional model work.
+    // 2. A closed target fails closed: the same endpoint, a thread this
+    // receiver does not own - no delivery, no second conversation, no model
+    // work.
     let missing = run_native_command(
-        &fixture,
-        queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, true, fixture.port),
+        &fixture.exe,
+        &home,
+        &fixture.workspace,
+        &root,
+        queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, Some(fixture.port)),
         vec![(
             "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
             fixture.token.clone(),
@@ -2734,89 +3244,42 @@ fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
     let sessions_after_missing = count_files(&home.join("sessions"));
     let foreign = foreign_provider_requests(&root, &thread);
 
-    // The complete observed record is written before any expectation: a failed
-    // assertion still leaves the receipt beside the raw provider requests.
     let receipt = json!({
         "schema": 1,
-        "subject": "installed native queue boundary for an already running ordinary CLI conversation",
+        "subject": "installed queue endpoint positive control for its owning thread (managed app-server receiver, not the ordinary arm)",
         "nativeVersion": version.trim(),
         "exe": fixture.exe.to_string_lossy(),
-        "threadId": thread,
-        "marks": {
-            "ordinary": ORDINARY_QUEUE_MARK,
-            "endpoint": ENDPOINT_QUEUE_MARK,
-            "missing": MISSING_QUEUE_MARK,
-        },
-        "unmanaged": {
-            "command": unmanaged,
-            "providerHits": hit_json(&unmanaged_hits),
-            "deliveredWithoutEndpoint": delivered_without_endpoint,
-            "receiverReceivedIt": received_without_endpoint,
-            "consistent": unmanaged_consistent,
-            "daemonSocketAfter": daemon_socket_after_unmanaged,
-            "daemonCleanup": daemon_cleanup,
-            "sessionFilesDelta": sessions_after_unmanaged as i64 - sessions_before as i64,
-        },
+        "threadId": &thread,
+        "marks": {"endpoint": ENDPOINT_QUEUE_MARK, "missing": MISSING_QUEUE_MARK},
         "endpoint": {
-            "command": managed,
+            "command": &managed,
             "deliveryCount": endpoint_hits.len(),
             "providerHits": hit_json(&endpoint_hits),
             "receiverCopies": received_managed,
-            "sameThread": endpoint_consistent,
+            "sameThread": same_thread,
             "providerRequestsTotal": total_after_managed,
         },
-        "missingThread": {
-            "command": missing,
+        "closedTarget": {
+            "command": &missing,
             "providerHits": hit_json(&missing_hits),
             "providerRequestsTotal": total_after_missing,
             "sessionFilesDelta": sessions_after_missing as i64 - sessions_after_managed as i64,
         },
-        "providerRequestsBaseline": baseline_requests,
+        "baselineProviderRequests": baseline_requests,
+        "sessionFilesBaseline": sessions_before,
         "foreignProviderRequests": hit_json(&foreign),
         "deliveryEvidence": "the receiver's own provider request on the exact thread plus the receiver's own thread item",
         "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
     });
     fs::write(
-        root.join("ordinary-lead-queue-boundary.json"),
+        root.join("queue-endpoint-positive-control.json"),
         serde_json::to_vec_pretty(&receipt).unwrap(),
     )
     .unwrap();
 
-    // Expectations, checked after the record exists: the running conversation
-    // keeps its identity, the owning endpoint delivers exactly once, and every
-    // closed target fails without model or conversation work.
     assert_eq!(
         baseline_requests, 0,
         "an idle running conversation must not have called a model before any queue attempt"
-    );
-    assert!(
-        unmanaged_hits.len() <= 1,
-        "queue without an endpoint produced {} deliveries: {unmanaged_hits:?}; command {unmanaged}; evidence {}",
-        unmanaged_hits.len(),
-        root.display()
-    );
-    for (file, hit_thread, _) in &unmanaged_hits {
-        assert_eq!(
-            hit_thread, &thread,
-            "{file} reached a different conversation than the running one"
-        );
-    }
-    assert!(
-        unmanaged_consistent,
-        "a provider request without the running conversation's own item means queue resumed a clone: {after_unmanaged}"
-    );
-    assert_eq!(
-        after_unmanaged["thread"]["id"], thread,
-        "the running conversation's thread identity changed: {after_unmanaged}"
-    );
-    assert!(
-        !managed_text.contains(fixture.token.as_str()),
-        "queue must not echo the capability token: {managed}"
-    );
-    assert_eq!(
-        managed["exitCode"].as_i64(),
-        Some(0),
-        "queue with the owning endpoint failed: {managed}"
     );
     assert!(
         first_hit,
@@ -2824,7 +3287,7 @@ fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
         root.display()
     );
     assert!(
-        endpoint_consistent,
+        same_thread,
         "endpoint delivery reached another conversation: {endpoint_hits:?}; evidence {}",
         root.display()
     );
@@ -2838,10 +3301,28 @@ fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
         received_managed, 1,
         "the running conversation must hold exactly one copy of the queued message: {after_managed}"
     );
+    assert_eq!(
+        total_after_managed,
+        baseline_requests + 1,
+        "the delivery must be the only model request: {managed}"
+    );
+    assert_eq!(
+        managed["exitCode"].as_i64(),
+        Some(0),
+        "queue with the owning endpoint failed: {managed}"
+    );
+    assert!(
+        !managed_text.contains(fixture.token.as_str()),
+        "queue must not echo the capability token: {managed}"
+    );
     assert!(
         missing_hits.is_empty(),
         "queue with an unowned thread id started another conversation: {missing_hits:?}; command {missing}; evidence {}",
         root.display()
+    );
+    assert_eq!(
+        total_after_missing, total_after_managed,
+        "the closed-target attempt added model work: {missing}"
     );
     assert_eq!(
         status["thread"]["id"], thread,
@@ -2864,10 +3345,10 @@ fn ordinary_lead_queue_boundary_needs_the_owning_endpoint() {
         fixture.server,
         &fixture.exe,
         &user,
-        "the ordinary-lead queue boundary probe left its receiver app-server running",
+        "the queue endpoint positive control left its receiver app-server running",
     );
     eprintln!(
-        "ordinary-lead queue boundary: deliveredWithoutEndpoint={delivered_without_endpoint} endpointDeliveries={} receiverCopies={received_managed} missingThreadDeliveries={} foreignRequests={}; evidence {}",
+        "queue endpoint positive control: endpointDeliveries={} receiverCopies={received_managed} closedTargetDeliveries={} foreignRequests={}; evidence {}",
         endpoint_hits.len(),
         missing_hits.len(),
         foreign.len(),
