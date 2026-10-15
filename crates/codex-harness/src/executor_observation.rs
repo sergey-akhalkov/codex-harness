@@ -25,7 +25,7 @@ use std::{
     fs, io,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[path = "executor_cache.rs"]
@@ -125,6 +125,7 @@ pub(crate) const MAX_STDERR_TAIL: usize = 2 * 1024;
 pub(crate) const MAX_WAITING_REFERENCES: usize = 4;
 /// Bound on how long the receipt writer lock waits for another writer.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
+const RECEIPT_REPLACE_WAIT: Duration = Duration::from_secs(2);
 /// Poll interval of the spool tail while the owned child runs.
 const TAIL_POLL: Duration = Duration::from_millis(25);
 /// Bounded cleanup budget after the host terminates its owned launcher tree.
@@ -1536,7 +1537,35 @@ fn write_receipt(receipt: &Path, value: &Value) -> io::Result<()> {
     // from being replaced under an unrelated rename.
     let temp = receipt.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&temp, bytes)?;
-    fs::rename(&temp, receipt)
+    let started = Instant::now();
+    loop {
+        match fs::rename(&temp, receipt) {
+            Ok(()) => return Ok(()),
+            // Windows can refuse replacement while a reader has the old
+            // receipt open. Keep the writer lock and complete the same atomic
+            // update after a short read; never delete or truncate the old file.
+            Err(error)
+                if cfg!(windows)
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && started.elapsed() < RECEIPT_REPLACE_WAIT =>
+            {
+                std::thread::sleep(
+                    TAIL_POLL.min(RECEIPT_REPLACE_WAIT.saturating_sub(started.elapsed())),
+                );
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot replace receipt {} after {:.3}s; pending update retained at {}: {error}",
+                        receipt.display(),
+                        started.elapsed().as_secs_f64(),
+                        temp.display(),
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Serializes one receipt's writers with the kit's stable OS file lock: the
@@ -4616,6 +4645,76 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
             "no temp file survives a completed write"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn receipt_replacement_waits_for_a_transient_reader() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        fs::write(&receipt, br#"{"schema":1,"window":{"owned":true}}"#).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE, as in common file readers.
+            .open(&receipt)
+            .unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let writer = {
+            let receipt = receipt.clone();
+            std::thread::spawn(move || {
+                sent.send(update_receipt_field(&receipt, "probe", json!("retained")))
+                    .unwrap();
+            })
+        };
+        let early = received.recv_timeout(Duration::from_millis(150));
+        let returned_while_held = early.is_ok();
+        let unchanged = fs::read(&receipt).unwrap();
+        drop(reader);
+        let result = early.unwrap_or_else(|error| {
+            assert!(matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout));
+            received.recv_timeout(Duration::from_secs(5)).unwrap()
+        });
+        writer.join().unwrap();
+        assert!(
+            !returned_while_held,
+            "replacement abandoned a temporary reader: {result:?}"
+        );
+        result.unwrap();
+        assert_eq!(unchanged, br#"{"schema":1,"window":{"owned":true}}"#);
+        let value = read_receipt_value(&receipt).unwrap();
+        assert_eq!(value["window"]["owned"], true);
+        assert_eq!(value["probe"], "retained");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn receipt_replacement_reports_a_persistent_reader_without_losing_state() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        let original = br#"{"schema":1,"window":{"owned":true}}"#;
+        fs::write(&receipt, original).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&receipt)
+            .unwrap();
+        let error = update_receipt_field(&receipt, "probe", json!("retained")).unwrap_err();
+        assert_eq!(fs::read(&receipt).unwrap(), original);
+        let pending = receipt.with_extension(format!("{}.tmp", std::process::id()));
+        assert_eq!(read_receipt_value(&pending).unwrap()["probe"], "retained");
+        assert!(error.to_string().contains("replace receipt"), "{error}");
+        assert!(
+            error.to_string().contains(&receipt.display().to_string()),
+            "{error}"
+        );
+        drop(reader);
+        update_receipt_field(&receipt, "probe", json!("recovered")).unwrap();
+        assert_eq!(read_receipt_value(&receipt).unwrap()["probe"], "recovered");
+        assert!(!pending.exists());
     }
 
     #[test]
