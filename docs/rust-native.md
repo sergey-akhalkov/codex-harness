@@ -1640,6 +1640,15 @@ regressions run in the standard workspace gate, and the adopted-package check
 (explicit `HARNESS_CODE_TOOLS_REGISTRY`) must complete MCP initialize and
 tools/list before a release is called delivered.
 
+The `open_session_restarts_its_broker_after_installed_manager_link_changes`
+test additionally requires `HARNESS_TEST_NEXT_MANAGER` to name a distinct,
+already built native manager. It starts through an owned installation link,
+changes that link, restarts the broker and checks both old and new conversations.
+The automatic Serena workflow prepares a release manager for this input while
+the test uses the development manager as its first generation. A local run can
+reuse a different immutable installed build. The separate Pascal startup test
+requires an adopted `pasls`; the Rust/Python CI runner explicitly excludes it.
+
 The local xAI compatibility transport is a managed generation with owned
 endpoint identity. The launcher prepares a private generation root; the shim
 publishes an endpoint receipt binding its PID, process creation time, image

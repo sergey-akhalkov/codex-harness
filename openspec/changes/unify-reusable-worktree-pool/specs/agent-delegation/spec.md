@@ -33,4 +33,3 @@ Each workstream SHALL receive a concise objective, sufficient inputs, dependenci
 #### Scenario: One isolation contract across task types
 - **WHEN** a workstream changes from a main-session experiment to an executor assignment
 - **THEN** its checkout remains governed by the same pool capacity, ownership and preservation rules, and any session handoff is explicit rather than an additional worktree allocation
-

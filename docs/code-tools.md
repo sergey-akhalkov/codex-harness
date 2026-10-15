@@ -201,6 +201,11 @@ previous owned tree before admitting a replacement. Startup locks prevent duplic
 broker launches; retirement drains admitted work. Unfinished activation journals
 block new shared-service work until Recover resolves the transaction.
 
+An open Serena client retains the resolved immutable manager path used for its
+broker identity. Updating the installed manager link therefore leaves that
+client able to restart its own broker; new clients use the new build generation.
+Do not remove retained immutable builds while their sessions are still open.
+
 On Windows, shared brokers start through built-in local WMI as the same verified
 user, independently of the first client's process Job. They immediately establish
 their own child ownership and a finite startup watchdog. Closing the starter does

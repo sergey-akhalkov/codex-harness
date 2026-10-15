@@ -129,4 +129,3 @@ New executor terminal titles SHALL begin with `CEx` and retain their profile and
 #### Scenario: Configured four-slot pool is full
 - **WHEN** all four configured shared slots contain live, suspended, reserved or unreviewed tasks of any supported type and a fifth independent owner requests dispatch
 - **THEN** the existing pool reports capacity exhaustion without creating another slot or replacing held work
-
