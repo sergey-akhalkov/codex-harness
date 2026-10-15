@@ -4,9 +4,9 @@
 
 See [proposal.md](proposal.md) for motivation and the [delta specification](specs/global-working-principles/spec.md) for the behavioral contract. The user confirmed this direction on 2026-10-12 and requested planning, not implementation or changes to a consuming project.
 
-The current [principles](../../../global/principles-of-work.md) already cover developer experience, everyday-use discovery, dissent, bounded improvements and reassessment of costly repetition. The gap is explicit coverage of every interface and the response to a workflow that can be forced through but remains materially burdensome. These additions therefore belong in the existing `global-working-principles` capability.
+The current [principles](../../../../global/principles-of-work.md) already cover developer experience, everyday-use discovery, dissent, bounded improvements and reassessment of costly repetition. The gap is explicit coverage of every interface and the response to a workflow that can be forced through but remains materially burdensome. These additions therefore belong in the existing `global-working-principles` capability.
 
-The [delivery guide](../../../docs/global-instructions.md) identifies a live global instruction link; fresh sessions consume the source and running sessions are not proven to reload it. External OpenSpec skills and workflow configuration are protected. The principles have effectively no headroom under the native 25,088-byte check; the existing specification separately requires at most 24 KiB. Meeting the stricter 24 KiB bound satisfies both without changing either limit.
+The [delivery guide](../../../../docs/global-instructions.md) identifies a live global instruction link; fresh sessions consume the source and running sessions are not proven to reload it. External OpenSpec skills and workflow configuration are protected. The principles have effectively no headroom under the native 25,088-byte check; the existing specification separately requires at most 24 KiB. Meeting the stricter 24 KiB bound satisfies both without changing either limit.
 
 ## Goals / Non-Goals
 
