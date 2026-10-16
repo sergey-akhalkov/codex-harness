@@ -1547,6 +1547,39 @@ pub struct Overhead {
     pub maintenance_seconds_per_task: f64,
 }
 
+/// A declared conjunction of adoption criteria over one observed unit set:
+/// strictly more independently accepted outcomes, no critical regression, and
+/// both a useful total-time and a useful recorded-token reduction. Every
+/// member is a hard requirement; a declared trade-off never waives one, and an
+/// unmeasured member leaves the result inconclusive instead of satisfied.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConjunctionPolicy {
+    /// The quality member: adoption requires more independently accepted
+    /// outcomes than the baseline arm recorded. The declaration must require
+    /// it; an unchanged success count is not a benefit.
+    pub require_quality_improvement: bool,
+    /// Minimum useful reduction of the total measured time through
+    /// acceptance, in percent; positive and finite.
+    pub minimum_time_reduction_percent: f64,
+    /// Minimum useful reduction of the recorded native token cost, in
+    /// percent; positive and finite.
+    pub minimum_token_reduction_percent: f64,
+}
+
+impl ConjunctionPolicy {
+    /// The conjunction exactly as it is recorded with every measured attempt
+    /// before results, so a criterion relaxed after an outcome exists is
+    /// detectable as declaration drift.
+    pub fn declaration(&self) -> Value {
+        json!({
+            "requireQualityImprovement": self.require_quality_improvement,
+            "minimumTimeReductionPercent": self.minimum_time_reduction_percent,
+            "minimumTokenReductionPercent": self.minimum_token_reduction_percent,
+        })
+    }
+}
+
 /// The complete policy, fixed before any comparative result is observed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1570,6 +1603,11 @@ pub struct ComparisonPolicy {
     pub uncertainty: String,
     pub horizon_tasks: f64,
     pub overhead: Overhead,
+    /// The declared conjunction of adoption criteria over one observed unit
+    /// set. `None` keeps the legacy single-objective declaration, behavior
+    /// and serialized identity unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conjunction: Option<ConjunctionPolicy>,
 }
 
 /// A policy fixed and digested before results.
@@ -1634,6 +1672,12 @@ impl ComparisonPolicy {
         // candidate outcome exists.
         if let Ok(Some(plan)) = parse_baseline_reuse(&self.uncertainty) {
             value["baseline_reuse"] = plan.declaration();
+        }
+        // The declared conjunction criteria are recorded with every measured
+        // attempt before results: its membership, quality requirement and
+        // both useful margins cannot be relaxed after an outcome exists.
+        if let Some(conjunction) = &self.conjunction {
+            value["conjunction"] = conjunction.declaration();
         }
         value
     }
@@ -1709,6 +1753,37 @@ impl ComparisonPolicy {
             {
                 return Err(invalid(
                     "the trade-off allowance must be a finite non-negative percent",
+                ));
+            }
+        }
+        if let Some(conjunction) = &self.conjunction {
+            if self.objective != Objective::Quality {
+                return Err(invalid(
+                    "a conjunction comparison decides the quality objective; its time and token margins are additional required members over the same observed unit set",
+                ));
+            }
+            if self.basis.maintenance_basis().is_some() {
+                return Err(invalid(
+                    "a conjunction comparison requires the efficiency basis; a maintenance declaration cannot carry required savings margins",
+                ));
+            }
+            if !conjunction.require_quality_improvement {
+                return Err(invalid(
+                    "a conjunction cannot waive its quality-improvement member",
+                ));
+            }
+            if !conjunction.minimum_time_reduction_percent.is_finite()
+                || conjunction.minimum_time_reduction_percent <= 0.0
+            {
+                return Err(invalid(
+                    "a conjunction needs a positive finite minimum total-time reduction percent",
+                ));
+            }
+            if !conjunction.minimum_token_reduction_percent.is_finite()
+                || conjunction.minimum_token_reduction_percent <= 0.0
+            {
+                return Err(invalid(
+                    "a conjunction needs a positive finite minimum recorded-token reduction percent",
                 ));
             }
         }
@@ -2068,6 +2143,10 @@ struct UnitFacts {
     candidate_bounds: Option<(f64, f64)>,
     baseline_steps: Option<u64>,
     candidate_steps: Option<u64>,
+    /// Recorded native token totals per arm from the accounting owner's unit
+    /// usage summary; `None` when either arm's recorded usage is unknown.
+    baseline_tokens: Option<u64>,
+    candidate_tokens: Option<u64>,
     usage_measured: bool,
     /// The unit's method executes no model call: its model metrics are
     /// recorded as inapplicable, never as a measured zero.
@@ -2224,6 +2303,38 @@ fn observed_tokens(row: &Value) -> Option<u64> {
         .get(side)
         .and_then(|value| value.get("total_tokens"))
         .and_then(Value::as_u64)
+}
+
+/// The recorded native token cost of one attempt: the accounting owner's
+/// per-run usage totals counted once (never by summing overlapping token
+/// categories), with worker usage included once and inherited child records
+/// left to the row that owns them. Missing or unknown usage stays unknown,
+/// never a fabricated zero.
+fn recorded_native_tokens(row: &Value) -> Option<u64> {
+    let usage = row.get("usage")?.as_object()?;
+    if usage.get("status").and_then(Value::as_str) != Some("per_run")
+        || usage.get("unknown_runs").is_some()
+    {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut measured = false;
+    for run in usage
+        .get("runs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        total = total.checked_add(run.get("total_tokens")?.as_u64()?)?;
+        measured = true;
+    }
+    if let Some(workers) = usage.get("workers").and_then(Value::as_array) {
+        for worker in workers {
+            total = total.checked_add(worker.get("usage")?.get("total_tokens")?.as_u64()?)?;
+            measured = true;
+        }
+    }
+    measured.then_some(total)
 }
 
 /// Work-efficiency time is selected before the decision tree. Other objectives
@@ -2472,6 +2583,416 @@ fn exclusion_text(reason: &crate::improvement_experiment::ExclusionReason) -> St
     }
 }
 
+/// Evaluate the declared conjunction over one observed unit set: quality
+/// improvement, no critical regression, and useful total-time and
+/// recorded-token reductions. Every member is a hard requirement and no
+/// trade-off waives one. A member that cannot be measured over complete
+/// evidence leaves the result inconclusive (unknown is not a reduction); a
+/// measured member below its declared criterion, or a material per-unit
+/// regression beyond the declared tolerance, rejects adoption.
+fn conjunction_verdict(
+    policy: &ComparisonPolicy,
+    conjunction: &ConjunctionPolicy,
+    facts: &[UnitFacts],
+    reasons: &mut Vec<String>,
+) -> PolicyDecision {
+    let required_units = policy.stopping.required_units as usize;
+    if facts.len() < required_units {
+        reasons.push(format!(
+            "the declared panel of {required_units} independent unit(s) is incomplete ({} complete matched unit(s) recorded); the conjunction cannot be stated",
+            facts.len()
+        ));
+        return PolicyDecision::Inconclusive;
+    }
+    let baseline_accepted = facts.iter().filter(|fact| fact.baseline_accepted).count();
+    let candidate_accepted = facts.iter().filter(|fact| fact.candidate_accepted).count();
+
+    // The time member consumes the recorded total time through acceptance
+    // over the same observed unit set. A missing arm duration is unknown, not
+    // a zero saving.
+    let mut baseline_seconds = 0.0;
+    let mut candidate_seconds = 0.0;
+    let mut missing_time = 0usize;
+    for fact in facts {
+        match (fact.baseline_seconds, fact.candidate_seconds) {
+            (Some(baseline), Some(candidate)) => {
+                baseline_seconds += baseline;
+                candidate_seconds += candidate;
+            }
+            _ => missing_time += 1,
+        }
+    }
+    if missing_time > 0 {
+        reasons.push(format!(
+            "the recorded total time is unknown on {missing_time} complete matched unit(s); unknown time is not a reduction and the conjunction stays inconclusive"
+        ));
+        return PolicyDecision::Inconclusive;
+    }
+    if !(baseline_seconds.is_finite() && candidate_seconds.is_finite()) || baseline_seconds <= 0.0 {
+        reasons.push(
+            "the observed baseline total time is not a positive measured value; no total-time reduction can be stated"
+                .to_owned(),
+        );
+        return PolicyDecision::Inconclusive;
+    }
+
+    // The token member consumes the accounting owner's recorded native usage
+    // totals, counted once per attempt. An unmeasured or partially known cost
+    // is unknown, not a zero saving.
+    let mut baseline_tokens: u128 = 0;
+    let mut candidate_tokens: u128 = 0;
+    let mut missing_tokens = 0usize;
+    for fact in facts {
+        match (fact.baseline_tokens, fact.candidate_tokens) {
+            (Some(baseline), Some(candidate)) if fact.usage_measured => {
+                baseline_tokens += u128::from(baseline);
+                candidate_tokens += u128::from(candidate);
+            }
+            _ => missing_tokens += 1,
+        }
+    }
+    if missing_tokens > 0 {
+        reasons.push(format!(
+            "the recorded native token usage is missing or unknown on {missing_tokens} complete matched unit(s); an unmeasured cost is not a token reduction and the conjunction stays inconclusive"
+        ));
+        return PolicyDecision::Inconclusive;
+    }
+    if baseline_tokens == 0 {
+        reasons.push(
+            "no baseline token usage was recorded; a token reduction cannot be stated over a zero baseline"
+                .to_owned(),
+        );
+        return PolicyDecision::Inconclusive;
+    }
+
+    // A material per-unit regression on either cost dimension is a critical
+    // regression: it blocks adoption whatever the aggregate shows, and no
+    // trade-off covers it. A quality regression was already refused before
+    // this verdict.
+    let mut worst_time_regression = f64::NEG_INFINITY;
+    let mut worst_token_regression = f64::NEG_INFINITY;
+    for fact in facts {
+        if let (Some(baseline), Some(candidate)) = (fact.baseline_seconds, fact.candidate_seconds)
+            && let Some(regression) = percent_regression(baseline, candidate)
+        {
+            worst_time_regression = worst_time_regression.max(regression);
+        }
+        if let (Some(baseline), Some(candidate)) = (fact.baseline_tokens, fact.candidate_tokens)
+            && let Some(regression) = percent_regression(baseline as f64, candidate as f64)
+        {
+            worst_token_regression = worst_token_regression.max(regression);
+        }
+    }
+    if worst_time_regression > policy.tolerance_percent {
+        reasons.push(format!(
+            "the candidate materially regressed the recorded total time on at least one matched unit (worst +{worst_time_regression:.1}% beyond the {:.1}% tolerance); a favourable unit does not offset a critical regression",
+            policy.tolerance_percent
+        ));
+        return PolicyDecision::Reject;
+    }
+    if worst_token_regression > policy.tolerance_percent {
+        reasons.push(format!(
+            "the candidate materially regressed the recorded native token cost on at least one matched unit (worst +{worst_token_regression:.1}% beyond the {:.1}% tolerance); a favourable unit does not offset a critical regression",
+            policy.tolerance_percent
+        ));
+        return PolicyDecision::Reject;
+    }
+
+    let time_reduction = (baseline_seconds - candidate_seconds) / baseline_seconds * 100.0;
+    let token_reduction =
+        (baseline_tokens as f64 - candidate_tokens as f64) / baseline_tokens as f64 * 100.0;
+    if candidate_accepted <= baseline_accepted {
+        reasons.push(format!(
+            "the conjunction requires quality improvement: {candidate_accepted} of {} independent outcome(s) independently accepted versus {baseline_accepted} on the baseline arm; an unchanged success count is not a benefit",
+            facts.len()
+        ));
+        return PolicyDecision::Reject;
+    }
+    if time_reduction < conjunction.minimum_time_reduction_percent {
+        reasons.push(format!(
+            "the recorded total time through acceptance improved by {time_reduction:.1}%, below the declared useful margin of {:.1}%; the conjunction is not met",
+            conjunction.minimum_time_reduction_percent
+        ));
+        return PolicyDecision::Reject;
+    }
+    if token_reduction < conjunction.minimum_token_reduction_percent {
+        reasons.push(format!(
+            "the recorded native token cost improved by {token_reduction:.1}%, below the declared useful margin of {:.1}%; the conjunction is not met",
+            conjunction.minimum_token_reduction_percent
+        ));
+        return PolicyDecision::Reject;
+    }
+    reasons.push(format!(
+        "the conjunction holds over {} complete matched unit(s): independent acceptance {baseline_accepted}->{candidate_accepted}, total time through acceptance -{time_reduction:.1}% and recorded native token cost -{token_reduction:.1}% (declared useful margins {:.1}% time and {:.1}% tokens) with no critical regression beyond the {:.1}% tolerance",
+        facts.len(),
+        conjunction.minimum_time_reduction_percent,
+        conjunction.minimum_token_reduction_percent,
+        policy.tolerance_percent
+    ));
+    PolicyDecision::Adopt
+}
+
+/// The observed unit set of a declared conjunction, taken from the final
+/// result of each arm instead of the comparable-pair units.
+///
+/// The comparable-pair accounting admits a measured effect only across
+/// accepted outcomes; a failed baseline or candidate arm leaves its unit
+/// without comparable edges. Comparing exactly those acceptance outcomes is
+/// the conjunction's quality member, so each declared unit contributes one
+/// final baseline result and one final candidate result, each with its
+/// recorded total time through the result and the recorded native token cost
+/// of the whole attempt chain counted once per attempt. A unit that records
+/// more than one final result per arm, that declares another claim class, or
+/// whose arms differ in any recorded condition other than the acceptance
+/// outcome cannot carry the conjunction and stays out of the observed set.
+struct ObservedConjunction {
+    facts: Vec<UnitFacts>,
+    /// Declarations recorded on the observed attempts that differ from the
+    /// predeclared policy; such a comparison is invalid, never adopted.
+    drift: Vec<String>,
+    /// Observed units that cannot carry the conjunction, retained as
+    /// limitations of the decision instead of being silently dropped.
+    limitations: Vec<String>,
+}
+
+fn conjunction_observation(
+    policy: &ComparisonPolicy,
+    attempts: &[Value],
+) -> io::Result<ObservedConjunction> {
+    let results: BTreeMap<&str, &Value> = attempts
+        .iter()
+        .filter_map(|row| {
+            row.get("attempt_id")
+                .and_then(Value::as_str)
+                .map(|id| (id, row))
+        })
+        .collect();
+    let referenced: BTreeSet<&str> = attempts
+        .iter()
+        .filter_map(|row| row.get("retry_of").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut units: BTreeMap<&str, (Vec<&Value>, Vec<&Value>)> = BTreeMap::new();
+    let mut limitations: Vec<String> = Vec::new();
+    for row in attempts {
+        let is_tip = row
+            .get("attempt_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !referenced.contains(id));
+        if !is_tip {
+            continue;
+        }
+        let Some(unit) = row
+            .get("unit")
+            .and_then(Value::as_str)
+            .filter(|unit| !unit.is_empty())
+        else {
+            limitations.push(
+                "an attempt records no declared unit; it cannot carry the conjunction".to_owned(),
+            );
+            continue;
+        };
+        let entry = units.entry(unit).or_default();
+        match row.get("arm").and_then(Value::as_str) {
+            Some("baseline") => entry.0.push(row),
+            Some("candidate") => entry.1.push(row),
+            Some(arm) => limitations.push(format!(
+                "unit {unit}: an attempt declares the unrecognized arm {arm:?}"
+            )),
+            None => limitations.push(format!(
+                "unit {unit}: an attempt declares no arm and cannot be observed"
+            )),
+        }
+    }
+
+    let mut facts: Vec<UnitFacts> = Vec::new();
+    let mut drift: Vec<String> = Vec::new();
+    for (unit, (baseline, candidate)) in units {
+        if baseline.len() != 1 || candidate.len() != 1 {
+            limitations.push(format!(
+                "unit {unit}: {} final baseline result(s) and {} final candidate result(s) are recorded; the conjunction observes exactly one final result per arm",
+                baseline.len(),
+                candidate.len()
+            ));
+            continue;
+        }
+        let (baseline, candidate) = (baseline[0], candidate[0]);
+        // A unit declaring another objective's claim class is another
+        // comparison's evidence; it is excluded exactly as the unit-level
+        // accounting excludes it, never consumed and never treated as drift.
+        let claim = |row: &Value| {
+            row.get("declaration")
+                .and_then(|declaration| declaration.get("objective"))
+                .and_then(Value::as_str)
+                .map(|objective| match objective {
+                    "quality" => "deterministic_quality",
+                    "time" | "resource" => "stochastic_savings",
+                    _ => "",
+                })
+        };
+        if let Some(other) = [claim(baseline), claim(candidate)]
+            .into_iter()
+            .flatten()
+            .find(|class| *class != policy.objective.claim_class())
+        {
+            limitations.push(format!(
+                "unit {unit}: claim class '{other}' does not match the declared {} objective",
+                policy.objective.as_str()
+            ));
+            continue;
+        }
+        // The acceptance outcome is the only permitted separation between the
+        // arms: any other recorded difference (identity, conditions, discovery
+        // evidence or retained-baseline refusal) means the final results did
+        // not observe the same comparison.
+        if let Some(reason) = crate::outcome_report::comparison_reasons(baseline, candidate)?
+            .into_iter()
+            .find(|reason| !reason.starts_with("outcome_"))
+        {
+            limitations.push(format!(
+                "unit {unit}: the arms are not comparable apart from the acceptance outcome ({reason}); the conjunction cannot consume the unit"
+            ));
+            continue;
+        }
+        // The declaration recorded on the attempts is the one fixed before
+        // results; a criterion added, relaxed or removed after an outcome
+        // exists cannot inherit it.
+        let expected_conjunction = policy
+            .conjunction
+            .as_ref()
+            .expect("conjunction units are observed only under a declared conjunction")
+            .declaration();
+        for (arm, row) in [("baseline", baseline), ("candidate", candidate)] {
+            let Some(declared) = row.get("declaration").and_then(Value::as_object) else {
+                drift.push(format!(
+                    "unit {unit}: the recorded {arm} attempt carries no declaration"
+                ));
+                continue;
+            };
+            let field = |key: &str| declared.get(key).and_then(Value::as_str);
+            if field("objective") != Some(policy.objective.as_str()) {
+                drift.push(format!("unit {unit}: declared objective differs"));
+            }
+            if field("task_mix") != Some(policy.task_mix.as_str()) {
+                drift.push(format!("unit {unit}: declared task mix differs"));
+            }
+            if field("stopping") != Some(policy.stopping_text().as_str()) {
+                drift.push(format!("unit {unit}: declared stopping rule differs"));
+            }
+            if field("uncertainty") != Some(policy.uncertainty.as_str()) {
+                drift.push(format!("unit {unit}: declared uncertainty policy differs"));
+            }
+            let declared_effect = declared.get("effect_percent").and_then(number);
+            let expected_effect = match policy.objective {
+                Objective::Quality => policy.meaningful_effect_percent,
+                _ => Some(policy.meaningful_effect_percent.unwrap_or(0.0)),
+            };
+            match (declared_effect, expected_effect) {
+                (Some(a), Some(b)) if a == b => {}
+                (None, None) => {}
+                _ => drift.push(format!("unit {unit}: declared meaningful effect differs")),
+            }
+            match declared.get("basis").and_then(Value::as_str) {
+                Some(basis) if basis == policy.basis.declaration_text() => {}
+                None if policy.basis.maintenance_basis().is_none() => {}
+                _ => drift.push(format!(
+                    "unit {unit}: the recorded basis is missing or differs from the predeclared {} basis",
+                    policy.basis.as_str()
+                )),
+            }
+            if declared.get("conjunction").filter(|value| !value.is_null())
+                != Some(&expected_conjunction)
+            {
+                drift.push(format!(
+                    "unit {unit}: the recorded {arm} declaration conjunction differs from the predeclared one"
+                ));
+            }
+        }
+        let (baseline_tokens, baseline_usage) = chain_native_tokens(baseline, &results);
+        let (candidate_tokens, candidate_usage) = chain_native_tokens(candidate, &results);
+        let baseline_accepted = accepted(baseline);
+        let candidate_accepted = accepted(candidate);
+        let model_free = crate::outcome_report::model_free_attempt(baseline)
+            && crate::outcome_report::model_free_attempt(candidate);
+        let method = match (
+            baseline.get("method").and_then(Value::as_str),
+            candidate.get("method").and_then(Value::as_str),
+        ) {
+            (Some(left), Some(right)) if left == right => Some(left.to_owned()),
+            _ => None,
+        };
+        facts.push(UnitFacts {
+            name: unit.to_owned(),
+            case_id: baseline
+                .get("case_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            baseline_seconds: baseline.get("total_result_seconds").and_then(number),
+            candidate_seconds: candidate.get("total_result_seconds").and_then(number),
+            baseline_bounds: None,
+            candidate_bounds: None,
+            baseline_steps: None,
+            candidate_steps: None,
+            baseline_tokens,
+            candidate_tokens,
+            usage_measured: baseline_usage && candidate_usage,
+            model_free,
+            operation_work: false,
+            method,
+            baseline_accepted,
+            candidate_accepted,
+            positive_effect: candidate_accepted && !baseline_accepted,
+            evidence_complete: true,
+            does_not_repay: false,
+            time_uncertain: false,
+            token_regression: None,
+            subtractive: None,
+            reuse: None,
+            limitations: Vec::new(),
+        });
+    }
+    Ok(ObservedConjunction {
+        facts,
+        drift,
+        limitations,
+    })
+}
+
+/// The recorded native token cost of one final result, counting every attempt
+/// of its retry chain once in the shape the accounting owner consumes. A
+/// missing or unknown cost on any attempt of the chain stays unknown, never a
+/// fabricated zero.
+fn chain_native_tokens(row: &Value, results: &BTreeMap<&str, &Value>) -> (Option<u64>, bool) {
+    let mut chain: Vec<&str> = row
+        .get("result_attempt_ids")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if chain.is_empty() {
+        match row.get("attempt_id").and_then(Value::as_str) {
+            Some(id) => chain.push(id),
+            None => return (None, false),
+        }
+    }
+    let mut total: u64 = 0;
+    let mut usage = true;
+    for id in chain {
+        let Some(attempt) = results.get(id).copied() else {
+            return (None, false);
+        };
+        usage &= usage_measured(attempt);
+        let Some(tokens) = recorded_native_tokens(attempt) else {
+            return (None, usage);
+        };
+        match total.checked_add(tokens) {
+            Some(sum) => total = sum,
+            None => return (None, usage),
+        }
+    }
+    (Some(total), usage)
+}
+
 /// Evaluate the declared policy against the authoritative outcome summary.
 pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<PolicyEvaluation> {
     declared.verify()?;
@@ -2581,6 +3102,20 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         }
     }
 
+    // A declared conjunction decides on acceptance outcomes that the
+    // comparable-pair accounting keeps out of its measured effects, so its
+    // observed units are taken directly from the final result of each arm,
+    // and the declarations recorded on those attempts are checked against
+    // the predeclared policy in the same pass.
+    let observed_conjunction = if policy.conjunction.is_some() {
+        let observed = conjunction_observation(policy, attempts)?;
+        drift.extend(observed.drift);
+        recorded_limitations.extend(observed.limitations);
+        Some(observed.facts)
+    } else {
+        None
+    };
+
     let mut attempts_per_arm: BTreeMap<String, u64> = BTreeMap::new();
     for row in attempts {
         if let Some(arm) = row.get("arm").and_then(Value::as_str) {
@@ -2667,110 +3202,122 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         }
     }
 
-    let mut facts: Vec<UnitFacts> = Vec::new();
+    // A declared conjunction decides over the units observed from the final
+    // result of each arm; every other policy keeps the comparable-pair facts.
+    let mut facts: Vec<UnitFacts> = observed_conjunction.unwrap_or_default();
     let mut missing_results = false;
-    for unit in &included {
-        let name = unit_name(unit);
-        let baseline_row = arm_result(&results, unit, "baseline_result");
-        let candidate_row = arm_result(&results, unit, "candidate_result");
-        if baseline_row.is_none() || candidate_row.is_none() {
-            missing_results = true;
-        }
-        let usages = match (baseline_row, candidate_row) {
-            (Some(a), Some(b)) => usage_measured(a) && usage_measured(b),
-            _ => false,
-        };
-        let selected = selected_time_view(policy, baseline_row, candidate_row);
-        let mut baseline_seconds = number(&unit["effect"]["baseline_seconds"]);
-        let mut candidate_seconds = number(&unit["effect"]["candidate_seconds"]);
-        let mut positive_effect = unit.get("positive_effect") == Some(&Value::Bool(true));
-        let mut time_uncertain = false;
-        let token_regression = selected.as_ref().and_then(|view| view.token_regression);
-        if let Some(view) = selected.as_ref() {
-            baseline_seconds = view.baseline_seconds;
-            candidate_seconds = view.candidate_seconds;
-            positive_effect = view.positive_effect;
-            time_uncertain = view.uncertain;
-        }
-        // A unit whose baseline result is retained evidence carries the
-        // evidence owner's normalized reuse record: the retained execution
-        // identity, its age, the retained coverage and uncertainty, its
-        // original cost, and the model-metric applicability. The frozen
-        // reuse policy is applied to exactly these facts.
-        let reuse = unit
-            .get("reuse")
-            .and_then(Value::as_object)
-            .and_then(|reuse| {
-                let text = |key: &str| reuse.get(key).and_then(Value::as_str).map(str::to_owned);
-                Some(ReusedBaselineFacts {
-                    attempt: text("of")?,
-                    executed_at: reuse.get("executed_at").and_then(number)?,
-                    selected_at: reuse.get("selected_at").and_then(number)?,
-                    age_seconds: reuse.get("age_seconds").and_then(number)?,
-                    original_seconds: reuse.get("original_seconds").and_then(number),
-                    trace: text("trace")?,
-                    retained_coverage: text("coverage")?,
-                    retained_uncertainty: text("uncertainty")?,
-                    model_free: reuse.get("model_metrics").and_then(Value::as_str)
-                        == Some(crate::outcome_report::MODEL_METRICS_INAPPLICABLE),
-                    model_metrics: text("model_metrics")?,
-                    qualification: text("qualification")?,
-                    candidate_started_at: candidate_row.and_then(|row| number(&row["started_at"])),
-                })
+    if policy.conjunction.is_none() {
+        for unit in &included {
+            let name = unit_name(unit);
+            let baseline_row = arm_result(&results, unit, "baseline_result");
+            let candidate_row = arm_result(&results, unit, "candidate_result");
+            if baseline_row.is_none() || candidate_row.is_none() {
+                missing_results = true;
+            }
+            let usages = match (baseline_row, candidate_row) {
+                (Some(a), Some(b)) => usage_measured(a) && usage_measured(b),
+                _ => false,
+            };
+            let baseline_tokens = baseline_row.and_then(recorded_native_tokens);
+            let candidate_tokens = candidate_row.and_then(recorded_native_tokens);
+            let selected = selected_time_view(policy, baseline_row, candidate_row);
+            let mut baseline_seconds = number(&unit["effect"]["baseline_seconds"]);
+            let mut candidate_seconds = number(&unit["effect"]["candidate_seconds"]);
+            let mut positive_effect = unit.get("positive_effect") == Some(&Value::Bool(true));
+            let mut time_uncertain = false;
+            let token_regression = selected.as_ref().and_then(|view| view.token_regression);
+            if let Some(view) = selected.as_ref() {
+                baseline_seconds = view.baseline_seconds;
+                candidate_seconds = view.candidate_seconds;
+                positive_effect = view.positive_effect;
+                time_uncertain = view.uncertain;
+            }
+            // A unit whose baseline result is retained evidence carries the
+            // evidence owner's normalized reuse record: the retained execution
+            // identity, its age, the retained coverage and uncertainty, its
+            // original cost, and the model-metric applicability. The frozen
+            // reuse policy is applied to exactly these facts.
+            let reuse = unit
+                .get("reuse")
+                .and_then(Value::as_object)
+                .and_then(|reuse| {
+                    let text =
+                        |key: &str| reuse.get(key).and_then(Value::as_str).map(str::to_owned);
+                    Some(ReusedBaselineFacts {
+                        attempt: text("of")?,
+                        executed_at: reuse.get("executed_at").and_then(number)?,
+                        selected_at: reuse.get("selected_at").and_then(number)?,
+                        age_seconds: reuse.get("age_seconds").and_then(number)?,
+                        original_seconds: reuse.get("original_seconds").and_then(number),
+                        trace: text("trace")?,
+                        retained_coverage: text("coverage")?,
+                        retained_uncertainty: text("uncertainty")?,
+                        model_free: reuse.get("model_metrics").and_then(Value::as_str)
+                            == Some(crate::outcome_report::MODEL_METRICS_INAPPLICABLE),
+                        model_metrics: text("model_metrics")?,
+                        qualification: text("qualification")?,
+                        candidate_started_at: candidate_row
+                            .and_then(|row| number(&row["started_at"])),
+                    })
+                });
+            facts.push(UnitFacts {
+                case_id: unit
+                    .get("case_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                baseline_seconds,
+                candidate_seconds,
+                baseline_bounds: baseline_row
+                    .and_then(crate::infrastructure_accounting::arm_bounds),
+                candidate_bounds: candidate_row
+                    .and_then(crate::infrastructure_accounting::arm_bounds),
+                baseline_steps: baseline_row.and_then(steps),
+                candidate_steps: candidate_row.and_then(steps),
+                baseline_tokens,
+                candidate_tokens,
+                usage_measured: usages,
+                model_free: unit.get("model_metrics").and_then(Value::as_str)
+                    == Some(crate::outcome_report::MODEL_METRICS_INAPPLICABLE),
+                operation_work: unit.get("operation_work") == Some(&Value::Bool(true)),
+                method: unit
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                baseline_accepted: baseline_row.is_some_and(accepted),
+                candidate_accepted: candidate_row.is_some_and(accepted),
+                positive_effect,
+                evidence_complete: unit.get("evidence_complete") == Some(&Value::Bool(true)),
+                does_not_repay: unit
+                    .get("net_saving")
+                    .and_then(|saving| saving.get("verdict"))
+                    .and_then(Value::as_str)
+                    == Some("does_not_repay"),
+                time_uncertain,
+                token_regression,
+                subtractive: (unit.get("subtractive") == Some(&Value::Bool(true))).then(|| {
+                    SubtractiveFacts {
+                        removed: unit
+                            .get("removed_burden")
+                            .and_then(Value::as_str)
+                            .unwrap_or("(unnamed)")
+                            .to_owned(),
+                        applicability: unit
+                            .get("applicability")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                        retained_checks: unit.get("retained_checks") == Some(&Value::Bool(true)),
+                        repayment: unit
+                            .get("net_saving")
+                            .is_some_and(|saving| !saving.is_null()),
+                    }
+                }),
+                reuse,
+                limitations: unit_limitations(unit),
+                name,
             });
-        facts.push(UnitFacts {
-            case_id: unit
-                .get("case_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-            baseline_seconds,
-            candidate_seconds,
-            baseline_bounds: baseline_row.and_then(crate::infrastructure_accounting::arm_bounds),
-            candidate_bounds: candidate_row.and_then(crate::infrastructure_accounting::arm_bounds),
-            baseline_steps: baseline_row.and_then(steps),
-            candidate_steps: candidate_row.and_then(steps),
-            usage_measured: usages,
-            model_free: unit.get("model_metrics").and_then(Value::as_str)
-                == Some(crate::outcome_report::MODEL_METRICS_INAPPLICABLE),
-            operation_work: unit.get("operation_work") == Some(&Value::Bool(true)),
-            method: unit
-                .get("method")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            baseline_accepted: baseline_row.is_some_and(accepted),
-            candidate_accepted: candidate_row.is_some_and(accepted),
-            positive_effect,
-            evidence_complete: unit.get("evidence_complete") == Some(&Value::Bool(true)),
-            does_not_repay: unit
-                .get("net_saving")
-                .and_then(|saving| saving.get("verdict"))
-                .and_then(Value::as_str)
-                == Some("does_not_repay"),
-            time_uncertain,
-            token_regression,
-            subtractive: (unit.get("subtractive") == Some(&Value::Bool(true))).then(|| {
-                SubtractiveFacts {
-                    removed: unit
-                        .get("removed_burden")
-                        .and_then(Value::as_str)
-                        .unwrap_or("(unnamed)")
-                        .to_owned(),
-                    applicability: unit
-                        .get("applicability")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                    retained_checks: unit.get("retained_checks") == Some(&Value::Bool(true)),
-                    repayment: unit
-                        .get("net_saving")
-                        .is_some_and(|saving| !saving.is_null()),
-                }
-            }),
-            reuse,
-            limitations: unit_limitations(unit),
-            name,
-        });
+        }
     }
 
     // Measurement bounds and empirical variation are retained separately.
@@ -2881,14 +3428,20 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         ),
     };
 
-    let matched: u64 = included
-        .iter()
-        .map(|unit| {
-            unit.get("comparable_pairs")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-        })
-        .sum();
+    // A conjunction's observed units are its matched pairs: each declared
+    // unit contributes one final result per arm.
+    let matched: u64 = if policy.conjunction.is_some() {
+        facts.len() as u64
+    } else {
+        included
+            .iter()
+            .map(|unit| {
+                unit.get("comparable_pairs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
     let baseline_seconds = (facts.iter().all(|fact| fact.baseline_seconds.is_some())
         && !facts.is_empty())
     .then(|| {
@@ -3133,7 +3686,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             failed_candidate_tasks.join(", ")
         ));
         decision = PolicyDecision::Reject;
-    } else if included.is_empty() {
+    } else if included.is_empty() && policy.conjunction.is_none() {
         reasons.push(
             "no matched, independently accepted unit was recorded for the declared policy"
                 .to_owned(),
@@ -3244,6 +3797,8 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 "the declared metric coverage is incomplete ({}); unmeasured dimensions cannot support adoption",
                 missing_coverage.join(", ")
             ));
+        } else if let Some(conjunction) = &policy.conjunction {
+            decision = conjunction_verdict(policy, conjunction, &facts, &mut reasons);
         } else if policy.objective == Objective::Time && worst_time > policy.tolerance_percent {
             // A favourable subset never offsets a materially regressed primary
             // metric in the same declared task mix; the aggregate claim would

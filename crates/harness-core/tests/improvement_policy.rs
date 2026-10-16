@@ -4,13 +4,14 @@
 //! claim, a synthetic statistic or a post-hoc threshold.
 use harness_core::improvement_policy::{
     AnalysisMethod, BASELINE_REUSE_CLAUSE, BaselineReusePlan, Basis, ClaimScope, ComparisonPolicy,
-    DeclaredComparison, EffectPath, ExperimentMethod, ExperimentSelection, FaultRule, InitialState,
-    LoadRule, MeasurementStatus, NuisanceControlPlan, Objective, OrderRule, Overhead,
-    PerSuccessStatus, PolicyDecision, REUSE_IDENTITIES, RealizedFirst, RepeatedSelection,
-    RetryRule, SharedState, StatisticalClaim, StoppingRule, TradeOff, VariationStatus,
-    baseline_reuse_clause, evaluate, experiment_selection_clause, nuisance_control_clause,
-    parse_baseline_reuse, parse_experiment_selection, parse_nuisance_control,
-    parse_statistical_claim, refuse_cross_task_speed_claim, statistical_clause,
+    ConjunctionPolicy, DeclaredComparison, EffectPath, ExperimentMethod, ExperimentSelection,
+    FaultRule, InitialState, LoadRule, MeasurementStatus, NuisanceControlPlan, Objective,
+    OrderRule, Overhead, PerSuccessStatus, PolicyDecision, REUSE_IDENTITIES, RealizedFirst,
+    RepeatedSelection, RetryRule, SharedState, StatisticalClaim, StoppingRule, TradeOff,
+    VariationStatus, baseline_reuse_clause, evaluate, experiment_selection_clause,
+    nuisance_control_clause, parse_baseline_reuse, parse_experiment_selection,
+    parse_nuisance_control, parse_statistical_claim, refuse_cross_task_speed_claim,
+    statistical_clause,
 };
 use harness_core::infrastructure_accounting::{Mechanism, MetricView, binding_clause};
 use harness_core::outcome_report::{
@@ -42,6 +43,7 @@ fn policy() -> ComparisonPolicy {
             evaluation_seconds: 5.0,
             maintenance_seconds_per_task: 0.5,
         },
+        conjunction: None,
     }
 }
 
@@ -6131,4 +6133,453 @@ fn raised_field_bounds_admit_bounded_detail_and_refuse_beyond_them() {
     assert!(problem.contains("must be one bounded line"), "{problem}");
     let problem = prepared("one;two".to_owned()).problem().unwrap();
     assert!(problem.contains("without ';'"), "{problem}");
+}
+
+/// A policy whose verdict is the declared conjunction over one observed unit
+/// set: strictly more independently accepted outcomes, no critical
+/// regression, and both a useful total-time and recorded-token reduction.
+/// The margins here are synthetic contract values, never chosen real
+/// thresholds or a frozen experiment.
+fn conjunction_policy() -> ComparisonPolicy {
+    let mut policy = policy();
+    policy.objective = Objective::Quality;
+    policy.conjunction = Some(ConjunctionPolicy {
+        require_quality_improvement: true,
+        minimum_time_reduction_percent: 10.0,
+        minimum_token_reduction_percent: 10.0,
+    });
+    policy
+}
+
+/// Record a definite per-run native usage total on an attempt, in the shape
+/// the accounting owner's usage summary and the conjunction consume.
+fn recorded_tokens(mut row: Value, total_tokens: u64) -> Value {
+    row["native_runs"][0]["usage"] = json!({
+        "model": "fixed",
+        "input_tokens": total_tokens,
+        "output_tokens": 0,
+        "total_tokens": total_tokens,
+    });
+    row
+}
+
+/// One matched pair of attempts under the conjunction policy, carrying the
+/// arm's recorded acceptance, total time through acceptance and recorded
+/// native token total.
+fn conjunction_pair(
+    case: &str,
+    baseline_seconds: f64,
+    baseline_accepted: bool,
+    baseline_tokens: u64,
+    candidate_seconds: f64,
+    candidate_accepted: bool,
+    candidate_tokens: u64,
+) -> Vec<Value> {
+    vec![
+        recorded_tokens(
+            attempt(
+                &format!("{case}-baseline"),
+                "baseline",
+                case,
+                0.0,
+                baseline_seconds,
+                baseline_accepted,
+                Some(4),
+                Some(6),
+                false,
+            ),
+            baseline_tokens,
+        ),
+        recorded_tokens(
+            attempt(
+                &format!("{case}-candidate"),
+                "candidate",
+                case,
+                200.0,
+                candidate_seconds,
+                candidate_accepted,
+                Some(3),
+                Some(6),
+                false,
+            ),
+            candidate_tokens,
+        ),
+    ]
+}
+
+#[test]
+fn the_conjunction_requires_quality_improvement_with_time_and_token_reductions() {
+    let policy = conjunction_policy();
+    let declared = declare(&policy);
+
+    // Every member holds over the same observed unit set: independent
+    // acceptance improves from none to one, and both the total time through
+    // acceptance and the recorded native token cost fall beyond their
+    // declared useful margins.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, false, 400, 40.0, true, 160),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("conjunction holds")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(evaluation.baseline_seconds, Some(100.0));
+    assert_eq!(evaluation.candidate_seconds, Some(40.0));
+
+    // Unchanged quality: an unchanged success count is not a benefit, and a
+    // larger time or token gain cannot buy an adoption.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, true, 400, 40.0, true, 160),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("quality improvement")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The time member fails on its own: 5% is below the declared 10% useful
+    // margin although acceptance improved and tokens fell beyond theirs.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, false, 400, 95.0, true, 80),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("total time through acceptance")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The recorded-token member fails on its own: 5% is below its declared
+    // useful margin although acceptance improved and time fell beyond its.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, false, 400, 40.0, true, 380),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("recorded native token cost improved by 5.0%")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A material regression of one matched unit is critical: the favourable
+    // aggregate of the other unit cannot offset it and no declared trade-off
+    // waives the conjunction.
+    let mut rows = conjunction_pair("case-a", 10.0, false, 100, 22.0, true, 100);
+    rows.extend(conjunction_pair(
+        "case-b", 100.0, false, 300, 40.0, true, 100,
+    ));
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("at least one matched unit")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn the_conjunction_stays_inconclusive_without_complete_measured_evidence() {
+    let policy = conjunction_policy();
+    let declared = declare(&policy);
+
+    // Missing recorded usage on either arm is unknown, not a zero saving.
+    for rows in [
+        vec![
+            attempt(
+                "b1",
+                "baseline",
+                "case-q",
+                0.0,
+                100.0,
+                false,
+                Some(4),
+                Some(6),
+                false,
+            ),
+            recorded_tokens(
+                attempt(
+                    "c1",
+                    "candidate",
+                    "case-q",
+                    200.0,
+                    40.0,
+                    true,
+                    Some(3),
+                    Some(6),
+                    false,
+                ),
+                160,
+            ),
+        ],
+        vec![
+            recorded_tokens(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-q",
+                    0.0,
+                    100.0,
+                    false,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                400,
+            ),
+            attempt(
+                "c2",
+                "candidate",
+                "case-q",
+                200.0,
+                40.0,
+                true,
+                Some(3),
+                Some(6),
+                false,
+            ),
+        ],
+    ] {
+        let report = summarize(&rows, &policy);
+        let evaluation = evaluate(&declared, &report).unwrap();
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::Inconclusive,
+            "{:?}",
+            evaluation.reasons
+        );
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("token usage is missing or unknown")),
+            "{:?}",
+            evaluation.reasons
+        );
+    }
+
+    // A declared panel that requires an additional independent unit cannot
+    // state the conjunction from the units recorded so far.
+    let mut panel = conjunction_policy();
+    panel.stopping.required_units = 2;
+    let declared = declare(&panel);
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, false, 400, 40.0, true, 160),
+        &panel,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("panel of 2")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn a_conjunction_criterion_cannot_be_relaxed_or_removed_after_results() {
+    let policy = conjunction_policy();
+    let declared = declare(&policy);
+    assert!(declared.digest_matches(&declared.digest));
+
+    // An unset, nonpositive or nonfinite margin is not a decision criterion:
+    // the declaration is refused before any result exists.
+    for margin in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let mut invalid = policy.clone();
+        invalid
+            .conjunction
+            .as_mut()
+            .unwrap()
+            .minimum_time_reduction_percent = margin;
+        assert!(invalid.declare().is_err(), "margin {margin}");
+    }
+    // The quality member and the quality objective are hard members of the
+    // conjunction declaration.
+    let mut waived = policy.clone();
+    waived
+        .conjunction
+        .as_mut()
+        .unwrap()
+        .require_quality_improvement = false;
+    assert!(waived.declare().is_err());
+    let mut time_objective = policy.clone();
+    time_objective.objective = Objective::Time;
+    assert!(time_objective.declare().is_err());
+
+    // Relaxing a criterion after the declaration breaks the recorded digest.
+    let mut relaxed = policy.clone();
+    relaxed
+        .conjunction
+        .as_mut()
+        .unwrap()
+        .minimum_token_reduction_percent = 5.0;
+    assert_ne!(declared.digest, relaxed.declare().unwrap().digest);
+    let mut changed = declared.clone();
+    changed
+        .policy
+        .conjunction
+        .as_mut()
+        .unwrap()
+        .minimum_token_reduction_percent = 5.0;
+    assert!(changed.verify().is_err());
+
+    // Results measured under the relaxed declaration cannot inherit the
+    // predeclared conjunction: the recorded rows differ from the declaration
+    // and the comparison is invalid, not an adoption.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, false, 400, 40.0, true, 160),
+        &relaxed,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("differs from the predeclared policy")),
+        "{:?}",
+        evaluation.reasons
+    );
+    // The same results recorded under the predeclared criteria are adopted,
+    // so the refusal above is the declaration difference and nothing else.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, false, 400, 40.0, true, 160),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn the_conjunction_counts_each_recorded_attempt_cost_once() {
+    let policy = conjunction_policy();
+    let declared = declare(&policy);
+    // The candidate attempt records its own run usage plus one worker whose
+    // usage belongs to the same attempt: the worker cost is part of the
+    // attempt total, counted once — never duplicated and never dropped.
+    let mut candidate = recorded_tokens(
+        attempt(
+            "c1",
+            "candidate",
+            "case-q",
+            200.0,
+            40.0,
+            true,
+            Some(3),
+            Some(6),
+            false,
+        ),
+        100,
+    );
+    candidate["children"] = json!([{
+        "started_at": 200.0,
+        "ended_at": 240.0,
+        "usage": {"total_tokens": 50},
+    }]);
+    let report = summarize(
+        &[
+            recorded_tokens(
+                attempt(
+                    "b1",
+                    "baseline",
+                    "case-q",
+                    0.0,
+                    100.0,
+                    false,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                200,
+            ),
+            candidate,
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    // 200 -> 150 recorded tokens is a 25% reduction: the run's own 100 plus
+    // the worker's 50, each counted once.
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("token cost -25.0%")),
+        "{:?}",
+        evaluation.reasons
+    );
 }

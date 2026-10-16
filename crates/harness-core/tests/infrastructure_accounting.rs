@@ -226,6 +226,7 @@ fn policy(uncertainty: &str) -> ComparisonPolicy {
             evaluation_seconds: 0.0,
             maintenance_seconds_per_task: 0.0,
         },
+        conjunction: None,
     }
 }
 

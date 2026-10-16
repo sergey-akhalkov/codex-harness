@@ -716,6 +716,135 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     assert_eq!(fixture.bd_comments(&fixture.card), comments_before);
 }
 
+/// The declared conjunction is one combined verdict through the built
+/// runner: the same observed unit set must show quality improvement, a
+/// useful total-time reduction and a useful recorded-token reduction with no
+/// critical regression, and a member below its declared margin does not
+/// adopt. Only control failure followed by candidate success can show the
+/// quality member, so a recorded control failure must not stop the candidate
+/// measurement.
+#[test]
+fn a_declared_conjunction_consumes_the_combined_verdict() {
+    let _serial = INSTALL.lock().unwrap();
+
+    // Quality improvement with useful total-time and recorded-token
+    // reductions: adopted.
+    let fixture = Fixture::new("conjunction-adopt");
+    let mut policy = load_json(&fixture.policy);
+    policy["objective"] = json!("quality");
+    policy["conjunction"] = json!({
+        "requireQualityImprovement": true,
+        "minimumTimeReductionPercent": 10.0,
+        "minimumTokenReductionPercent": 25.0,
+    });
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("conjunction-adopt-baseline");
+    fixture.simulate_arm("baseline", "baseline", "wrong", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], false,
+        "the recorded control failure proceeds to the candidate measurement: {status}"
+    );
+    let session = session_id("conjunction-adopt-candidate");
+    fixture.simulate_arm_with_tokens(
+        "candidate",
+        "candidate",
+        "solved",
+        50,
+        1.5,
+        1,
+        1,
+        &session,
+        60,
+    );
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}\n{output}");
+    assert!(
+        status["comparison"]["decision"]
+            .as_str()
+            .unwrap()
+            .contains("outcome=adopt"),
+        "{status}"
+    );
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    assert_eq!(evaluation["decision"], "adopt", "{evaluation}");
+    assert_eq!(evaluation["matched"], 1, "{evaluation}");
+    assert!(
+        evaluation["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| {
+                reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("conjunction holds"))
+            }),
+        "the runner consumes the single combined verdict: {evaluation}"
+    );
+    let comments = fixture.bd_comments(&fixture.card);
+    assert!(comments.contains("outcome=adopt"), "{comments}");
+    assert!(comments.contains("matched=1"), "{comments}");
+
+    // The recorded-token member below its declared useful margin: the same
+    // combined verdict does not adopt, and no partial credit is given.
+    let fixture = Fixture::new("conjunction-member-fails");
+    let mut policy = load_json(&fixture.policy);
+    policy["objective"] = json!("quality");
+    policy["conjunction"] = json!({
+        "requireQualityImprovement": true,
+        "minimumTimeReductionPercent": 10.0,
+        "minimumTokenReductionPercent": 25.0,
+    });
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("conjunction-member-baseline");
+    fixture.simulate_arm("baseline", "baseline", "wrong", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("conjunction-member-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}\n{output}");
+    assert!(
+        status["comparison"]["decision"]
+            .as_str()
+            .unwrap()
+            .contains("outcome=reject"),
+        "{status}"
+    );
+    let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+    assert_eq!(evaluation["decision"], "reject", "{evaluation}");
+    assert!(
+        evaluation["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| {
+                reason.as_str().is_some_and(|reason| {
+                    reason.contains("recorded native token cost improved by 0.0%")
+                })
+            }),
+        "the unmet member is the recorded-token margin: {evaluation}"
+    );
+}
+
 /// The continuous controller consumes a supported adoption through the real
 /// integration and activation owners: the checked revision reaches the
 /// mainline, the prepared candidate runtime becomes the experimental

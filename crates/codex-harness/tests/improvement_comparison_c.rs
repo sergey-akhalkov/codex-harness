@@ -90,6 +90,91 @@ fn comparison_preparation_requires_policy_qualification_and_workload_planning() 
     assert!(!fixture.run.join("comparison").exists(), "{status}");
 }
 
+/// A conjunction declaration that cannot govern a comparison — a member
+/// missing from the record, a margin that is not positive and finite, or a
+/// conjunction outside the quality objective — is refused with its cause
+/// before any measured arm, installation or comparison workspace exists, so
+/// unusable acceptance machinery never authorizes dependent dispatch.
+#[test]
+fn an_invalid_conjunction_declaration_is_refused_before_effects() {
+    let _serial = INSTALL.lock().unwrap();
+
+    // A recorded member missing from the declaration cannot be defaulted.
+    let fixture = Fixture::new("conjunction-missing-member");
+    let mut policy = load_json(&fixture.policy);
+    policy["objective"] = json!("quality");
+    policy["conjunction"] = json!({
+        "requireQualityImprovement": true,
+        "minimumTimeReductionPercent": 10.0,
+    });
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("predeclared comparison policy is unusable"),
+        "{output}"
+    );
+    assert!(
+        output.contains("minimumTokenReductionPercent"),
+        "the missing recorded member is named: {output}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(status["attempts"].as_array().unwrap().len(), 0, "{status}");
+    assert!(!fixture.run.join("comparison").exists(), "{status}");
+
+    // A member that is not positive and finite is not a useful margin.
+    let fixture = Fixture::new("conjunction-unusable-margin");
+    let mut policy = load_json(&fixture.policy);
+    policy["objective"] = json!("quality");
+    policy["conjunction"] = json!({
+        "requireQualityImprovement": true,
+        "minimumTimeReductionPercent": 0.0,
+        "minimumTokenReductionPercent": 25.0,
+    });
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("positive finite minimum total-time reduction percent"),
+        "{output}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(status["attempts"].as_array().unwrap().len(), 0, "{status}");
+    assert!(!fixture.run.join("comparison").exists(), "{status}");
+
+    // The conjunction decides the quality objective; the legacy time
+    // objective cannot carry required savings margins.
+    let fixture = Fixture::new("conjunction-time-objective");
+    let mut policy = load_json(&fixture.policy);
+    policy["conjunction"] = json!({
+        "requireQualityImprovement": true,
+        "minimumTimeReductionPercent": 10.0,
+        "minimumTokenReductionPercent": 25.0,
+    });
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("a conjunction comparison decides the quality objective"),
+        "{output}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(status["attempts"].as_array().unwrap().len(), 0, "{status}");
+    assert!(!fixture.run.join("comparison").exists(), "{status}");
+}
+
 /// A declared corroboration requirement with too few applicable retained units
 /// stays explicitly inconclusive: the comparison selects through the driver's
 /// merged owner before evaluating, attaches the run's own receipt to the

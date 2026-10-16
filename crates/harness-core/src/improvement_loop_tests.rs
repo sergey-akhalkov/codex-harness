@@ -1586,6 +1586,7 @@ fn comparison_inputs_are_validated_before_preparation() {
             evaluation_seconds: 1.0,
             maintenance_seconds_per_task: 0.0,
         },
+        conjunction: None,
     };
     let policy_path = spec.comparison.as_ref().unwrap().policy.clone();
     fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();

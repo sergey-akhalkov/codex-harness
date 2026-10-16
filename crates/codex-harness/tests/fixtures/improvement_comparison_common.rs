@@ -1261,7 +1261,42 @@ impl Fixture {
         tool_calls: u64,
         session: &str,
     ) -> PathBuf {
+        self.simulate_arm_with_tokens(
+            arm,
+            role,
+            solution,
+            sleep_ms,
+            started_offset_seconds,
+            messages,
+            tool_calls,
+            session,
+            120,
+        )
+    }
+
+    /// The same simulated measured conversation with an explicit recorded
+    /// native token total. The four usage categories keep the fixture's fixed
+    /// proportions — the default 120 total is exactly input 100 / cached 40 /
+    /// output 20 / reasoning 5 — so a declared token-cost conjunction is
+    /// exercised through the real usage reader instead of a rewritten row.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn simulate_arm_with_tokens(
+        &self,
+        arm: &str,
+        role: &str,
+        solution: &str,
+        sleep_ms: u64,
+        started_offset_seconds: f64,
+        messages: u64,
+        tool_calls: u64,
+        session: &str,
+        tokens: u64,
+    ) -> PathBuf {
         let dir = self.arm_dir(arm);
+        let output_tokens = tokens / 6;
+        let input_tokens = tokens - output_tokens;
+        let cached_input_tokens = tokens / 3;
+        let reasoning_output_tokens = tokens / 24;
         let checkout = dir.join("checkout");
         let slot = dir.join("checkout-wt1");
         if slot.exists() {
@@ -1329,11 +1364,11 @@ impl Fixture {
             "payload": {
                 "response_id": "response-1",
                 "usage": {
-                    "input_tokens": 100,
-                    "cached_input_tokens": 40,
-                    "output_tokens": 20,
-                    "reasoning_output_tokens": 5,
-                    "total_tokens": 120,
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "output_tokens": output_tokens,
+                    "reasoning_output_tokens": reasoning_output_tokens,
+                    "total_tokens": tokens,
                 },
             },
         }));
@@ -1346,11 +1381,11 @@ impl Fixture {
                 "type": "token_count",
                 "info": {
                     "total_token_usage": {
-                        "input_tokens": 100,
-                        "cached_input_tokens": 40,
-                        "output_tokens": 20,
-                        "reasoning_output_tokens": 5,
-                        "total_tokens": 120,
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached_input_tokens,
+                        "output_tokens": output_tokens,
+                        "reasoning_output_tokens": reasoning_output_tokens,
+                        "total_tokens": tokens,
                     },
                 },
             },
