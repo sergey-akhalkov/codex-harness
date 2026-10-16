@@ -55,10 +55,11 @@ core, 6,669-byte developer text, 6,185-byte 23-skill catalogue; 37,831 bytes /
 for the executor (-19.1% / -19.6%), 36,993 bytes / 4,851 words for the lead
 (-2.2% / -2.4%) and 67,612 / 8,848 for the combined two-role load (-10.6% /
 -11.0%). These are source-text sizes: the comparison excludes generated
-briefs, invoked bodies and linked reference files (measured separately and not yet
-for a matched task) and establishes no semantic equivalence, quality or speed
-benefit. Semantic coverage and real-task comparisons remain open in
-[the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md).
+briefs, invoked bodies and linked reference files. The completed matched-task
+accounting includes those surfaces and confirms a reduction in required source
+load; its limits and the inconclusive operational comparison are recorded in
+[the role-context decision](project-decisions.md). Source sizes alone establish
+no semantic equivalence, quality or speed benefit.
 
 The ordinary local launcher resolves the role before startup and composes it
 with the applicable native profile, project and session context. Managed
@@ -72,10 +73,12 @@ restates the standing responsibility guidance - it reaches a managed session
 once through its role context - while the brief keeps the task-specific
 outcome, checkout, base, owned paths, checks, consumer, feedback address and
 extra boundaries. Maintenance commands and remote attachments retain their
-existing path. Installed consumption, real-task acceptance and global
-delivery remain unfinished in
-[the active role change](../openspec/changes/separate-lead-executor-contexts/tasks.md);
-source and fixture checks do not establish effective consumption.
+existing path. Installed common/role context and effective catalogues have been
+verified outside the kit, followed by real executor work, returned corrections
+and accepted integration through the delivered components. Recovery distinguishes
+saved guidance from the current source revision; the supported boundary is in
+[agent delegation](agent-delegation.md). Source and fixture checks alone do not
+establish effective consumption.
 
 The launcher keeps configuration overrides in the native root argument scope,
 before the subcommand, with explicit values in encounter order and composed
