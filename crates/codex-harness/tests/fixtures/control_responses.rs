@@ -482,11 +482,19 @@ impl Responses {
                     json!({"type":"message","id":"msg-executor-helper","role":"assistant","content":[{"type":"output_text","text":FINAL}]})
                 } else if result_seen {
                     if probed.contains(&identity.thread) {
+                        // The session preserves the invocation and its result
+                        // as two items sharing the call id, so the result of
+                        // the observed code-mode `exec` route is selected by
+                        // its type (`custom_tool_call_output`), never the
+                        // invocation.
                         let output = request["input"]
                             .as_array()
                             .unwrap()
                             .iter()
-                            .find(|item| item["call_id"] == "control-tool-1")
+                            .find(|item| {
+                                item["type"] == "custom_tool_call_output"
+                                    && item["call_id"] == "control-tool-1"
+                            })
                             .and_then(|item| item.get("output"))
                             .expect("the native session must return the owned exec call's output");
                         let names = tool_catalogue::probe_names(output).unwrap_or_else(|| {
