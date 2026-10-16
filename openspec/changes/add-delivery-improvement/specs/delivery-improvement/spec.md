@@ -48,23 +48,87 @@ Each observer conversation SHALL have a dedicated titled terminal surface before
 
 ### Requirement: Evidence covers the lead and its executors
 
-Observation SHALL cover authorized visible messages, tool outcomes and assignment/lifecycle events from the bound lead and its executors, including both directions of their exchange. Each observation SHALL retain source and episode identity, instruction/assignment context and evidence locators. Missing, stale or unavailable content SHALL be reported as a coverage limit; delivery metadata alone SHALL NOT be treated as message content.
+The routine analysis feed SHALL include all new authorized visible user, lead and executor text messages within the bound work, including both directions of addressed exchanges. Native message type and channel SHALL define inclusion, without keyword, importance or anomaly filtering. Source, episode and message identity SHALL remain attributable. Activation SHALL expose its starting coverage boundary; unavailable content SHALL remain an explicit coverage gap.
 
 #### Scenario: A lead sends a correction
 - **WHEN** `executor message` delivers a correction, inline or through the supported spill path
 - **THEN** the observer can access its actual authorized text and the relevant assignment/result context, distinguish submission from delivery, and attribute the episode without asking the lead to label or copy the message
 
 #### Scenario: Friction occurs in the lead's own work
-- **WHEN** the lead repeats a failed tool operation or costly preparation without an executor exchange
-- **THEN** its relevant observable tool outcomes can supply evidence to the improvement session
+- **WHEN** the lead describes an obstacle, repeated preparation or changed approach without an executor exchange
+- **THEN** its new visible text reaches the observer, which assesses its meaning and can request the relevant tool evidence without a controller having to classify the message as friction
+
+#### Scenario: An ordinary message contains an important clue
+- **WHEN** an in-scope visible message has no error label or correction keyword
+- **THEN** it remains in the analysis feed with its text intact, including any explanation or command quoted in the message; source record type rather than wording determines inclusion
+
+#### Scenario: One exchange appears in multiple session records
+- **WHEN** native provenance identifies the same message at its sender and recipient
+- **THEN** the feed represents its text once with both endpoints and delivery state, while distinct messages with identical wording retain their identities
 
 #### Scenario: A session is outside supported observation coverage
 - **WHEN** the bound lead or executor cannot provide the required events or addressed delivery
 - **THEN** activation or continued coverage reports the missing capability and supported remedy without claiming a complete operative loop, while independent authorized work can continue
 
+### Requirement: Detailed evidence answers a concrete analysis question
+
+Routine input SHALL exclude reasoning, tool calls, step traces, raw tool results and repeated system or role instructions. The observer SHALL assess message meaning and request authorized technical excerpts only for an explicit unresolved question tied to an episode. Such retrieval SHALL remain bounded and source-attributed; it SHALL NOT expand into full session inspection or access opaque reasoning.
+
+#### Scenario: Messages justify inspecting one failed operation
+- **WHEN** an exchange suggests a tool defect but does not establish the cause
+- **THEN** the observer requests the relevant operation and result through their evidence locators, states the question they answer and retains uncertainty if the detail is unavailable
+
+#### Scenario: A large trace accompanies a short conversation
+- **WHEN** the source sessions contain many tool steps and reasoning records alongside visible messages
+- **THEN** only the visible message text enters routine model input; technical details remain separately retrievable and reasoning remains excluded
+
+#### Scenario: A failure appears only in an excluded tool result
+- **WHEN** no visible message or relevant board update exposes the failure
+- **THEN** routine text analysis is not claimed to detect it; existing operational failure reporting remains available without silently broadening the observer feed
+
+### Requirement: Relevant board records provide incremental task context
+
+The observer SHALL receive relevant beads tasks, assignments, blocking dependencies and linked feedback with source identity and revision. It SHALL inspect their current state at activation and subsequent changes without routinely reloading the board. The initial scope SHALL follow the bound work and explicit task relationships; the observer SHALL be able to request other relevant records with a stated reason. Board status alone SHALL NOT prove progress or success.
+
+#### Scenario: Activation supplies the work's existing context
+- **WHEN** observation starts for a lead with task-linked executor assignments and feedback
+- **THEN** the observer receives the current task, those assignments, direct blocking dependencies and linked feedback within bounded input, without an automatic scan of every project issue or historical comment
+
+#### Scenario: A task changes while observation is active
+- **WHEN** an in-scope task's acceptance, status, blocker, comment or decision changes
+- **THEN** its changed content and revision are retained for analysis with enough prior context to interpret the change; an unchanged read starts no model turn
+
+#### Scenario: An older issue may explain the current exchange
+- **WHEN** the observer identifies a concrete question requiring an additional board record or bounded search
+- **THEN** it can retrieve that context within the analysis allowance without importing the entire board into its conversation
+
+#### Scenario: A completed card lacks supporting acceptance
+- **WHEN** a task is marked complete but messages or linked evidence do not establish the required result
+- **THEN** the observer distinguishes the recorded status from verified progress and does not manufacture an independent evidence vote from the card
+
+### Requirement: Code feedback is attributable to the work that produced it
+
+For a code-related finding, the observer SHALL be able to relate the original assignment and applicable requirements to the executor's submitted change, the actual lead feedback, subsequent correction and relevant checks. Each available link SHALL retain its author or run, source revision and evidence locator. Diffs, code and check detail SHALL be retrieved for the specific question, not added wholesale to routine input. Missing links SHALL remain explicit.
+
+#### Scenario: Lead feedback concerns a submitted change
+- **WHEN** a message or board record identifies a suspected defect in executor work
+- **THEN** the observer can request the affected diff against its assignment base, the relevant source or symbols, the feedback author and exact message, and the correction and check results needed to assess the cause
+
+#### Scenario: A reused checkout no longer contains the reviewed revision
+- **WHEN** the current branch or worktree differs from the code that received feedback
+- **THEN** analysis uses the recorded commit or retained patch through its existing owner, or reports unavailable evidence; it does not attribute the latest contents to the earlier executor
+
+#### Scenario: A correction could improve assignment or executor practice
+- **WHEN** evidence establishes an avoidable defect
+- **THEN** the finding distinguishes a missing or contradictory brief from an executor failing an existing requirement or applicable engineering practice, considers both causes where supported, and proposes a checkable preventive change at the appropriate owner
+
+#### Scenario: The lead's proposed fix is unsupported
+- **WHEN** code, original acceptance or checks contradict the lead's diagnosis, or the feedback introduces a new requirement
+- **THEN** the observer preserves that distinction instead of treating criticism as ground truth or automatically adding instructions to the executor
+
 ### Requirement: Bounded analysis consumes new evidence
 
-Collection, waiting and unchanged-state reconciliation SHALL make no model calls. Observer turns SHALL consume bounded batches of new evidence, with at most one turn in flight and further arrivals retained for the next batch. Routine analysis SHALL respect existing supervision cadence; earlier analysis SHALL require an allowed substantive event. Full transcripts, opaque reasoning state and conversation pixels SHALL NOT be routine inputs.
+Collection, waiting, deduplication and unchanged-state reconciliation SHALL make no model calls. Observer turns SHALL consume bounded batches of new text and board changes, with one turn in flight and further arrivals retained. Routine analysis SHALL respect existing supervision cadence; earlier analysis SHALL require an allowed substantive event. Batch limits SHALL change processing pace, not omit messages or substitute controller-generated semantic summaries.
 
 #### Scenario: No new work evidence arrives
 - **WHEN** the observation interval expires with no new eligible evidence or due decision condition
@@ -74,9 +138,45 @@ Collection, waiting and unchanged-state reconciliation SHALL make no model calls
 - **WHEN** new events arrive during analysis of a related episode
 - **THEN** the controller retains and coalesces the arrivals, avoiding concurrent observer turns and repeated analysis of acknowledged evidence
 
+#### Scenario: A long message exceeds one input batch
+- **WHEN** one eligible message cannot fit within the current input allowance
+- **THEN** ordered parts retain message identity and continuation state until covered, with no silent truncation, importance sampling or acknowledgment of unread content
+
 #### Scenario: A healthy executor is silent
 - **WHEN** elapsed time or a yielded wait is the only new information
 - **THEN** the observer does not infer a stall, ask for status, interrupt work or recommend reassignment on that basis
+
+### Requirement: Observation has finite cumulative cost limits
+
+Installed defaults SHALL bound per-turn supplied context, episode analysis turns and detail retrieval, and cumulative observer work for the bound task. Limits SHALL cover message intake, board context and further investigation, including carried conversation context. Status SHALL expose consumed allowance, pending coverage and the reason for any pause. Available usage SHALL be reported separately from estimates; token counts SHALL NOT imply subscription savings.
+
+#### Scenario: The task allowance is exhausted with unread messages
+- **WHEN** another analysis turn cannot be admitted within the cumulative allowance
+- **THEN** new model work pauses, pending messages and board changes remain retained, and the lead receives a bounded notice with the cause and supported continuation choice; elapsed time, a new batch or reactivation does not silently reset the allowance
+
+#### Scenario: Repeated excerpt requests do not resolve a cause
+- **WHEN** an episode reaches its investigation allowance without enough evidence
+- **THEN** the observer records an inconclusive result and the missing fact instead of broadening into whole-session reads; further investigation requires a recorded lead decision and sufficient remaining allowance
+
+#### Scenario: The observer conversation grows across many batches
+- **WHEN** earlier analysis would make carried context exceed its bound
+- **THEN** continuation uses compact retained findings, unresolved questions, board references and source cursors, preserving pending work without replaying the consumed transcript or repeating investigations
+
+#### Scenario: Runtime usage is incomplete or exceeds a reservation
+- **WHEN** native usage is unavailable or a completed turn exceeds its estimated allowance
+- **THEN** status identifies the measurement limit or overrun, retains enforceable turn and context bounds, and admits no additional work beyond the remaining allowance; it does not claim an exact token cap or silently change models
+
+### Requirement: Unproductive analysis reduces frequency without losing coverage
+
+Repeated analysis without an actionable finding SHALL reduce routine model-call frequency by accumulating larger bounded batches or waiting for an existing work boundary. It SHALL NOT filter or discard eligible text, demand special progress reports or generate findings to justify its activity. Status SHALL distinguish an intentional batching wait from a coverage failure. No new evidence SHALL mean no model turn.
+
+#### Scenario: Several analyses find no useful improvement
+- **WHEN** the configured no-finding condition is reached
+- **THEN** routine analysis backs off under visible finite pacing rules, preserving unread input and reducing calls for comparable message traffic; text content is not heuristically ranked or sampled
+
+#### Scenario: Buffered text is ready for a later analysis
+- **WHEN** a configured batch or pending-input wait boundary, task completion, or explicit lead request makes retained input ready
+- **THEN** the observer resumes within admission and remaining cost limits, preserving input order and reporting any budget-blocked tail instead of claiming complete coverage
 
 ### Requirement: Findings distinguish causes from symptoms
 
@@ -93,6 +193,10 @@ The observer SHALL compare observations with the applicable task and evidence be
 #### Scenario: One incident does not support a general rule
 - **WHEN** an isolated observation lacks an attributable cause or likely relevant recurrence
 - **THEN** it remains a bounded hypothesis, requests only decision-relevant investigation, or yields no proposal instead of expanding global guidance
+
+#### Scenario: A reusable engineering practice may prevent recurrence
+- **WHEN** attributed code and feedback evidence supports an improvement in task framing, implementation judgment or self-verification
+- **THEN** the proposal names the concrete behavior and a representative check, compares an owning tool or test improvement with role or skill guidance, and retains applicable skill evaluation before claiming the executor will perform better without additional lead prompting
 
 ### Requirement: Existing boards own improvement work
 
@@ -160,7 +264,7 @@ Implementation, integration, publication and observed consumption SHALL remain d
 
 ### Requirement: Improvement claims require relevant outcome evidence
 
-The lead SHALL accept correctness through the real affected entry point and assess benefit with proportionate evidence, including coordination, analysis, checking and rework costs. Strategy or agent-behavior claims SHALL use applicable real-agent evaluation; experiment and skill-evaluation gates SHALL remain intact. Supported, adverse and inconclusive results SHALL be distinguishable. Fewer messages or shorter prompts SHALL NOT alone establish improvement.
+The lead SHALL verify correctness through the real affected entry point and assess benefit including observation, coordination, implementation, checking, rework and displaced delivery. Expected reuse SHALL inform admission; time and token effects SHALL be reported separately. Agent-behavior claims SHALL retain applicable real-agent and skill evaluation. Supported, adverse and inconclusive results SHALL remain distinct; shorter prompts or fewer messages alone SHALL NOT establish benefit.
 
 #### Scenario: A deterministic preparation defect is repaired
 - **WHEN** the original failure can be exercised through its real command
@@ -169,6 +273,22 @@ The lead SHALL accept correctness through the real affected entry point and asse
 #### Scenario: A prompt change reduces messages but misses a requirement
 - **WHEN** the candidate produces less feedback while degrading acceptance quality
 - **THEN** it is not accepted as a demonstrated improvement and the prior accepted guidance remains recoverable
+
+#### Scenario: Expected future reuse may repay an improvement
+- **WHEN** an ordinary optimization is proposed for repeated relevant work
+- **THEN** the lead records the credible next uses, expected avoided work and proportionate total cost before assignment, distinguishing predictions from measured benefit without delaying urgent correctness or integrity handling
+
+#### Scenario: A comparison finds that observation has no net benefit
+- **WHEN** comparable work with observation costs more or finishes later without sufficient benefit
+- **THEN** the result remains adverse or inconclusive as supported by the evidence, with costs from no-finding batches and unsuccessful investigations included; any claim of long-term payback requires observed relevant reuse rather than hypothetical unlimited repetition
+
+#### Scenario: The observer's own experiment is not qualified
+- **WHEN** attributable baseline evidence, frozen task/control identities, meaningful outcome thresholds or stopping conditions are missing
+- **THEN** dependent observer implementation/evaluation is held, and formal planning validity or a working transport cannot substitute for that evidence
+
+#### Scenario: The observer treatment fails its declared benefit gate
+- **WHEN** the complete matched comparison rejects the observer or remains inconclusive
+- **THEN** the observer candidate is excluded from accepted source and active installation, the prior accepted behavior is restored and verified, and its inactive patch, measurements and reason remain available without favorable-result retries
 
 ### Requirement: Observation recovery preserves ownership and progress
 

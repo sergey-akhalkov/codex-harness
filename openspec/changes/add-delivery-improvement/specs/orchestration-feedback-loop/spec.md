@@ -15,7 +15,7 @@ Lead and executor feedback about the work, the orchestration, instructions, tool
 - **THEN** it records its own feedback task for triage rather than steering every session individually with duplicated context
 
 #### Scenario: An enabled observer finds actionable friction
-- **WHEN** the designated improvement session diagnoses an attributable problem from new lead or executor evidence
+- **WHEN** the designated improvement session diagnoses an attributable problem from new visible exchanges, relevant board changes or requested code and check evidence
 - **THEN** it records or updates the bounded board item and submits it for the lead's next safe decision boundary without requiring the original reporter to repeat the observation
 
 ### Requirement: Observations are routed by kind
@@ -119,3 +119,7 @@ While `delivery-improvement` is active, the lead SHALL be able to admit a bounde
 #### Scenario: A historical item becomes relevant now
 - **WHEN** an existing incubator item has sufficient current evidence and falls within the active mandate
 - **THEN** the lead can admit that same item through the verified path while preserving its vote history and prior decisions
+
+#### Scenario: Ordinary optimization has an uncertain opportunity to repay
+- **WHEN** a proposed optimization lacks credible relevant reuse or its expected benefit does not justify investigation, implementation, verification and displaced delivery
+- **THEN** the lead records a bounded rejection or deferral on the existing item rather than assigning work merely to justify the observer; urgent correctness and integrity work retains its existing consequence path
