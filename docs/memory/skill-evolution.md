@@ -7,6 +7,26 @@ The closed change is
 [archived](../../openspec/changes/archive/2026-09-19-autonomous-skill-evolution/tasks.md).
 Private evidence roots stay outside Git.
 
+## Role context comparison
+
+The role-separation comparison used a reconstructed pre-partition baseline and
+the delivered candidate, with the same frozen real-code defect, checks and
+three cases: implementation, returned correction and scope-boundary escalation.
+Both visible `ds` sessions produced the same checked artifact and preserved the
+scope refusal. Source accounting includes complete selected skill bodies,
+local-reference upper bounds and actual briefs; omitted skill/reference reads
+are not savings. The lead's already injected common text is counted once.
+
+This supports the measured reduction in required source guidance for those
+cases. An operational improvement remains unestablished: recovery and Rust/cache
+preparation differed, lead scheduling affected accepted-result time, the task
+history exposed the prior fix, and the candidate's output increased despite
+lower aggregate provider counters. Full workflow adherence is not proven by
+passing artifact checks. Keep the preserved failures and complete experiment
+cost in the private comparison owner; do not transfer this result to another
+skill, promise quota savings, or use it to admit an independent optimization.
+Future comparisons need prospective inputs and equivalent resource preparation.
+
 ## Pilot (task 0.1)
 
 - Owned skill: `project-verification` (existing kit skill with native checks).

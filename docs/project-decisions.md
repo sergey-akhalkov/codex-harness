@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-10-13**.
+Last updated: **2026-10-16**.
 
 ## Public pack
 
@@ -251,6 +251,23 @@ no longer used and no fallback routes to them. This supersedes the earlier
 default routing of executors and succession to external subscriptions. Effort
 names are model-specific; do not promise unsupported combinations or silently
 substitute.
+
+**2026-10-15, reaffirmed:** executor dispatch uses only `ds`; neither xAI nor
+Z.AI profiles or models may be used as an alternative or fallback. Native
+acceptance fixtures use the supported model names too, so test output cannot
+suggest that a retired provider was invoked. A local canned transport remains
+distinct from actual model execution.
+
+**2026-10-16, verified delivery:** shared principles, role fragments and skill
+membership have separate declared owners in `global/roles.toml`. Ordinary
+sessions use the lead context and managed executors use the executor context.
+Saved-session resume keeps its original developer text while the live skill
+catalogue refreshes; a fresh restart adopts the new role revision. Required-load
+accounting includes invoked bodies, required references and generated briefs,
+so moving text is not a saving. The bounded comparison supports source-load
+reduction and the exercised artifact checks, but establishes no causal delivery
+time or quota improvement; see the [calibration record](memory/skill-evolution.md#role-context-comparison).
+No independent optimization is admitted from prompt size alone.
 
 Every active conversation needs its own visible terminal surface with a
 distinct title: lead, workers and any model-backed helpers. Show assignment,
@@ -788,6 +805,19 @@ implementation, remeasurement and the final decision with verified adoption or
 restoration. Existing routine observations can seed the investigation; complete
 validated artifacts and frozen experiment acceptance precede candidate edits.
 An ordinary evaluation workload does not need an artificial second hypothesis.
+
+**2026-10-15, confirmed:** improvement work follows collected data, analysis
+and a falsifiable hypothesis, a predeclared solution/experiment, implementation,
+and practical verification of the predicted effect. Planning validity, a passing
+functional test or a completed task alone is not evidence of improvement. Bind
+the baseline and candidate to attributable inputs and concrete outcome metrics
+where applicable; missing evidence leaves the hypothesis unqualified. Rejected
+or inconclusive candidate code must not remain in accepted source or active
+installations. Remove or revert that candidate's introduced effects through the
+existing recovery owners, verify restored behavior and preserve the comparison
+evidence and recoverable patch outside accepted delivery. This is scoped cleanup
+of the experiment, not permission to delete unrelated accepted capabilities or
+erase failed results. Existing quality and informed-removal constraints remain.
 
 Within established run authority, the loop chooses and executes these phases
 autonomously, retaining supported candidates, restoring the accepted runtime
