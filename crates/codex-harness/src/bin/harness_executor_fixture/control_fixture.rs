@@ -20,6 +20,13 @@
 //!
 //! Mode switches (all optional, all explicit):
 //! - `HARNESS_IMPROVEMENT_FIXTURE_SESSION`: the thread identity to serve;
+//! - `HARNESS_IMPROVEMENT_FIXTURE_CONTROL`: what the controlled agent does
+//!   once the host submitted its assignment: `complete` (default) finishes the
+//!   turn, `hold` keeps the turn open without ever completing it so the real
+//!   stop owner can interrupt and end this run, and `fail` ends this child
+//!   with a nonzero exit code before any completion. With
+//!   `HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER` the child records the
+//!   assignment it observed before `hold` or `fail` takes effect;
 //! - `HARNESS_IMPROVEMENT_FIXTURE_MODEL` / `..._EFFORT`: override the model and
 //!   reasoning effort recorded in the native rollout (the wrong-observation
 //!   counterexamples); the default echoes the arm's installed configuration;
@@ -163,6 +170,33 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             let until = Instant::now() + Duration::from_secs(120);
             while Instant::now() < until {
                 if !server.requests_for("turn/start").is_empty() {
+                    let control = control_mode();
+                    if control != "complete" {
+                        record_control_marker(&session, &control);
+                    }
+                    if control == "hold" {
+                        // The submitted turn stays open: the thread record
+                        // names it as the active turn, so the real stop owner
+                        // addresses its interruption through it, and no
+                        // completion is ever pushed - the run stays live until
+                        // its own owner ends it.
+                        server.answer(
+                            "thread/read",
+                            Answer::Result(json!({"thread": {
+                                "id": session.clone(),
+                                "turns": [{"id": TURN, "status": "inProgress", "items": []}],
+                            }})),
+                        );
+                        server.answer("turn/interrupt", Answer::Result(json!({})));
+                        return;
+                    }
+                    if control == "fail" {
+                        // A failing child: the host observes the closed
+                        // connection and records the failure outcome while the
+                        // slot, the binding and the partial work stay.
+                        thread::sleep(Duration::from_millis(250));
+                        std::process::exit(9);
+                    }
                     // The thread is no longer fresh: the compatibility route
                     // reads it only here, while a native frontend read the
                     // empty thread before this assignment was submitted.
@@ -265,6 +299,32 @@ fn record_child(path: PathBuf) -> io::Result<()> {
         serde_json::to_vec_pretty(&record).map_err(io::Error::other)?,
     )?;
     Ok(())
+}
+
+/// The controlled behavior of this child once the host submitted its
+/// assignment; the default completes the turn exactly as before.
+fn control_mode() -> String {
+    env::var("HARNESS_IMPROVEMENT_FIXTURE_CONTROL").unwrap_or_else(|_| "complete".into())
+}
+
+/// Records the assignment this child observed, when the caller named a marker
+/// path, so a model-free check waits for the child's own observation of the
+/// `hold` or `fail` mode instead of guessing from process timing.
+fn record_control_marker(session: &str, control: &str) {
+    let Some(path) = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let record = json!({
+        "schema": 1,
+        "control": control,
+        "session": session,
+        "turn": TURN,
+    });
+    let _ = fs::write(path, record.to_string());
 }
 
 /// The installed client route of this arm home: the explicit configuration the

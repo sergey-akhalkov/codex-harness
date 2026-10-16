@@ -539,6 +539,14 @@ pub struct ControlPlan {
     /// capability and must not be mistaken for an executor by the launcher or
     /// by the kit's own nested-dispatch refusal.
     pub executor_session: bool,
+    /// Whether this plan serves a bounded lead conversation. A bounded lead
+    /// keeps the lead role, the configured lead profile and the ordinary
+    /// source/check tools, but the single-agent override applies exactly as it
+    /// does for an executor: the bounded participant returns decisions to the
+    /// lead that dispatched it instead of starting further model
+    /// conversations. Its own session marker, never the executor one, makes
+    /// the kit's dispatch entries refuse inside its process tree.
+    pub bounded_lead_session: bool,
     /// Bound for readiness and for every request's answer.
     pub bound: Duration,
     /// Record-read timeout of one pump step.
@@ -569,6 +577,7 @@ impl ControlPlan {
             port: None,
             env: BTreeMap::new(),
             executor_session: true,
+            bounded_lead_session: false,
             bound: DEFAULT_BOUND,
             poll: DEFAULT_POLL,
         }
@@ -578,9 +587,11 @@ impl ControlPlan {
 /// The `codex app-server` command one control session spawns: the loopback
 /// listener, the capability-token file, the caller's extra arguments, the bound
 /// slot as working directory, and - for an executor conversation - the executor
-/// session environment and the agent-tool override. A managed lead session gets
-/// neither, because the lead keeps the native agent capability. The parent's
-/// session and thread id are removed in both cases, so the child cannot attach
+/// session environment. The agent-tool override reaches executor and bounded
+/// lead conversations alike; a bounded lead conversation carries its own
+/// session marker instead of the executor one, and a managed lead session gets
+/// neither because the lead keeps the native agent capability. The parent's
+/// session and thread id are removed in every case, so the child cannot attach
 /// to a conversation it does not serve.
 pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
     let mut command = CommandSpec::new(&plan.launcher);
@@ -628,9 +639,12 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         OsString::from("--ws-token-file"),
         plan.paths.token.clone().into_os_string(),
     ];
-    if plan.executor_session {
+    if plan.executor_session || plan.bounded_lead_session {
         // A managed lead session keeps the native agent capability: neither
         // this override nor the session marker reaches its app-server child.
+        // A bounded lead conversation is a bounded decision participant, not
+        // another dispatch owner, so its native agent tools stay off while its
+        // role, profile and source/check tools stay exactly as resolved.
         args.extend(EXECUTOR_AGENT_TOOLS_OFF.map(OsString::from));
     }
     args.extend(plan.args.iter().cloned());

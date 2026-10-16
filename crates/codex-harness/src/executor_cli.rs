@@ -131,14 +131,17 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("spawn") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             spawn(&args[1..])
         }
         Some("resume") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             resume(&args[1..])
         }
         Some("restart") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             continue_slot(&args[1..], true, Role::Executor)
         }
         Some("watch") => watch(&args[1..]),
@@ -155,10 +158,12 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         Some("assignment") => assignment_check(&args[1..]),
         Some("run") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             run_exec(&args[1..])
         }
         Some("succeed") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             succeed(&args[1..])
         }
         _ => Err(invalid("invalid native executor options")),
@@ -186,7 +191,10 @@ codex-harness lead dispatch --source CHECKOUT --codex-home DIRECTORY --owner LAB
   Dispatch one fresh bounded visible lead conversation: the configured lead profile
   (global/orchestration.toml lead_profile), the lead role composition, the managed
   native frontend and a pooled slot with its own receipt, observation and terminal.
-  The owner label names this conversation for later resume and stop.
+  The owner label names this conversation for later resume and stop. The conversation
+  is bounded: native agent tools stay off and the kit's dispatch entries refuse inside
+  it, so it returns decisions to the lead that dispatched it instead of starting
+  another model conversation.
 codex-harness lead resume --source CHECKOUT --codex-home DIRECTORY --owner LABEL --slot N [--session THREAD_ID] (--exec PROMPT | --assignment FILE)
   Continue the exact recorded lead conversation on its slot without resetting its
   checkout: --session names the thread, or the slot's receipt records it. A receipt
@@ -244,18 +252,35 @@ fn refuse_lead_hosting(marker: Option<OsString>) -> io::Result<()> {
 
 /// The environment marker a bounded lead conversation sets on the process
 /// tree it hosts. The conversation is a bounded decision participant, not
-/// another dispatch owner: it may dispatch executors like any lead, but it can
-/// never host or dispatch a further lead conversation.
+/// another dispatch owner: it never starts a further model conversation, so
+/// the dispatch entries and the internal dispatch paths refuse here while the
+/// participant returns its decisions to the lead that dispatched it.
 const BOUNDED_LEAD_SESSION_ENV: &str = "HARNESS_BOUNDED_LEAD_SESSION";
 
 /// A bounded lead conversation never spawns another lead conversation: its
 /// own tools carry the marker, so nested hosting or dispatch is refused here
-/// before any slot, process or model request, while `executor spawn` stays
-/// available exactly as the ordinary workflow needs it.
+/// before any slot, process or model request.
 fn refuse_bounded_lead_recursion(marker: Option<OsString>) -> io::Result<()> {
     if marker.is_some() {
         return Err(invalid(
             "bounded lead conversations cannot host or dispatch another lead conversation: this process runs inside one (HARNESS_BOUNDED_LEAD_SESSION is set); return the decision to the lead that dispatched this conversation instead of creating another lead",
+        ));
+    }
+    Ok(())
+}
+
+/// A bounded lead conversation is a bounded decision participant, not another
+/// dispatch owner: it never starts a further model conversation through the
+/// dispatch entries or through the internal dispatch paths. Its own tools
+/// carry the marker, so executor dispatch, executor continuation and receipt
+/// hosting are refused here before any slot, process or model request, and the
+/// refusal names the channel back to the lead that dispatched the
+/// conversation. Ordinary executor work from the lead that dispatched it, and
+/// from a managed lead session, is untouched.
+fn refuse_bounded_lead_dispatch(marker: Option<OsString>) -> io::Result<()> {
+    if marker.is_some() {
+        return Err(invalid(
+            "bounded lead conversations cannot dispatch executors or host another model conversation: this process runs inside one (HARNESS_BOUNDED_LEAD_SESSION is set); return the decision to the lead that dispatched this conversation instead of starting another conversation",
         ));
     }
     Ok(())
@@ -1774,6 +1799,7 @@ pub(crate) fn dispatch_visible_conversation(
     request: &VisibleConversation,
 ) -> io::Result<VisibleAccepted> {
     refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+    refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
     if !request.source.is_absolute() || !request.codex_home.is_absolute() {
         return Err(invalid(
             "visible conversation source and codex home must be absolute paths",
@@ -1849,6 +1875,7 @@ pub(crate) fn dispatch_visible_lead_conversation(
     request: &VisibleLeadConversation,
 ) -> io::Result<VisibleAccepted> {
     refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+    refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
     if !request.source.is_absolute() || !request.codex_home.is_absolute() {
         return Err(invalid(
             "bounded lead source and codex home must be absolute paths",
@@ -4283,16 +4310,11 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
         fs::read(path).map_err(|error| invalid(&format!("executor run receipt: {error}")))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| invalid(&format!("executor run receipt JSON: {error}")))?;
-    // A bounded lead conversation never hosts a further lead conversation:
-    // hosting is another entry into the lead role, and a process that already
-    // runs inside one (a shell of the bounded lead carries its marker) must
-    // return the decision to the lead that dispatched the conversation
-    // instead of creating a peer of its own. This precedes the shell
-    // preflight, the lease and any app-server child. Executor receipts stay
-    // hostable, exactly as the ordinary workflow needs them.
-    if role_from_receipt(&value)?.is_some_and(|role| role.role == Role::Lead.label()) {
-        refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
-    }
+    // The dispatch entry refuses `executor run` inside a bounded lead
+    // conversation before parsing reaches this host, so a bounded lead never
+    // hosts a further conversation of any role here; it returns the decision
+    // to the lead that dispatched it instead. Hosting a lead-role receipt from
+    // a managed lead session stays an ordinary continuation.
     let launcher = value
         .get("launcher")
         .and_then(serde_json::Value::as_str)
@@ -4546,8 +4568,9 @@ const FRONTEND_TAIL_GRACE: Duration = Duration::from_secs(5);
 /// `turn/start`, every control record is rendered on this surface while the
 /// bounded detail file and the receipt's lifecycle stay current, and the
 /// thread's own items supply the exact session identity and the final message.
-/// A receipt recorded for the lead role hosts a bounded lead conversation with
-/// the native agent capability instead of the executor single-agent shape.
+/// A receipt recorded for the lead role hosts a bounded lead conversation: the
+/// lead role, profile and settings with the single-agent suppression instead
+/// of the executor session marker.
 ///
 /// Fail-closed: a startup or binding failure is recorded as a failed state
 /// with its cause and fails this host. The receipt records no `codex exec`
@@ -4596,10 +4619,11 @@ fn run_control_receipt(
     };
     let profile = value["profile"].as_str().unwrap_or("default");
     // The recorded role selects the hosted conversation's identity. A receipt
-    // recorded for the lead role hosts a bounded lead conversation: the native
-    // agent capability, no executor session marker and the lead frontend
-    // shape, with the title the dispatching side already published. An
-    // executor or legacy receipt keeps exactly the executor lifecycle.
+    // recorded for the lead role hosts a bounded lead conversation: the lead
+    // role, profile and tools with the single-agent suppression, its own
+    // bounded-lead marker instead of the executor session marker and the lead
+    // frontend shape, with the title the dispatching side already published.
+    // An executor or legacy receipt keeps exactly the executor lifecycle.
     let recorded_role = role_from_receipt(value)?;
     let hosted_role = match &recorded_role {
         Some(role) if role.role == Role::Lead.label() => Role::Lead,
@@ -4652,10 +4676,12 @@ fn run_control_receipt(
     }
     // An executor conversation is marked with the executor session environment
     // and runs the single-agent override; a bounded lead conversation keeps
-    // the native agent capability and is marked as such, so its own tools can
-    // refuse a nested lead conversation while `executor spawn` stays exactly
-    // as available as the ordinary workflow needs it.
+    // the lead role, the configured lead profile and the ordinary tools but is
+    // a bounded decision participant: it runs the same single-agent override
+    // and carries its own bounded-lead marker, so its tools can neither
+    // dispatch further model conversations nor host another lead conversation.
     plan.executor_session = hosted_role == Role::Executor;
+    plan.bounded_lead_session = hosted_role == Role::Lead;
     if hosted_role == Role::Lead {
         plan.env
             .insert(BOUNDED_LEAD_SESSION_ENV.into(), Some("1".into()));
@@ -4718,21 +4744,26 @@ struct OwnedFrontend {
 }
 
 /// How an owned native frontend relates to the conversation it presents. An
-/// executor surface stays single-agent; a managed lead session keeps the native
-/// agent capability of the interactive CLI it hosts.
+/// executor surface stays single-agent, a bounded lead conversation is a
+/// bounded decision participant whose frontend carries the same single-agent
+/// suppression, and a managed lead session keeps the native agent capability
+/// of the interactive CLI it hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrontendRole {
     Executor,
+    BoundedLead,
     Lead,
 }
 
 impl FrontendRole {
     /// What this host reports as unfinished when the frontend cannot be
-    /// attached: an executor dispatch has not submitted its assignment, and a
-    /// lead session has not exposed a conversation.
+    /// attached: an executor dispatch has not submitted its assignment, a
+    /// bounded lead conversation has not exposed its conversation, and a
+    /// managed lead session has not exposed one either.
     fn unfinished(self) -> &'static str {
         match self {
             Self::Executor => "The assignment was not submitted",
+            Self::BoundedLead => "No bounded lead conversation was exposed",
             Self::Lead => "No lead session was exposed",
         }
     }
@@ -4900,8 +4931,10 @@ fn fail_with_frontend(
 /// token stays in the environment. Permission overrides stay on the backend;
 /// remote resume rejects them. The assignment is not an argument, so the
 /// frontend cannot submit it. Explicit exec adds `--no-alt-screen` so the
-/// native inline TUI keeps the text/scrollback contract. Both spellings pin
-/// `agents.enabled=false`; that config override is not a permission override.
+/// native inline TUI keeps the text/scrollback contract. Executor and bounded
+/// lead frontends pin `agents.enabled=false`; the managed lead's own frontend
+/// keeps the native agent capability. That config override is not a permission
+/// override.
 fn attach_owned_frontend(
     plan: &ControlPlan,
     conversation: &Conversation,
@@ -4932,8 +4965,10 @@ fn attach_owned_frontend(
     // Only the native frontend's own connection is relayed: the recorded
     // endpoint that `executor message` and `executor stop` address, and this
     // host's control connection, keep addressing the app-server child itself.
-    // A managed lead session runs no cache-guard diagnostics, so its
-    // interactive surface stays on the recorded address.
+    // An executor conversation owns the warning surface of its cache guard; a
+    // lead-role conversation - managed or bounded - records that delivery
+    // through the honest no-consumer surface instead, so its interactive
+    // surface stays on the recorded address.
     let relay = match role {
         FrontendRole::Executor => Some(
             Relay::start(
@@ -4948,7 +4983,7 @@ fn attach_owned_frontend(
                 ))
             })?,
         ),
-        FrontendRole::Lead => None,
+        FrontendRole::BoundedLead | FrontendRole::Lead => None,
     };
     let frontend_port = relay
         .as_ref()
@@ -4974,8 +5009,8 @@ fn attach_owned_frontend(
     for name in INHERITED_SESSION_ENV {
         spec.env.insert((*name).into(), None);
     }
-    if role == FrontendRole::Lead {
-        // The lead's own session must not inherit an executor marker: its
+    if matches!(role, FrontendRole::Lead | FrontendRole::BoundedLead) {
+        // A lead-role frontend must not inherit an executor marker: its
         // app-server has none, and a frontend that carried one would make the
         // lead's own nested CLI invocations look like executor sessions. An
         // executor frontend keeps the marker it was started with.
@@ -5024,7 +5059,10 @@ fn frontend_args(
         "-c".into(),
         "features.worktrees=false".into(),
     ];
-    if role == FrontendRole::Executor {
+    if matches!(role, FrontendRole::Executor | FrontendRole::BoundedLead) {
+        // Every frontend but the managed lead's own keeps the native agent
+        // capability off: an executor or bounded lead conversation must not
+        // re-expose the child-spawn tools through its own configuration.
         args.push("-c".into());
         args.push("agents.enabled=false".into());
     }
@@ -5234,11 +5272,14 @@ fn host_control_conversation(
                 Some(job),
             );
         }
-        // The bounded lead conversation keeps the native agent capability: its
-        // frontend runs without the executor marker, without the single-agent
-        // suppression and without the executor warning relay.
+        // A bounded lead conversation is a bounded decision participant: its
+        // frontend carries the same single-agent suppression as an executor's
+        // and never the executor marker, while a managed lead session keeps
+        // the native agent capability of the interactive CLI it hosts.
         let frontend_role = if plan.executor_session {
             FrontendRole::Executor
+        } else if plan.bounded_lead_session {
+            FrontendRole::BoundedLead
         } else {
             FrontendRole::Lead
         };
@@ -7511,16 +7552,20 @@ fn invalid(message: &str) -> io::Error {
 mod tests {
     use super::*;
 
-    /// Managed lead and executor frontends are remote TUI processes whose
-    /// conversation is served by the harness's app-server child. Both roles
-    /// carry the managed `features.worktrees=false` default in the frontend's
-    /// own configuration before the resume subcommand, which keeps the thread
-    /// id as its only positional; the pair stays scoped to this process, so
-    /// the selected profile is never shadowed here.
+    /// Managed lead, bounded lead and executor frontends are remote TUI
+    /// processes whose conversation is served by the harness's app-server
+    /// child. Every role carries the managed `features.worktrees=false` default
+    /// in the frontend's own configuration before the resume subcommand, which
+    /// keeps the thread id as its only positional; the pair stays scoped to
+    /// this process, so the selected profile is never shadowed here.
     #[test]
     fn managed_frontends_suppress_the_native_worktree_tool_surface() {
         let pair = ["-c", "features.worktrees=false"];
-        for role in [FrontendRole::Executor, FrontendRole::Lead] {
+        for role in [
+            FrontendRole::Executor,
+            FrontendRole::BoundedLead,
+            FrontendRole::Lead,
+        ] {
             let args = frontend_args(1, "thread-1", NativePresentation::NativeInline, role);
             assert!(
                 args.iter().any(|arg| arg == "--remote"),
@@ -7677,16 +7722,22 @@ mod tests {
             "an owner mismatch is not adopted at the deadline"
         );
 
+        // The dead-run premise is an inspectable identity, not an assumed-free
+        // pid: this very test process is live, so it opens for inspection, and
+        // the deliberately mismatched creation time is the reused-pid case the
+        // recorded identity must reject. An arbitrary pid could name another
+        // user's process and be conservatively treated as still running.
+        let live = observation::host_identity().unwrap();
         let mut dead = waiting.clone();
         dead["observation"]["host"] = json!({
-            "pid": 4242,
-            "created": 1,
-            "program": root.path().join("absent-host.exe").to_string_lossy()
+            "pid": live.pid,
+            "created": live.created + 1,
+            "program": live.program
         });
         fs::write(&receipt, serde_json::to_vec_pretty(&dead).unwrap()).unwrap();
         assert!(
             waiting_at_deadline(&receipt, None).is_none(),
-            "a dead run is not waiting"
+            "a run whose recorded host identity no longer exists is not waiting"
         );
     }
 
@@ -7937,9 +7988,9 @@ mod tests {
         assert!(message.contains("lead message"), "{message}");
     }
 
-    /// A bounded lead conversation may dispatch executors like any lead, but
-    /// it never hosts or dispatches another lead conversation: its own marker
-    /// refuses nesting before any slot, process or model request.
+    /// A bounded lead conversation never hosts or dispatches another lead
+    /// conversation: its own marker refuses the lead entries before any slot,
+    /// process or model request.
     #[test]
     fn a_bounded_lead_conversation_never_creates_another_lead() {
         refuse_bounded_lead_recursion(None).unwrap();
@@ -7958,9 +8009,35 @@ mod tests {
         );
     }
 
-    /// The one asymmetry the lead's own session needs: it keeps the native
-    /// agent capability and the native settings, while an executor
-    /// conversation stays marked and single-agent.
+    /// A bounded lead conversation never starts a further model conversation
+    /// through the executor entries either: dispatch, continuation and receipt
+    /// hosting refuse before any slot, launcher or model request, and the
+    /// refusal names the channel back to the dispatching lead. Ordinary
+    /// executors and managed lead sessions carry no such marker and stay
+    /// untouched.
+    #[test]
+    fn a_bounded_lead_conversation_never_dispatches_further_conversations() {
+        refuse_bounded_lead_dispatch(None).unwrap();
+        let error = refuse_bounded_lead_dispatch(Some("1".into())).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "bounded lead conversations cannot dispatch executors or host another model conversation"
+            ),
+            "{message}"
+        );
+        assert!(message.contains(BOUNDED_LEAD_SESSION_ENV), "{message}");
+        assert!(
+            message.contains("return the decision to the lead that dispatched this conversation"),
+            "{message}"
+        );
+    }
+
+    /// The one asymmetry the lead's own session needs: a managed lead session
+    /// keeps the native agent capability and the native settings, while an
+    /// executor conversation stays marked and single-agent and a bounded lead
+    /// conversation keeps the lead identity with its own marker and the same
+    /// single-agent suppression.
     #[test]
     fn a_lead_session_is_not_an_executor_session() {
         let home = PathBuf::from(r"C:\harness-home");
@@ -7988,12 +8065,26 @@ mod tests {
             &home,
             &slot,
             lead_title("default", &slot),
-            identity,
+            identity.clone(),
             ControlPaths::for_lead_host(&home, 4242),
         );
         lead.executor_session = false;
+        let mut bounded = ControlPlan::new(
+            Path::new("codex.exe"),
+            &home,
+            &slot,
+            lead_title("default", &slot),
+            identity,
+            ControlPaths::for_lead_host(&home, 4242),
+        );
+        bounded.executor_session = false;
+        bounded.bounded_lead_session = true;
+        bounded
+            .env
+            .insert(BOUNDED_LEAD_SESSION_ENV.into(), Some("1".into()));
         let executor_spec = control::app_server_spec(&executor, 51234);
         let lead_spec = control::app_server_spec(&lead, 51235);
+        let bounded_spec = control::app_server_spec(&bounded, 51236);
         let args = |spec: &harness_core::process::CommandSpec| {
             spec.args
                 .iter()
@@ -8014,6 +8105,13 @@ mod tests {
             "{:?}",
             args(&lead_spec)
         );
+        assert!(
+            args(&bounded_spec)
+                .windows(2)
+                .any(|pair| pair == ["-c", "agents.enabled=false"]),
+            "a bounded lead conversation runs the single-agent suppression: {:?}",
+            args(&bounded_spec)
+        );
         assert_eq!(
             executor_spec
                 .env
@@ -8026,7 +8124,22 @@ mod tests {
                 .get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
             None
         );
-        for spec in [&executor_spec, &lead_spec] {
+        // The bounded lead's own marker reaches its app-server child and the
+        // executor marker does not: the child's tools refuse further model
+        // conversations without ever looking like an executor session.
+        assert_eq!(
+            bounded_spec
+                .env
+                .get(std::ffi::OsStr::new(BOUNDED_LEAD_SESSION_ENV)),
+            Some(&Some(OsString::from("1")))
+        );
+        assert_eq!(
+            bounded_spec
+                .env
+                .get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
+            None
+        );
+        for spec in [&executor_spec, &lead_spec, &bounded_spec] {
             // Neither child inherits a session identity that is not its own,
             // and both run in the checkout they serve.
             assert_eq!(
@@ -8057,6 +8170,20 @@ mod tests {
         );
         assert!(lead_frontend.iter().any(|arg| arg == "--remote"));
         assert_eq!(lead_frontend.last().unwrap(), "thread-1");
+        let bounded_frontend = frontend_args(
+            9,
+            "thread-1",
+            NativePresentation::NativeTui,
+            FrontendRole::BoundedLead,
+        );
+        assert!(
+            bounded_frontend
+                .iter()
+                .any(|arg| arg == "agents.enabled=false"),
+            "a bounded lead frontend runs the single-agent suppression: {bounded_frontend:?}"
+        );
+        assert!(bounded_frontend.iter().any(|arg| arg == "--remote"));
+        assert_eq!(bounded_frontend.last().unwrap(), "thread-1");
         assert!(
             frontend_args(
                 9,

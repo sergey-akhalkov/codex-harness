@@ -4,7 +4,8 @@
 //! subscription work stays opt-in.
 #![cfg(windows)]
 
-use harness_core::process::{SHARED_CPU_PERCENT, SharedCpuBudget};
+use harness_core::process::{ProcessIdentity, SHARED_CPU_PERCENT, SharedCpuBudget};
+use harness_core::process_service::{self, ServiceProcess};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -13,7 +14,8 @@ use std::{
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
@@ -1011,8 +1013,9 @@ fn a_bounded_lead_conversation_dispatches_resumes_and_refuses_role_conversion() 
     );
 
     // The app-server child itself reports the effective role context: the
-    // lead composition, no executor session marker, and the native agent
-    // capability the lead keeps.
+    // lead composition, no executor session marker, and the single-agent
+    // suppression that keeps the bounded conversation from starting further
+    // model work through its own configuration.
     let child: Value = serde_json::from_slice(&fs::read(&child_record).unwrap()).unwrap();
     assert_eq!(child["contextRole"], "lead", "{child}");
     assert!(
@@ -1032,8 +1035,8 @@ fn a_bounded_lead_conversation_dispatches_resumes_and_refuses_role_conversion() 
         .collect::<Vec<_>>();
     assert!(argv.contains(&"app-server"), "{child}");
     assert!(
-        !argv.contains(&"agents.enabled=false"),
-        "a bounded lead keeps the native agent capability: {child}"
+        argv.contains(&"agents.enabled=false"),
+        "a bounded lead runs the single-agent suppression: {child}"
     );
 
     // The dispatch receipt carries the lead composition, the lead-rendered
@@ -1208,6 +1211,330 @@ fn a_bounded_lead_conversation_dispatches_resumes_and_refuses_role_conversion() 
         recorded["control"]["role"]["role"], "executor",
         "{recorded}"
     );
+    fixture.drop();
+}
+
+/// One live bounded lead dispatch this check acts on while it still runs,
+/// together with the kit state its own run recorded.
+struct LiveLead {
+    process: Child,
+    /// The dispatch receipt the run's own host keeps current.
+    receipt: PathBuf,
+    /// The recorded control endpoint that addresses this run: port, thread and
+    /// the app-server child's exact process identity.
+    endpoint: Value,
+}
+
+/// Starts one bounded lead dispatch whose app-server child follows the named
+/// control mode and waits until the run is live and addressable: the receipt
+/// names this exact session and the host process, the slot's endpoint record
+/// names the app-server child, and the child itself recorded the assignment it
+/// observed. Every wait reads the run's own records, never a timing guess.
+fn dispatch_live_bounded_lead(owner: &str, session: &str, control: &str) -> (Fixture, LiveLead) {
+    let fixture = Fixture::new(&format!("bounded-lead-{control}"), 1);
+    install_launcher(
+        &fixture.home,
+        Path::new(env!("CARGO_BIN_EXE_harness-executor-fixture")),
+    );
+    fs::write(
+        fixture.home.join("config.toml"),
+        "model = 'lead-model'\nmodel_provider = 'lead-provider'\nmodel_reasoning_effort = 'xhigh'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let kit = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &kit);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+    let assignment = fixture.root.join("lead-assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document(
+            "Hold the bounded lead conversation",
+            &["README.md"],
+            &["out/lead-note.txt"],
+        ),
+    )
+    .unwrap();
+    let control_marker = fixture.root.join("control-marker.json");
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "dispatch",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--owner",
+        owner,
+        "--assignment",
+        assignment.to_str().unwrap(),
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_CONTROL", control);
+    command.env(
+        "HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER",
+        &control_marker,
+    );
+    command.env_remove("WT_SESSION");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let process = command.spawn().unwrap();
+
+    let state = wait_pooled_state_dir(&fixture.home);
+    let receipt = state.join("spawn-1.json");
+    wait_json(&receipt, "the dispatch receipt", |value| {
+        value["observation"]["session"].as_str() == Some(session)
+            && value["observation"]["host"]["pid"].as_u64().is_some()
+    });
+    let endpoint = wait_json(
+        &state.join("endpoint-1.json"),
+        "the control endpoint record",
+        |value| {
+            value["threadId"].as_str() == Some(session)
+                && value["process"]["pid"].as_u64().is_some()
+        },
+    );
+    wait_json(&control_marker, "the child's assignment marker", |value| {
+        value["session"].as_str() == Some(session)
+    });
+    (
+        fixture,
+        LiveLead {
+            process,
+            receipt,
+            endpoint,
+        },
+    )
+}
+
+/// Writes the partial work a stop or a failure must never touch: one tracked
+/// edit and one untracked file, exactly as an interrupted session leaves them.
+fn write_partial_work(slot: &Path) -> PathBuf {
+    fs::write(slot.join("partial-work.txt"), "partial work\n").unwrap();
+    let readme = slot.join("README.md");
+    let mut edited = fs::read_to_string(&readme).unwrap();
+    edited.push_str("carried partial edit\n");
+    fs::write(&readme, edited).unwrap();
+    readme
+}
+
+/// Asserts the recorded app-server child is gone within the bound, by its
+/// exact recorded identity (pid, creation time and image), never by pid alone.
+fn wait_child_gone(endpoint: &Value, label: &str) {
+    let user = process_service::current_user().unwrap();
+    let child = ProcessIdentity {
+        pid: endpoint["process"]["pid"].as_u64().unwrap() as u32,
+        creation_time: endpoint["process"]["creationTime"].as_u64().unwrap(),
+    };
+    let program = PathBuf::from(endpoint["process"]["program"].as_str().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match ServiceProcess::inspect(child, &program, &user) {
+            Ok(None) => return,
+            Ok(Some(_)) => assert!(
+                Instant::now() < deadline,
+                "{label} {child:?} is still running"
+            ),
+            Err(error) => panic!("{label} {child:?} could not be inspected: {error}"),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded wait for one recorded JSON document to satisfy the predicate; the
+/// returned document is what the check then asserts on.
+fn wait_json(path: &Path, label: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && ready(&value)
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} was not recorded at {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Bounded wait for a spawned dispatch process, so a hung host fails the check
+/// instead of blocking it forever.
+fn wait_child(child: &mut Child, label: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} did not exit within the bound"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The bounded lead's stop path through the real owner: a held bounded lead
+/// conversation is addressed by --source/--slot/--owner and its recorded
+/// session, the native interruption is accepted through the run's own control
+/// endpoint, the recorded host and app-server child are ended and verified
+/// gone by their exact recorded identities, and the receipt keeps the lead
+/// role, the exact recorded host generation and every tracked and untracked
+/// partial file without any reset, release or completion claim.
+#[test]
+fn a_held_bounded_lead_is_stopped_and_preserves_partial_work() {
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let (fixture, mut live) = dispatch_live_bounded_lead("lead-hold-1", session, "hold");
+    let before: Value = serde_json::from_slice(&fs::read(&live.receipt).unwrap()).unwrap();
+
+    let slot = pooled_slot_path(&fixture.home);
+    let readme = write_partial_work(&slot);
+
+    // The real stop owner stops the held run by its recorded identity.
+    let stop = lead_command()
+        .args([
+            "executor",
+            "stop",
+            "--source",
+            fixture.source.to_str().unwrap(),
+            "--codex-home",
+            fixture.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            "lead-hold-1",
+            "--session",
+            session,
+            "--timeout",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    let stop_text = output_text(&stop);
+    assert_eq!(stop.status.code(), Some(0), "{stop_text}");
+    assert!(stop_text.contains(": stopped in "), "{stop_text}");
+    assert!(
+        stop_text.contains("native turn/interrupt accepted through the recorded control endpoint"),
+        "the held run is interrupted through its own control endpoint: {stop_text}"
+    );
+    assert!(
+        stop_text.contains("no reset, clean, release or completion claim"),
+        "{stop_text}"
+    );
+    assert!(
+        stop_text.contains("the recorded console window") && stop_text.contains("closed"),
+        "the owned console surface of the stopped run is verified closed: {stop_text}"
+    );
+
+    // The dispatch entry returns once its stopped run's console host ended.
+    // Its exit is the route's acceptance result, never the conversation's
+    // outcome: an accepted dispatch returns 0 and the receipt below carries
+    // the stopped lifecycle.
+    let status = wait_child(&mut live.process, "the stopped bounded lead dispatch");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an accepted dispatch returns its acceptance result: {status:?}"
+    );
+
+    // The receipt records the verified stop of exactly the generation its own
+    // observation recorded, with the lead identity and binding untouched.
+    let stopped: Value = serde_json::from_slice(&fs::read(&live.receipt).unwrap()).unwrap();
+    assert_eq!(stopped["control"]["role"]["role"], "lead", "{stopped}");
+    assert_eq!(stopped["observation"]["state"], "stopped", "{stopped}");
+    assert_eq!(stopped["observation"]["exitCode"], Value::Null, "{stopped}");
+    assert_eq!(stopped["stop"]["outcome"], "stopped", "{stopped}");
+    assert_eq!(stopped["stop"]["survivors"], json!([]), "{stopped}");
+    assert_eq!(
+        stopped["stop"]["host"], before["observation"]["host"],
+        "the stop addressed the exact recorded host generation: {stopped}"
+    );
+    assert_eq!(stopped["slot"]["owner"], "lead-hold-1", "{stopped}");
+    assert_eq!(
+        fixture.record(1)["state"],
+        "occupied",
+        "a stop releases nothing"
+    );
+
+    // Tracked and untracked partial work survives the stop byte for byte.
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+
+    // No fixture process outlived the stop.
+    wait_child_gone(&live.endpoint, "the stopped run's app-server child");
+    fixture.drop();
+}
+
+/// A bounded lead whose app-server child fails: the real host records the
+/// failure outcome with its own cause, the exact session and lead role stay
+/// recorded, every partial file stays untouched, and no fixture process
+/// outlives the failed run.
+#[test]
+fn a_failed_bounded_lead_child_records_the_failure_and_preserves_partial_work() {
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
+    let (fixture, mut live) = dispatch_live_bounded_lead("lead-fail-1", session, "fail");
+
+    let slot = pooled_slot_path(&fixture.home);
+    let readme = write_partial_work(&slot);
+
+    // The failing child ends the run by itself; the real host records the
+    // failure outcome before its own process ends. The dispatch entry's exit
+    // is its acceptance result, not the conversation's outcome: the receipt
+    // below carries the failure.
+    let status = wait_child(&mut live.process, "the failed bounded lead dispatch");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an accepted dispatch returns its acceptance result: {status:?}"
+    );
+
+    let failed: Value = serde_json::from_slice(&fs::read(&live.receipt).unwrap()).unwrap();
+    assert_eq!(failed["control"]["role"]["role"], "lead", "{failed}");
+    assert_eq!(failed["observation"]["state"], "failed", "{failed}");
+    assert_eq!(failed["observation"]["exitCode"], Value::Null, "{failed}");
+    let cause = failed["observation"]["cause"].as_str().unwrap_or_default();
+    assert!(
+        cause.contains("executor observation failed"),
+        "the recorded cause names the observed failure: {failed}"
+    );
+    assert_eq!(failed["observation"]["session"], session, "{failed}");
+    assert_eq!(failed["slot"]["owner"], "lead-fail-1", "{failed}");
+    assert_eq!(
+        fixture.record(1)["state"],
+        "occupied",
+        "a failure releases nothing"
+    );
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+
+    // The failed run left no orphaned fixture process.
+    wait_child_gone(&live.endpoint, "the failed run's app-server child");
     fixture.drop();
 }
 
@@ -2305,13 +2632,14 @@ fn executor_dispatch_is_refused_inside_an_executor_session() {
     }
 }
 
-/// The bounded lead session marker refuses every further lead entry point
-/// before parsing anything, while leaving executor work available exactly as
-/// the ordinary workflow needs it. A lead-role receipt is refused at the host
-/// entry only inside such a conversation; without the marker the same
-/// receipt proceeds to its ordinary resolution.
+/// The bounded lead session marker refuses every dispatch entry before
+/// parsing anything: the lead entries with the recursion refusal, and both the
+/// executor dispatch entries and the receipt-hosting entry with the dispatch
+/// refusal, so the bounded conversation cannot start or host another model
+/// conversation of any role. Without the marker the same receipt proceeds to
+/// its ordinary resolution, exactly as a managed lead session needs.
 #[test]
-fn a_bounded_lead_marker_refuses_nested_lead_entries_and_keeps_executor_work_available() {
+fn a_bounded_lead_marker_refuses_every_dispatch_entry() {
     let root = std::env::temp_dir().join(format!("executor-bounded-lead-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -2348,30 +2676,35 @@ fn a_bounded_lead_marker_refuses_nested_lead_entries_and_keeps_executor_work_ava
             "{entry:?}: {text}"
         );
     }
-    // The host entry of a lead conversation is refused inside a bounded lead
-    // too: hosting another lead would be a peer of the conversation the
-    // process already runs inside.
-    let text = inside(&["executor", "run", "--file", lead_receipt.to_str().unwrap()]);
-    assert!(
-        text.contains(
-            "bounded lead conversations cannot host or dispatch another lead conversation"
-        ),
-        "{text}"
-    );
-    // The marker takes neither executor dispatch nor an executor receipt's
-    // host entry away: both proceed to their own ordinary resolution.
-    let text = inside(&["executor", "spawn"]);
-    assert!(text.contains("--source"), "{text}");
-    assert!(!text.contains("bounded lead conversations"), "{text}");
-    let text = inside(&[
-        "executor",
-        "run",
-        "--file",
-        executor_receipt.to_str().unwrap(),
-    ]);
-    assert!(text.contains("launcher is missing"), "{text}");
+    // Every executor dispatch entry is refused inside a bounded lead before it
+    // parses anything: dispatch, continuation, succession and the
+    // receipt-hosting entry for receipts of either role. The bounded
+    // participant starts no further model conversation; it returns its
+    // decision to the lead that dispatched it.
+    for entry in [
+        vec!["executor", "spawn"],
+        vec!["executor", "resume"],
+        vec!["executor", "restart"],
+        vec!["executor", "succeed"],
+        vec![
+            "executor",
+            "run",
+            "--file",
+            executor_receipt.to_str().unwrap(),
+        ],
+        vec!["executor", "run", "--file", lead_receipt.to_str().unwrap()],
+    ] {
+        let text = inside(&entry);
+        assert!(
+            text.contains(
+                "bounded lead conversations cannot dispatch executors or host another model conversation"
+            ),
+            "{entry:?}: {text}"
+        );
+    }
     // Without the marker the same lead receipt is not refused at the host
-    // entry; it proceeds to its ordinary receipt resolution too.
+    // entry; it proceeds to its ordinary receipt resolution, exactly as a
+    // managed lead session continuing a lead conversation needs.
     let mut command = lead_command();
     command.args(["executor", "run", "--file", lead_receipt.to_str().unwrap()]);
     let text = output_text(&command.output().unwrap());
@@ -3247,6 +3580,29 @@ fn pooled_state_dir(home: &Path) -> PathBuf {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.is_dir())
         .expect("pool state directory")
+}
+
+/// The pool slot directory, for a fresh dispatch whose host has not finished
+/// recording it yet: the caller waits on the run's own state, never on a
+/// timing guess.
+fn wait_pooled_state_dir(home: &Path) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(entries) = fs::read_dir(home.join("harness/executor-pool"))
+            && let Some(state) = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find(|path| path.is_dir())
+        {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pool state directory under {} was never recorded",
+            home.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn pooled_slot_path(home: &Path) -> PathBuf {
