@@ -689,8 +689,8 @@ held tasks unavailable to it during rollback; deleting ownership records is
 not a rollback procedure. The standalone `isolated-worktree` skill and its
 disposable-tree recipe are retired now that the installed common task path
 passed, with the surviving guidance maintained in the pool guide and the
-team-lead skill. Change:
-[unify reusable worktree pool](../openspec/changes/unify-reusable-worktree-pool/proposal.md).
+team-lead skill. Current contract:
+[shared worktree pool](../openspec/specs/isolated-worktree-workflow/spec.md).
 
 **2026-09-19, confirmed:** the feedback loop's kit-level backlog is the kit
 checkout's own `bd` board, addressed explicitly by the lead session
