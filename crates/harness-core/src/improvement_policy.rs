@@ -2722,41 +2722,25 @@ fn conjunction_verdict(
         ));
         return PolicyDecision::Reject;
     }
-    // The aggregate reductions alone are not the benefit. The declared
-    // complete cost of the improvement (implementation, evaluation and the
-    // recurring maintenance over the declared use horizon) must be repaid by
-    // each unit's recorded saving, exactly as the accounting owner computes
-    // its net-saving verdict; the conjunction's quality-class units carry no
-    // unit-level net saving, so this is the single place the declared cost is
-    // consumed. An apparent saving that disappears once the complete declared
-    // costs are included cannot authorize adoption.
+    // Setup and evaluation belong to the whole declared task mix. Project its
+    // mean saving over the task horizon, consuming shared costs once. A healthy
+    // unit with no regression need not repay the entire setup by itself.
     let horizon = policy.horizon_tasks;
     let declared_costs = policy.overhead.implementation_seconds
         + policy.overhead.evaluation_seconds
         + policy.overhead.maintenance_seconds_per_task * horizon;
-    for fact in facts {
-        let (Some(baseline), Some(candidate)) = (fact.baseline_seconds, fact.candidate_seconds)
-        else {
-            continue;
-        };
-        let net = (baseline - candidate) * horizon - declared_costs;
-        if net <= 0.0 {
-            reasons.push(format!(
-                "unit {}: the recorded per-unit saving does not repay the declared implementation, evaluation and maintenance cost within the declared horizon of {horizon:.1} task(s); the apparent saving disappears once the complete declared costs are included and the conjunction cannot adopt",
-                fact.name
-            ));
-            return PolicyDecision::Reject;
-        }
+    let net_saving = |baseline: f64, candidate: f64| {
+        (baseline - candidate) / facts.len() as f64 * horizon - declared_costs
+    };
+    if net_saving(baseline_seconds, candidate_seconds) <= 0.0 {
+        reasons.push(format!(
+            "the recorded task-mix saving does not repay the declared implementation, evaluation and maintenance cost within the declared horizon of {horizon:.1} task(s); the conjunction cannot adopt"
+        ));
+        return PolicyDecision::Reject;
     }
-    // Attribution bounds are measurement evidence, not run-to-run variation.
-    // The units the accounting can bound must reach this verdict, because an
-    // admissible range that can move the time member below its declared
-    // useful margin, or a unit's regression beyond the declared tolerance,
-    // reverses the decision; a partially bounded panel cannot state the
-    // conjunction at all. A bound the accounting cannot turn into an
-    // admissible reduction range stays exactly as the comparable-pair
-    // accounting treats it, and the recorded totals remain the decision
-    // basis.
+    // Presence and usability differ: a one-sided or unusable interval must
+    // never silently become a point measurement. No supplied intervals retains
+    // the owner's existing recorded-total behavior.
     let admissible = |fact: &UnitFacts| -> Option<(f64, f64)> {
         let (baseline_low, baseline_high) = fact.baseline_bounds?;
         let (candidate_low, candidate_high) = fact.candidate_bounds?;
@@ -2769,7 +2753,7 @@ fn conjunction_verdict(
     };
     let bounded_units = facts
         .iter()
-        .filter(|fact| admissible(fact).is_some())
+        .filter(|fact| fact.baseline_bounds.is_some() || fact.candidate_bounds.is_some())
         .count();
     if bounded_units > 0 {
         if bounded_units < facts.len() {
@@ -2777,6 +2761,12 @@ fn conjunction_verdict(
                 "admissible attribution bounds are recorded for only {bounded_units} of {} observed unit(s); a partially bounded panel cannot state the conjunction and the result stays inconclusive",
                 facts.len()
             ));
+            return PolicyDecision::Inconclusive;
+        }
+        if facts.iter().any(|fact| admissible(fact).is_none()) {
+            reasons.push(
+                "the recorded attribution bounds are incomplete or do not form a usable admissible range; the conjunction stays inconclusive".to_owned(),
+            );
             return PolicyDecision::Inconclusive;
         }
         let (mut baseline_low, mut baseline_high) = (0.0, 0.0);
@@ -2813,6 +2803,12 @@ fn conjunction_verdict(
                 );
                 return PolicyDecision::Inconclusive;
             }
+        }
+        if net_saving(baseline_low, candidate_high) <= 0.0 {
+            reasons.push(
+                "admissible attribution bounds can reverse repayment of the declared complete costs within the task horizon; the conjunction stays inconclusive".to_owned(),
+            );
+            return PolicyDecision::Inconclusive;
         }
         for fact in facts {
             let Some((_, worst)) = fact.time_regression_range() else {

@@ -6905,3 +6905,75 @@ fn a_conjunction_cannot_consume_retained_baseline_evidence_without_its_clause() 
         evaluation.reasons
     );
 }
+
+#[test]
+fn conjunction_panel_repays_shared_cost_once_without_requiring_every_unit_to_save() {
+    let mut policy = conjunction_policy();
+    policy.stopping.required_units = 2;
+    let mut rows = conjunction_pair("improved", 100.0, false, 400, 40.0, true, 160);
+    rows.extend(conjunction_pair(
+        "healthy", 100.0, true, 400, 100.0, true, 400,
+    ));
+    // The frozen mix saves 30 seconds per task over five tasks. The healthy
+    // unit has no regression and need not repay the entire common setup alone.
+    policy.overhead.implementation_seconds = 140.0;
+    let evaluation = evaluate(&declare(&policy), &summarize(&rows, &policy)).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    policy.overhead.implementation_seconds = 150.0;
+    let evaluation = evaluate(&declare(&policy), &summarize(&rows, &policy)).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn conjunction_unusable_or_one_sided_bounds_never_become_point_measurements() {
+    let policy = conjunction_policy();
+    for (baseline_bounds, candidate_bounds) in [
+        (Some((0.0, 100.0)), Some((30.0, 60.0))),
+        (Some((100.0, 100.0)), None),
+        (None, Some((30.0, 60.0))),
+    ] {
+        let mut rows = conjunction_pair("bounded", 100.0, false, 400, 40.0, true, 160);
+        if let Some((low, high)) = baseline_bounds {
+            bounded(&mut rows[0], low, high);
+        }
+        if let Some((low, high)) = candidate_bounds {
+            bounded(&mut rows[1], low, high);
+        }
+        let evaluation = evaluate(&declare(&policy), &summarize(&rows, &policy)).unwrap();
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::Inconclusive,
+            "{:?}",
+            evaluation.reasons
+        );
+    }
+}
+
+#[test]
+fn conjunction_bounds_must_support_repayment_as_well_as_the_raw_time_margin() {
+    let mut policy = conjunction_policy();
+    policy.overhead.implementation_seconds = 290.0;
+    let mut rows = conjunction_pair("bounded", 100.0, false, 400, 40.0, true, 160);
+    bounded(&mut rows[0], 100.0, 100.0);
+    bounded(&mut rows[1], 30.0, 60.0);
+    // Every bound supports the 10% raw time margin, but 40 seconds of saving
+    // per task cannot repay 297.5 seconds over five tasks. The point estimate
+    // alone would adopt, so the bounded verdict is still inconclusive.
+    let evaluation = evaluate(&declare(&policy), &summarize(&rows, &policy)).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+}
