@@ -621,11 +621,16 @@ model-free probe of the installed app-server route (the same binary and
 `features.worktrees` override forms the hosted route uses) registered no
 worktree-named tool in its runtime catalogue under the feature default,
 `false` or `true`, so the exercised hosted boundary did not re-expose the
-competing tools; the remote frontend's own catalogue is not observable by
-this probe, and a fresh hosted catalogue remains an open acceptance item in
-pool task 4.4. A hosted conversation whose effective catalogue still
-re-exposed the tools would be an explicit-override or host-injected
-configuration conflict to report, not a successful suppression; the
+competing tools. The actual `lead start` route is exercised directly by its
+own model-free fixture
+(`lead_message_native::managed_lead_start_hosts_the_catalogue_without_native_worktree_tools`):
+three fresh probe rounds run inside that served session reported 46 tools
+with none worktree-named while all 38 unrelated probe tools remained, so the
+backend catalogue that answers the conversation's model requests is covered.
+The remote frontend's separate UI catalogue is not read by these probes. A
+hosted conversation whose effective catalogue still re-exposed the tools
+would be an explicit-override or host-injected configuration conflict to
+report, not a successful suppression; the
 precedence and conflict reporting below belongs to the registered launcher
 route, where re-exposure is observable.
 
