@@ -11,7 +11,7 @@ surfaces with durable recovery.
 
 ### Requirement: Configurable lead and executor roles
 
-The kit SHALL provide reusable orchestration configuration that names the lead session profile, the executor profiles available for assignment, and the maximum number of concurrent executors. Dispatch SHALL use exactly the configured profiles and SHALL NOT hardcode provider-specific roles, while explicit user profile selection retains its native precedence. The existing installation check SHALL validate that every configured profile is installed and that the concurrency limit is positive, reporting a concrete error without substituting another profile or silently disabling orchestration. Unrelated user configuration, credentials and profiles SHALL be preserved.
+The kit SHALL provide reusable orchestration configuration that names the lead session profile, the executor profiles available for assignment, the maximum number of concurrent executors, and the independent managed worktree pool capacity defined by `isolated-worktree-workflow`. Dispatch SHALL use exactly the configured profiles and SHALL NOT hardcode provider-specific roles, while explicit user profile selection retains its native precedence. The existing installation check SHALL validate that every configured profile is installed and that both limits are positive, reporting a concrete error without substituting another profile or silently disabling orchestration. Unrelated user configuration, credentials and profiles SHALL be preserved.
 
 #### Scenario: Roles come from configuration
 - **WHEN** the configuration names one lead profile and two executor profiles
@@ -20,6 +20,10 @@ The kit SHALL provide reusable orchestration configuration that names the lead s
 #### Scenario: A configured profile is missing
 - **WHEN** a named profile is absent from the target installation
 - **THEN** check and dispatch report the missing profile and take no substitute model action
+
+#### Scenario: Repository selection does not require copying kit configuration
+- **WHEN** an installed executor is dispatched into a selected consuming repository
+- **THEN** it uses the installed orchestration configuration and the selected repository's common pool, without requiring a copy of kit configuration inside that repository
 
 ### Requirement: Lead activation through the team-lead skill
 
@@ -81,11 +85,11 @@ stopping orchestration SHALL remain explicit and preserve partial work.
 
 ### Requirement: Isolated and visible executor sessions
 
-Every executor assignment SHALL run a native `codex --profile <id>` session on its own visible terminal surface - a dedicated titled tab, a pane or a window - established by the dispatch command before its first model request, and in a harness-owned pool worktree that the dispatch command selects, synchronizes and binds to that session before its first model request. A titled terminal tab in the lead's own terminal SHALL satisfy the visibility requirement; simultaneous on-screen tiling of all conversations SHALL NOT be required. Executor isolation SHALL use the executor worktree pool of the source checkout; the dispatch command SHALL be its sole allocator, and an executor session, the lead, or the `isolated-worktree-workflow` skill MUST NOT create a substitute or additional worktree for an executor assignment. The controller SHALL record the slot mapping with the assignment, including slot path and index, owner session identity, archived or unavailable status and synchronized base revision, and preserve it through interruption. Slot release SHALL reuse the tree: after the lead merges or explicitly discards the assignment result, the slot is reset to the merged committed base with ignored build caches kept, and the same slot serves later assignments. A slot whose state cannot be safely reset SHALL be preserved with its reason for lead review; the controller MUST NOT silently reset a dirty slot, force-remove an unmerged tree, delete a branch whose work is not preserved, or treat agents-overview hide, archive or task deletion as slot release. Deleting a pool tree is a slot-retirement action that first establishes the work is preserved and the removal is authorized. A control view SHALL attach with its cwd at the already bound pool slot instead of allocating another checkout. Ephemeral spawn_agent helpers SHALL be spawned only by the lead; executor sessions SHALL run without agent-spawning tools, so helper and nested-executor conversations cannot originate inside an executor assignment. Executors SHALL NOT write to the shared checkout. Each surface SHALL show assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. The controller and lead SHALL NOT resize, move or arrange desktop windows - including the terminal the lead runs in - to make conversations fit the screen; missing or lost views SHALL be restored through the owning dispatch command. Automatic model-backed helpers SHALL be visible and attributable or disabled. If a required view fails or closes and no other attached view displays that conversation, the controller SHALL suspend new model dispatch for it, reconcile in-flight effects without replay, report the failure and restore visibility before continuing.
+Every executor assignment SHALL run a native `codex --profile <id>` session on its own visible terminal surface - a dedicated titled tab, a pane or a window - established by the dispatch command before its first model request, and in a harness-owned pool worktree that the dispatch command selects, synchronizes and binds to that session before its first model request. A titled terminal tab in the lead's own terminal SHALL satisfy the visibility requirement; simultaneous on-screen tiling of all conversations SHALL NOT be required. Executor isolation SHALL use the selected repository's shared harness pool defined by `isolated-worktree-workflow`. The dispatch command SHALL acquire and bind through that common owner before launching a session; executor sessions and lead-side recipes MUST NOT create substitute or additional worktrees. The controller SHALL record the slot mapping with the assignment, including slot path and index, owner session identity, archived or unavailable status and synchronized base revision, and preserve it through interruption. Slot release SHALL reuse the tree: after the lead merges or explicitly discards the assignment result, the slot is reset to the merged committed base with ignored build caches kept, and the same slot serves later assignments. A slot whose state cannot be safely reset SHALL be preserved with its reason for lead review; the controller MUST NOT silently reset a dirty slot, force-remove an unmerged tree, delete a branch whose work is not preserved, or treat agents-overview hide, archive or task deletion as slot release. Deleting a pool tree is a slot-retirement action that first establishes the work is preserved and the removal is authorized. A control view SHALL attach with its cwd at the already bound pool slot instead of allocating another checkout. Ephemeral spawn_agent helpers SHALL be spawned only by the lead; executor sessions SHALL run without agent-spawning tools, so helper and nested-executor conversations cannot originate inside an executor assignment. Executors SHALL NOT write to the shared checkout. Each surface SHALL show assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. The controller and lead SHALL NOT resize, move or arrange desktop windows - including the terminal the lead runs in - to make conversations fit the screen; missing or lost views SHALL be restored through the owning dispatch command. Automatic model-backed helpers SHALL be visible and attributable or disabled. If a required view fails or closes and no other attached view displays that conversation, the controller SHALL suspend new model dispatch for it, reconcile in-flight effects without replay, report the failure and restore visibility before continuing.
 
 #### Scenario: Two executors work in parallel
 - **WHEN** the lead dispatches two independent assignments to different configured profiles
-- **THEN** both executor sessions run concurrently on separate titled terminal surfaces (for example tabs of the lead's terminal), each bound before its first model request to a distinct slot of the executor worktree pool, with no shared-checkout writes and no worktree created beyond the pool
+- **THEN** both executor sessions run concurrently on separate titled terminal surfaces (for example tabs of the lead's terminal), each bound before its first model request to a distinct slot of the shared worktree pool, with no shared-checkout writes and no worktree created beyond the pool
 
 #### Scenario: Same-terminal tabs satisfy visibility
 - **WHEN** executor spawn runs inside the lead's Windows terminal and opens each assignment as a titled tab of that terminal
@@ -117,7 +121,7 @@ Every executor assignment SHALL run a native `codex --profile <id>` session on i
 
 #### Scenario: Ordinary Git worktrees are not executor isolation
 - **WHEN** an executor assignment needs an isolated checkout
-- **THEN** the session is bound to a pool slot allocated by the dispatch command, and neither the executor nor the lead creates a task-named or otherwise ad-hoc substitute worktree for that session
+- **THEN** the session is bound to a shared pool slot acquired by the dispatch command, and neither the executor nor the lead creates a task-named or otherwise ad-hoc substitute worktree for that session
 
 #### Scenario: Overview archive does not retire a worktree
 - **WHEN** an executor task is hidden, archived or deleted in the agents overview while its slot worktree still exists
@@ -346,15 +350,19 @@ Before the first executor dispatch in an activated lead session, the `team-lead`
 
 ### Requirement: Executor worktree pool with deterministic slots and upstream freshness
 
-For each source checkout used by an activated lead, executor dispatch SHALL maintain a fixed pool of ordinary Git worktrees sized to the configured maximum concurrent executor count, created as sibling directories of the source checkout and named `<repository-name>-wt1` through `<repository-name>-wtN` in stable slot order. The dispatch command SHALL be the sole pool allocator: it selects a free slot, creating it only when its pool position does not yet exist, and MUST NOT register or create executor worktrees beyond the configured pool size; when every slot is occupied by a live executor session, dispatch SHALL abort with a concrete cause instead of allocating another tree. Before binding a session to a slot, the dispatch command SHALL synchronize the slot with upstream by fetching the configured remote and resetting the slot to the resolved base while removing untracked files and keeping ignored build caches; synchronization SHALL complete before the first model request. The default base SHALL be the upstream default branch, and an explicit base override SHALL be supported for assignments that must start from another revision. The lead SHALL fix a committed snapshot before dispatch: an assignment that depends on source-checkout state SHALL name, through the explicit base override, a revision that contains every assignment input - changes committed in the source checkout before dispatch (a local commit; pushing remains a separate authorized step) or verified committed HEAD - while unrelated dirty work SHALL NOT be committed just to form a base, and an assignment whose required inputs cannot be committed within authorization SHALL NOT be dispatched from a stale base. Executor briefs SHALL name the synchronized base revision; an executor SHALL verify that its slot HEAD equals that base before substantive edits and SHALL stop and report a mismatch instead of repairing synchronization or creating a substitute tree. Copying files into a live executor slot SHALL NOT be accepted as synchronization: changed tracked inputs SHALL travel as a new commit and a redispatch, and reusing the owner id SHALL rebind and resynchronize the same slot. Failed upstream fetch, an occupied dirty slot, a free slot holding unreviewed changes, or a missing or unusable slot SHALL abort dispatch with the concrete cause before any model request, instead of degrading to a stale base, an extra tree or silent data loss. Slot occupancy SHALL be reconciled with executor session liveness, and the worktree inventory check SHALL enforce the pool invariant instead of warning: harness dispatch never creates beyond the pool, reports preserved slots with their reasons, and reports non-pool trees as foreign or legacy items for lead review rather than silently absorbing them.
+Executor dispatch SHALL consume the selected repository's shared harness pool under `isolated-worktree-workflow`; ordinary isolated tasks and executors SHALL count toward the same independently configured capacity. The existing `executor spawn`, `resume`, `restart`, `pool` and `release` entry points SHALL remain supported as adapters to the common lifecycle, with executor concurrency enforced separately. An explicit repository selector SHALL allow installed dispatch to target a consuming repository while preserving the existing `--source` meaning and default target when that selector is omitted. Dispatch SHALL select, synchronize and bind a free slot before its first model request, or report the actual capacity, concurrency, ownership or preparation failure without creating an extra checkout. The default executor base SHALL remain the resolved upstream default branch for compatibility. An explicit locally available base SHALL not require a fetch; a base requiring remote resolution or requested refresh SHALL fail closed if that operation fails. The lead SHALL fix a committed snapshot before dispatch: an assignment that depends on source-checkout state SHALL name a revision containing every assignment input, using authorized local commits or verified committed HEAD without committing unrelated dirty work. An assignment whose required inputs cannot be committed within authorization SHALL remain with the lead rather than use a stale base. Executor briefs SHALL name the exact synchronized base, and executors SHALL verify it before substantive edits and report any mismatch without repairing synchronization or allocating a substitute tree. Copying files into a live slot SHALL NOT count as synchronization: changed assignment inputs SHALL use a new committed base after acceptance or explicit discard and release of the previous task binding. Repeating acquisition or continuation for a still-held task SHALL preserve its HEAD and partial work; owner reuse alone SHALL NOT authorize reset. Pool inventory SHALL report all task types and preserved reasons, and report non-pool worktrees as foreign or legacy rather than silently absorbing them.
+
+#### Scenario: Pool size is independent of configured concurrency
+- **WHEN** pool capacity is four, maximum concurrent executors is two and dispatch first runs for a repository
+- **THEN** it allocates only within the four stable pool positions, starts at most two executors and shares remaining capacity with ordinary isolated tasks
 
 #### Scenario: Pool size matches configured concurrency
-- **WHEN** the maximum concurrent executor count is configured as two and executor dispatch first runs for a repository checkout
-- **THEN** dispatch uses exactly the sibling slots named `<repository-name>-wt1` and `<repository-name>-wt2` and never creates a third executor tree for that checkout
+- **WHEN** a legacy configuration has maximum concurrent executors two and no explicit pool capacity
+- **THEN** migration preserves capacity two as the explicit pool value, so the two existing stable slot positions remain the limit until that independent setting is deliberately changed
 
 #### Scenario: Dispatch beyond the pool is refused
-- **WHEN** every pool slot is occupied by a live executor session and the lead dispatches another assignment
-- **THEN** dispatch aborts naming the occupied slots, no new worktree is registered, and the lead can wait or stop a running assignment instead
+- **WHEN** every pool slot is held by a live, suspended, reserved or unreviewed task and the lead dispatches another assignment
+- **THEN** dispatch aborts naming the occupied slots, no new worktree is registered, and the lead can wait or complete the acceptance and release of a held task instead; stopping a run alone does not free its slot
 
 #### Scenario: A slot is reused instead of recreated
 - **WHEN** an earlier assignment was merged or explicitly discarded and a new assignment is dispatched into the same lane
@@ -374,19 +382,27 @@ For each source checkout used by an activated lead, executor dispatch SHALL main
 
 #### Scenario: The executor verifies the named base
 - **WHEN** an executor begins work and its slot HEAD differs from the base named in its brief
-- **THEN** it stops dependent edits and reports the mismatch, and the lead corrects the slot by redispatching with the same owner id
+- **THEN** it stops dependent edits and reports the mismatch, and the lead preserves the mismatched checkout, resolves the cause and performs an explicitly authorized release or correction before redispatch rather than treating owner reuse as reset permission
 
 #### Scenario: Upstream fetch failure blocks dispatch
-- **WHEN** the configured remote cannot be fetched during slot synchronization
+- **WHEN** dispatch requires an upstream refresh or remote base resolution and the configured remote cannot be fetched
 - **THEN** dispatch aborts with the fetch failure before any model request, the slot keeps its prior state, and no executor session starts from a stale base through that path
 
 #### Scenario: An explicit base override is honored
 - **WHEN** an assignment must start from a revision other than the upstream default branch
-- **THEN** dispatch names that revision, the slot is reset to it after the upstream fetch, and the recorded slot mapping carries that base
+- **THEN** dispatch names that revision, the slot is synchronized to its exact commit without requiring a fetch when that commit is already available locally, and the recorded slot mapping carries that base
 
 #### Scenario: A free slot with unreviewed work is preserved
 - **WHEN** a slot's executor session has ended but the slot still holds unmerged or unreviewed changes
 - **THEN** dispatch does not select or reset that slot, reports it with its reason, and the lead must merge or explicitly discard the work before the slot re-enters the pool
+
+#### Scenario: Ordinary isolation consumes the last slot
+- **WHEN** all shared pool slots are held by ordinary experiments and reviews while executor concurrency is available
+- **THEN** executor dispatch reports pool exhaustion without starting a model or allocating another worktree
+
+#### Scenario: Existing executor command remains compatible
+- **WHEN** a caller uses an existing executor command without a repository selector
+- **THEN** its previous target selection, configured profile, visible terminal behavior and default upstream-base behavior remain available while its allocation uses the common pool
 
 ### Requirement: Deterministic executor terminal targeting
 
@@ -490,14 +506,14 @@ Additional reply-workflow observation SHALL extend this base contract without re
 
 ### Requirement: Concise titles and four executor slots
 
-New executor terminal titles SHALL begin with `CEx` and retain their profile and assignment owner. The shipped orchestration configuration SHALL permit four concurrent executor slots without changing the aggregate heavy-command allowance or explicit executor profile.
+New executor terminal titles SHALL begin with `CEx` and retain their profile and assignment owner. The shipped orchestration configuration SHALL permit four concurrent executor runs and independently default the shared worktree pool capacity to four without changing the aggregate heavy-command allowance or explicit executor profile.
 
 #### Scenario: Executor terminal identity
 - **WHEN** dispatch or continuation opens an executor terminal
 - **THEN** its title uses `CEx ({profile}) - {owner}` and remains distinct from another owner's terminal
 
 #### Scenario: Configured four-slot pool is full
-- **WHEN** all four configured slots contain live or unreviewed work and a fifth independent owner requests dispatch
+- **WHEN** all four configured shared slots contain live, suspended, reserved or unreviewed tasks of any supported type and a fifth independent owner requests dispatch
 - **THEN** the existing pool reports capacity exhaustion without creating another slot or replacing held work
 
 ### Requirement: Shared heavy-command admission
