@@ -132,6 +132,12 @@ the observer module's adoption comparison separate from the handling of each
 finding; preserve required acceptance and scope boundaries. The active change
 owns this [single-observation admission](../openspec/changes/add-delivery-improvement/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
 
+The user also authorized isolated candidate implementation in parallel with
+comparison preparation to shorten delivery. The candidate remains inactive;
+the [evaluation and acceptance gates](../openspec/changes/add-delivery-improvement/design.md#parallel-candidate-implementation-and-predeclared-evaluation)
+remain unchanged. This accepts possible unused implementation, not a lower
+acceptance standard.
+
 Deliver a quality, verified end-to-end MVP through real components as early as
 possible, then complete the whole agreed result. Small transparent operating
 restrictions are allowed; they do not authorize simplifying promised product

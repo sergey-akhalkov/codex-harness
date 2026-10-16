@@ -24,13 +24,19 @@ The existing feedback spec's incubator-only routing and lead-only semantic triag
 
 ## Decisions
 
-### Measurement and decision before implementation
+### Parallel candidate implementation and predeclared evaluation
 
 Keep the initial evidence and uncertainty in `proposal.md`; do not turn the
 audit's small sample into an incidence or savings claim. Task 1.3 must qualify
-real pre-solution inputs and freeze the comparison before observer code or
-guidance is evaluated. Reuse the existing outcome-policy, skill-evaluation and
-local evidence owners, not a new experiment framework.
+real pre-solution inputs and freeze the comparison before observer candidate
+model dispatch, evaluation or adoption. Isolated code and guidance implementation,
+builds and model-free checks may proceed in parallel with qualification. Keep
+that candidate inactive and outside accepted delivery, preserve the accepted
+baseline, and count the implementation work in the existing cost accounting.
+This concurrency may leave an unused candidate if the pilot rejects it; it
+does not relax any comparison or product acceptance criterion. Reuse the existing
+outcome-policy, skill-evaluation and local evidence owners, not a new experiment
+framework.
 
 The initial panel is three matched real tasks: reconciliation of stale planning
 against existing implementation; diagnosis of missing/contradictory evidence;
@@ -58,8 +64,9 @@ rework within the frozen observation horizon, total time through acceptance and
 native recorded token usage. Finding counts and admission latency are diagnostic
 metrics only. Freeze metric coverage, the horizon, practical effect thresholds
 and any uncertainty/repetition rule in the existing comparison policy from the
-baseline measurements before implementation; an unset threshold is a blocked
-experiment, not zero. Preserve the owner's addition gate: quality must improve
+baseline measurements before observer candidate model dispatch or evaluation;
+an unset threshold is a blocked experiment, not zero. Preserve the owner's
+addition gate: quality must improve
 with no critical regression and both time and token cost must improve by their
 declared useful margins. Do not add time and tokens into an invented score.
 Missing counters, a verdict-changing bound, an unchanged success rate or absent

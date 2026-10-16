@@ -284,7 +284,11 @@ The lead SHALL verify correctness through the real affected entry point and asse
 
 #### Scenario: The observer's own experiment is not qualified
 - **WHEN** attributable baseline evidence, frozen task/control identities, meaningful outcome thresholds or stopping conditions are missing
-- **THEN** dependent observer implementation/evaluation is held, and formal planning validity or a working transport cannot substitute for that evidence
+- **THEN** observer candidate model dispatch, evaluation and adoption are held, and formal planning validity or a working transport cannot substitute for that evidence
+
+#### Scenario: Candidate implementation proceeds during qualification
+- **WHEN** comparison qualification is incomplete and an isolated implementation can proceed independently
+- **THEN** code and guidance authoring, builds and model-free checks may proceed while the candidate remains inactive and outside accepted delivery, the accepted baseline is preserved, and implementation costs and all required comparison and product acceptance remain accounted for
 
 #### Scenario: The observer treatment fails its declared benefit gate
 - **WHEN** the complete matched comparison rejects the observer or remains inconclusive
