@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "tool_catalogue.rs"]
+mod tool_catalogue;
+
 pub const PROVIDER_ID: &str = "canned_skill_catalog";
 pub const API_KEY: &str = "canned-skill-catalog-fixture-key";
 pub const API_KEY_ENV: &str = "SKILL_CATALOG_CANNED_API_KEY";
@@ -37,8 +40,6 @@ pub const CHILD_CALL_ID: &str = "skill-catalog-child-exec-1";
 /// The probe turn prompt: a non-special prompt so the turn classifies outside
 /// the canned turn kinds and can be repeated for bounded settle rounds.
 pub const ALL_TOOLS_PROBE_PROMPT: &str = "Canned all-tools settle probe: report the nested tool catalogue. Reply with CANNED_ALL_TOOLS_SETTLE_OK.";
-pub const ALL_TOOLS_MARKER: &str = "CANNED_ALL_TOOLS_PROBE";
-pub const ALL_TOOLS_END: &str = "CANNED_ALL_TOOLS_END";
 /// The installed CLI asks the model for a thread title after a turn starts;
 /// the probe answers that request with a plain message so a title turn never
 /// consumes a probe call or masks a probe turn.
@@ -384,7 +385,8 @@ fn response_for(
             }
         }
         let call_id = format!(
-            "canned-all-tools-probe-{}",
+            "{}{}",
+            tool_catalogue::PROBE_CALL_PREFIX,
             inner.probe_seq.fetch_add(1, Ordering::SeqCst) + 1
         );
         *pending = Some(call_id.clone());
@@ -495,12 +497,7 @@ fn probe_output_present(body: &str, call_id: &str) -> bool {
 /// between calls.
 fn all_tools_probe_sse(call_id: &str) -> String {
     let response_id = format!("resp-{call_id}");
-    let input = format!(
-        "const names = Object.keys(typeof tools === 'undefined' ? {{}} : tools);\n\
-         const listed = typeof ALL_TOOLS === 'undefined' ? [] : ALL_TOOLS;\n\
-         for (const entry of Object.values(listed)) names.push(typeof entry === 'string' ? entry : entry.name);\n\
-         text('{ALL_TOOLS_MARKER}' + [...new Set(names)].join('|') + '{ALL_TOOLS_END}');"
-    );
+    let input = tool_catalogue::all_tools_probe_script();
     sse(&[
         json!({"type": "response.created", "response": {"id": response_id.clone()}}),
         json!({

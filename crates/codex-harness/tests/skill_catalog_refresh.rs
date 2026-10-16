@@ -8,6 +8,8 @@ mod native_sampling;
 mod skill_catalog_responses;
 #[path = "fixtures/synthetic_role_build.rs"]
 mod synthetic_role_build;
+#[path = "fixtures/tool_catalogue.rs"]
+mod tool_catalogue;
 
 use harness_core::{
     build_identity,
@@ -17,16 +19,18 @@ use harness_core::{
 };
 use serde_json::{Value, json};
 use skill_catalog_responses::{
-    ALL_TOOLS_END, ALL_TOOLS_MARKER, ALL_TOOLS_PROBE_PROMPT, API_KEY, API_KEY_ENV, CALL_ID,
-    CHILD_CALL_ID, CHILD_PROMPT, COMPACT_PROMPT, CannedResponses, EARLY_SKILL, NEXT_TURN_PROMPT,
-    PROVIDER_ID, RESUME_PROMPT, RETIRE_PROMPT, RequestKind, SUMMARY_TEXT, UNRELATED_PROMPT,
-    USER_PROMPT,
+    ALL_TOOLS_PROBE_PROMPT, API_KEY, API_KEY_ENV, CALL_ID, CHILD_CALL_ID, CHILD_PROMPT,
+    COMPACT_PROMPT, CannedResponses, EARLY_SKILL, NEXT_TURN_PROMPT, PROVIDER_ID, RESUME_PROMPT,
+    RETIRE_PROMPT, RequestKind, SUMMARY_TEXT, UNRELATED_PROMPT, USER_PROMPT,
 };
 use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tool_catalogue::{
+    PROBE_CALL_PREFIX, probe_names, tool_surface, worktree_fragments, worktree_names,
 };
 
 const EXPECTED_SHA: &str = "e4c11374bd9de8ad5c3b7617fd4654bb7839901edb0863f9930666863c7a021b";
@@ -4443,68 +4447,6 @@ fn described(body: &str) -> Value {
     })
 }
 
-/// The visible tool surface of one captured model request: tool names reachable
-/// through top-level `tools` entries, `additional_tools` input namespaces and
-/// entries nested under both, plus the tool-definition text that carries any
-/// deferred declarations.
-fn tool_surface(body: &str) -> (Vec<String>, String) {
-    fn visit(items: &[Value], names: &mut Vec<String>) {
-        for item in items {
-            if let Some(name) = item.get("name").and_then(Value::as_str) {
-                names.push(name.to_owned());
-            }
-            if let Some(name) = item
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-            {
-                names.push(name.to_owned());
-            }
-            if let Some(nested) = item.get("tools").and_then(Value::as_array) {
-                visit(nested, names);
-            }
-        }
-    }
-    let mut names = Vec::new();
-    let mut definitions = String::new();
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        if let Some(tools) = value.get("tools").and_then(Value::as_array) {
-            definitions.push_str(
-                &serde_json::to_string(tools).expect("native tool definitions serialize"),
-            );
-            visit(tools, &mut names);
-        }
-        if let Some(items) = value.get("input").and_then(Value::as_array) {
-            for item in items
-                .iter()
-                .filter(|item| item["type"] == "additional_tools")
-            {
-                definitions.push_str(&item.to_string());
-                if let Some(tools) = item.get("tools").and_then(Value::as_array) {
-                    visit(tools, &mut names);
-                }
-            }
-        }
-    }
-    (names, definitions)
-}
-
-/// The competing native-worktree fragments of one effective tool surface: a
-/// tool whose name mentions a worktree, or the `codex_worktrees` marker when
-/// the surface defers that dynamic-tools server behind the exec orchestrator.
-fn worktree_fragments(surface: &(Vec<String>, String)) -> Vec<String> {
-    let mut fragments = surface
-        .0
-        .iter()
-        .filter(|name| name.to_lowercase().contains("worktree"))
-        .cloned()
-        .collect::<Vec<_>>();
-    if surface.1.contains("codex_worktrees") {
-        fragments.push("deferred:codex_worktrees".to_owned());
-    }
-    fragments
-}
-
 fn live_codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -4661,37 +4603,6 @@ struct RuntimeCatalogue {
     transcript: String,
 }
 
-/// The probe call id prefix the canned fixture issues for runtime readings.
-const PROBE_CALL_PREFIX: &str = "canned-all-tools-probe-";
-
-/// The runtime tool names one `exec` output item carries, if any. The session
-/// exchanges them as one `|`-separated marker payload, a format that a JSON
-/// string wrapper around the exec result cannot corrupt; an exec result can
-/// arrive as raw text or as content parts, so both shapes are read.
-fn probe_names(output: &Value) -> Option<Vec<String>> {
-    let mut texts: Vec<&str> = Vec::new();
-    match output {
-        Value::String(text) => texts.push(text.as_str()),
-        Value::Array(parts) => texts.extend(parts.iter().filter_map(|part| {
-            part.as_str()
-                .or_else(|| part.get("text").and_then(Value::as_str))
-        })),
-        _ => return None,
-    }
-    texts.into_iter().find_map(|text| {
-        let start = text.find(ALL_TOOLS_MARKER)? + ALL_TOOLS_MARKER.len();
-        let rest = &text[start..];
-        let end = rest.find(ALL_TOOLS_END)?;
-        let names = rest[..end]
-            .split('|')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        (!names.is_empty()).then_some(names)
-    })
-}
-
 /// Every distinct runtime catalogue reading carried by `requests`, in arrival
 /// order: the probe call id the fixture issued and the runtime tool names the
 /// session reported through that code-mode `exec` call. Later requests repeat
@@ -4726,15 +4637,6 @@ fn probe_readings(
         }
     }
     readings
-}
-
-/// The competing native-worktree entries of one runtime catalogue.
-fn worktree_names(names: &[String]) -> Vec<String> {
-    names
-        .iter()
-        .filter(|name| name.to_lowercase().contains("worktree"))
-        .cloned()
-        .collect()
 }
 
 /// Runs one fresh installed-CLI TUI session against the canned local Responses

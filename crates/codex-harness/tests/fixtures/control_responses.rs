@@ -3,6 +3,7 @@
 //! answered without a model and without a recorded request.
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -14,6 +15,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+#[path = "tool_catalogue.rs"]
+mod tool_catalogue;
 
 pub const FINAL: &str = "CONTROL_TOOL_RESULT_CONSUMED";
 pub const PARENT_FINAL: &str = "CONTROL_PARENT_RESULTS_CONSUMED";
@@ -145,6 +149,7 @@ impl Responses {
         let pair = evidence.join("two-executors").is_file();
         let helper_case = evidence.join("helper-window").is_file();
         let close_view = evidence.join("close-view").is_file();
+        let catalogue_probe = evidence.join("catalogue-probe").is_file();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -152,6 +157,7 @@ impl Responses {
         let stopping = stop.clone();
         let worker = thread::spawn(move || {
             let mut sequence = 0;
+            let mut probed = HashSet::new();
             while !stopping.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(value) => value,
@@ -475,6 +481,31 @@ impl Responses {
                 } else if helper_case && worker {
                     json!({"type":"message","id":"msg-executor-helper","role":"assistant","content":[{"type":"output_text","text":FINAL}]})
                 } else if result_seen {
+                    if probed.contains(&identity.thread) {
+                        let output = request["input"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|item| item["call_id"] == "control-tool-1")
+                            .and_then(|item| item.get("output"))
+                            .expect("the native session must return the owned exec call's output");
+                        let names = tool_catalogue::probe_names(output).unwrap_or_else(|| {
+                            panic!(
+                                "the code-mode exec probe returned no runtime catalogue marker; the session reported no runtime tool names"
+                            )
+                        });
+                        fs::write(
+                            evidence.join("catalogue.json"),
+                            serde_json::to_vec(&json!({
+                                "schema":1,
+                                "callId":"control-tool-1",
+                                "sequence":sequence,
+                                "names":names,
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
                     if pair {
                         assert!(
                             request["input"].as_array().unwrap().iter().any(|item| {
@@ -536,12 +567,32 @@ impl Responses {
                             else { "[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt" },
                         "shell":"powershell","yield_time_ms":if background { 1000 } else if view_loss || close_view || pair { 30000 } else { 10000 }
                     })).unwrap();
-                    if request["tools"].as_array().is_some_and(|tools| {
+                    // The owned action may run through the session's own
+                    // code-mode `exec` orchestrator. The oldest native shape
+                    // advertises that custom tool as a top-level `tools` entry;
+                    // the observed shape advertises it inside the developer
+                    // `additional_tools` namespace. Only a case that owns the
+                    // runtime catalogue probe recognises the newer shape and
+                    // prepends the shared probe script, so every other case
+                    // keeps its exact former tool call.
+                    let custom_exec = request["tools"].as_array().is_some_and(|tools| {
                         tools
                             .iter()
                             .any(|tool| tool["type"] == "custom" && tool["name"] == "exec")
-                    }) {
-                        json!({"type":"custom_tool_call","call_id":"control-tool-1","name":"exec","input":format!("const result = await tools.exec_command({arguments}); text(result);")})
+                    }) || catalogue_probe && advertises_custom_exec(&request);
+                    if custom_exec {
+                        let input = if catalogue_probe {
+                            probed.insert(identity.thread.clone());
+                            format!(
+                                "{}\nconst result = await tools.exec_command({arguments}); text(result);",
+                                tool_catalogue::all_tools_probe_script()
+                            )
+                        } else {
+                            format!(
+                                "const result = await tools.exec_command({arguments}); text(result);"
+                            )
+                        };
+                        json!({"type":"custom_tool_call","call_id":"control-tool-1","name":"exec","input":input})
                     } else {
                         json!({"type":"function_call","call_id":"control-tool-1","name":"exec_command","arguments":arguments})
                     }
@@ -864,6 +915,32 @@ fn respond_models(stream: &mut TcpStream) {
             .as_bytes(),
         )
         .unwrap();
+}
+
+/// Whether one native request advertises the session's code-mode `exec`
+/// custom tool inside the developer `additional_tools` input namespace, the
+/// shape observed from the current runtime. The tool may sit directly in a
+/// namespace's entries or deeper, so the entries are visited recursively.
+fn advertises_custom_exec(request: &Value) -> bool {
+    fn visit(items: &[Value]) -> bool {
+        items.iter().any(|item| {
+            (item["type"] == "custom" && item["name"] == "exec")
+                || item
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nested| visit(nested))
+        })
+    }
+    request["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .filter(|item| item["type"] == "additional_tools")
+            .any(|item| {
+                item.get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| visit(tools))
+            })
+    })
 }
 
 /// One accepted request: the scripted Responses POST, or the model-catalogue

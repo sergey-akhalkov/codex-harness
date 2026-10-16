@@ -3,6 +3,8 @@
 #![cfg(windows)]
 #[path = "fixtures/control_responses.rs"]
 mod control_responses;
+#[path = "fixtures/tool_catalogue.rs"]
+mod tool_catalogue;
 use harness_core::{
     broker_state::BrokerRoot,
     build_identity::{self, BuildRecord},
@@ -414,6 +416,13 @@ fn native_entry(case: EntryCase) {
     }
     if view_close {
         fs::write(root.join("close-view"), "owned closed conversation restore").unwrap();
+    }
+    if matches!(case, EntryCase::Normal) {
+        fs::write(
+            root.join("catalogue-probe"),
+            "the ordinary lead must report its owned runtime catalogue",
+        )
+        .unwrap();
     }
     let home = root.join("home");
     let workspace = root.join("workspace");
@@ -954,6 +963,43 @@ trust_level = "trusted"
             assert!(
                 !body.contains(CONTROL_EXECUTOR_ROLE_MARKER),
                 "{route} request {sequence} must not carry the executor role text"
+            );
+        }
+    }
+    // The ordinary lead's owned action ran through the session's own code-mode
+    // `exec` orchestrator, so the session reported its own runtime tool names.
+    // The preserved unrelated tools must survive while the competing native
+    // codex_worktrees surface stays absent; a missing probe marker fails here
+    // instead of passing vacuously.
+    if matches!(case, EntryCase::Normal) {
+        let receipt: Value = serde_json::from_slice(&fs::read(root.join("catalogue.json")).expect(
+            "the ordinary lead must report its runtime tool catalogue before this case can pass",
+        ))
+        .unwrap();
+        let names = receipt["names"]
+            .as_array()
+            .expect("the catalogue receipt must carry the probed runtime tool names")
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !names.is_empty(),
+            "the ordinary lead's runtime catalogue must not be empty"
+        );
+        assert!(
+            tool_catalogue::native_worktree_names(&names).is_empty(),
+            "the competing native codex_worktrees surface must stay absent from the ordinary lead: {names:?}"
+        );
+        for preserved in [
+            "exec_command",
+            "apply_patch",
+            "view_image",
+            "write_stdin",
+            "clock__curr_time",
+        ] {
+            assert!(
+                names.iter().any(|name| name == preserved),
+                "the ordinary lead's runtime catalogue must preserve the unrelated {preserved} tool: {names:?}"
             );
         }
     }
