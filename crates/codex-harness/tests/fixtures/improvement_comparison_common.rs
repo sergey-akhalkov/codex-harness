@@ -510,7 +510,7 @@ impl Fixture {
         fs::create_dir_all(proj.join("global")).unwrap();
         fs::write(
             proj.join("global/orchestration.toml"),
-            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\n",
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nworktree_pool_size = 1\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\n",
         )
         .unwrap();
         fs::write(proj.join("README.md"), "synthetic\n").unwrap();

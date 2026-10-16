@@ -2722,6 +2722,115 @@ fn conjunction_verdict(
         ));
         return PolicyDecision::Reject;
     }
+    // The aggregate reductions alone are not the benefit. The declared
+    // complete cost of the improvement (implementation, evaluation and the
+    // recurring maintenance over the declared use horizon) must be repaid by
+    // each unit's recorded saving, exactly as the accounting owner computes
+    // its net-saving verdict; the conjunction's quality-class units carry no
+    // unit-level net saving, so this is the single place the declared cost is
+    // consumed. An apparent saving that disappears once the complete declared
+    // costs are included cannot authorize adoption.
+    let horizon = policy.horizon_tasks;
+    let declared_costs = policy.overhead.implementation_seconds
+        + policy.overhead.evaluation_seconds
+        + policy.overhead.maintenance_seconds_per_task * horizon;
+    for fact in facts {
+        let (Some(baseline), Some(candidate)) = (fact.baseline_seconds, fact.candidate_seconds)
+        else {
+            continue;
+        };
+        let net = (baseline - candidate) * horizon - declared_costs;
+        if net <= 0.0 {
+            reasons.push(format!(
+                "unit {}: the recorded per-unit saving does not repay the declared implementation, evaluation and maintenance cost within the declared horizon of {horizon:.1} task(s); the apparent saving disappears once the complete declared costs are included and the conjunction cannot adopt",
+                fact.name
+            ));
+            return PolicyDecision::Reject;
+        }
+    }
+    // Attribution bounds are measurement evidence, not run-to-run variation.
+    // The units the accounting can bound must reach this verdict, because an
+    // admissible range that can move the time member below its declared
+    // useful margin, or a unit's regression beyond the declared tolerance,
+    // reverses the decision; a partially bounded panel cannot state the
+    // conjunction at all. A bound the accounting cannot turn into an
+    // admissible reduction range stays exactly as the comparable-pair
+    // accounting treats it, and the recorded totals remain the decision
+    // basis.
+    let admissible = |fact: &UnitFacts| -> Option<(f64, f64)> {
+        let (baseline_low, baseline_high) = fact.baseline_bounds?;
+        let (candidate_low, candidate_high) = fact.candidate_bounds?;
+        crate::infrastructure_accounting::reduction_range(
+            baseline_low,
+            baseline_high,
+            candidate_low,
+            candidate_high,
+        )
+    };
+    let bounded_units = facts
+        .iter()
+        .filter(|fact| admissible(fact).is_some())
+        .count();
+    if bounded_units > 0 {
+        if bounded_units < facts.len() {
+            reasons.push(format!(
+                "admissible attribution bounds are recorded for only {bounded_units} of {} observed unit(s); a partially bounded panel cannot state the conjunction and the result stays inconclusive",
+                facts.len()
+            ));
+            return PolicyDecision::Inconclusive;
+        }
+        let (mut baseline_low, mut baseline_high) = (0.0, 0.0);
+        let (mut candidate_low, mut candidate_high) = (0.0, 0.0);
+        for fact in facts {
+            let (Some((low, high)), Some((candidate_low_unit, candidate_high_unit))) =
+                (fact.baseline_bounds, fact.candidate_bounds)
+            else {
+                continue;
+            };
+            baseline_low += low;
+            baseline_high += high;
+            candidate_low += candidate_low_unit;
+            candidate_high += candidate_high_unit;
+        }
+        match crate::infrastructure_accounting::reduction_range(
+            baseline_low,
+            baseline_high,
+            candidate_low,
+            candidate_high,
+        ) {
+            Some((low, high)) if low < conjunction.minimum_time_reduction_percent => {
+                reasons.push(format!(
+                    "admissible attribution bounds can move the total-time member below its declared useful margin (admissible reduction {low:.1}%..{high:.1}% against the declared {:.1}%); the conjunction does not hold across the supported range and stays inconclusive",
+                    conjunction.minimum_time_reduction_percent
+                ));
+                return PolicyDecision::Inconclusive;
+            }
+            Some(_) => {}
+            None => {
+                reasons.push(
+                    "the recorded attribution bounds do not form a usable admissible range; unknown evidence is not a reduction and the conjunction stays inconclusive"
+                        .to_owned(),
+                );
+                return PolicyDecision::Inconclusive;
+            }
+        }
+        for fact in facts {
+            let Some((_, worst)) = fact.time_regression_range() else {
+                reasons.push(format!(
+                    "unit {}: the recorded attribution bounds do not form a usable time range; the conjunction cannot state the regression across the supported range and stays inconclusive",
+                    fact.name
+                ));
+                return PolicyDecision::Inconclusive;
+            };
+            if worst > policy.tolerance_percent {
+                reasons.push(format!(
+                    "unit {}: admissible attribution bounds can move the time regression across the declared {:.1}% tolerance (worst admissible +{worst:.1}%); the conjunction does not hold across the supported range and stays inconclusive",
+                    fact.name, policy.tolerance_percent
+                ));
+                return PolicyDecision::Inconclusive;
+            }
+        }
+    }
     reasons.push(format!(
         "the conjunction holds over {} complete matched unit(s): independent acceptance {baseline_accepted}->{candidate_accepted}, total time through acceptance -{time_reduction:.1}% and recorded native token cost -{token_reduction:.1}% (declared useful margins {:.1}% time and {:.1}% tokens) with no critical regression beyond the {:.1}% tolerance",
         facts.len(),
@@ -2921,6 +3030,41 @@ fn conjunction_observation(
             (Some(left), Some(right)) if left == right => Some(left.to_owned()),
             _ => None,
         };
+        // A retained baseline stays retained evidence in the conjunction: the
+        // evidence owner's normalized reuse record is consumed exactly as the
+        // comparable-pair accounting consumes it, so the frozen reuse policy
+        // applies to the same facts. A record the conjunction cannot consume
+        // is an explicit limitation of the unit, never an implicitly complete
+        // fresh baseline.
+        let mut unit_limitations: Vec<String> = Vec::new();
+        let reuse = match baseline.get("reuse_evidence") {
+            None => None,
+            Some(evidence) => match conjunction_reuse_facts(evidence, baseline, candidate) {
+                Some(reuse) => Some(reuse),
+                None => {
+                    unit_limitations.push(
+                        "the baseline result records retained-evidence reuse whose normalized record is incomplete; the retained baseline cannot be verified and the unit is not consumed as a fresh measurement"
+                            .to_owned(),
+                    );
+                    None
+                }
+            },
+        };
+        // A subtractive treatment's consumption applicability and retained
+        // checks stay with the comparable-pair accounting; the conjunction
+        // consumes no unverified substitute and refuses the unit instead of
+        // advertising a combination it cannot measure.
+        if let Some(arm) = [("baseline", baseline), ("candidate", candidate)]
+            .into_iter()
+            .find(|(_, row)| {
+                row.get("treatment_kind").and_then(Value::as_str) == Some("subtractive")
+            })
+            .map(|(arm, _)| arm)
+        {
+            unit_limitations.push(format!(
+                "the {arm} arm declares a subtractive treatment; its consumption applicability and retained-check evidence stays with the comparable-pair accounting and the conjunction does not consume the unit"
+            ));
+        }
         facts.push(UnitFacts {
             name: unit.to_owned(),
             case_id: baseline
@@ -2930,8 +3074,8 @@ fn conjunction_observation(
                 .to_owned(),
             baseline_seconds: baseline.get("total_result_seconds").and_then(number),
             candidate_seconds: candidate.get("total_result_seconds").and_then(number),
-            baseline_bounds: None,
-            candidate_bounds: None,
+            baseline_bounds: crate::infrastructure_accounting::arm_bounds(baseline),
+            candidate_bounds: crate::infrastructure_accounting::arm_bounds(candidate),
             baseline_steps: None,
             candidate_steps: None,
             baseline_tokens,
@@ -2943,19 +3087,47 @@ fn conjunction_observation(
             baseline_accepted,
             candidate_accepted,
             positive_effect: candidate_accepted && !baseline_accepted,
-            evidence_complete: true,
+            evidence_complete: unit_limitations.is_empty(),
             does_not_repay: false,
             time_uncertain: false,
             token_regression: None,
             subtractive: None,
-            reuse: None,
-            limitations: Vec::new(),
+            reuse,
+            limitations: unit_limitations,
         });
     }
     Ok(ObservedConjunction {
         facts,
         drift,
         limitations,
+    })
+}
+
+/// The retained-baseline facts of one conjunction unit, mapped from the
+/// evidence owner's normalized reuse record exactly as the comparable-pair
+/// accounting maps them. A missing required fact returns `None`, so the unit
+/// is refused instead of being consumed as an implicitly complete baseline.
+fn conjunction_reuse_facts(
+    evidence: &Value,
+    baseline: &Value,
+    candidate: &Value,
+) -> Option<ReusedBaselineFacts> {
+    let record = evidence.as_object()?;
+    let text = |key: &str| record.get(key).and_then(Value::as_str).map(str::to_owned);
+    Some(ReusedBaselineFacts {
+        attempt: text("of")?,
+        executed_at: record.get("executed_at").and_then(number)?,
+        selected_at: record.get("selected_at").and_then(number)?,
+        age_seconds: record.get("age_seconds").and_then(number)?,
+        original_seconds: baseline.get("total_result_seconds").and_then(number),
+        trace: text("trace")?,
+        retained_coverage: text("coverage")?,
+        retained_uncertainty: text("uncertainty")?,
+        model_free: record.get("model_metrics").and_then(Value::as_str)
+            == Some(crate::outcome_report::MODEL_METRICS_INAPPLICABLE),
+        model_metrics: text("model_metrics")?,
+        qualification: text("qualification")?,
+        candidate_started_at: candidate.get("started_at").and_then(number),
     })
 }
 

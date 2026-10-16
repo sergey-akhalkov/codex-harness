@@ -6583,3 +6583,325 @@ fn the_conjunction_counts_each_recorded_attempt_cost_once() {
         evaluation.reasons
     );
 }
+
+/// The conjunction consumes the declared complete costs: a raw saving that no
+/// longer repays the declared implementation, evaluation and maintenance over
+/// the declared horizon rejects adoption although every measured margin
+/// holds, and the cost is consumed exactly once (the quality-class unit
+/// accounting carries no net-saving verdict of its own).
+#[test]
+fn a_conjunction_member_must_repay_the_declared_complete_costs() {
+    let rows = conjunction_pair("case-q", 100.0, false, 400, 40.0, true, 160);
+
+    // 60 s recorded per task over the declared 5-task horizon is 300 s of
+    // saving; a declared implementation cost of 300 s plus the 5 s
+    // evaluation and the 0.5 s/task maintenance (307.5 s total) turns the net
+    // saving negative although every measured member holds.
+    let mut unpaying = conjunction_policy();
+    unpaying.overhead.implementation_seconds = 300.0;
+    let declared = declare(&unpaying);
+    let report = summarize(&rows, &unpaying);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| reason.contains(
+            "does not repay the declared implementation, evaluation and maintenance cost"
+        )),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The declared cost reaches the decision exactly once: the accounting
+    // owner computes its net-saving verdict for the time and resource
+    // classes only, so an otherwise comparable quality-class unit records
+    // no net saving of its own and no second formula consumes the same
+    // declared costs.
+    let comparable = summarize(
+        &conjunction_pair("case-q", 100.0, true, 400, 40.0, true, 160),
+        &conjunction_policy(),
+    );
+    let units = comparable["units"].as_array().expect("unit records");
+    assert_eq!(units.len(), 1, "{comparable}");
+    assert!(
+        units[0]["net_saving"].is_null(),
+        "no quality-class net saving is recorded at the unit level: {}",
+        units[0]
+    );
+
+    // Within the declared complete costs the same measured pair repays its
+    // overhead and the conjunction holds. The borderline carries the
+    // counting evidence: the single consumption leaves the recorded saving
+    // 2.5 s above zero, while any second subtraction of the same declared
+    // costs would drive the comparison negative.
+    let mut paying = conjunction_policy();
+    paying.overhead.implementation_seconds = 290.0;
+    let declared = declare(&paying);
+    let report = summarize(&rows, &paying);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+/// A verdict-changing attribution bound reaches the conjunction: when the
+/// accounting can bound the observed units, an admissible range that can move
+/// the time member below its declared useful margin keeps the result
+/// inconclusive instead of adopting on the recorded totals, and a partially
+/// bounded panel cannot state the conjunction at all. Unbounded units keep
+/// the recorded totals as the decision basis and still adopt.
+#[test]
+fn a_conjunction_verdict_stays_inconclusive_when_a_bound_can_reverse_it() {
+    let policy = conjunction_policy();
+    let declared = declare(&policy);
+
+    // Recorded totals: 100 s -> 40 s (60%) and 400 -> 160 tokens (60%)
+    // against the declared 10% margins, with acceptance improving. The
+    // candidate's admissible range reaches 95 s, so the admissible total-time
+    // reduction is 5%..70% and can reverse the time member.
+    let mut baseline = recorded_tokens(
+        attempt(
+            "b1",
+            "baseline",
+            "case-q",
+            0.0,
+            100.0,
+            false,
+            Some(4),
+            Some(6),
+            false,
+        ),
+        400,
+    );
+    let mut candidate = recorded_tokens(
+        attempt(
+            "c1",
+            "candidate",
+            "case-q",
+            200.0,
+            40.0,
+            true,
+            Some(3),
+            Some(6),
+            false,
+        ),
+        160,
+    );
+    bounded(&mut baseline, 100.0, 100.0);
+    bounded(&mut candidate, 30.0, 95.0);
+    let report = summarize(&[baseline, candidate], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("admissible attribution bounds")
+                && reason.contains("below its declared useful margin")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A fully bounded range that stays beyond the declared margin and within
+    // tolerance (admissible reduction 40%..70%) adopts.
+    let mut baseline = recorded_tokens(
+        attempt(
+            "b2",
+            "baseline",
+            "case-q",
+            0.0,
+            100.0,
+            false,
+            Some(4),
+            Some(6),
+            false,
+        ),
+        400,
+    );
+    let mut candidate = recorded_tokens(
+        attempt(
+            "c2",
+            "candidate",
+            "case-q",
+            200.0,
+            40.0,
+            true,
+            Some(3),
+            Some(6),
+            false,
+        ),
+        160,
+    );
+    bounded(&mut baseline, 100.0, 100.0);
+    bounded(&mut candidate, 30.0, 60.0);
+    let report = summarize(&[baseline, candidate], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Without attribution bounds the recorded totals remain the decision
+    // basis and the same measured pair adopts.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, false, 400, 40.0, true, 160),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A panel with admissible bounds on only part of its units cannot state
+    // the conjunction.
+    let mut bounded_pair = conjunction_pair("case-a", 100.0, false, 400, 40.0, true, 160);
+    bounded(&mut bounded_pair[0], 100.0, 100.0);
+    bounded(&mut bounded_pair[1], 40.0, 60.0);
+    let mut rows = bounded_pair;
+    rows.extend(conjunction_pair(
+        "case-b", 100.0, false, 400, 40.0, true, 160,
+    ));
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("only 1 of 2 observed unit(s)")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+/// Retained-baseline reuse reaches the conjunction through the accounting
+/// owner's normalized record: a unit whose baseline is retained evidence
+/// cannot be consumed under a policy that declares no baseline-reuse clause,
+/// while the same measured pair without retained evidence adopts.
+#[test]
+fn a_conjunction_cannot_consume_retained_baseline_evidence_without_its_clause() {
+    let policy = conjunction_policy();
+    let declared = declare(&policy);
+
+    let baseline = retained(
+        recorded_tokens(
+            attempt(
+                "b1",
+                "baseline",
+                "case-q",
+                0.0,
+                100.0,
+                false,
+                Some(4),
+                Some(6),
+                false,
+            ),
+            400,
+        ),
+        10.0,
+        20.0,
+        30.0,
+    );
+    let candidate = conditions(
+        recorded_tokens(
+            attempt(
+                "c1",
+                "candidate",
+                "case-q",
+                200.0,
+                40.0,
+                true,
+                Some(3),
+                Some(6),
+                false,
+            ),
+            160,
+        ),
+        "owned-cold",
+        "recorded-idle",
+    );
+    let report = summarize(&[baseline, candidate], &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("without a predeclared baseline-reuse clause")),
+        "the retained baseline must reach the conjunction's reuse guard exactly once: {:?}",
+        evaluation.reasons
+    );
+
+    // The identical measured result without retained evidence adopts, so the
+    // refusal is the reuse guard and not the measurement.
+    let report = summarize(
+        &[
+            recorded_tokens(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-q",
+                    0.0,
+                    100.0,
+                    false,
+                    Some(4),
+                    Some(6),
+                    false,
+                ),
+                400,
+            ),
+            conditions(
+                recorded_tokens(
+                    attempt(
+                        "c2",
+                        "candidate",
+                        "case-q",
+                        200.0,
+                        40.0,
+                        true,
+                        Some(3),
+                        Some(6),
+                        false,
+                    ),
+                    160,
+                ),
+                "owned-cold",
+                "recorded-idle",
+            ),
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+}
