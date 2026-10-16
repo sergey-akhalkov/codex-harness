@@ -16,7 +16,7 @@ use std::{
 };
 
 #[path = "tool_catalogue.rs"]
-mod tool_catalogue;
+pub mod tool_catalogue;
 
 pub const PROVIDER_ID: &str = "canned_skill_catalog";
 pub const API_KEY: &str = "canned-skill-catalog-fixture-key";
@@ -46,6 +46,10 @@ pub const ALL_TOOLS_PROBE_PROMPT: &str = "Canned all-tools settle probe: report 
 const TITLE_PROMPT: &str = "Generate a concise, single-line task title";
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
+/// Idle keep-alive bound for one accepted connection: the client may hold
+/// a pooled connection across probe rounds, so the bound only stops a
+/// socket from outliving the run; it stays longer than any probe.
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct CapturedRequest {
@@ -191,10 +195,29 @@ impl Drop for CannedResponses {
     }
 }
 
+/// One line per accepted connection, request, response and read error,
+/// appended to the fixture root's `connections.log`: the local socket
+/// exchange is the only place where a client-side send failure can be told
+/// apart from a request the fixture never received.
+fn connection_log(inner: &Inner, message: &str) {
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(inner.root.join("connections.log"))
+    {
+        let _ = writeln!(file, "{unix_ms} {message}");
+    }
+}
+
 fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
     while !inner.stop.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                connection_log(&inner, &format!("accept peer={peer}"));
                 let inner = Arc::clone(&inner);
                 thread::spawn(move || {
                     let _ = handle_connection(stream, inner);
@@ -218,42 +241,88 @@ fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
 }
 
 fn handle_connection(mut stream: TcpStream, inner: Arc<Inner>) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    // A Windows accept inherits the non-blocking listener mode; in that
+    // mode every read after the first response returns immediately and the
+    // keep-alive loop below would close each connection after one request.
+    // Blocking mode lets the timeouts below bound idle waits instead.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(CONNECTION_IDLE_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let request = read_http(&mut stream)?;
-    let method = request.method;
-    let path = request.path;
-    let headers = request.headers;
-    let body = request.body;
-    if method == "POST"
-        && headers
-            .get("expect")
-            .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
-    {
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+    loop {
+        let request = match read_http(&mut stream) {
+            Ok(request) => request,
+            Err(error) => {
+                connection_log(
+                    &inner,
+                    &format!(
+                        "read-error peer={peer} kind={:?} error={error}",
+                        error.kind()
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        let method = request.method;
+        let path = request.path;
+        let headers = request.headers;
+        let body = request.body;
+        // HTTP/1.1 keeps one connection alive unless the client asks to
+        // close. A client that reuses it for its next request is then served
+        // here instead of writing into a closed peer.
+        let close = headers
+            .get("connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"));
+        connection_log(
+            &inner,
+            &format!("request peer={peer} method={method} path={path} close={close}"),
+        );
+        if method == "POST"
+            && headers
+                .get("expect")
+                .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
+        {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        }
+        let body_text = String::from_utf8_lossy(&body).into_owned();
+        let kind = classify(&method, &path, &body_text, &inner);
+        let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
+        let captured = CapturedRequest {
+            seq,
+            method: method.clone(),
+            path: path.clone(),
+            body: if body_text.len() > MAX_BODY {
+                body_text[..MAX_BODY].to_string()
+            } else {
+                body_text.clone()
+            },
+            unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            kind,
+        };
+        persist_request(&inner.root, &captured);
+        inner.requests.lock().unwrap().push(captured);
+        let (status, content_type, payload) =
+            response_for(&method, &path, kind, &body_text, &inner);
+        let result = write_response(&mut stream, status, content_type, payload.as_bytes(), close);
+        connection_log(
+            &inner,
+            &format!(
+                "response peer={peer} status={status} bytes={} result={:?}",
+                payload.len(),
+                result.as_ref().err().map(io::Error::kind)
+            ),
+        );
+        result?;
+        if close {
+            return Ok(());
+        }
     }
-    let body_text = String::from_utf8_lossy(&body).into_owned();
-    let kind = classify(&method, &path, &body_text, &inner);
-    let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
-    let captured = CapturedRequest {
-        seq,
-        method: method.clone(),
-        path: path.clone(),
-        body: if body_text.len() > MAX_BODY {
-            body_text[..MAX_BODY].to_string()
-        } else {
-            body_text.clone()
-        },
-        unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        kind,
-    };
-    persist_request(&inner.root, &captured);
-    inner.requests.lock().unwrap().push(captured);
-    let (status, content_type, payload) = response_for(&method, &path, kind, &body_text, &inner);
-    write_response(&mut stream, status, content_type, payload.as_bytes())
 }
 
 fn classify(method: &str, path: &str, body: &str, inner: &Inner) -> RequestKind {
@@ -370,19 +439,19 @@ fn response_for(
             || (kind == RequestKind::Other && body.contains(ALL_TOOLS_PROBE_PROMPT)));
     if probing {
         let mut pending = inner.pending_probe.lock().unwrap();
-        if let Some(call_id) = pending.clone() {
-            if probe_output_present(body, &call_id) {
-                *pending = None;
-                return (
-                    "200 OK",
-                    "text/event-stream",
-                    message_sse(
-                        &format!("all-tools-done-{call_id}"),
-                        "CANNED_ALL_TOOLS_DONE",
-                        400,
-                    ),
-                );
-            }
+        if let Some(call_id) = pending.clone()
+            && probe_output_present(body, &call_id)
+        {
+            *pending = None;
+            return (
+                "200 OK",
+                "text/event-stream",
+                message_sse(
+                    &format!("all-tools-done-{call_id}"),
+                    "CANNED_ALL_TOOLS_DONE",
+                    400,
+                ),
+            );
         }
         let call_id = format!(
             "{}{}",
@@ -712,9 +781,11 @@ fn write_response(
     status: &str,
     content_type: &str,
     body: &[u8],
+    close: bool,
 ) -> io::Result<()> {
+    let connection = if close { "Connection: close\r\n" } else { "" };
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n{connection}\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;

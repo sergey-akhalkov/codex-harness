@@ -8,8 +8,7 @@ mod native_sampling;
 mod skill_catalog_responses;
 #[path = "fixtures/synthetic_role_build.rs"]
 mod synthetic_role_build;
-#[path = "fixtures/tool_catalogue.rs"]
-mod tool_catalogue;
+use skill_catalog_responses::tool_catalogue;
 
 use harness_core::{
     build_identity,
@@ -3449,9 +3448,12 @@ fn tree_paths(root: &Path) -> Vec<String> {
 /// session's first-request surface. The unsuppressed control run proves the
 /// probe observes the runtime surface while the feature is on: a control that
 /// exposes nothing leaves this check with no observation and the task open
-/// rather than passing vacuously. Driven over the installed native CLI TUI
-/// against the canned local Responses server; no billed model call and no
-/// shared configuration write.
+/// rather than passing vacuously. Both probe homes also register the
+/// first-party fixture as a real unrelated MCP server, and both sessions
+/// must keep its discovered tools with its own recorded handshake: the
+/// suppression drops the competing worktree surface, not unrelated servers.
+/// Driven over the installed native CLI TUI against the canned local
+/// Responses server; no billed model call and no shared configuration write.
 #[test]
 #[ignore = "explicit installed native CLI ordinary TUI + canned local Responses; no live model"]
 fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf() {
@@ -3481,6 +3483,10 @@ fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_manage
         control.names,
         evidence.display()
     );
+    // The same control home carries the registered unrelated MCP server, so
+    // a managed session that kept it proves preservation rather than an
+    // absent MCP surface.
+    assert_unrelated_mcp_preserved(&control, "the unsuppressed control session");
 
     let suppressed = installed_tui_all_tools(
         &upstream,
@@ -3501,13 +3507,16 @@ fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_manage
         "features.worktrees=false left the competing worktree surface in the session: runtime {suppressed_fragments:?}, request surface {surface_fragments:?}; evidence {}",
         evidence.display()
     );
+    assert_unrelated_mcp_preserved(&suppressed, "the managed-leaf session");
     write_json(
         &evidence.join("acceptance.json"),
         &json!({
             "control_fragments": control_fragments,
             "control_names": control.names,
+            "control_unrelated": tool_catalogue::unrelated_probe_names(&control.names),
             "suppressed_fragments": suppressed_fragments,
             "suppressed_names": suppressed.names,
+            "suppressed_unrelated": tool_catalogue::unrelated_probe_names(&suppressed.names),
             "suppressed_surface_fragments": surface_fragments,
         }),
     );
@@ -3531,8 +3540,11 @@ fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_manage
 /// tools, both managed roles stay free of them, a selected profile that
 /// carries no features.worktrees choice still receives the suppression
 /// default, and an explicit winning profile true is honored with a truthful
-/// conflict report at the real entry point. No global deployment and no
-/// billed model call.
+/// conflict report at the real entry point. Every session in this probe also
+/// carries the registered first-party fixture as a real unrelated MCP server
+/// and must keep its discovered tools with the server's own recorded
+/// handshake, so no route may pass by dropping unrelated servers. No global
+/// deployment and no billed model call.
 #[test]
 #[ignore = "explicit installed native CLI TUI through the real launcher + canned local Responses; no live model"]
 fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {
@@ -3568,6 +3580,7 @@ fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {
         control.names,
         evidence.display()
     );
+    assert_unrelated_mcp_preserved(&control, "the unsuppressed control session");
 
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -3592,6 +3605,7 @@ fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {
             "the managed {route} session reported a worktree conflict it does not have; evidence {}",
             evidence.display()
         );
+        assert_unrelated_mcp_preserved(catalogue, &format!("the managed {route} session"));
     };
 
     let lead = managed_tui_all_tools(&install, &evidence, "managed-lead", &[], false, &[], 3);
@@ -3650,20 +3664,26 @@ fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {
         "the re-exposed native tools must be reported at the real entry point; evidence {}",
         evidence.display()
     );
+    assert_unrelated_mcp_preserved(&explicit, "the explicit-true profile session");
 
     write_json(
         &evidence.join("acceptance.json"),
         &json!({
             "control_fragments": control_fragments,
             "control_names": control.names,
+            "control_unrelated": tool_catalogue::unrelated_probe_names(&control.names),
             "lead_fragments": worktree_names(&lead.names),
             "lead_names": lead.names,
+            "lead_unrelated": tool_catalogue::unrelated_probe_names(&lead.names),
             "executor_fragments": worktree_names(&executor.names),
             "executor_names": executor.names,
+            "executor_unrelated": tool_catalogue::unrelated_probe_names(&executor.names),
             "profile_fragments": worktree_names(&profiled.names),
             "profile_names": profiled.names,
+            "profile_unrelated": tool_catalogue::unrelated_probe_names(&profiled.names),
             "explicit_fragments": explicit_fragments,
             "explicit_names": explicit.names,
+            "explicit_unrelated": tool_catalogue::unrelated_probe_names(&explicit.names),
         }),
     );
     println!(
@@ -3895,8 +3915,9 @@ fn catalogue_role_executor_disables_lead_skills_across_linked_worktree_copies() 
     drop(linked_worktree);
 }
 
-/// Explicit native probe of what installed 0.162.1 actually consumes for a
-/// managed resume. Fresh starts consume the composed role text and the live
+/// Explicit native probe of what the installed native CLI (0.162.1 or
+/// 0.163.0) actually consumes for a managed resume. Fresh starts consume the
+/// composed role text and the live
 /// skill selection. A resumed thread keeps the developer text saved at its
 /// start and retains the skill entries saved then, while skills added later
 /// are picked up from the live surface; neither `config.developer_instructions`
@@ -3918,8 +3939,10 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
     assert!(upstream.is_absolute() && upstream.is_file());
     let version = Command::new(&upstream).arg("--version").output().unwrap();
     let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    // The installed native CLI is exactly the observed 0.162.1 or 0.163.0 in
+    // its normal `codex-cli <version>` form; any other version stays refused.
     assert!(
-        version.contains("0.162.1"),
+        version == "codex-cli 0.162.1" || version == "codex-cli 0.163.0",
         "unexpected native CLI: {version}"
     );
 
@@ -3955,10 +3978,12 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
     );
 
     let canned = CannedResponses::spawn(&evidence).unwrap();
-    write_role_probe_home(&home, &case, &canned, "");
+    let unrelated = unrelated_probe_mcp(&home);
+    write_role_probe_home(&home, &case, &canned, &unrelated);
 
     let (lead_revision, lead_args) =
         role_args(&home, &case, harness_core::role_context::Role::Lead);
+    clear_probe_receipt(&home);
     let lead_body = {
         let mut lead = RoleAppServer::spawn(&upstream, &home, &case, &lead_args, false, None);
         lead.initialize();
@@ -3967,6 +3992,13 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
         lead.shutdown();
         body
     };
+    let lead_receipt = wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the lead route must leave a fresh unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&home).display()
+        )
+    });
+    assert_probe_receipt(&lead_receipt, "the lead route");
 
     let (start_revision, mut start_args) =
         role_args(&home, &case, harness_core::role_context::Role::Executor);
@@ -3974,6 +4006,7 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
     start_args.push("agents.enabled=false".into());
     let mut threads = Vec::new();
     let mut start_bodies = Vec::new();
+    clear_probe_receipt(&home);
     {
         let mut executor = RoleAppServer::spawn(&upstream, &home, &case, &start_args, true, None);
         executor.initialize();
@@ -3985,6 +4018,13 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
         }
         executor.shutdown();
     }
+    let start_receipt = wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the executor start routes must leave a fresh unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&home).display()
+        )
+    });
+    assert_probe_receipt(&start_receipt, "the executor start routes");
 
     fs::write(
         source.join("global/executor.md"),
@@ -4026,6 +4066,7 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
     ];
     let mut resume_answers = Vec::new();
     let mut resume_bodies = Vec::new();
+    clear_probe_receipt(&home);
     let restart_body = {
         let mut executor = RoleAppServer::spawn(&upstream, &home, &case, &resume_args, true, None);
         executor.initialize();
@@ -4051,6 +4092,13 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
         executor.shutdown();
         restart_body
     };
+    let resume_receipt = wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the resume and restart routes must leave a fresh unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&home).display()
+        )
+    });
+    assert_probe_receipt(&resume_receipt, "the resume and restart routes");
 
     for (name, body) in start_bodies
         .iter()
@@ -4095,6 +4143,11 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
         "executor_resume": resume_bodies.iter().map(|body| described(body)).collect::<Vec<_>>(),
         "restart": described(&restart_body),
         "resume_answers": resume_answers,
+        "receipts": {
+            "lead": lead_receipt["calls"].clone(),
+            "executor_start": start_receipt["calls"].clone(),
+            "executor_resume": resume_receipt["calls"].clone(),
+        },
     });
     write_json(&evidence.join("report.json"), &report);
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -4191,6 +4244,49 @@ fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue(
     assert_eq!(report["restart"]["unrelated"], true);
     assert_eq!(report["restart"]["spawn_agent"], false);
     assert_eq!(report["restart"]["multi_agent"], false);
+
+    // The live catalogue of every captured turn - fresh starts, the three
+    // resumed threads and the restart contrast - stays free of the competing
+    // native worktree surface, while every turn keeps the registered
+    // unrelated MCP server's model-visible surface. The managed app-server
+    // route advertises that server as the single `mcp__unrelated_probe`
+    // namespace entry (the TUI catalogue route reports its expanded
+    // `mcp__unrelated_probe__*` tools), and the fresh per-session receipts
+    // asserted above record each session's real handshake with it:
+    // suppression must drop only the competing surface, at the resume and
+    // restart boundaries too.
+    let assert_boundary = |label: String, entry: &Value| {
+        assert!(
+            entry["worktree_tools"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{label} must stay free of the competing native worktree tools: {entry}"
+        );
+        assert!(
+            entry["unrelated_tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{label} must keep the registered unrelated MCP server's tools: {entry}"
+        );
+    };
+    assert_boundary("the lead start".to_owned(), &report["lead"]);
+    for (index, start) in report["executor_start"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_boundary(format!("executor start {index}"), start);
+    }
+    for (index, resume) in report["executor_resume"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_boundary(format!("executor resume {index}"), resume);
+    }
+    assert_boundary("the restart contrast".to_owned(), &report["restart"]);
 }
 
 /// One native app-server child driven over stdio JSON-RPC, the same protocol
@@ -4447,6 +4543,8 @@ fn described(body: &str) -> Value {
         "user_unrelated": body.contains(&format!("- {CATALOGUE_USER_UNRELATED_SKILL}:")),
         "spawn_agent": tools.iter().any(|name| name.contains("spawn")),
         "multi_agent": tools.iter().any(|name| name.contains("multi_agent")),
+        "worktree_tools": tool_catalogue::native_worktree_names(&tools),
+        "unrelated_tools": tool_catalogue::unrelated_probe_surface(&tools),
         "tools": tools,
     })
 }
@@ -4602,6 +4700,12 @@ fn spawn_probe_tui_args(
 /// call, plus the session's static first-request surface and console
 /// transcript for evidence.
 struct RuntimeCatalogue {
+    /// The probe root this reading belongs to: the workspace and every
+    /// evidence file of the reading live beneath it.
+    root: PathBuf,
+    /// The probe home the reading ran with: the registered unrelated MCP
+    /// server and its handshake receipt live beneath it.
+    home: PathBuf,
     names: Vec<String>,
     surface: (Vec<String>, String),
     transcript: String,
@@ -4665,7 +4769,8 @@ fn installed_tui_all_tools(
     fs::create_dir_all(&workspace).unwrap();
     git_identity(&workspace);
     let canned = CannedResponses::spawn_all_tools(&root).unwrap();
-    write_probe_config(&home, &workspace, &canned, "", false);
+    let unrelated = unrelated_probe_mcp(&home);
+    write_probe_config(&home, &workspace, &canned, &unrelated, false);
     let session = spawn_probe_tui_args(exe, &home, &workspace, extra);
     tui_all_tools_probe(&root, &home, &canned, session, label, rounds)
 }
@@ -4683,7 +4788,7 @@ fn tui_all_tools_probe(
     label: &str,
     rounds: usize,
 ) -> RuntimeCatalogue {
-    ready_named(&session, &root, &home, &format!("RuntimeTools{label}"));
+    ready_named(&session, root, home, &format!("RuntimeTools{label}"));
     let mut names = Vec::new();
     for round in 1..=rounds {
         let before = probe_readings(&canned.requests());
@@ -4737,9 +4842,110 @@ fn tui_all_tools_probe(
         &json!({"names": &surface.0, "definitions": &surface.1}),
     );
     RuntimeCatalogue {
+        root: root.to_path_buf(),
+        home: home.to_path_buf(),
         names,
         surface,
         transcript,
+    }
+}
+
+/// Registers the first-party probe fixture as a real unrelated stdio MCP
+/// server inside one probe home: the session must start the server, discover
+/// its tools and keep every one of them while the competing native worktree
+/// surface is suppressed. Returns the `[mcp_servers]` configuration layer
+/// naming the copied fixture, whose sibling receipt records the handshake.
+fn unrelated_probe_mcp(home: &Path) -> String {
+    let directory = home.join("mcp-probe");
+    fs::create_dir_all(&directory).unwrap();
+    let executable = directory.join("harness-mcp-probe-fixture.exe");
+    fs::copy(env!("CARGO_BIN_EXE_harness-mcp-probe-fixture"), &executable).unwrap();
+    fs::write(
+        executable.with_extension("json"),
+        serde_json::to_vec(&json!({"mode": "valid", "kind": "nuphus"})).unwrap(),
+    )
+    .unwrap();
+    format!(
+        "[mcp_servers.unrelated_probe]\ncommand = {}\n",
+        serde_json::to_string(&executable.to_string_lossy()).unwrap()
+    )
+}
+
+/// Asserts one probe session really reached the registered unrelated MCP
+/// server and kept its tools: the runtime catalogue carries the server's
+/// model-visible namespace and the server's own receipt records its
+/// initialize/tools-list handshake. A suppressed comparison that silently
+/// dropped unrelated servers fails here instead of passing as "no tools".
+fn assert_unrelated_mcp_preserved(catalogue: &RuntimeCatalogue, label: &str) {
+    let tools = tool_catalogue::unrelated_probe_names(&catalogue.names);
+    assert!(
+        !tools.is_empty(),
+        "{label} must preserve the registered unrelated MCP server's tools: names {:?}; evidence {}",
+        catalogue.names,
+        catalogue.root.display()
+    );
+    let receipt = wait_for_probe_receipt(&catalogue.home).unwrap_or_else(|| {
+        panic!(
+            "{label} must leave a complete unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&catalogue.home).display()
+        )
+    });
+    assert_probe_receipt(&receipt, label);
+}
+
+/// The copied probe fixture's own handshake receipt inside one probe home:
+/// the fixture rewrites it beside its copied executable for every method it
+/// receives, so one receipt file serves a whole probe home.
+fn probe_receipt_path(home: &Path) -> PathBuf {
+    home.join("mcp-probe")
+        .join("harness-mcp-probe-fixture.receipt.json")
+}
+
+/// The copied fixture's receipt once it records a complete handshake. One
+/// receipt file is shared per probe home, so a caller that needs fresh
+/// per-session evidence clears it before the session and waits here after.
+fn wait_for_probe_receipt(home: &Path) -> Option<Value> {
+    let receipt_path = probe_receipt_path(home);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let complete = fs::read(&receipt_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if let Some(value) = complete {
+            let handshaken = value["calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().any(|call| call.as_str() == Some("tools/list")));
+            if handshaken {
+                return Some(value);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+/// Clears any receipt an earlier probe session left behind, so the next
+/// session's handshake is proven by a fresh file rather than its
+/// predecessor's.
+fn clear_probe_receipt(home: &Path) {
+    let _ = fs::remove_file(probe_receipt_path(home));
+}
+
+/// Asserts one real handshake receipt records the initialize/tools-list
+/// exchange: the fixture's own evidence that a session reached it as a real
+/// stdio MCP server rather than merely echoing its registration.
+fn assert_probe_receipt(receipt: &Value, label: &str) {
+    let calls = receipt["calls"]
+        .as_array()
+        .expect("the MCP server receipt records its received methods")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for method in ["initialize", "notifications/initialized", "tools/list"] {
+        assert!(
+            calls.contains(&method),
+            "{label}: the unrelated MCP server must record its real {method} handshake: {calls:?}"
+        );
     }
 }
 
@@ -4897,7 +5103,8 @@ fn managed_tui_all_tools(
         .unwrap(),
     );
     let canned = CannedResponses::spawn_all_tools(&root).unwrap();
-    write_probe_config(&home, &workspace, &canned, "", false);
+    let unrelated = unrelated_probe_mcp(&home);
+    write_probe_config(&home, &workspace, &canned, &unrelated, false);
     for (name, body) in home_files {
         fs::write(home.join(name), body).unwrap();
     }

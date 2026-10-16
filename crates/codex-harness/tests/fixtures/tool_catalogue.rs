@@ -78,6 +78,47 @@ pub fn native_worktree_names(names: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The model-visible namespace of the synthetic unrelated MCP server the
+/// owned catalogue probes register beside the competing worktree surface:
+/// the first-party probe fixture, started as a real stdio server, keeps
+/// every tool under this prefix while a suppressed comparison must keep all
+/// of them alongside the dropped native worktree entries.
+pub const UNRELATED_PROBE_PREFIX: &str = "mcp__unrelated_probe__";
+
+/// The unrelated MCP server's discovered tools in one runtime catalogue. An
+/// empty result means the session never reached that server, so a
+/// preservation assertion must treat it as a missing observation rather than
+/// a pass.
+pub fn unrelated_probe_names(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| name.starts_with(UNRELATED_PROBE_PREFIX))
+        .cloned()
+        .collect()
+}
+
+/// The server-level namespace entry the managed app-server route advertises
+/// for that same registered server: its captured model request carries one
+/// `mcp__unrelated_probe` namespace tool instead of the expanded
+/// `mcp__unrelated_probe__*` names the TUI catalogue route reports.
+pub const UNRELATED_PROBE_NAMESPACE: &str = "mcp__unrelated_probe";
+
+/// The registered unrelated MCP server's model-visible surface in one
+/// captured tool list, in whichever form the observing route advertises it:
+/// expanded `mcp__unrelated_probe__*` tools or the single server namespace
+/// entry. An empty result means that surface never carried the server, so a
+/// preservation assertion must treat it as a missing observation rather
+/// than a pass.
+pub fn unrelated_probe_surface(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| {
+            name.starts_with(UNRELATED_PROBE_PREFIX) || name.as_str() == UNRELATED_PROBE_NAMESPACE
+        })
+        .cloned()
+        .collect()
+}
+
 /// The visible tool surface of one captured model request: tool names reachable
 /// through top-level `tools` entries, `additional_tools` input namespaces and
 /// entries nested under both, plus the tool-definition text that carries any

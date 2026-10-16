@@ -3,8 +3,7 @@
 #![cfg(windows)]
 #[path = "fixtures/control_responses.rs"]
 mod control_responses;
-#[path = "fixtures/tool_catalogue.rs"]
-mod tool_catalogue;
+use control_responses::tool_catalogue;
 use harness_core::{
     broker_state::BrokerRoot,
     build_identity::{self, BuildRecord},

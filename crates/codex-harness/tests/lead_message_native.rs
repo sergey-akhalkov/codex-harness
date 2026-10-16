@@ -610,7 +610,7 @@ fn two_lead_router(state: Arc<Mutex<LeadRoute>>) -> impl Fn(&Value) -> Value + S
                 "name": "exec_command",
                 "arguments": serde_json::to_string(&json!({
                     "cmd": command,
-                    "shell": "powershell",
+                    "shell": control_responses::owned_pwsh(),
                     "yield_time_ms": 60000
                 }))
                 .unwrap()
@@ -3838,7 +3838,7 @@ trust_level = "trusted"
     );
     let notice_text = format!("{}{}", notice["stdout"], notice["stderr"]);
     assert!(
-        notice["exited"] == Value::Bool(true) && notice["exitCode"] == Value::from(0),
+        notice["exited"] == Value::Bool(true) && notice["exitCode"] == 0,
         "the first notification must finish with exit 0: {notice}; evidence {}",
         root.display()
     );
@@ -3878,7 +3878,7 @@ trust_level = "trusted"
 
     let repeat_text = format!("{}{}", repeat["stdout"], repeat["stderr"]);
     assert!(
-        repeat["exited"] == Value::Bool(true) && repeat["exitCode"] == Value::from(0),
+        repeat["exited"] == Value::Bool(true) && repeat["exitCode"] == 0,
         "the repeat must finish with exit 0: {repeat}; evidence {}",
         root.display()
     );
@@ -3907,7 +3907,7 @@ trust_level = "trusted"
 
     let spill_text = format!("{}{}", spill["stdout"], spill["stderr"]);
     assert!(
-        spill["exited"] == Value::Bool(true) && spill["exitCode"] == Value::from(0),
+        spill["exited"] == Value::Bool(true) && spill["exitCode"] == 0,
         "the spilled notification must finish with exit 0: {spill}; evidence {}",
         root.display()
     );
@@ -3935,7 +3935,7 @@ trust_level = "trusted"
 
     let missing_text = format!("{}{}", missing["stdout"], missing["stderr"]);
     assert!(
-        missing["exited"] == Value::Bool(true) && missing["exitCode"] == Value::from(1),
+        missing["exited"] == Value::Bool(true) && missing["exitCode"] == 1,
         "a target the receiver does not own must be refused as a recorded error: {missing}; evidence {}",
         root.display()
     );
@@ -3964,7 +3964,7 @@ trust_level = "trusted"
     );
     assert!(
         stopped["exited"] == Value::Bool(true)
-            && (stopped["exitCode"] == Value::from(0) || stopped["exitCode"] == Value::from(1)),
+            && (stopped["exitCode"] == 0 || stopped["exitCode"] == 1),
         "the stopped-target arm must finish with an honest classified result, not a crash or a timeout: {stopped}; evidence {}",
         root.display()
     );
@@ -3990,7 +3990,7 @@ trust_level = "trusted"
         "the stopped receiver must not be resurrected; evidence {}",
         root.display()
     );
-    if stopped["exitCode"] == Value::from(1) {
+    if stopped["exitCode"] == 1 {
         assert!(
             stopped_text.contains("lead message: error")
                 || stopped_text.contains("lead message: indeterminate"),

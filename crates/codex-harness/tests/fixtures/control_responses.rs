@@ -17,7 +17,7 @@ use std::{
 };
 
 #[path = "tool_catalogue.rs"]
-mod tool_catalogue;
+pub mod tool_catalogue;
 
 pub const FINAL: &str = "CONTROL_TOOL_RESULT_CONSUMED";
 pub const PARENT_FINAL: &str = "CONTROL_PARENT_RESULTS_CONSUMED";
@@ -27,6 +27,31 @@ enum Quota {
     None,
     Refusal,
     Handoff,
+}
+
+/// The owner's PowerShell 7 executable for fabricated owned native actions:
+/// the same resolution order the accepted desktop helpers use, so the request
+/// never names Windows PowerShell 5.1.
+#[allow(dead_code)] // Only the binaries that fabricate an owned action use it.
+pub fn owned_pwsh() -> String {
+    if let Some(path) = std::env::var_os("HARNESS_ACCEPTANCE_POWERSHELL") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    let known = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+    if known.is_file() {
+        return known.to_string_lossy().into_owned();
+    }
+    if let Some(found) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|entry| entry.join("pwsh.exe"))
+            .find(|entry| entry.is_file())
+    }) {
+        return found.to_string_lossy().into_owned();
+    }
+    panic!("owner PowerShell 7 (pwsh.exe) is required for the owned native action")
 }
 
 pub struct Responses {
@@ -376,7 +401,7 @@ impl Responses {
                     });
                     if !read_done {
                         json!({"type":"function_call","call_id":"control-read-1","name":"exec_command",
-                            "arguments":serde_json::to_string(&json!({"cmd":"Get-Content proof.txt","shell":"powershell","yield_time_ms":10000})).unwrap()})
+                            "arguments":serde_json::to_string(&json!({"cmd":"Get-Content proof.txt","shell":owned_pwsh(),"yield_time_ms":10000})).unwrap()})
                     } else {
                         assert!(
                             request["input"]
@@ -399,7 +424,7 @@ impl Responses {
                 } else if helper_worker {
                     let arguments=serde_json::to_string(&json!({
                         "cmd":"[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt",
-                        "shell":"powershell","yield_time_ms":10000
+                        "shell":owned_pwsh(),"yield_time_ms":10000
                     })).unwrap();
                     if request["tools"].as_array().is_some_and(|tools| {
                         tools
@@ -573,7 +598,7 @@ impl Responses {
                     let arguments=serde_json::to_string(&json!({
                         "cmd":if pair { pair_command.as_str() } else if view_loss || close_view || background { "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-tool); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-tool)) { throw 'owned tool release deadline' }; Get-Content proof.txt" }
                             else { "[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt" },
-                        "shell":"powershell","yield_time_ms":if background { 1000 } else if view_loss || close_view || pair { 30000 } else { 10000 }
+                        "shell":owned_pwsh(),"yield_time_ms":if background { 1000 } else if view_loss || close_view || pair { 30000 } else { 10000 }
                     })).unwrap();
                     // The owned action may run through the session's own
                     // code-mode `exec` orchestrator. The oldest native shape
@@ -951,9 +976,13 @@ fn advertises_custom_exec(request: &Value) -> bool {
     })
 }
 
+/// Headers (`name: value` pairs, original spelling) and raw body of one
+/// accepted fixture request.
+type RawRequest = (Vec<(String, String)>, Vec<u8>);
+
 /// One accepted request: the scripted Responses POST, or the model-catalogue
 /// probe a frontend issues before its first turn (`None`).
-fn read_request(stream: &mut TcpStream) -> Option<(Vec<(String, String)>, Vec<u8>)> {
+fn read_request(stream: &mut TcpStream) -> Option<RawRequest> {
     let mut bytes = Vec::new();
     let (start, length, headers) = loop {
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {

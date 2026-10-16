@@ -1,4 +1,7 @@
-//! Process-boundary double for dependency validation. Never registered as MCP.
+//! Process-boundary double for dependency validation. The owned ordinary-control
+//! case copies it into its test-only home and registers that copy as the synthetic
+//! `unrelated_probe` MCP server; no real installation or user configuration
+//! references it.
 #[cfg(windows)]
 mod windows {
     use serde_json::{Value, json};
