@@ -884,6 +884,333 @@ fn an_explicit_local_base_completes_offline_and_continuation_keeps_the_slot_work
     fixture.drop();
 }
 
+/// The bounded lead conversation route end to end: one fresh pooled lead
+/// dispatch resolves the configured lead profile and the lead role
+/// composition against the recorded synthetic build, its exact session
+/// continues on the same slot without resetting partial work, the app-server
+/// child itself reports the lead context instead of the executor one, and a
+/// receipt recorded for another role is refused before any launcher or model
+/// request with the previous run's evidence untouched.
+#[test]
+fn a_bounded_lead_conversation_dispatches_resumes_and_refuses_role_conversion() {
+    let fixture = Fixture::new("bounded-lead", 1);
+    install_launcher(
+        &fixture.home,
+        Path::new(env!("CARGO_BIN_EXE_harness-executor-fixture")),
+    );
+    // The configured lead profile is the base configuration itself; the
+    // executor profile keeps its ordinary ds route. Every route assertion
+    // below would change if the lead dispatch fell back to it.
+    fs::write(
+        fixture.home.join("config.toml"),
+        "model = 'lead-model'\nmodel_provider = 'lead-provider'\nmodel_reasoning_effort = 'xhigh'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let kit = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &kit);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+
+    // A lead continuation continues the configured lead profile only: an
+    // executor profile can never be selected, and the refusal precedes any
+    // slot or pool state.
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "lead-exp-1",
+        "--profile",
+        "ds",
+        "--session",
+        "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+        "--exec",
+        "text",
+    ]);
+    command.env_remove("WT_SESSION");
+    let refused = command.output().unwrap();
+    let text = output_text(&refused);
+    assert_ne!(refused.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(
+            "lead resume continues the configured lead profile: --profile is not accepted"
+        ),
+        "{text}"
+    );
+    assert!(
+        !fixture.slot(1).exists(),
+        "the profile refusal precedes any slot: {text}"
+    );
+
+    let objective = "Bound the synthetic lead conversation route";
+    let assignment = fixture.root.join("lead-assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document(objective, &["README.md"], &["out/lead-note.txt"]),
+    )
+    .unwrap();
+
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let child_record = fixture.root.join("app-server-child.json");
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "dispatch",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--owner",
+        "lead-exp-1",
+        "--assignment",
+        assignment.to_str().unwrap(),
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env("HARNESS_EXECUTOR_FIXTURE_RECORD", &child_record);
+    command.env_remove("WT_SESSION");
+    let dispatched = command.output().unwrap();
+    let text = output_text(&dispatched);
+
+    let slot = fixture.slot(1);
+    assert_eq!(dispatched.status.code(), Some(0), "{text}");
+    assert!(text.contains("host=owned-console"), "{text}");
+    assert!(text.contains("lead slot: index=1"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "lead presentation: mode=tui presentation=native-tui model=lead-model provider=lead-provider effort=xhigh cwd={}",
+            slot.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "lead dispatch accepted: profile=default model=lead-model provider=lead-provider effort=xhigh host=owned-console title=\"CLead (default) - lead-exp-1\""
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("lead role context: role=lead revision="),
+        "{text}"
+    );
+    assert!(
+        !text.contains("deepseek"),
+        "the bounded lead never falls back to an executor profile: {text}"
+    );
+
+    // The app-server child itself reports the effective role context: the
+    // lead composition, no executor session marker, and the native agent
+    // capability the lead keeps.
+    let child: Value = serde_json::from_slice(&fs::read(&child_record).unwrap()).unwrap();
+    assert_eq!(child["contextRole"], "lead", "{child}");
+    assert!(
+        child["contextRevision"]
+            .as_str()
+            .is_some_and(|revision| !revision.is_empty()),
+        "{child}"
+    );
+    assert_eq!(child["boundedLeadSession"], "1", "{child}");
+    assert!(child["executorSession"].is_null(), "{child}");
+    assert_eq!(child["currentDir"], slot.display().to_string(), "{child}");
+    let argv = child["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(argv.contains(&"app-server"), "{child}");
+    assert!(
+        !argv.contains(&"agents.enabled=false"),
+        "a bounded lead keeps the native agent capability: {child}"
+    );
+
+    // The dispatch receipt carries the lead composition, the lead-rendered
+    // assignment bound to this exact slot and the observed lifecycle.
+    let state = pooled_state_dir(&fixture.home);
+    let receipt_path = pooled_receipt_path(&fixture.home, 1);
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["profile"], "default", "{receipt}");
+    assert_eq!(receipt["control"]["role"]["role"], "lead", "{receipt}");
+    let role_args = receipt["control"]["role"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        role_args.contains("Fixture lead responsibility"),
+        "{receipt}"
+    );
+    assert!(
+        !role_args.contains("Fixture executor responsibility"),
+        "{receipt}"
+    );
+    let rendered = receipt["control"]["assignment"].as_str().unwrap();
+    let base = receipt["slot"]["base"].as_str().unwrap();
+    assert!(
+        rendered.starts_with(&format!(
+            "Structured lead assignment (schema 1)\nobjective: {objective}\ncheckout: {}\nbase: {base}\nsource: {}\nowner: lead-exp-1\n",
+            slot.display(),
+            fixture.source.display()
+        )),
+        "{rendered}"
+    );
+    assert!(rendered.contains("- out/lead-note.txt"), "{rendered}");
+    assert_eq!(receipt["slot"]["owner"], "lead-exp-1", "{receipt}");
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(
+        fs::read_to_string(state.join("message-1.txt")).unwrap(),
+        "fixture turn completed; the committed solution is in the bound slot"
+    );
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(state.join("endpoint-1.json")).unwrap()).unwrap();
+    assert_eq!(endpoint["threadId"], session, "{endpoint}");
+    let detail = fs::read_to_string(state.join("stream-1.jsonl")).unwrap();
+    assert!(detail.contains("\"method\":\"thread/started\""), "{detail}");
+    assert!(detail.contains("\"method\":\"turn/completed\""), "{detail}");
+    assert_eq!(fixture.record(1)["state"], "occupied");
+    assert_eq!(fixture.record(1)["owner"], "lead-exp-1");
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+
+    // The same conversation continues on its slot: interruption-shaped
+    // partial work (one tracked edit, one untracked file) survives the
+    // resume, which addresses the exact recorded session without --session.
+    fs::write(slot.join("partial-work.txt"), "partial work\n").unwrap();
+    let readme = slot.join("README.md");
+    let mut edited = fs::read_to_string(&readme).unwrap();
+    edited.push_str("carried partial edit\n");
+    fs::write(&readme, edited).unwrap();
+
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "lead-exp-1",
+        "--exec",
+        "continue the interrupted assignment",
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env("HARNESS_EXECUTOR_FIXTURE_RECORD", &child_record);
+    command.env_remove("WT_SESSION");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(&format!(
+            "lead resume: slot=1 owner=lead-exp-1 session={session} identity=recorded dispatch receipt"
+        )),
+        "{text}"
+    );
+    let child: Value = serde_json::from_slice(&fs::read(&child_record).unwrap()).unwrap();
+    assert_eq!(child["contextRole"], "lead", "{child}");
+    assert_eq!(child["boundedLeadSession"], "1", "{child}");
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["control"]["resumeSession"], session, "{receipt}");
+    assert_eq!(
+        receipt["control"]["role"]["previous"]["recorded"], true,
+        "{receipt}"
+    );
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(fixture.record(1)["owner"], "lead-exp-1");
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+
+    // A receipt recorded for the executor role is refused when the lead entry
+    // continues it: the refusal precedes the launcher and the model, so the
+    // previous run's result and stream stay exactly as they were and the
+    // recorded role is not converted.
+    let frozen_message = fs::read_to_string(state.join("message-1.txt")).unwrap();
+    let frozen_stream = fs::read(state.join("stream-1.jsonl")).unwrap();
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    let mut tampered = receipt.clone();
+    tampered["control"]["role"]["role"] = json!("executor");
+    fs::write(&receipt_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "lead-exp-1",
+        "--session",
+        session,
+        "--exec",
+        "convert the conversation",
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env_remove("WT_SESSION");
+    let refused = command.output().unwrap();
+    let text = output_text(&refused);
+    assert_ne!(refused.status.code(), Some(0), "{text}");
+    assert!(text.contains("role mismatch"), "{text}");
+    assert!(text.contains("continue it as lead"), "{text}");
+    assert_eq!(
+        fs::read_to_string(state.join("message-1.txt")).unwrap(),
+        frozen_message,
+        "the refusal precedes the launcher, so the previous result is untouched"
+    );
+    assert_eq!(
+        fs::read(state.join("stream-1.jsonl")).unwrap(),
+        frozen_stream,
+        "no app-server run followed the refusal"
+    );
+    let recorded: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        recorded["control"]["role"]["role"], "executor",
+        "{recorded}"
+    );
+    fixture.drop();
+}
+
 #[test]
 fn pooled_spawn_defaults_to_the_native_tui_and_qualifies_both_spellings() {
     let fixture = Fixture::new("presentation", 1);
@@ -1976,6 +2303,80 @@ fn executor_dispatch_is_refused_inside_an_executor_session() {
             "{command}: {text}"
         );
     }
+}
+
+/// The bounded lead session marker refuses every further lead entry point
+/// before parsing anything, while leaving executor work available exactly as
+/// the ordinary workflow needs it. A lead-role receipt is refused at the host
+/// entry only inside such a conversation; without the marker the same
+/// receipt proceeds to its ordinary resolution.
+#[test]
+fn a_bounded_lead_marker_refuses_nested_lead_entries_and_keeps_executor_work_available() {
+    let root = std::env::temp_dir().join(format!("executor-bounded-lead-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let lead_receipt = root.join("lead-receipt.json");
+    fs::write(
+        &lead_receipt,
+        serde_json::to_vec(&json!({
+            "control": {"role": {"role": "lead", "revision": "synthetic", "args": []}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let executor_receipt = root.join("executor-receipt.json");
+    fs::write(
+        &executor_receipt,
+        serde_json::to_vec(&json!({
+            "control": {"role": {"role": "executor", "revision": "synthetic", "args": []}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let inside = |args: &[&str]| {
+        let mut command = lead_command();
+        command.env("HARNESS_BOUNDED_LEAD_SESSION", "1");
+        command.args(args);
+        output_text(&command.output().unwrap())
+    };
+    for entry in [["lead", "start"], ["lead", "dispatch"], ["lead", "resume"]] {
+        let text = inside(&entry);
+        assert!(
+            text.contains(
+                "bounded lead conversations cannot host or dispatch another lead conversation"
+            ),
+            "{entry:?}: {text}"
+        );
+    }
+    // The host entry of a lead conversation is refused inside a bounded lead
+    // too: hosting another lead would be a peer of the conversation the
+    // process already runs inside.
+    let text = inside(&["executor", "run", "--file", lead_receipt.to_str().unwrap()]);
+    assert!(
+        text.contains(
+            "bounded lead conversations cannot host or dispatch another lead conversation"
+        ),
+        "{text}"
+    );
+    // The marker takes neither executor dispatch nor an executor receipt's
+    // host entry away: both proceed to their own ordinary resolution.
+    let text = inside(&["executor", "spawn"]);
+    assert!(text.contains("--source"), "{text}");
+    assert!(!text.contains("bounded lead conversations"), "{text}");
+    let text = inside(&[
+        "executor",
+        "run",
+        "--file",
+        executor_receipt.to_str().unwrap(),
+    ]);
+    assert!(text.contains("launcher is missing"), "{text}");
+    // Without the marker the same lead receipt is not refused at the host
+    // entry; it proceeds to its ordinary receipt resolution too.
+    let mut command = lead_command();
+    command.args(["executor", "run", "--file", lead_receipt.to_str().unwrap()]);
+    let text = output_text(&command.output().unwrap());
+    assert!(text.contains("launcher is missing"), "{text}");
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

@@ -139,7 +139,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         }
         Some("restart") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
-            continue_slot(&args[1..], true)
+            continue_slot(&args[1..], true, Role::Executor)
         }
         Some("watch") => watch(&args[1..]),
         Some("release") => release(&args[1..]),
@@ -176,25 +176,55 @@ codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session
   routing and cwd stay unchanged; no daemon or second conversation. PROMPT is
   submitted only after the frontend attaches.
 ";
+/// Usage of the bounded lead conversation entries: `dispatch` starts one
+/// fresh pooled lead conversation, and `resume` continues an exact recorded
+/// one on its slot. Both reuse the executor lifecycle owners - slot, receipt,
+/// observation, lease, terminal - with the configured lead profile and the
+/// lead role composition, and neither resolves an executor profile.
+const LEAD_DISPATCH_USAGE: &str = "\
+codex-harness lead dispatch --source CHECKOUT --codex-home DIRECTORY --owner LABEL (--exec PROMPT | --assignment FILE) [--base COMMIT]
+  Dispatch one fresh bounded visible lead conversation: the configured lead profile
+  (global/orchestration.toml lead_profile), the lead role composition, the managed
+  native frontend and a pooled slot with its own receipt, observation and terminal.
+  The owner label names this conversation for later resume and stop.
+codex-harness lead resume --source CHECKOUT --codex-home DIRECTORY --owner LABEL --slot N [--session THREAD_ID] (--exec PROMPT | --assignment FILE)
+  Continue the exact recorded lead conversation on its slot without resetting its
+  checkout: --session names the thread, or the slot's receipt records it. A receipt
+  recorded for another role is refused before any model request.";
 
 /// `codex-harness lead`: the lead side of the executor exchange.
 ///
-/// `start` hosts one managed native lead session, and `message` is a spawned
-/// executor's own channel back to the lead that dispatched it; the caller of
-/// `message` supplies no address.
+/// `start` hosts one managed native lead session, `dispatch` starts one fresh
+/// bounded lead conversation and `resume` continues an exact recorded one on
+/// its slot; `message` is a spawned executor's own channel back to the lead
+/// that dispatched it, and the caller of `message` supplies no address.
 pub fn lead(args: &[OsString]) -> io::Result<i32> {
     match args.first().and_then(|arg| arg.to_str()) {
         None | Some("--help") => {
-            println!("{LEAD_START_USAGE}\n{}", executor_message::LEAD_USAGE);
+            println!(
+                "{LEAD_START_USAGE}\n{LEAD_DISPATCH_USAGE}\n{}",
+                executor_message::LEAD_USAGE
+            );
             Ok(0)
         }
         Some("start") => {
             refuse_lead_hosting(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             lead_start(&args[1..])
+        }
+        Some("dispatch") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+            lead_dispatch(&args[1..])
+        }
+        Some("resume") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+            lead_resume(&args[1..])
         }
         Some("message") => executor_message::lead_message(&args[1..]),
         _ => Err(invalid(
-            "invalid lead command: expected `codex-harness lead start` or `codex-harness lead message` with --text or --file",
+            "invalid lead command: expected `codex-harness lead start`, `codex-harness lead dispatch`, `codex-harness lead resume` or `codex-harness lead message` with --text or --file",
         )),
     }
 }
@@ -207,6 +237,25 @@ fn refuse_lead_hosting(marker: Option<OsString>) -> io::Result<()> {
     if marker.is_some() {
         return Err(invalid(
             "executor sessions cannot host a lead session: this process runs inside an executor (HARNESS_EXECUTOR_SESSION is set); ask the lead that dispatched this run through `codex-harness lead message` instead of creating a conversation",
+        ));
+    }
+    Ok(())
+}
+
+/// The environment marker a bounded lead conversation sets on the process
+/// tree it hosts. The conversation is a bounded decision participant, not
+/// another dispatch owner: it may dispatch executors like any lead, but it can
+/// never host or dispatch a further lead conversation.
+const BOUNDED_LEAD_SESSION_ENV: &str = "HARNESS_BOUNDED_LEAD_SESSION";
+
+/// A bounded lead conversation never spawns another lead conversation: its
+/// own tools carry the marker, so nested hosting or dispatch is refused here
+/// before any slot, process or model request, while `executor spawn` stays
+/// available exactly as the ordinary workflow needs it.
+fn refuse_bounded_lead_recursion(marker: Option<OsString>) -> io::Result<()> {
+    if marker.is_some() {
+        return Err(invalid(
+            "bounded lead conversations cannot host or dispatch another lead conversation: this process runs inside one (HARNESS_BOUNDED_LEAD_SESSION is set); return the decision to the lead that dispatched this conversation instead of creating another lead",
         ));
     }
     Ok(())
@@ -372,6 +421,89 @@ fn invalid_lead_option(key: &str) -> String {
     format!(
         "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID, --exec PROMPT and --exec-file FILE only"
     )
+}
+
+fn invalid_lead_dispatch_option(key: &str) -> String {
+    format!(
+        "invalid lead dispatch option {key}: `codex-harness lead dispatch` accepts --source CHECKOUT, --codex-home DIRECTORY, --owner LABEL, --base COMMIT, --exec PROMPT and --assignment FILE only"
+    )
+}
+
+/// `codex-harness lead dispatch`: one fresh bounded lead conversation through
+/// the pooled dispatch owner. The configured lead profile, the lead role
+/// composition and the managed frontend are resolved by the shared dispatch
+/// path; this entry only parses the bounded request.
+fn lead_dispatch(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!("{LEAD_DISPATCH_USAGE}");
+        return Ok(0);
+    }
+    let mut source = None;
+    let mut codex_home = None;
+    let mut owner = None;
+    let mut base = None;
+    let mut prompt = None;
+    let mut assignment_file = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid(&invalid_lead_dispatch_option("<not Unicode>")))?;
+        if control::supplied_lead_option(key) {
+            return Err(invalid(
+                "caller-supplied lead id or recipient is not authority; refusing before a model request",
+            ));
+        }
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid(&invalid_lead_dispatch_option(key)))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--codex-home" => codex_home = Some(PathBuf::from(value)),
+            "--owner" => owner = Some(option_text(value)?),
+            "--base" => base = Some(option_text(value)?),
+            "--exec" => {
+                prompt = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid(&invalid_lead_dispatch_option(key)))?
+                        .to_owned(),
+                )
+            }
+            "--assignment" => assignment_file = Some(PathBuf::from(value)),
+            _ => return Err(invalid(&invalid_lead_dispatch_option(key))),
+        }
+    }
+    let source = required(source, "--source")?;
+    let codex_home = required(codex_home, "--codex-home")?;
+    let owner = owner.filter(|owner| !owner.trim().is_empty()).ok_or_else(|| {
+        invalid(
+            "lead dispatch --owner is required: the label names this conversation for resume and stop",
+        )
+    })?;
+    let prompt = parse_prompt(prompt, assignment_file)?;
+    let request = VisibleLeadConversation {
+        codex_home,
+        source,
+        owner,
+        base,
+        prompt,
+    };
+    // Acceptance is this route's result, exactly as it is for the executor
+    // controller route: the receipt and observation carry the conversation's
+    // own later lifecycle, which the caller watches instead of blocking here.
+    dispatch_visible_lead_conversation(&request).map(|_| 0)
+}
+
+/// `codex-harness lead resume`: continues the exact recorded lead conversation
+/// on its slot through the shared continuation owner, which reads the slot's
+/// predecessor receipt and refuses a role mismatch before any launch.
+fn lead_resume(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!("{LEAD_DISPATCH_USAGE}");
+        return Ok(0);
+    }
+    continue_slot(args, false, Role::Lead)
 }
 
 /// The title a managed lead conversation carries, so the native frontend's
@@ -791,6 +923,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
         handle: handle.as_deref(),
         profile: &profile,
         prompt,
+        role: Role::Executor,
         mode,
         resumed_session: None,
         terminal_profile: terminal_profile.as_deref(),
@@ -804,12 +937,24 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
 /// thread and attaches the native frontend to it, instead of starting another
 /// conversation or replaying completed work.
 fn resume(args: &[OsString]) -> io::Result<i32> {
-    continue_slot(args, false)
+    continue_slot(args, false, Role::Executor)
 }
 
 /// A restart adopts the same occupied slot but starts a fresh conversation;
 /// resume retains the exact old conversation. Neither path resets the tree.
-fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
+/// The caller names the responsibility role: an executor continuation
+/// resolves the listed executor profiles, a bounded lead continuation resolves
+/// the configured lead profile and may never select another one.
+fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> {
+    // The continuation entry keeps its executor spelling; a lead continuation
+    // names its own role in every refusal and report.
+    let verb = format!("{} resume", role.label());
+    // The installed command a refusal directs the caller to when the slot has
+    // no recorded session: spawning the dispatch again is role-specific.
+    let spawn_hint = match role {
+        Role::Executor => "codex-harness executor spawn",
+        Role::Lead => "codex-harness lead dispatch",
+    };
     let mut source = None;
     let mut repository = None;
     let mut codex_home = None;
@@ -841,10 +986,10 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
             "--slot" => {
                 let text = value
                     .to_str()
-                    .ok_or_else(|| invalid("executor resume --slot must be a slot number"))?;
+                    .ok_or_else(|| invalid(&format!("{verb} --slot must be a slot number")))?;
                 slot = Some(
                     text.parse::<u32>()
-                        .map_err(|_| invalid("executor resume --slot must be a slot number"))?,
+                        .map_err(|_| invalid(&format!("{verb} --slot must be a slot number")))?,
                 );
             }
             "--owner" => owner = Some(option_text(value)?),
@@ -895,12 +1040,12 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
     let repository = repository.unwrap_or_else(|| source.clone());
-    let slot = slot.ok_or_else(|| invalid("executor resume --slot is required"))?;
+    let slot = slot.ok_or_else(|| invalid(&format!("{verb} --slot is required")))?;
     let owner = owner
         .filter(|owner| !owner.trim().is_empty())
-        .ok_or_else(|| invalid("executor resume --owner is required"))?;
+        .ok_or_else(|| invalid(&format!("{verb} --owner is required")))?;
     if !source.is_absolute() || !codex_home.is_absolute() || !repository.is_absolute() {
-        return Err(invalid("executor resume paths must be absolute"));
+        return Err(invalid(&format!("{verb} paths must be absolute")));
     }
     let (session, identity) = match session {
         Some(text) => (
@@ -908,13 +1053,13 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
             "explicit --session",
         ),
         None => (
-            recorded_session(&codex_home, &repository, slot, &owner)?,
+            recorded_session(&codex_home, &repository, slot, &owner, &verb, spawn_hint)?,
             "recorded dispatch receipt",
         ),
     };
     let mut predecessor = serde_json::Value::Null;
     if fresh {
-        let recorded = recorded_session(&codex_home, &repository, slot, &owner)?;
+        let recorded = recorded_session(&codex_home, &repository, slot, &owner, &verb, spawn_hint)?;
         if recorded != session {
             return Err(invalid(
                 "executor restart refused: the exact previous session no longer occupies this slot",
@@ -950,10 +1095,23 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
     };
     let session_label = if fresh { "previous-session" } else { "session" };
     println!(
-        "executor {action}: slot={slot} owner={owner} {session_label}={session} identity={identity}"
+        "{} {action}: slot={slot} owner={owner} {session_label}={session} identity={identity}",
+        role.label()
     );
     let config = load(&source)?;
-    let profile = executor_profile(&config, profile.as_deref())?.to_owned();
+    // A lead continuation continues the configured lead profile only: it can
+    // never select or fall back to an executor profile.
+    let profile = match role {
+        Role::Executor => executor_profile(&config, profile.as_deref())?.to_owned(),
+        Role::Lead => {
+            if profile.is_some() {
+                return Err(invalid(
+                    "lead resume continues the configured lead profile: --profile is not accepted",
+                ));
+            }
+            config.lead_profile.clone()
+        }
+    };
     let pool_size = worktree_pool_size(&config);
     let request = Dispatch {
         codex_home: &codex_home,
@@ -968,6 +1126,7 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
         handle: None,
         profile: &profile,
         prompt,
+        role,
         mode: SpawnMode::Exec,
         resumed_session: Some(&session),
         terminal_profile: terminal_profile.as_deref(),
@@ -1208,8 +1367,6 @@ impl NativePresentation {
     }
 }
 
-/// One pooled dispatch. The slot is selected, synchronized and bound before any
-/// launcher process starts, so the session never runs from a stale base.
 struct Dispatch<'a> {
     codex_home: &'a Path,
     /// The kit/configuration checkout: its orchestration configuration names
@@ -1234,6 +1391,11 @@ struct Dispatch<'a> {
     handle: Option<&'a str>,
     profile: &'a str,
     prompt: PromptSource,
+    /// The responsibility role this dispatch resolves and records. The role
+    /// selects the owned composition, the printed identity, the console title
+    /// and - at host time - the managed frontend shape; a continued
+    /// conversation never changes it silently.
+    role: Role,
     mode: SpawnMode,
     /// Exact session a resume continues; its identity is carried into the new
     /// observation so a failed resume attempt cannot lose it.
@@ -1247,7 +1409,8 @@ struct Dispatch<'a> {
 /// caller's own text.
 /// The structured variant is rendered into the brief against the bound slot
 /// after allocation, so the model never sees a checkout it is not running in.
-enum PromptSource {
+#[derive(Clone)]
+pub(crate) enum PromptSource {
     FreeText(String),
     Structured(executor_assignment::Assignment),
 }
@@ -1632,6 +1795,7 @@ pub(crate) fn dispatch_visible_conversation(
         handle: None,
         profile: &profile,
         prompt: PromptSource::Structured(assignment),
+        role: Role::Executor,
         mode: SpawnMode::Tui,
         resumed_session: None,
         terminal_profile: None,
@@ -1641,6 +1805,82 @@ pub(crate) fn dispatch_visible_conversation(
     let accepted = VisibleAccepted {
         owner: prepared.binding.owner.clone(),
         title: executor_title(&profile, &prepared.binding.owner),
+        slot: prepared.binding.index,
+        model: prepared.bound.model.clone(),
+        model_provider: prepared.bound.model_provider.clone(),
+        reasoning_effort: prepared.bound.reasoning_effort.clone(),
+        checkout: prepared.binding.path.clone(),
+        receipt: prepared.paths.receipt.clone(),
+        result: prepared.paths.result.clone(),
+        detail: prepared.paths.detail.clone(),
+    };
+    launch_bound(
+        &dispatch,
+        &prepared.binding,
+        prepared.route,
+        &prepared.bound,
+        &prepared.paths,
+    )?;
+    Ok(accepted)
+}
+
+/// One bounded visible lead conversation requested from the dispatch side. It
+/// reuses the pooled dispatch owner verbatim - slot allocation, the configured
+/// lead profile, the lead role composition, the native frontend attach wait
+/// and the receipt/observation artifacts - and it never resolves an executor
+/// profile: a bounded experimental lead is the configured lead, not an
+/// executor that pretends to lead. `lead resume` continues an exact recorded
+/// conversation on its slot through the shared continuation owner.
+pub(crate) struct VisibleLeadConversation {
+    pub codex_home: PathBuf,
+    pub source: PathBuf,
+    /// Bounded, distinct owner label; the console title derives from it and
+    /// `lead resume` continues this conversation by the same label.
+    pub owner: String,
+    pub base: Option<String>,
+    pub prompt: PromptSource,
+}
+
+/// Dispatches one fresh bounded lead conversation through the pooled dispatch
+/// owner. The configured `lead_profile` binding and the lead role composition
+/// are resolved and recorded before anything launches; a missing role input or
+/// a full active-run allowance refuses here with the slot still bound.
+pub(crate) fn dispatch_visible_lead_conversation(
+    request: &VisibleLeadConversation,
+) -> io::Result<VisibleAccepted> {
+    refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+    if !request.source.is_absolute() || !request.codex_home.is_absolute() {
+        return Err(invalid(
+            "bounded lead source and codex home must be absolute paths",
+        ));
+    }
+    let config = load(&request.source)?;
+    // The configured lead profile only: a bounded lead never falls back to an
+    // executor profile and no caller flag can select one.
+    let profile = config.lead_profile.clone();
+    let dispatch = Dispatch {
+        codex_home: &request.codex_home,
+        source: &request.source,
+        repository: &request.source,
+        pool_size: worktree_pool_size(&config),
+        max_concurrency: config.max_concurrent_executors,
+        named_slot: None,
+        owner: &request.owner,
+        base: request.base.as_deref(),
+        task: None,
+        handle: None,
+        profile: &profile,
+        prompt: request.prompt.clone(),
+        role: Role::Lead,
+        mode: SpawnMode::Tui,
+        resumed_session: None,
+        terminal_profile: None,
+        terminal_window: None,
+    };
+    let prepared = prepare_dispatch(&dispatch)?;
+    let accepted = VisibleAccepted {
+        owner: prepared.binding.owner.clone(),
+        title: lead_dispatch_title(&profile, &prepared.binding.owner),
         slot: prepared.binding.index,
         model: prepared.bound.model.clone(),
         model_provider: prepared.bound.model_provider.clone(),
@@ -1836,15 +2076,20 @@ pub(crate) fn stop_owned_run(
 fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<String> {
     match &request.prompt {
         PromptSource::FreeText(text) => Ok(executor_assignment::free_text_brief(text)),
-        PromptSource::Structured(assignment) => executor_assignment::brief(
-            assignment,
-            &executor_assignment::AssignmentContext {
+        PromptSource::Structured(assignment) => {
+            let context = executor_assignment::AssignmentContext {
                 checkout: &binding.path,
                 base: &binding.base,
                 owner: &binding.owner,
                 source: request.source,
-            },
-        ),
+            };
+            // The brief heading names the role the conversation actually
+            // runs as; the declared contract itself is identical.
+            match request.role {
+                Role::Executor => executor_assignment::brief(assignment, &context),
+                Role::Lead => executor_assignment::lead_brief(assignment, &context),
+            }
+        }
     }
 }
 
@@ -1928,13 +2173,17 @@ fn launch_bound(
     let lead = control::establish_originating_lead(state_dir)?;
     record_originating_lead(&paths.receipt, &lead)?;
     inherit_lead_endpoint(state_dir, request.codex_home, &lead, binding.index)?;
-    println!("{}", slot_summary(binding, request.named_slot));
+    println!(
+        "{}",
+        slot_summary(request.role, binding, request.named_slot)
+    );
     report_inventory(request)?;
     ensure_workspace_trust(request.codex_home, &binding.path)?;
     // Visible before a missing launcher aborts, so a dispatch that never
     // opens a window still names the presentation it selected.
     println!(
-        "executor presentation: mode={} presentation={} model={} provider={} effort={} cwd={}",
+        "{} presentation: mode={} presentation={} model={} provider={} effort={} cwd={}",
+        request.role.label(),
         request.mode.as_str(),
         route.presentation_label(),
         bound.model.as_deref().unwrap_or("unknown"),
@@ -1960,14 +2209,15 @@ fn launch_bound(
     // A resume attaches to the saved native thread and keeps its developer
     // text; a restart starts a fresh conversation that consumes this
     // dispatch's resolved text. Only resume marks route resume_session.
-    let role = executor_role_receipt(
+    let role = role_receipt(
         request,
         binding,
         &paths.receipt,
         route.control().resume_session.is_some(),
     )?;
     println!(
-        "executor role context: role={} revision={} {} {}",
+        "{} role context: role={} revision={} {} {}",
+        request.role.label(),
         role.role,
         role.revision,
         role.saved_clause(),
@@ -1991,12 +2241,13 @@ fn launch_bound(
         None,
     )?;
     println!(
-        "executor shell: {} ({}) policy={}",
+        "{} shell: {} ({}) policy={}",
+        request.role.label(),
         shell.version,
         shell.executable.display(),
         shell.sandbox_mode
     );
-    let title = executor_title(request.profile, &binding.owner);
+    let title = role_title(request.role, request.profile, &binding.owner);
     let session = std::env::var_os("WT_SESSION");
     let client = windows_terminal_client();
     if prefers_terminal_tab(session.as_deref(), client.as_deref()) {
@@ -2020,31 +2271,36 @@ fn launch_bound(
     }
 }
 
-/// The managed executor role resolved before launch. The installed build's
-/// recorded source supplies the owned role inputs; a missing or inconsistent
-/// input refuses the dispatch with the exact cause, keeping the slot bound for
-/// the next dispatch and making no launcher or model request. A native resume
-/// (`resumes_saved_thread`) keeps the developer text saved at the continued
-/// thread's start, so the receipt persists that text's known revision instead
-/// of overwriting it with this dispatch's freshly resolved one.
-fn executor_role_receipt(
+/// The managed dispatch role resolved before launch, executor or bounded lead.
+/// The installed build's recorded source supplies the owned role inputs; a
+/// missing or inconsistent input refuses the dispatch with the exact cause,
+/// keeping the slot bound for the next dispatch and making no launcher or model
+/// request. A native resume (`resumes_saved_thread`) keeps the developer text
+/// saved at the continued thread's start, so the receipt persists that text's
+/// known revision instead of overwriting it with this dispatch's freshly
+/// resolved one. The requested role must match the role the continued receipt
+/// recorded; a mismatch refuses before any launcher or model request.
+fn role_receipt(
     request: &Dispatch,
     binding: &SlotBinding,
     receipt: &Path,
     resumes_saved_thread: bool,
 ) -> io::Result<RoleReceipt> {
+    let requested = request.role;
     let profile = orchestration_config::profile_config(request.codex_home, request.profile)?;
     let launch = native_launcher::role_launch(
         request.codex_home,
         &binding.path,
         Some(&profile),
         &toml::Table::new(),
-        Role::Executor,
+        requested,
     )
     .map_err(|error| {
         invalid(&format!(
-            "executor role context: {error}; slot {} stays bound to {} and is reused by the next dispatch, no launcher or model request was made; repair the registered build, global/roles.toml and the role files it names before dispatching",
-            binding.index, binding.owner
+            "{} role context: {error}; slot {} stays bound to {} and is reused by the next dispatch, no launcher or model request was made; repair the registered build, global/roles.toml and the role files it names before dispatching",
+            requested.label(),
+            binding.index,
+            binding.owner
         ))
     })?;
     let (previous, saved) = continued_role(
@@ -2052,6 +2308,7 @@ fn executor_role_receipt(
         request.resumed_session.is_some(),
         resumes_saved_thread,
         &launch.revision,
+        requested,
     )?;
     Ok(RoleReceipt {
         role: launch.role.label().to_owned(),
@@ -2069,12 +2326,15 @@ fn executor_role_receipt(
 /// it consumes this dispatch's resolved text. A fresh spawn continues nothing
 /// and records no predecessor claim. A missing or pre-recording receipt
 /// records no saved text for a resume, while a restart still consumes this
-/// dispatch's resolved text.
+/// dispatch's resolved text. The requested role must match the role the
+/// receipt recorded: a different recorded role refuses here, before any
+/// launcher or model request, instead of converting the conversation.
 fn continued_role(
     receipt: &Path,
     continues_session: bool,
     resumes_saved_thread: bool,
     resolved: &str,
+    requested: Role,
 ) -> io::Result<(Option<PreviousRole>, Option<String>)> {
     if !continues_session {
         return Ok((None, Some(resolved.to_owned())));
@@ -2099,6 +2359,17 @@ fn continued_role(
         ))
     })?;
     Ok(match role_from_receipt(&value)? {
+        Some(role) if role.role != requested.label() => {
+            // A continued conversation never changes responsibility role: the
+            // recorded composition is the developer text and skill catalogue
+            // the thread actually runs under, so continuing it as another role
+            // would present a role the conversation does not have.
+            return Err(invalid(&format!(
+                "role mismatch: the continued receipt records a {} conversation, and this dispatch would continue it as {}; continue it with the recorded role's own entry, or start a fresh conversation under another owner",
+                role.role,
+                requested.label()
+            )));
+        }
         Some(role) => {
             let saved = if resumes_saved_thread {
                 role.known_saved()
@@ -2135,11 +2406,13 @@ fn restart_saved(resumes_saved_thread: bool, resolved: &str) -> Option<String> {
     }
 }
 
-/// The observable outcome of slot allocation: the lead reads the mapping here
-/// and reloads the same fields from `executor pool` or the kit-local record.
-fn slot_summary(binding: &SlotBinding, named: Option<u32>) -> String {
+/// The observable outcome of slot allocation: the caller reads the mapping
+/// here and reloads the same fields from `executor pool` or the kit-local
+/// record.
+fn slot_summary(role: Role, binding: &SlotBinding, named: Option<u32>) -> String {
     let mut line = format!(
-        "executor slot: index={} path={} base={} owner={} remote={}{} source={} repository={} task={} handle={}",
+        "{} slot: index={} path={} base={} owner={} remote={}{} source={} repository={} task={} handle={}",
+        role.label(),
         binding.index,
         binding.path.display(),
         binding.base,
@@ -2177,7 +2450,31 @@ pub(crate) const EXECUTOR_TITLE_LIMIT: usize = 48;
 pub(crate) fn executor_title(profile: &str, owner: &str) -> String {
     // The profile is bounded first so the total title stays within the limit
     // even for an unusually long configured profile name.
-    let prefix = format!("CEx ({}) - ", bounded_title_component(profile, 16));
+    bounded_owner_title(
+        format!("CEx ({}) - ", bounded_title_component(profile, 16)),
+        owner,
+    )
+}
+
+/// The console title of one bounded lead conversation: distinct from both the
+/// interactive lead title and any executor title, and bounded like them.
+fn lead_dispatch_title(profile: &str, owner: &str) -> String {
+    bounded_owner_title(
+        format!("CLead ({}) - ", bounded_title_component(profile, 16)),
+        owner,
+    )
+}
+
+/// The console, thread and window title of one dispatch, selected by its
+/// responsibility role.
+fn role_title(role: Role, profile: &str, owner: &str) -> String {
+    match role {
+        Role::Executor => executor_title(profile, owner),
+        Role::Lead => lead_dispatch_title(profile, owner),
+    }
+}
+
+fn bounded_owner_title(prefix: String, owner: &str) -> String {
     let budget = EXECUTOR_TITLE_LIMIT
         .saturating_sub(prefix.chars().count())
         .max(8);
@@ -2428,8 +2725,9 @@ fn active_executor_runs(
 }
 
 /// Executor admission is separate from pool capacity: `max_concurrent_executors`
-/// bounds active runs, so one lead - or a successor with the same configuration
-/// - cannot multiply the allowance by dispatching along free pool slots.
+/// bounds active runs, so one lead (or a successor with the same configuration)
+/// cannot multiply the allowance by dispatching along free pool slots. A
+/// bounded lead conversation counts as one active run like any other dispatch.
 fn admit_executor_run(request: &Dispatch, replacing: Option<u32>) -> io::Result<()> {
     let active = active_executor_runs(
         request.codex_home,
@@ -2444,8 +2742,15 @@ fn admit_executor_run(request: &Dispatch, replacing: Option<u32>) -> io::Result<
             .map(|(index, owner)| format!("slot {index} is running '{owner}'"))
             .collect::<Vec<_>>()
             .join("; ");
+        // A bounded lead conversation consumes the same active-run allowance
+        // as an executor run; the refusal names the shared limit truthfully
+        // for both roles.
+        let subject = match request.role {
+            Role::Executor => "executor concurrency",
+            Role::Lead => "run concurrency",
+        };
         return Err(invalid(&format!(
-            "executor concurrency is full: {} of {limit} active runs (max_concurrent_executors): {runs}; a free pool slot does not grant another active run - stop or wait for a run",
+            "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {runs}; a free pool slot does not grant another active run - stop or wait for a run",
             active.len()
         )));
     }
@@ -2829,17 +3134,21 @@ const MAX_CHANGED_FILES: usize = 40;
 
 /// The exact session a resume continues when `--session` is omitted: the
 /// identity the dispatch receipt mechanically recorded. Never a picker, never
-/// recency, never a rollout filename.
+/// recency, never a rollout filename. The caller names its verb and the
+/// dispatch command a refusal directs the caller toward, so an executor
+/// continuation and a bounded lead continuation read correctly.
 fn recorded_session(
     codex_home: &Path,
     source: &Path,
     slot: u32,
     owner: &str,
+    verb: &str,
+    spawn_hint: &str,
 ) -> io::Result<String> {
     let receipt = receipt_path(codex_home, source, slot)?;
     let bytes = fs::read(&receipt).map_err(|error| {
         invalid(&format!(
-            "executor resume without --session needs the dispatch receipt {} to name the exact recorded session: {error}; pass --session SESSION_ID explicitly, or dispatch `codex-harness executor spawn` first",
+            "{verb} without --session needs the dispatch receipt {} to name the exact recorded session: {error}; pass --session SESSION_ID explicitly, or dispatch `{spawn_hint}` first",
             receipt.display()
         ))
     })?;
@@ -2859,14 +3168,14 @@ fn recorded_session(
     }
     let Some(run) = RunObservation::from_receipt(&value) else {
         return Err(invalid(&format!(
-            "the receipt {} is a legacy record without native observation; it names no exact session, so pass --session SESSION_ID explicitly or dispatch `codex-harness executor spawn` again",
+            "the receipt {} is a legacy record without native observation; it names no exact session, so pass --session SESSION_ID explicitly or dispatch `{spawn_hint}` again",
             receipt.display()
         )));
     };
     match run.recorded_session() {
         Some(session) => Ok(task_succession::exact_session_id(session)?.to_owned()),
         None => Err(invalid(&format!(
-            "the recorded run in slot {slot} observed no native session (state={}, coverage={}, cause={}); pass --session SESSION_ID explicitly or dispatch `codex-harness executor spawn` again",
+            "the recorded run in slot {slot} observed no native session (state={}, coverage={}, cause={}); pass --session SESSION_ID explicitly or dispatch `{spawn_hint}` again",
             run.state,
             run.coverage,
             run.cause
@@ -3974,6 +4283,16 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
         fs::read(path).map_err(|error| invalid(&format!("executor run receipt: {error}")))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| invalid(&format!("executor run receipt JSON: {error}")))?;
+    // A bounded lead conversation never hosts a further lead conversation:
+    // hosting is another entry into the lead role, and a process that already
+    // runs inside one (a shell of the bounded lead carries its marker) must
+    // return the decision to the lead that dispatched the conversation
+    // instead of creating a peer of its own. This precedes the shell
+    // preflight, the lease and any app-server child. Executor receipts stay
+    // hostable, exactly as the ordinary workflow needs them.
+    if role_from_receipt(&value)?.is_some_and(|role| role.role == Role::Lead.label()) {
+        refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+    }
     let launcher = value
         .get("launcher")
         .and_then(serde_json::Value::as_str)
@@ -4221,12 +4540,14 @@ const FRONTEND_ATTACH: Duration = Duration::from_secs(30);
 /// terminal surface by itself before this host ends it.
 const FRONTEND_TAIL_GRACE: Duration = Duration::from_secs(5);
 
-/// Hosts one control-backed exec run: the recorded dispatch identity is
-/// verified, one `codex app-server` child starts inside this host's Job with
-/// the prepared executor shell, the assignment is submitted through
+/// Hosts one control-backed pooled run: the recorded dispatch identity and
+/// role are verified, one `codex app-server` child starts inside this host's
+/// Job with the prepared shell, the assignment is submitted through
 /// `turn/start`, every control record is rendered on this surface while the
 /// bounded detail file and the receipt's lifecycle stay current, and the
 /// thread's own items supply the exact session identity and the final message.
+/// A receipt recorded for the lead role hosts a bounded lead conversation with
+/// the native agent capability instead of the executor single-agent shape.
 ///
 /// Fail-closed: a startup or binding failure is recorded as a failed state
 /// with its cause and fails this host. The receipt records no `codex exec`
@@ -4274,11 +4595,21 @@ fn run_control_receipt(
         ));
     };
     let profile = value["profile"].as_str().unwrap_or("default");
+    // The recorded role selects the hosted conversation's identity. A receipt
+    // recorded for the lead role hosts a bounded lead conversation: the native
+    // agent capability, no executor session marker and the lead frontend
+    // shape, with the title the dispatching side already published. An
+    // executor or legacy receipt keeps exactly the executor lifecycle.
+    let recorded_role = role_from_receipt(value)?;
+    let hosted_role = match &recorded_role {
+        Some(role) if role.role == Role::Lead.label() => Role::Lead,
+        _ => Role::Executor,
+    };
     let mut plan = ControlPlan::new(
         &launcher,
         codex_home,
         &binding.path,
-        executor_title(profile, &binding.owner),
+        role_title(hosted_role, profile, &binding.owner),
         control.identity.clone(),
         ControlPaths::for_slot(codex_home, binding.repository(), binding.index)?,
     );
@@ -4301,7 +4632,7 @@ fn run_control_receipt(
     // environment names the effective role and revision. A receipt written
     // before role recording applies nothing and is reported as unrecorded
     // rather than re-resolved at host time.
-    match role_from_receipt(value)? {
+    match recorded_role {
         Some(role) => {
             plan.args
                 .extend(role.args.iter().cloned().map(OsString::from));
@@ -4318,6 +4649,16 @@ fn run_control_receipt(
         None => println!(
             "role context: unrecorded (this receipt was written before role recording); the app-server child starts without owned role text, and resume or restart of this slot records the current role"
         ),
+    }
+    // An executor conversation is marked with the executor session environment
+    // and runs the single-agent override; a bounded lead conversation keeps
+    // the native agent capability and is marked as such, so its own tools can
+    // refuse a nested lead conversation while `executor spawn` stays exactly
+    // as available as the ordinary workflow needs it.
+    plan.executor_session = hosted_role == Role::Executor;
+    if hosted_role == Role::Lead {
+        plan.env
+            .insert(BOUNDED_LEAD_SESSION_ENV.into(), Some("1".into()));
     }
     plan.env.insert("PATH".into(), Some(shell.path.clone()));
     if let Some(generation) = value["originatingLead"]["runGeneration"]
@@ -4893,12 +5234,15 @@ fn host_control_conversation(
                 Some(job),
             );
         }
-        match attach_owned_frontend(
-            plan,
-            &conversation,
-            control.presentation,
-            FrontendRole::Executor,
-        ) {
+        // The bounded lead conversation keeps the native agent capability: its
+        // frontend runs without the executor marker, without the single-agent
+        // suppression and without the executor warning relay.
+        let frontend_role = if plan.executor_session {
+            FrontendRole::Executor
+        } else {
+            FrontendRole::Lead
+        };
+        match attach_owned_frontend(plan, &conversation, control.presentation, frontend_role) {
             Ok(attached) => {
                 if let Err(error) = wait_for_frontend(
                     &attached,
@@ -6118,6 +6462,7 @@ fn dispatch_terminal_tab(
     println!(
         "{}",
         spawn_summary(
+            request.role,
             request.profile,
             bound,
             title,
@@ -6143,7 +6488,7 @@ fn dispatch_owned_console(
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let profile = request.profile;
-    let title = executor_title(profile, &binding.owner);
+    let title = role_title(request.role, profile, &binding.owner);
     // This process hosts the session for as long as the view runs, so it is
     // the recorded liveness of the slot.
     record_lease(request.codex_home, binding)?;
@@ -6172,7 +6517,15 @@ fn dispatch_owned_console(
         )?;
         println!(
             "{}",
-            spawn_summary(profile, bound, &title, receipt, "owned-console", run)
+            spawn_summary(
+                request.role,
+                profile,
+                bound,
+                &title,
+                receipt,
+                "owned-console",
+                run
+            )
         );
         // The console hosts the same tab-host wrapper as the terminal tab.
         // The native frontend owns that surface; the wrapper does not render
@@ -6218,6 +6571,7 @@ fn dispatch_owned_console(
 }
 
 fn spawn_summary(
+    role: Role,
     profile: &str,
     bound: &ProfileBinding,
     title: &str,
@@ -6244,7 +6598,8 @@ fn spawn_summary(
         ),
     };
     format!(
-        "executor dispatch accepted: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\" (native start is observed, not implied)\nreceipt: {}\nobservation: {observation}\nwatch: codex-harness executor watch --receipt {}",
+        "{} dispatch accepted: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\" (native start is observed, not implied)\nreceipt: {}\nobservation: {observation}\nwatch: codex-harness executor watch --receipt {}",
+        role.label(),
         receipt.display(),
         receipt.display()
     )
@@ -7232,6 +7587,7 @@ mod tests {
             handle: None,
             profile: "ds",
             prompt: PromptSource::FreeText("finish the sample outcome".into()),
+            role: Role::Executor,
             mode: SpawnMode::Exec,
             resumed_session: None,
             terminal_profile: None,
@@ -7465,6 +7821,110 @@ mod tests {
         );
     }
 
+    /// The bounded lead entries parse only their own bounded request: an
+    /// unknown or delegating option, a missing value, a missing owner and an
+    /// ambiguous assignment source are refused before any slot, launcher or
+    /// model request, and the usage names both entries and their own flags.
+    #[test]
+    fn lead_dispatch_parses_its_own_options_and_refuses_the_rest() {
+        let unknown =
+            lead_dispatch(&[OsString::from("--thread"), OsString::from("x")]).unwrap_err();
+        let message = unknown.to_string();
+        assert!(
+            message.contains("invalid lead dispatch option --thread"),
+            "{message}"
+        );
+        for name in [
+            "--source",
+            "--codex-home",
+            "--owner",
+            "--base",
+            "--exec",
+            "--assignment",
+        ] {
+            assert!(message.contains(name), "{message}");
+        }
+        let missing_value = lead_dispatch(&[OsString::from("--source")]).unwrap_err();
+        assert!(
+            missing_value
+                .to_string()
+                .contains("invalid lead dispatch option --source"),
+            "{missing_value}"
+        );
+        let delegated =
+            lead_dispatch(&[OsString::from("--lead"), OsString::from("t-1")]).unwrap_err();
+        assert!(
+            delegated.to_string().contains("caller-supplied lead id"),
+            "{delegated}"
+        );
+        let missing_owner = lead_dispatch(&[
+            OsString::from("--source"),
+            OsString::from(r"D:\absent"),
+            OsString::from("--codex-home"),
+            OsString::from(r"D:\absent-home"),
+            OsString::from("--exec"),
+            OsString::from("text"),
+        ])
+        .unwrap_err();
+        assert!(
+            missing_owner
+                .to_string()
+                .contains("lead dispatch --owner is required"),
+            "{missing_owner}"
+        );
+        let conflict = lead_dispatch(&[
+            OsString::from("--source"),
+            OsString::from(r"D:\absent"),
+            OsString::from("--codex-home"),
+            OsString::from(r"D:\absent-home"),
+            OsString::from("--owner"),
+            OsString::from("lead-exp-1"),
+            OsString::from("--exec"),
+            OsString::from("text"),
+            OsString::from("--assignment"),
+            OsString::from(r"D:\absent.json"),
+        ])
+        .unwrap_err();
+        assert!(
+            conflict.to_string().contains("mutually exclusive"),
+            "{conflict}"
+        );
+        assert!(lead_dispatch(&[OsString::from("--help")]).is_ok());
+        assert!(lead_resume(&[OsString::from("--help")]).is_ok());
+        let wrong_entry =
+            lead_resume(&[OsString::from("--lead"), OsString::from("t-1")]).unwrap_err();
+        assert!(
+            wrong_entry.to_string().contains("caller-supplied lead id"),
+            "{wrong_entry}"
+        );
+        let missing_slot = lead_resume(&[
+            OsString::from("--source"),
+            OsString::from(r"D:\absent"),
+            OsString::from("--codex-home"),
+            OsString::from(r"D:\absent-home"),
+            OsString::from("--owner"),
+            OsString::from("lead-exp-1"),
+            OsString::from("--exec"),
+            OsString::from("text"),
+        ])
+        .unwrap_err();
+        assert!(
+            missing_slot
+                .to_string()
+                .contains("lead resume --slot is required"),
+            "{missing_slot}"
+        );
+        let usage = LEAD_DISPATCH_USAGE;
+        assert!(usage.contains("codex-harness lead dispatch"), "{usage}");
+        assert!(usage.contains("codex-harness lead resume"), "{usage}");
+        assert!(usage.contains("--owner LABEL"), "{usage}");
+        assert!(usage.contains("--assignment FILE"), "{usage}");
+        assert!(
+            usage.contains("refused before any model request"),
+            "{usage}"
+        );
+    }
+
     #[test]
     fn an_executor_never_hosts_a_lead_session() {
         refuse_lead_hosting(None).unwrap();
@@ -7475,6 +7935,27 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("lead message"), "{message}");
+    }
+
+    /// A bounded lead conversation may dispatch executors like any lead, but
+    /// it never hosts or dispatches another lead conversation: its own marker
+    /// refuses nesting before any slot, process or model request.
+    #[test]
+    fn a_bounded_lead_conversation_never_creates_another_lead() {
+        refuse_bounded_lead_recursion(None).unwrap();
+        let error = refuse_bounded_lead_recursion(Some("1".into())).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "bounded lead conversations cannot host or dispatch another lead conversation"
+            ),
+            "{message}"
+        );
+        assert!(message.contains(BOUNDED_LEAD_SESSION_ENV), "{message}");
+        assert!(
+            message.contains("return the decision to the lead"),
+            "{message}"
+        );
     }
 
     /// The one asymmetry the lead's own session needs: it keeps the native
@@ -8011,6 +8492,7 @@ mod tests {
             reasoning_effort: Some("max".into()),
         };
         let summary = spawn_summary(
+            Role::Executor,
             "ds",
             &bound,
             "CEx (ds)",
@@ -8087,6 +8569,36 @@ mod tests {
         // its prefix, which is exactly what the attach guard checks.
         let caption = format!("{first} | ready");
         assert!(caption.starts_with(&format!("{first} | ")));
+    }
+
+    /// A bounded lead conversation's console title names the lead role and its
+    /// own dispatch owner, stays bounded for long owners and stays distinct
+    /// from an executor title of the same owner and profile.
+    #[test]
+    fn bounded_lead_titles_are_role_named_bounded_and_distinct() {
+        assert_eq!(
+            lead_dispatch_title("default", "lead-exp-1"),
+            "CLead (default) - lead-exp-1"
+        );
+        assert_ne!(
+            lead_dispatch_title("default", "owner"),
+            executor_title("default", "owner")
+        );
+        assert_eq!(
+            role_title(Role::Lead, "default", "owner"),
+            lead_dispatch_title("default", "owner")
+        );
+        assert_eq!(
+            role_title(Role::Executor, "default", "owner"),
+            executor_title("default", "owner")
+        );
+        let long_a = format!("lead-{}", "a".repeat(160));
+        let long_b = format!("lead-{}", "b".repeat(160));
+        let first = lead_dispatch_title("default", &long_a);
+        assert!(first.starts_with("CLead (default) - "), "{first}");
+        assert!(first.chars().count() <= EXECUTOR_TITLE_LIMIT, "{first}");
+        assert_ne!(first, lead_dispatch_title("default", &long_b));
+        assert_eq!(first, lead_dispatch_title("default", &long_a));
     }
 
     #[test]
@@ -8425,24 +8937,29 @@ mod tests {
         let receipt = root.join("spawn-1.json");
 
         // A fresh spawn continues nothing and consumes its own resolved text.
-        let (previous, saved) = continued_role(&receipt, false, false, "fresh-text").unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, false, false, "fresh-text", Role::Executor).unwrap();
         assert!(previous.is_none());
         assert_eq!(saved.as_deref(), Some("fresh-text"));
 
         // A resume of a missing receipt records no predecessor and no saved
         // text; a restart still consumes this dispatch's resolved text.
-        let (previous, saved) = continued_role(&receipt, true, true, "resolved").unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, true, "resolved", Role::Executor).unwrap();
         assert!(!previous.unwrap().recorded);
         assert!(saved.is_none());
-        let (previous, saved) = continued_role(&receipt, true, false, "restarted-text").unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, false, "restarted-text", Role::Executor).unwrap();
         assert!(!previous.unwrap().recorded);
         assert_eq!(saved.as_deref(), Some("restarted-text"));
 
         fs::write(&receipt, json!({"schema": 1}).to_string()).unwrap();
-        let (previous, saved) = continued_role(&receipt, true, true, "resolved").unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, true, "resolved", Role::Executor).unwrap();
         assert!(!previous.unwrap().recorded);
         assert!(saved.is_none(), "a legacy receipt records no saved text");
-        let (previous, saved) = continued_role(&receipt, true, false, "restarted-text").unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, false, "restarted-text", Role::Executor).unwrap();
         assert!(!previous.unwrap().recorded);
         assert_eq!(
             saved.as_deref(),
@@ -8458,14 +8975,16 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        let (previous, saved) = continued_role(&receipt, true, false, "restarted-text").unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, false, "restarted-text", Role::Executor).unwrap();
         let previous = previous.unwrap();
         assert!(previous.recorded);
         assert_eq!(previous.revision.as_deref(), Some("kept-revision"));
         assert_eq!(saved.as_deref(), Some("restarted-text"));
 
         // A resume keeps the predecessor's persisted saved text.
-        let (previous, saved) = continued_role(&receipt, true, true, "resolved-later").unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, true, "resolved-later", Role::Executor).unwrap();
         assert!(previous.unwrap().recorded);
         assert_eq!(saved.as_deref(), Some("kept-revision"));
 
@@ -8479,7 +8998,8 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        let (_, saved) = continued_role(&old_fresh, true, true, "resolved-later").unwrap();
+        let (_, saved) =
+            continued_role(&old_fresh, true, true, "resolved-later", Role::Executor).unwrap();
         assert_eq!(saved.as_deref(), Some("original-revision"));
 
         // A continued old-format receipt cannot distinguish a resume from a
@@ -8492,12 +9012,59 @@ mod tests {
         )
         .unwrap();
         let (previous, saved) =
-            continued_role(&old_continued, true, true, "resolved-later").unwrap();
+            continued_role(&old_continued, true, true, "resolved-later", Role::Executor).unwrap();
         assert!(previous.unwrap().recorded);
         assert!(
             saved.is_none(),
             "an ambiguous old record must not claim a saved revision"
         );
+
+        // A continued conversation never changes responsibility role: the
+        // receipt's recorded role is what the thread actually runs under, so
+        // another role's entry point refuses before it resolves anything for
+        // its own role. The same receipt continues cleanly under its own.
+        let lead_receipt = root.join("lead-role.json");
+        fs::write(
+            &lead_receipt,
+            json!({"control": {"role": {"role": "lead", "revision": "lead-revision", "args": [], "saved": "lead-revision"}}})
+                .to_string(),
+        )
+        .unwrap();
+        let mismatch =
+            continued_role(&lead_receipt, true, true, "resolved", Role::Executor).unwrap_err();
+        let message = mismatch.to_string();
+        assert!(message.contains("role mismatch"), "{message}");
+        assert!(message.contains("records a lead conversation"), "{message}");
+        assert!(message.contains("continue it as executor"), "{message}");
+        let (previous, saved) =
+            continued_role(&lead_receipt, false, false, "fresh-text", Role::Lead).unwrap();
+        assert!(
+            previous.is_none(),
+            "a fresh lead dispatch continues nothing"
+        );
+        assert_eq!(saved.as_deref(), Some("fresh-text"));
+        let (previous, saved) =
+            continued_role(&lead_receipt, true, true, "resolved", Role::Lead).unwrap();
+        assert!(previous.unwrap().recorded);
+        assert_eq!(saved.as_deref(), Some("lead-revision"));
+        let executor_receipt = root.join("executor-role.json");
+        fs::write(
+            &executor_receipt,
+            json!({"control": {"role": {"role": "executor", "revision": "executor-revision", "args": []}}})
+                .to_string(),
+        )
+        .unwrap();
+        let mismatch =
+            continued_role(&executor_receipt, true, true, "resolved", Role::Lead).unwrap_err();
+        assert!(mismatch.to_string().contains("role mismatch"), "{mismatch}");
+        fs::write(&executor_receipt, json!({"schema": 1}).to_string()).unwrap();
+        let (previous, saved) =
+            continued_role(&executor_receipt, true, true, "resolved", Role::Lead).unwrap();
+        assert!(
+            !previous.unwrap().recorded,
+            "a legacy receipt records no role and continues as neither"
+        );
+        assert!(saved.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -8537,13 +9104,18 @@ mod tests {
         };
         let observed =
             RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
-        // Each step is the dispatch accounting exactly as executor_role_receipt
+        // Each step is the dispatch accounting exactly as role_receipt
         // applies it, persisted through the real receipt writer and read back.
         let dispatch =
             |continues_session: bool, resumes_saved_thread: bool, resolved: &str| -> RoleReceipt {
-                let (previous, saved) =
-                    continued_role(&receipt, continues_session, resumes_saved_thread, resolved)
-                        .unwrap();
+                let (previous, saved) = continued_role(
+                    &receipt,
+                    continues_session,
+                    resumes_saved_thread,
+                    resolved,
+                    Role::Executor,
+                )
+                .unwrap();
                 let mut route = HostRoute::Control(Box::new(ControlReceipt {
                     schema: CONTROL_SCHEMA,
                     assignment: "Continue the outcome.".into(),
@@ -8829,7 +9401,7 @@ mod tests {
             task: None,
             handle: None,
         };
-        let line = slot_summary(&binding, None);
+        let line = slot_summary(Role::Executor, &binding, None);
         for expected in [
             "index=1",
             r"D:\lanes\proj-wt1",
@@ -8841,7 +9413,7 @@ mod tests {
             assert!(line.contains(expected), "{line}");
         }
         assert!(!line.contains("--workspace named slot"), "{line}");
-        let named = slot_summary(&binding, Some(2));
+        let named = slot_summary(Role::Executor, &binding, Some(2));
         assert!(
             named.contains("--workspace named slot 2; the pool bound the free slot 1"),
             "{named}"
@@ -9221,9 +9793,16 @@ mod tests {
         let source = root.path().join("proj");
         let home = root.path().join("home");
         fs::create_dir_all(&source).unwrap();
-        let missing = recorded_session(&home, &source, 1, "exec-ds-7")
-            .unwrap_err()
-            .to_string();
+        let missing = recorded_session(
+            &home,
+            &source,
+            1,
+            "exec-ds-7",
+            "executor resume",
+            "codex-harness executor spawn",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(missing.contains("pass --session"), "{missing}");
         let receipt = receipt_path(&home, &source, 1).unwrap();
         fs::create_dir_all(receipt.parent().unwrap()).unwrap();
@@ -9238,9 +9817,16 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let legacy = recorded_session(&home, &source, 1, "exec-ds-7")
-            .unwrap_err()
-            .to_string();
+        let legacy = recorded_session(
+            &home,
+            &source,
+            1,
+            "exec-ds-7",
+            "executor resume",
+            "codex-harness executor spawn",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(legacy.contains("legacy record"), "{legacy}");
         let binding = SlotBinding {
             index: 1,
@@ -9270,12 +9856,27 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let foreign = recorded_session(&home, &source, 1, "exec-ds-7")
-            .unwrap_err()
-            .to_string();
+        let foreign = recorded_session(
+            &home,
+            &source,
+            1,
+            "exec-ds-7",
+            "executor resume",
+            "codex-harness executor spawn",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(foreign.contains("belongs to owner exec-other"), "{foreign}");
         assert_eq!(
-            recorded_session(&home, &source, 1, "exec-other").unwrap(),
+            recorded_session(
+                &home,
+                &source,
+                1,
+                "exec-other",
+                "executor resume",
+                "codex-harness executor spawn"
+            )
+            .unwrap(),
             "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4"
         );
         // A resume attempt that never observed its own identity still
@@ -9297,7 +9898,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            recorded_session(&home, &source, 1, "exec-other").unwrap(),
+            recorded_session(
+                &home,
+                &source,
+                1,
+                "exec-other",
+                "executor resume",
+                "codex-harness executor spawn"
+            )
+            .unwrap(),
             "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5"
         );
         let _ = fs::remove_dir_all(root);

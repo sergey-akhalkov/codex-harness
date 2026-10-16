@@ -58,6 +58,12 @@ const FINAL_MESSAGE: &str = "fixture turn completed; the committed solution is i
 /// Serves one `app-server` invocation. Returns the process exit code; the
 /// caller's Job owns termination, exactly as it owns the real child.
 pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
+    // The dispatching side may direct this child to record the exact
+    // invocation and role-marking environment it received, so the effective
+    // role context is asserted from the child instead of inferred.
+    if let Some(path) = env::var_os("HARNESS_EXECUTOR_FIXTURE_RECORD") {
+        record_child(PathBuf::from(path))?;
+    }
     let listen = option(args, "--listen").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -226,6 +232,39 @@ fn option(args: &[std::ffi::OsString], name: &str) -> Option<String> {
         .and_then(|index| args.get(index + 1))
         .and_then(|value| value.to_str())
         .map(str::to_owned)
+}
+
+/// Records this child's own invocation and role-marking environment when the
+/// host names an output path, so a model-free check asserts the effective
+/// role context and routing argv the app-server actually received instead of
+/// inferring them from the dispatching process. Every ordinary run records
+/// nothing.
+fn record_child(path: PathBuf) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let argv = env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let marker = |name: &str| match env::var(name) {
+        Ok(value) => json!(value),
+        Err(_) => json!(null),
+    };
+    let record = json!({
+        "schema": 1,
+        "argv": argv,
+        "executorSession": marker("HARNESS_EXECUTOR_SESSION"),
+        "boundedLeadSession": marker("HARNESS_BOUNDED_LEAD_SESSION"),
+        "contextRole": marker("HARNESS_CONTEXT_ROLE"),
+        "contextRevision": marker("HARNESS_CONTEXT_REVISION"),
+        "currentDir": env::current_dir().ok().map(|path| path.display().to_string()),
+    });
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&record).map_err(io::Error::other)?,
+    )?;
+    Ok(())
 }
 
 /// The installed client route of this arm home: the explicit configuration the

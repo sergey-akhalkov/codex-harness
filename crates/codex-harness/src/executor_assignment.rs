@@ -180,16 +180,32 @@ impl Assignment {
     }
 }
 
-/// Validates the declared paths and renders the brief the session receives.
-/// The same function serves dispatch and the model-free `executor assignment`
-/// path, so a lead can exercise the exact rendering without a model request.
-/// The brief carries the task-specific contract - outcome, checkout, base,
-/// owned paths, checks, consumer, feedback address and the additional
-/// boundaries declared for this task. Standing responsibility guidance (work
-/// cycle, base verification, the heavy-command lane, escalation policy, the
-/// waiting behavior and the compact result shape) reaches a managed session
-/// through its role context, so it is not restated here.
+/// Validates the declared paths and renders the brief an executor session
+/// receives. The same function serves dispatch and the model-free `executor
+/// assignment` path, so a session-role caller can exercise the exact rendering
+/// without a model request.
 pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Result<String> {
+    render_brief(
+        assignment,
+        context,
+        "Structured executor assignment (schema 1)",
+    )
+}
+
+/// Renders the same declared contract under the lead-role heading. A bounded
+/// experimental lead conversation receives the identical brief - objective,
+/// checkout, base, owned paths, checks, consumer, feedback address and
+/// boundaries - and its heading names its own role instead of presenting the
+/// conversation as an executor session.
+pub fn lead_brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Result<String> {
+    render_brief(assignment, context, "Structured lead assignment (schema 1)")
+}
+
+fn render_brief(
+    assignment: &Assignment,
+    context: &AssignmentContext<'_>,
+    heading: &str,
+) -> io::Result<String> {
     assignment.validate_paths(context.checkout)?;
     let consumer = consumer_text(assignment);
     let boundaries = assignment
@@ -198,7 +214,8 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
         .map(|item| item.trim().to_owned())
         .collect::<Vec<_>>();
     let mut text = String::new();
-    text.push_str("Structured executor assignment (schema 1)\n");
+    text.push_str(heading);
+    text.push('\n');
     text.push_str(&format!("objective: {}\n", assignment.objective.trim()));
     text.push_str(&format!("checkout: {}\n", context.checkout.display()));
     text.push_str(&format!("base: {}\n", context.base));
@@ -652,6 +669,41 @@ mod tests {
         ] {
             assert!(!text.contains(standing), "{standing}\n{text}");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The bounded lead conversation receives the same declared contract
+    /// under its own heading: one rendering path serves both roles, only the
+    /// first line names the role the conversation actually runs as.
+    #[test]
+    fn the_lead_brief_keeps_the_contract_under_its_own_heading() {
+        let root = temp_root("lead-brief");
+        fs::write(root.join("input.txt"), "input\n").unwrap();
+        let assignment = checked_in(
+            &root,
+            "assignment.json",
+            &document("Bound the lead route", &["input.txt"], &["out/result.txt"]),
+        );
+        let context = AssignmentContext {
+            checkout: &root,
+            base: "0123456789abcdef0123456789abcdef01234567",
+            owner: "lead-exp-1",
+            source: &root,
+        };
+        let lead = lead_brief(&assignment, &context).unwrap();
+        let executor = brief(&assignment, &context).unwrap();
+        assert!(
+            lead.starts_with("Structured lead assignment (schema 1)\n"),
+            "{lead}"
+        );
+        assert_eq!(
+            lead.strip_prefix("Structured lead assignment (schema 1)\n"),
+            executor.strip_prefix("Structured executor assignment (schema 1)\n"),
+            "the contract below the heading is identical"
+        );
+        assert!(lead.contains("owner: lead-exp-1"), "{lead}");
+        assert!(lead.contains("- input.txt"), "{lead}");
+        assert!(lead.contains("- out/result.txt"), "{lead}");
         let _ = fs::remove_dir_all(root);
     }
 
