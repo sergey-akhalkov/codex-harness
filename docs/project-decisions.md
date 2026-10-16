@@ -123,6 +123,15 @@ cost. Routine in-scope workflow improvements need no separate specification;
 short tasks need no optimization ceremony. Preserve full acceptance, authority
 and recovery. The canonical details remain in the portable principles below.
 
+**2026-10-16, clarified:** an active delivery-improvement observer should turn
+one clear, attributable bottleneck into a bounded correction promptly. Do not
+wait for repeated episodes, votes or statistical proof when the available facts
+already support the remedy. Investigate only uncertainty that changes the
+decision, and verify the result proportionately through its actual use. Keep
+the observer module's adoption comparison separate from the handling of each
+finding; preserve required acceptance and scope boundaries. The active change
+owns this [single-observation admission](../openspec/changes/add-delivery-improvement/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
+
 Deliver a quality, verified end-to-end MVP through real components as early as
 possible, then complete the whole agreed result. Small transparent operating
 restrictions are allowed; they do not authorize simplifying promised product
