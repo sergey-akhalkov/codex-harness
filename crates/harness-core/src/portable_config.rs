@@ -37,14 +37,40 @@ pub fn overrides(
     codex_home: &Path,
     working_directory: &Path,
 ) -> io::Result<Vec<OsString>> {
+    Ok(overrides_with_shadowed(shared_file, codex_home, working_directory)?.0)
+}
+
+/// A shared default a higher-precedence configuration layer replaced, with the
+/// effective value that won. Callers that must report losing an invariant read
+/// these instead of re-deriving precedence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowedDefault {
+    /// Dotted path of the shared leaf, for example `features.worktrees`.
+    pub path: String,
+    /// Highest-precedence layer that replaced the shared value.
+    pub source: PreferenceSource,
+    /// The effective value that replaced the shared default.
+    pub value: toml::Value,
+}
+
+/// [`overrides`] plus the shared defaults that higher-precedence configuration
+/// replaced. The forwarded leaves are identical; a caller uses this form when
+/// silently losing a shared default could hide a broken invariant.
+pub fn overrides_with_shadowed(
+    shared_file: &Path,
+    codex_home: &Path,
+    working_directory: &Path,
+) -> io::Result<(Vec<OsString>, Vec<ShadowedDefault>)> {
     let shared = read(shared_file)?;
     let local = read_user(codex_home)?;
     let project = trusted_project_config(&local, working_directory)?;
     let mut result = Vec::new();
+    let mut shadowed = Vec::new();
     for (key, value) in &shared {
         if key != "projects" {
             leaves(
                 &mut result,
+                &mut shadowed,
                 &mut vec![key.as_str()],
                 value,
                 &local,
@@ -53,7 +79,41 @@ pub fn overrides(
             )?;
         }
     }
-    Ok(result)
+    Ok((result, shadowed))
+}
+
+/// The effective `features.worktrees` value the applicable native layers
+/// select, with the winning layer's own label. The shared portable file is
+/// not consulted: callers treat `None` as "no higher-precedence choice". An
+/// explicit profile layers over the base user configuration and a trusted
+/// project file over both, the same order role retention applies.
+pub fn worktree_feature_choice(
+    codex_home: &Path,
+    working_directory: &Path,
+    profile: Option<(&str, &toml::Table)>,
+) -> io::Result<Option<(String, toml::Value)>> {
+    let user = read_user(codex_home)?;
+    let mut trust = user.clone();
+    if let Some((_, table)) = profile {
+        merge_tables(&mut trust, table);
+    }
+    let project = trusted_project_config(&trust, working_directory)?;
+    let selected = |layer: Option<&toml::Table>| -> Option<toml::Value> {
+        layer?
+            .get("features")?
+            .as_table()?
+            .get("worktrees")
+            .cloned()
+    };
+    if let Some(value) = selected(project.as_ref()) {
+        return Ok(Some(("trusted-project".into(), value)));
+    }
+    if let Some((name, table)) = profile
+        && let Some(value) = selected(Some(table))
+    {
+        return Ok(Some((format!("explicit profile '{name}'"), value)));
+    }
+    Ok(selected(Some(&user)).map(|value| ("user".to_owned(), value)))
 }
 
 /// Retain context settings for responsibility-role composition. Callers pass
@@ -298,6 +358,7 @@ fn parse(text: &str) -> io::Result<toml::Table> {
 
 fn leaves<'a>(
     output: &mut Vec<OsString>,
+    shadowed: &mut Vec<ShadowedDefault>,
     keys: &mut Vec<&'a str>,
     value: &'a toml::Value,
     local: &toml::Table,
@@ -318,7 +379,7 @@ fn leaves<'a>(
     if let toml::Value::Table(table) = value {
         for (key, child) in table {
             keys.push(key);
-            leaves(output, keys, child, local, project, home)?;
+            leaves(output, shadowed, keys, child, local, project, home)?;
             keys.pop();
         }
         return Ok(());
@@ -336,6 +397,16 @@ fn leaves<'a>(
             project_selected = project_selected.and_then(|v| v.get(*key));
         }
         if selected.is_some() || project_selected.is_some() {
+            let (source, value) = match (project_selected, selected) {
+                (Some(value), _) => (PreferenceSource::Project, value.clone()),
+                (None, Some(value)) => (PreferenceSource::User, value.clone()),
+                (None, None) => unreachable!("a replacing layer owns the effective value"),
+            };
+            shadowed.push(ShadowedDefault {
+                path: keys.join("."),
+                source,
+                value,
+            });
             return Ok(());
         }
     }

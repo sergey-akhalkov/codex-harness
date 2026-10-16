@@ -1,4 +1,7 @@
-//! Process-boundary double for dependency validation. Never registered as MCP.
+//! Process-boundary double for dependency validation. The owned ordinary-control
+//! case copies it into its test-only home and registers that copy as the synthetic
+//! `unrelated_probe` MCP server; no real installation or user configuration
+//! references it.
 #[cfg(windows)]
 mod windows {
     use serde_json::{Value, json};
@@ -277,10 +280,30 @@ mod windows {
             let mut result = match method {
                 "initialize" => {
                     assert!(!initialized);
-                    assert_eq!(request["params"]["protocolVersion"], "2024-11-05");
-                    assert_eq!(request["params"]["capabilities"], json!({}));
+                    // Two owned clients reach this server double: the harness
+                    // dependency probe pins 2024-11-05 without capabilities,
+                    // while the real codex session client requests
+                    // 2025-06-18 with its elicitation capability. Accept those
+                    // two known revisions with their expected capability
+                    // shapes, record the actual handshake, and answer the
+                    // requested revision.
+                    let protocol = request["params"]["protocolVersion"]
+                        .as_str()
+                        .expect("MCP client protocol revision");
+                    match protocol {
+                        "2024-11-05" => assert_eq!(request["params"]["capabilities"], json!({})),
+                        "2025-06-18" => {
+                            assert!(request["params"]["capabilities"].is_object())
+                        }
+                        other => panic!("unknown MCP client protocol revision: {other}"),
+                    }
+                    receipt["initialize"] = json!({
+                        "protocolVersion":request["params"]["protocolVersion"],
+                        "capabilities":request["params"]["capabilities"],
+                        "clientInfo":request["params"]["clientInfo"],
+                    });
                     initialized = true;
-                    json!({"protocolVersion":if mode=="protocol" {"2099-01-01"} else {"2024-11-05"},"capabilities":{"tools":{}},"serverInfo":{"name":"nuphus-mcp","version":"0.2.2"},"instructions":"SECRET_FOREIGN_TOKEN"})
+                    json!({"protocolVersion":if mode=="protocol" {"2099-01-01"} else {protocol},"capabilities":{"tools":{}},"serverInfo":{"name":"nuphus-mcp","version":"0.2.2"},"instructions":"SECRET_FOREIGN_TOKEN"})
                 }
                 "notifications/initialized" => {
                     assert!(initialized && !declared);

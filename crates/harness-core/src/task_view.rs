@@ -16,18 +16,14 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::IVirtualDesktopManager;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_MENU, keybd_event};
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, POINT, RECT},
-    Graphics::{
-        Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
-        Gdi::ClientToScreen,
-    },
+    Foundation::{HWND, LPARAM, RECT},
+    Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
     System::Console::GetConsoleWindow,
     System::Threading::{AttachThreadInput, GetCurrentThreadId},
     UI::WindowsAndMessaging::{
-        EnumWindows, GW_HWNDPREV, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent,
-        GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, SPI_GETWORKAREA, SW_RESTORE, SetForegroundWindow, ShowWindow,
-        SwitchToThisWindow, SystemParametersInfoW,
+        EnumWindows, GetClassNameW, GetForegroundWindow, GetParent, GetWindowRect, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, SPI_GETWORKAREA, SW_RESTORE,
+        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SystemParametersInfoW,
     },
 };
 
@@ -105,8 +101,7 @@ impl Watch {
 
     pub(crate) fn visible(&self) -> io::Result<bool> {
         Ok(self.process.is_running()?
-            && visible_bounds(self.window, self.process.identity().pid).is_ok()
-            && unobscured(self.window as HWND)?)
+            && visible_bounds(self.window, self.process.identity().pid).is_ok())
     }
 
     pub(crate) fn process_running(&self) -> io::Result<bool> {
@@ -462,48 +457,6 @@ fn restore_foreground(current: HWND, previous: HWND) {
     }
 }
 
-/// Conservatively require the conversation client area to be unobscured.
-/// IsWindowVisible checks a style bit, not whether another app covers the text.
-fn unobscured(window: HWND) -> io::Result<bool> {
-    if cloaked(window)? {
-        return Ok(false);
-    }
-    let mut area = RECT::default();
-    let mut origin = POINT::default();
-    if unsafe { GetClientRect(window, &mut area) } == 0
-        || unsafe { ClientToScreen(window, &mut origin) } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    area.left += origin.x;
-    area.right += origin.x;
-    area.top += origin.y;
-    area.bottom += origin.y;
-    if area.left >= area.right || area.top >= area.bottom {
-        return Ok(false);
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    let mut above = unsafe { GetWindow(window, GW_HWNDPREV) };
-    while !above.is_null() {
-        // Window destruction/reordering can invalidate a traversal. Never loop
-        // indefinitely or infer visibility from an incomplete observation.
-        if seen.len() >= 4096 || !seen.insert(above as usize) {
-            return Ok(false);
-        }
-        if unsafe { IsWindowVisible(above) } != 0 && unsafe { IsIconic(above) } == 0 {
-            let mut other = RECT::default();
-            if unsafe { GetWindowRect(above, &mut other) } == 0 {
-                return Ok(false);
-            }
-            if overlaps(&area, &other) && !cloaked(above)? {
-                return Ok(false);
-            }
-        }
-        above = unsafe { GetWindow(above, GW_HWNDPREV) };
-    }
-    Ok(true)
-}
-
 fn cloaked(window: HWND) -> io::Result<bool> {
     let mut value = 0u32;
     let result = unsafe {
@@ -520,10 +473,6 @@ fn cloaked(window: HWND) -> io::Result<bool> {
         ));
     }
     Ok(value != 0)
-}
-
-fn overlaps(a: &RECT, b: &RECT) -> bool {
-    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
 struct FindWindow {
@@ -756,6 +705,14 @@ fn visible_bounds(window: usize, expected_pid: u32) -> io::Result<Bounds> {
             "conversation window is unavailable: owner pid={pid}, expected pid={expected_pid}, visible={visible}, minimized={minimized}; suspend new model dispatch"
         )));
     }
+    // A distinct attached surface remains available when another window
+    // overlaps it. Requiring unobscured pixels would force users to tile all
+    // conversations. A hidden composition surface is still unavailable.
+    if cloaked(window)? {
+        return Err(io::Error::other(
+            "conversation window is cloaked; suspend new model dispatch",
+        ));
+    }
     let mut bounds = RECT::default();
     if unsafe { GetWindowRect(window, &mut bounds) } == 0 {
         return Err(io::Error::last_os_error());
@@ -885,8 +842,8 @@ mod tests {
         assert!(five[4].y >= five[2].y);
     }
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
-        ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+        CreateWindowExW, DestroyWindow, SW_HIDE, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+        WS_POPUP, WS_VISIBLE,
     };
 
     struct OwnedWindow(HWND);
@@ -924,60 +881,20 @@ mod tests {
 
     #[test]
     #[ignore = "creates two short-lived owned desktop windows; requires available interactive desktop"]
-    fn obscured_chat_is_not_visible_until_cover_is_removed() {
+    fn overlapping_conversations_remain_available_but_lost_surfaces_do_not() {
         let chat = owned_window(30, 30, 400, 240);
-        assert!(unobscured(chat.0).unwrap());
-        let cover = owned_window(80, 80, 150, 100);
-        assert_ne!(unsafe { IsWindowVisible(chat.0) }, 0);
-        assert!(
-            !unobscured(chat.0).unwrap(),
-            "partial coverage hides conversation content"
-        );
+        let pid = std::process::id();
+        assert!(visible_bounds(chat.0 as usize, pid).is_ok());
+        let cover = owned_window(30, 30, 400, 240);
+        assert!(visible_bounds(chat.0 as usize, pid).is_ok());
+        assert!(visible_bounds(cover.0 as usize, pid).is_ok());
+        assert!(visible_bounds(chat.0 as usize, 0).is_err());
         unsafe {
-            SetWindowPos(
-                cover.0,
-                null_mut(),
-                30,
-                30,
-                400,
-                240,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+            ShowWindow(chat.0, SW_HIDE);
         }
-        assert!(
-            !unobscured(chat.0).unwrap(),
-            "full coverage must also suspend admission"
-        );
-        unsafe {
-            SetWindowPos(
-                cover.0,
-                null_mut(),
-                430,
-                30,
-                150,
-                100,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
-        }
-        assert!(
-            unobscured(chat.0).unwrap(),
-            "touching edges do not obscure the client"
-        );
-        unsafe {
-            SetWindowPos(
-                cover.0,
-                null_mut(),
-                80,
-                80,
-                150,
-                100,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
-            ShowWindow(cover.0, SW_HIDE);
-        }
-        assert!(
-            unobscured(chat.0).unwrap(),
-            "a hidden covering window does not obscure the client"
-        );
+        assert!(visible_bounds(chat.0 as usize, pid).is_err());
+        let closed = cover.0 as usize;
+        drop(cover);
+        assert!(visible_bounds(closed, pid).is_err());
     }
 }

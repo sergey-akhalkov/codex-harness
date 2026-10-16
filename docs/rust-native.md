@@ -605,6 +605,86 @@ anything. `executor resume`, `restart`, `watch`, `message`, `stop`,
 `assignment`, `pool` and `release` accept the same `--repository` selector. `executor pool` lines
 add `repository=`, `task=` and `handle=` beside the session fields.
 
+### Native worktree tool suppression
+
+The native TUI hosts a dynamic `codex_worktrees` tool server into sessions
+while its `worktrees` feature is enabled, which competes with the common pool
+as a second allocator. The kit's shared configuration turns the native feature
+off (`features.worktrees = false`), a session start forwards that leaf as
+`-c features.worktrees=false`, and managed lead and executor frontends carry
+the same pair before their `resume` subcommand. Those controller frontends
+(`lead start` / `executor host`) run as remote TUIs attached to the harness's
+app-server child, which serves the conversation; the pair pins the frontend
+process's own configuration to the managed default, while the selected
+profile and the user configuration reach the app-server child unchanged. A
+model-free probe of the installed app-server route (the same binary and
+`features.worktrees` override forms the hosted route uses) registered no
+worktree-named tool in its runtime catalogue under the feature default,
+`false` or `true`, so the exercised hosted boundary did not re-expose the
+competing tools; the remote frontend's own catalogue is not observable by
+this probe, and a fresh hosted catalogue remains an open acceptance item in
+pool task 4.4. A hosted conversation whose effective catalogue still
+re-exposed the tools would be an explicit-override or host-injected
+configuration conflict to report, not a successful suppression; the
+precedence and conflict reporting below belongs to the registered launcher
+route, where re-exposure is observable.
+
+The switch is proven against the effective runtime tool catalogue, not a
+configuration value, a feature readback or the static first request: the
+installed CLI defers dynamically hosted tool servers out of the first request
+schemas, so the opt-in installed check reads the session's own runtime
+catalogue. It drives the installed native CLI TUI against the canned local
+Responses fixture, has the session run code-mode `exec` calls that report the
+keys of its runtime `tools` object plus its `ALL_TOOLS` metadata, and repeats
+that up to three bounded settle rounds because tool availability can change
+between calls. An unsuppressed control run must expose a worktree-named tool
+in its runtime catalogue, and the managed-leaf run
+(`-c features.worktrees=false`) must expose none of it in the runtime
+catalogue or the session's first request surface, so a control that observes
+nothing leaves the requirement open instead of passing vacuously. Request
+bodies and terminal transcripts stay in the kept evidence directory it prints.
+
+```powershell
+cargo test --locked -p codex-harness --test skill_catalog_refresh installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf --jobs 1 -- --ignored --exact --nocapture --test-threads=1
+```
+
+The same installed check covers the launcher's forwarding route end to end:
+`installed_managed_role_tui_catalogues_drop_native_worktree_tools` records a
+build whose `codex.exe` is this checkout's real launcher and whose registered
+upstream is the installed CLI, then runs fresh role-marked managed sessions -
+lead, executor, a no-leaf profile and an explicit-true profile - against the
+canned Responses fixture. This is the launcher's forwarding route, whose
+locally hosted TUI is the surface this check reads; the controller-hosted
+frontends attach to a separate app-server conversation that this probe does
+not read. The unsuppressed control must expose a worktree-named tool;
+the managed lead and executor sessions and a managed session whose selected
+profile carries no `features.worktrees` choice must expose none, because
+selecting a profile is not a worktree choice; and an explicit winning profile
+`true` must keep the tools and print the conflict report, so the decision is
+observed at the runtime catalogue instead of inferred from argv.
+
+```powershell
+cargo test --locked -p codex-harness --test skill_catalog_refresh installed_managed_role_tui_catalogues_drop_native_worktree_tools --jobs 1 -- --ignored --exact --nocapture --test-threads=1
+```
+
+The `native_launcher` tests pin the launch side:
+`managed_session_starts_forward_the_worktree_tool_suppression_leaf` requires
+the forwarded leaf for TUI and non-TUI starts, while
+`native_worktree_choice_precedence_reports_only_unsuppressed_sessions`
+exercises the installed native precedence: repeated `-c` leaves keep the last
+value, `--enable` and `--disable` re-encode as the feature leaf and win over
+`-c` regardless of encounter order, a disable wins over an enable, and only
+an explicit winning `false` establishes the suppression. Any other winning
+choice - a higher-precedence user or project replacement, an explicit profile
+leaf, a command-line `true`/`--enable`, or a value that is not a boolean and
+that the native session refuses - is reported on stderr as a configuration
+conflict instead of being fought or claimed silently. The report names the
+winning source and effective value, states the suppression decision, and is
+never a claim about an observed tool catalogue. A conversation that started
+before the change keeps the tools it registered; the suppression applies to
+fresh sessions, so an existing conversation needs an explicit restart rather
+than an in-place update.
+
 ## Structured executor assignments
 
 `codex-harness executor spawn`, `resume` and `restart` accept `--assignment FILE` or
@@ -1200,11 +1280,13 @@ transport evidence, not a native provider integration receipt.
 
 `task_admission` connects request correlation to the observed native session and
 active turn, then checks the exact conversation's registered process identity and
-visible window before forwarding. A parent's window cannot cover a child;
-interrupted turns wait and stopped tasks reject dispatch. Focused checks verify
-that missing child visibility produces no upstream connection. Only ordinary
-turn requests currently have this admission path; other request kinds are
-rejected pending explicit visibility support.
+visible window before forwarding. A conversation stays available while another
+window covers it, because on-screen tiling is not required; a hidden, minimized,
+cloaked or closed surface waits while its view is unavailable, interrupted turns
+wait, and stopped tasks reject dispatch. Focused checks verify that missing child
+visibility produces no upstream connection. Only ordinary turn requests
+currently have this admission path; other request kinds are rejected pending
+explicit visibility support.
 
 The release ordinary-entry and quota-handoff checks passed with CLI 0.154.0
 through this gate and `task_forward` into an owned synthetic upstream. They
@@ -1222,19 +1304,21 @@ successor configuration. Focused ingress checks verify rejection without any
 upstream connection and joined shutdown during an incomplete HTTP read. The
 integrated ordinary release entry check passed with native tool execution,
 visible final result, saved local route configuration and process cleanup.
-An earlier handoff observation exposed a gap: window-presence checks reported
-conversations obscured by another application as visible.
-`task_view::Watch` now also checks the client rectangle against windows above it
-and rejects cloaked conversations. An owned Windows-window test passed for
-partial/full coverage, moving the cover away and hiding it; all windows were
-destroyed by their test owner. The bounded traversal treats changing or unknown
-composition state conservatively. It uses window rectangles, so transparent or
-irregular overlays can also suspend admission. This follows the documented
-[IsWindowVisible limitation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible)
-and [window ordering contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow).
-The integrated ordinary, quota-handoff and minimize/restore release checks passed
-with this change and CLI 0.154.0. The handoff windows were observed simultaneously;
-all three checks showed the final result and verified process cleanup.
+An earlier handoff observation showed why window composition is not the
+availability signal: `IsWindowVisible` reports a style bit and stays true while
+another application covers the conversation. Availability is decided per
+conversation from its own surface: the exact registered process must be running
+and its window visible, not minimized, not cloaked and not empty. Overlap with
+another conversation, including a parent's, leaves the surface available because
+on-screen tiling is not required; a hidden, minimized, cloaked or closed surface
+suspends dispatch. An ignored owned Windows-window regression covers overlapping
+surfaces plus hidden and closed ones; all windows are destroyed by their test
+owner. This follows the documented
+[IsWindowVisible limitation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible),
+which does not report occlusion. The integrated ordinary, quota-handoff and
+minimize/restore release checks passed with the earlier coverage check on CLI
+0.154.0; the handoff windows were observed simultaneously, and all three checks
+showed the final result and verified process cleanup.
 On CLI 0.155.1, `ordinary_launcher_opens_helper_before_its_first_request`
 passed through the release entry point: lead, executor and helper panes were
 established before the helper's first model request (helper title `Helper 1`,

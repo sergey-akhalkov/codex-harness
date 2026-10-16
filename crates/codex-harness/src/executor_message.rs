@@ -78,7 +78,10 @@ use super::{
     SessionLease, invalid, lease_path, option_text, read_lease, receipt_binding, receipt_path,
 };
 use harness_core::orchestration_config::{self, worktree_pool_size};
-use harness_core::process::{Cancellation, Deadline, ExclusiveFileLock, ProcessIdentity};
+use harness_core::process::{
+    Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, ProcessIdentity,
+    StopReason,
+};
 use harness_core::process_service::{self, ServiceProcess};
 use harness_core::task_succession;
 use harness_core::task_worktree;
@@ -87,7 +90,7 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     fs, io,
-    io::Write,
+    io::{BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -99,6 +102,31 @@ const CONTROL_BOUND: Duration = Duration::from_secs(20);
 /// before the acceptance answer is reported as queued instead of delivered.
 const EVIDENCE_WINDOW: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(200);
+/// The most UTF-16 units one composed envelope may occupy on the ordinary
+/// queue route: one Windows command line holds 32,767 units including the
+/// program, its quoting and the terminating null, so this leaves margin for
+/// the fixed arguments. A larger envelope is refused before anything is
+/// recorded or started - never truncated, split or rewritten.
+const ORDINARY_ARGV_UNITS: usize = 30_000;
+/// The method an ordinary-route attempt records: the installed native CLI's
+/// own queue command, whose exit status is transport acceptance only.
+const ORDINARY_QUEUE_METHOD: &str = "queue";
+/// Bounds of one evidence pass over the conversation's own rollout tree: how
+/// many files are visited, how much of a leading metadata row is read, and how
+/// much of the newest tail of one file is read. They bound the observation,
+/// never the message.
+const ROLLOUT_FILES_BOUND: usize = 4096;
+const ROLLOUT_META_PREFIX: u64 = 64 * 1024;
+const ROLLOUT_TAIL_BOUND: u64 = 8 * 1024 * 1024;
+/// How much of one native queue command's own report is read back for the
+/// recorded attempt detail.
+const QUEUE_REPORT_READ: u64 = 4096;
+/// The launcher registration is read with the same bound the launcher itself
+/// applies before it trusts one; a larger file is refused instead of parsed.
+const NATIVE_REGISTRATION_LIMIT: u64 = 65_536;
+/// The observed 0.162.1 missing-thread refusal precedes a queue effect. The
+/// generic queue-error prefix alone does not establish that nothing applied.
+const QUEUE_MISSING_THREAD_PREFIX: &str = "Error: failed to queue session message: thread/queue/add failed: failed to read thread: invalid thread-store request: no rollout found for thread id ";
 /// The inline delivery bound of one message: what is sent below it is always the
 /// literal text (a file is a correction, not a task re-send), and above it the
 /// shared spill owner delivers the complete payload as a pointer envelope. The
@@ -1627,6 +1655,12 @@ struct SpawnedRun {
     /// The kit home this run's records live under: the owner of the spill
     /// directory a message too large for one conversation input is written to.
     home: PathBuf,
+    /// The originating lead's own kit home, captured with the rest of the
+    /// recorded relationship. The executor's selected home is never assumed
+    /// to be the same: dispatch accepts an explicit `--codex-home`, and the
+    /// ordinary queue route must address the lead conversation's own store.
+    /// `None` when the dispatching process could not resolve its native home.
+    lead_home: Option<PathBuf>,
     lead_thread: String,
     generation: String,
     owner: String,
@@ -1645,7 +1679,11 @@ struct SpawnedRun {
 /// spawn command legitimately exits after starting the host. A copied marker,
 /// cwd, label, or most recent session is not authority. Delivery uses the
 /// existing app-server owner: `turn/steer` on an active turn and `turn/start`
-/// on an idle thread. No listener is started.
+/// on an idle thread. A lead that never recorded an endpoint is an ordinary
+/// conversation on its own recorded thread, reached through the installed
+/// native CLI's own queue route: that command's exit is transport acceptance,
+/// and only the addressed conversation's own stored items are delivery.
+/// Neither route starts a listener, daemon or second conversation.
 pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!("{LEAD_USAGE}");
@@ -1682,7 +1720,7 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
     {
         return report_recorded_lead_repeat(&run, &id, kind, previous, payload.len());
     }
-    let endpoint = verified_lead_endpoint(&run)?;
+    let route = resolve_lead_route(&run)?;
     let reply = if input.notify {
         "not-requested".to_owned()
     } else {
@@ -1721,7 +1759,14 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
         payload: &payload,
         spill: delivery.spill.as_ref(),
     };
-    deliver_to_recorded_lead(&run, &endpoint, &message, previous.as_ref())
+    match &route {
+        LeadRoute::Endpoint(endpoint) => {
+            deliver_to_recorded_lead(&run, endpoint, &message, previous.as_ref())
+        }
+        LeadRoute::Ordinary { executable, digest } => {
+            deliver_to_ordinary_lead(&run, executable, digest, &message, previous.as_ref())
+        }
+    }
 }
 
 fn parse_lead_input(args: &[OsString]) -> io::Result<LeadInput> {
@@ -1850,6 +1895,7 @@ fn resolve_spawned_run() -> io::Result<SpawnedRun> {
     Ok(SpawnedRun {
         receipt,
         home: PathBuf::from(&home),
+        lead_home: lead.home,
         lead_thread: lead.thread_id,
         generation: lead.run_generation,
         owner: registered_text(&value["slot"]["owner"]),
@@ -2021,27 +2067,60 @@ fn parent_process_id(pid: u32) -> Option<u32> {
     u32::try_from(basic.inherited_from_unique_process_id).ok()
 }
 
-fn verified_lead_endpoint(run: &SpawnedRun) -> io::Result<Endpoint> {
+/// The recorded delivery route of one run's originating lead: the managed
+/// endpoint its lead session recorded, or - for an ordinary lead conversation
+/// that never recorded one - the installed native CLI's own queue route. The
+/// ordinary route carries the registered upstream together with the digest
+/// that same registration records, so a replaced or modified executable is
+/// refused before it is run. A recorded endpoint is never silently replaced
+/// by the queue route, and the queue route is never substituted for a
+/// recorded managed endpoint.
+enum LeadRoute {
+    Endpoint(Endpoint),
+    Ordinary { executable: PathBuf, digest: String },
+}
+
+fn resolve_lead_route(run: &SpawnedRun) -> io::Result<LeadRoute> {
     let path = run
         .receipt
         .parent()
-        .ok_or_else(|| fresh_launch(&run.lead_thread, "the receipt has no directory"))?
-        .join(format!("lead-endpoint-{}.json", run.slot));
-    let endpoint = match Endpoint::read(&path) {
-        Ok(endpoint) => endpoint,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(fresh_launch(
+        .ok_or_else(|| {
+            fresh_launch(
                 &run.lead_thread,
-                "no lead-endpoint record exists beside the spawn receipt",
-            ));
+                "the receipt has no directory",
+                "the kit home of this run cannot be derived from the receipt",
+            )
+        })?
+        .join(format!("lead-endpoint-{}.json", run.slot));
+    match Endpoint::read(&path) {
+        Ok(endpoint) => verify_lead_endpoint(run, endpoint),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let (executable, digest) = native_queue_upstream(&run.home).map_err(|reason| {
+                fresh_launch(
+                    &run.lead_thread,
+                    "no lead-endpoint record exists beside the spawn receipt",
+                    &reason,
+                )
+            })?;
+            require_thread_uuid(&run.lead_thread).map_err(|reason| {
+                fresh_launch(
+                    &run.lead_thread,
+                    "no lead-endpoint record exists beside the spawn receipt",
+                    &reason,
+                )
+            })?;
+            Ok(LeadRoute::Ordinary { executable, digest })
         }
-        Err(error) => {
-            return Err(invalid(&format!(
-                "recorded lead endpoint {} is not usable: {error}; nothing was sent and no daemon, listener, or second conversation was started",
-                path.display()
-            )));
-        }
-    };
+        Err(error) => Err(invalid(&format!(
+            "recorded lead endpoint {} is not usable: {error}; nothing was sent and no daemon, listener, or second conversation was started",
+            path.display()
+        ))),
+    }
+}
+
+/// One recorded managed endpoint, verified as the address of the exact
+/// originating thread before any send.
+fn verify_lead_endpoint(run: &SpawnedRun, endpoint: Endpoint) -> io::Result<LeadRoute> {
     if endpoint.thread_id.as_deref() != Some(run.lead_thread.as_str()) {
         return Err(invalid(&format!(
             "recorded lead endpoint names a different thread than originating lead {}; refusing before any send",
@@ -2052,6 +2131,7 @@ fn verified_lead_endpoint(run: &SpawnedRun) -> io::Result<Endpoint> {
         return Err(fresh_launch(
             &run.lead_thread,
             "the endpoint record names no process",
+            "a recorded managed endpoint is not replaced by the ordinary queue route",
         ));
     };
     require_live(
@@ -2064,14 +2144,98 @@ fn verified_lead_endpoint(run: &SpawnedRun) -> io::Result<Endpoint> {
         fresh_launch(
             &run.lead_thread,
             "the recorded endpoint process is not live",
+            "a recorded managed endpoint is not replaced by the ordinary queue route",
         )
     })?;
-    Ok(endpoint)
+    Ok(LeadRoute::Endpoint(endpoint))
 }
 
-fn fresh_launch(thread: &str, reason: &str) -> io::Error {
+/// The installed native executable the ordinary queue route runs, from this
+/// kit home's own launcher registration, together with the upstream digest
+/// that registration records. Only the recorded installation is authority; an
+/// environment substitution or a guessed install location is not. The
+/// registration is read with the launcher's own bound and only a supported
+/// schema with an absolute registered native executable is accepted. This
+/// route invokes the registered binary itself to reach the lead's own store,
+/// so the recorded digest must still match the file before a send; the
+/// ordinary launcher instead treats a changed digest as an upstream update,
+/// and the installation check reports the mismatch. The digest itself is
+/// compared when a send is about to happen, so reading the lead
+/// conversation's own evidence never depends on the file and a reconcile is
+/// still possible without it.
+fn native_queue_upstream(home: &Path) -> Result<(PathBuf, String), String> {
+    let path = home.join("harness/native-launch.json");
+    let mut bytes = Vec::new();
+    fs::File::open(&path)
+        .map_err(|error| {
+            format!(
+                "this kit home records no readable installed native launcher ({}: {error}); repair the kit installation and retry",
+                path.display()
+            )
+        })?
+        .take(NATIVE_REGISTRATION_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "the installed native launcher registration {} cannot be read ({error}); repair the kit installation and retry",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > NATIVE_REGISTRATION_LIMIT {
+        return Err(format!(
+            "the installed native launcher registration {} exceeds its bound; repair the kit installation and retry",
+            path.display()
+        ));
+    }
+    let registration: harness_core::native_launcher::Registration = serde_json::from_slice(&bytes)
+        .map_err(|error| {
+            format!(
+                "the installed native launcher registration {} is not usable: {error}; repair the kit installation and retry",
+                path.display()
+            )
+        })?;
+    if registration.schema != 1 && registration.schema != 2 {
+        return Err(format!(
+            "the installed native launcher registration {} names unsupported schema {}; repair the kit installation and retry",
+            path.display(),
+            registration.schema
+        ));
+    }
+    let executable = registration.upstream.executable;
+    if !executable.is_absolute()
+        || !executable
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Err(format!(
+            "the installed native launcher registers a non-absolute or non-executable upstream {}; repair the kit installation and retry",
+            executable.display()
+        ));
+    }
+    Ok((executable, registration.upstream.sha256))
+}
+
+/// The recorded lead thread must be exactly the native session id shape the
+/// queue route addresses; any other value could name a different session as a
+/// title or alias, so it is refused before any send.
+fn require_thread_uuid(thread: &str) -> Result<(), String> {
+    let bytes = thread.as_bytes();
+    let shaped = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
+        });
+    if shaped {
+        return Ok(());
+    }
+    Err(format!(
+        "the recorded lead thread {thread:?} is not a native session id, and the queue route addresses an exact session id rather than resolving a title or alias; refusing before any send"
+    ))
+}
+
+fn fresh_launch(thread: &str, reason: &str, queue: &str) -> io::Error {
     invalid(&format!(
-        "no verified lead endpoint is recorded for originating lead thread {thread}: {reason}. Ordinary leads expose no delivery endpoint. This command does not start a daemon, listener, or second conversation. Next action: fresh-launch the lead session so this same thread records a verified app-server endpoint, then dispatch the executor again. Nothing was sent"
+        "no verified lead endpoint is recorded for originating lead thread {thread}: {reason}, and the native queue route is unavailable: {queue}. This command does not start a daemon, listener, or second conversation. Next action: fresh-launch the lead session so this same thread records a verified app-server endpoint, then dispatch the executor again. Nothing was sent"
     ))
 }
 
@@ -2632,6 +2796,595 @@ fn deliver_to_recorded_lead(
         message.spill,
         None,
     )
+}
+
+/// The installed native CLI's own queue route as one attempt classifies it:
+/// the command's exit status is transport acceptance only, and nothing here is
+/// delivery.
+enum QueueOutcome {
+    /// The native queue command exited 0: the message is accepted for the
+    /// conversation, not yet shown by it.
+    Accepted { detail: String },
+    /// The native queue named its own rejection of the queue add: a
+    /// definitive result that applied nothing and may be sent again as a new
+    /// attempt.
+    Refused { detail: String },
+    /// The native queue did not finish within the bound, or exited non-zero
+    /// without its rejection mark: whether the message reached the
+    /// conversation is unknown, so the attempt may not be repeated blindly.
+    Unresolved { detail: String },
+}
+
+/// Delivers one message through the installed native CLI's own queue route to
+/// the already running ordinary lead conversation on its recorded thread. The
+/// queue command carries no message identity, so it is invoked at most once
+/// per attempt: transport acceptance is recorded as queued, and only the
+/// addressed conversation's own stored items upgrade it to delivered.
+fn deliver_to_ordinary_lead(
+    run: &SpawnedRun,
+    executable: &Path,
+    digest: &str,
+    message: &LeadMessage<'_>,
+    previous: Option<&Value>,
+) -> io::Result<i32> {
+    if let Some(previous) = previous {
+        return reconcile_ordinary_lead(run, message, previous);
+    }
+    // The native queue carries the message as one command-line argument and
+    // has no file or piped message source. A message that cannot fit one
+    // command line is refused before anything is recorded or started: nothing
+    // is truncated, split or rewritten, and the spill pointer covers the
+    // messages above the inline bound.
+    let units = message.envelope.encode_utf16().count();
+    if units > ORDINARY_ARGV_UNITS {
+        return Err(invalid(&format!(
+            "the composed message is {units} UTF-16 units of one command line, above the {ORDINARY_ARGV_UNITS} units the native queue route can carry; nothing was sent and nothing was truncated. Next action: send a message whose own text points at the file carrying the complete content, or deliver from a lead session that records a managed endpoint (which carries the {}-byte inline bound); nothing was sent",
+            executor_input::INLINE_BOUND
+        )));
+    }
+    // The queue child must load the originating lead's own store: the
+    // executor's selected home is not the lead's home unless the dispatch
+    // recorded it, and a message that cannot be pointed at the lead
+    // conversation is refused before anything is recorded or started.
+    let Some(lead_home) = run.lead_home.as_deref() else {
+        return Err(invalid(
+            "the originating lead's own kit home was not recorded when this run was dispatched, so the native queue cannot be pointed at that conversation's own store; nothing was sent. Next action: dispatch from a lead session whose process resolves a kit home, or deliver from a lead session that records a managed endpoint",
+        ));
+    };
+    if !executable.is_file() {
+        return Err(invalid(&format!(
+            "the installed native launcher registers {} as its upstream, and that file does not exist; nothing was sent",
+            executable.display()
+        )));
+    }
+    // A registered upstream whose own file no longer matches the digest the
+    // installation recorded is a replaced or modified executable. This route
+    // invokes the registered binary itself to reach the lead's own store, so
+    // the recorded identity must hold: it refuses before anything is recorded
+    // or started. The ordinary launcher instead treats a changed digest as an
+    // upstream update; the installation check reports the mismatch.
+    let observed = harness_core::build_identity::hash_file(executable).map_err(|error| {
+        invalid(&format!(
+            "the registered native upstream {} cannot be verified ({error}); nothing was sent",
+            executable.display()
+        ))
+    })?;
+    if observed != digest {
+        return Err(invalid(&format!(
+            "the installed native launcher records upstream {} with SHA-256 {digest}, and the file's current digest is {observed}; a changed upstream is not launched through the queue route; nothing was sent. Next action: repair the kit installation, or deliver from a lead session that records a managed endpoint",
+            executable.display()
+        )));
+    }
+    // The attempt is recorded before the command starts, so an invocation that
+    // is interrupted mid-command leaves its identity behind instead of an
+    // invitation to deliver the same words again.
+    let pending = LeadAttempt {
+        status: STATUS_PENDING,
+        method: ORDINARY_QUEUE_METHOD.to_owned(),
+        attempts: 1,
+        detail: "the message is being submitted to the native queue for the lead conversation's exact thread, and that conversation's own stored items are being read".to_owned(),
+    };
+    record_lead_message(run, message, &pending)?;
+    let outcome =
+        match queue_lead_message(executable, lead_home, &run.lead_thread, message.envelope) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The command could not be started or its lifecycle could not be
+                // observed: a definitive local result, recorded as one so no
+                // phantom hold blocks a later honest retry.
+                let attempt = LeadAttempt {
+                    status: STATUS_ERROR,
+                    method: ORDINARY_QUEUE_METHOD.to_owned(),
+                    attempts: 1,
+                    detail: format!(
+                        "the native queue command could not be run ({error}); nothing was delivered"
+                    ),
+                };
+                record_lead_message(run, message, &attempt)?;
+                return report_lead_message(
+                    run,
+                    message.id,
+                    message.kind,
+                    &attempt,
+                    message.payload.len(),
+                    message.spill,
+                    None,
+                );
+            }
+        };
+    let attempt = match outcome {
+        QueueOutcome::Accepted { detail } => {
+            let evidence = ordinary_input_evidence(
+                lead_home,
+                &run.lead_thread,
+                message.id,
+                message.envelope,
+                Instant::now() + EVIDENCE_WINDOW,
+            );
+            match evidence {
+                Some(evidence) => LeadAttempt {
+                    status: STATUS_DELIVERED,
+                    method: ORDINARY_QUEUE_METHOD.to_owned(),
+                    attempts: 1,
+                    detail: format!(
+                        "the input is in the lead conversation's own stored items ({evidence}); whether the lead applied it is the lead's own report"
+                    ),
+                },
+                None => LeadAttempt {
+                    status: STATUS_QUEUED,
+                    method: ORDINARY_QUEUE_METHOD.to_owned(),
+                    attempts: 1,
+                    detail: format!(
+                        "{detail}; the lead conversation's own stored items do not show the input yet"
+                    ),
+                },
+            }
+        }
+        QueueOutcome::Refused { detail } => LeadAttempt {
+            status: STATUS_ERROR,
+            method: ORDINARY_QUEUE_METHOD.to_owned(),
+            attempts: 1,
+            detail,
+        },
+        QueueOutcome::Unresolved { detail } => LeadAttempt {
+            status: STATUS_INDETERMINATE,
+            method: ORDINARY_QUEUE_METHOD.to_owned(),
+            attempts: 1,
+            detail,
+        },
+    };
+    record_lead_message(run, message, &attempt)?;
+    report_lead_message(
+        run,
+        message.id,
+        message.kind,
+        &attempt,
+        message.payload.len(),
+        message.spill,
+        None,
+    )
+}
+
+/// Nothing is sent again while an earlier queue attempt of the same message
+/// may be in the lead conversation: the exact thread's own stored items are
+/// reconciled first. Observed evidence upgrades the recorded attempt to
+/// delivered, an accepted attempt stays one queued input, and an attempt whose
+/// fate is unknown stays unresolved under its own identity, so an uncertain
+/// repeat can neither deliver a second copy nor drop the hold.
+fn reconcile_ordinary_lead(
+    run: &SpawnedRun,
+    message: &LeadMessage<'_>,
+    previous: &Value,
+) -> io::Result<i32> {
+    let status = recorded_status(previous).to_owned();
+    let method = previous["method"].as_str().unwrap_or_default().to_owned();
+    let attempts = previous["attempts"].as_u64().unwrap_or(0);
+    let detail = previous["detail"].as_str().unwrap_or_default().to_owned();
+    if status == STATUS_DELIVERED {
+        return report_recorded_lead_repeat(
+            run,
+            message.id,
+            message.kind,
+            previous,
+            message.payload.len(),
+        );
+    }
+    // The lead home was captured with the relationship; when the dispatching
+    // process recorded none, the conversation's own items cannot be read at
+    // this address, and the held attempt is reported from its own record
+    // instead of being upgraded.
+    let evidence = run.lead_home.as_deref().and_then(|lead_home| {
+        ordinary_input_evidence(
+            lead_home,
+            &run.lead_thread,
+            message.id,
+            message.envelope,
+            Instant::now() + EVIDENCE_WINDOW,
+        )
+    });
+    if let Some(evidence) = evidence {
+        let attempt = LeadAttempt {
+            status: STATUS_DELIVERED,
+            method,
+            attempts,
+            detail: format!(
+                "the input is in the lead conversation's own stored items ({evidence}); the recorded attempt was upgraded from {status} by that evidence, and whether the lead applied it is the lead's own report"
+            ),
+        };
+        record_lead_message(run, message, &attempt)?;
+        return report_lead_message(
+            run,
+            message.id,
+            message.kind,
+            &attempt,
+            message.payload.len(),
+            message.spill,
+            Some(
+                "nothing was sent: the earlier attempt is in the lead conversation, so the same words cannot be delivered twice".to_owned(),
+            ),
+        );
+    }
+    match status.as_str() {
+        STATUS_QUEUED => {
+            let attempt = LeadAttempt {
+                status: STATUS_QUEUED,
+                method,
+                attempts,
+                detail,
+            };
+            report_lead_message(
+                run,
+                message.id,
+                message.kind,
+                &attempt,
+                message.payload.len(),
+                message.spill,
+                Some(
+                    "nothing was sent again: the native queue accepted the earlier attempt, which is one input for the lead conversation, so the same words cannot be delivered twice. The recorded request stands; answer or stop it explicitly".to_owned(),
+                ),
+            )
+        }
+        // A pending attempt stopped before its outcome was recorded, and an
+        // indeterminate one lost its answer: both may or may not have reached
+        // the lead, so the recorded identity stays unresolved and the repeat is
+        // refused rather than risking a second copy.
+        _ => {
+            let detail = format!(
+                "the earlier attempt ({method}) is recorded as {status} and the lead conversation's own stored items do not show it, so whether it reached the lead is unknown"
+            );
+            let attempt = LeadAttempt {
+                status: STATUS_INDETERMINATE,
+                method,
+                attempts,
+                detail,
+            };
+            record_lead_message(run, message, &attempt)?;
+            report_lead_message(
+                run,
+                message.id,
+                message.kind,
+                &attempt,
+                message.payload.len(),
+                message.spill,
+                Some(
+                    "nothing was sent again: an earlier attempt of this exact text may already be in the lead conversation, so a repeat could deliver it twice. Next action: inspect the lead conversation; if the words are genuinely absent, send them again with a distinguishing first line".to_owned(),
+                ),
+            )
+        }
+    }
+}
+
+/// Runs the installed native queue command once, as an owned child under one
+/// Job with a bounded wait, and classifies the result: exit 0 is transport
+/// acceptance; a non-zero exit counts as a refusal only when the command
+/// reports the observed exact missing-thread rejection, because an
+/// arbitrary failure can follow an applied queue effect; any other non-zero
+/// exit, and any command whose end cannot be observed within the bound, is
+/// unresolved. The command's own combined report is read back for the
+/// recorded detail. No listener, daemon or second conversation is started
+/// here, and the child tree is ended with its Job before this returns.
+fn queue_lead_message(
+    executable: &Path,
+    lead_home: &Path,
+    thread: &str,
+    envelope: &str,
+) -> io::Result<QueueOutcome> {
+    let log = tempfile::tempfile()?;
+    let mut spec = CommandSpec::new(executable);
+    spec.args = vec![
+        "queue".into(),
+        "--thread".into(),
+        thread.into(),
+        "--message".into(),
+        envelope.into(),
+    ];
+    spec.env
+        .insert("CODEX_HOME".into(), Some(lead_home.as_os_str().to_owned()));
+    // This process is a member of an executor run; the queue command is not,
+    // and a leaked conversation identity must not ride along as its native
+    // identity.
+    spec.env.insert("CODEX_SESSION_ID".into(), None);
+    spec.env.insert("CODEX_THREAD_ID".into(), None);
+    spec.stdout = Some(log.try_clone()?);
+    spec.stderr = Some(log);
+    // Every check whose failure is definitive is settled before the command
+    // starts. From the spawn onward an unobservable end is not a definitive
+    // failure: the message may already have been accepted, so it is carried
+    // as unresolved instead of being classified as a retryable error.
+    let deadline = Deadline::after(CONTROL_BOUND)?;
+    let job = Job::new(Limits::default())?;
+    let child = job.spawn(&spec)?;
+    let outcome = job.wait(
+        &child,
+        deadline,
+        &Cancellation::default(),
+        Duration::from_secs(2),
+    );
+    let report = queue_report(spec.stdout.take());
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Ok(QueueOutcome::Unresolved {
+                detail: format!(
+                    "the native queue command did not finish observably ({error}); whether the message reached the lead conversation is unknown (report: {report})"
+                ),
+            });
+        }
+    };
+    Ok(match outcome.reason {
+        StopReason::Exited if outcome.process_exit_code == 0 => QueueOutcome::Accepted {
+            detail: format!(
+                "the native queue accepted the message for thread {thread} (exit 0: {report})"
+            ),
+        },
+        StopReason::Exited if queue_refused_missing_thread(&report, thread) => {
+            QueueOutcome::Refused {
+                detail: format!(
+                    "the native queue refused the message for thread {thread} (exit {}: {report}); nothing was delivered",
+                    outcome.process_exit_code
+                ),
+            }
+        }
+        // A non-zero exit without the native rejection mark does not prove no
+        // earlier queue effect: the command may have applied the input before
+        // failing. The attempt stays unresolved under its own identity
+        // instead of becoming retryable.
+        StopReason::Exited => QueueOutcome::Unresolved {
+            detail: format!(
+                "the native queue exited {} without a recognized pre-delivery refusal ({report}); whether the message reached the lead conversation is unknown",
+                outcome.process_exit_code
+            ),
+        },
+        StopReason::Timeout => QueueOutcome::Unresolved {
+            detail: format!(
+                "the native queue did not exit within {}s, so whether the message reached the lead conversation is unknown",
+                CONTROL_BOUND.as_secs()
+            ),
+        },
+        StopReason::MemoryLimit | StopReason::Cancelled => QueueOutcome::Unresolved {
+            detail: format!(
+                "the native queue was ended before it exited ({:?}), so whether the message reached the lead conversation is unknown",
+                outcome.reason
+            ),
+        },
+    })
+}
+
+fn queue_refused_missing_thread(report: &str, thread: &str) -> bool {
+    report.trim() == format!("{QUEUE_MISSING_THREAD_PREFIX}{thread} (code -32603)")
+}
+
+#[cfg(test)]
+#[test]
+fn only_an_exact_missing_target_proves_no_delivery() {
+    let target = "00000000-0000-4000-8000-000000000000";
+    let missing = format!("{QUEUE_MISSING_THREAD_PREFIX}{target} (code -32603)");
+    assert!(queue_refused_missing_thread(&missing, target));
+    assert!(!queue_refused_missing_thread(&missing, "another-thread"));
+    assert!(!queue_refused_missing_thread(
+        "Error: failed to queue session message: connection closed after sending the request",
+        target,
+    ));
+    assert!(!queue_refused_missing_thread(
+        &format!("{missing}\nresponse lost after another queue operation"),
+        target,
+    ));
+}
+
+/// The command's own combined report, read back within its bound. A report
+/// that cannot be read back is simply absent: the exit status is the transport
+/// result, so a failed readback must not reclassify a finished command.
+fn queue_report(handle: Option<fs::File>) -> String {
+    let mut report = Vec::new();
+    if let Some(mut handle) = handle
+        && handle.seek(io::SeekFrom::Start(0)).is_ok()
+    {
+        let _ = (&mut handle)
+            .take(QUEUE_REPORT_READ)
+            .read_to_end(&mut report);
+    }
+    let report = observation::excerpt(String::from_utf8_lossy(&report).trim(), 400);
+    if report.is_empty() {
+        "no report".to_owned()
+    } else {
+        report
+    }
+}
+
+/// The addressed ordinary conversation's own stored evidence of one input: the
+/// user message row carrying this exact envelope, in a rollout whose own
+/// session metadata names the exact lead thread. A filename, transcript,
+/// rendered text, exit status or process state is never identity or delivery.
+/// The search is bounded to the given instant and to its own read bounds; a
+/// scan that finds nothing within them reports absence instead of blocking.
+fn ordinary_input_evidence(
+    home: &Path,
+    thread: &str,
+    id: &str,
+    envelope: &str,
+    until: Instant,
+) -> Option<String> {
+    loop {
+        if let Some(detail) = session_input_row(&home.join("sessions"), thread, id, envelope) {
+            return Some(detail);
+        }
+        let now = Instant::now();
+        if now >= until {
+            return None;
+        }
+        thread::sleep(POLL.min(until - now));
+    }
+}
+
+/// One pass over the conversation's own rollout tree: a file's own session
+/// metadata must name the exact thread before any row of it is considered,
+/// and the newest files are read first because a just-submitted input is
+/// appended at the end of its rollout.
+fn session_input_row(sessions: &Path, thread: &str, id: &str, envelope: &str) -> Option<String> {
+    let mut files = Vec::new();
+    collect_rollouts(sessions, &mut files, 0);
+    files.sort();
+    for file in files.into_iter().rev() {
+        // A rollout filename carries its own conversation id, so the name
+        // narrows the candidates cheaply; it is never identity by itself: the
+        // file's own session metadata must still name the exact thread.
+        if !rollout_name_names(&file, thread) {
+            continue;
+        }
+        if rollout_session(&file).as_deref() != Some(thread) {
+            continue;
+        }
+        if rollout_carries_input(&file, id, envelope) {
+            return Some(file.display().to_string());
+        }
+    }
+    None
+}
+
+/// Whether one rollout file's own name follows the native convention and
+/// carries the thread id as a substring, the same narrowing the existing
+/// successor locator uses. This only selects candidates for the metadata
+/// check that follows; it is never identity.
+fn rollout_name_names(file: &Path, thread: &str) -> bool {
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.contains(thread))
+}
+
+/// Collects the rollout files under one sessions tree, bounded in count and
+/// depth so one evidence pass visits a bounded tree.
+fn collect_rollouts(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 8 || files.len() >= ROLLOUT_FILES_BOUND {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollouts(&path, files, depth + 1);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            files.push(path);
+        }
+        if files.len() >= ROLLOUT_FILES_BOUND {
+            return;
+        }
+    }
+}
+
+/// The conversation identity one rollout file's own metadata records, from its
+/// leading rows only. The filename is never consulted.
+fn rollout_session(file: &Path) -> Option<String> {
+    // The take bound caps the reader itself, so no single metadata line can
+    // allocate past the prefix this pass is allowed to read.
+    let mut reader = BufReader::new(fs::File::open(file).ok()?.take(ROLLOUT_META_PREFIX));
+    let mut line = String::new();
+    let mut read = 0u64;
+    loop {
+        line.clear();
+        let count = reader.read_line(&mut line).ok()?;
+        if count == 0 {
+            return None;
+        }
+        read += count as u64;
+        if line.contains("session_meta")
+            && let Ok(row) = serde_json::from_str::<Value>(&line)
+            && row["type"] == "session_meta"
+        {
+            let session = row["payload"]["id"]
+                .as_str()
+                .or_else(|| row["payload"]["session_id"].as_str());
+            if let Some(session) = session {
+                return Some(session.to_owned());
+            }
+        }
+        if read >= ROLLOUT_META_PREFIX {
+            return None;
+        }
+    }
+}
+
+/// Whether one rollout file holds the stored user message row carrying this
+/// exact envelope at its newest end. The read starts at a bounded distance
+/// from the end because a just-submitted input is appended there; a partial
+/// first line is simply not parseable and is skipped.
+fn rollout_carries_input(file: &Path, id: &str, envelope: &str) -> bool {
+    let Ok(mut handle) = fs::File::open(file) else {
+        return false;
+    };
+    let length = handle.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = length.saturating_sub(ROLLOUT_TAIL_BOUND);
+    if start > 0 && handle.seek(io::SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    // The take bound caps the read itself, so a file that keeps growing while
+    // this pass reads it cannot extend the pass beyond its own bound.
+    let mut reader = BufReader::new(handle.take(ROLLOUT_TAIL_BOUND));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let Ok(count) = reader.read_line(&mut line) else {
+            return false;
+        };
+        if count == 0 {
+            return false;
+        }
+        if !line.contains(id) {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if user_row_text(&row).is_some_and(|text| text.contains(envelope)) {
+            return true;
+        }
+    }
+}
+
+/// The visible text of one stored user message row, when that row is a user
+/// message; any other row shape is not delivery evidence.
+fn user_row_text(row: &Value) -> Option<String> {
+    if row["type"] != "response_item"
+        || row["payload"]["type"] != "message"
+        || row["payload"]["role"] != "user"
+    {
+        return None;
+    }
+    if let Some(text) = row["payload"]["content"].as_str() {
+        return Some(text.to_owned());
+    }
+    let parts = row["payload"]["content"].as_array()?;
+    let mut text = String::new();
+    for part in parts {
+        if let Some(part) = part["text"].as_str() {
+            text.push_str(part);
+        }
+    }
+    Some(text)
 }
 
 /// Address fields supplied beside `--reply-to`. A present field that does not

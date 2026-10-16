@@ -610,7 +610,7 @@ fn two_lead_router(state: Arc<Mutex<LeadRoute>>) -> impl Fn(&Value) -> Value + S
                 "name": "exec_command",
                 "arguments": serde_json::to_string(&json!({
                     "cmd": command,
-                    "shell": "powershell",
+                    "shell": control_responses::owned_pwsh(),
                     "yield_time_ms": 60000
                 }))
                 .unwrap()
@@ -3251,6 +3251,775 @@ trust_level = "trusted"
         primary_hits.len(),
         auxiliary_hits.len(),
         foreign.len(),
+        root.display()
+    );
+}
+
+/// The value of one `key: value` line in a command's own text report.
+fn text_line(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key).map(|value| value.trim().to_owned()))
+}
+
+/// The provider request count once it stops growing: a queued turn's own
+/// request and its native title auxiliary land beside each other, and a
+/// baseline must cover the whole turn instead of racing the auxiliary.
+fn settled_provider_count(root: &Path) -> usize {
+    let mut count = provider_request_count(root);
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_secs(1));
+        let settled = provider_request_count(root);
+        if settled == count {
+            break;
+        }
+        count = settled;
+    }
+    count
+}
+
+/// One `codex-harness lead message` invocation - the production entry point -
+/// run as a bounded owned child in the passed kit home. The command's own
+/// report is recorded; it is never accepted as delivery here.
+fn run_harness_lead(
+    root: &Path,
+    home: &Path,
+    workspace: &Path,
+    generation: &str,
+    args: &[&str],
+    label: &str,
+) -> Value {
+    let mut spec = CommandSpec::new(PathBuf::from(env!("CARGO_BIN_EXE_codex-harness")));
+    spec.current_dir = Some(workspace.into());
+    let mut all: Vec<OsString> = vec!["lead".into(), "message".into()];
+    all.extend(args.iter().map(|arg| OsString::from(*arg)));
+    spec.args = all;
+    spec.env.insert("CODEX_HOME".into(), Some(home.into()));
+    spec.env
+        .insert("HARNESS_EXECUTOR_RUN".into(), Some(generation.into()));
+    spec.env
+        .insert("HARNESS_EXECUTOR_SESSION".into(), Some("1".into()));
+    // A most-recent or inherited conversation identity is not authority.
+    spec.env.insert(
+        "CODEX_THREAD_ID".into(),
+        Some("most-recent-session-is-not-authority".into()),
+    );
+    for key in [
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+        "CODEX_SESSION_ID",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    // The sender spawns the installed native queue client, which must see the
+    // owned home only: no ambient provider credential rides along, and the
+    // fixture key is what that home's own config names.
+    for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+        spec.env.insert(key.into(), None);
+    }
+    spec.env.insert(
+        "HARNESS_CONTROL_FIXTURE_KEY".into(),
+        Some("synthetic-owned-fixture".into()),
+    );
+    let stdout_path = root.join(format!("{label}-stdout.txt"));
+    let stderr_path = root.join(format!("{label}-stderr.txt"));
+    spec.stdout = Some(fs::File::create(&stdout_path).unwrap());
+    spec.stderr = Some(fs::File::create(&stderr_path).unwrap());
+    let job = Job::new(Limits::default()).unwrap();
+    let child = job.spawn(&spec).unwrap();
+    let started = Instant::now();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(Duration::from_secs(90)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    json!({
+        "exitCode": outcome.exit_code,
+        "exited": outcome.reason == StopReason::Exited,
+        "reason": format!("{:?}", outcome.reason),
+        "seconds": started.elapsed().as_secs_f64(),
+        "stdout": excerpt(&stdout, 4000),
+        "stderr": excerpt(&stderr, 1000),
+    })
+}
+
+/// One fabricated run identity for the production entry point: the receipt the
+/// real dispatch writes, with this test process as the recorded live host (an
+/// ancestor of every sender it runs) and the given conversation as the
+/// recorded originating lead, whose own kit home is the receiver home the
+/// queue route must address. It starts no process and writes only its own
+/// owned file.
+fn write_ordinary_run_receipt(path: &Path, home: &Path, generation: &str, thread: &str) {
+    let user = process_service::current_user().unwrap();
+    let program = std::env::current_exe().unwrap();
+    let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+        .unwrap()
+        .identity();
+    let state = path.parent().unwrap();
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "originatingLead": {
+                "schema": 1,
+                "threadId": thread,
+                "runGeneration": generation,
+                "home": home,
+                "dispatcher": {
+                    "pid": identity.pid,
+                    "creationTime": identity.creation_time,
+                    "program": program.clone(),
+                },
+            },
+            "slot": {
+                "index": 1,
+                "path": state.join("worktree"),
+                "source": state.join("checkout"),
+                "owner": "ordinary-lead-production",
+            },
+            "observation": {
+                "schema": 1,
+                "state": "running",
+                "session": "ordinary-lead-production-session",
+                "host": {
+                    "pid": identity.pid,
+                    "created": identity.creation_time,
+                    "program": program,
+                },
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// The production entry point over the verified native boundary: the same
+/// owned ordinary native TUI is the running receiver, and the checkout's own
+/// `codex-harness lead message` is the sender. The sender runs as a member of
+/// a fabricated run identity whose recorded live host is this test process
+/// (its own ancestor), resolves its route from the same owned kit home (no
+/// lead endpoint is recorded; the home's own launcher registration names the
+/// installed executable) and must reach the running conversation through the
+/// installed native queue. Delivery is the receiver's own stored user row and
+/// its own model request; the harness report, exit status and process state
+/// are recorded beside them and are not delivery. One message is sent first,
+/// repeated second (idempotent), then one payload above the inline bound
+/// (spill pointer), then one nonexistent target, and finally one
+/// stopped-existing target after the receiver quits. Each arm records what
+/// actually happened; the expectations name the invariants that hold for
+/// either honest classification, so neither a test name nor an assertion
+/// presumes in advance that unmanaged delivery fails.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; starts an owned ordinary native TUI with the canned local Responses provider and drives this checkout's own `codex-harness lead message`; no live model, no daemon, no desktop"]
+fn installed_queue_production_lead_message_reaches_a_running_ordinary_tui() {
+    const NOTICE_MARK: &str = "ORDINARY-LEAD-PRODUCTION-NOTICE-8me13";
+    const SPILL_MARK: &str = "ORDINARY-LEAD-PRODUCTION-SPILL-8me13";
+    const SPILL_FILLER: &str = "ORDINARY-LEAD-PRODUCTION-SPILL-FILLER-8me13";
+    const MISSING_MARK: &str = "ORDINARY-LEAD-PRODUCTION-MISSING-8me13";
+    const STOPPED_MARK: &str = "ORDINARY-LEAD-PRODUCTION-STOPPED-8me13";
+    const RUN_GENERATION: &str = "generation-ordinary-lead-production";
+    const MISSING_GENERATION: &str = "generation-ordinary-lead-missing";
+
+    let exe = codex_exe();
+    let upstream = installed_upstream();
+    assert!(
+        same_executable(&exe, &upstream),
+        "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the production arm runs the installed native queue",
+        exe.display(),
+        upstream.display()
+    );
+    let version = version_text(&exe);
+    let sha = build_identity::hash_file(&exe).unwrap();
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let root = owned_root.path().to_path_buf();
+    let home = root.join("ordinary-home");
+    let workspace = root.join("ordinary-workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    // The kit home's own launcher registration is the ordinary route's only
+    // authority for the queue executable; seeding it copies the installed
+    // record, and it starts no process.
+    seed_launcher_registration(&home);
+    let user = process_service::current_user().unwrap();
+    eprintln!(
+        "ordinary-lead production integration evidence: {}",
+        root.display()
+    );
+
+    // The receiver: a real ordinary native TUI, built exactly like the
+    // accepted boundary probe, answering every request from the canned
+    // provider.
+    let responses = control_responses::Responses::routed(root.clone(), |_request| {
+        json!({
+            "type": "message",
+            "id": "ordinary-control-reply",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ORDINARY_TUI_CONTROL_REPLY}]
+        })
+    });
+    let trusted = serde_json::to_string(&workspace.to_string_lossy().to_lowercase()).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+model = "gpt-6-astra"
+model_provider = "control_fixture"
+model_reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "disabled"
+cli_auth_credentials_store = "file"
+[model_providers.control_fixture]
+name = "Owned ordinary TUI fixture"
+base_url = "http://127.0.0.1:{}/v1"
+wire_api = "responses"
+env_key = "HARNESS_CONTROL_FIXTURE_KEY"
+requires_openai_auth = false
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+[windows]
+sandbox = "unelevated"
+[features]
+hooks = false
+apps = false
+multi_agent = false
+multi_agent_v2 = false
+memories = false
+goals = false
+plugins = false
+skill_search = false
+skip_host_skill_discovery = true
+[analytics]
+enabled = false
+[projects.{trusted}]
+trust_level = "trusted"
+"#,
+            responses.port
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "harness-control-ordinary-tui"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut spec = command(&exe, &home, &workspace);
+    spec.args = vec!["--no-alt-screen".into()];
+    spec.env.insert("PATH".into(), Some(filtered_path()));
+    for key in [
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let mut console = ConsoleSpec::new(spec);
+    console.limits.memory_bytes = Some(512 * 1024 * 1024);
+    console.limits.cpu_percent = Some(50.0);
+    let session = ConsoleSession::spawn(console).unwrap();
+    let identity = session.identity();
+    let ready = wait_until(60, || {
+        let text = session.transcript();
+        text.contains("gpt-6-astra") || text.contains("Codex")
+    });
+    if !ready {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned ordinary TUI did not become ready; evidence {}",
+            root.display()
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
+
+    // The control turn establishes the running conversation's exact thread
+    // through its own model request; the queued arms below can then be
+    // attributed only to that conversation.
+    send_line(&session, ORDINARY_TUI_CONTROL_PROMPT).unwrap();
+    let mut submit_retries = 0;
+    let mut control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    while !control_requested && submit_retries < 2 {
+        let _ = session.send("\r");
+        submit_retries += 1;
+        control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    }
+    if !control_requested {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned provider recorded no request for the control turn; evidence {}",
+            root.display()
+        );
+    }
+    let control_answered = wait_until(60, || {
+        session_mark_count(&home, ORDINARY_TUI_CONTROL_REPLY) >= 1
+            || session.transcript().contains(ORDINARY_TUI_CONTROL_REPLY)
+    });
+    let baseline_requests = settled_provider_count(&root);
+    let entries = provider_entries(&root);
+    let (_, _, thread, control_turn) = entries
+        .first()
+        .unwrap_or_else(|| panic!("no recorded provider request; evidence {}", root.display()))
+        .clone();
+    let baseline_auxiliary = entries
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
+    let meta_before = session_meta_ids(&home);
+    let sessions_before = count_files(&home.join("sessions"));
+    let daemon_socket = home
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    let daemon_socket_before = daemon_socket.exists();
+    eprintln!(
+        "ordinary lead production: receiver pid {} creation {} thread {thread} controlTurn {control_turn} baselineRequests {baseline_requests}; evidence {}",
+        identity.pid,
+        identity.creation_time,
+        root.display()
+    );
+
+    // The fabricated run identity: this test process is the recorded live
+    // host and the ancestor of every sender invocation below; the receiver's
+    // exact thread is the recorded originating lead.
+    let state = home.join("harness/executor-pool/ordinary-lead-production");
+    fs::create_dir_all(&state).unwrap();
+    write_ordinary_run_receipt(&state.join("spawn-1.json"), &home, RUN_GENERATION, &thread);
+    write_ordinary_run_receipt(
+        &state.join("spawn-2.json"),
+        &home,
+        MISSING_GENERATION,
+        MISSING_THREAD_ID,
+    );
+
+    // Arm 1: the first notification through the production entry point.
+    let notice = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--text", NOTICE_MARK],
+        "lead-notice",
+    );
+    let notice_delivered = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, NOTICE_MARK).is_empty()
+    });
+    let notice_requests = settled_provider_count(&root);
+    let notice_hits = provider_hits(&root, NOTICE_MARK);
+    let notice_primary: Vec<(String, String, String)> = notice_hits
+        .iter()
+        .filter(|(file, hit_thread, _)| {
+            hit_thread == &thread && !title_generation_request(&provider_request(&root, file))
+        })
+        .cloned()
+        .collect();
+    let notice_rollout = session_mark_count(&home, NOTICE_MARK);
+    let receiver_alive = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_some())
+        .unwrap_or(false);
+    let daemon_socket_after_notice = daemon_socket.exists();
+    let meta_after_notice = session_meta_ids(&home);
+    let sessions_after_notice = count_files(&home.join("sessions"));
+
+    // Arm 2: the same words again - a repeat must reconcile the recorded
+    // attempt, never deliver a second copy.
+    let repeat = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--text", NOTICE_MARK],
+        "lead-notice-repeat",
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let repeat_requests = provider_request_count(&root);
+    let repeat_rollout = session_mark_count(&home, NOTICE_MARK);
+    let notice_record = read_json(&state.join("spawn-1.json")).unwrap_or(Value::Null);
+
+    // Arm 3: one payload above the inline bound travels as the shared spill
+    // pointer; the complete payload is never rewritten into a command line.
+    let spill_payload = format!(
+        "{SPILL_MARK}\n{}\n{SPILL_MARK}\n",
+        SPILL_FILLER.repeat(8000)
+    );
+    let spill_file = root.join("production-spill-payload.txt");
+    fs::write(&spill_file, spill_payload.as_bytes()).unwrap();
+    let spill = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--file", spill_file.to_str().unwrap()],
+        "lead-spill",
+    );
+    let spill_delivered = wait_until(WAIT.as_secs(), || {
+        session_mark_count(&home, "larger than one conversation input") >= 1
+    });
+    let spill_requests = settled_provider_count(&root);
+    let spill_pointer_hits = provider_hits(&root, "larger than one conversation input");
+    let spill_pointer_primary = spill_pointer_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread == &thread)
+        .count();
+    let spill_inline_leak = provider_entries(&root)
+        .iter()
+        .any(|(_, request, _, _)| contains_payload(request, SPILL_FILLER));
+    let spill_path_reported = text_line(
+        spill["stdout"].as_str().unwrap_or_default(),
+        "payloadPath: ",
+    );
+    let spill_file_matches = spill_path_reported
+        .as_deref()
+        .map(|path| {
+            fs::read(path)
+                .map(|bytes| bytes == spill_payload.as_bytes())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    // Arm 4: a target the receiver does not own refuses through the same
+    // production entry point and records an honest error.
+    let missing = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        MISSING_GENERATION,
+        &["--notify", "--text", MISSING_MARK],
+        "lead-missing",
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let missing_requests = provider_request_count(&root);
+    let missing_record = read_json(&state.join("spawn-2.json")).unwrap_or(Value::Null);
+
+    // The receiver quits through its own console; the last arm addresses the
+    // same existing thread with no conversation behind it any more.
+    dump_terminal(&root, &session);
+    let _ = send_line(&session, "/quit");
+    let console_result = session.wait(
+        Deadline::after(Duration::from_secs(25)).unwrap(),
+        &Cancellation::default(),
+        Duration::from_secs(5),
+    );
+    let console_outcome = match &console_result {
+        Ok(value) => {
+            fs::write(root.join("terminal-final.txt"), &value.transcript).unwrap();
+            json!({
+                "exited": value.outcome.reason == StopReason::Exited,
+                "outcome": value.outcome,
+                "truncated": value.output_truncated,
+            })
+        }
+        Err(error) => json!({"error": error.to_string()}),
+    };
+    let receiver_gone = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_none())
+        .unwrap_or(false);
+    let meta_before_stopped = session_meta_ids(&home);
+    let before_stopped = settled_provider_count(&root);
+    let stopped = run_harness_lead(
+        &root,
+        &home,
+        &workspace,
+        RUN_GENERATION,
+        &["--notify", "--text", STOPPED_MARK],
+        "lead-stopped",
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    let stopped_requests = provider_request_count(&root);
+    let stopped_hits = provider_hits(&root, STOPPED_MARK);
+    let stopped_rollout = session_mark_count(&home, STOPPED_MARK);
+    let meta_after_stopped = session_meta_ids(&home);
+    let sessions_after_stopped = count_files(&home.join("sessions"));
+    let daemon_socket_after_stopped = daemon_socket.exists();
+    let receiver_still_gone = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_none())
+        .unwrap_or(false);
+
+    // The complete observed record is written before any expectation: a
+    // failed assertion still leaves this receipt beside the raw evidence.
+    let receipt = json!({
+        "schema": 1,
+        "subject": "production `codex-harness lead message` over the installed native queue against an already running ordinary embedded CLI conversation",
+        "nativeVersion": version.trim(),
+        "sha256": sha,
+        "exe": exe.to_string_lossy(),
+        "sender": env!("CARGO_BIN_EXE_codex-harness"),
+        "home": home.to_string_lossy(),
+        "workspace": workspace.to_string_lossy(),
+        "threadId": &thread,
+        "runGeneration": RUN_GENERATION,
+        "receiver": {
+            "pid": identity.pid,
+            "creationTime": identity.creation_time,
+            "aliveAfterNotice": receiver_alive,
+            "goneAfterClose": receiver_gone,
+            "stillGoneAtStoppedArm": receiver_still_gone,
+        },
+        "control": {
+            "answered": control_answered,
+            "turn": control_turn,
+            "submitRetries": submit_retries,
+        },
+        "baseline": {
+            "providerRequests": baseline_requests,
+            "titleRequests": baseline_auxiliary,
+            "sessionFiles": sessions_before,
+            "sessionMetaIds": &meta_before,
+            "daemonSocket": daemon_socket_before,
+        },
+        "notice": {
+            "command": &notice,
+            "delivered": notice_delivered,
+            "primaryHits": hit_json(&notice_primary),
+            "allHits": hit_json(&notice_hits),
+            "rolloutCopies": notice_rollout,
+            "providerRequestsAfter": notice_requests,
+            "sessionMetaIdsAfter": &meta_after_notice,
+            "sessionFilesAfter": sessions_after_notice,
+            "daemonSocketAfter": daemon_socket_after_notice,
+        },
+        "noticeRepeat": {
+            "command": &repeat,
+            "providerRequestsAfter": repeat_requests,
+            "rolloutCopies": repeat_rollout,
+            "recordedAttempt": &notice_record["leadMessages"][0],
+        },
+        "spill": {
+            "command": &spill,
+            "delivered": spill_delivered,
+            "payloadBytes": spill_payload.len(),
+            "reportedPath": spill_path_reported,
+            "reportedFileMatchesPayload": spill_file_matches,
+            "pointerPrimaryHits": spill_pointer_primary,
+            "inlinePayloadLeak": spill_inline_leak,
+            "providerRequestsAfter": spill_requests,
+        },
+        "missingTarget": {
+            "command": &missing,
+            "providerRequestsAfter": missing_requests,
+            "recordedAttempts": &missing_record["leadMessages"],
+        },
+        "stoppedTarget": {
+            "command": &stopped,
+            "providerRequestsBefore": before_stopped,
+            "providerRequestsAfter": stopped_requests,
+            "hits": hit_json(&stopped_hits),
+            "rolloutCopies": stopped_rollout,
+            "sessionMetaIdsBefore": &meta_before_stopped,
+            "sessionMetaIdsAfter": &meta_after_stopped,
+            "sessionFilesAfter": sessions_after_stopped,
+            "daemonSocketAfter": daemon_socket_after_stopped,
+        },
+        "consoleOutcome": &console_outcome,
+        "deliveryEvidence": "the addressed conversation's own stored user row and its own model request carrying the mark on its exact thread",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+        "limitations": "one installed version, one owned home, one receiver; the stopped-target arm records what the native queue actually does, and neither its classification nor its exit is presumed in advance",
+    });
+    fs::write(
+        root.join("ordinary-lead-production.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // Expectations, checked after the record exists.
+    assert!(
+        baseline_requests >= 1,
+        "the control turn must be among the running conversation's own model requests; evidence {}",
+        root.display()
+    );
+    let notice_text = format!("{}{}", notice["stdout"], notice["stderr"]);
+    assert!(
+        notice["exited"] == Value::Bool(true) && notice["exitCode"] == 0,
+        "the first notification must finish with exit 0: {notice}; evidence {}",
+        root.display()
+    );
+    assert!(
+        notice_text.contains("lead message: delivered")
+            || notice_text.contains("lead message: queued"),
+        "the first notification must be classified honestly as delivered or queued: {notice_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        notice_primary.len() == 1,
+        "the addressed conversation must issue exactly one primary request carrying the notice once: {:?}; evidence {}",
+        hit_json(&notice_primary),
+        root.display()
+    );
+    assert!(
+        notice_delivered && notice_rollout >= 1,
+        "the notice must be observable in the running conversation's own request and stored items: delivered={notice_delivered} rollout={notice_rollout}; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_alive,
+        "the receiver must still be running after the notice; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        meta_after_notice,
+        meta_before,
+        "no second conversation may appear while the notice is delivered; evidence {}",
+        root.display()
+    );
+    assert!(
+        !daemon_socket_after_notice && !daemon_socket_before,
+        "no daemon may appear for the owned home; evidence {}",
+        root.display()
+    );
+
+    let repeat_text = format!("{}{}", repeat["stdout"], repeat["stderr"]);
+    assert!(
+        repeat["exited"] == Value::Bool(true) && repeat["exitCode"] == 0,
+        "the repeat must finish with exit 0: {repeat}; evidence {}",
+        root.display()
+    );
+    assert!(
+        repeat_text.contains("lead message: delivered") && repeat_text.contains("nothing was sent"),
+        "the repeat must reconcile the recorded attempt instead of sending: {repeat_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        repeat_requests == notice_requests && repeat_rollout == notice_rollout,
+        "the repeat must add no model request and no stored copy: requests {notice_requests}->{repeat_requests}, rollout {notice_rollout}->{repeat_rollout}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        notice_record["leadMessages"][0]["status"],
+        "delivered",
+        "the recorded attempt must end as delivered once the conversation's own row exists; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        notice_record["leadMessages"][0]["attempts"],
+        1,
+        "the repeat must not add a second transport attempt; evidence {}",
+        root.display()
+    );
+
+    let spill_text = format!("{}{}", spill["stdout"], spill["stderr"]);
+    assert!(
+        spill["exited"] == Value::Bool(true) && spill["exitCode"] == 0,
+        "the spilled notification must finish with exit 0: {spill}; evidence {}",
+        root.display()
+    );
+    assert!(
+        spill_text.contains("lead message: delivered")
+            || spill_text.contains("lead message: queued"),
+        "the spilled notification must be classified honestly as delivered or queued: {spill_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        spill_text.contains("delivery: spill") && spill_file_matches,
+        "the spill pointer must name the harness file whose bytes are the complete payload: {spill_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        !spill_inline_leak,
+        "the complete payload must not ride inline in any model request; evidence {}",
+        root.display()
+    );
+    assert!(
+        spill_delivered && spill_pointer_primary >= 1,
+        "the pointer must be observable in the running conversation's own request on its exact thread: delivered={spill_delivered} pointerHits={spill_pointer_primary}; evidence {}",
+        root.display()
+    );
+
+    let missing_text = format!("{}{}", missing["stdout"], missing["stderr"]);
+    assert!(
+        missing["exited"] == Value::Bool(true) && missing["exitCode"] == 1,
+        "a target the receiver does not own must be refused as a recorded error: {missing}; evidence {}",
+        root.display()
+    );
+    assert!(
+        missing_text.contains("lead message: error") && missing_text.contains("refused"),
+        "the recorded error must name the native refusal: {missing_text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        missing_requests == spill_requests,
+        "the nonexistent target must produce no model request: {spill_requests}->{missing_requests}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        missing_record["leadMessages"][0]["status"],
+        "error",
+        "the nonexistent target's refusal must be recorded as an error; evidence {}",
+        root.display()
+    );
+
+    let stopped_text = format!("{}{}", stopped["stdout"], stopped["stderr"]);
+    assert!(
+        receiver_gone && console_outcome["exited"] == Value::Bool(true),
+        "the owned receiver must quit through its own console before the stopped-target arm: {console_outcome}; evidence {}",
+        root.display()
+    );
+    assert!(
+        stopped["exited"] == Value::Bool(true)
+            && (stopped["exitCode"] == 0 || stopped["exitCode"] == 1),
+        "the stopped-target arm must finish with an honest classified result, not a crash or a timeout: {stopped}; evidence {}",
+        root.display()
+    );
+    assert!(
+        stopped_hits.is_empty() && stopped_requests == before_stopped,
+        "no model request may follow a stopped target: {stopped_requests} vs {before_stopped}, hits {:?}; evidence {}",
+        hit_json(&stopped_hits),
+        root.display()
+    );
+    assert_eq!(
+        meta_after_stopped,
+        meta_before_stopped,
+        "a stopped target must not start a second conversation or resume a clone; evidence {}",
+        root.display()
+    );
+    assert!(
+        !daemon_socket_after_stopped,
+        "no daemon may appear for a stopped target; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_still_gone,
+        "the stopped receiver must not be resurrected; evidence {}",
+        root.display()
+    );
+    if stopped["exitCode"] == 1 {
+        assert!(
+            stopped_text.contains("lead message: error")
+                || stopped_text.contains("lead message: indeterminate"),
+            "exit 1 must carry an honest error or indeterminate class: {stopped_text}; evidence {}",
+            root.display()
+        );
+    }
+    if stopped_text.contains("lead message: delivered")
+        || stopped_text.contains("lead message: queued")
+    {
+        assert!(
+            sessions_after_stopped >= sessions_before,
+            "the stopped arm's sessions tree must not lose the receiver's own records; evidence {}",
+            root.display()
+        );
+    }
+    if stopped_text.contains("lead message: delivered") {
+        assert!(
+            stopped_rollout >= 1,
+            "a delivered claim for a stopped target must be backed by the conversation's own stored row: rollout={stopped_rollout}; evidence {}",
+            root.display()
+        );
+    }
+    eprintln!(
+        "ordinary-lead production: noticePrimary={} rollouts={notice_rollout} repeatRequests={notice_requests}->{repeat_requests} spillBytes={} pointerHits={spill_pointer_primary} missingExit={} stoppedExit={} stoppedRollout={stopped_rollout} receiverGone={receiver_gone}; evidence {}",
+        notice_primary.len(),
+        spill_payload.len(),
+        missing["exitCode"],
+        stopped["exitCode"],
         root.display()
     );
 }

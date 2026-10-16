@@ -3,6 +3,7 @@
 //! answered without a model and without a recorded request.
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -15,6 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "tool_catalogue.rs"]
+pub mod tool_catalogue;
+
 pub const FINAL: &str = "CONTROL_TOOL_RESULT_CONSUMED";
 pub const PARENT_FINAL: &str = "CONTROL_PARENT_RESULTS_CONSUMED";
 
@@ -23,6 +27,31 @@ enum Quota {
     None,
     Refusal,
     Handoff,
+}
+
+/// The owner's PowerShell 7 executable for fabricated owned native actions:
+/// the same resolution order the accepted desktop helpers use, so the request
+/// never names Windows PowerShell 5.1.
+#[allow(dead_code)] // Only the binaries that fabricate an owned action use it.
+pub fn owned_pwsh() -> String {
+    if let Some(path) = std::env::var_os("HARNESS_ACCEPTANCE_POWERSHELL") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    let known = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+    if known.is_file() {
+        return known.to_string_lossy().into_owned();
+    }
+    if let Some(found) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|entry| entry.join("pwsh.exe"))
+            .find(|entry| entry.is_file())
+    }) {
+        return found.to_string_lossy().into_owned();
+    }
+    panic!("owner PowerShell 7 (pwsh.exe) is required for the owned native action")
 }
 
 pub struct Responses {
@@ -145,6 +174,7 @@ impl Responses {
         let pair = evidence.join("two-executors").is_file();
         let helper_case = evidence.join("helper-window").is_file();
         let close_view = evidence.join("close-view").is_file();
+        let catalogue_probe = evidence.join("catalogue-probe").is_file();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -152,6 +182,7 @@ impl Responses {
         let stopping = stop.clone();
         let worker = thread::spawn(move || {
             let mut sequence = 0;
+            let mut probed = HashSet::new();
             while !stopping.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(value) => value,
@@ -216,10 +247,10 @@ impl Responses {
                 );
                 if quota == Quota::Handoff {
                     assert_eq!(
-                        request["model"], "zai/glm-5.3",
+                        request["model"], "deepseek-flash",
                         "a fresh exact successor must serve every request after GPT refusal"
                     );
-                    assert_eq!(request["reasoning"]["effort"], "high");
+                    assert_eq!(request["reasoning"]["effort"], "max");
                     assert!(request["input"].to_string().contains(
                         "Perform the owned proof command and return its consumed result."
                     ));
@@ -254,9 +285,25 @@ impl Responses {
                         item["type"] == "agent_message"
                             && item["recipient"] == "/root/control_worker_two"
                     });
-                let second_worker = second_worker || pair && request["model"] == "xai/grok-4.6";
+                // Both executors use the same configured model. Identify their
+                // actual assignment instead of conflating a model with a role.
+                let assigned = |marker: &str| {
+                    request["input"].as_array().unwrap().iter().any(|item| {
+                        (item["type"] == "agent_message" || item["role"] == "user")
+                            && item["content"].as_array().is_some_and(|content| {
+                                content.iter().any(|part| {
+                                    part["text"]
+                                        .as_str()
+                                        .is_some_and(|text| text.contains(marker))
+                                })
+                            })
+                    })
+                };
+                let second_worker = second_worker
+                    || pair
+                        && assigned("CONTROL_CHILD_ASSIGNMENT: run the second owned proof command");
                 let worker = second_worker
-                    || pair && request["model"] == "zai/glm-5.3"
+                    || pair && assigned("CONTROL_CHILD_ASSIGNMENT: run the owned proof command")
                     || request["input"].as_array().unwrap().iter().any(|item| {
                         item["type"] == "agent_message"
                             && item["recipient"] == "/root/control_worker"
@@ -287,15 +334,8 @@ impl Responses {
                 });
                 let worker = worker && !helper_worker;
                 if pair && worker {
-                    assert_eq!(
-                        request["model"],
-                        if second_worker {
-                            "xai/grok-4.6"
-                        } else {
-                            "zai/glm-5.3"
-                        }
-                    );
-                    assert_eq!(request["reasoning"]["effort"], "high");
+                    assert_eq!(request["model"], "deepseek-flash");
+                    assert_eq!(request["reasoning"]["effort"], "max");
                     let assignment = if second_worker {
                         "run the second owned proof command"
                     } else {
@@ -361,7 +401,7 @@ impl Responses {
                     });
                     if !read_done {
                         json!({"type":"function_call","call_id":"control-read-1","name":"exec_command",
-                            "arguments":serde_json::to_string(&json!({"cmd":"Get-Content proof.txt","shell":"powershell","yield_time_ms":10000})).unwrap()})
+                            "arguments":serde_json::to_string(&json!({"cmd":"Get-Content proof.txt","shell":owned_pwsh(),"yield_time_ms":10000})).unwrap()})
                     } else {
                         assert!(
                             request["input"]
@@ -384,7 +424,7 @@ impl Responses {
                 } else if helper_worker {
                     let arguments=serde_json::to_string(&json!({
                         "cmd":"[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt",
-                        "shell":"powershell","yield_time_ms":10000
+                        "shell":owned_pwsh(),"yield_time_ms":10000
                     })).unwrap();
                     if request["tools"].as_array().is_some_and(|tools| {
                         tools
@@ -398,13 +438,13 @@ impl Responses {
                 } else if !direct && !worker && !helper_worker && !spawned {
                     let mut assignment = json!({"task_name":"control_worker","message":"CONTROL_CHILD_ASSIGNMENT: run the owned proof command, then consume and return its result. Do not spawn other agents."});
                     if pair {
-                        assignment["model"] = json!("zai/glm-5.3");
-                        assignment["reasoning_effort"] = json!("high");
+                        assignment["model"] = json!("deepseek-flash");
+                        assignment["reasoning_effort"] = json!("max");
                         assignment["fork_turns"] = json!("none");
                     }
                     json!({"type":"function_call","call_id":"control-spawn-1","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&assignment).unwrap()})
                 } else if pair && !worker && !second_spawned {
-                    json!({"type":"function_call","call_id":"control-spawn-2","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"task_name":"control_worker_two","model":"xai/grok-4.6","reasoning_effort":"high","fork_turns":"none","message":"CONTROL_CHILD_ASSIGNMENT: run the second owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
+                    json!({"type":"function_call","call_id":"control-spawn-2","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"task_name":"control_worker_two","model":"deepseek-flash","reasoning_effort":"max","fork_turns":"none","message":"CONTROL_CHILD_ASSIGNMENT: run the second owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
                 } else if pair && !worker {
                     let input = request["input"].as_array().unwrap();
                     let output = |call: &str| {
@@ -466,6 +506,39 @@ impl Responses {
                 } else if helper_case && worker {
                     json!({"type":"message","id":"msg-executor-helper","role":"assistant","content":[{"type":"output_text","text":FINAL}]})
                 } else if result_seen {
+                    if probed.contains(&identity.thread) {
+                        // The session preserves the invocation and its result
+                        // as two items sharing the call id, so the result of
+                        // the observed code-mode `exec` route is selected by
+                        // its type (`custom_tool_call_output`), never the
+                        // invocation.
+                        let output = request["input"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|item| {
+                                item["type"] == "custom_tool_call_output"
+                                    && item["call_id"] == "control-tool-1"
+                            })
+                            .and_then(|item| item.get("output"))
+                            .expect("the native session must return the owned exec call's output");
+                        let names = tool_catalogue::probe_names(output).unwrap_or_else(|| {
+                            panic!(
+                                "the code-mode exec probe returned no runtime catalogue marker; the session reported no runtime tool names"
+                            )
+                        });
+                        fs::write(
+                            evidence.join("catalogue.json"),
+                            serde_json::to_vec(&json!({
+                                "schema":1,
+                                "callId":"control-tool-1",
+                                "sequence":sequence,
+                                "names":names,
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
                     if pair {
                         assert!(
                             request["input"].as_array().unwrap().iter().any(|item| {
@@ -525,14 +598,34 @@ impl Responses {
                     let arguments=serde_json::to_string(&json!({
                         "cmd":if pair { pair_command.as_str() } else if view_loss || close_view || background { "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-tool); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-tool)) { throw 'owned tool release deadline' }; Get-Content proof.txt" }
                             else { "[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt" },
-                        "shell":"powershell","yield_time_ms":if background { 1000 } else if view_loss || close_view || pair { 30000 } else { 10000 }
+                        "shell":owned_pwsh(),"yield_time_ms":if background { 1000 } else if view_loss || close_view || pair { 30000 } else { 10000 }
                     })).unwrap();
-                    if request["tools"].as_array().is_some_and(|tools| {
+                    // The owned action may run through the session's own
+                    // code-mode `exec` orchestrator. The oldest native shape
+                    // advertises that custom tool as a top-level `tools` entry;
+                    // the observed shape advertises it inside the developer
+                    // `additional_tools` namespace. Only a case that owns the
+                    // runtime catalogue probe recognises the newer shape and
+                    // prepends the shared probe script, so every other case
+                    // keeps its exact former tool call.
+                    let custom_exec = request["tools"].as_array().is_some_and(|tools| {
                         tools
                             .iter()
                             .any(|tool| tool["type"] == "custom" && tool["name"] == "exec")
-                    }) {
-                        json!({"type":"custom_tool_call","call_id":"control-tool-1","name":"exec","input":format!("const result = await tools.exec_command({arguments}); text(result);")})
+                    }) || catalogue_probe && advertises_custom_exec(&request);
+                    if custom_exec {
+                        let input = if catalogue_probe {
+                            probed.insert(identity.thread.clone());
+                            format!(
+                                "{}\nconst result = await tools.exec_command({arguments}); text(result);",
+                                tool_catalogue::all_tools_probe_script()
+                            )
+                        } else {
+                            format!(
+                                "const result = await tools.exec_command({arguments}); text(result);"
+                            )
+                        };
+                        json!({"type":"custom_tool_call","call_id":"control-tool-1","name":"exec","input":input})
                     } else {
                         json!({"type":"function_call","call_id":"control-tool-1","name":"exec_command","arguments":arguments})
                     }
@@ -732,7 +825,7 @@ fn assert_successor_visible(evidence: &std::path::Path, requested_thread: &str) 
     let id = leader["threadId"].as_str().unwrap();
     assert_eq!(id, requested_thread);
     assert_ne!(initial["threadId"], id);
-    assert_eq!(leader["model"], "zai/glm-5.3");
+    assert_eq!(leader["model"], "deepseek-flash");
     assert_eq!(leader["previousThreadId"], initial["threadId"]);
     let native = view_executable(evidence);
     let user = harness_core::process_service::current_user().unwrap();
@@ -857,9 +950,39 @@ fn respond_models(stream: &mut TcpStream) {
         .unwrap();
 }
 
+/// Whether one native request advertises the session's code-mode `exec`
+/// custom tool inside the developer `additional_tools` input namespace, the
+/// shape observed from the current runtime. The tool may sit directly in a
+/// namespace's entries or deeper, so the entries are visited recursively.
+fn advertises_custom_exec(request: &Value) -> bool {
+    fn visit(items: &[Value]) -> bool {
+        items.iter().any(|item| {
+            (item["type"] == "custom" && item["name"] == "exec")
+                || item
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nested| visit(nested))
+        })
+    }
+    request["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .filter(|item| item["type"] == "additional_tools")
+            .any(|item| {
+                item.get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| visit(tools))
+            })
+    })
+}
+
+/// Headers (`name: value` pairs, original spelling) and raw body of one
+/// accepted fixture request.
+type RawRequest = (Vec<(String, String)>, Vec<u8>);
+
 /// One accepted request: the scripted Responses POST, or the model-catalogue
 /// probe a frontend issues before its first turn (`None`).
-fn read_request(stream: &mut TcpStream) -> Option<(Vec<(String, String)>, Vec<u8>)> {
+fn read_request(stream: &mut TcpStream) -> Option<RawRequest> {
     let mut bytes = Vec::new();
     let (start, length, headers) = loop {
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {

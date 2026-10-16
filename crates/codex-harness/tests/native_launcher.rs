@@ -120,6 +120,11 @@ impl Fixture {
             account,
         };
         f.register(json!({"executable":f.upstream, "sha256":build_identity::hash_file(&f.upstream).unwrap(), "package":null}));
+        // Every session launch composes a responsibility role from the shared
+        // kit, so the fixture carries role sources as part of its base state:
+        // each case reaches its own assertions instead of failing on missing
+        // role inputs. Source freshness ignores global sources and skills.
+        write_role_sources(&f);
         f
     }
     fn register(&self, upstream: Value) {
@@ -187,6 +192,36 @@ fn refresh_record(f: &Fixture) {
     )
     .unwrap();
     build_selection::activate(&f.state, build).unwrap();
+}
+
+/// Write the role sources the launcher's responsibility context resolves:
+/// the kit manifest points at `AGENTS.md` and `skills`, and the role
+/// descriptor names one instruction file per role. Fixture::new calls this so
+/// every launch that reaches session composition resolves them.
+fn write_role_sources(f: &Fixture) {
+    fs::create_dir_all(f.source.join("skills")).unwrap();
+    fs::create_dir_all(f.source.join("global/roles")).unwrap();
+    fs::write(f.source.join("AGENTS.md"), "fixture common guidance").unwrap();
+    fs::write(f.source.join("global/roles/lead.md"), "lead role guidance").unwrap();
+    fs::write(
+        f.source.join("global/roles/executor.md"),
+        "executor role guidance",
+    )
+    .unwrap();
+    fs::write(
+        f.source.join("global/roles.toml"),
+        concat!(
+            "schema = 1\n",
+            "shared_skills = []\n",
+            "[roles.lead]\n",
+            "instructions = \"global/roles/lead.md\"\n",
+            "skills = []\n",
+            "[roles.executor]\n",
+            "instructions = \"global/roles/executor.md\"\n",
+            "skills = []\n",
+        ),
+    )
+    .unwrap();
 }
 
 /// Bytes the launcher process has read so far, from the kernel's own
@@ -465,6 +500,10 @@ fn native_argv_unicode_stdin_streams_cwd_and_nonzero_exit() {
             "approval_policy=\"never\"",
             "-c",
             "model_reasoning_effort=\"low\"",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
             "exec",
             "",
             "проверка \"кавычки\"",
@@ -517,6 +556,12 @@ fn explicit_native_precedence_and_package_manager_metadata() {
     assert_eq!(
         report["args"],
         json!([
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "features.worktrees=false",
+            "-c",
+            "skills.config=[]",
             "--profile",
             "user",
             "exec",
@@ -558,7 +603,16 @@ fn saved_native_effort_survives_per_model_default_injection() {
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         report["args"],
-        json!(["-c", "approval_policy=\"never\"", "exec", "hello"])
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "exec",
+            "hello"
+        ])
     );
     // A plain TUI session start resolves the same effective configuration.
     let out = f.command().output().unwrap();
@@ -575,7 +629,11 @@ fn saved_native_effort_survives_per_model_default_injection() {
             "-c",
             "approval_policy=\"never\"",
             "-c",
-            "features.daemon_auto_start=false"
+            "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]"
         ])
     );
 }
@@ -617,7 +675,17 @@ fn trusted_project_preferences_win_over_shared_defaults() {
         String::from_utf8_lossy(&out.stderr)
     );
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["args"], json!(["exec", "hello"]));
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "exec",
+            "hello"
+        ])
+    );
 }
 
 #[test]
@@ -640,6 +708,10 @@ fn per_model_default_applies_without_any_native_effort() {
             "approval_policy=\"never\"",
             "-c",
             "model_reasoning_effort=\"max\"",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
             "exec",
             "hello"
         ])
@@ -691,6 +763,12 @@ fn embedded_tui_sessions_suppress_the_daemon_fallback_warning() {
         json!([
             "-c",
             "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "features.worktrees=false",
+            "-c",
+            "skills.config=[]",
             "--profile",
             "user"
         ])
@@ -710,6 +788,10 @@ fn embedded_tui_sessions_suppress_the_daemon_fallback_warning() {
             "approval_policy=\"never\"",
             "-c",
             "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
             "hello"
         ])
     );
@@ -724,7 +806,491 @@ fn embedded_tui_sessions_suppress_the_daemon_fallback_warning() {
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         report["args"],
-        json!(["-c", "approval_policy=\"never\"", "exec", "hello"])
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "exec",
+            "hello"
+        ])
+    );
+}
+
+#[test]
+fn managed_session_starts_forward_the_worktree_tool_suppression_leaf() {
+    let f = Fixture::new();
+    // The kit's shared defaults own the managed suppression: the native
+    // worktree tools would compete with the common harness pool, so a
+    // session start forwards the feature leaf as a native CLI override.
+    fs::write(
+        f.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    let out = f.command().arg("hello").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.worktrees=false",
+            "-c",
+            "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "hello"
+        ])
+    );
+
+    // Non-TUI commands share the same defaults layer and carry the leaf too;
+    // the daemon opt-out stays TUI-only.
+    let out = f.command().args(["exec", "hello"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.worktrees=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "exec",
+            "hello"
+        ])
+    );
+
+    // The executor marker composes the executor role instead of the lead role
+    // and keeps the same shared suppression leaf alongside the single-agent
+    // switch.
+    let out = f
+        .command()
+        .env("HARNESS_EXECUTOR_SESSION", "1")
+        .arg("hello")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.worktrees=false",
+            "-c",
+            "features.daemon_auto_start=false",
+            "-c",
+            "agents.enabled=false",
+            "-c",
+            "developer_instructions=\"executor role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "hello"
+        ])
+    );
+
+    // A machine-local leaf that agrees with the shared suppression is not a
+    // conflict: the shared leaf stays skipped and no re-enable is reported.
+    fs::write(
+        f.home.join("config.toml"),
+        "[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    let out = f.command().arg("hello").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "hello"
+        ])
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("features.worktrees"),
+        "an agreeing machine-local leaf is not a worktree-tool conflict"
+    );
+}
+
+#[test]
+fn explicit_native_worktree_feature_choice_shields_the_managed_suppression_leaf() {
+    let f = Fixture::new();
+    fs::write(
+        f.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    // A machine-local leaf is the explicit native choice: the shared default
+    // is skipped instead of fought, so the session keeps the native worktree
+    // tools and the re-exposed surface is reported as a configuration conflict
+    // for managed-pool delivery instead of a silent suppression claim.
+    fs::write(
+        f.home.join("config.toml"),
+        "model = \"gpt-6.1-sol\"\n[features]\nworktrees = true\n[mcp_servers.demo]\ncommand = \"demo-server\"\n",
+    )
+    .unwrap();
+    let before = fs::read(f.home.join("config.toml")).unwrap();
+    let out = f.command().arg("hello").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "hello"
+        ])
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the user configuration sets features.worktrees=true")
+            && stderr.contains("compete with the shared worktree pool"),
+        "the re-enabled native worktree tools must be reported instead of lost silently: {stderr}"
+    );
+    // The explicit machine-local choice and its unrelated model and MCP
+    // settings survive the launch untouched.
+    assert_eq!(before, fs::read(f.home.join("config.toml")).unwrap());
+
+    // An explicit profile replaces the kit's shared layer but selects no
+    // worktree value, so the base user configuration's `true` is the winning
+    // native choice: the session keeps the competing tools and the ineffective
+    // suppression is reported instead of claimed.
+    let out = f.command().args(["--profile", "user"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "features.daemon_auto_start=false",
+            "-c",
+            "developer_instructions=\"lead role guidance\"",
+            "-c",
+            "skills.config=[]",
+            "--profile",
+            "user"
+        ])
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("the user configuration sets features.worktrees=true"),
+        "an explicit profile must report the re-exposed native tools: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn native_worktree_choice_precedence_reports_only_unsuppressed_sessions() {
+    let f = Fixture::new();
+    fs::write(
+        f.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    let run = |fixture: &Fixture, args: &[&str]| {
+        let out = fixture.command().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+    // The installed native precedence for an explicit feature choice:
+    // repeated `-c` leaves keep the last value, `--enable`/`--disable` win
+    // over `-c` regardless of encounter order, and a disable wins over an
+    // enable. Only a winning `false` establishes the managed suppression; any
+    // other winning choice is an explicit override that re-exposes the
+    // competing tools or leaves the suppression unestablishable, reported as a
+    // configuration conflict instead of a successful managed-pool delivery.
+    let cases: &[(&str, &[&str], Option<&str>)] = &[
+        (
+            "explicit true",
+            &["-c", "features.worktrees=true", "hello"],
+            Some("the command-line configuration sets features.worktrees=true"),
+        ),
+        (
+            "explicit false",
+            &["-c", "features.worktrees=false", "hello"],
+            None,
+        ),
+        (
+            "enable flag",
+            &["--enable", "worktrees", "hello"],
+            Some("the command-line configuration sets features.worktrees=true"),
+        ),
+        (
+            "enable flag beats config",
+            &[
+                "--enable=worktrees",
+                "-c",
+                "features.worktrees=false",
+                "hello",
+            ],
+            Some("the command-line configuration sets features.worktrees=true"),
+        ),
+        ("disable flag", &["--disable", "worktrees", "hello"], None),
+        (
+            "disable flag beats config",
+            &[
+                "-c",
+                "features.worktrees=true",
+                "--disable=worktrees",
+                "hello",
+            ],
+            None,
+        ),
+        (
+            "last leaf wins false",
+            &[
+                "-c",
+                "features.worktrees=true",
+                "-c",
+                "features.worktrees=false",
+                "hello",
+            ],
+            None,
+        ),
+        (
+            "last leaf wins true",
+            &[
+                "-c",
+                "features.worktrees=false",
+                "-c",
+                "features.worktrees=true",
+                "hello",
+            ],
+            Some("the command-line configuration sets features.worktrees=true"),
+        ),
+        (
+            "non-boolean value",
+            &["-c", "features.worktrees=maybe", "hello"],
+            Some("which is not a boolean"),
+        ),
+    ];
+    for (label, args, expected) in cases {
+        let (report, stderr) = run(&f, args);
+        match expected {
+            Some(fragment) => assert!(stderr.contains(*fragment), "{label}: {stderr}"),
+            None => assert!(
+                !stderr.contains("features.worktrees"),
+                "{label}: an established or unneeded suppression must stay silent: {stderr}"
+            ),
+        }
+        if *label == "disable flag" {
+            let composed = report["args"].as_array().unwrap();
+            assert!(
+                !composed
+                    .iter()
+                    .any(|value| value == "features.worktrees=false"),
+                "{label}: the shared leaf is skipped, not fought: {composed:?}"
+            );
+            assert!(
+                composed.iter().any(|value| value == "--disable"),
+                "{label}: the explicit flag is forwarded: {composed:?}"
+            );
+        }
+    }
+    // A machine-local `true` is the earlier native choice; the command line
+    // still wins with an explicit `false`.
+    let user = Fixture::new();
+    fs::write(
+        user.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    fs::write(
+        user.home.join("config.toml"),
+        "[features]\nworktrees = true\n",
+    )
+    .unwrap();
+    let (_, stderr) = run(&user, &["hello"]);
+    assert!(
+        stderr.contains("the user configuration sets features.worktrees=true"),
+        "{stderr}"
+    );
+    let (_, stderr) = run(&user, &["-c", "features.worktrees=false", "hello"]);
+    assert!(
+        !stderr.contains("features.worktrees"),
+        "command-line false must override the earlier user true: {stderr}"
+    );
+    // Selecting a profile is not itself a worktree choice: a managed session
+    // whose profile selects no features.worktrees leaf still receives the
+    // suppression default with the profile's other settings untouched, while
+    // an actual winning choice in any layer is reported instead of fought.
+    let profiles = Fixture::new();
+    fs::write(
+        profiles.source.join("global/harness.config.toml"),
+        "approval_policy = 'never'\n[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    fs::write(
+        profiles.home.join("user.config.toml"),
+        "model = \"gpt-6.1-sol\"\nmodel_reasoning_effort = \"low\"\n[mcp_servers.demo]\ncommand = \"demo-server\"\n",
+    )
+    .unwrap();
+    let before = fs::read(profiles.home.join("user.config.toml")).unwrap();
+    let (report, stderr) = run(&profiles, &["--profile", "user", "hello"]);
+    assert!(
+        !stderr.contains("features.worktrees"),
+        "a profile with no worktree choice must receive the suppression default silently: {stderr}"
+    );
+    let composed = report["args"].as_array().unwrap();
+    assert!(
+        composed
+            .iter()
+            .any(|value| value == "features.worktrees=false"),
+        "a profile with no worktree choice must still carry the managed suppression leaf: {composed:?}"
+    );
+    assert!(
+        composed.iter().any(|value| value == "--profile")
+            && composed.iter().any(|value| value == "user"),
+        "the selected profile stays part of the composed session: {composed:?}"
+    );
+    assert!(
+        !composed.iter().any(|value| {
+            let value = value.as_str().unwrap_or("");
+            value.starts_with("model=") || value.starts_with("mcp_servers")
+        }),
+        "the profile's own model and MCP settings are not replaced by launch overrides: {composed:?}"
+    );
+    assert_eq!(
+        before,
+        fs::read(profiles.home.join("user.config.toml")).unwrap(),
+        "the profile layer is never rewritten by a launch"
+    );
+
+    // The same profile session under the executor marker keeps the managed
+    // suppression leaf beside the single-agent switch.
+    let out = profiles
+        .command()
+        .env("HARNESS_EXECUTOR_SESSION", "1")
+        .args(["--profile", "user", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let composed = report["args"].as_array().unwrap();
+    assert!(
+        composed
+            .iter()
+            .any(|value| value == "features.worktrees=false")
+            && composed.iter().any(|value| value == "agents.enabled=false"),
+        "an executor profile session carries the suppression leaf and stays single-agent: {composed:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("features.worktrees"),
+        "an executor profile session with no worktree choice is not a conflict: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Only an actual profile choice is a conflict, and it keeps the tools.
+    fs::write(
+        profiles.home.join("user.config.toml"),
+        "model = \"gpt-6.1-sol\"\n[features]\nworktrees = true\n",
+    )
+    .unwrap();
+    let (report, stderr) = run(&profiles, &["--profile", "user", "hello"]);
+    assert!(
+        stderr.contains("the explicit profile 'user' configuration sets features.worktrees=true"),
+        "{stderr}"
+    );
+    let composed = report["args"].as_array().unwrap();
+    assert!(
+        !composed
+            .iter()
+            .any(|value| value == "features.worktrees=false"),
+        "an explicit profile choice is honored instead of fought: {composed:?}"
+    );
+
+    // A trusted project file still wins over the profile, so a winning false
+    // needs no injected leaf and stays silent.
+    let project = profiles.root.path().join("project");
+    fs::create_dir_all(project.join(".codex")).unwrap();
+    fs::write(
+        project.join(".codex/config.toml"),
+        "[features]\nworktrees = false\n",
+    )
+    .unwrap();
+    fs::write(
+        profiles.home.join("config.toml"),
+        format!(
+            "[projects.'{}']\ntrust_level = 'trusted'\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+    let out = profiles
+        .command()
+        .current_dir(&project)
+        .args(["--profile", "user", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("features.worktrees"),
+        "the trusted project choice wins over the profile: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -925,7 +1491,14 @@ fn changed_upstream_digest_still_launches_without_a_compatibility_warning() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert_eq!(stderr.trim(), "upstream stderr");
+    // The explicit profile carries no managed suppression, so the launch
+    // reports that conflict; nothing else is added to the upstream's line.
+    assert!(stderr.contains("upstream stderr"), "{stderr}");
+    assert!(
+        stderr.lines().all(|line| line == "upstream stderr"
+            || line.starts_with("codex-harness: the explicit profile")),
+        "{stderr}"
+    );
     assert!(!stderr.contains("explicit update"), "{stderr}");
     assert!(!f.state.join("staging").exists());
 
@@ -958,7 +1531,12 @@ fn changed_upstream_digest_still_launches_without_a_compatibility_warning() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8(out.stderr.clone()).unwrap();
-    assert_eq!(stderr.trim(), "upstream stderr");
+    assert!(stderr.contains("upstream stderr"), "{stderr}");
+    assert!(
+        stderr.lines().all(|line| line == "upstream stderr"
+            || line.starts_with("codex-harness: the explicit profile")),
+        "{stderr}"
+    );
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["environment"]["CODEX_MANAGED_BY_NPM"], "1");
 }
@@ -2051,19 +2629,29 @@ fn process_in_named_job(pid: u32, name: &str) -> bool {
     }
 }
 
-fn pid_running(pid: u32) -> bool {
+/// Whether the pid names a process that is still running.
+///
+/// A payload terminated with its session Job can leave a process object that
+/// remains referenced: its exit is already final and process listings no
+/// longer show it, while the pid stays openable. Bare openability is therefore
+/// not liveness, and the reap contract is checked on the final exit code.
+fn process_alive(pid: u32) -> bool {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(process: *mut std::ffi::c_void, code: *mut u32) -> i32;
         fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
     }
+    const STILL_ACTIVE: u32 = 259;
     unsafe {
         let process = OpenProcess(0x1000, 0, pid);
         if process.is_null() {
             return false;
         }
+        let mut code = 0u32;
+        let read = GetExitCodeProcess(process, &mut code);
         CloseHandle(process);
-        true
+        read != 0 && code == STILL_ACTIVE
     }
 }
 
@@ -2248,7 +2836,7 @@ fn session_exit_death_and_reconnect_keep_one_peer_allowance() {
         fs::read_to_string(exiting.directory.join("launcher.stderr")).unwrap_or_default()
     );
     assert!(process_in_named_job(peer_pid, &name));
-    assert!(pid_running(peer_pid));
+    assert!(process_alive(peer_pid));
     assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
     assert_eq!(
         SharedCpuBudget::acquire(&f.account, TEST_RATE)
@@ -2275,15 +2863,15 @@ fn session_exit_death_and_reconnect_keep_one_peer_allowance() {
         "abrupt launcher death looked like a clean exit: {killed}"
     );
     let reap_deadline = Instant::now() + Duration::from_secs(5);
-    while pid_running(owner_pid) && Instant::now() < reap_deadline {
+    while process_alive(owner_pid) && Instant::now() < reap_deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        !pid_running(owner_pid),
+        !process_alive(owner_pid),
         "abrupt launcher death must reap that session's payload"
     );
     assert!(
-        process_in_named_job(peer_pid, &name) && pid_running(peer_pid),
+        process_in_named_job(peer_pid, &name) && process_alive(peer_pid),
         "peer session lost its allowance when the other control owner died"
     );
     assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
@@ -2396,7 +2984,7 @@ fn incomplete_activation_names_outside_session_route_and_keeps_peer() {
         "{}",
         report.kernel_configuration
     );
-    assert!(process_in_named_job(peer_pid, &name) && pid_running(peer_pid));
+    assert!(process_in_named_job(peer_pid, &name) && process_alive(peer_pid));
     assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
     assert!(outside.try_wait().unwrap().is_none());
     assert_eq!(

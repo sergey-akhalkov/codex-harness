@@ -3,6 +3,7 @@
 #![cfg(windows)]
 #[path = "fixtures/control_responses.rs"]
 mod control_responses;
+use control_responses::tool_catalogue;
 use harness_core::{
     broker_state::BrokerRoot,
     build_identity::{self, BuildRecord},
@@ -40,6 +41,14 @@ use windows_sys::Win32::{
 const JOB_OBJECT_QUERY: u32 = 0x0004;
 
 const WAIT: Duration = Duration::from_secs(30);
+
+/// Managed-session role composition markers. The fixture kit supplies the
+/// owned developer text plus distinct lead and executor role bodies, and the
+/// canonical provider requests must show the composed lead context, including
+/// on the configured successor route, without the executor body.
+const CONTROL_COMMON_ROLE_MARKER: &str = "CONTROL_COMMON_ROLE_MARKER owned kit developer guidance";
+const CONTROL_LEAD_ROLE_MARKER: &str = "CONTROL_LEAD_ROLE_MARKER lead responsibility";
+const CONTROL_EXECUTOR_ROLE_MARKER: &str = "CONTROL_EXECUTOR_ROLE_MARKER executor responsibility";
 
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
@@ -84,7 +93,7 @@ fn ordinary_launcher_records_quota_refusal_without_another_gpt_request() {
 
 #[test]
 #[ignore = "requires native CLI, explicit model catalog and both native chat observations; synthetic quota handoff"]
-fn ordinary_launcher_hands_quota_refusal_to_visible_zai_lead() {
+fn ordinary_launcher_hands_quota_refusal_to_visible_ds_lead() {
     native_entry(EntryCase::QuotaHandoff);
 }
 
@@ -407,6 +416,13 @@ fn native_entry(case: EntryCase) {
     if view_close {
         fs::write(root.join("close-view"), "owned closed conversation restore").unwrap();
     }
+    if matches!(case, EntryCase::Normal) {
+        fs::write(
+            root.join("catalogue-probe"),
+            "the ordinary lead must report its owned runtime catalogue",
+        )
+        .unwrap();
+    }
     let home = root.join("home");
     let workspace = root.join("workspace");
     let build = root.join("build");
@@ -416,6 +432,8 @@ fn native_entry(case: EntryCase) {
         workspace.clone(),
         build.clone(),
         source.join("global"),
+        source.join("global/roles"),
+        source.join("skills"),
         source.join("crates/fixture/src"),
         source.join("crates/harness-rtk/src"),
         source
@@ -426,6 +444,25 @@ fn native_entry(case: EntryCase) {
     ] {
         fs::create_dir_all(directory).unwrap();
     }
+    // The Normal case owns one synthetic unrelated MCP server: the first-party
+    // probe fixture copied into the owned home beside its mode config. The
+    // launched session must preserve this configuration and discover the
+    // server's real tools; no other case configures one.
+    let probe_executable = matches!(case, EntryCase::Normal).then(|| {
+        let directory = home.join("mcp-probe");
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("harness-mcp-probe-fixture.exe");
+        fs::copy(env!("CARGO_BIN_EXE_harness-mcp-probe-fixture"), &executable).unwrap();
+        fs::write(
+            executable.with_extension("json"),
+            serde_json::to_vec(&json!({"mode": "valid", "kind": "nuphus"})).unwrap(),
+        )
+        .unwrap();
+        executable
+    });
+    let probe_receipt = probe_executable
+        .as_ref()
+        .map(|executable| executable.with_extension("receipt.json"));
     for file in [
         "Cargo.toml",
         "Cargo.lock",
@@ -436,19 +473,48 @@ fn native_entry(case: EntryCase) {
     }
     fs::write(
         source.join("global/profile.toml"),
-        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel = 'gpt-6-astra'\n",
+        format!(
+            "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel = 'gpt-6-astra'\ndeveloper_instructions = '{CONTROL_COMMON_ROLE_MARKER}'\n"
+        ),
     )
     .unwrap();
     fs::write(source.join("global/kit.json"), serde_json::to_vec(&json!({"schema":1,"profile_name":"harness","profile":"global/profile.toml","instructions":"global/instructions.md","skills":"skills","agents":"global/agents","hooks":"global/hooks.json","token_hooks":"global/token-hooks.json"})).unwrap()).unwrap();
+    // A managed session composes its role context from the kit sources, so
+    // the fixture carries the common instructions, both role bodies and the
+    // shared skill root beside the manifest.
+    fs::write(
+        source.join("global/instructions.md"),
+        "Owned fixture common instructions.\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/roles.toml"),
+        "schema = 1\nshared_skills = []\n[roles.lead]\ninstructions = 'global/roles/lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/roles/executor.md'\nskills = []\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/roles/lead.md"),
+        format!(
+            "# Lead responsibility\n\n{CONTROL_LEAD_ROLE_MARKER}: preserve the task, its constraints and acceptance.\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/roles/executor.md"),
+        format!(
+            "# Executor responsibility\n\n{CONTROL_EXECUTOR_ROLE_MARKER}: own the complete local work cycle.\n"
+        ),
+    )
+    .unwrap();
     if quota_handoff {
         fs::write(
             source.join("global/orchestration.toml"),
-            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"zai\"\nexecutor_profiles = [\"zai\"]\nmax_concurrent_executors = 2\n",
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 2\n",
         )
         .unwrap();
         fs::write(
-            home.join("zai.config.toml"),
-            "model = \"zai/glm-5.3\"\nmodel_provider = \"control_fixture\"\n",
+            home.join("ds.config.toml"),
+            "model = \"deepseek-flash\"\nmodel_provider = \"control_fixture\"\nmodel_reasoning_effort = \"max\"\n",
         )
         .unwrap();
     }
@@ -527,6 +593,18 @@ fn native_entry(case: EntryCase) {
         ""
     };
     let multi_agent_v2 = if pair { "true" } else { "false" };
+    // Only the Normal case carries the synthetic unrelated MCP server: the
+    // absolute fixture path reaches the session through the exercised
+    // launcher's own configuration handling.
+    let unrelated_mcp = probe_executable
+        .as_ref()
+        .map(|executable| {
+            format!(
+                "[mcp_servers.unrelated_probe]\ncommand = {}\n",
+                serde_json::to_string(&executable.to_string_lossy()).unwrap()
+            )
+        })
+        .unwrap_or_default();
     fs::write(
         home.join("config.toml"),
         format!(
@@ -558,7 +636,7 @@ multi_agent_v2 = {multi_agent_v2}
 enabled = false
 [projects.{trusted}]
 trust_level = "trusted"
-"#,
+{unrelated_mcp}"#,
             responses.port
         ),
     )
@@ -570,7 +648,17 @@ trust_level = "trusted"
         "HARNESS_CONTROL_FIXTURE_KEY".into(),
         Some("synthetic-owned-fixture".into()),
     );
-    for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+    // This acceptance may itself run as a ds executor session; its inherited
+    // executor/session/role markers must not reach the ordinary launch under
+    // observation. Only the owned child's environment is adjusted.
+    for key in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_CONTEXT_ROLE",
+        "HARNESS_CONTEXT_REVISION",
+    ] {
         command.env.insert(key.into(), None);
     }
     let path = std::env::join_paths(
@@ -586,7 +674,7 @@ trust_level = "trusted"
     command.args = vec![
         "--no-alt-screen".into(),
         if pair {
-            "Delegate two independent owned proof tasks to Z.AI and Grok.".into()
+            "Delegate two independent owned proof tasks to the two configured ds executors.".into()
         } else if child {
             "Delegate the owned proof to one native child.".into()
         } else {
@@ -620,9 +708,9 @@ trust_level = "trusted"
         serde_json::to_vec(&json!({"root":state})).unwrap(),
     )
     .unwrap();
-    reveal_conversation(&state, &upstream);
+    observe_conversation_visibility(&state, &upstream);
     if view_loss {
-        exercise_view_loss(root, &state, &workspace);
+        exercise_view_loss(root, &state, &workspace, &upstream);
     }
     if user_stop {
         exercise_user_stop(root, &state, &workspace);
@@ -883,7 +971,132 @@ trust_level = "trusted"
             .exists(),
         "named conversation must not issue an auxiliary model request"
     );
-    fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"zai/glm-5.3"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
+    // The ordinary main session proves the same composed lead context for a
+    // direct tool task without delegation; the successor route must carry it
+    // from its first request. Neither may leak the executor role text.
+    if quota_handoff || matches!(case, EntryCase::Normal) {
+        for sequence in 1..=expected_requests {
+            let body = fs::read_to_string(root.join(format!("provider-{sequence}.json"))).unwrap();
+            let route = match (quota_handoff, sequence) {
+                (true, 1) => "first refused lead",
+                (true, _) => "configured successor lead",
+                (false, _) => "ordinary lead",
+            };
+            assert!(
+                body.contains(CONTROL_COMMON_ROLE_MARKER),
+                "{route} request {sequence} must carry the owned common developer text"
+            );
+            assert!(
+                body.contains(CONTROL_LEAD_ROLE_MARKER),
+                "{route} request {sequence} must carry the composed lead role text"
+            );
+            assert!(
+                !body.contains(CONTROL_EXECUTOR_ROLE_MARKER),
+                "{route} request {sequence} must not carry the executor role text"
+            );
+        }
+    }
+    // The ordinary lead's owned action ran through the session's own code-mode
+    // `exec` orchestrator, so the session reported its own runtime tool names.
+    // The preserved unrelated tools must survive while the competing native
+    // codex_worktrees surface stays absent; a missing probe marker fails here
+    // instead of passing vacuously.
+    if matches!(case, EntryCase::Normal) {
+        let receipt: Value = serde_json::from_slice(&fs::read(root.join("catalogue.json")).expect(
+            "the ordinary lead must report its runtime tool catalogue before this case can pass",
+        ))
+        .unwrap();
+        let names = receipt["names"]
+            .as_array()
+            .expect("the catalogue receipt must carry the probed runtime tool names")
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !names.is_empty(),
+            "the ordinary lead's runtime catalogue must not be empty"
+        );
+        assert!(
+            tool_catalogue::native_worktree_names(&names).is_empty(),
+            "the competing native codex_worktrees surface must stay absent from the ordinary lead: {names:?}"
+        );
+        for preserved in [
+            "exec_command",
+            "apply_patch",
+            "view_image",
+            "write_stdin",
+            "clock__curr_time",
+        ] {
+            assert!(
+                names.iter().any(|name| name == preserved),
+                "the ordinary lead's runtime catalogue must preserve the unrelated {preserved} tool: {names:?}"
+            );
+        }
+        // The synthetic unrelated MCP server configured in this case's owned
+        // home must survive the exercised launcher as a real discovery: its
+        // tools reach the session's own runtime catalogue under the server's
+        // model-visible namespace, and the server recorded the actual
+        // initialize/tools-list handshake behind that namespace.
+        let mcp_tools = names
+            .iter()
+            .filter(|name| name.starts_with("mcp__unrelated_probe__"))
+            .collect::<Vec<_>>();
+        assert!(
+            !mcp_tools.is_empty(),
+            "the ordinary lead's runtime catalogue must preserve the unrelated MCP server's discovered tools: {names:?}"
+        );
+        let receipt_path = probe_receipt
+            .as_ref()
+            .expect("the Normal case owns the synthetic unrelated MCP server");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let receipt: Value = loop {
+            let complete = fs::read(receipt_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            match complete {
+                Some(value) => break value,
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                None => panic!(
+                    "the synthetic unrelated MCP server must leave a complete handshake receipt at {}",
+                    receipt_path.display()
+                ),
+            }
+        };
+        let calls = receipt["calls"]
+            .as_array()
+            .expect("the MCP server receipt must record its received methods")
+            .iter()
+            .map(|call| call.as_str().unwrap())
+            .collect::<Vec<_>>();
+        for method in ["initialize", "notifications/initialized", "tools/list"] {
+            assert!(
+                calls.contains(&method),
+                "the synthetic unrelated MCP server must record its real {method} handshake: {calls:?}"
+            );
+        }
+        let negotiated = &receipt["initialize"];
+        assert!(
+            negotiated["protocolVersion"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty()),
+            "the recorded MCP handshake must carry the negotiated protocol revision: {negotiated}"
+        );
+        fs::write(
+            root.join("mcp-probe.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema":1,
+                "server":"unrelated_probe",
+                "toolPrefix":"mcp__unrelated_probe__",
+                "tools":mcp_tools,
+                "handshake":receipt,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"deepseek-flash"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
 }
 
 fn pair_model_catalog(source: &Path) -> Vec<u8> {
@@ -900,10 +1113,7 @@ fn pair_model_catalog(source: &Path) -> Vec<u8> {
     let models = catalog["models"].as_array_mut().unwrap();
     for (slug, display, effort) in [
         ("gpt-6-astra", "GPT-6 Astra", "low"),
-        ("glm-5.3", "Z.AI GLM-5.3", "high"),
-        ("zai/glm-5.3", "Z.AI GLM-5.3", "high"),
-        ("grok-4.6", "Grok 4.6", "high"),
-        ("xai/grok-4.6", "Grok 4.6", "high"),
+        ("deepseek-flash", "DeepSeek V4.1 Flash", "max"),
     ] {
         if !models.iter().any(|model| model["slug"] == slug) {
             models.push(json!({
@@ -1060,7 +1270,7 @@ fn exercise_user_stop(root: &Path, state: &Path, workspace: &Path) {
     .unwrap();
 }
 
-fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
+fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path, executable: &Path) {
     let until = Instant::now() + WAIT;
     while !(state.join("view.json").is_file() && workspace.join("proof.txt").is_file())
         && Instant::now() < until
@@ -1072,14 +1282,36 @@ fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
         "one"
     );
     let view: Value = serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
+    let snapshot: harness_core::task_view::Snapshot =
+        serde_json::from_value(view["window"].clone()).unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    // The injected fault targets only the exact conversation surface recorded
+    // by the controller, and it is validated through the owned identity check
+    // before any window is touched.
+    assert!(
+        snapshot.is_visible(executable, &user).unwrap(),
+        "the owned conversation surface must be visible before the injected loss"
+    );
+    let target = window_identity(snapshot.window);
     fs::write(
         root.join("native-entry-partial-ready.json"),
-        serde_json::to_vec(&json!({"state":state,"view":view})).unwrap(),
+        serde_json::to_vec(&json!({"state":state,"view":view,"target":target.clone()})).unwrap(),
     )
     .unwrap();
     eprintln!(
-        "native partial effect ready; minimize owned conversation: {}",
+        "native partial effect ready; minimize the owned conversation: {}",
         root.display()
+    );
+    minimize_owned_conversation(&snapshot);
+    // Observe the loss through the same owned-surface check the controller
+    // uses; the injected minimize must remove this exact surface.
+    let until = Instant::now() + WAIT;
+    while Instant::now() < until && snapshot.is_visible(executable, &user).unwrap_or(true) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !snapshot.is_visible(executable, &user).unwrap_or(true),
+        "the injected minimize must remove the owned conversation surface; inspect the target window identity"
     );
     let until = Instant::now() + WAIT;
     loop {
@@ -1125,17 +1357,28 @@ fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
     )
     .unwrap();
     eprintln!(
-        "native interruption settled; restore owned conversation: {}",
+        "native interruption settled; restore the owned conversation: {}",
         root.display()
     );
+    restore_owned_conversation(&snapshot);
+    // Record the restoration only after observing it through the same
+    // owned-surface check; an unobserved marker would fake the recovery.
     let until = Instant::now() + Duration::from_secs(90);
-    while !root.join("native-entry-view-restored.json").is_file() && Instant::now() < until {
+    while Instant::now() < until && !snapshot.is_visible(executable, &user).unwrap_or(false) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        root.join("native-entry-view-restored.json").is_file(),
-        "scoped restoration observation required"
+        snapshot.is_visible(executable, &user).unwrap_or(false),
+        "the restored conversation must be visible through the owned-surface check"
     );
+    fs::write(
+        root.join("native-entry-view-restored.json"),
+        serde_json::to_vec(
+            &json!({"schema":1,"threadId":view["threadId"],"window":snapshot.window,"observedRestored":true,"target":target}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_secs(2));
     assert!(
         !root.join("provider-2.json").exists(),
@@ -1150,6 +1393,42 @@ fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
         "the unfinished native tool must remain owned after turn interruption"
     );
     fs::write(workspace.join("finish-tool"), "release owned command").unwrap();
+}
+
+/// Bounded fault injection against the exact conversation surface recorded by
+/// the controller: the same user-visible loss a manual minimize produces.
+/// `Snapshot::is_visible` validated this handle immediately before the call,
+/// and no other window is touched.
+fn minimize_owned_conversation(snapshot: &harness_core::task_view::Snapshot) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, ShowWindow};
+    unsafe {
+        ShowWindow(snapshot.window as _, SW_MINIMIZE);
+    }
+}
+
+/// Restore the same owned surface without activating or arranging any window.
+fn restore_owned_conversation(snapshot: &harness_core::task_view::Snapshot) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
+    unsafe {
+        ShowWindow(snapshot.window as _, SW_RESTORE);
+    }
+}
+
+/// Recorded identity of a fault target so the evidence names the exact window
+/// that was minimized instead of an anonymous handle.
+fn window_identity(window: usize) -> Value {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+    let mut pid = 0;
+    let mut class = [0u16; 128];
+    let copied = unsafe {
+        GetWindowThreadProcessId(window as _, &mut pid);
+        GetClassNameW(window as _, class.as_mut_ptr(), class.len() as i32)
+    };
+    json!({
+        "window": window,
+        "ownerPid": pid,
+        "class": String::from_utf16_lossy(&class[..copied.max(0) as usize]),
+    })
 }
 
 fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: &Path) {
@@ -1250,10 +1529,7 @@ fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: 
     fs::write(workspace.join("finish-tool"), "release owned command").unwrap();
 }
 
-fn reveal_conversation(state: &Path, executable: &Path) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
-    };
+fn observe_conversation_visibility(state: &Path, executable: &Path) {
     let until = Instant::now() + WAIT;
     while !state.join("view.json").is_file() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
@@ -1262,17 +1538,8 @@ fn reveal_conversation(state: &Path, executable: &Path) {
     let snapshot: harness_core::task_view::Snapshot =
         serde_json::from_value(view["window"].clone()).unwrap();
     let user = harness_core::process_service::current_user().unwrap();
-    unsafe {
-        SetWindowPos(
-            snapshot.window as _,
-            HWND_TOP,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
+    // Visibility must come from the owning launcher. Observe it without
+    // changing window position, size, activation or stacking order.
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         if snapshot.is_visible(executable, &user).unwrap_or(false) {

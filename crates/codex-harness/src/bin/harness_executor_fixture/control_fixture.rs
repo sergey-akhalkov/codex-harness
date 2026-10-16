@@ -124,23 +124,17 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                 "turn/start",
                 Answer::Result(json!({"turn": {"id": TURN, "status": "inProgress"}})),
             );
-            // The first read must see an empty thread (the host refuses a
-            // conversation whose fresh thread already has turns); the second read
-            // serves the completed turn's final assistant message.
-            server.answer_sequence(
-            "thread/read",
-            vec![
+            // Until the assignment is submitted this is the fresh empty thread
+            // a pre-submission check must see (the host refuses a conversation
+            // whose fresh thread already has turns). The agent thread below
+            // replaces this answer with the completed turn as soon as
+            // `turn/start` arrives, so every read after submission - in any
+            // read order or count the attaching route uses - observes the
+            // turn's final assistant message.
+            server.answer(
+                "thread/read",
                 Answer::Result(json!({"thread": {"id": session_for_thread.clone(), "turns": []}})),
-                Answer::Result(json!({"thread": {
-                    "id": session_for_thread.clone(),
-                    "turns": [{
-                        "id": TURN,
-                        "status": "completed",
-                        "items": [{"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE}],
-                    }],
-                }})),
-            ],
-        );
+            );
             server.push(json!({"method": "thread/started", "params": {"thread": {"id": session_for_thread.clone()}}}));
             server.push(json!({
             "method": "turn/started",
@@ -163,6 +157,20 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             let until = Instant::now() + Duration::from_secs(120);
             while Instant::now() < until {
                 if !server.requests_for("turn/start").is_empty() {
+                    // The thread is no longer fresh: the compatibility route
+                    // reads it only here, while a native frontend read the
+                    // empty thread before this assignment was submitted.
+                    server.answer(
+                        "thread/read",
+                        Answer::Result(json!({"thread": {
+                            "id": session.clone(),
+                            "turns": [{
+                                "id": TURN,
+                                "status": "completed",
+                                "items": [{"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE}],
+                            }],
+                        }})),
+                    );
                     record_selected_tools();
                     let _ = commit_solution();
                     let heavy = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok();
