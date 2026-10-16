@@ -534,16 +534,15 @@ fn watch_reports_failure_interruption_and_never_waits_forever() {
     assert!(output.contains("cause: fixture"), "{output}");
 
     // A recorded host whose exact process identity is gone is an interrupted
-    // run: unknown exit code, no fabricated completion.
+    // run: unknown exit code, no fabricated completion. The identity is this
+    // test's own observed and reaped child, so the outcome never depends on
+    // what unrelated process happens to hold a pid on this machine.
     let run = SeededRun::new();
+    let (_ended_host, ended_host) = observed_ended_host();
     let mut receipt = receipt_json(&run.receipt);
     receipt["observation"]["state"] = json!("running");
     receipt["observation"]["session"] = json!("01a0c719-f4d4-7880-a9d2-1a96ee0f23f4");
-    receipt["observation"]["host"] = json!({
-        "pid": 4242,
-        "created": 1,
-        "program": run.root.join("absent-host.exe").to_string_lossy()
-    });
+    receipt["observation"]["host"] = ended_host;
     fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     let out = run.watch(&["--timeout", "30"]);
     let output = text(&out);
@@ -2594,6 +2593,36 @@ fn assert_backend_released(host: &ControlHost) {
     );
 }
 
+/// An owned process identity that has verifiably ended: the child's exact
+/// identity (pid, creation time and image) is observed while it runs, and it
+/// is then reaped. The retained handle pins the process object, so the
+/// recorded pid cannot be reused before the record is consumed. A dead host
+/// is proven by this test's own ended identity, never by guessing from a
+/// fixed pid that this machine may or may not be able to open.
+fn observed_ended_host() -> (Child, Value) {
+    let program = PathBuf::from(r"C:\Windows\System32\ping.exe");
+    let mut child = Command::new(&program)
+        .args(["-n", "300", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity =
+        harness_core::process_service::ServiceProcess::observe(child.id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+    child.kill().unwrap();
+    let _ = child.wait().unwrap();
+    let host = json!({
+        "pid": identity.pid,
+        "created": identity.creation_time,
+        "program": program.canonicalize().unwrap().to_string_lossy()
+    });
+    (child, host)
+}
+
 fn spawn_neighbor() -> std::process::Child {
     Command::new("pwsh")
         .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 90"])
@@ -3676,14 +3705,11 @@ fn waiting_at_the_watch_deadline_is_action_required_and_never_a_terminal_claim()
     // A dead run with the same unresolved request keeps its real outcome
     // instead of appearing reply-capable, and so does a stopped run.
     let run = SeededRun::new();
+    let (_ended_host, dead_host) = observed_ended_host();
     let mut dead = receipt_json(&run.receipt);
     dead["observation"]["state"] = json!("running");
     dead["observation"]["session"] = json!(CONTROL_THREAD);
-    dead["observation"]["host"] = json!({
-        "pid": 4242,
-        "created": 1,
-        "program": run.root.join("absent-host.exe").to_string_lossy()
-    });
+    dead["observation"]["host"] = dead_host;
     dead["replyRequests"] = json!([{"id": "req-1", "status": "unresolved", "requiresReply": true}]);
     fs::write(&run.receipt, serde_json::to_vec_pretty(&dead).unwrap()).unwrap();
     let interrupted = run.watch(&["--timeout", "5"]);

@@ -299,10 +299,11 @@ impl Handoff {
                 }) {
                     self.effort = supported_effort(model, self.successor_effort.as_deref());
                     if self.effort.is_none() {
-                        return self.block(
-                            root,
-                            json!({"reason":"successor catalog has no supported non-delegating effort"}),
+                        let reason = catalog_effort_refusal(
+                            self.successor_effort.as_deref(),
+                            &self.successor_model,
                         );
+                        return self.block(root, json!({"reason": reason}));
                     }
                     self.send(root, connection, Phase::Rename, "thread/name/set", json!({"threadId":self.previous["threadId"],"name":"Previous lead - quota unavailable"}))?;
                 } else if let Some(cursor) = result["nextCursor"].as_str() {
@@ -460,6 +461,15 @@ fn supported_effort(model: &Value, declared: Option<&str>) -> Option<String> {
                     .any(|row| row["reasoningEffort"] == *effort)
         })
         .map(str::to_owned)
+}
+
+fn catalog_effort_refusal(declared: Option<&str>, model: &str) -> String {
+    match declared {
+        Some(declared) => format!(
+            "configured successor effort {declared} is unsupported by successor model {model}; correct the successor profile or the installed catalog instead of choosing a fallback"
+        ),
+        None => "successor catalog has no supported non-delegating effort".to_owned(),
+    }
 }
 
 fn visible_history(thread: &Value) -> Result<Vec<Value>, &'static str> {
@@ -746,5 +756,91 @@ mod tests {
         );
         assert_eq!(supported_effort(&defaulted, None).as_deref(), Some("low"));
         assert!(visible_history(&json!({"turns":[{"items":[{"type":"userMessage","content":[{"type":"image","url":"owned-image"}]}]}]})).is_err());
+    }
+
+    #[test]
+    fn an_explicit_unsupported_successor_effort_names_its_cause_before_dispatch() {
+        use std::net::{Ipv4Addr, TcpListener};
+        assert_eq!(
+            catalog_effort_refusal(None, "deepseek-flash"),
+            "successor catalog has no supported non-delegating effort"
+        );
+        let mismatch = catalog_effort_refusal(Some("xhigh"), "deepseek-flash");
+        assert!(mismatch.contains("xhigh"), "{mismatch}");
+        assert!(mismatch.contains("deepseek-flash"), "{mismatch}");
+        assert!(
+            mismatch.contains("correct the successor profile or the installed catalog"),
+            "{mismatch}"
+        );
+        let prepared = BrokerRoot::prepare().unwrap();
+        let root = prepared.root();
+        save(
+            &root.path().join("leader.json"),
+            &json!({"threadId":"lead","model":"gpt-6-astra","native":{"cwd":"owned"}}),
+        )
+        .unwrap();
+        crate::orchestration_config::persist_successor(
+            root.path(),
+            &crate::orchestration_config::SuccessorChoice {
+                schema: 1,
+                profile: "ds".into(),
+                model: "deepseek-flash".into(),
+                title: "ds temporary lead".into(),
+                reasoning_effort: Some("xhigh".into()),
+            },
+        )
+        .unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server =
+            std::thread::spawn(move || tungstenite::accept(listener.accept().unwrap().0).unwrap());
+        let mut connection =
+            ControlConnection::connect(port, &"a".repeat(32), Duration::from_secs(2)).unwrap();
+        let mut server = server.join().unwrap();
+        server
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut handoff = Handoff::load(root).unwrap();
+        let tasks = BTreeMap::from([(
+            "lead".into(),
+            json!({"turns":[{"id":"refused","status":"failed","items":[{"type":"userMessage","content":[{"type":"text","text":"Inspect only"}]}]}]}),
+        )]);
+        let failures = BTreeMap::from([(
+            "lead".into(),
+            json!({"failure":{"threadId":"lead","turnId":"refused","cause":"quota"}}),
+        )]);
+        let settled = BTreeSet::from(["lead".into()]);
+        handoff
+            .tick(root, &mut connection, &tasks, &failures, &settled, &settled)
+            .unwrap();
+        let request: Value =
+            serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(request["method"], "model/list");
+        handoff
+            .event(
+                root,
+                &mut connection,
+                &json!({"id":request["id"],"result":{"data":[{"model":"deepseek-flash","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"},{"reasoningEffort":"max"}]}]}}),
+            )
+            .unwrap();
+        assert!(handoff.phase == Phase::Blocked);
+        let reason = handoff.error["reason"].as_str().unwrap();
+        assert!(reason.contains("xhigh"), "{reason}");
+        assert!(reason.contains("deepseek-flash"), "{reason}");
+        assert!(
+            !reason.contains("has no supported non-delegating effort"),
+            "{reason}"
+        );
+        assert!(handoff.effort.is_none());
+        let saved: Value = read_json(&root.path().join("handoff.json")).unwrap();
+        assert_eq!(saved["transfer"]["phase"], "blocked");
+        server
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(
+            matches!(server.read(), Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
     }
 }
