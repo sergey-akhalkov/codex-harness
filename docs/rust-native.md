@@ -605,6 +605,21 @@ anything. `executor resume`, `restart`, `watch`, `message`, `stop`,
 `assignment`, `pool` and `release` accept the same `--repository` selector. `executor pool` lines
 add `repository=`, `task=` and `handle=` beside the session fields.
 
+### Bounded lead conversations
+
+`codex-harness lead dispatch --source CHECKOUT --codex-home DIRECTORY --owner LABEL
+--assignment FILE` starts a separate visible decision participant using the configured
+`lead_profile` and lead role. It uses the shared pool, receipt and control lifecycle.
+Native agent tools and further harness model dispatch are disabled inside this
+conversation; the originating lead owns executor assignments and integration.
+`lead resume` accepts the same source, home and owner plus `--slot N` and optional
+`--session THREAD_ID`, retaining the exact conversation and partial work. Observe,
+message and stop it through the corresponding `executor` commands and recorded slot.
+Dispatch exit zero means the request was accepted; the receipt records completion,
+failure or interruption. Model-free fixtures cover dispatch, resume, role mismatch,
+stopping and child failure; measured workflow composition and real-agent equivalence
+require their own acceptance before this route can supply comparison evidence.
+
 ### Native worktree tool suppression
 
 The native TUI hosts a dynamic `codex_worktrees` tool server into sessions
