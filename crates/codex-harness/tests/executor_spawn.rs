@@ -503,10 +503,37 @@ fn explicit_base_binds_the_exact_local_commit_offline_and_unknown_revisions_are_
     assert_eq!(fixture.record(1)["owner"], "exec-local");
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
 
-    // An unknown revision is refused as a local-resolution failure before any
-    // claim: the held record and the registered checkout stay untouched.
     let record_path = fixture.record_path(1);
     let before = fs::read(&record_path).unwrap();
+    let kept_on_conflict = slot.join("keep-on-conflict.txt");
+    fs::write(&kept_on_conflict, "preserved local work\n").unwrap();
+
+    // A known local commit is still invalid for this held binding. Refuse it
+    // before launch instead of resetting the slot or discarding partial work.
+    fs::write(fixture.source.join("other-base.txt"), "other base\n").unwrap();
+    git(&fixture.source, &["add", "other-base.txt"]);
+    git(&fixture.source, &["commit", "-qm", "other local base"]);
+    let other_base = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    assert_ne!(other_base, commit);
+    let conflicting = fixture.spawn(&["--owner", "exec-local", "--base", &other_base]);
+    let text = output_text(&conflicting);
+    assert!(!conflicting.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "the requested base {other_base} conflicts with the binding"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("executor presentation:"), "{text}");
+    assert_eq!(fs::read(&record_path).unwrap(), before);
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(
+        fs::read_to_string(&kept_on_conflict).unwrap(),
+        "preserved local work\n"
+    );
+
+    // An unknown revision is refused as a local-resolution failure before any
+    // claim: the held record and the registered checkout stay untouched.
     let unknown = fixture.spawn(&[
         "--owner",
         "exec-other",
