@@ -3439,8 +3439,8 @@ fn tree_paths(root: &Path) -> Vec<String> {
 /// static first model request can defer dynamic tool servers, so the effective
 /// catalogue is read from the running session itself: one code-mode `exec`
 /// call per bounded settle round reports the session's own `ALL_TOOLS`. The
-/// managed selection (the shared configuration leaf and the managed
-/// frontend's `-c features.worktrees=false` pair) must leave no worktree-named
+/// managed selection (the shared configuration leaf, forwarded as
+/// `-c features.worktrees=false`) must leave no worktree-named
 /// tool in that runtime catalogue and no `codex_worktrees` marker in the
 /// session's first-request surface. The unsuppressed control run proves the
 /// probe observes the runtime surface while the feature is on: a control that
@@ -3510,16 +3510,23 @@ fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_manage
     );
 }
 
-/// Explicit native probe: fresh managed lead and executor sessions must
-/// consume the worktree-tool suppression at the runtime tool catalogue, not
-/// merely construct argv. The real launcher binary under a recorded build
-/// whose source root is this checkout forwards single sessions to the
-/// installed native CLI against the canned local Responses server. The
-/// unsuppressed direct control exposes the competing tools, both managed
-/// roles stay free of them, a selected profile that carries no
-/// features.worktrees choice still receives the suppression default, and an
-/// explicit winning profile true is honored with a truthful conflict report
-/// at the real entry point. No global deployment and no billed model call.
+/// Explicit native probe: fresh managed sessions through the launcher's
+/// registered build, carrying the lead or executor role marker, must consume
+/// the worktree-tool suppression at the runtime tool catalogue, not merely
+/// construct argv. This is the launcher's forwarding route, whose locally
+/// hosted TUI is the surface this probe reads; the controller-hosted
+/// frontends (`lead start` / `executor host`) attach to a separate
+/// app-server conversation, so this check makes no claim about that route
+/// (the installed app-server tool-registration boundary is probed
+/// separately). The real launcher
+/// binary under a recorded build whose source root is this checkout forwards
+/// single sessions to the installed native CLI against the canned local
+/// Responses server. The unsuppressed direct control exposes the competing
+/// tools, both managed roles stay free of them, a selected profile that
+/// carries no features.worktrees choice still receives the suppression
+/// default, and an explicit winning profile true is honored with a truthful
+/// conflict report at the real entry point. No global deployment and no
+/// billed model call.
 #[test]
 #[ignore = "explicit installed native CLI TUI through the real launcher + canned local Responses; no live model"]
 fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {

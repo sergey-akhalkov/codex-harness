@@ -84,7 +84,7 @@ const USAGE: &str = concat!(
     "Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. `executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifying each by the recorded identity and terminating survivors so a child command is reported actually terminated. The stopped run's tab closes because that run's own host process ends; no terminal command is ever sent, so the lead's window and sibling tabs are untouched. Nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. ",
     "Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). `executor message` delivers one literal correction into the addressed run's own live conversation under the content and address rules above, then verifies the recorded binding, exact session, lease, host and conversation before acting. `--reply-to MESSAGE_ID` is the lead's reply to one request from its own executor and takes only that id plus content. The id resolves from the lifecycle record written by `lead message`, then this same steer/start owner delivers the unchanged payload to that exact executor run. Another lead, an unknown or retired id, a reused slot or generation, and a contradictory explicit address are refused before anything is sent. ",
     "Delivery goes to the same thread through the run's kit-local control endpoint (`endpoint-N.json`): a running turn is steered with `turn/steer` at the nearest supported point and is never interrupted, an idle thread gets a new turn on its own thread. The result distinguishes delivered (observed in the conversation's own items), queued (accepted by the recorded turn; not yet visible), error (the endpoint refused; nothing delivered) and indeterminate (unanswered, so whether it was applied is unknown); acceptance is never reported as the executor having applied it. Every attempt is recorded with its content identity: an already delivered or queued text is reported instead of sent again, an indeterminate attempt refuses the repeat, and only a definite error may be sent again. A completed, stopped, interrupted, failed or unavailable run reports its actual state with the exact-session continuation remedy, and a surface that records no control endpoint (a historical unmanaged or legacy receipt) is reported as unsupported instead of pretending delivery. ",
-    "Exit codes: 0 delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. `lead message` is the executor's only return channel: content under the rules above goes to the originating lead recorded for its own live run, with no recipient, slot, session, checkout or endpoint; --notify sends a notice that requests no reply. A caller outside that run's recorded relationship, a stale or foreign marker and a caller-supplied address are refused before anything is sent. Routine progress stays on the beads board rather than this channel. A structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and partial work. ",
+    "Exit codes: 0 delivered or queued, 1 a native error or an indeterminate result with delivery still unknown, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. `lead message` is the executor's only return channel: content under the rules above goes to the originating lead recorded for its own live run, with no recipient, slot, session, checkout or endpoint; --notify sends a notice that requests no reply. A caller outside that run's recorded relationship, a stale or foreign marker and a caller-supplied address are refused before anything is sent. Routine progress stays on the beads board rather than this channel. A structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and partial work. ",
     "`executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified. Assignments also accept `--exec -` for piped free text.\n",
 );
 const STARTUP: Duration = Duration::from_secs(20);
@@ -4661,9 +4661,14 @@ fn attach_owned_frontend(
 }
 
 /// Global options before `resume`. The thread id is the only positional, so
-/// the frontend cannot submit the assignment. Every managed frontend also
-/// turns the native worktree tools off: those tools allocate outside the
-/// shared harness pool, so the pool stays the conversation's only allocator.
+/// the frontend cannot submit the assignment. Every managed frontend runs as
+/// a remote TUI whose conversation, including its tool catalogue, is served
+/// by the harness's app-server child; the `-c features.worktrees=false` pair
+/// pins this frontend process's own configuration to the managed default and
+/// never shadows the selected profile, which travels only to the app-server
+/// child as configuration overrides. A hosted conversation whose effective
+/// catalogue still re-exposed the competing tools would be a configuration
+/// conflict to report rather than a silently accepted suppression.
 fn frontend_args(
     port: u16,
     thread_id: &str,
@@ -5975,7 +5980,7 @@ fn inherit_lead_endpoint(
                 note = format!("; a previous record of this slot could not be retired: {error}");
             }
             println!(
-                "executor lead channel: unavailable ({cause}); `codex-harness lead message` reports this condition and its remedy instead of sending, and this dispatch continues as before{note}. Remedy: host the lead session through `codex-harness lead start`, which records a verified endpoint for its exact thread, then dispatch again"
+                "executor lead channel: unavailable ({cause}); `codex-harness lead message` delivers to an ordinary lead conversation through the installed native CLI's own queue route when the dispatch recorded the originating lead's own kit home and that home registers a verifiable installed launcher, and it reports this condition and its remedy instead of sending when either is unavailable. This dispatch continues as before{note}. Remedy for a managed channel: host the lead session through `codex-harness lead start`, which records a verified endpoint for its exact thread, then dispatch again"
             );
         }
     }
@@ -7151,17 +7156,25 @@ fn invalid(message: &str) -> io::Error {
 mod tests {
     use super::*;
 
-    /// Managed lead and executor frontends are the native TUI processes that
-    /// would register the competing `codex_worktrees` tools into a hosted
-    /// conversation. The common pool is the only allocator a managed
-    /// conversation may use, so both roles carry the native feature off
-    /// before the resume subcommand, which keeps the thread id as its only
-    /// positional.
+    /// Managed lead and executor frontends are remote TUI processes whose
+    /// conversation is served by the harness's app-server child. Both roles
+    /// carry the managed `features.worktrees=false` default in the frontend's
+    /// own configuration before the resume subcommand, which keeps the thread
+    /// id as its only positional; the pair stays scoped to this process, so
+    /// the selected profile is never shadowed here.
     #[test]
     fn managed_frontends_suppress_the_native_worktree_tool_surface() {
         let pair = ["-c", "features.worktrees=false"];
         for role in [FrontendRole::Executor, FrontendRole::Lead] {
             let args = frontend_args(1, "thread-1", NativePresentation::NativeInline, role);
+            assert!(
+                args.iter().any(|arg| arg == "--remote"),
+                "{role:?} frontend args must stay a remote TUI: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "--profile"),
+                "{role:?}: the selected profile travels to the app-server child and must not be shadowed by the frontend pin: {args:?}"
+            );
             assert!(
                 args.windows(2)
                     .any(|window| window[0] == pair[0] && window[1] == pair[1]),
@@ -8180,6 +8193,7 @@ mod tests {
             schema: control::ORIGINATING_LEAD_SCHEMA,
             thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2301".into(),
             run_generation: "test-run-generation".into(),
+            home: None,
             dispatcher: control::DispatcherIdentity {
                 pid: std::process::id(),
                 creation_time: 1,
@@ -8514,6 +8528,7 @@ mod tests {
             schema: control::ORIGINATING_LEAD_SCHEMA,
             thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2302".into(),
             run_generation: "test-run-generation".into(),
+            home: None,
             dispatcher: control::DispatcherIdentity {
                 pid: std::process::id(),
                 creation_time: 1,

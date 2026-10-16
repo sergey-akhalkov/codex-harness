@@ -3271,6 +3271,12 @@ mod tests {
 
     #[test]
     fn role_context_keeps_explicit_native_guidance_and_fails_before_dispatch() {
+        // The composed role resolves from the caller's inherited executor
+        // session marker, so the expected role text follows whichever role
+        // this test process runs as. The marker is process-global state
+        // shared with concurrently running tests: never mutate it here.
+        let executor_session =
+            std::env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some();
         let fixture = Fixture::new();
         fs::write(fixture.home.join("custom.config.toml"),
             "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'high'\ndeveloper_instructions = 'Profile guidance'\n").unwrap();
@@ -3292,9 +3298,23 @@ mod tests {
             .unwrap();
         let effective = crate::portable_config::context_overrides(&context.overrides).unwrap();
         let developer = effective["developer_instructions"].as_str().unwrap();
-        assert!(developer.contains("Fixture lead responsibility"));
-        assert!(developer.contains("Session guidance"));
-        assert!(!developer.contains("Fixture executor responsibility"));
+        let (expected_role, other_role) = if executor_session {
+            (
+                "Fixture executor responsibility",
+                "Fixture lead responsibility",
+            )
+        } else {
+            (
+                "Fixture lead responsibility",
+                "Fixture executor responsibility",
+            )
+        };
+        assert!(
+            developer.contains(expected_role),
+            "composed developer instructions: {developer:?}; composed argv: {actual:?}"
+        );
+        assert!(developer.contains("Session guidance"), "{developer:?}");
+        assert!(!developer.contains(other_role));
         assert!(!developer.contains("Profile guidance"));
         assert_eq!(context.profile.as_deref(), Some("custom"));
         assert!(!effective.contains_key("model"));
