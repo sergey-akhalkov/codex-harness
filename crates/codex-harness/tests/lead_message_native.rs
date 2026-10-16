@@ -24,6 +24,9 @@
 #[path = "fixtures/control_responses.rs"]
 mod control_responses;
 
+#[path = "fixtures/skill_catalog_responses.rs"]
+mod skill_catalog_responses;
+
 use harness_core::{
     broker_state::BrokerRoot,
     build_identity,
@@ -152,19 +155,40 @@ fn seed_launcher_registration(home: &Path) {
     });
 }
 
+/// The native CLI versions the retained lead-message protocol has been run
+/// against: the historical pin, plus the installed upstream that was qualified
+/// from its own local `app-server --help` (WebSocket transport flags) and its
+/// generated protocol schema (initialize, thread/start, thread/read,
+/// turn/start, turn/steer, thread/resume). A further upstream version must be
+/// qualified the same way before this check claims it.
+const QUALIFIED_UPSTREAM_VERSIONS: &[&str] = &["0.157.0", "0.163.0"];
+
+/// Requires the fixture executable to be the installation-record upstream
+/// binary at one of the qualified versions and returns the recorded version
+/// text: the fixture hosts the installed native CLI, and a different binary or
+/// an unqualified upstream version is not this check's contract.
+fn qualified_installed_upstream(exe: &Path) -> String {
+    let upstream = installed_upstream();
+    assert!(
+        same_executable(exe, &upstream),
+        "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; this check runs the installed native CLI, not another binary",
+        exe.display(),
+        upstream.display()
+    );
+    let version = version_text(exe);
+    let qualified = QUALIFIED_UPSTREAM_VERSIONS
+        .iter()
+        .any(|candidate| version.contains(&format!("codex-cli {candidate}")));
+    assert!(
+        qualified,
+        "the installation-record upstream must be a qualified Codex CLI version (one of {QUALIFIED_UPSTREAM_VERSIONS:?}): {version}"
+    );
+    version
+}
+
 fn fixture() -> Fixture {
-    fixture_with_version_requirement(Some("0.157.0"))
-}
-
-/// Builds the same owned fixture for the installation-record upstream binary:
-/// the endpoint positive control must run the installed native CLI, and it
-/// records the actual version instead of requiring a historical pin.
-fn installed_fixture() -> Fixture {
-    fixture_with_version_requirement(None)
-}
-
-fn fixture_with_version_requirement(required: Option<&str>) -> Fixture {
     let exe = codex_exe();
+    qualified_installed_upstream(&exe);
     let owned_root = BrokerRoot::prepare().unwrap().keep();
     let root = owned_root.path();
     let home = root.join("home");
@@ -172,25 +196,6 @@ fn fixture_with_version_requirement(required: Option<&str>) -> Fixture {
     fs::create_dir(&home).unwrap();
     fs::create_dir(&workspace).unwrap();
     seed_launcher_registration(&home);
-    let version = version_text(&exe);
-    match required {
-        Some(required) => {
-            let expected = format!("codex-cli {required}");
-            assert!(
-                version.contains(expected.as_str()),
-                "HARNESS_CONTROL_CODEX_EXE must be the installed Codex {required} binary: {version}"
-            );
-        }
-        None => {
-            let upstream = installed_upstream();
-            assert!(
-                same_executable(&exe, &upstream),
-                "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the ordinary-lead boundary probe runs the installed native CLI, not another binary",
-                exe.display(),
-                upstream.display()
-            );
-        }
-    }
     let responses = control_responses::Responses::start(root.into(), true);
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
     fs::write(
@@ -1312,34 +1317,73 @@ fn assert_process_gone(identity: ProcessIdentity, program: &Path, user: &str, la
 }
 
 /// The surface the dispatch recorded is a real, non-minimized window of the
-/// exact process it names - not a claim inside a record.
+/// exact process it names - not a claim inside a record. The deciding rule is
+/// `harness_core::task_view`'s retained-view rule, so it also accepts a
+/// console the terminal host presents for that exact recorded process.
 fn assert_visible_surface(root: &LeadRoot) {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    };
     let receipt = root.receipt();
     let surface = &receipt["window"];
-    let window = surface["window"].as_u64().unwrap_or_else(|| {
-        panic!(
-            "{}: the dispatch recorded no visible surface: {receipt}",
-            root.role
-        )
-    });
-    let pid = surface["process"]["pid"].as_u64().unwrap_or(0) as u32;
+    let snapshot: harness_core::task_view::Snapshot = serde_json::from_value(surface.clone())
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}: the dispatch recorded no usable visible surface ({error}): {receipt}",
+                root.role
+            )
+        });
+    let host = &receipt["observation"]["host"];
+    let program = PathBuf::from(host["program"].as_str().unwrap_or_default());
+    let user = process_service::current_user().unwrap();
+    // The harness's own retained-view rule: the exact process identity plus a
+    // live, non-minimized window, whether the console owns it or the terminal
+    // host presents it. A surface that is still settling gets a bounded moment.
+    let until = Instant::now() + WAIT;
+    loop {
+        match snapshot.is_visible(&program, &user) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => panic!(
+                "{}: the recorded surface could not be checked: {error}; {surface}",
+                root.role
+            ),
+        }
+        assert!(
+            Instant::now() < until,
+            "{}: the recorded surface is not this run's own live window: {surface} {}",
+            root.role,
+            window_state(snapshot.window)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The observed state of one window handle, for the surface failure message:
+/// existence, owning process, visibility, minimize state and class. The
+/// presentation rule itself stays owned by `harness_core::task_view`.
+fn window_state(window: usize) -> Value {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    };
+    let handle = window as HWND;
+    let exists = unsafe { IsWindow(handle) } != 0;
     let mut owner = 0u32;
-    let bounds = &surface["bounds"];
-    assert!(
-        unsafe { IsWindow(window as HWND) } != 0
-            && unsafe { GetWindowThreadProcessId(window as HWND, &mut owner) } != 0
-            && owner == pid
-            && unsafe { IsWindowVisible(window as HWND) } != 0
-            && unsafe { IsIconic(window as HWND) } == 0
-            && bounds["width"].as_i64().unwrap_or(0) > 0
-            && bounds["height"].as_i64().unwrap_or(0) > 0,
-        "{}: the recorded surface is not this run's own live window: {surface}",
-        root.role
-    );
+    let mut class = [0u16; 128];
+    let copied = if exists {
+        unsafe {
+            GetWindowThreadProcessId(handle, &mut owner);
+            GetClassNameW(handle, class.as_mut_ptr(), class.len() as i32)
+        }
+    } else {
+        0
+    };
+    json!({
+        "window": window,
+        "exists": exists,
+        "ownerPid": owner,
+        "class": String::from_utf16_lossy(&class[..copied.max(0) as usize]),
+        "visible": exists && unsafe { IsWindowVisible(handle) } != 0,
+        "minimized": exists && unsafe { IsIconic(handle) } != 0,
+    })
 }
 
 /// What the real dispatch recorded for one root's fresh executor: the run
@@ -1734,17 +1778,7 @@ fn same_directory(reported: &str, expected: &Path) -> bool {
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream and the deployed kit; two native lead roots with owned canned Responses; no live model"]
 fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
     let exe = codex_exe();
-    let upstream = installed_upstream();
-    assert!(
-        same_executable(&exe, &upstream),
-        "HARNESS_CONTROL_CODEX_EXE must be the installation-record upstream executable {} so this check runs the installed native CLI, not another binary",
-        upstream.display()
-    );
-    let version = version_text(&exe);
-    assert!(
-        version.contains("codex-cli 0.157.0"),
-        "the installation-record upstream must be Codex 0.157.0: {version}"
-    );
+    let version = qualified_installed_upstream(&exe);
     let entry = installed_entry();
     eprintln!(
         "installed two-lead isolation: entry={} upstream={} ({})",
@@ -4035,7 +4069,7 @@ trust_level = "trusted"
 #[test]
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; owned native app-server fixture and canned Responses; no live model"]
 fn installed_queue_endpoint_reaches_its_owning_thread() {
-    let fixture = installed_fixture();
+    let fixture = fixture();
     let root = fixture.root.path().to_path_buf();
     let home = root.join("home");
     let version = version_text(&fixture.exe);
@@ -4282,5 +4316,407 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
         missing_hits.len(),
         foreign.len(),
         root.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Managed lead start acceptance
+// ---------------------------------------------------------------------------
+
+/// One actual `codex-harness lead start` session: the checkout-built harness
+/// hosts the lead profile in this terminal through one native app-server, its
+/// attached native frontend, the canned local Responses provider and the
+/// registered unrelated stdio MCP server. The entry point is the real
+/// `lead start` command; an ordinary Normal session or a directly composed
+/// app-server does not stand in for it.
+///
+/// The session's own runtime catalogue must lose the competing native
+/// `codex_worktrees` tools while the unrelated server's tools survive, the
+/// transcript must report the resolved role revision and the bound model,
+/// provider and effort, and the published endpoint must appear only after the
+/// frontend attached to the exact thread and must retire with the session.
+///
+/// The hosted app-server route cannot observe one permitted configuration
+/// conflict - an explicit worktree leaf that re-exposes the competing tools is
+/// owned by the registered-launcher check
+/// `installed_managed_role_tui_catalogues_drop_native_worktree_tools` - so
+/// this check claims only the observed suppression and the preserved
+/// unrelated surface, never a successful managed-pool delivery.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream and the checkout-built harness; owned canned Responses and unrelated MCP fixture; no live model"]
+fn managed_lead_start_hosts_the_catalogue_without_native_worktree_tools() {
+    let exe = codex_exe();
+    let version = qualified_installed_upstream(&exe);
+    let upstream = installed_upstream();
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let evidence = tempfile::Builder::new()
+        .prefix("lead-start-native-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!(
+        "managed lead start evidence: {} (upstream {} {})",
+        evidence.display(),
+        upstream.display(),
+        version.trim()
+    );
+    let home = evidence.join("home");
+    fs::create_dir_all(home.join("harness")).unwrap();
+    // `lead start` launches `<home>/harness/bin/codex.exe`, so the recorded
+    // build is that exact directory: this checkout's real launcher beside its
+    // integrity stubs, with the record's source root pointing at this
+    // checkout. The registration names the installed upstream the launcher
+    // forwards to; nothing global is read or changed.
+    let build = home.join("harness/bin");
+    skill_catalog_responses::managed_launcher_build_in(&build, &checkout);
+    let registration_bytes = serde_json::to_vec(&harness_core::native_launcher::Registration {
+        schema: 2,
+        state: None,
+        build: Some(build.clone()),
+        task_control: false,
+        upstream: harness_core::native_launcher::Upstream {
+            executable: upstream.clone(),
+            sha256: build_identity::hash_file(&upstream).unwrap(),
+            package: None,
+        },
+    })
+    .unwrap();
+    fs::write(home.join("harness/native-launch.json"), &registration_bytes).unwrap();
+    fs::write(evidence.join("native-launch.json"), &registration_bytes).unwrap();
+    let canned = skill_catalog_responses::CannedResponses::spawn_all_tools(&evidence).unwrap();
+    let unrelated = skill_catalog_responses::unrelated_probe_mcp(&home);
+    // The session runs in this checkout, so the checkout is the trusted
+    // project; the canned provider is bound to the exact model, provider and
+    // effort this run asserts, and the unrelated server is the only other
+    // tool source.
+    skill_catalog_responses::write_probe_config(&home, &checkout, &canned, &unrelated, false);
+    skill_catalog_responses::clear_probe_receipt(&home);
+    let expected_revision =
+        harness_core::role_context::resolve(&checkout, harness_core::role_context::Role::Lead)
+            .unwrap()
+            .revision;
+
+    let entry = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    let mut spec = CommandSpec::new(&entry);
+    spec.args = vec![
+        "lead".into(),
+        "start".into(),
+        "--source".into(),
+        checkout.clone().into_os_string(),
+        "--codex-home".into(),
+        home.clone().into_os_string(),
+        "--exec".into(),
+        skill_catalog_responses::ALL_TOOLS_PROBE_PROMPT.into(),
+    ];
+    spec.current_dir = Some(checkout.clone());
+    spec.env
+        .insert("CODEX_HOME".into(), Some(home.clone().into_os_string()));
+    spec.env.insert(
+        skill_catalog_responses::API_KEY_ENV.into(),
+        Some(skill_catalog_responses::API_KEY.into()),
+    );
+    spec.env.insert("PATH".into(), Some(filtered_path()));
+    spec.env.insert(
+        "CODEX_HARNESS_CPU_ACCOUNT".into(),
+        Some(evidence.join("cpu-account").into_os_string()),
+    );
+    for key in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_CONTEXT_ROLE",
+        "HARNESS_CONTEXT_REVISION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+        "WT_SESSION",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let mut console = ConsoleSpec::new(spec);
+    console.limits.memory_bytes = Some(1024 * 1024 * 1024);
+    console.limits.cpu_percent = Some(50.0);
+    let session = ConsoleSession::spawn(console).unwrap();
+    let host = session.identity();
+
+    // The host reports the resolved lead context and the bound routing before
+    // it starts anything: these lines are this run's own source and runtime
+    // identity, and the role revision is resolved from the same checkout the
+    // registered build names.
+    let expected_context =
+        format!("lead role context: role=lead revision={expected_revision} previous=none");
+    let expected_session = format!(
+        "lead session: profile=default model=gpt-6-astra provider=canned_skill_catalog effort=low cwd={}",
+        checkout.display()
+    );
+    let started = wait_until(60, || {
+        let text = session.transcript();
+        text.contains(&expected_context) && text.contains(&expected_session)
+    });
+    if !started {
+        dump_terminal(&evidence, &session);
+        panic!(
+            "the managed lead host did not report its resolved role context and bound routing; evidence {}",
+            evidence.display()
+        );
+    }
+
+    // The registry record is published only after the native frontend attached
+    // to this exact thread, so its appearance is the attachment evidence.
+    let registry = home.join("harness/lead-endpoints");
+    let published = wait_until(90, || {
+        fs::read_dir(&registry)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+            })
+            .unwrap_or(false)
+    });
+    if !published {
+        dump_terminal(&evidence, &session);
+        panic!(
+            "the managed lead session published no endpoint; evidence {}",
+            evidence.display()
+        );
+    }
+    let mut records: Vec<PathBuf> = fs::read_dir(&registry)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "the registry must publish exactly this session's record"
+    );
+    let endpoint_path = records.pop().unwrap();
+    let endpoint: Value = serde_json::from_slice(&fs::read(&endpoint_path).unwrap()).unwrap();
+    let port = u16::try_from(endpoint["port"].as_u64().unwrap()).unwrap();
+    let token = endpoint["token"].as_str().unwrap().to_owned();
+    let thread = endpoint["threadId"].as_str().unwrap().to_owned();
+    let recorded = ProcessIdentity {
+        pid: u32::try_from(endpoint["process"]["pid"].as_u64().unwrap()).unwrap(),
+        creation_time: endpoint["process"]["creationTime"].as_u64().unwrap(),
+    };
+    let program = PathBuf::from(endpoint["process"]["program"].as_str().unwrap());
+    assert!(
+        same_executable(&program, &build.join("codex.exe")),
+        "the published endpoint must record the registered launcher this home hosts, not another program: {}",
+        program.display()
+    );
+    let user = process_service::current_user().unwrap();
+    assert!(
+        ServiceProcess::inspect(recorded, &program, &user)
+            .unwrap()
+            .is_some(),
+        "the published endpoint must record the live app-server child of this session"
+    );
+    fs::write(
+        evidence.join("endpoint.json"),
+        serde_json::to_vec_pretty(&json!({
+            "port": port,
+            "threadId": thread,
+            "process": {
+                "pid": recorded.pid,
+                "creationTime": recorded.creation_time,
+                "program": program,
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Three probe rounds: the `--exec` first prompt and two typed turns, each
+    // executing one fresh runtime-catalogue call inside this session. Every
+    // reading must show the unrelated MCP surface and none of the competing
+    // native worktree tools.
+    let mut readings: Vec<(String, Vec<String>)> = Vec::new();
+    for round in 1..=3 {
+        if round > 1 {
+            send_line(&session, skill_catalog_responses::ALL_TOOLS_PROBE_PROMPT).unwrap();
+        }
+        let seen = readings.last().map(|(call_id, _)| call_id.clone());
+        let captured = canned.wait_for(Duration::from_secs(180), |requests| {
+            skill_catalog_responses::probe_readings(requests)
+                .last()
+                .is_some_and(|(call_id, _)| Some(call_id) != seen.as_ref())
+        });
+        assert!(
+            captured,
+            "probe round {round} captured no runtime catalogue output; evidence {}",
+            evidence.display()
+        );
+        let current = skill_catalog_responses::probe_readings(&canned.requests());
+        let (call_id, names) = current
+            .last()
+            .cloned()
+            .expect("a captured reading is present");
+        assert!(
+            !readings.iter().any(|(earlier, _)| *earlier == call_id),
+            "probe round {round} re-read an earlier probe output; evidence {}",
+            evidence.display()
+        );
+        assert!(
+            !names.is_empty(),
+            "probe round {round} reported an empty runtime catalogue; evidence {}",
+            evidence.display()
+        );
+        let fragments = skill_catalog_responses::tool_catalogue::native_worktree_names(&names);
+        assert!(
+            fragments.is_empty(),
+            "the managed lead runtime catalogue kept the competing native worktree tools: {fragments:?}; evidence {}",
+            evidence.display()
+        );
+        let tools = skill_catalog_responses::tool_catalogue::unrelated_probe_surface(&names);
+        assert!(
+            !tools.is_empty(),
+            "probe round {round} must keep the registered unrelated MCP server's tools: names {names:?}; evidence {}",
+            evidence.display()
+        );
+        fs::write(
+            evidence.join(format!("all-tools-round-{round}.json")),
+            serde_json::to_vec_pretty(&json!({
+                "call_id": call_id,
+                "names": &names,
+                "unrelated": &tools,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        readings.push((call_id, names));
+    }
+
+    // The session reached the registered unrelated server as a real stdio MCP
+    // server: its own receipt records this session's full handshake, because
+    // the previous receipt was cleared before the host started.
+    let receipt = skill_catalog_responses::wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the managed lead session left no fresh unrelated MCP handshake receipt at {}",
+            skill_catalog_responses::probe_receipt_path(&home).display()
+        )
+    });
+    skill_catalog_responses::assert_probe_receipt(&receipt, "the managed lead-start session");
+    fs::write(
+        evidence.join("mcp-receipt.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // The request that carried the first probe turn is the exact model and
+    // effort this session bound, not the fixture's defaults.
+    let probe = canned
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .body
+                .contains(skill_catalog_responses::ALL_TOOLS_PROBE_PROMPT)
+        })
+        .expect("a captured request carries the probe prompt");
+    fs::write(evidence.join("first-probe.body.json"), &probe.body).unwrap();
+    let body: Value = serde_json::from_str(&probe.body).unwrap();
+    assert_eq!(
+        body["model"],
+        "gpt-6-astra",
+        "the lead turn must run the bound model; body keys {:?}",
+        body.as_object().map(|map| map.keys().collect::<Vec<_>>())
+    );
+    assert_eq!(
+        body["reasoning"]["effort"],
+        "low",
+        "the lead turn must run the bound reasoning effort; body keys {:?}",
+        body.as_object().map(|map| map.keys().collect::<Vec<_>>())
+    );
+
+    // Ending the frontend ends the host: the exact thread and this host's
+    // working files must retire, the app-server child must be gone, and the
+    // retired port must refuse the recorded address.
+    send_line(&session, "/quit").unwrap();
+    let outcome = session
+        .wait(
+            Deadline::after(Duration::from_secs(90)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    let transcript = outcome.transcript.clone();
+    fs::write(evidence.join("terminal.txt"), &transcript).unwrap();
+    assert_eq!(outcome.outcome.reason, StopReason::Exited, "{transcript}");
+    assert_eq!(outcome.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        transcript.contains(&format!(
+            "lead session: ended thread {thread} profile default frontend-exit 0"
+        )),
+        "the host must report the exact ended thread and its frontend exit: {transcript}"
+    );
+    assert!(
+        transcript.contains("lead endpoint:") && transcript.contains("was retired"),
+        "the host must report the retired endpoint: {transcript}"
+    );
+    assert!(
+        !transcript.contains("lead session note:"),
+        "the host reported a cleanup problem: {transcript}"
+    );
+    assert!(
+        !endpoint_path.exists(),
+        "the retired session's registry record outlived it: {}",
+        endpoint_path.display()
+    );
+    let host_dir = home.join("harness/lead-endpoints/host");
+    for path in [
+        host_dir.join(format!("{}.json", host.pid)),
+        host_dir.join(format!("{}.token", host.pid)),
+    ] {
+        assert!(
+            !path.exists(),
+            "a retired lead host must leave no working address file: {}",
+            path.display()
+        );
+    }
+    if let Ok(log) = fs::read(host_dir.join(format!("{}.log", host.pid))) {
+        fs::write(evidence.join("host.log"), log).unwrap();
+    }
+    let until = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < until
+        && ServiceProcess::inspect(recorded, &program, &user)
+            .map(|process| process.is_some())
+            .unwrap_or(true)
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_process_gone(
+        recorded,
+        &program,
+        &user,
+        "the managed lead session left its app-server child running",
+    );
+    assert!(
+        ControlConnection::connect(port, &token, Duration::from_millis(500)).is_err(),
+        "the retired endpoint still accepted a connection on port {port}"
+    );
+    eprintln!(
+        "managed lead start: thread {thread} rounds {} unrelatedTools {}; evidence {}",
+        readings.len(),
+        readings
+            .last()
+            .map(|(_, names)| {
+                skill_catalog_responses::tool_catalogue::unrelated_probe_surface(names).len()
+            })
+            .unwrap_or(0),
+        evidence.display()
     );
 }

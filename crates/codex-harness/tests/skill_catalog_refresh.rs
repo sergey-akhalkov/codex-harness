@@ -2,6 +2,8 @@
 //! Uses an owned CODEX_HOME, a distinct canned local Responses provider, and
 //! ConPTY + Windows Jobs. Never redefines reserved provider openai.
 #![cfg(windows)]
+#[path = "fixtures/control_responses.rs"]
+mod control_responses;
 #[path = "fixtures/native_sampling.rs"]
 mod native_sampling;
 #[path = "fixtures/skill_catalog_responses.rs"]
@@ -19,8 +21,10 @@ use harness_core::{
 use serde_json::{Value, json};
 use skill_catalog_responses::{
     ALL_TOOLS_PROBE_PROMPT, API_KEY, API_KEY_ENV, CALL_ID, CHILD_CALL_ID, CHILD_PROMPT,
-    COMPACT_PROMPT, CannedResponses, EARLY_SKILL, NEXT_TURN_PROMPT, PROVIDER_ID, RESUME_PROMPT,
-    RETIRE_PROMPT, RequestKind, SUMMARY_TEXT, UNRELATED_PROMPT, USER_PROMPT,
+    COMPACT_PROMPT, CannedResponses, EARLY_SKILL, ManagedInstall, NEXT_TURN_PROMPT, PROVIDER_ID,
+    RESUME_PROMPT, RETIRE_PROMPT, RequestKind, SUMMARY_TEXT, UNRELATED_PROMPT, USER_PROMPT,
+    assert_probe_receipt, clear_probe_receipt, probe_readings, probe_receipt_path,
+    record_managed_install, unrelated_probe_mcp, wait_for_probe_receipt, write_probe_config,
 };
 use std::{
     fs, io,
@@ -28,9 +32,7 @@ use std::{
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tool_catalogue::{
-    PROBE_CALL_PREFIX, probe_names, tool_surface, worktree_fragments, worktree_names,
-};
+use tool_catalogue::{tool_surface, worktree_fragments, worktree_names};
 
 const EXPECTED_SHA: &str = "e4c11374bd9de8ad5c3b7617fd4654bb7839901edb0863f9930666863c7a021b";
 const EXPECTED_LEN: u64 = 307_150_128;
@@ -4601,68 +4603,6 @@ fn pinned_exe() -> PathBuf {
     exe
 }
 
-fn write_probe_config(
-    home: &Path,
-    workspace: &Path,
-    canned: &CannedResponses,
-    extra: &str,
-    compact_prompt: bool,
-) {
-    let trusted = json_escape(workspace);
-    let compact = if compact_prompt {
-        format!("compact_prompt = \"{COMPACT_PROMPT}\"\n")
-    } else {
-        String::new()
-    };
-    fs::write(
-        home.join("config.toml"),
-        format!(
-            r#"model = "gpt-6-astra"
-model_provider = "{PROVIDER_ID}"
-model_reasoning_effort = "low"
-approval_policy = "never"
-sandbox_mode = "danger-full-access"
-web_search = "disabled"
-model_auto_compact_token_limit = 1000000
-model_context_window = 20000
-{compact}[model_providers.{PROVIDER_ID}]
-name = "Canned skill catalog Responses"
-base_url = "{}"
-env_key = "{API_KEY_ENV}"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = false
-request_max_retries = 0
-stream_max_retries = 0
-[windows]
-sandbox = "unelevated"
-[features]
-hooks = false
-apps = false
-multi_agent = false
-memories = false
-goals = false
-plugins = true
-skill_search = true
-[projects.{trusted}]
-trust_level = "trusted"
-{extra}
-"#,
-            canned.base_url()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        home.join("auth.json"),
-        serde_json::to_vec_pretty(&json!({
-            "auth_mode": "apikey",
-            "OPENAI_API_KEY": API_KEY
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-}
-
 fn spawn_probe_tui(exe: &Path, home: &Path, workspace: &Path) -> ConsoleSession {
     spawn_probe_tui_args(exe, home, workspace, &[])
 }
@@ -4709,42 +4649,6 @@ struct RuntimeCatalogue {
     names: Vec<String>,
     surface: (Vec<String>, String),
     transcript: String,
-}
-
-/// Every distinct runtime catalogue reading carried by `requests`, in arrival
-/// order: the probe call id the fixture issued and the runtime tool names the
-/// session reported through that code-mode `exec` call. Later requests repeat
-/// earlier conversation items, so readings are deduplicated by call id; a new
-/// entry means the session executed a newer probe call.
-fn probe_readings(
-    requests: &[skill_catalog_responses::CapturedRequest],
-) -> Vec<(String, Vec<String>)> {
-    let mut readings: Vec<(String, Vec<String>)> = Vec::new();
-    for request in requests {
-        let Ok(body) = serde_json::from_str::<Value>(&request.body) else {
-            continue;
-        };
-        let Some(items) = body.get("input").and_then(Value::as_array) else {
-            continue;
-        };
-        for item in items {
-            if item.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
-                continue;
-            }
-            let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
-                continue;
-            };
-            if !call_id.starts_with(PROBE_CALL_PREFIX)
-                || readings.iter().any(|(seen, _)| seen == call_id)
-            {
-                continue;
-            }
-            if let Some(names) = item.get("output").and_then(probe_names) {
-                readings.push((call_id.to_owned(), names));
-            }
-        }
-    }
-    readings
 }
 
 /// Runs one fresh installed-CLI TUI session against the canned local Responses
@@ -4850,27 +4754,6 @@ fn tui_all_tools_probe(
     }
 }
 
-/// Registers the first-party probe fixture as a real unrelated stdio MCP
-/// server inside one probe home: the session must start the server, discover
-/// its tools and keep every one of them while the competing native worktree
-/// surface is suppressed. Returns the `[mcp_servers]` configuration layer
-/// naming the copied fixture, whose sibling receipt records the handshake.
-fn unrelated_probe_mcp(home: &Path) -> String {
-    let directory = home.join("mcp-probe");
-    fs::create_dir_all(&directory).unwrap();
-    let executable = directory.join("harness-mcp-probe-fixture.exe");
-    fs::copy(env!("CARGO_BIN_EXE_harness-mcp-probe-fixture"), &executable).unwrap();
-    fs::write(
-        executable.with_extension("json"),
-        serde_json::to_vec(&json!({"mode": "valid", "kind": "nuphus"})).unwrap(),
-    )
-    .unwrap();
-    format!(
-        "[mcp_servers.unrelated_probe]\ncommand = {}\n",
-        serde_json::to_string(&executable.to_string_lossy()).unwrap()
-    )
-}
-
 /// Asserts one probe session really reached the registered unrelated MCP
 /// server and kept its tools: the runtime catalogue carries the server's
 /// model-visible namespace and the server's own receipt records its
@@ -4891,133 +4774,6 @@ fn assert_unrelated_mcp_preserved(catalogue: &RuntimeCatalogue, label: &str) {
         )
     });
     assert_probe_receipt(&receipt, label);
-}
-
-/// The copied probe fixture's own handshake receipt inside one probe home:
-/// the fixture rewrites it beside its copied executable for every method it
-/// receives, so one receipt file serves a whole probe home.
-fn probe_receipt_path(home: &Path) -> PathBuf {
-    home.join("mcp-probe")
-        .join("harness-mcp-probe-fixture.receipt.json")
-}
-
-/// The copied fixture's receipt once it records a complete handshake. One
-/// receipt file is shared per probe home, so a caller that needs fresh
-/// per-session evidence clears it before the session and waits here after.
-fn wait_for_probe_receipt(home: &Path) -> Option<Value> {
-    let receipt_path = probe_receipt_path(home);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        let complete = fs::read(&receipt_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-        if let Some(value) = complete {
-            let handshaken = value["calls"]
-                .as_array()
-                .is_some_and(|calls| calls.iter().any(|call| call.as_str() == Some("tools/list")));
-            if handshaken {
-                return Some(value);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    None
-}
-
-/// Clears any receipt an earlier probe session left behind, so the next
-/// session's handshake is proven by a fresh file rather than its
-/// predecessor's. A failed removal cannot count as fresh evidence.
-fn clear_probe_receipt(home: &Path) {
-    let path = probe_receipt_path(home);
-    if let Err(error) = fs::remove_file(&path) {
-        assert_eq!(
-            error.kind(),
-            std::io::ErrorKind::NotFound,
-            "cannot clear the previous MCP handshake receipt at {}: {error}",
-            path.display()
-        );
-    }
-}
-
-/// Asserts one real handshake receipt records the initialize/tools-list
-/// exchange: the fixture's own evidence that a session reached it as a real
-/// stdio MCP server rather than merely echoing its registration.
-fn assert_probe_receipt(receipt: &Value, label: &str) {
-    let calls = receipt["calls"]
-        .as_array()
-        .expect("the MCP server receipt records its received methods")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    for method in ["initialize", "notifications/initialized", "tools/list"] {
-        assert!(
-            calls.contains(&method),
-            "{label}: the unrelated MCP server must record its real {method} handshake: {calls:?}"
-        );
-    }
-}
-
-/// The recorded managed installation one runtime-catalogue route runs
-/// against: this checkout's launcher binary under a recorded build whose
-/// source root is this checkout, forwarding to the real installed native CLI.
-/// The registration lives only in the probe's own home; no global
-/// installation, deployment or configuration is read or changed.
-struct ManagedInstall {
-    launcher: PathBuf,
-    upstream: PathBuf,
-    build: PathBuf,
-    cpu_account: PathBuf,
-}
-
-/// Records one native build whose `codex.exe` is this checkout's real
-/// launcher binary, so a spawned launcher passes its own selected-build
-/// check; the remaining recorded binaries are integrity stubs. The record's
-/// source root is this checkout, so the launcher reads the live kit manifest,
-/// profile and role inputs exactly as a managed session would.
-fn managed_launcher_build(evidence: &Path, source: &Path) -> PathBuf {
-    let build = evidence.join("native-build");
-    fs::create_dir_all(&build).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_codex"), build.join("codex.exe")).unwrap();
-    for binary in build_identity::BINARIES {
-        let path = build.join(binary);
-        if !path.exists() {
-            fs::write(&path, binary.as_bytes()).unwrap();
-        }
-    }
-    let record = build_identity::BuildRecord {
-        schema: build_identity::SCHEMA,
-        source_root: source.to_path_buf(),
-        source: build_identity::source_identity(source).unwrap(),
-        rustc: "fixture".into(),
-        cargo: "fixture".into(),
-        target: "x86_64-pc-windows-msvc".into(),
-        profile: "release".into(),
-        binaries: build_identity::BINARIES
-            .iter()
-            .map(|name| {
-                (
-                    (*name).to_string(),
-                    build_identity::hash_file(&build.join(name)).unwrap(),
-                )
-            })
-            .collect(),
-    };
-    fs::write(
-        build.join("build.json"),
-        serde_json::to_vec(&record).unwrap(),
-    )
-    .unwrap();
-    build
-}
-
-fn record_managed_install(evidence: &Path, upstream: &Path, source: &Path) -> ManagedInstall {
-    let build = managed_launcher_build(evidence, source);
-    ManagedInstall {
-        launcher: build.join("codex.exe"),
-        upstream: upstream.to_path_buf(),
-        build,
-        cpu_account: evidence.join("cpu-account"),
-    }
 }
 
 /// Spawns one managed launcher session under the recorded build: the same

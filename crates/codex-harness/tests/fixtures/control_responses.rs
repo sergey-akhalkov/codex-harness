@@ -1,6 +1,7 @@
 //! Owned Responses fixture for native controller acceptance; never calls a model.
 //! The model-catalogue probe a frontend may issue before its first turn is
 //! answered without a model and without a recorded request.
+#![allow(dead_code)] // Each test binary compiles the subset its own cases use.
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -597,7 +598,7 @@ impl Responses {
                     );
                     let arguments=serde_json::to_string(&json!({
                         "cmd":if pair { pair_command.as_str() } else if view_loss || close_view || background { "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-tool); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-tool)) { throw 'owned tool release deadline' }; Get-Content proof.txt" }
-                            else { "[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt" },
+                            else { "[IO.File]::AppendAllText('proof.txt', 'one'); [IO.File]::WriteAllText('shell-execution.json', (@{exe=(Get-Process -Id $PID).Path; edition=$PSVersionTable.PSEdition; major=$PSVersionTable.PSVersion.Major; version=$PSVersionTable.PSVersion.ToString()} | ConvertTo-Json -Compress)); Start-Sleep -Seconds 3; Get-Content proof.txt" },
                         "shell":owned_pwsh(),"yield_time_ms":if background { 1000 } else if view_loss || close_view || pair { 30000 } else { 10000 }
                     })).unwrap();
                     // The owned action may run through the session's own

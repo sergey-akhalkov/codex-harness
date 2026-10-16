@@ -785,6 +785,31 @@ trust_level = "trusted"
             "one"
         );
     }
+    if matches!(case, EntryCase::Normal) {
+        // The owned action reports the PowerShell host that actually ran it;
+        // the request's shell argument alone proves only the intent.
+        let capture: Value =
+            serde_json::from_slice(&fs::read(workspace.join("shell-execution.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            capture["edition"], "Core",
+            "the owned action must run in PowerShell Core"
+        );
+        assert_eq!(
+            capture["major"], 7,
+            "the owned action must run on PowerShell 7"
+        );
+        let expected = fs::canonicalize(control_responses::owned_pwsh()).unwrap();
+        let executed = fs::canonicalize(capture["exe"].as_str().unwrap()).unwrap();
+        assert!(
+            executed
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "the owned action must run the owner's PowerShell 7 executable {}; it ran {}",
+            expected.display(),
+            executed.display()
+        );
+    }
     if pair {
         let saved = fs::read_to_string(state.join("task.json")).unwrap();
         assert!(
