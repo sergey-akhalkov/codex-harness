@@ -445,6 +445,25 @@ fn native_entry(case: EntryCase) {
     ] {
         fs::create_dir_all(directory).unwrap();
     }
+    // The Normal case owns one synthetic unrelated MCP server: the first-party
+    // probe fixture copied into the owned home beside its mode config. The
+    // launched session must preserve this configuration and discover the
+    // server's real tools; no other case configures one.
+    let probe_executable = matches!(case, EntryCase::Normal).then(|| {
+        let directory = home.join("mcp-probe");
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("harness-mcp-probe-fixture.exe");
+        fs::copy(env!("CARGO_BIN_EXE_harness-mcp-probe-fixture"), &executable).unwrap();
+        fs::write(
+            executable.with_extension("json"),
+            serde_json::to_vec(&json!({"mode": "valid", "kind": "nuphus"})).unwrap(),
+        )
+        .unwrap();
+        executable
+    });
+    let probe_receipt = probe_executable
+        .as_ref()
+        .map(|executable| executable.with_extension("receipt.json"));
     for file in [
         "Cargo.toml",
         "Cargo.lock",
@@ -575,6 +594,18 @@ fn native_entry(case: EntryCase) {
         ""
     };
     let multi_agent_v2 = if pair { "true" } else { "false" };
+    // Only the Normal case carries the synthetic unrelated MCP server: the
+    // absolute fixture path reaches the session through the exercised
+    // launcher's own configuration handling.
+    let unrelated_mcp = probe_executable
+        .as_ref()
+        .map(|executable| {
+            format!(
+                "[mcp_servers.unrelated_probe]\ncommand = {}\n",
+                serde_json::to_string(&executable.to_string_lossy()).unwrap()
+            )
+        })
+        .unwrap_or_default();
     fs::write(
         home.join("config.toml"),
         format!(
@@ -606,7 +637,7 @@ multi_agent_v2 = {multi_agent_v2}
 enabled = false
 [projects.{trusted}]
 trust_level = "trusted"
-"#,
+{unrelated_mcp}"#,
             responses.port
         ),
     )
@@ -1002,6 +1033,69 @@ trust_level = "trusted"
                 "the ordinary lead's runtime catalogue must preserve the unrelated {preserved} tool: {names:?}"
             );
         }
+        // The synthetic unrelated MCP server configured in this case's owned
+        // home must survive the exercised launcher as a real discovery: its
+        // tools reach the session's own runtime catalogue under the server's
+        // model-visible namespace, and the server recorded the actual
+        // initialize/tools-list handshake behind that namespace.
+        let mcp_tools = names
+            .iter()
+            .filter(|name| name.starts_with("mcp__unrelated_probe__"))
+            .collect::<Vec<_>>();
+        assert!(
+            !mcp_tools.is_empty(),
+            "the ordinary lead's runtime catalogue must preserve the unrelated MCP server's discovered tools: {names:?}"
+        );
+        let receipt_path = probe_receipt
+            .as_ref()
+            .expect("the Normal case owns the synthetic unrelated MCP server");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let receipt: Value = loop {
+            let complete = fs::read(receipt_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            match complete {
+                Some(value) => break value,
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                None => panic!(
+                    "the synthetic unrelated MCP server must leave a complete handshake receipt at {}",
+                    receipt_path.display()
+                ),
+            }
+        };
+        let calls = receipt["calls"]
+            .as_array()
+            .expect("the MCP server receipt must record its received methods")
+            .iter()
+            .map(|call| call.as_str().unwrap())
+            .collect::<Vec<_>>();
+        for method in ["initialize", "notifications/initialized", "tools/list"] {
+            assert!(
+                calls.contains(&method),
+                "the synthetic unrelated MCP server must record its real {method} handshake: {calls:?}"
+            );
+        }
+        let negotiated = &receipt["initialize"];
+        assert!(
+            negotiated["protocolVersion"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty()),
+            "the recorded MCP handshake must carry the negotiated protocol revision: {negotiated}"
+        );
+        fs::write(
+            root.join("mcp-probe.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema":1,
+                "server":"unrelated_probe",
+                "toolPrefix":"mcp__unrelated_probe__",
+                "tools":mcp_tools,
+                "handshake":receipt,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
     fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"deepseek-flash"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
 }

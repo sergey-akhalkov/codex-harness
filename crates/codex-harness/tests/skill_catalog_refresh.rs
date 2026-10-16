@@ -3459,10 +3459,10 @@ fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_manage
     assert!(upstream.is_absolute() && upstream.is_file());
     let version = Command::new(&upstream).arg("--version").output().unwrap();
     let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
-    // The explicitly observed current native CLI 0.163.0 is admitted beside
-    // 0.162.1; any other version stays refused.
+    // The installed native CLI is exactly the observed 0.162.1 or 0.163.0 in
+    // its normal `codex-cli <version>` form; any other version stays refused.
     assert!(
-        version.contains("0.162.1") || version.contains("0.163.0"),
+        version == "codex-cli 0.162.1" || version == "codex-cli 0.163.0",
         "unexpected native CLI: {version}"
     );
 
@@ -3540,10 +3540,10 @@ fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {
     assert!(upstream.is_absolute() && upstream.is_file());
     let version = Command::new(&upstream).arg("--version").output().unwrap();
     let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
-    // The explicitly observed current native CLI 0.163.0 is admitted beside
-    // 0.162.1; any other version stays refused.
+    // The installed native CLI is exactly the observed 0.162.1 or 0.163.0 in
+    // its normal `codex-cli <version>` form; any other version stays refused.
     assert!(
-        version.contains("0.162.1") || version.contains("0.163.0"),
+        version == "codex-cli 0.162.1" || version == "codex-cli 0.163.0",
         "unexpected native CLI: {version}"
     );
 
