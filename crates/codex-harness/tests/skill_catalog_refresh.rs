@@ -4926,9 +4926,17 @@ fn wait_for_probe_receipt(home: &Path) -> Option<Value> {
 
 /// Clears any receipt an earlier probe session left behind, so the next
 /// session's handshake is proven by a fresh file rather than its
-/// predecessor's.
+/// predecessor's. A failed removal cannot count as fresh evidence.
 fn clear_probe_receipt(home: &Path) {
-    let _ = fs::remove_file(probe_receipt_path(home));
+    let path = probe_receipt_path(home);
+    if let Err(error) = fs::remove_file(&path) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "cannot clear the previous MCP handshake receipt at {}: {error}",
+            path.display()
+        );
+    }
 }
 
 /// Asserts one real handshake receipt records the initialize/tools-list
