@@ -443,10 +443,15 @@ fn same_permissions(before: &Value, after: &Value) -> bool {
 
 fn supported_effort(model: &Value, declared: Option<&str>) -> Option<String> {
     let supported = model["supportedReasoningEfforts"].as_array()?;
-    declared
+    if let Some(declared) = declared {
+        return (declared != "ultra"
+            && supported
+                .iter()
+                .any(|row| row["reasoningEffort"] == declared))
+        .then(|| declared.to_owned());
+    }
+    [Some("high"), model["defaultReasoningEffort"].as_str()]
         .into_iter()
-        .map(Some)
-        .chain([Some("high"), model["defaultReasoningEffort"].as_str()])
         .flatten()
         .find(|effort| {
             *effort != "ultra"
@@ -532,9 +537,9 @@ mod tests {
             root.path(),
             &crate::orchestration_config::SuccessorChoice {
                 schema: 1,
-                profile: "zai".into(),
-                model: "zai/glm-5.3".into(),
-                title: "Z.AI temporary lead".into(),
+                profile: "ds".into(),
+                model: "deepseek-flash".into(),
+                title: "ds temporary lead".into(),
                 reasoning_effort: None,
             },
         )
@@ -625,7 +630,7 @@ mod tests {
                 &json!({"method":"turn/started","params":{"threadId":"lead","turn":{"id":"new"}}}),
             )
             .unwrap();
-        handoff.event(root, &mut connection, &json!({"id":request["id"],"result":{"data":[{"model":"zai/glm-5.3","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}})).unwrap();
+        handoff.event(root, &mut connection, &json!({"id":request["id"],"result":{"data":[{"model":"deepseek-flash","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}})).unwrap();
         assert!(handoff.phase == Phase::Blocked);
         assert!(handoff.pending.is_none());
         let saved: Value = read_json(&root.path().join("handoff.json")).unwrap();
@@ -732,11 +737,14 @@ mod tests {
             supported_effort(&catalog, Some("max")).as_deref(),
             Some("max")
         );
-        assert_eq!(
-            supported_effort(&catalog, Some("xhigh")).as_deref(),
-            Some("high")
-        );
+        assert!(supported_effort(&catalog, Some("xhigh")).is_none());
         assert_eq!(supported_effort(&catalog, None).as_deref(), Some("high"));
+        let defaulted = json!({"defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"max"}]});
+        assert_eq!(
+            supported_effort(&defaulted, Some("low")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(supported_effort(&defaulted, None).as_deref(), Some("low"));
         assert!(visible_history(&json!({"turns":[{"items":[{"type":"userMessage","content":[{"type":"image","url":"owned-image"}]}]}]})).is_err());
     }
 }
