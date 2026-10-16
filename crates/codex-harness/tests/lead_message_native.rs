@@ -3850,7 +3850,7 @@ trust_level = "trusted"
     );
     assert!(
         notice_primary.len() == 1,
-        "the addressed conversation must issue exactly one primary request carrying the notice once: {}; evidence {}",
+        "the addressed conversation must issue exactly one primary request carrying the notice once: {:?}; evidence {}",
         hit_json(&notice_primary),
         root.display()
     );
@@ -3970,7 +3970,7 @@ trust_level = "trusted"
     );
     assert!(
         stopped_hits.is_empty() && stopped_requests == before_stopped,
-        "no model request may follow a stopped target: {stopped_requests} vs {before_stopped}, hits {}; evidence {}",
+        "no model request may follow a stopped target: {stopped_requests} vs {before_stopped}, hits {:?}; evidence {}",
         hit_json(&stopped_hits),
         root.display()
     );
