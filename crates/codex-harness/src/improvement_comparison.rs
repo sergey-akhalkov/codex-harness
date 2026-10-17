@@ -390,6 +390,18 @@ pub(super) fn advance(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> 
     ) {
         return Ok(());
     }
+    if run
+        .spec
+        .comparison
+        .as_ref()
+        .is_some_and(|comparison| comparison.workflow.is_some())
+    {
+        return block(
+            run,
+            notes,
+            "the declared executor/lead workflow runner is not connected in this build; preserve the frozen inputs and resume with a build supporting that workflow; no executor-only fallback or model dispatch was attempted".to_owned(),
+        );
+    }
     // The predeclared selection decides the measured unit. A
     // `real-operation`/`local-operation` selection is executed directly as
     // the declared real operation; every other selection keeps the two

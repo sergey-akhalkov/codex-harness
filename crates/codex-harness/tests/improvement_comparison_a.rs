@@ -1911,6 +1911,55 @@ fn a_controller_targeting_candidate_is_assessed_by_the_unchanged_supervisor() {
     );
 }
 
+/// A declared multi-role workflow must not silently run the executor-only
+/// comparison while its runner is still being integrated.
+#[test]
+fn an_unconnected_workflow_refuses_before_comparison_preparation_or_dispatch() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("workflow-not-connected");
+    let mut document = load_json(&fixture.spec);
+    document["comparison"]["workflow"] = json!({
+        "schema": 1,
+        "lead_profile": "fixture-lead",
+        "executor_profile": "ds",
+        "max_corrections": 1
+    });
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("workflow runner is not connected"),
+        "the unsupported workflow must retain its cause: {output}"
+    );
+    assert!(
+        !fixture.run.join("comparison").exists(),
+        "the refusal must precede comparison preparation"
+    );
+    let status = fixture.status_json();
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["effects"].as_array().unwrap().iter().any(|effect| {
+            effect["kind"] == "dispatch-refused"
+                && effect["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("workflow runner is not connected"))
+        }),
+        "the refusal must survive status refresh: {cursor}"
+    );
+    assert_eq!(status["attempts"].as_array().unwrap().len(), 0, "{output}");
+
+    let retry = fixture.resume();
+    assert!(retry.status.success(), "{}", text(&retry));
+    assert_eq!(
+        fixture.status_json()["attempts"].as_array().unwrap().len(),
+        0
+    );
+    assert!(!fixture.run.join("comparison").exists());
+}
+
 /// A policy file the candidate branch could rewrite cannot govern the
 /// comparison: the declared policy must stay outside the candidate's writable
 /// scope, and the refusal happens before any preparation or dispatch.
