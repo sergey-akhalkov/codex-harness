@@ -26,6 +26,7 @@ use crate::executor_cli::{
     wait_for_frontend,
 };
 use harness_core::{
+    delivery_reflection::{Finding, StageOutcome, UsageDelta},
     orchestration_config::{self, ProfileBinding},
     process::{Job, Limits},
     role_context::{self, ResolvedRole, Role},
@@ -60,6 +61,9 @@ const ROLLOUT_DEPTH: usize = 5;
 const ROLLOUT_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
 const LEAD_PREFLIGHT_BOUND: Duration = Duration::from_secs(20);
+/// Bound for waiting on the exact accepting lead turn before the lead fork.
+/// The turn identity is retained when this expires; nothing is replayed.
+const LEAD_TURN_WAIT: Duration = Duration::from_secs(120);
 
 const EXECUTOR_STAGE: &str = "executor-self-reflection";
 const LEAD_STAGE: &str = "lead-self-reflection";
@@ -135,7 +139,7 @@ fn default_bound_seconds() -> u64 {
 /// change is drift, not a resume, and refuses before a native request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ChainState {
+pub(crate) struct ChainState {
     schema: u32,
     task: String,
     run: String,
@@ -154,7 +158,7 @@ struct ChainState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum StageStatus {
+pub(crate) enum StageStatus {
     NotStarted,
     Forking,
     Forked,
@@ -178,7 +182,7 @@ impl StageStatus {
 /// evidence fields and are never part of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct StageState {
+pub(crate) struct StageState {
     schema: u32,
     stage: String,
     task: String,
@@ -267,7 +271,7 @@ impl StageState {
 /// never `delivered`; that state requires the lead conversation's own items.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct DeliveryState {
+pub(crate) struct DeliveryState {
     schema: u32,
     state: String,
     client_message_id: String,
@@ -365,53 +369,19 @@ fn print_help() {
 
 fn execute(path: &Path) -> io::Result<i32> {
     let request: Request = read_json(path, MAX_REQUEST_BYTES)?;
-    let chain = chain_state(request)?;
-    let chain_path = chain.state_dir.join("chain.json");
-    if chain_path.exists() {
-        let retained: ChainState = read_json(&chain_path, MAX_REQUEST_BYTES)?;
-        if retained != chain {
-            return Err(invalid(format!(
-                "the request drifts from the retained chain at {}; task, run, acceptance, source, stage routing, role revision or lead address changed. Retained evidence is preserved; close or archive this chain (a new state directory) instead of overwriting it",
-                chain_path.display()
-            )));
-        }
-    } else {
-        write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
-    }
-    preflight_lead_return(&chain)?;
-    let executor = prepare_stage(&chain, &chain.executor_stage, Role::ExecutorSelfReflection)?;
-    let lead = prepare_stage(&chain, &chain.lead_stage, Role::LeadSelfReflection)?;
-    let executor_state_path = chain.state_dir.join("executor-stage.json");
-    let executor_state = run_stage(
-        &chain,
-        &chain.executor_stage,
-        &chain.executor_source,
-        &executor,
-        &executor_state_path,
-        executor_prompt(&chain),
-    )?;
-    let executor_result = executor_state.result.clone().ok_or_else(|| {
-        invalid(
-            "the retained executor reflection carries no result; the lead stage cannot consume it",
-        )
-    })?;
-    if executor_result.trim() == "NO FINDING" {
-        println!("executor self-reflection: no finding (retained; lead stage still synthesizes)");
-    }
-    let lead_state_path = chain.state_dir.join("lead-stage.json");
-    let lead_state = run_stage(
-        &chain,
-        &chain.lead_stage,
-        &chain.lead_source,
-        &lead,
-        &lead_state_path,
-        lead_prompt(&chain, &executor_state)?,
-    )?;
-    let synthesis = lead_state
-        .result
-        .clone()
-        .ok_or_else(|| invalid("the retained lead reflection carries no synthesis to deliver"))?;
-    let delivery = deliver(&chain, &executor_state, &lead_state, &synthesis)?;
+    execute_request(request)
+}
+
+/// One chain through the same native runner. The manual `self-reflection`
+/// route reads its request file and calls this; the automatic delivery
+/// controller builds the same request from accepted records.
+pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
+    let chain = prepare_chain(request)?;
+    preflight_lead(&chain)?;
+    let executor_state = run_executor(&chain)?;
+    preflight_lead(&chain)?;
+    let lead_state = run_lead(&chain, &executor_state)?;
+    let delivery = deliver_synthesis(&chain, &executor_state, &lead_state)?;
     let delivered = delivery.state == "delivered";
     let result = json!({
         "schema": SCHEMA,
@@ -425,6 +395,179 @@ fn execute(path: &Path) -> io::Result<i32> {
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(if delivered { 0 } else { 3 })
+}
+
+/// Verifies (or creates) the immutable `chain.json` before any native work.
+pub(crate) fn prepare_chain(request: Request) -> io::Result<ChainState> {
+    let chain = chain_state(request)?;
+    let chain_path = chain.state_dir.join("chain.json");
+    if chain_path.exists() {
+        let retained: ChainState = read_json(&chain_path, MAX_REQUEST_BYTES)?;
+        if retained != chain {
+            return Err(invalid(format!(
+                "the request drifts from the retained chain at {}; task, run, acceptance, source, stage routing, role revision or lead address changed. Retained evidence is preserved; close or archive this chain (a new state directory) instead of overwriting it",
+                chain_path.display()
+            )));
+        }
+    } else {
+        write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
+    }
+    Ok(chain)
+}
+
+/// Refuses before any fork when the exact managed lead return surface is not
+/// live and readable.
+pub(crate) fn preflight_lead(chain: &ChainState) -> io::Result<()> {
+    preflight_lead_return(chain)
+}
+
+/// Runs (or reuses) the executor stage exactly once for this chain.
+pub(crate) fn run_executor(chain: &ChainState) -> io::Result<StageState> {
+    let prepared = prepare_stage(chain, &chain.executor_stage, Role::ExecutorSelfReflection)?;
+    let path = chain.state_dir.join("executor-stage.json");
+    run_stage(
+        chain,
+        &chain.executor_stage,
+        &chain.executor_source,
+        &prepared,
+        &path,
+        executor_prompt(chain),
+    )
+}
+
+/// Waits, without model calls, until the exact accepting lead turn recorded in
+/// `leadSource.lastTurn` reaches `completed` on the live lead endpoint. The
+/// executor stage never waits for unrelated later lead work.
+pub(crate) fn wait_for_lead_turn(chain: &ChainState) -> io::Result<()> {
+    wait_for_exact_turn_completed(chain)
+}
+
+/// Runs (or reuses) the lead stage over the retained executor outcome.
+pub(crate) fn run_lead(chain: &ChainState, executor: &StageState) -> io::Result<StageState> {
+    let prepared = prepare_stage(chain, &chain.lead_stage, Role::LeadSelfReflection)?;
+    let path = chain.state_dir.join("lead-stage.json");
+    run_stage(
+        chain,
+        &chain.lead_stage,
+        &chain.lead_source,
+        &prepared,
+        &path,
+        lead_prompt(chain, executor)?,
+    )
+}
+
+/// Delivers the retained lead synthesis to the exact real lead conversation.
+pub(crate) fn deliver_synthesis(
+    chain: &ChainState,
+    executor: &StageState,
+    lead: &StageState,
+) -> io::Result<DeliveryState> {
+    let synthesis = lead
+        .result
+        .clone()
+        .ok_or_else(|| invalid("the retained lead reflection carries no synthesis to deliver"))?;
+    deliver(chain, executor, lead, &synthesis)
+}
+
+pub(crate) fn stage_result(state: &StageState) -> Option<&str> {
+    state.result.as_deref()
+}
+
+pub(crate) fn stage_turn(state: &StageState) -> Option<&str> {
+    state.turn_id.as_deref()
+}
+
+pub(crate) fn stage_usage_known(state: &StageState) -> bool {
+    state.usage_known
+}
+
+pub(crate) fn stage_unknown_reason(state: &StageState) -> Option<&str> {
+    state
+        .usage_unknown_reason
+        .as_deref()
+        .or(state.error.as_deref())
+}
+
+pub(crate) fn stage_error(state: &StageState) -> Option<&str> {
+    state.error.as_deref()
+}
+
+pub(crate) fn stage_is_completed(state: &StageState) -> bool {
+    state.status == StageStatus::Completed
+}
+
+/// The newly billed token delta of this stage's exact turn. Unknown usage is
+/// recorded as zero tokens beside the retained unknown reason, never replaced
+/// with an estimate.
+pub(crate) fn stage_usage_delta(state: &StageState) -> UsageDelta {
+    let tokens = if state.usage_known {
+        state
+            .usage
+            .get("total_tokens")
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| {
+                state
+                    .usage
+                    .get("input_tokens")
+                    .copied()
+                    .flatten()
+                    .unwrap_or(0)
+                    .saturating_add(
+                        state
+                            .usage
+                            .get("output_tokens")
+                            .copied()
+                            .flatten()
+                            .unwrap_or(0),
+                    )
+            })
+    } else {
+        0
+    };
+    UsageDelta {
+        turns: u64::from(state.status == StageStatus::Completed),
+        tokens,
+    }
+}
+
+/// The durable core outcome of one completed stage. The retained result is
+/// bounded for the record; the full evidence stays in the stage state file.
+pub(crate) fn stage_outcome(state: &StageState) -> StageOutcome {
+    let result = state.result.clone().unwrap_or_default();
+    let finding = if result.trim() == "NO FINDING" {
+        Finding::NoFinding
+    } else if result.trim().is_empty() {
+        Finding::Inconclusive
+    } else {
+        Finding::Findings
+    };
+    let summary: String = result.chars().take(2_000).collect();
+    let mut coverage = vec![format!(
+        "source thread {} turn {}",
+        state.source_thread, state.source_last_turn
+    )];
+    if let Some(fork) = &state.fork {
+        coverage.push(format!("fork {}", fork.fork_thread));
+    }
+    if let Some(turn) = &state.turn_id {
+        coverage.push(format!("turn {turn}"));
+    }
+    StageOutcome {
+        finding,
+        summary,
+        coverage,
+        retained_at: String::new(),
+        session: state.fork.as_ref().map(|fork| fork.fork_thread.clone()),
+    }
+}
+
+pub(crate) fn delivery_state(delivery: &DeliveryState) -> &str {
+    &delivery.state
+}
+
+pub(crate) fn delivery_json(delivery: &DeliveryState) -> Value {
+    serde_json::to_value(delivery).unwrap_or_else(|error| json!({"error": error.to_string()}))
 }
 
 fn chain_state(request: Request) -> io::Result<ChainState> {
@@ -561,6 +704,71 @@ fn canonical_stage(stage: &StageDeclaration, label: &str) -> io::Result<StageDec
         checkout,
         title: stage.title.clone(),
     })
+}
+
+/// Bounded, model-free wait for the exact accepting lead turn recorded as the
+/// lead source boundary. A turn that is still running keeps its identity
+/// pending; the automatic controller re-runs process after it completes rather
+/// than forking an unfinished boundary or guessing a later turn.
+fn wait_for_exact_turn_completed(chain: &ChainState) -> io::Result<()> {
+    let endpoint = Endpoint::read(&chain.lead_return.endpoint).map_err(|error| {
+        invalid(format!(
+            "the real lead endpoint {} is unavailable while waiting for the accepting turn {}: {error}; start or resume the managed lead with `codex-harness lead start --session THREAD`, then retry",
+            chain.lead_return.endpoint.display(),
+            chain.lead_source.last_turn
+        ))
+    })?;
+    if endpoint.thread_id.as_deref() != Some(chain.lead_return.thread.as_str()) {
+        return Err(invalid(format!(
+            "the real lead endpoint {} does not name the declared return thread {}; the accepting turn was not read",
+            chain.lead_return.endpoint.display(),
+            chain.lead_return.thread
+        )));
+    }
+    let mut conversation = Conversation::attach(&endpoint, LEAD_PREFLIGHT_BOUND)?;
+    let deadline = Instant::now() + LEAD_TURN_WAIT;
+    loop {
+        let thread = conversation.thread_state()?;
+        if thread["id"].as_str() != Some(chain.lead_return.thread.as_str()) {
+            return Err(invalid(format!(
+                "the live lead conversation is not thread {}; the accepting turn was not read",
+                chain.lead_return.thread
+            )));
+        }
+        let turn = thread["turns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|turn| turn["id"].as_str() == Some(chain.lead_source.last_turn.as_str()));
+        let Some(turn) = turn else {
+            return Err(invalid(format!(
+                "the exact accepting lead turn {} is not present on live thread {}; reflection refuses a guessed or recency-based boundary",
+                chain.lead_source.last_turn, chain.lead_return.thread
+            )));
+        };
+        match turn["status"].as_str() {
+            Some("completed") => return Ok(()),
+            Some("inProgress") => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "the exact accepting lead turn {} is still in progress; its identity stays pending and the lead reflection was not started. Re-run `codex-harness delivery-improvement process` after it completes",
+                            chain.lead_source.last_turn
+                        ),
+                    ));
+                }
+                std::thread::sleep(POLL);
+            }
+            other => {
+                return Err(invalid(format!(
+                    "the exact accepting lead turn {} is {}, not completed; only a completed turn is a reflection boundary",
+                    chain.lead_source.last_turn,
+                    other.unwrap_or("unrecorded")
+                )));
+            }
+        }
+    }
 }
 
 /// Proves the exact managed lead return surface is live before either

@@ -1763,6 +1763,11 @@ impl ReflectionController {
                         "lead reflection is ineligible until the executor outcome is retained",
                     ));
                 }
+                if !record.executor.usage_reconciled {
+                    return Err(conflict(
+                        "lead reflection is ineligible until the executor stage's new-turn usage is reconciled; record the measured or explicitly unknown cost first",
+                    ));
+                }
                 if record.lead.state != StageState::Pending
                     || record.delivery == DeliveryState::Consumed
                 {
@@ -1857,9 +1862,57 @@ impl ReflectionController {
                 record.delivery = DeliveryState::Pending;
             }
             let record_tokens = record.usage_totals().tokens;
-            let next = record.executor.state == StageState::Retained
-                && record.lead.state == StageState::Pending
-                && record.delivery != DeliveryState::Consumed;
+            let next = lead_stage_eligible(record);
+            (record_tokens, next)
+        };
+        let receipt = {
+            let record = &state.records[acceptance_id];
+            stage_receipt(record, stage, next_stage_eligible, record_tokens)
+        };
+        self.write_state_at(&path, &state)?;
+        Ok(receipt)
+    }
+
+    /// Retains a completed stage's result while its exact new-turn cost is
+    /// still unreconciled. The result survives, but lead admission stays
+    /// closed until `record_unknown_usage` records the measured or explicitly
+    /// unknown cost.
+    pub fn retain_stage_unreconciled(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        mut outcome: StageOutcome,
+        usage: UsageDelta,
+        detail: impl Into<String>,
+    ) -> io::Result<StageReceipt> {
+        normalize_outcome(&mut outcome)?;
+        let detail = bounded_text("usage uncertainty", &detail.into(), MAX_TEXT_BYTES)?;
+        let path = self.state_path(&self.current_source()?);
+        let _lock = self.lock(&path)?;
+        let mut state = self.active_state(&path)?;
+        let (record_tokens, next_stage_eligible) = {
+            let record = state
+                .records
+                .get_mut(acceptance_id)
+                .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
+            let slot = stage_slot(record, stage);
+            if slot.state != StageState::InFlight {
+                return Err(conflict(&format!(
+                    "{} reflection is {:?}, not in flight",
+                    stage.as_str(),
+                    slot.state
+                )));
+            }
+            add_usage(slot, usage);
+            slot.state = StageState::Retained;
+            slot.usage.last_error = Some(detail);
+            slot.usage_reconciled = false;
+            slot.outcome = Some(outcome);
+            if stage == Stage::Lead {
+                record.delivery = DeliveryState::Pending;
+            }
+            let record_tokens = record.usage_totals().tokens;
+            let next = lead_stage_eligible(record);
             (record_tokens, next)
         };
         let receipt = {
@@ -1954,26 +2007,31 @@ impl ReflectionController {
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;
         let mut state = self.active_state(&path)?;
-        let record_tokens = {
+        let (record_tokens, next_stage_eligible) = {
             let record = state
                 .records
                 .get_mut(acceptance_id)
                 .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
             let slot = stage_slot(record, stage);
-            if slot.state != StageState::Unknown {
+            let reconcilable = slot.state == StageState::Unknown
+                || (slot.state == StageState::Retained && !slot.usage_reconciled);
+            if !reconcilable {
                 return Err(conflict(&format!(
-                    "{} reflection is {:?}, not unknown",
+                    "{} reflection is {:?} with usage reconciled {}, not unknown or retained-unreconciled",
                     stage.as_str(),
-                    slot.state
+                    slot.state,
+                    slot.usage_reconciled
                 )));
             }
             add_usage(slot, usage);
             slot.usage_reconciled = true;
-            record.usage_totals().tokens
+            let record_tokens = record.usage_totals().tokens;
+            let next = stage == Stage::Executor && lead_stage_eligible(record);
+            (record_tokens, next)
         };
         let receipt = {
             let record = &state.records[acceptance_id];
-            stage_receipt(record, stage, false, record_tokens)
+            stage_receipt(record, stage, next_stage_eligible, record_tokens)
         };
         self.write_state_at(&path, &state)?;
         Ok(receipt)
@@ -2581,6 +2639,16 @@ fn normalize_outcome(outcome: &mut StageOutcome) -> io::Result<()> {
         *session = bounded_text("stage session", session, MAX_TEXT_BYTES)?;
     }
     Ok(())
+}
+
+/// The lead stage may begin only after the executor outcome is retained and
+/// its new-turn cost is reconciled; an unreconciled cost pauses admission
+/// instead of resetting or skipping it.
+fn lead_stage_eligible(record: &ReflectionRecord) -> bool {
+    record.executor.state == StageState::Retained
+        && record.executor.usage_reconciled
+        && record.lead.state == StageState::Pending
+        && record.delivery != DeliveryState::Consumed
 }
 
 fn stage_receipt(
