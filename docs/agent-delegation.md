@@ -421,16 +421,20 @@ original timeout or changing its cleanup.
 
 Steer a continuing run by piping content into `codex-harness executor message`; a short `--text` or explicit UTF-8 `--file` remains a fallback. With one live run the command resolves and verifies checkout, home, slot, owner and exact session itself; several runs produce a bounded listing that names `--slot`. Oversized piped input spills automatically and is reported as spill evidence, never confused with model delivery. Message only to add a fact, resolve a request or correct an established mistake—not for status, hurry or repetition without new facts.
 
-An executor asks through `codex-harness lead message` from piped/text/file input; `--notify` sends a no-reply notice. The request reference lets the lead answer with `codex-harness executor message --reply-to MESSAGE_ID`, continuing the same conversation without reconstructing an address or resuming. `lead start` registers the lead endpoint that spawn inherits. When an ordinary lead has no endpoint, the command can use the registered native CLI's session queue to address the exact originating thread in its recorded home. This route starts no second conversation or listener; an invalid recorded endpoint is not replaced with it.
+An executor asks through `codex-harness lead message` from piped/text/file input; `--notify` sends a no-reply notice. The request reference lets the lead answer with `codex-harness executor message --reply-to MESSAGE_ID`, continuing the same conversation without reconstructing an address or resuming. `lead start` registers the lead endpoint that spawn inherits; that managed endpoint steers an active turn and starts an idle one on the exact thread. When a dispatch recorded no per-spawn endpoint, the command resolves only the managed registry record for that exact originating thread under the lead home recorded at dispatch, which `lead start --session THREAD` publishes after resuming the same thread. It never starts a second conversation or listener, never uses a registry record from another home or for another thread, and never replaces a malformed, mismatched or stale per-spawn endpoint.
 
-Queue acceptance means the input is queued; delivery is reported only when the
-lead's own conversation evidence contains it. A timeout or ambiguous failure
-keeps the attempt indeterminate, and repeating the same message reconciles it
-without another send. Legacy receipts without the originating home cannot use
-the ordinary route. A changed registered upstream binary is also refused before
-send: repair its installation registration before retrying. The native queue
-boundary is exercised on CLI 0.162.1; unsupported routes retain their diagnostic
-and recovery action rather than claiming delivery.
+The installed native queue is idle-only: its queue operation dispatches only
+when the target turn is idle, so it cannot deliver an operational message
+during the lead's current turn and `lead message` does not use it. With no
+verified live managed endpoint the command refuses before composing the
+envelope, writing a spill, recording an attempt or creating a reply hold, and
+names the same-thread managed resume remedy. That is an honest capability
+limitation of an ordinary embedded conversation, not evidence that the
+session was repaired. Legacy queued or indeterminate attempts stay recorded
+for reconciliation: a repeat reads the lead's own stored items without
+transmitting, upgrades to delivered only on that evidence, keeps an accepted
+attempt queued and never sends the same text again. Native queue entries are
+not deleted, so the recorded identity remains the one input to reconcile.
 
 Stop only for explicit cancellation or a concrete necessity: demonstrated wrong direction, inability to progress, or a resource conflict the executor cannot resolve. Waiting, silence, slowness and timeout are not causes. The kit stop preserves files, slot and partial work, verifies recorded identity, closes only that run's surface and records the outcome; manual killing has none of those guarantees. Continue an ordinary interruption by exact-session resume, cache loss by restart, and release only by explicit lead decision.
 

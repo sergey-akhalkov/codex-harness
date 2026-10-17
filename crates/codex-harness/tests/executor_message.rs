@@ -1728,6 +1728,69 @@ impl LeadFixture {
         }
     }
 
+    /// Rewrites the recorded originating lead's own kit home, the home whose
+    /// managed registry and stored items this run may read.
+    fn record_lead_home(&self, path: &Path) {
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(self.state.join("spawn-1.json")).unwrap()).unwrap();
+        value["originatingLead"]["home"] = json!(path);
+        fs::write(
+            self.state.join("spawn-1.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Publishes this fixture's live endpoint in the managed registry of the
+    /// given lead home, as `lead start --session THREAD` does after resuming
+    /// that exact thread. The per-spawn record is left untouched.
+    fn publish_registry_endpoint(&self, home: &Path, thread: &str) {
+        self.publish_registry_record(home, thread, thread);
+    }
+
+    /// Publishes this fixture's live endpoint under the registry key of `key`
+    /// while its record names `recorded_thread`, so a registry record whose
+    /// key and own thread identity disagree is observable.
+    fn publish_registry_record(&self, home: &Path, key: &str, recorded_thread: &str) {
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(self.state.join("lead-endpoint-1.json")).unwrap())
+                .unwrap();
+        record["threadId"] = json!(recorded_thread);
+        let dir = home.join("harness/lead-endpoints");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{key}.json")),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Records one previous attempt for a payload, merged into the receipt the
+    /// way the sender's own record writes it, and returns that attempt's id.
+    fn seed_attempt(&self, status: &str, kind: &str, payload: &str) -> String {
+        let content = lead_content_id_for(&self.generation, kind, payload);
+        let id = "lead-000000000000000000000000";
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(self.state.join("spawn-1.json")).unwrap()).unwrap();
+        value["leadMessages"] = json!([{
+            "schema": 1,
+            "id": id,
+            "contentId": content,
+            "kind": kind,
+            "status": status,
+            "method": "queue",
+            "attempts": 1,
+            "detail": "recorded before this invocation",
+            "runGeneration": self.generation,
+        }]);
+        fs::write(
+            self.state.join("spawn-1.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        id.to_owned()
+    }
+
     fn sender(&self, args: &[&str], cwd: Option<&Path>) -> Output {
         let mut command = Command::new(manager());
         command.args(["lead", "message"]).args(args);
@@ -2044,13 +2107,22 @@ fn lead_message_refuses_a_missing_endpoint_without_starting_a_listener() {
     fs::remove_file(fixture.state.join("lead-endpoint-1.json")).unwrap();
     let out = fixture.sender(&["--text", "no endpoint"], None);
     let text = output_text(&out);
-    assert!(!out.status.success(), "{text}");
+    assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(text.contains("no verified lead endpoint"), "{text}");
-    assert!(text.contains("fresh-launch"), "{text}");
     assert!(text.contains("Nothing was sent"), "{text}");
-    assert!(text.contains("does not start a daemon"), "{text}");
+    assert!(
+        text.contains("native queue was not started"),
+        "the refusal must name the idle-only queue boundary: {text}"
+    );
+    assert!(
+        text.contains("dispatch this executor again"),
+        "without a recorded lead home the remedy must be a fresh dispatch: {text}"
+    );
     assert!(!fixture.state.join("lead-endpoint-1.json").exists());
     assert_eq!(fixture.server.connections(), 0, "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert!(receipt.get("leadMessages").is_none(), "{receipt}");
 }
 
 /// One ordinary-lead run without any recorded endpoint: the receipt the real
@@ -2125,24 +2197,12 @@ impl OrdinaryFixture {
         self.home.parent().unwrap()
     }
 
-    /// Seeds the kit home's own launcher registration with one upstream
-    /// executable and its own digest when the file exists, exactly as the
-    /// installation lifecycle records it; no process is started, and the file
-    /// itself is checked only on a send.
+    /// Seeds the kit home's own launcher registration, exactly as the
+    /// installation lifecycle records it. The pinned baseline's idle-only
+    /// queue route launched this registered upstream; the fixed command must
+    /// never read the registration, so a launch is observable as its marker.
     fn seed_launcher(&self, upstream: &Path) {
-        let digest = if upstream.is_file() {
-            harness_core::build_identity::hash_file(upstream).unwrap()
-        } else {
-            // The file does not exist, so its missing-file refusal is the
-            // first observable one and no digest can match it.
-            "0".repeat(64)
-        };
-        self.seed_launcher_with_digest(upstream, &digest);
-    }
-
-    /// Seeds the registration with an explicit recorded digest, so a
-    /// changed-upstream refusal is observable as its own case.
-    fn seed_launcher_with_digest(&self, upstream: &Path, digest: &str) {
+        let digest = harness_core::build_identity::hash_file(upstream).unwrap();
         let dir = self.home.join("harness");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -2242,60 +2302,74 @@ fn lead_content_id_for(generation: &str, kind: &str, payload: &str) -> String {
     format!("lead-content-{hex}")
 }
 
+fn ordinary_envelope(fixture: &OrdinaryFixture, kind: &str, payload: &str, id: &str) -> String {
+    let reply = if kind == "notification" {
+        "not-requested".to_owned()
+    } else {
+        format!("codex-harness executor message --reply-to {id} --text TEXT")
+    };
+    let header = json!({
+        "id": id,
+        "kind": kind,
+        "owner": OWNER,
+        "runGeneration": fixture.generation,
+        "session": EXECUTOR_SESSION,
+        "checkout": fixture.root().join("checkout"),
+        "worktree": fixture.root().join("worktree"),
+        "slot": 1,
+        "leadThreadId": ORDINARY_THREAD,
+        "assignment": "unavailable",
+        "bd": "unavailable",
+        "reply": reply,
+    });
+    format!(
+        "{}\n---payload---\n{payload}",
+        serde_json::to_string(&header).unwrap()
+    )
+}
+
 const ORDINARY_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24d1";
 
 #[test]
-fn lead_message_refuses_an_ordinary_lead_thread_that_is_not_a_native_session_id() {
+fn lead_message_refuses_a_missing_endpoint_instead_of_starting_the_idle_only_queue() {
     let fixture = OrdinaryFixture::new(
-        "ordinary-thread-shape",
-        "generation-ordinary-thread-shape",
-        "not-a-native-session-id",
-    );
-    fixture.seed_launcher(&launcher());
-    let out = fixture.sender(&["--text", "no"]);
-    let text = output_text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("is not a native session id"), "{text}");
-    assert!(text.contains("Nothing was sent"), "{text}");
-    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
-    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
-}
-
-#[test]
-fn lead_message_refuses_an_ordinary_message_that_cannot_fit_one_native_command_line() {
-    let fixture = OrdinaryFixture::new(
-        "ordinary-argv-bound",
-        "generation-ordinary-argv-bound",
+        "ordinary-missing-endpoint-send",
+        "generation-ordinary-missing-endpoint-send",
         ORDINARY_THREAD,
     );
-    fixture.seed_launcher(&launcher());
-    let payload = "x".repeat(40_000);
-    let file = fixture.root().join("argv-bound-payload.txt");
-    fs::write(&file, payload.as_bytes()).unwrap();
-    let out = fixture.sender(&["--file", file.to_str().unwrap()]);
-    let text = output_text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("UTF-16 units"), "{text}");
-    assert!(text.contains("30000"), "{text}");
-    assert!(text.contains("nothing was truncated"), "{text}");
-    assert!(text.contains("nothing was sent"), "{text}");
-    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
-    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
-}
-
-#[test]
-fn lead_message_refuses_when_the_registered_native_launcher_is_missing() {
-    let fixture = OrdinaryFixture::new(
-        "ordinary-missing-upstream",
-        "generation-ordinary-missing-upstream",
-        ORDINARY_THREAD,
+    // A digest-matching owned upstream records its own start. On the pinned
+    // baseline the missing endpoint selects the native queue route and this
+    // marker appears; the fixed command must refuse before launching it.
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    fixture.seed_launcher(&upstream);
+    let marker = fixture.root().join("idle-only-queue-started.txt");
+    let out = fixture.sender_with_env(
+        &["--notify", "--text", "must not enter the idle-only queue"],
+        &[("HARNESS_LAUNCH_FIXTURE_STARTED", marker.to_str().unwrap())],
     );
-    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
-    let out = fixture.sender(&["--text", "no launcher"]);
     let text = output_text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("does not exist; nothing was sent"), "{text}");
-    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no verified lead endpoint"), "{text}");
+    assert!(
+        text.contains("native queue was not started"),
+        "the refusal must name the idle-only queue boundary: {text}"
+    );
+    assert!(
+        text.contains("codex-harness lead start") && text.contains("--session"),
+        "the refusal must name the same-thread managed resume remedy: {text}"
+    );
+    assert!(
+        !marker.exists(),
+        "the idle-only native queue client was launched: {text}"
+    );
+    assert!(
+        fixture.receipt()["leadMessages"].is_null(),
+        "a refused message left a phantom request: {text}"
+    );
+    assert!(
+        !fixture.home.join("harness/messages").exists(),
+        "a refused message wrote a spill: {text}"
+    );
 }
 
 #[test]
@@ -2305,10 +2379,9 @@ fn a_queued_ordinary_attempt_is_reconciled_instead_of_being_sent_again() {
         "generation-ordinary-queued-repeat",
         ORDINARY_THREAD,
     );
-    // The registered upstream must not exist, so reaching a send would be
-    // observable as its own refusal; exit 0 with the recorded class proves the
-    // reconcile never attempted one.
-    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
+    // No live endpoint exists, so reaching a send would be observable as a
+    // connection attempt; exit 0 with the recorded class proves the reconcile
+    // never attempted one.
     let payload = "queued ordinary words";
     fixture.seed_attempt("queued", "notification", payload);
     let out = fixture.sender(&["--notify", "--text", payload]);
@@ -2317,9 +2390,72 @@ fn a_queued_ordinary_attempt_is_reconciled_instead_of_being_sent_again() {
     assert!(text.contains("lead message: queued"), "{text}");
     assert!(text.contains("nothing was sent again"), "{text}");
     assert!(text.contains("cannot be delivered twice"), "{text}");
+    assert!(text.contains("native queue was not started"), "{text}");
     let receipt = fixture.receipt();
     assert_eq!(receipt["leadMessages"][0]["status"], "queued", "{text}");
     assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
+    assert!(
+        !fixture.home.join("harness/messages").exists(),
+        "a read-only reconciliation wrote a spill: {text}"
+    );
+}
+
+#[test]
+fn a_queued_ordinary_attempt_upgrades_from_stored_evidence_without_an_endpoint() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-queued-evidence",
+        "generation-ordinary-queued-evidence",
+        ORDINARY_THREAD,
+    );
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    fixture.seed_launcher(&upstream);
+    let marker = fixture.root().join("idle-only-queue-started.txt");
+    let payload = "queued ordinary words now present";
+    let content = fixture.seed_attempt("queued", "notification", payload);
+    let id = "lead-000000000000000000000000";
+    let envelope = ordinary_envelope(&fixture, "notification", payload, id);
+    let sessions = fixture.home.join("sessions/2026/10/17");
+    fs::create_dir_all(&sessions).unwrap();
+    let rollout = sessions.join(format!(
+        "rollout-2026-10-17T00-00-00-{ORDINARY_THREAD}.jsonl"
+    ));
+    let meta = json!({
+        "type": "session_meta",
+        "payload": {"id": ORDINARY_THREAD},
+    });
+    let input = json!({
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": envelope}],
+        },
+    });
+    fs::write(&rollout, format!("{meta}\n{input}\n")).unwrap();
+    let out = fixture.sender_with_env(
+        &["--notify", "--text", payload],
+        &[("HARNESS_LAUNCH_FIXTURE_STARTED", marker.to_str().unwrap())],
+    );
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert!(text.contains("upgraded from queued"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(
+        !marker.exists(),
+        "the idle-only native queue was launched: {text}"
+    );
+    let receipt = fixture.receipt();
+    assert_eq!(
+        receipt["leadMessages"][0]["contentId"], content,
+        "{receipt}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["id"], id, "{receipt}");
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "delivered",
+        "{receipt}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{receipt}");
 }
 
 #[test]
@@ -2329,7 +2465,6 @@ fn an_indeterminate_ordinary_attempt_is_reconciled_without_a_second_send() {
         "generation-ordinary-pending-repeat",
         ORDINARY_THREAD,
     );
-    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
     let payload = "possibly-delivered ordinary words";
     fixture.seed_attempt("pending", "notification", payload);
     let out = fixture.sender(&["--notify", "--text", payload]);
@@ -2341,6 +2476,7 @@ fn an_indeterminate_ordinary_attempt_is_reconciled_without_a_second_send() {
         text.contains("may already be in the lead conversation"),
         "{text}"
     );
+    assert!(text.contains("native queue was not started"), "{text}");
     let receipt = fixture.receipt();
     assert_eq!(
         receipt["leadMessages"][0]["status"], "indeterminate",
@@ -2349,144 +2485,352 @@ fn an_indeterminate_ordinary_attempt_is_reconciled_without_a_second_send() {
 }
 
 #[test]
-fn an_error_ordinary_attempt_is_retryable_as_a_new_attempt() {
+fn an_error_ordinary_attempt_is_terminal_and_not_retried_without_an_endpoint() {
     let fixture = OrdinaryFixture::new(
         "ordinary-error-retry",
         "generation-ordinary-error-retry",
         ORDINARY_THREAD,
     );
-    fixture.seed_launcher(&fixture.root().join("missing-codex.exe"));
     let payload = "refused ordinary words";
-    fixture.seed_attempt("error", "notification", payload);
+    let id = fixture.seed_attempt("error", "notification", payload);
     let out = fixture.sender(&["--notify", "--text", payload]);
     let text = output_text(&out);
-    // The refusal below is the registered upstream's own missing-file check:
-    // the earlier error did not suppress this new attempt.
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("does not exist; nothing was sent"), "{text}");
-}
-
-#[test]
-fn lead_message_refuses_a_changed_registered_upstream_before_running_it() {
-    let fixture = OrdinaryFixture::new(
-        "ordinary-changed-upstream",
-        "generation-ordinary-changed-upstream",
-        ORDINARY_THREAD,
-    );
-    // The registered file exists and ends in .exe, but the installation-record
-    // digest is deliberately not its own: a replaced upstream that this route
-    // refuses, even though the ordinary launcher treats the changed digest as
-    // an upstream update. The owned double records its own start into the
-    // marker, so a launch that must not happen is observable as that file.
-    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
-    fixture.seed_launcher_with_digest(&upstream, &"0".repeat(64));
-    let marker = fixture.root().join("changed-upstream-started.txt");
-    let out = fixture.sender_with_env(
-        &["--notify", "--text", "no changed upstream"],
-        &[("HARNESS_LAUNCH_FIXTURE_STARTED", marker.to_str().unwrap())],
-    );
-    let text = output_text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("SHA-256"), "{text}");
-    assert!(text.contains("nothing was sent"), "{text}");
-    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
-    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
-    assert!(!marker.exists(), "a changed upstream was launched: {text}");
-}
-
-#[test]
-fn a_queue_exit_after_a_possible_effect_is_held_instead_of_being_resent() {
-    let fixture = OrdinaryFixture::new(
-        "ordinary-effect-then-exit",
-        "generation-ordinary-effect-then-exit",
-        ORDINARY_THREAD,
-    );
-    // The registered upstream is a real, digest-matching owned binary that
-    // records its own start and then exits non-zero without the native queue's
-    // rejection mark: the message may already have been applied, so the
-    // attempt must stay unresolved instead of becoming a retryable error.
-    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
-    fixture.seed_launcher(&upstream);
-    let marker = fixture.root().join("queue-effect-started.txt");
-    let payload = "possibly applied ordinary words";
-    let envs = [
-        ("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero"),
-        ("HARNESS_LAUNCH_FIXTURE_STARTED", marker.to_str().unwrap()),
-    ];
-    let out = fixture.sender_with_env(&["--notify", "--text", payload], &envs);
-    let text = output_text(&out);
-    assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("lead message: indeterminate"), "{text}");
-    assert!(text.contains("unknown"), "{text}");
+    // A definite error is terminal, so it neither holds the repeat nor
+    // suppresses a new attempt; with no live endpoint the new attempt is
+    // refused before any effect and the earlier record is untouched.
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no verified lead endpoint"), "{text}");
     assert!(
-        marker.is_file(),
-        "the queue effect was not observable: {text}"
+        text.contains("no request or reply hold was recorded"),
+        "{text}"
     );
     let receipt = fixture.receipt();
+    assert_eq!(receipt["leadMessages"][0]["contentId"], id, "{text}");
+    assert_eq!(receipt["leadMessages"][0]["status"], "error", "{text}");
     assert_eq!(
-        receipt["leadMessages"][0]["status"], "indeterminate",
+        receipt["leadMessages"].as_array().unwrap().len(),
+        1,
         "{text}"
     );
-    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
-
-    // The same words again must reconcile the recorded attempt instead of
-    // sending a second copy: the marker is removed first, so a repeat send is
-    // observable as its recreation.
-    fs::remove_file(&marker).unwrap();
-    let out = fixture.sender_with_env(&["--notify", "--text", payload], &envs);
-    let text = output_text(&out);
-    assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("nothing was sent again"), "{text}");
     assert!(
-        text.contains("may already be in the lead conversation"),
-        "{text}"
-    );
-    assert!(!marker.exists(), "a second copy was sent: {text}");
-    let receipt = fixture.receipt();
-    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
-    assert_eq!(
-        receipt["leadMessages"][0]["status"], "indeterminate",
-        "{text}"
+        !fixture.home.join("harness/messages").exists(),
+        "a refused message wrote a spill: {text}"
     );
 }
 
 #[test]
-fn lead_message_points_the_queue_at_the_recorded_lead_home_not_the_executor_home() {
+fn lead_message_does_not_resolve_a_registry_under_a_foreign_home() {
     let fixture = OrdinaryFixture::new(
-        "ordinary-two-homes",
-        "generation-ordinary-two-homes",
+        "ordinary-foreign-registry",
+        "generation-ordinary-foreign-registry",
         ORDINARY_THREAD,
     );
-    // The originating lead recorded its own home, deliberately not the
-    // executor's selected one. The registered upstream is a real, digest
-    // matching owned binary that writes the arguments it receives into its own
-    // `$CODEX_HOME` before failing: where that file lands is which home the
-    // queue child was pointed at.
+    // The originating lead recorded its own home, which has no registry. A
+    // live-looking registry for the exact thread under the executor's selected
+    // home is not the lead's address and must never be used.
     let lead_home = fixture.root().join("lead-home");
     fs::create_dir_all(&lead_home).unwrap();
     fixture.record_lead_home(&lead_home);
-    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
-    fixture.seed_launcher(&upstream);
-    let out = fixture.sender(&["--notify", "--text", "two homes"]);
+    let user = process_service::current_user().unwrap();
+    let program = std::env::current_exe().unwrap();
+    let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+        .unwrap()
+        .identity();
+    let registry = fixture.home.join("harness/lead-endpoints");
+    fs::create_dir_all(&registry).unwrap();
+    fs::write(
+        registry.join(format!("{ORDINARY_THREAD}.json")),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "port": 1,
+            "token": TOKEN,
+            "threadId": ORDINARY_THREAD,
+            "process": {
+                "pid": identity.pid,
+                "creationTime": identity.creation_time,
+                "program": program,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = fixture.sender(&["--notify", "--text", "foreign registry words"]);
     let text = output_text(&out);
-    assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("lead message: indeterminate"), "{text}");
-    let recorded =
-        fs::read_to_string(lead_home.join("frontend-argv.txt")).unwrap_or_else(|error| {
-            panic!("the queue child did not run in the recorded lead home: {error}; {text}")
-        });
-    assert!(recorded.contains("queue"), "{recorded}");
-    assert!(recorded.contains(ORDINARY_THREAD), "{recorded}");
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no verified lead endpoint"), "{text}");
     assert!(
-        !fixture.home.join("frontend-argv.txt").exists(),
-        "the queue child ran in the executor's home: {text}"
+        text.contains(&lead_home.display().to_string()),
+        "the refusal must name the recorded originating lead home: {text}"
     );
-    let receipt = fixture.receipt();
+    assert!(text.contains("no live registered endpoint"), "{text}");
+    assert!(!text.contains("foreign registry words"), "{text}");
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+}
+
+#[test]
+fn lead_message_refuses_a_malformed_recorded_endpoint_before_any_send() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-malformed-endpoint",
+        "generation-ordinary-malformed-endpoint",
+        ORDINARY_THREAD,
+    );
+    fs::write(
+        fixture.state.join("lead-endpoint-1.json"),
+        b"{ not an endpoint record",
+    )
+    .unwrap();
+    let out = fixture.sender(&["--notify", "--text", "malformed endpoint words"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("is not usable"), "{text}");
+    assert!(text.contains("Nothing was sent"), "{text}");
+    assert!(
+        text.contains("codex-harness lead start"),
+        "the malformed record must name the same-thread resume remedy: {text}"
+    );
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
+}
+
+#[test]
+fn lead_message_refuses_a_recorded_endpoint_for_another_thread_before_any_send() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-mismatched-endpoint",
+        "generation-ordinary-mismatched-endpoint",
+        ORDINARY_THREAD,
+    );
+    let user = process_service::current_user().unwrap();
+    let program = std::env::current_exe().unwrap();
+    let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+        .unwrap()
+        .identity();
+    fs::write(
+        fixture.state.join("lead-endpoint-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "port": 1,
+            "token": TOKEN,
+            "threadId": "another-conversation",
+            "process": {
+                "pid": identity.pid,
+                "creationTime": identity.creation_time,
+                "program": program,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = fixture.sender(&["--notify", "--text", "mismatched endpoint words"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("names a different thread"), "{text}");
+    assert!(text.contains("Nothing was sent"), "{text}");
+    assert!(
+        text.contains("codex-harness lead start") && text.contains("--session"),
+        "the mismatched record must name the same-thread resume remedy: {text}"
+    );
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
+}
+
+#[test]
+fn lead_message_refuses_a_stale_recorded_endpoint_before_any_send() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-stale-endpoint",
+        "generation-ordinary-stale-endpoint",
+        ORDINARY_THREAD,
+    );
+    let program = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+    let mut child = Command::new(&program)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let user = process_service::current_user().unwrap();
+    let identity = ServiceProcess::observe(child.id(), &program, 0, &user)
+        .unwrap()
+        .identity();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    fs::write(
+        fixture.state.join("lead-endpoint-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "port": 1,
+            "token": TOKEN,
+            "threadId": ORDINARY_THREAD,
+            "process": {
+                "pid": identity.pid,
+                "creationTime": identity.creation_time,
+                "program": program,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = fixture.sender(&["--notify", "--text", "stale endpoint words"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("not live"), "{text}");
+    assert!(text.contains("Nothing was sent"), "{text}");
+    assert!(
+        text.contains("codex-harness lead start") && text.contains("--session"),
+        "the stale record must name the same-thread resume remedy: {text}"
+    );
+    assert!(fixture.receipt()["leadMessages"].is_null(), "{text}");
+    assert!(!fixture.home.join("harness/messages").exists(), "{text}");
+}
+
+#[test]
+fn lead_message_recovers_the_same_thread_from_the_managed_registry_after_resume() {
+    let fixture = LeadFixture::new("lead-registry-recover", LEAD_THREAD, true);
+    let lead_home = fixture._root.path().join("lead-home");
+    fs::create_dir_all(&lead_home).unwrap();
+    fixture.record_lead_home(&lead_home);
+    // The resumed same thread publishes its live endpoint in the managed
+    // registry under the originating lead's own home; the per-spawn record
+    // stays absent, so the registry is provably the route used.
+    fixture.publish_registry_endpoint(&lead_home, LEAD_THREAD);
+    fs::remove_file(fixture.state.join("lead-endpoint-1.json")).unwrap();
+    let payload = "recovered question after the managed resume";
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &id);
+    script_delivery(&fixture, false, &envelope, &id);
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert_metadata(&text, &fixture, "reply-request", &id);
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{started:?}");
     assert_eq!(
-        receipt["leadMessages"][0]["status"], "indeterminate",
-        "{text}"
+        started[0]["params"]["threadId"], LEAD_THREAD,
+        "the registry route reached another conversation: {started:?}"
     );
-    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{text}");
+    assert!(
+        !fixture.state.join("lead-endpoint-1.json").exists(),
+        "the per-spawn record was not the route: {text}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "delivered",
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["originatingLead"]["threadId"], LEAD_THREAD,
+        "the recovered thread replaced the recorded lead: {receipt}"
+    );
+}
+
+#[test]
+fn lead_message_refuses_a_registry_record_for_another_thread() {
+    let fixture = LeadFixture::new("lead-registry-other", LEAD_THREAD, true);
+    let lead_home = fixture._root.path().join("lead-home");
+    fs::create_dir_all(&lead_home).unwrap();
+    fixture.record_lead_home(&lead_home);
+    fixture.publish_registry_record(&lead_home, LEAD_THREAD, OTHER_LEAD_THREAD);
+    fs::remove_file(fixture.state.join("lead-endpoint-1.json")).unwrap();
+    let out = fixture.sender(&["--text", "registry other thread"], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no verified lead endpoint"), "{text}");
+    assert!(text.contains("belongs to another conversation"), "{text}");
+    assert_eq!(fixture.server.connections(), 0, "{text}");
+    assert!(fixture.server.requests_for("turn/start").is_empty());
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert!(receipt.get("leadMessages").is_none(), "{receipt}");
+}
+
+#[test]
+fn a_legacy_queued_attempt_is_not_resent_after_same_thread_recovery() {
+    let fixture = LeadFixture::new("lead-registry-queued", LEAD_THREAD, true);
+    let lead_home = fixture._root.path().join("lead-home");
+    fs::create_dir_all(&lead_home).unwrap();
+    fixture.record_lead_home(&lead_home);
+    fixture.publish_registry_endpoint(&lead_home, LEAD_THREAD);
+    fs::remove_file(fixture.state.join("lead-endpoint-1.json")).unwrap();
+    let payload = "legacy queued words";
+    let id = fixture.seed_attempt("queued", "notification", payload);
+    fixture.server.answer(
+        "thread/read",
+        Answer::Result(lead_thread_read(LEAD_THREAD, "idle", json!([]))),
+    );
+    let out = fixture.sender(&["--notify", "--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: queued"), "{text}");
+    assert!(text.contains("nothing was sent again"), "{text}");
+    assert!(text.contains("cannot be delivered twice"), "{text}");
+    assert!(
+        fixture.server.requests_for("turn/steer").is_empty(),
+        "a recovered legacy attempt was steered again: {:?}",
+        fixture.server.requests()
+    );
+    assert!(
+        fixture.server.requests_for("turn/start").is_empty(),
+        "a recovered legacy attempt started a second turn: {:?}",
+        fixture.server.requests()
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(receipt["leadMessages"][0]["id"], id, "{receipt}");
+    assert_eq!(receipt["leadMessages"][0]["status"], "queued", "{receipt}");
+    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{receipt}");
+    assert_eq!(receipt["leadMessages"][0]["method"], "queue", "{receipt}");
+}
+
+#[test]
+fn a_legacy_queued_attempt_upgrades_to_delivered_from_lead_evidence_after_recovery() {
+    let fixture = LeadFixture::new("lead-registry-upgrade", LEAD_THREAD, true);
+    let lead_home = fixture._root.path().join("lead-home");
+    fs::create_dir_all(&lead_home).unwrap();
+    fixture.record_lead_home(&lead_home);
+    fixture.publish_registry_endpoint(&lead_home, LEAD_THREAD);
+    fs::remove_file(fixture.state.join("lead-endpoint-1.json")).unwrap();
+    let payload = "legacy queued words now present";
+    let id = fixture.seed_attempt("queued", "notification", payload);
+    fixture.server.answer(
+        "thread/read",
+        Answer::Result(lead_thread_read(
+            LEAD_THREAD,
+            "idle",
+            json!([{
+                "id": TURN,
+                "status": "completed",
+                "items": [{
+                    "id": "u1",
+                    "type": "userMessage",
+                    "clientId": id,
+                    "content": [{"type": "text", "text": "the earlier queued delivery"}]
+                }]
+            }]),
+        )),
+    );
+    let out = fixture.sender(&["--notify", "--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert!(text.contains("upgraded from queued"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert_eq!(fixture.server.connections(), 1, "{text}");
+    assert!(fixture.server.requests_for("turn/steer").is_empty());
+    assert!(fixture.server.requests_for("turn/start").is_empty());
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "delivered",
+        "{receipt}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["attempts"], 1, "{receipt}");
 }
 
 #[test]

@@ -60,6 +60,19 @@
 //! lead-message write merges under the receipt lock, so a concurrent request or
 //! answer is never replaced by a stale snapshot.
 //!
+//! A lead message is transmitted only through a live managed endpoint whose
+//! process and thread identity are verified. When a dispatch recorded no
+//! endpoint, a managed resume of that exact thread publishes a registry record
+//! under the originating lead's own home; that record can be resolved without
+//! starting a second server or conversation. No endpoint means an explicit
+//! refusal with the same-thread resume remedy. The installed native queue is
+//! not a send fallback because it dispatches only when the target turn is idle;
+//! an operational message must not wait silently for the current turn. An
+//! earlier queued or indeterminate attempt may still be reconciled from the
+//! lead's stored items, but that read-only path never transmits, never claims
+//! this invocation queued anything, and never permits the same text to be sent
+//! again.
+//!
 //! A completed, stopped, interrupted or unavailable run gets its actual state
 //! with the exact-session `executor resume` remedy, and a surface without a
 //! recorded control endpoint (tui mode, legacy receipts) is reported as
@@ -78,10 +91,7 @@ use super::{
     SessionLease, invalid, lease_path, option_text, read_lease, receipt_binding, receipt_path,
 };
 use harness_core::orchestration_config::{self, worktree_pool_size};
-use harness_core::process::{
-    Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, ProcessIdentity,
-    StopReason,
-};
+use harness_core::process::{Cancellation, Deadline, ExclusiveFileLock, ProcessIdentity};
 use harness_core::process_service::{self, ServiceProcess};
 use harness_core::task_succession;
 use harness_core::task_worktree;
@@ -102,15 +112,6 @@ const CONTROL_BOUND: Duration = Duration::from_secs(20);
 /// before the acceptance answer is reported as queued instead of delivered.
 const EVIDENCE_WINDOW: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(200);
-/// The most UTF-16 units one composed envelope may occupy on the ordinary
-/// queue route: one Windows command line holds 32,767 units including the
-/// program, its quoting and the terminating null, so this leaves margin for
-/// the fixed arguments. A larger envelope is refused before anything is
-/// recorded or started - never truncated, split or rewritten.
-const ORDINARY_ARGV_UNITS: usize = 30_000;
-/// The method an ordinary-route attempt records: the installed native CLI's
-/// own queue command, whose exit status is transport acceptance only.
-const ORDINARY_QUEUE_METHOD: &str = "queue";
 /// Bounds of one evidence pass over the conversation's own rollout tree: how
 /// many files are visited, how much of a leading metadata row is read, and how
 /// much of the newest tail of one file is read. They bound the observation,
@@ -118,15 +119,6 @@ const ORDINARY_QUEUE_METHOD: &str = "queue";
 const ROLLOUT_FILES_BOUND: usize = 4096;
 const ROLLOUT_META_PREFIX: u64 = 64 * 1024;
 const ROLLOUT_TAIL_BOUND: u64 = 8 * 1024 * 1024;
-/// How much of one native queue command's own report is read back for the
-/// recorded attempt detail.
-const QUEUE_REPORT_READ: u64 = 4096;
-/// The launcher registration is read with the same bound the launcher itself
-/// applies before it trusts one; a larger file is refused instead of parsed.
-const NATIVE_REGISTRATION_LIMIT: u64 = 65_536;
-/// The observed 0.162.1 missing-thread refusal precedes a queue effect. The
-/// generic queue-error prefix alone does not establish that nothing applied.
-const QUEUE_MISSING_THREAD_PREFIX: &str = "Error: failed to queue session message: thread/queue/add failed: failed to read thread: invalid thread-store request: no rollout found for thread id ";
 /// The inline delivery bound of one message: what is sent below it is always the
 /// literal text (a file is a correction, not a task re-send), and above it the
 /// shared spill owner delivers the complete payload as a pointer envelope. The
@@ -1658,8 +1650,10 @@ struct SpawnedRun {
     /// The originating lead's own kit home, captured with the rest of the
     /// recorded relationship. The executor's selected home is never assumed
     /// to be the same: dispatch accepts an explicit `--codex-home`, and the
-    /// ordinary queue route must address the lead conversation's own store.
-    /// `None` when the dispatching process could not resolve its native home.
+    /// managed lead registry and the lead conversation's own stored items are
+    /// read only at this recorded home. `None` when the dispatching process
+    /// could not resolve its native home; recovery then requires a fresh
+    /// dispatch from the resumed lead rather than guessing a home.
     lead_home: Option<PathBuf>,
     lead_thread: String,
     generation: String,
@@ -1679,11 +1673,12 @@ struct SpawnedRun {
 /// spawn command legitimately exits after starting the host. A copied marker,
 /// cwd, label, or most recent session is not authority. Delivery uses the
 /// existing app-server owner: `turn/steer` on an active turn and `turn/start`
-/// on an idle thread. A lead that never recorded an endpoint is an ordinary
-/// conversation on its own recorded thread, reached through the installed
-/// native CLI's own queue route: that command's exit is transport acceptance,
-/// and only the addressed conversation's own stored items are delivery.
-/// Neither route starts a listener, daemon or second conversation.
+/// on an idle thread. A lead that never recorded a per-spawn endpoint is
+/// resolved only from the managed registry for the exact recorded thread
+/// under its own recorded home. When no live verified endpoint exists, the
+/// command refuses before composing the envelope, writing a spill, recording
+/// an attempt or creating a reply hold. It never starts the idle-only native
+/// queue, a listener, daemon or second conversation.
 pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!("{LEAD_USAGE}");
@@ -1721,6 +1716,17 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
         return report_recorded_lead_repeat(&run, &id, kind, previous, payload.len());
     }
     let route = resolve_lead_route(&run)?;
+    // A missing live endpoint is a definite capability refusal. With no earlier
+    // attempt of this exact text, nothing is composed, spilled, recorded or
+    // started: no header, no spill file, no attempt entry and no reply hold.
+    // An earlier attempt may already be in the lead conversation, so its
+    // identity is still reconciled read-only from that conversation's own
+    // stored items; that path never transmits.
+    if previous.is_none()
+        && let LeadRoute::Unavailable { reason } = &route
+    {
+        return Err(endpoint_unavailable(&run, reason));
+    }
     let reply = if input.notify {
         "not-requested".to_owned()
     } else {
@@ -1763,8 +1769,13 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
         LeadRoute::Endpoint(endpoint) => {
             deliver_to_recorded_lead(&run, endpoint, &message, previous.as_ref())
         }
-        LeadRoute::Ordinary { executable, digest } => {
-            deliver_to_ordinary_lead(&run, executable, digest, &message, previous.as_ref())
+        LeadRoute::Unavailable { reason } => {
+            let previous = previous.as_ref().ok_or_else(|| {
+                invalid(
+                    "no verified lead endpoint is available; nothing was sent and nothing was recorded",
+                )
+            })?;
+            reconcile_unavailable_lead(&run, &message, previous, reason)
         }
     }
 }
@@ -2067,17 +2078,15 @@ fn parent_process_id(pid: u32) -> Option<u32> {
     u32::try_from(basic.inherited_from_unique_process_id).ok()
 }
 
-/// The recorded delivery route of one run's originating lead: the managed
-/// endpoint its lead session recorded, or - for an ordinary lead conversation
-/// that never recorded one - the installed native CLI's own queue route. The
-/// ordinary route carries the registered upstream together with the digest
-/// that same registration records, so a replaced or modified executable is
-/// refused before it is run. A recorded endpoint is never silently replaced
-/// by the queue route, and the queue route is never substituted for a
-/// recorded managed endpoint.
+/// The verified delivery route of one run's originating lead: a live managed
+/// endpoint recorded beside this spawn, or the live registry record published
+/// when that exact thread was resumed through the managed lifecycle. A
+/// recorded endpoint that is malformed, mismatched or stale fails closed and
+/// is never replaced by another address. No live route is an explicit
+/// capability refusal; there is no idle-only queue fallback.
 enum LeadRoute {
     Endpoint(Endpoint),
-    Ordinary { executable: PathBuf, digest: String },
+    Unavailable { reason: String },
 }
 
 fn resolve_lead_route(run: &SpawnedRun) -> io::Result<LeadRoute> {
@@ -2085,157 +2094,122 @@ fn resolve_lead_route(run: &SpawnedRun) -> io::Result<LeadRoute> {
         .receipt
         .parent()
         .ok_or_else(|| {
-            fresh_launch(
-                &run.lead_thread,
-                "the receipt has no directory",
-                "the kit home of this run cannot be derived from the receipt",
+            invalid(
+                "the dispatch receipt has no directory, so the exact lead endpoint inherited for this spawn cannot be located; nothing was sent",
             )
         })?
         .join(format!("lead-endpoint-{}.json", run.slot));
     match Endpoint::read(&path) {
         Ok(endpoint) => verify_lead_endpoint(run, endpoint),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let (executable, digest) = native_queue_upstream(&run.home).map_err(|reason| {
-                fresh_launch(
-                    &run.lead_thread,
-                    "no lead-endpoint record exists beside the spawn receipt",
-                    &reason,
-                )
-            })?;
-            require_thread_uuid(&run.lead_thread).map_err(|reason| {
-                fresh_launch(
-                    &run.lead_thread,
-                    "no lead-endpoint record exists beside the spawn receipt",
-                    &reason,
-                )
-            })?;
-            Ok(LeadRoute::Ordinary { executable, digest })
-        }
-        Err(error) => Err(invalid(&format!(
-            "recorded lead endpoint {} is not usable: {error}; nothing was sent and no daemon, listener, or second conversation was started",
-            path.display()
-        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => resolve_registered_lead(run),
+        Err(error) => Err(stale_endpoint_refusal(
+            run,
+            &format!(
+                "the recorded lead endpoint {} is not usable: {error}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// A missing per-spawn endpoint may be recovered only from the registry
+/// published for the exact recorded lead thread under the originating lead's
+/// own recorded home. The registry is read through the same fail-closed
+/// resolver used by managed lifecycle code, which verifies the record's thread
+/// and the recorded app-server process. The executor's own home and the
+/// most-recent-session environment are never consulted.
+fn resolve_registered_lead(run: &SpawnedRun) -> io::Result<LeadRoute> {
+    let Some(lead_home) = run.lead_home.as_deref() else {
+        return Ok(LeadRoute::Unavailable {
+            reason: "no endpoint was inherited beside the spawn receipt, and dispatch recorded no originating lead home from which the exact thread's managed registry could be read".to_owned(),
+        });
+    };
+    match control::registered_lead(lead_home, &run.lead_thread) {
+        control::RegisteredLead::Live(endpoint) => verify_lead_endpoint(run, *endpoint),
+        control::RegisteredLead::Unavailable(cause) => Ok(LeadRoute::Unavailable {
+            reason: format!(
+                "no endpoint was inherited beside the spawn receipt, and the recorded originating lead home {} has no live registered endpoint for this exact thread ({cause})",
+                lead_home.display()
+            ),
+        }),
     }
 }
 
 /// One recorded managed endpoint, verified as the address of the exact
-/// originating thread before any send.
+/// originating thread before any send. A mismatched, incomplete or stale
+/// per-spawn record fails closed; the command never substitutes a later
+/// registry record for an address the dispatch already recorded.
 fn verify_lead_endpoint(run: &SpawnedRun, endpoint: Endpoint) -> io::Result<LeadRoute> {
     if endpoint.thread_id.as_deref() != Some(run.lead_thread.as_str()) {
-        return Err(invalid(&format!(
-            "recorded lead endpoint names a different thread than originating lead {}; refusing before any send",
-            run.lead_thread
-        )));
+        return Err(stale_endpoint_refusal(
+            run,
+            &format!(
+                "the recorded lead endpoint names a different thread than originating lead {}",
+                run.lead_thread
+            ),
+        ));
     }
     let Some(process) = endpoint.process.as_ref() else {
-        return Err(fresh_launch(
-            &run.lead_thread,
-            "the endpoint record names no process",
-            "a recorded managed endpoint is not replaced by the ordinary queue route",
+        return Err(stale_endpoint_refusal(
+            run,
+            "the recorded endpoint names no process",
         ));
     };
     require_live(
         process.pid,
         process.creation_time,
         &process.program,
-        "no verified lead endpoint is recorded: its process is not live",
+        "the recorded lead endpoint process is not live",
     )
-    .map_err(|_| {
-        fresh_launch(
-            &run.lead_thread,
-            "the recorded endpoint process is not live",
-            "a recorded managed endpoint is not replaced by the ordinary queue route",
-        )
-    })?;
+    .map_err(|_| stale_endpoint_refusal(run, "the recorded endpoint process is not live"))?;
     Ok(LeadRoute::Endpoint(endpoint))
 }
 
-/// The installed native executable the ordinary queue route runs, from this
-/// kit home's own launcher registration, together with the upstream digest
-/// that registration records. Only the recorded installation is authority; an
-/// environment substitution or a guessed install location is not. The
-/// registration is read with the launcher's own bound and only a supported
-/// schema with an absolute registered native executable is accepted. This
-/// route invokes the registered binary itself to reach the lead's own store,
-/// so the recorded digest must still match the file before a send; the
-/// ordinary launcher instead treats a changed digest as an upstream update,
-/// and the installation check reports the mismatch. The digest itself is
-/// compared when a send is about to happen, so reading the lead
-/// conversation's own evidence never depends on the file and a reconcile is
-/// still possible without it.
-fn native_queue_upstream(home: &Path) -> Result<(PathBuf, String), String> {
-    let path = home.join("harness/native-launch.json");
-    let mut bytes = Vec::new();
-    fs::File::open(&path)
-        .map_err(|error| {
-            format!(
-                "this kit home records no readable installed native launcher ({}: {error}); repair the kit installation and retry",
-                path.display()
-            )
-        })?
-        .take(NATIVE_REGISTRATION_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            format!(
-                "the installed native launcher registration {} cannot be read ({error}); repair the kit installation and retry",
-                path.display()
-            )
-        })?;
-    if bytes.len() as u64 > NATIVE_REGISTRATION_LIMIT {
-        return Err(format!(
-            "the installed native launcher registration {} exceeds its bound; repair the kit installation and retry",
-            path.display()
-        ));
+/// The supported same-thread resume command for the originating lead. The
+/// source and home are the relationship recorded at dispatch; neither is
+/// inferred from the executor's current environment.
+fn managed_resume_command(run: &SpawnedRun) -> String {
+    match run.lead_home.as_deref() {
+        Some(home) => format!(
+            "codex-harness lead start --source {} --codex-home {} --session {}",
+            run.checkout,
+            home.display(),
+            run.lead_thread
+        ),
+        None => format!("codex-harness lead start --session {}", run.lead_thread),
     }
-    let registration: harness_core::native_launcher::Registration = serde_json::from_slice(&bytes)
-        .map_err(|error| {
-            format!(
-                "the installed native launcher registration {} is not usable: {error}; repair the kit installation and retry",
-                path.display()
-            )
-        })?;
-    if registration.schema != 1 && registration.schema != 2 {
-        return Err(format!(
-            "the installed native launcher registration {} names unsupported schema {}; repair the kit installation and retry",
-            path.display(),
-            registration.schema
-        ));
-    }
-    let executable = registration.upstream.executable;
-    if !executable.is_absolute()
-        || !executable
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-    {
-        return Err(format!(
-            "the installed native launcher registers a non-absolute or non-executable upstream {}; repair the kit installation and retry",
-            executable.display()
-        ));
-    }
-    Ok((executable, registration.upstream.sha256))
 }
 
-/// The recorded lead thread must be exactly the native session id shape the
-/// queue route addresses; any other value could name a different session as a
-/// title or alias, so it is refused before any send.
-fn require_thread_uuid(thread: &str) -> Result<(), String> {
-    let bytes = thread.as_bytes();
-    let shaped = bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
-        });
-    if shaped {
-        return Ok(());
-    }
-    Err(format!(
-        "the recorded lead thread {thread:?} is not a native session id, and the queue route addresses an exact session id rather than resolving a title or alias; refusing before any send"
+/// A missing live endpoint is an explicit capability refusal made before any
+/// header, spill file, attempt record or child process. The remedy preserves
+/// the exact registered lead thread instead of suggesting a new conversation.
+fn endpoint_unavailable(run: &SpawnedRun, reason: &str) -> io::Error {
+    let next = if run.lead_home.is_some() {
+        format!(
+            "have the originating lead resume that same thread in its own terminal with `{}`, which publishes a verified endpoint for this exact thread, then repeat this message; an existing queued or indeterminate attempt is reconciled before any new send",
+            managed_resume_command(run)
+        )
+    } else {
+        format!(
+            "resume that exact thread from the lead's own installed kit home with `{}`, then dispatch this executor again so the new receipt records that home",
+            managed_resume_command(run)
+        )
+    };
+    invalid(&format!(
+        "no verified lead endpoint is available for originating lead thread {}: {reason}. Nothing was sent and no request or reply hold was recorded. The installed native queue was not started because its queue operation dispatches only when the lead turn is idle and cannot deliver this operational message now. Next action: {next}",
+        run.lead_thread
     ))
 }
 
-fn fresh_launch(thread: &str, reason: &str, queue: &str) -> io::Error {
+/// An endpoint record that exists but cannot name the live originating thread
+/// fails closed. Silently replacing it with a later registry address or the
+/// native queue would change the route after dispatch; a fresh dispatch is
+/// required to inherit the resumed session's verified endpoint.
+fn stale_endpoint_refusal(run: &SpawnedRun, reason: &str) -> io::Error {
     invalid(&format!(
-        "no verified lead endpoint is recorded for originating lead thread {thread}: {reason}, and the native queue route is unavailable: {queue}. This command does not start a daemon, listener, or second conversation. Next action: fresh-launch the lead session so this same thread records a verified app-server endpoint, then dispatch the executor again. Nothing was sent"
+        "no verified lead endpoint is available for originating lead thread {}: {reason}. Nothing was sent, no request or reply hold was recorded, and no listener, second conversation, alternate registry address, or native queue was started. Next action: have the originating lead resume the same thread in its own terminal with `{}`, then dispatch this executor again so the new run inherits its verified endpoint; an existing queued or indeterminate attempt stays recorded for reconciliation",
+        run.lead_thread,
+        managed_resume_command(run)
     ))
 }
 
@@ -2798,183 +2772,20 @@ fn deliver_to_recorded_lead(
     )
 }
 
-/// The installed native CLI's own queue route as one attempt classifies it:
-/// the command's exit status is transport acceptance only, and nothing here is
-/// delivery.
-enum QueueOutcome {
-    /// The native queue command exited 0: the message is accepted for the
-    /// conversation, not yet shown by it.
-    Accepted { detail: String },
-    /// The native queue named its own rejection of the queue add: a
-    /// definitive result that applied nothing and may be sent again as a new
-    /// attempt.
-    Refused { detail: String },
-    /// The native queue did not finish within the bound, or exited non-zero
-    /// without its rejection mark: whether the message reached the
-    /// conversation is unknown, so the attempt may not be repeated blindly.
-    Unresolved { detail: String },
-}
-
-/// Delivers one message through the installed native CLI's own queue route to
-/// the already running ordinary lead conversation on its recorded thread. The
-/// queue command carries no message identity, so it is invoked at most once
-/// per attempt: transport acceptance is recorded as queued, and only the
-/// addressed conversation's own stored items upgrade it to delivered.
-fn deliver_to_ordinary_lead(
-    run: &SpawnedRun,
-    executable: &Path,
-    digest: &str,
-    message: &LeadMessage<'_>,
-    previous: Option<&Value>,
-) -> io::Result<i32> {
-    if let Some(previous) = previous {
-        return reconcile_ordinary_lead(run, message, previous);
-    }
-    // The native queue carries the message as one command-line argument and
-    // has no file or piped message source. A message that cannot fit one
-    // command line is refused before anything is recorded or started: nothing
-    // is truncated, split or rewritten, and the spill pointer covers the
-    // messages above the inline bound.
-    let units = message.envelope.encode_utf16().count();
-    if units > ORDINARY_ARGV_UNITS {
-        return Err(invalid(&format!(
-            "the composed message is {units} UTF-16 units of one command line, above the {ORDINARY_ARGV_UNITS} units the native queue route can carry; nothing was sent and nothing was truncated. Next action: send a message whose own text points at the file carrying the complete content, or deliver from a lead session that records a managed endpoint (which carries the {}-byte inline bound); nothing was sent",
-            executor_input::INLINE_BOUND
-        )));
-    }
-    // The queue child must load the originating lead's own store: the
-    // executor's selected home is not the lead's home unless the dispatch
-    // recorded it, and a message that cannot be pointed at the lead
-    // conversation is refused before anything is recorded or started.
-    let Some(lead_home) = run.lead_home.as_deref() else {
-        return Err(invalid(
-            "the originating lead's own kit home was not recorded when this run was dispatched, so the native queue cannot be pointed at that conversation's own store; nothing was sent. Next action: dispatch from a lead session whose process resolves a kit home, or deliver from a lead session that records a managed endpoint",
-        ));
-    };
-    if !executable.is_file() {
-        return Err(invalid(&format!(
-            "the installed native launcher registers {} as its upstream, and that file does not exist; nothing was sent",
-            executable.display()
-        )));
-    }
-    // A registered upstream whose own file no longer matches the digest the
-    // installation recorded is a replaced or modified executable. This route
-    // invokes the registered binary itself to reach the lead's own store, so
-    // the recorded identity must hold: it refuses before anything is recorded
-    // or started. The ordinary launcher instead treats a changed digest as an
-    // upstream update; the installation check reports the mismatch.
-    let observed = harness_core::build_identity::hash_file(executable).map_err(|error| {
-        invalid(&format!(
-            "the registered native upstream {} cannot be verified ({error}); nothing was sent",
-            executable.display()
-        ))
-    })?;
-    if observed != digest {
-        return Err(invalid(&format!(
-            "the installed native launcher records upstream {} with SHA-256 {digest}, and the file's current digest is {observed}; a changed upstream is not launched through the queue route; nothing was sent. Next action: repair the kit installation, or deliver from a lead session that records a managed endpoint",
-            executable.display()
-        )));
-    }
-    // The attempt is recorded before the command starts, so an invocation that
-    // is interrupted mid-command leaves its identity behind instead of an
-    // invitation to deliver the same words again.
-    let pending = LeadAttempt {
-        status: STATUS_PENDING,
-        method: ORDINARY_QUEUE_METHOD.to_owned(),
-        attempts: 1,
-        detail: "the message is being submitted to the native queue for the lead conversation's exact thread, and that conversation's own stored items are being read".to_owned(),
-    };
-    record_lead_message(run, message, &pending)?;
-    let outcome =
-        match queue_lead_message(executable, lead_home, &run.lead_thread, message.envelope) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                // The command could not be started or its lifecycle could not be
-                // observed: a definitive local result, recorded as one so no
-                // phantom hold blocks a later honest retry.
-                let attempt = LeadAttempt {
-                    status: STATUS_ERROR,
-                    method: ORDINARY_QUEUE_METHOD.to_owned(),
-                    attempts: 1,
-                    detail: format!(
-                        "the native queue command could not be run ({error}); nothing was delivered"
-                    ),
-                };
-                record_lead_message(run, message, &attempt)?;
-                return report_lead_message(
-                    run,
-                    message.id,
-                    message.kind,
-                    &attempt,
-                    message.payload.len(),
-                    message.spill,
-                    None,
-                );
-            }
-        };
-    let attempt = match outcome {
-        QueueOutcome::Accepted { detail } => {
-            let evidence = ordinary_input_evidence(
-                lead_home,
-                &run.lead_thread,
-                message.id,
-                message.envelope,
-                Instant::now() + EVIDENCE_WINDOW,
-            );
-            match evidence {
-                Some(evidence) => LeadAttempt {
-                    status: STATUS_DELIVERED,
-                    method: ORDINARY_QUEUE_METHOD.to_owned(),
-                    attempts: 1,
-                    detail: format!(
-                        "the input is in the lead conversation's own stored items ({evidence}); whether the lead applied it is the lead's own report"
-                    ),
-                },
-                None => LeadAttempt {
-                    status: STATUS_QUEUED,
-                    method: ORDINARY_QUEUE_METHOD.to_owned(),
-                    attempts: 1,
-                    detail: format!(
-                        "{detail}; the lead conversation's own stored items do not show the input yet"
-                    ),
-                },
-            }
-        }
-        QueueOutcome::Refused { detail } => LeadAttempt {
-            status: STATUS_ERROR,
-            method: ORDINARY_QUEUE_METHOD.to_owned(),
-            attempts: 1,
-            detail,
-        },
-        QueueOutcome::Unresolved { detail } => LeadAttempt {
-            status: STATUS_INDETERMINATE,
-            method: ORDINARY_QUEUE_METHOD.to_owned(),
-            attempts: 1,
-            detail,
-        },
-    };
-    record_lead_message(run, message, &attempt)?;
-    report_lead_message(
-        run,
-        message.id,
-        message.kind,
-        &attempt,
-        message.payload.len(),
-        message.spill,
-        None,
-    )
-}
-
-/// Nothing is sent again while an earlier queue attempt of the same message
-/// may be in the lead conversation: the exact thread's own stored items are
-/// reconciled first. Observed evidence upgrades the recorded attempt to
-/// delivered, an accepted attempt stays one queued input, and an attempt whose
-/// fate is unknown stays unresolved under its own identity, so an uncertain
-/// repeat can neither deliver a second copy nor drop the hold.
-fn reconcile_ordinary_lead(
+/// A repeat of an earlier attempt while no live endpoint exists is reconciled
+/// read-only from the addressed lead conversation's own stored items. Observed
+/// evidence upgrades the recorded attempt to delivered; an attempt the native
+/// transport already accepted stays one queued input; a pending or
+/// indeterminate attempt stays unresolved under its own identity. Nothing is
+/// transmitted and the installed native queue is never started, so this
+/// invocation cannot claim that it queued anything. The exact recorded attempt
+/// id and its content are preserved, so a later recovery of the same thread
+/// reconciles the same identity instead of sending a second copy.
+fn reconcile_unavailable_lead(
     run: &SpawnedRun,
     message: &LeadMessage<'_>,
     previous: &Value,
+    reason: &str,
 ) -> io::Result<i32> {
     let status = recorded_status(previous).to_owned();
     let method = previous["method"].as_str().unwrap_or_default().to_owned();
@@ -3039,9 +2850,9 @@ fn reconcile_ordinary_lead(
                 &attempt,
                 message.payload.len(),
                 message.spill,
-                Some(
-                    "nothing was sent again: the native queue accepted the earlier attempt, which is one input for the lead conversation, so the same words cannot be delivered twice. The recorded request stands; answer or stop it explicitly".to_owned(),
-                ),
+                Some(format!(
+                    "nothing was sent again: the native transport accepted the earlier attempt, which is one input for the lead conversation, so the same words cannot be delivered twice. The recorded request stands; answer or stop it explicitly. No live verified lead endpoint is available now ({reason}); the installed native queue was not started because its queue operation dispatches only when the lead turn is idle"
+                )),
             )
         }
         // A pending attempt stopped before its outcome was recorded, and an
@@ -3050,7 +2861,7 @@ fn reconcile_ordinary_lead(
         // refused rather than risking a second copy.
         _ => {
             let detail = format!(
-                "the earlier attempt ({method}) is recorded as {status} and the lead conversation's own stored items do not show it, so whether it reached the lead is unknown"
+                "the earlier attempt ({method}) is recorded as {status} and the lead conversation's own stored items do not show it, so whether it reached the lead is unknown. No live verified lead endpoint is available now ({reason}), so nothing was sent by this invocation; the installed native queue was not started because its queue operation dispatches only when the lead turn is idle"
             );
             let attempt = LeadAttempt {
                 status: STATUS_INDETERMINATE,
@@ -3071,143 +2882,6 @@ fn reconcile_ordinary_lead(
                 ),
             )
         }
-    }
-}
-
-/// Runs the installed native queue command once, as an owned child under one
-/// Job with a bounded wait, and classifies the result: exit 0 is transport
-/// acceptance; a non-zero exit counts as a refusal only when the command
-/// reports the observed exact missing-thread rejection, because an
-/// arbitrary failure can follow an applied queue effect; any other non-zero
-/// exit, and any command whose end cannot be observed within the bound, is
-/// unresolved. The command's own combined report is read back for the
-/// recorded detail. No listener, daemon or second conversation is started
-/// here, and the child tree is ended with its Job before this returns.
-fn queue_lead_message(
-    executable: &Path,
-    lead_home: &Path,
-    thread: &str,
-    envelope: &str,
-) -> io::Result<QueueOutcome> {
-    let log = tempfile::tempfile()?;
-    let mut spec = CommandSpec::new(executable);
-    spec.args = vec![
-        "queue".into(),
-        "--thread".into(),
-        thread.into(),
-        "--message".into(),
-        envelope.into(),
-    ];
-    spec.env
-        .insert("CODEX_HOME".into(), Some(lead_home.as_os_str().to_owned()));
-    // This process is a member of an executor run; the queue command is not,
-    // and a leaked conversation identity must not ride along as its native
-    // identity.
-    spec.env.insert("CODEX_SESSION_ID".into(), None);
-    spec.env.insert("CODEX_THREAD_ID".into(), None);
-    spec.stdout = Some(log.try_clone()?);
-    spec.stderr = Some(log);
-    // Every check whose failure is definitive is settled before the command
-    // starts. From the spawn onward an unobservable end is not a definitive
-    // failure: the message may already have been accepted, so it is carried
-    // as unresolved instead of being classified as a retryable error.
-    let deadline = Deadline::after(CONTROL_BOUND)?;
-    let job = Job::new(Limits::default())?;
-    let child = job.spawn(&spec)?;
-    let outcome = job.wait(
-        &child,
-        deadline,
-        &Cancellation::default(),
-        Duration::from_secs(2),
-    );
-    let report = queue_report(spec.stdout.take());
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return Ok(QueueOutcome::Unresolved {
-                detail: format!(
-                    "the native queue command did not finish observably ({error}); whether the message reached the lead conversation is unknown (report: {report})"
-                ),
-            });
-        }
-    };
-    Ok(match outcome.reason {
-        StopReason::Exited if outcome.process_exit_code == 0 => QueueOutcome::Accepted {
-            detail: format!(
-                "the native queue accepted the message for thread {thread} (exit 0: {report})"
-            ),
-        },
-        StopReason::Exited if queue_refused_missing_thread(&report, thread) => {
-            QueueOutcome::Refused {
-                detail: format!(
-                    "the native queue refused the message for thread {thread} (exit {}: {report}); nothing was delivered",
-                    outcome.process_exit_code
-                ),
-            }
-        }
-        // A non-zero exit without the native rejection mark does not prove no
-        // earlier queue effect: the command may have applied the input before
-        // failing. The attempt stays unresolved under its own identity
-        // instead of becoming retryable.
-        StopReason::Exited => QueueOutcome::Unresolved {
-            detail: format!(
-                "the native queue exited {} without a recognized pre-delivery refusal ({report}); whether the message reached the lead conversation is unknown",
-                outcome.process_exit_code
-            ),
-        },
-        StopReason::Timeout => QueueOutcome::Unresolved {
-            detail: format!(
-                "the native queue did not exit within {}s, so whether the message reached the lead conversation is unknown",
-                CONTROL_BOUND.as_secs()
-            ),
-        },
-        StopReason::MemoryLimit | StopReason::Cancelled => QueueOutcome::Unresolved {
-            detail: format!(
-                "the native queue was ended before it exited ({:?}), so whether the message reached the lead conversation is unknown",
-                outcome.reason
-            ),
-        },
-    })
-}
-
-fn queue_refused_missing_thread(report: &str, thread: &str) -> bool {
-    report.trim() == format!("{QUEUE_MISSING_THREAD_PREFIX}{thread} (code -32603)")
-}
-
-#[cfg(test)]
-#[test]
-fn only_an_exact_missing_target_proves_no_delivery() {
-    let target = "00000000-0000-4000-8000-000000000000";
-    let missing = format!("{QUEUE_MISSING_THREAD_PREFIX}{target} (code -32603)");
-    assert!(queue_refused_missing_thread(&missing, target));
-    assert!(!queue_refused_missing_thread(&missing, "another-thread"));
-    assert!(!queue_refused_missing_thread(
-        "Error: failed to queue session message: connection closed after sending the request",
-        target,
-    ));
-    assert!(!queue_refused_missing_thread(
-        &format!("{missing}\nresponse lost after another queue operation"),
-        target,
-    ));
-}
-
-/// The command's own combined report, read back within its bound. A report
-/// that cannot be read back is simply absent: the exit status is the transport
-/// result, so a failed readback must not reclassify a finished command.
-fn queue_report(handle: Option<fs::File>) -> String {
-    let mut report = Vec::new();
-    if let Some(mut handle) = handle
-        && handle.seek(io::SeekFrom::Start(0)).is_ok()
-    {
-        let _ = (&mut handle)
-            .take(QUEUE_REPORT_READ)
-            .read_to_end(&mut report);
-    }
-    let report = observation::excerpt(String::from_utf8_lossy(&report).trim(), 400);
-    if report.is_empty() {
-        "no report".to_owned()
-    } else {
-        report
     }
 }
 

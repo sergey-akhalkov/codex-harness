@@ -832,6 +832,21 @@ request keeps the run, its session, slot and worktree live (`executor watch`
 exit 3) without a resume. Selection rules live in
 [agent delegation](agent-delegation.md#steering-and-stopping-executors).
 
+Transmission requires a verified live managed endpoint: `turn/steer` on the
+lead's active turn, or `turn/start` on its idle recorded thread. When the
+dispatch recorded no per-spawn endpoint, the command reads only the managed
+registry record for that exact thread under the originating lead home recorded
+at dispatch, as published by `lead start --session THREAD` after resuming the
+same thread. The installed native queue is not used: its queue operation
+dispatches only when the target turn is idle, so it cannot deliver an
+operational message during the lead's current turn. With no live verified
+endpoint the command refuses before composing an envelope, writing a spill,
+recording an attempt or creating a reply hold, and names the same-thread
+managed resume remedy. A malformed, mismatched or stale recorded endpoint
+fails closed. Legacy queued or indeterminate attempts are reconciled read-only
+from the lead's own stored items on a repeat; they are never transmitted again,
+and native queue entries are left in place.
+
 ```powershell
 cargo test --locked -p codex-harness --test executor_observation --jobs 1 -- --test-threads=1
 cargo test --locked -p codex-harness --test executor_spawn --jobs 1 -- --test-threads=1
