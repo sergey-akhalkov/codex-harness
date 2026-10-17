@@ -601,6 +601,219 @@ fn lead_message_reaches_the_native_owning_thread() {
     drop(fixture.job);
 }
 
+/// The checkout's real self-reflection entry point against the installed native
+/// app-server and frontend. Only Responses are canned; source threads, forks,
+/// tool catalogues, retained turns and delivery use native components.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE and native frontend; owned canned Responses and MCP; no live model"]
+fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead() {
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let responses = control_responses::Responses::routed(owned_root.path().into(), |_| {
+        json!({"type":"message","id":"msg-native-reflection","role":"assistant",
+            "content":[{"type":"output_text","text":"NO FINDING"}]})
+    });
+    let fixture = fixture_with_responses(owned_root, responses);
+    let root = fixture.root.path();
+    let home = root.join("home");
+    let checkout = native_path(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap(),
+    );
+    println!("native reflection evidence: {}", root.display());
+    let config_path = home.join("config.toml");
+    let unrelated = skill_catalog_responses::unrelated_probe_mcp(&home).replace(
+        "mcp_servers.unrelated_probe",
+        "mcp_servers.\"unrelated.probe\"",
+    );
+    let original_config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!("{original_config}\n{unrelated}\n[profiles.reflection_fixture]\nmodel = \"gpt-6-astra\"\nmodel_provider = \"control_fixture\"\nmodel_reasoning_effort = \"low\"\n"),
+    ).unwrap();
+    let config_before = fs::read(&config_path).unwrap();
+    let mcp_config: toml::Table = unrelated.parse().unwrap();
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let mut sources = Vec::new();
+    for label in ["accepted executor work", "lead acceptance"] {
+        let source = owner.request(
+            "thread/start",
+            json!({
+                "cwd": fixture.workspace,
+                "model":"gpt-6-astra", "modelProvider":"control_fixture",
+                "allowProviderModelFallback":false, "approvalPolicy":"never",
+                "sandbox":"danger-full-access", "config":mcp_config,
+            }),
+        );
+        let thread = source["thread"]["id"].as_str().unwrap().to_owned();
+        let turn = owner.request(
+            "turn/start",
+            json!({
+                "threadId":thread,
+                "input":[{"type":"text","text":label}],
+            }),
+        )["turn"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let completed = wait_for_turn_completion(&mut owner, &thread, &turn);
+        let catalogue = owner.request(
+            "mcpServerStatus/list",
+            json!({
+                "threadId":thread, "detail":"toolsAndAuthOnly",
+            }),
+        );
+        assert!(
+            catalogue["data"].as_array().unwrap().iter().any(|server| {
+                server["name"] == "unrelated.probe"
+                    && server["tools"]
+                        .as_object()
+                        .is_some_and(|tools| !tools.is_empty())
+            }),
+            "source must expose the actual MCP before suppression: {catalogue}"
+        );
+        sources.push((thread, turn, completed["thread"]["turns"].clone()));
+    }
+    let endpoint_dir = record_native_lead(&fixture, &sources[1].0, "native-reflection-return");
+    let state_dir = root.join("reflection-state");
+    let stage = |role: harness_core::role_context::Role| {
+        let resolved = harness_core::role_context::resolve(&checkout, role).unwrap();
+        json!({
+            "role":role.label(), "revision":resolved.revision,
+            "profile":"reflection_fixture", "model":"gpt-6-astra",
+            "provider":"control_fixture", "effort":"low",
+            "checkout":fixture.workspace, "title":format!("native model-free {}", role.label()),
+        })
+    };
+    let request = json!({
+        "schema":1, "task":"owned accepted task", "run":"native-reflection-chain",
+        "acceptance":"owned native completed checkpoints", "source":checkout,
+        "codexHome":home, "launcher":fixture.exe, "stateDir":state_dir,
+        "executorSource":{"thread":sources[0].0,"lastTurn":sources[0].1},
+        "leadSource":{"thread":sources[1].0,"lastTurn":sources[1].1},
+        "executorStage":stage(harness_core::role_context::Role::ExecutorSelfReflection),
+        "leadStage":stage(harness_core::role_context::Role::LeadSelfReflection),
+        "leadReturn":{"endpoint":endpoint_dir.join("lead-endpoint-1.json"),"thread":sources[1].0},
+        "boundSeconds":45,
+    });
+    let request_path = root.join("reflection-request.json");
+    fs::write(&request_path, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+    let mut spec = command(
+        Path::new(env!("CARGO_BIN_EXE_codex-harness")),
+        &home,
+        &fixture.workspace,
+    );
+    spec.args = vec![
+        "self-reflection".into(),
+        "--request".into(),
+        request_path.into_os_string(),
+    ];
+    for key in [
+        "HARNESS_REFLECTION_SESSION",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_CONTEXT_ROLE",
+        "HARNESS_CONTEXT_REVISION",
+        "WT_SESSION",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let outcome = session
+        .wait(
+            Deadline::after(Duration::from_secs(150)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    fs::write(root.join("reflection-terminal.txt"), &outcome.transcript).unwrap();
+    assert_eq!(
+        outcome.outcome.exit_code,
+        0,
+        "native reflection failed; evidence {}: {}",
+        root.display(),
+        outcome.transcript
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    for (index, label) in ["executor", "lead"].into_iter().enumerate() {
+        let retained: Value =
+            read_json(&state_dir.join(format!("{label}-stage.json"))).expect("retained stage");
+        assert_eq!(retained["result"], "NO FINDING", "{retained}");
+        let fork = &retained["fork"];
+        assert_eq!(fork["sourcePreserved"], true, "{fork}");
+        assert_eq!(fork["forkGoalAfterClear"], Value::Null, "{fork}");
+        assert_eq!(fork["toolSurface"]["verified"], true, "{fork}");
+        assert_eq!(
+            fork["suppressedMcpServers"],
+            json!(["unrelated.probe"]),
+            "{fork}"
+        );
+        assert_eq!(fork["sourceThread"], sources[index].0, "{fork}");
+        let fork_id = fork["forkThread"].as_str().unwrap();
+        assert_ne!(fork_id, sources[index].0);
+        let requests: Vec<Value> = fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+            .map(|entry| read_json(&entry.path()).expect("retained provider request"))
+            .filter(|body| {
+                RequestIdentity::from_request(body).is_ok_and(|identity| identity.thread == fork_id)
+            })
+            .collect();
+        assert!(
+            !requests.is_empty(),
+            "no native provider input for {fork_id}"
+        );
+        for body in requests {
+            let surface = control_responses::tool_catalogue::tool_surface(&body.to_string());
+            assert!(
+                !surface.1.contains("unrelated.probe") && !surface.1.contains("unrelated_probe"),
+                "{surface:?}"
+            );
+        }
+        let original = owner.request(
+            "thread/read",
+            json!({
+                "threadId":sources[index].0, "includeTurns":true,
+            }),
+        );
+        let turns = original["thread"]["turns"].as_array().unwrap();
+        assert_eq!(
+            &turns[..sources[index].2.as_array().unwrap().len()],
+            sources[index].2.as_array().unwrap()
+        );
+        let catalogue = owner.request(
+            "mcpServerStatus/list",
+            json!({
+                "threadId":sources[index].0, "detail":"toolsAndAuthOnly",
+            }),
+        );
+        assert!(
+            catalogue["data"].as_array().unwrap().iter().any(|server| {
+                server["name"] == "unrelated.probe"
+                    && server["tools"]
+                        .as_object()
+                        .is_some_and(|tools| !tools.is_empty())
+            }),
+            "source MCP must survive the fork: {catalogue}"
+        );
+    }
+    let delivery: Value = read_json(&state_dir.join("delivery.json")).expect("retained delivery");
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    assert!(
+        fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+            .map(|entry| read_json(&entry.path()).expect("retained provider request"))
+            .any(|body| RequestIdentity::from_request(&body)
+                .is_ok_and(|identity| identity.thread == sources[1].0)
+                && contains_payload(&body, "native-reflection-chain")),
+        "the actual lead provider input must consume the synthesis"
+    );
+}
+
 fn lead_message_steers_the_active_native_owning_thread_with(harness: &Path, arm: &str) {
     let owned_root = BrokerRoot::prepare().unwrap().keep();
     let evidence = owned_root.path().to_path_buf();
