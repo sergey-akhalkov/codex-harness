@@ -607,7 +607,7 @@ fn derived_intake_links_the_source_without_a_vote_or_another_card() {
 
     // The analysis arrives before triage and must not become its own card or
     // vote. Source identity comes from the board record, not the CLI.
-    let out = board.record_derived(&source, "observer-a", "the wait follows each tool result");
+    let out = board.record_derived(&source, "reflection-a", "the wait follows each tool result");
     let text = output_text(&out);
     assert!(out.status.success(), "{text}");
     assert!(
@@ -625,28 +625,28 @@ fn derived_intake_links_the_source_without_a_vote_or_another_card() {
     assert_eq!(board.feedback_ids(), cards, "derived intake created a card");
 
     // Identical replay is harmless and reports the recorded outcome.
-    let out = board.record_derived(&source, "observer-a", "the wait follows each tool result");
+    let out = board.record_derived(&source, "reflection-a", "the wait follows each tool result");
     let text = output_text(&out);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("record=already-recorded votes=0"), "{text}");
     assert_eq!(board.derived_comments(&source).len(), 1, "{text}");
 
-    // Triage counts the source once. A second observer restating the same
+    // Triage counts the source once. A second reflection restating the same
     // episode retains analysis without adding a vote.
     let batch = board.decisions("source.json", &[(&source, "process", None)]);
     let out = board.feedback(&["triage", "--decisions", batch.to_str().unwrap()]);
     assert!(out.status.success(), "{}", output_text(&out));
     let out = board.record_derived(
         &source,
-        "observer-b",
+        "reflection-b",
         "another restatement of the same episode",
     );
     assert!(out.status.success(), "{}", output_text(&out));
     let ledger = output_text(&board.feedback(&["ledger", "--item", &source]));
     assert!(ledger.contains("votes=1 counted=1"), "{ledger}");
     assert!(ledger.contains("derived=2"), "{ledger}");
-    assert!(ledger.contains("reporter=observer-a"), "{ledger}");
-    assert!(ledger.contains("reporter=observer-b"), "{ledger}");
+    assert!(ledger.contains("reporter=reflection-a"), "{ledger}");
+    assert!(ledger.contains("reporter=reflection-b"), "{ledger}");
 
     // A genuinely independent episode still accumulates its own vote.
     let independent = board.record("dispatch waits after tools too", "exec-b", "e2", "executor");
@@ -660,7 +660,7 @@ fn derived_intake_links_the_source_without_a_vote_or_another_card() {
     assert!(ledger.contains("votes=2 counted=2"), "{ledger}");
 
     // Replaying the analysis after triage still changes neither count.
-    let out = board.record_derived(&source, "observer-a", "the wait follows each tool result");
+    let out = board.record_derived(&source, "reflection-a", "the wait follows each tool result");
     let text = output_text(&out);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("record=already-recorded"), "{text}");
@@ -675,22 +675,22 @@ fn derived_intake_refuses_invalid_sources_before_any_board_write() {
     let board = Board::new("derived-refusal");
     let source = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
     let unrelated = board.plain_task("Feedback-like task outside the bounded shape");
-    let legacy = board.legacy_derived("observer-old", "e9");
+    let legacy = board.legacy_derived("reflection-old", "e9");
     let cards = board.feedback_ids();
     let source_state = board.board_state(&source);
 
     // Missing source.
-    let out = board.record_derived("bdct-absent.9", "observer-a", "analysis of nothing");
+    let out = board.record_derived("bdct-absent.9", "reflection-a", "analysis of nothing");
     assert!(!out.status.success(), "{}", output_text(&out));
 
     // Existing but unrelated board item.
-    let out = board.record_derived(&unrelated, "observer-a", "analysis of a plain task");
+    let out = board.record_derived(&unrelated, "reflection-a", "analysis of a plain task");
     let text = output_text(&out);
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("not a bounded feedback record"), "{text}");
 
     // A legacy derived card cannot be restated into a second derived record.
-    let out = board.record_derived(&legacy, "observer-b", "analysis of an analysis");
+    let out = board.record_derived(&legacy, "reflection-b", "analysis of an analysis");
     let text = output_text(&out);
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("itself derived evidence"), "{text}");
@@ -703,7 +703,7 @@ fn derived_intake_refuses_invalid_sources_before_any_board_write() {
         "--observation",
         "analysis",
         "--reporter",
-        "observer-a",
+        "reflection-a",
         "--episode",
         "spoofed",
         "--kind",
@@ -726,7 +726,7 @@ fn derived_intake_refuses_invalid_sources_before_any_board_write() {
         "--scope",
         "synthetic",
         "--reporter",
-        "observer-a",
+        "reflection-a",
         "--episode",
         "e1",
         "--kind",
@@ -747,7 +747,7 @@ fn derived_intake_refuses_invalid_sources_before_any_board_write() {
         "--observation",
         "analysis",
         "--reporter",
-        "observer-a",
+        "reflection-a",
         "--kind",
         "derived-evidence",
     ]);
@@ -773,7 +773,7 @@ fn derived_provenance_survives_merge_and_partial_retry() {
     let incoming = board.record("the wait repeats under load", "exec-b", "e2", "executor");
     let out = board.record_derived(
         &incoming,
-        "observer-a",
+        "reflection-a",
         "analysis of the load-dependent wait",
     );
     assert!(out.status.success(), "{}", output_text(&out));
@@ -811,7 +811,7 @@ fn derived_provenance_survives_merge_and_partial_retry() {
     assert!(ledger.contains("derived=1"), "{ledger}");
     assert!(
         ledger.contains(&format!(
-            "derived source={incoming} source_reporter=exec-b source_kind=executor reporter=observer-a episode=e2"
+            "derived source={incoming} source_reporter=exec-b source_kind=executor reporter=reflection-a episode=e2"
         )),
         "{ledger}"
     );
@@ -834,7 +834,7 @@ fn derived_provenance_survives_merge_and_partial_retry() {
     // while retaining the original source identity.
     let out = board.record_derived(
         &incoming,
-        "observer-b",
+        "reflection-b",
         "a later analysis of the same episode",
     );
     let text = output_text(&out);
@@ -856,7 +856,7 @@ fn derived_copy_recovers_an_interrupted_merge_without_duplicates() {
     let incoming = board.record("the same wait under load", "exec-b", "e2", "executor");
     let out = board.record_derived(
         &incoming,
-        "observer-a",
+        "reflection-a",
         "analysis retained before the merge",
     );
     assert!(out.status.success(), "{}", output_text(&out));

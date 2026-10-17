@@ -188,7 +188,7 @@ pub struct DerivedRecord {
     pub source: String,
     pub source_reporter: String,
     pub source_kind: ReporterKind,
-    /// The observer that produced the analysis.
+    /// The reflection that produced the analysis.
     pub reporter: String,
     pub episode: String,
     pub parent_id: String,
@@ -616,11 +616,11 @@ pub fn record_feedback(
     string_field(&created, "id")
 }
 
-/// Records bounded observer analysis against its originating feedback item.
+/// Records bounded reflection analysis against its originating feedback item.
 ///
 /// The source is read before any write: it must be an existing bounded
 /// feedback record, and it must not itself be derived evidence. Episode and
-/// source identity come from that record, not from the observer's assertions.
+/// source identity come from that record, not from the reflection's assertions.
 /// The analysis is appended as a `feedback-derived` comment, so it creates no
 /// feedback card and no vote. If the source has already been merged, the
 /// comment is attached to its canonical item; later merges copy any existing
@@ -2446,7 +2446,7 @@ mod tests {
             source: "bdct-1.1.2".to_owned(),
             source_reporter: "exec-b".to_owned(),
             source_kind: ReporterKind::Executor,
-            reporter: "observer-a".to_owned(),
+            reporter: "reflection-a".to_owned(),
             episode: "e2".to_owned(),
             parent_id: "bdct-1.1".to_owned(),
             analysis: "the wait follows the tool result".to_owned(),
@@ -3742,7 +3742,7 @@ mod tests {
             &bd,
             &project,
             &second,
-            "observer-private",
+            "reflection-private",
             "private analysis of the dispatch naming mismatch",
         )
         .unwrap();
@@ -3830,7 +3830,7 @@ mod tests {
             "e7",
             &parent,
             "private analysis of the dispatch naming mismatch",
-            "observer-private",
+            "reflection-private",
             second.as_str(),
         ] {
             assert!(!description.contains(private), "kit item leaked {private}");
