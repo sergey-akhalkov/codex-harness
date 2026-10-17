@@ -181,7 +181,12 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
         )));
     }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
-    let body = &bodies[&role];
+    let body = bodies.get(&role).ok_or_else(|| {
+        invalid(format!(
+            "{} role is not declared in global/roles.toml; update the kit role sources before launching it",
+            role.label()
+        ))
+    })?;
     let revision = build_identity::hash_bytes(&serde_json::to_vec(&(
         role,
         descriptor_text,
@@ -420,6 +425,19 @@ mod tests {
             executor.revision,
             resolve(root.path(), Role::Executor).unwrap().revision
         );
+    }
+
+    #[test]
+    fn undeclared_reflection_roles_refuse_a_legacy_descriptor_without_panicking() {
+        let root = fixture();
+        for role in [Role::ExecutorSelfReflection, Role::LeadSelfReflection] {
+            let error = resolve(root.path(), role).unwrap_err().to_string();
+            assert!(error.contains(role.label()), "{error}");
+            assert!(error.contains("global/roles.toml"), "{error}");
+            assert!(error.contains("update"), "{error}");
+        }
+        assert!(resolve(root.path(), Role::Lead).is_ok());
+        assert!(resolve(root.path(), Role::Executor).is_ok());
     }
 
     #[test]
