@@ -75,6 +75,9 @@ const DISPATCH_WAIT: Duration = Duration::from_secs(300);
 /// plus the run's own closure is bounded well below a live model call.
 const ANSWER_WAIT: Duration = Duration::from_secs(120);
 const PAYLOAD: &str = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} from the executor\nsecond line: $(throw), %PATH%, `whoami`";
+const ACTIVE_TURN_PROMPT: &str = "ACTIVE-NATIVE-LEAD-TURN-HOLD-20261017";
+const ACTIVE_TOOL_CALL: &str = "control-active-tool-1";
+const ENVELOPE_MARK: &str = "\n---payload---\n";
 /// One native lead root: how long a request from a conversation the root has
 /// not identified yet waits for the dispatch's own session record. The record
 /// is written before the assignment is submitted, so a real run never reaches
@@ -195,16 +198,23 @@ fn qualified_installed_upstream(exe: &Path) -> String {
 }
 
 fn fixture() -> Fixture {
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let responses = control_responses::Responses::start(owned_root.path().into(), true);
+    fixture_with_responses(owned_root, responses)
+}
+
+fn fixture_with_responses(
+    owned_root: BrokerRoot,
+    responses: control_responses::Responses,
+) -> Fixture {
     let exe = codex_exe();
     qualified_installed_upstream(&exe);
-    let owned_root = BrokerRoot::prepare().unwrap().keep();
     let root = owned_root.path();
     let home = root.join("home");
     let workspace = root.join("workspace");
     fs::create_dir(&home).unwrap();
     fs::create_dir(&workspace).unwrap();
     seed_launcher_registration(&home);
-    let responses = control_responses::Responses::start(root.into(), true);
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
     fs::write(
         home.join("config.toml"),
@@ -327,27 +337,8 @@ impl Client {
     }
 }
 
-#[test]
-#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned native app-server fixture and canned Responses; no live model"]
-fn lead_message_reaches_the_native_owning_thread() {
-    let fixture = fixture();
+fn record_native_lead(fixture: &Fixture, thread: &str, generation: &str) -> PathBuf {
     let root = fixture.root.path();
-    let mut owner = Client::connect(fixture.port, &fixture.token);
-    let started = owner.request(
-        "thread/start",
-        json!({
-            "cwd": fixture.workspace,
-            "model": "gpt-6-astra",
-            "modelProvider": "control_fixture",
-            "allowProviderModelFallback": false,
-            "approvalPolicy": "never",
-            "sandbox": "danger-full-access"
-        }),
-    );
-    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
-    let status = owner.request("thread/read", json!({"threadId": thread}));
-    assert_eq!(status["thread"]["id"], thread);
-    assert_eq!(status["thread"]["status"]["type"], "idle", "{status}");
     let user = process_service::current_user().unwrap();
     let server = ServiceProcess::inspect(fixture.server, &fixture.exe, &user)
         .unwrap()
@@ -358,7 +349,6 @@ fn lead_message_reaches_the_native_owning_thread() {
         .identity();
     let state = root.join("run-home/harness/executor-pool/native-lead");
     fs::create_dir_all(&state).unwrap();
-    let generation = "generation-native-lead";
     fs::write(
         state.join("spawn-1.json"),
         serde_json::to_vec_pretty(&json!({
@@ -409,10 +399,18 @@ fn lead_message_reaches_the_native_owning_thread() {
         .unwrap(),
     )
     .unwrap();
-    let harness = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
-    let sent = Command::new(harness)
-        .args(["lead", "message", "--text", PAYLOAD])
-        .env("CODEX_HOME", root.join("run-home"))
+    state
+}
+
+fn send_lead_message(
+    harness: &Path,
+    home: &Path,
+    generation: &str,
+    payload: &str,
+) -> std::process::Output {
+    Command::new(harness)
+        .args(["lead", "message", "--text", payload])
+        .env("CODEX_HOME", home)
         .env("HARNESS_EXECUTOR_RUN", generation)
         .env("HARNESS_EXECUTOR_SESSION", "1")
         .env_remove("HARNESS_ORIGINATING_LEAD")
@@ -420,7 +418,142 @@ fn lead_message_reaches_the_native_owning_thread() {
         .env_remove("HARNESS_LEAD_RECIPIENT")
         .stdin(Stdio::null())
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+fn record_harness_selection(root: &Path, harness: &Path, arm: &str) {
+    assert!(
+        harness.is_absolute() && harness.is_file(),
+        "the {arm} harness executable must be an explicit absolute file: {}",
+        harness.display()
+    );
+    let selected = native_path(&harness.canonicalize().unwrap());
+    let sha256 = build_identity::hash_file(&selected).unwrap();
+    fs::write(
+        root.join("harness-selection.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "arm": arm,
+            "path": selected,
+            "sha256": sha256,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+struct ActiveToolRelease(PathBuf);
+
+impl Drop for ActiveToolRelease {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"release");
+    }
+}
+
+fn active_tool_continuation(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == ACTIVE_TOOL_CALL
+                && item["output"].as_str().is_some_and(|output| {
+                    output.contains("Process exited with code 0") && output.contains("released")
+                })
+        })
+    })
+}
+
+fn delivered_envelope(value: &Value) -> Option<(Value, String)> {
+    match value {
+        Value::String(text) => text
+            .split_once(ENVELOPE_MARK)
+            .and_then(|(header, payload)| {
+                serde_json::from_str(header)
+                    .ok()
+                    .map(|header| (header, payload.to_owned()))
+            }),
+        Value::Array(items) => items.iter().find_map(delivered_envelope),
+        Value::Object(map) => map.values().find_map(delivered_envelope),
+        _ => None,
+    }
+}
+
+fn wait_for_active_continuation(root: &Path, thread: &str, turn: &str) -> Value {
+    let until = Instant::now() + WAIT;
+    loop {
+        if let Some((_, request, hit_thread, hit_turn)) =
+            provider_entries(root)
+                .into_iter()
+                .find(|(_, request, hit_thread, hit_turn)| {
+                    hit_thread == thread
+                        && hit_turn == turn
+                        && active_tool_continuation(request)
+                        && contains_payload(request, PAYLOAD)
+                })
+        {
+            assert_eq!(hit_thread, thread);
+            assert_eq!(hit_turn, turn);
+            return request;
+        }
+        assert!(
+            Instant::now() < until,
+            "the active tool did not continue on the original turn {turn}; provider evidence {:?}",
+            provider_entries(root)
+                .into_iter()
+                .map(|(name, _, thread, turn)| (name, thread, turn))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_turn_completion(owner: &mut Client, thread: &str, turn: &str) -> Value {
+    let until = Instant::now() + WAIT;
+    loop {
+        let state = owner.request(
+            "thread/read",
+            json!({"threadId": thread, "includeTurns": true}),
+        );
+        let completed = state["thread"]["turns"].as_array().is_some_and(|turns| {
+            turns
+                .iter()
+                .any(|candidate| candidate["id"] == turn && candidate["status"] == "completed")
+        });
+        if completed && state["thread"]["status"]["type"] == "idle" {
+            return state;
+        }
+        assert!(
+            Instant::now() < until,
+            "the original active turn {turn} did not complete after its tool was released: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned native app-server fixture and canned Responses; no live model"]
+fn lead_message_reaches_the_native_owning_thread() {
+    let fixture = fixture();
+    let root = fixture.root.path();
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let started = owner.request(
+        "thread/start",
+        json!({
+            "cwd": fixture.workspace,
+            "model": "gpt-6-astra",
+            "modelProvider": "control_fixture",
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access"
+        }),
+    );
+    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+    let status = owner.request("thread/read", json!({"threadId": thread}));
+    assert_eq!(status["thread"]["id"], thread);
+    assert_eq!(status["thread"]["status"]["type"], "idle", "{status}");
+    let generation = "generation-native-lead";
+    record_native_lead(&fixture, &thread, generation);
+    let harness = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    let sent = send_lead_message(&harness, &root.join("run-home"), generation, PAYLOAD);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&sent.stdout),
@@ -466,6 +599,189 @@ fn lead_message_reaches_the_native_owning_thread() {
         root.display()
     );
     drop(fixture.job);
+}
+
+fn lead_message_steers_the_active_native_owning_thread_with(harness: &Path, arm: &str) {
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let evidence = owned_root.path().to_path_buf();
+    let responses = control_responses::Responses::routed(evidence, move |request| {
+        if title_generation_request(request) {
+            return json!({"type":"message","id":"msg-active-title","role":"assistant","content":[{"type":"output_text","text":"Active native turn"}]});
+        }
+        if !contains_payload(request, ACTIVE_TURN_PROMPT) {
+            return json!({"type":"message","id":"msg-active-unexpected","role":"assistant","content":[{"type":"output_text","text":"UNEXPECTED_ACTIVE_PROVIDER_REQUEST"}]});
+        }
+        let tool_completed = request["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == ACTIVE_TOOL_CALL
+            })
+        });
+        if tool_completed {
+            return json!({"type":"message","id":"msg-active-final","role":"assistant","content":[{"type":"output_text","text":"ACTIVE_NATIVE_TURN_COMPLETE"}]});
+        }
+        let command = "[IO.File]::WriteAllText('active-tool-ready', 'ready'); for ($n = 0; $n -lt 600 -and !(Test-Path 'active-tool-release'); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path 'active-tool-release')) { throw 'active tool release deadline' }; [IO.File]::WriteAllText('active-tool-done', 'done'); 'released'";
+        let arguments = serde_json::to_string(&json!({
+            "cmd": command,
+            "shell": control_responses::owned_pwsh(),
+            "yield_time_ms": 30000
+        }))
+        .unwrap();
+        json!({"type":"function_call","call_id":ACTIVE_TOOL_CALL,"name":"exec_command","arguments":arguments})
+    });
+    let fixture = fixture_with_responses(owned_root, responses);
+    let root = fixture.root.path();
+    let workspace = fixture.workspace.clone();
+    record_harness_selection(root, harness, arm);
+    let release_marker = workspace.join("active-tool-release");
+    let _release_on_drop = ActiveToolRelease(release_marker.clone());
+
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let started = owner.request(
+        "thread/start",
+        json!({
+            "cwd": fixture.workspace,
+            "model": "gpt-6-astra",
+            "modelProvider": "control_fixture",
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access"
+        }),
+    );
+    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+    let turn_started = owner.request(
+        "turn/start",
+        json!({
+            "threadId": thread,
+            "input": [{"type": "text", "text": ACTIVE_TURN_PROMPT}]
+        }),
+    );
+    let turn = turn_started["turn"]["id"]
+        .as_str()
+        .or_else(|| turn_started["id"].as_str())
+        .unwrap_or_else(|| panic!("turn/start answered without a turn identity: {turn_started}"))
+        .to_owned();
+    assert!(
+        wait_until(WAIT.as_secs(), || workspace
+            .join("active-tool-ready")
+            .is_file()),
+        "the owned native tool did not reach its readiness marker; provider {:?}; server {}",
+        provider_entries(root)
+            .into_iter()
+            .map(|(name, _, thread, turn)| (name, thread, turn))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(root.join("server-stderr.txt")).unwrap_or_default()
+    );
+    let active_state = owner.request(
+        "thread/read",
+        json!({"threadId": thread, "includeTurns": true}),
+    );
+    let active = active_state["thread"]["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|candidate| candidate["status"] == "inProgress")
+        .and_then(|candidate| candidate["id"].as_str());
+    assert_eq!(active, Some(turn.as_str()), "{active_state}");
+
+    let generation = "generation-native-active-lead";
+    record_native_lead(&fixture, &thread, generation);
+    let sent = send_lead_message(harness, &root.join("run-home"), generation, PAYLOAD);
+    let text = output_text(&sent);
+    assert!(
+        sent.status.success(),
+        "lead message failed against the active fixture turn; {text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        text.contains("lead message: delivered") || text.contains("lead message: queued"),
+        "{text}"
+    );
+    let transport_status = if text.contains("lead message: delivered") {
+        "delivered"
+    } else {
+        "queued"
+    };
+    assert!(text.contains("method: turn/steer"), "{text}");
+    assert!(text.contains(&format!("leadThreadId: {thread}")), "{text}");
+    assert!(!text.contains(&fixture.token), "{text}");
+    let id = text
+        .lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .unwrap_or_else(|| panic!("the delivery report named no message id: {text}"));
+    fs::write(root.join("lead-message-send.txt"), &text).unwrap();
+    fs::write(
+        root.join("lead-message-transport.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "transportStatus": transport_status,
+            "method": "turn/steer",
+            "threadId": thread,
+            "turnId": turn,
+            "messageId": id,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    fs::write(&release_marker, b"release").unwrap();
+    assert!(
+        wait_until(WAIT.as_secs(), || workspace
+            .join("active-tool-done")
+            .is_file()),
+        "the released native tool did not report completion; provider {:?}; server {}",
+        provider_entries(root)
+            .into_iter()
+            .map(|(name, _, thread, turn)| (name, thread, turn))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(root.join("server-stderr.txt")).unwrap_or_default()
+    );
+    let continuation = wait_for_active_continuation(root, &thread, &turn);
+    let identity = RequestIdentity::from_request(&continuation).unwrap();
+    assert_eq!(identity.thread, thread);
+    assert_eq!(identity.turn, turn, "the steer opened another turn");
+    let (header, payload) = delivered_envelope(&continuation)
+        .unwrap_or_else(|| panic!("the continuation carried no lead envelope: {continuation}"));
+    assert_eq!(payload, PAYLOAD, "the payload was not delivered unchanged");
+    assert_eq!(header["id"], id, "{header}");
+    assert_eq!(header["kind"], "reply-request", "{header}");
+    assert_eq!(header["runGeneration"], generation, "{header}");
+    assert_eq!(header["leadThreadId"], thread, "{header}");
+
+    let completed = wait_for_turn_completion(&mut owner, &thread, &turn);
+    let turns = completed["thread"]["turns"].as_array().unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "the steer created a second turn: {completed}"
+    );
+    assert_eq!(turns[0]["id"], turn, "{completed}");
+    assert_eq!(turns[0]["status"], "completed", "{completed}");
+    assert!(
+        foreign_provider_requests(root, &thread).is_empty(),
+        "a provider request reached another conversation: {:?}",
+        foreign_provider_requests(root, &thread)
+    );
+    eprintln!(
+        "active native lead: harness {arm} {}; thread {thread}; turn {turn}; transport {transport_status}; tool completed in the steered turn; evidence {}",
+        harness.display(),
+        root.display()
+    );
+    drop(fixture.job);
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; checkout-built harness; owned native app-server and canned Responses; no live model"]
+fn lead_message_steers_the_active_native_owning_thread() {
+    let harness = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    lead_message_steers_the_active_native_owning_thread_with(&harness, "source");
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE and the deployed harness; owned native app-server and canned Responses; no live model"]
+fn lead_message_steers_the_active_native_owning_thread_installed() {
+    let harness = installed_entry();
+    lead_message_steers_the_active_native_owning_thread_with(&harness, "installed");
 }
 
 // ---------------------------------------------------------------------------

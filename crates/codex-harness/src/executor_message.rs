@@ -2169,14 +2169,18 @@ fn verify_lead_endpoint(run: &SpawnedRun, endpoint: Endpoint) -> io::Result<Lead
 /// source and home are the relationship recorded at dispatch; neither is
 /// inferred from the executor's current environment.
 fn managed_resume_command(run: &SpawnedRun) -> String {
+    let literal = |value: String| format!("'{}'", value.replace('\'', "''"));
     match run.lead_home.as_deref() {
         Some(home) => format!(
             "codex-harness lead start --source {} --codex-home {} --session {}",
-            run.checkout,
-            home.display(),
-            run.lead_thread
+            literal(run.checkout.clone()),
+            literal(home.display().to_string()),
+            literal(run.lead_thread.clone())
         ),
-        None => format!("codex-harness lead start --session {}", run.lead_thread),
+        None => format!(
+            "codex-harness lead start --session {}",
+            literal(run.lead_thread.clone())
+        ),
     }
 }
 

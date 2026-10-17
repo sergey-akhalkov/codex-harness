@@ -2373,6 +2373,43 @@ fn lead_message_refuses_a_missing_endpoint_instead_of_starting_the_idle_only_que
 }
 
 #[test]
+fn lead_message_resume_remedy_quotes_literal_powershell_arguments() {
+    let fixture = OrdinaryFixture::new(
+        "ordinary-quoted-remedy",
+        "generation-ordinary-quoted-remedy",
+        ORDINARY_THREAD,
+    );
+    let source = fixture.root().join("source with space and 'quote'");
+    let lead_home = fixture.root().join("lead home's kit");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&lead_home).unwrap();
+    let mut record = fixture.receipt();
+    record["slot"]["source"] = json!(source);
+    record["slot"]["path"] = json!(source);
+    record["originatingLead"]["home"] = json!(lead_home);
+    fs::write(
+        fixture.state.join("spawn-1.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    let out = fixture.sender(&["--notify", "--text", "quoted remedy"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    let literal = |path: &Path| path.display().to_string().replace('\'', "''");
+    let expected = format!(
+        "codex-harness lead start --source '{}' --codex-home '{}' --session '{}'",
+        literal(&source),
+        literal(&lead_home),
+        ORDINARY_THREAD
+    );
+    assert!(
+        text.contains(&expected),
+        "the resume remedy must be copyable as one PowerShell command: {text}"
+    );
+}
+
+#[test]
 fn a_queued_ordinary_attempt_is_reconciled_instead_of_being_sent_again() {
     let fixture = OrdinaryFixture::new(
         "ordinary-queued-repeat",
