@@ -517,6 +517,27 @@ pub struct ComparisonInputs {
     /// absent means a declared bearer cannot be supplied.
     #[serde(default)]
     pub observation_auth: Option<ClientInput>,
+    /// Optional declared bounded lead/executor/review workflow. Absent keeps
+    /// the legacy executor-only measured conversation exactly as before.
+    #[serde(default)]
+    pub workflow: Option<WorkflowInputs>,
+}
+
+/// One predeclared measured workflow composition. It names only the
+/// participant profiles and the bounded correction allowance: the task,
+/// source, acceptance entry point, policy and realized arm order stay frozen
+/// by the enclosing comparison inputs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowInputs {
+    pub schema: u32,
+    /// The configured bounded-lead profile every lead turn continues.
+    pub lead_profile: String,
+    /// The executor profile every executor turn must resolve.
+    pub executor_profile: String,
+    /// Same-executor correction turns allowed after review (0 or 1).
+    #[serde(default)]
+    pub max_corrections: u32,
 }
 
 impl ComparisonInputs {
@@ -566,6 +587,25 @@ impl ComparisonInputs {
             if !auth.path.is_file() {
                 return Err(invalid(
                     "the observed bearer auth input must be an existing regular file",
+                ));
+            }
+        }
+        if let Some(workflow) = &self.workflow {
+            if workflow.schema != 1 {
+                return Err(invalid(format!(
+                    "the declared measured workflow uses unsupported schema {}; this controller reads schema 1",
+                    workflow.schema
+                )));
+            }
+            token("workflow lead profile", &workflow.lead_profile, MAX_TOKEN)?;
+            token(
+                "workflow executor profile",
+                &workflow.executor_profile,
+                MAX_TOKEN,
+            )?;
+            if workflow.max_corrections > 1 {
+                return Err(invalid(
+                    "the declared measured workflow allows more than one correction turn; the bounded acceptance capacity permits at most one",
                 ));
             }
         }
@@ -1049,6 +1089,14 @@ pub enum AttemptRole {
     Implementer,
     Baseline,
     Candidate,
+    /// The fresh bounded-lead framing turn of one measured workflow.
+    LeadFrame,
+    /// A same-lead review continuation after the executor turn.
+    LeadReview,
+    /// A bounded same-executor correction continuation.
+    Correction,
+    /// The same-lead exact acceptance decision after review.
+    LeadAcceptance,
 }
 
 impl AttemptRole {
@@ -1059,6 +1107,10 @@ impl AttemptRole {
             Self::Implementer => "implementer",
             Self::Baseline => "baseline",
             Self::Candidate => "candidate",
+            Self::LeadFrame => "lead-frame",
+            Self::LeadReview => "lead-review",
+            Self::Correction => "correction",
+            Self::LeadAcceptance => "lead-acceptance",
         }
     }
 
@@ -1069,6 +1121,10 @@ impl AttemptRole {
             Self::Implementer => "impl",
             Self::Baseline => "base",
             Self::Candidate => "cand",
+            Self::LeadFrame => "lframe",
+            Self::LeadReview => "lreview",
+            Self::Correction => "corr",
+            Self::LeadAcceptance => "laccept",
         }
     }
 
@@ -1699,6 +1755,54 @@ impl ComparisonArm {
     }
 }
 
+/// One exact participant conversation in a measured workflow. The slot,
+/// owner, session and profile are read back from the accepted native receipt;
+/// later continuations must reproduce all of them.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowParticipant {
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub profile: String,
+}
+
+/// The retained turn sequence of one arm's measured workflow. Attempt ids
+/// point at the existing attempt records, which retain each turn's receipt,
+/// result and accounting evidence. The state derives the next declared turn
+/// from these durable identities, never from a clock or a replay.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowArmState {
+    /// Digest of the frozen workflow composition this arm started under.
+    pub declaration_digest: String,
+    /// The exact bounded-lead conversation, once its frame completed.
+    #[serde(default)]
+    pub lead: Option<WorkflowParticipant>,
+    /// The exact executor conversation, once its first turn completed.
+    #[serde(default)]
+    pub executor: Option<WorkflowParticipant>,
+    #[serde(default)]
+    pub lead_frame: Option<String>,
+    #[serde(default)]
+    pub executor_attempt: Option<String>,
+    #[serde(default)]
+    pub review: Option<String>,
+    /// The exact first-line review decision (`accept` or `correct`).
+    #[serde(default)]
+    pub review_token: Option<String>,
+    #[serde(default)]
+    pub corrections: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Option<String>,
+    /// The exact first-line final lead decision (`accept` or `reject`).
+    #[serde(default)]
+    pub lead_accepted: Option<bool>,
+    /// All declared turns settled and the lead decision recorded.
+    #[serde(default)]
+    pub completed: bool,
+}
+
 /// The retained recovery state of one comparison arm. The prepared runtime
 /// receipt, the verified solution revision and the retained acceptance record
 /// are recovery data; the durable evidence lives in the run store files this
@@ -1734,6 +1838,9 @@ pub struct ArmComparisonState {
     /// The prepared immutable build this arm consumed.
     #[serde(default)]
     pub build: Option<PathBuf>,
+    /// The measured workflow turn state, when this comparison declares one.
+    #[serde(default)]
+    pub workflow: Option<WorkflowArmState>,
 }
 
 /// The retained comparison recovery state: the frozen policy identity, the
@@ -1745,6 +1852,10 @@ pub struct ComparisonState {
     pub schema: u32,
     /// Digest of the predeclared policy; a changed declaration refuses reuse.
     pub policy_digest: String,
+    /// Digest of the declared measured workflow composition, when one was
+    /// frozen before the first turn. A changed declaration refuses reuse.
+    #[serde(default)]
+    pub workflow_digest: Option<String>,
     /// The retained experiment bindings of the prepared comparison.
     #[serde(default)]
     pub bindings: Option<PathBuf>,
@@ -1783,6 +1894,7 @@ impl ComparisonState {
         Self {
             schema: COMPARISON_STATE_SCHEMA,
             policy_digest,
+            workflow_digest: None,
             bindings: None,
             planning: None,
             workload_card: None,

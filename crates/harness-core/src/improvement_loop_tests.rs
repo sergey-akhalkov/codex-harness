@@ -1480,6 +1480,7 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
         },
         observation_inputs: Vec::new(),
         observation_auth: None,
+        workflow: None,
     });
     spec
 }

@@ -1877,6 +1877,72 @@ pub(crate) struct VisibleLeadConversation {
     pub prompt: PromptSource,
 }
 
+/// One same-lead continuation requested by the controller. It names the exact
+/// recorded bounded-lead conversation - slot, owner and native session - and
+/// the next turn that lead must decide. The configured `lead_profile` and
+/// `Role::Lead` are resolved from the same source the fresh bounded lead used;
+/// no caller field can select another profile, slot or session.
+pub(crate) struct VisibleLeadContinuation {
+    pub codex_home: PathBuf,
+    pub source: PathBuf,
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub prompt: String,
+}
+
+#[derive(Debug)]
+
+/// The newly accepted continuation, read back from the receipt the shared
+/// continuation owner wrote. `generation` is this dispatch's own run
+/// generation; it is never the predecessor's. `session` is the exact
+/// conversation the recorded route resumes, not a fresh one.
+pub(crate) struct VisibleLeadContinuationAccepted {
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub generation: String,
+    pub profile: String,
+    pub role: Role,
+    pub exit_code: i32,
+    pub checkout: PathBuf,
+    pub receipt: PathBuf,
+    pub result: PathBuf,
+    pub detail: PathBuf,
+}
+
+/// One same-executor continuation requested by the controller. It names the
+/// exact recorded executor conversation and the executor profile that
+/// conversation was dispatched under; a correction can never switch role,
+/// profile, slot or session.
+pub(crate) struct VisibleExecutorContinuation {
+    pub codex_home: PathBuf,
+    pub source: PathBuf,
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub profile: String,
+    pub prompt: String,
+}
+
+/// The newly accepted executor continuation, read back from the receipt the
+/// shared continuation owner wrote. The generation is this turn's own, never
+/// the predecessor's, and the session is the exact conversation it resumed.
+#[derive(Debug)]
+pub(crate) struct VisibleExecutorContinuationAccepted {
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub generation: String,
+    pub profile: String,
+    pub role: Role,
+    pub exit_code: i32,
+    pub checkout: PathBuf,
+    pub receipt: PathBuf,
+    pub result: PathBuf,
+    pub detail: PathBuf,
+}
+
 /// Dispatches one fresh bounded lead conversation through the pooled dispatch
 /// owner. The configured `lead_profile` binding and the lead role composition
 /// are resolved and recorded before anything launches; a missing role input or
@@ -1935,6 +2001,633 @@ pub(crate) fn dispatch_visible_lead_conversation(
         &prepared.paths,
     )?;
     Ok(accepted)
+}
+
+pub(crate) fn continue_visible_lead_conversation(
+    request: &VisibleLeadContinuation,
+) -> io::Result<VisibleLeadContinuationAccepted> {
+    continue_visible_lead_conversation_with_markers(
+        request,
+        std::env::var_os(EXECUTOR_SESSION_ENV),
+        std::env::var_os(BOUNDED_LEAD_SESSION_ENV),
+    )
+}
+
+/// The wrapper body with the process markers supplied by the caller, so the
+/// focused checks can exercise the same slot, receipt and launch contract
+/// without mutating the process environment.
+fn continue_visible_lead_conversation_with_markers(
+    request: &VisibleLeadContinuation,
+    executor_marker: Option<OsString>,
+    bounded_lead_marker: Option<OsString>,
+) -> io::Result<VisibleLeadContinuationAccepted> {
+    refuse_executor_dispatch(executor_marker)?;
+    refuse_bounded_lead_dispatch(bounded_lead_marker)?;
+    if !request.source.is_absolute() || !request.codex_home.is_absolute() {
+        return Err(invalid(
+            "bounded lead continuation source and codex home must be absolute paths",
+        ));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(invalid(
+            "bounded lead continuation needs a non-empty next assignment",
+        ));
+    }
+    let config = load(&request.source)?;
+    let profile = config.lead_profile.clone();
+    if profile.trim().is_empty() {
+        return Err(invalid(
+            "configured lead_profile is empty; no bounded lead conversation can be continued",
+        ));
+    }
+    let session = task_succession::exact_session_id(&request.session)?.to_owned();
+    let paths = run_paths(&request.codex_home, &request.source, request.slot)?;
+    let predecessor = lead_continuation_predecessor(
+        &paths.receipt,
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+        &session,
+        &profile,
+    )?;
+    // A continuation is a new turn on an idle recorded conversation. A live
+    // host still owns the slot, and a second identity must not share it.
+    refuse_a_live_owner(&request.codex_home, &request.source, &request.owner)?;
+    refuse_a_live_slot(
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+    )?;
+    let args = [
+        OsString::from("--source"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--repository"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--codex-home"),
+        request.codex_home.as_os_str().to_owned(),
+        OsString::from("--slot"),
+        OsString::from(request.slot.to_string()),
+        OsString::from("--owner"),
+        OsString::from(request.owner.as_str()),
+        OsString::from("--session"),
+        OsString::from(&session),
+        OsString::from("--exec"),
+        OsString::from(request.prompt.as_str()),
+    ];
+    let exit_code = continue_slot(&args, false, Role::Lead)?;
+    accepted_lead_continuation(
+        &paths,
+        request,
+        &session,
+        &profile,
+        &predecessor.generation,
+        exit_code,
+    )
+}
+
+/// Continues one exact recorded executor conversation through the shared
+/// continuation owner. The correction turn keeps the executor's slot, owner,
+/// session and declared profile; a fresh conversation or a role/profile
+/// fallback is refused instead of reported as a correction.
+pub(crate) fn continue_visible_executor_conversation(
+    request: &VisibleExecutorContinuation,
+) -> io::Result<VisibleExecutorContinuationAccepted> {
+    continue_visible_executor_conversation_with_markers(
+        request,
+        std::env::var_os(EXECUTOR_SESSION_ENV),
+        std::env::var_os(BOUNDED_LEAD_SESSION_ENV),
+    )
+}
+
+fn continue_visible_executor_conversation_with_markers(
+    request: &VisibleExecutorContinuation,
+    executor_marker: Option<OsString>,
+    bounded_lead_marker: Option<OsString>,
+) -> io::Result<VisibleExecutorContinuationAccepted> {
+    refuse_executor_dispatch(executor_marker)?;
+    refuse_bounded_lead_dispatch(bounded_lead_marker)?;
+    if !request.source.is_absolute() || !request.codex_home.is_absolute() {
+        return Err(invalid(
+            "executor continuation source and codex home must be absolute paths",
+        ));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(invalid(
+            "executor continuation needs a non-empty correction assignment",
+        ));
+    }
+    let config = load(&request.source)?;
+    let profile = executor_profile(&config, Some(request.profile.as_str()))?.to_owned();
+    if profile != request.profile {
+        return Err(invalid(&format!(
+            "executor continuation refused: the requested profile {} is not the configured executor profile {profile}",
+            request.profile
+        )));
+    }
+    let session = task_succession::exact_session_id(&request.session)?.to_owned();
+    let paths = run_paths(&request.codex_home, &request.source, request.slot)?;
+    let predecessor = executor_continuation_predecessor(
+        &paths.receipt,
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+        &session,
+        &profile,
+    )?;
+    refuse_a_live_owner(&request.codex_home, &request.source, &request.owner)?;
+    refuse_a_live_slot(
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+    )?;
+    let args = [
+        OsString::from("--source"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--repository"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--codex-home"),
+        request.codex_home.as_os_str().to_owned(),
+        OsString::from("--slot"),
+        OsString::from(request.slot.to_string()),
+        OsString::from("--owner"),
+        OsString::from(request.owner.as_str()),
+        OsString::from("--session"),
+        OsString::from(&session),
+        OsString::from("--profile"),
+        OsString::from(&profile),
+        OsString::from("--exec"),
+        OsString::from(request.prompt.as_str()),
+    ];
+    let exit_code = continue_slot(&args, false, Role::Executor)?;
+    accepted_executor_continuation(&paths, request, &session, &profile, &predecessor, exit_code)
+}
+
+/// Reuses the exact predecessor proof for an executor turn: slot, owner,
+/// profile, session, role and a preserved checkout must all match before the
+/// shared continuation owner is touched.
+fn executor_continuation_predecessor(
+    receipt: &Path,
+    codex_home: &Path,
+    source: &Path,
+    slot: u32,
+    owner: &str,
+    session: &str,
+    profile: &str,
+) -> io::Result<String> {
+    let bytes = match fs::read(receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(&format!(
+                "no recorded executor conversation occupies slot {slot} for owner {owner}; dispatch one before requesting a correction"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the recorded executor conversation receipt {} is not JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    if value["slot"]["index"].as_u64() != Some(u64::from(slot))
+        || value["slot"]["owner"].as_str() != Some(owner)
+    {
+        return Err(invalid(&format!(
+            "executor continuation refused: receipt {} does not record slot {slot} owner {owner}",
+            receipt.display()
+        )));
+    }
+    if value["profile"].as_str() != Some(profile) {
+        return Err(invalid(&format!(
+            "executor continuation refused: the recorded conversation uses profile {}, not the declared executor profile {profile}",
+            value["profile"].as_str().unwrap_or("unrecorded")
+        )));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Executor.label() => {}
+        Some(role) => {
+            return Err(invalid(&format!(
+                "executor continuation refused: slot {slot} owner {owner} records role {}, not {}",
+                role.role,
+                Role::Executor.label()
+            )));
+        }
+        None => {
+            return Err(invalid(&format!(
+                "executor continuation refused: the receipt for slot {slot} owner {owner} does not record its responsibility role"
+            )));
+        }
+    }
+    let observed = value["observation"]["session"].as_str();
+    let previous = value["observation"]["previousSession"].as_str();
+    let resumed = value["control"]["resumeSession"].as_str();
+    for recorded in [observed, previous, resumed].into_iter().flatten() {
+        if recorded != session {
+            return Err(invalid(&format!(
+                "executor continuation refused: the recorded conversation names session {recorded}, not the exact requested session {session}"
+            )));
+        }
+    }
+    if observed.is_none() && previous.is_none() && resumed.is_none() {
+        return Err(invalid(&format!(
+            "executor continuation refused: the receipt for slot {slot} owner {owner} records no exact session"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| {
+            invalid(&format!(
+                "executor continuation refused: the receipt for slot {slot} owner {owner} records no run generation"
+            ))
+        })?;
+    let Some(record) = task_worktree::load_slot_record(codex_home, source, slot)? else {
+        return Err(invalid(&format!(
+            "executor continuation refused: slot {slot} has no recorded binding for owner {owner}; preserved work cannot be proved"
+        )));
+    };
+    match record.owner.as_deref() {
+        Some(existing) if existing == owner => {}
+        Some(other) => {
+            return Err(invalid(&format!(
+                "executor continuation refused: the slot record binds slot {slot} to {other}, not {owner}"
+            )));
+        }
+        None => {}
+    }
+    if !record.path.is_dir() {
+        return Err(invalid(&format!(
+            "executor continuation refused: the recorded checkout {} for slot {slot} is missing",
+            record.path.display()
+        )));
+    }
+    let recorded_checkout = value["slot"]["path"].as_str().ok_or_else(|| {
+        invalid(&format!(
+            "executor continuation refused: the receipt for slot {slot} records no checkout path"
+        ))
+    })?;
+    let recorded_checkout = fs::canonicalize(recorded_checkout).map_err(|error| {
+        invalid(&format!(
+            "executor continuation refused: the receipt checkout {recorded_checkout} cannot be resolved: {error}"
+        ))
+    })?;
+    let bound_checkout = fs::canonicalize(&record.path).map_err(|error| {
+        invalid(&format!(
+            "executor continuation refused: the slot checkout {} cannot be resolved: {error}",
+            record.path.display()
+        ))
+    })?;
+    if recorded_checkout != bound_checkout {
+        return Err(invalid(&format!(
+            "executor continuation refused: the receipt names checkout {}, but slot {slot} is bound to {}",
+            recorded_checkout.display(),
+            bound_checkout.display()
+        )));
+    }
+    Ok(generation.to_owned())
+}
+
+/// Reads back the executor continuation receipt and refuses any identity
+/// drift: same slot/owner/session/profile and role, a new generation, and no
+/// restart assignment.
+fn accepted_executor_continuation(
+    paths: &RunPaths,
+    request: &VisibleExecutorContinuation,
+    session: &str,
+    profile: &str,
+    predecessor_generation: &str,
+    exit_code: i32,
+) -> io::Result<VisibleExecutorContinuationAccepted> {
+    let bytes = fs::read(&paths.receipt)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the continuation receipt {} is not JSON: {error}",
+            paths.receipt.display()
+        ))
+    })?;
+    if value["slot"]["index"].as_u64() != Some(u64::from(request.slot))
+        || value["slot"]["owner"].as_str() != Some(request.owner.as_str())
+        || value["profile"].as_str() != Some(profile)
+    {
+        return Err(invalid(
+            "the continuation receipt does not record the requested executor slot, owner and profile",
+        ));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Executor.label() => {}
+        _ => {
+            return Err(invalid(
+                "the continuation receipt does not record the executor role; a role fallback is not accepted",
+            ));
+        }
+    }
+    if value["control"]["resumeSession"].as_str() != Some(session)
+        || value["observation"]["previousSession"].as_str() != Some(session)
+    {
+        return Err(invalid(&format!(
+            "the executor continuation did not resume the exact session {session}; a fresh conversation is never accepted"
+        )));
+    }
+    if !value["control"]["originalAssignment"].is_null() {
+        return Err(invalid(
+            "the executor continuation receipt records a restart assignment; a fresh conversation is never accepted",
+        ));
+    }
+    if let Some(observed) = value["observation"]["session"].as_str()
+        && observed != session
+    {
+        return Err(invalid(&format!(
+            "the executor continuation observed session {observed}, not the resumed session {session}"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| invalid("the continuation receipt records no run generation"))?;
+    if generation == predecessor_generation {
+        return Err(invalid(
+            "the continuation receipt still carries the predecessor generation; no new accepted run is recorded",
+        ));
+    }
+    let checkout = value["slot"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("the continuation receipt records no checkout path"))?;
+    Ok(VisibleExecutorContinuationAccepted {
+        slot: request.slot,
+        owner: request.owner.clone(),
+        session: session.to_owned(),
+        generation: generation.to_owned(),
+        profile: profile.to_owned(),
+        role: Role::Executor,
+        exit_code,
+        checkout,
+        receipt: paths.receipt.clone(),
+        result: paths.result.clone(),
+        detail: paths.detail.clone(),
+    })
+}
+
+/// The exact recorded conversation a lead continuation may continue. The
+/// predecessor generation is captured before the shared continuation owner
+/// overwrites the receipt, so the postcondition can prove the new run is not
+/// the same dispatch reported again.
+#[derive(Debug)]
+struct LeadContinuationPredecessor {
+    generation: String,
+}
+
+/// Verifies the exact same-lead predecessor before any effect. The receipt is
+/// authoritative for slot, owner, session, role and profile identity; the slot
+/// record proves the binding and preserved checkout, and the caller checks
+/// liveness separately before adopting anything.
+#[allow(clippy::too_many_arguments)]
+fn lead_continuation_predecessor(
+    receipt: &Path,
+    codex_home: &Path,
+    source: &Path,
+    slot: u32,
+    owner: &str,
+    session: &str,
+    profile: &str,
+) -> io::Result<LeadContinuationPredecessor> {
+    let bytes = match fs::read(receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(&format!(
+                "no recorded lead conversation occupies slot {slot} for owner {owner}; dispatch one with `codex-harness lead dispatch` before continuing it"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the recorded lead conversation receipt {} is not JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    let recorded_slot = value["slot"]["index"].as_u64();
+    if recorded_slot != Some(u64::from(slot)) {
+        return Err(invalid(&format!(
+            "lead continuation refused: receipt {} records slot {}, not the requested slot {slot}",
+            receipt.display(),
+            recorded_slot
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "none".into())
+        )));
+    }
+    let recorded_owner = value["slot"]["owner"].as_str();
+    if recorded_owner != Some(owner) {
+        return Err(invalid(&format!(
+            "lead continuation refused: slot {slot} is recorded for owner {}, not {owner}",
+            recorded_owner.unwrap_or("none")
+        )));
+    }
+    let recorded_profile = value["profile"].as_str();
+    if recorded_profile != Some(profile) {
+        return Err(invalid(&format!(
+            "lead continuation refused: the recorded conversation uses profile {}, but the configured lead_profile is {profile}; a continuation never switches profiles",
+            recorded_profile.unwrap_or("unrecorded")
+        )));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Lead.label() => {}
+        Some(role) => {
+            return Err(invalid(&format!(
+                "lead continuation refused: slot {slot} owner {owner} records role {}, not {}; continuing it under another role would present a role the conversation does not have",
+                role.role,
+                Role::Lead.label()
+            )));
+        }
+        None => {
+            return Err(invalid(&format!(
+                "lead continuation refused: the receipt for slot {slot} owner {owner} does not record its responsibility role; start a fresh bounded lead conversation instead of continuing an unverified one"
+            )));
+        }
+    }
+    let observed = value["observation"]["session"].as_str();
+    let previous = value["observation"]["previousSession"].as_str();
+    let resumed = value["control"]["resumeSession"].as_str();
+    for recorded in [observed, previous, resumed].into_iter().flatten() {
+        if recorded != session {
+            return Err(invalid(&format!(
+                "lead continuation refused: the recorded conversation names session {recorded}, not the exact requested session {session}"
+            )));
+        }
+    }
+    if observed.is_none() && previous.is_none() && resumed.is_none() {
+        return Err(invalid(&format!(
+            "lead continuation refused: the receipt for slot {slot} owner {owner} records no exact session; the conversation to continue cannot be proved"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| {
+            invalid(&format!(
+                "lead continuation refused: the receipt for slot {slot} owner {owner} records no run generation; a new accepted run cannot be distinguished from the predecessor"
+            ))
+        })?;
+    let Some(record) = task_worktree::load_slot_record(codex_home, source, slot)? else {
+        return Err(invalid(&format!(
+            "lead continuation refused: slot {slot} has no recorded binding for owner {owner}; preserved work cannot be proved"
+        )));
+    };
+    match record.owner.as_deref() {
+        Some(existing) if existing == owner => {}
+        Some(other) => {
+            return Err(invalid(&format!(
+                "lead continuation refused: the slot record binds slot {slot} to {other}, not {owner}"
+            )));
+        }
+        // A clean slot returns to the pool with no owner after reconciliation.
+        // The receipt and preserved checkout still prove this exact
+        // conversation, and `adopt_slot` rebinds the named owner without a
+        // reset; a recorded foreign owner is still refused above.
+        None => {}
+    }
+    if !record.path.is_dir() {
+        return Err(invalid(&format!(
+            "lead continuation refused: the recorded checkout {} for slot {slot} is missing; the preserved work cannot be continued",
+            record.path.display()
+        )));
+    }
+    let recorded_checkout = value["slot"]["path"].as_str().ok_or_else(|| {
+        invalid(&format!(
+            "lead continuation refused: the receipt for slot {slot} records no checkout path"
+        ))
+    })?;
+    let recorded_checkout = fs::canonicalize(recorded_checkout).map_err(|error| {
+        invalid(&format!(
+            "lead continuation refused: the receipt checkout {recorded_checkout} cannot be resolved: {error}"
+        ))
+    })?;
+    let bound_checkout = fs::canonicalize(&record.path).map_err(|error| {
+        invalid(&format!(
+            "lead continuation refused: the slot checkout {} cannot be resolved: {error}",
+            record.path.display()
+        ))
+    })?;
+    if recorded_checkout != bound_checkout {
+        return Err(invalid(&format!(
+            "lead continuation refused: the receipt names checkout {}, but slot {slot} is bound to {}",
+            recorded_checkout.display(),
+            bound_checkout.display()
+        )));
+    }
+    Ok(LeadContinuationPredecessor {
+        generation: generation.to_owned(),
+    })
+}
+
+/// Reads back the receipt the shared continuation owner just wrote. Every
+/// identity fact is checked against the request and the predecessor: the same
+/// slot/owner, the configured lead profile, the lead role, the exact resumed
+/// session on a resume route, and a new run generation. Any fresh
+/// conversation, profile or role fallback is refused instead of reported as an
+/// accepted continuation.
+fn accepted_lead_continuation(
+    paths: &RunPaths,
+    request: &VisibleLeadContinuation,
+    session: &str,
+    profile: &str,
+    predecessor_generation: &str,
+    exit_code: i32,
+) -> io::Result<VisibleLeadContinuationAccepted> {
+    let bytes = fs::read(&paths.receipt)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the continuation receipt {} is not JSON: {error}",
+            paths.receipt.display()
+        ))
+    })?;
+    if value["slot"]["index"].as_u64() != Some(u64::from(request.slot)) {
+        return Err(invalid(&format!(
+            "the continuation receipt does not name the requested slot {}",
+            request.slot
+        )));
+    }
+    if value["slot"]["owner"].as_str() != Some(request.owner.as_str()) {
+        return Err(invalid(&format!(
+            "the continuation receipt does not name the requested owner {}",
+            request.owner
+        )));
+    }
+    if value["profile"].as_str() != Some(profile) {
+        return Err(invalid(&format!(
+            "the continuation receipt records profile {}, not the configured lead_profile {profile}; a profile fallback is not a same-lead continuation",
+            value["profile"].as_str().unwrap_or("unrecorded")
+        )));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Lead.label() => {}
+        Some(role) => {
+            return Err(invalid(&format!(
+                "the continuation receipt records role {}, not {}; a role fallback is not accepted",
+                role.role,
+                Role::Lead.label()
+            )));
+        }
+        None => {
+            return Err(invalid(
+                "the continuation receipt records no responsibility role; a same-lead continuation cannot be proved",
+            ));
+        }
+    }
+    let resumed = value["control"]["resumeSession"].as_str();
+    if resumed != Some(session) {
+        return Err(invalid(&format!(
+            "the continuation did not resume the exact lead session {session}; the receipt records {}; a fresh conversation is never accepted as a continuation",
+            resumed.unwrap_or("no resumed session")
+        )));
+    }
+    if !value["control"]["originalAssignment"].is_null() {
+        return Err(invalid(
+            "the continuation receipt records a restart assignment; a fresh conversation is never accepted as a same-lead continuation",
+        ));
+    }
+    if value["observation"]["previousSession"].as_str() != Some(session) {
+        return Err(invalid(&format!(
+            "the continuation receipt does not retain the resumed session {session} as its previous session"
+        )));
+    }
+    if let Some(observed) = value["observation"]["session"].as_str()
+        && observed != session
+    {
+        return Err(invalid(&format!(
+            "the continuation receipt observed session {observed}, not the resumed session {session}; a conversation switch is not accepted"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| invalid("the continuation receipt records no run generation"))?;
+    if generation == predecessor_generation {
+        return Err(invalid(
+            "the continuation receipt still carries the predecessor generation; no new accepted run is recorded",
+        ));
+    }
+    let checkout = value["slot"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("the continuation receipt records no checkout path"))?;
+    Ok(VisibleLeadContinuationAccepted {
+        slot: request.slot,
+        owner: request.owner.clone(),
+        session: session.to_owned(),
+        generation: generation.to_owned(),
+        profile: profile.to_owned(),
+        role: Role::Lead,
+        exit_code,
+        checkout,
+        receipt: paths.receipt.clone(),
+        result: paths.result.clone(),
+        detail: paths.detail.clone(),
+    })
 }
 
 /// The lifecycle fact one controller needs from a dispatch receipt. It is a
@@ -2818,6 +3511,31 @@ fn refuse_a_live_owner(codex_home: &Path, source: &Path, owner: &str) -> io::Res
         ))),
         None => Ok(()),
     }
+}
+
+/// A slot is hosted by at most one live identity. The exact owner is refused
+/// by `refuse_a_live_owner`; this sibling check closes a live lease held by a
+/// different identity on the same slot before a continuation adopts it.
+fn refuse_a_live_slot(codex_home: &Path, source: &Path, slot: u32, owner: &str) -> io::Result<()> {
+    let dir = task_worktree::pool_state_dir(codex_home, source)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for lease in entries
+        .flatten()
+        .filter_map(|entry| read_lease(&entry.path()))
+    {
+        if lease.index == slot && lease.owner != owner && lease_live(&lease) {
+            return Err(invalid(&format!(
+                "slot {slot} is already live in session {} ({}); stop it before continuing the recorded owner {owner}",
+                lease.owner,
+                lease.path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Process identity of the session host that holds a slot. The lease is what
@@ -9779,6 +10497,452 @@ mod tests {
         );
         assert_ne!(control.assignment, prompt);
         assert_eq!(control.presentation, NativePresentation::NativeTui);
+    }
+
+    /// Exercise the same wrapper body without the marker inherited by the
+    /// test process itself.
+    fn continue_lead_for_test(
+        request: &VisibleLeadContinuation,
+    ) -> io::Result<VisibleLeadContinuationAccepted> {
+        continue_visible_lead_conversation_with_markers(request, None, None)
+    }
+
+    struct LeadContinuationCase {
+        root: PathBuf,
+        source: PathBuf,
+        home: PathBuf,
+        binding: SlotBinding,
+        receipt: PathBuf,
+        session: String,
+    }
+
+    impl Drop for LeadContinuationCase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn lead_continuation_case(name: &str) -> LeadContinuationCase {
+        let root = std::env::temp_dir().join(format!(
+            "executor-lead-continuation-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("proj");
+        let home = root.join("home");
+        let checkout = root.join("proj-wt1");
+        fs::create_dir_all(source.join("global")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(
+            source.join("global/orchestration.toml"),
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nworktree_pool_size = 1\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\n",
+        )
+        .unwrap();
+        let binding = SlotBinding {
+            index: 1,
+            path: checkout,
+            source: source.clone(),
+            repository: Some(source.clone()),
+            owner: "lead-exp-1".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+            task: None,
+            handle: None,
+        };
+        write_test_slot_record(&home, &source, &binding);
+        let receipt = run_paths(&home, &source, 1).unwrap().receipt;
+        fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4".to_owned();
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&lead_continuation_receipt(&binding, "gen-1", &session))
+                .unwrap(),
+        )
+        .unwrap();
+        LeadContinuationCase {
+            root,
+            source,
+            home,
+            binding,
+            receipt,
+            session,
+        }
+    }
+
+    fn lead_continuation_receipt(
+        binding: &SlotBinding,
+        generation: &str,
+        session: &str,
+    ) -> serde_json::Value {
+        json!({
+            "schema": 1,
+            "profile": "default",
+            "slot": {
+                "index": binding.index,
+                "owner": binding.owner,
+                "path": binding.path,
+            },
+            "control": {
+                "schema": 1,
+                "assignment": "frame the measured unit",
+                "identity": {
+                    "profile": "default",
+                    "model": null,
+                    "modelProvider": null,
+                    "reasoningEffort": null,
+                },
+                "presentation": "native-tui",
+                "role": {
+                    "role": "lead",
+                    "revision": "fixture-revision",
+                    "args": [],
+                    "saved": "fixture-revision",
+                },
+                "resumeSession": null,
+            },
+            "observation": {
+                "coverage": "native",
+                "state": "completed",
+                "session": session,
+            },
+            "originatingLead": {"runGeneration": generation},
+        })
+    }
+
+    fn lead_continuation_request(case: &LeadContinuationCase) -> VisibleLeadContinuation {
+        VisibleLeadContinuation {
+            codex_home: case.home.clone(),
+            source: case.source.clone(),
+            slot: 1,
+            owner: "lead-exp-1".into(),
+            session: case.session.clone(),
+            prompt: "Review the executor result and decide whether it is accepted.".into(),
+        }
+    }
+
+    /// A continuation never adopts a slot from a mismatched receipt or slot
+    /// binding. Every refusal happens before the shared continuation owner can
+    /// record a new generation or touch the preserved work.
+    #[test]
+    fn lead_continuation_refuses_mismatched_identity_before_effects() {
+        let case = lead_continuation_case("identity");
+        let original_receipt = fs::read(&case.receipt).unwrap();
+        let slot_record = task_worktree::slot_record_path(&case.home, &case.source, 1).unwrap();
+        let original_slot = fs::read(&slot_record).unwrap();
+
+        let mut request = lead_continuation_request(&case);
+        request.owner = "lead-other".into();
+        let error = continue_lead_for_test(&request).unwrap_err().to_string();
+        assert!(
+            error.contains("recorded for owner lead-exp-1, not lead-other"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+        assert_eq!(fs::read(&slot_record).unwrap(), original_slot);
+
+        request = lead_continuation_request(&case);
+        request.session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23ff".into();
+        let error = continue_lead_for_test(&request).unwrap_err().to_string();
+        assert!(error.contains("not the exact requested session"), "{error}");
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["profile"] = json!("ds");
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uses profile ds"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["control"]["role"]["role"] = json!("executor");
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records role executor, not lead"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["control"]["role"] = serde_json::Value::Null;
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not record its responsibility role"),
+            "{error}"
+        );
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let slot_two = run_paths(&case.home, &case.source, 2).unwrap().receipt;
+        fs::create_dir_all(slot_two.parent().unwrap()).unwrap();
+        fs::write(&slot_two, &original_receipt).unwrap();
+        request = lead_continuation_request(&case);
+        request.slot = 2;
+        let error = continue_lead_for_test(&request).unwrap_err().to_string();
+        assert!(
+            error.contains("records slot 1, not the requested slot 2"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&slot_two).unwrap(), original_receipt);
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["originatingLead"] = serde_json::Value::Null;
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records no run generation"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["observation"] = json!({"coverage": "native", "state": "completed"});
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records no exact session"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut record: serde_json::Value = serde_json::from_slice(&original_slot).unwrap();
+        record["owner"] = json!("lead-other");
+        fs::write(&slot_record, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("slot record binds slot 1 to lead-other, not lead-exp-1"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+        fs::write(&slot_record, &original_slot).unwrap();
+    }
+
+    /// Both forms of live ownership refuse before an effect: the exact owner
+    /// already hosting the slot and a different identity holding the same
+    /// slot.
+    #[test]
+    fn lead_continuation_refuses_a_live_slot_before_effects() {
+        let case = lead_continuation_case("live");
+        let original = fs::read(&case.receipt).unwrap();
+        record_lease(&case.home, &case.binding).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already live in slot 1"), "{error}");
+        assert_eq!(fs::read(&case.receipt).unwrap(), original);
+        remove_lease(&case.home, &case.binding).unwrap();
+
+        let program = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        let path = lease_path(&case.home, &case.source, 1).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&SessionLease {
+                schema: 1,
+                owner: "lead-other".into(),
+                index: 1,
+                path: case.binding.path.clone(),
+                pid: identity.pid,
+                created: identity.creation_time,
+                program,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("slot 1 is already live in session lead-other"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original);
+    }
+
+    /// A missing recorded conversation or slot binding cannot be adopted as a
+    /// fresh conversation: both refuse before a launch and leave the receipt
+    /// untouched.
+    #[test]
+    fn lead_continuation_refuses_absent_work_without_adopting_a_slot() {
+        let case = lead_continuation_case("absent");
+        let slot_record = task_worktree::slot_record_path(&case.home, &case.source, 1).unwrap();
+        let original_slot = fs::read(&slot_record).unwrap();
+        let original_receipt = fs::read(&case.receipt).unwrap();
+        fs::remove_file(&case.receipt).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no recorded lead conversation occupies slot 1"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&slot_record).unwrap(), original_slot);
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        fs::remove_file(&slot_record).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has no recorded binding for owner lead-exp-1"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+        fs::write(&slot_record, &original_slot).unwrap();
+
+        fs::remove_dir_all(&case.binding.path).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("checkout") && error.contains("is missing"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+    }
+
+    /// A clean slot legitimately returns to the pool with no recorded owner.
+    /// The receipt, session, checkout and preserved binding still prove the
+    /// exact conversation, so continuation may rebind that owner through
+    /// `adopt_slot`; a different recorded owner is still refused.
+    #[test]
+    fn lead_continuation_predecessor_accepts_a_clean_slot_but_refuses_a_foreign_owner() {
+        let case = lead_continuation_case("clean-slot");
+        let slot_record = task_worktree::slot_record_path(&case.home, &case.source, 1).unwrap();
+        let original_slot = fs::read(&slot_record).unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&original_slot).unwrap();
+        record["state"] = json!("free");
+        record["owner"] = serde_json::Value::Null;
+        fs::write(&slot_record, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let predecessor = lead_continuation_predecessor(
+            &case.receipt,
+            &case.home,
+            &case.source,
+            1,
+            "lead-exp-1",
+            &case.session,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(predecessor.generation, "gen-1");
+
+        record["owner"] = json!("lead-other");
+        fs::write(&slot_record, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let error = lead_continuation_predecessor(
+            &case.receipt,
+            &case.home,
+            &case.source,
+            1,
+            "lead-exp-1",
+            &case.session,
+            "default",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("slot record binds slot 1 to lead-other, not lead-exp-1"),
+            "{error}"
+        );
+        fs::write(&slot_record, &original_slot).unwrap();
+    }
+
+    /// The accepted continuation is the newly written receipt, never the
+    /// predecessor: the same slot/owner/session, the configured lead profile,
+    /// `Role::Lead`, a resume route and a different run generation are all
+    /// required. A fresh conversation or identity fallback is refused.
+    #[test]
+    fn accepted_lead_continuation_requires_new_identity_and_exact_resume_route() {
+        let case = lead_continuation_case("accepted");
+        let request = lead_continuation_request(&case);
+        let paths = run_paths(&case.home, &case.source, 1).unwrap();
+        let mut receipt = lead_continuation_receipt(&case.binding, "gen-2", &case.session);
+        receipt["control"]["resumeSession"] = json!(case.session);
+        receipt["observation"]["previousSession"] = json!(case.session);
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+        let accepted =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap();
+        assert_eq!(accepted.slot, 1);
+        assert_eq!(accepted.owner, "lead-exp-1");
+        assert_eq!(accepted.session, case.session);
+        assert_eq!(accepted.generation, "gen-2");
+        assert_eq!(accepted.profile, "default");
+        assert_eq!(accepted.role, Role::Lead);
+        assert_eq!(accepted.receipt, paths.receipt);
+        assert_eq!(accepted.result, paths.result);
+        assert_eq!(accepted.detail, paths.detail);
+        assert_eq!(accepted.exit_code, 0);
+        assert_eq!(accepted.checkout, case.binding.path);
+
+        receipt["originatingLead"]["runGeneration"] = json!("gen-1");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("still carries the predecessor generation"),
+            "{error}"
+        );
+
+        receipt["originatingLead"]["runGeneration"] = json!("gen-2");
+        receipt["control"]["resumeSession"] = serde_json::Value::Null;
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("did not resume the exact lead session"),
+            "{error}"
+        );
+
+        receipt["control"]["resumeSession"] = json!(case.session);
+        receipt["control"]["originalAssignment"] = json!("restart the work");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("restart assignment"), "{error}");
+
+        receipt["control"]["originalAssignment"] = serde_json::Value::Null;
+        receipt["control"]["role"]["role"] = json!("executor");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("records role executor, not lead"), "{error}");
+
+        receipt["control"]["role"]["role"] = json!("lead");
+        receipt["profile"] = json!("ds");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("profile ds"), "{error}");
+
+        receipt["profile"] = json!("default");
+        receipt["observation"]["session"] = json!("01a0c719-f4d4-7880-a9d2-1a96ee0f23ff");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("conversation switch"), "{error}");
     }
 
     #[test]

@@ -33,6 +33,14 @@
 //! - `HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_FILE` / `..._SOLUTION_TEXT`: the
 //!   committed solution the controlled agent leaves in its bound slot
 //!   (default `solution.txt` = `solved`); an empty text skips the commit.
+//! - `HARNESS_IMPROVEMENT_FIXTURE_SCENARIO=measured-workflow` with
+//!   `HARNESS_IMPROVEMENT_FIXTURE_ROLE=lead-frame|executor|lead-review|correction|lead-acceptance`:
+//!   one explicit turn of a synthetic measured workflow. Only `executor` and
+//!   `correction` commit the bound solution; every lead turn performs no
+//!   executor commit. Each completed turn records its own native rollout and
+//!   an append-only role receipt under `CODEX_HOME`, so repeated turns on one
+//!   lead session retain distinct identities. Without the scenario both the
+//!   message and the unconditional commit keep the legacy fixture behavior.
 //! - `tool-probes/<arm>.json` beside the comparison run, when present: the
 //!   controlled agent resolves each named unqualified command through the
 //!   host-supplied environment and executes it only when the hit is under the
@@ -66,6 +74,106 @@ const INHERITED_MUTATOR_SERVER: &str = "inherited-mutator";
 const INHERITED_DOTTED_SERVER: &str = "odd.name";
 const INHERITED_MUTATOR_TOOL: &str = "write_owned_target";
 const INHERITED_APP: &str = "inherited-app";
+const WORKFLOW_SCENARIO: &str = "measured-workflow";
+const WORKFLOW_RECORD_FILE: &str = "fixture-workflow-turns.jsonl";
+
+/// One explicit synthetic turn of the measured workflow. The default fixture
+/// is the legacy one-turn executor double; the synthetic mode names a role so
+/// a lead turn can never commit executor work by sharing the executor fixture.
+#[derive(Clone, Debug)]
+struct FixtureTurn {
+    role: Option<&'static str>,
+    id: &'static str,
+    message_id: &'static str,
+    response_id: &'static str,
+    message: &'static str,
+    commits: bool,
+}
+
+impl FixtureTurn {
+    fn legacy() -> Self {
+        Self {
+            role: None,
+            id: TURN,
+            message_id: "message-1",
+            response_id: "response-1",
+            message: FINAL_MESSAGE,
+            commits: true,
+        }
+    }
+}
+
+fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
+    let scenario = env::var("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO").ok();
+    let Some(scenario) = scenario.as_deref() else {
+        return Ok(None);
+    };
+    if scenario != WORKFLOW_SCENARIO {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unknown HARNESS_IMPROVEMENT_FIXTURE_SCENARIO {scenario:?}; the only synthetic scenario is {WORKFLOW_SCENARIO}"
+            ),
+        ));
+    }
+    let role = env::var("HARNESS_IMPROVEMENT_FIXTURE_ROLE").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HARNESS_IMPROVEMENT_FIXTURE_ROLE is required with the measured-workflow scenario",
+        )
+    })?;
+    let turn = match role.as_str() {
+        "lead-frame" => FixtureTurn {
+            role: Some("lead-frame"),
+            id: "fixture-turn-lead-frame",
+            message_id: "message-lead-frame",
+            response_id: "response-lead-frame",
+            message: "lead-frame: framed the measured task and participants; no executor work committed",
+            commits: false,
+        },
+        "executor" => FixtureTurn {
+            role: Some("executor"),
+            id: "fixture-turn-executor",
+            message_id: "message-executor",
+            response_id: "response-executor",
+            message: "executor: completed the measured task and committed its solution",
+            commits: true,
+        },
+        "lead-review" => FixtureTurn {
+            role: Some("lead-review"),
+            id: "fixture-turn-lead-review",
+            message_id: "message-lead-review",
+            response_id: "response-lead-review",
+            message: "lead-review: reviewed the executor artifact; no executor work committed",
+            commits: false,
+        },
+        "correction" => FixtureTurn {
+            role: Some("correction"),
+            id: "fixture-turn-correction",
+            message_id: "message-correction",
+            response_id: "response-correction",
+            message: "correction: applied the bounded correction requested by the lead",
+            commits: true,
+        },
+        "lead-acceptance" => FixtureTurn {
+            role: Some("lead-acceptance"),
+            id: "fixture-turn-lead-acceptance",
+            message_id: "message-lead-acceptance",
+            response_id: "response-lead-acceptance",
+            message: "lead-acceptance: accepted the reviewed result; no executor work committed",
+            commits: false,
+        },
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown HARNESS_IMPROVEMENT_FIXTURE_ROLE {role:?}; expected lead-frame, executor, lead-review, correction or lead-acceptance"
+                ),
+            ));
+        }
+    };
+    Ok(Some(turn))
+}
 
 /// Serves one `app-server` invocation. Returns the process exit code; the
 /// caller's Job owns termination, exactly as it owns the real child.
@@ -103,6 +211,8 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
     let token_file = PathBuf::from(token_file);
     let session =
         env::var("HARNESS_IMPROVEMENT_FIXTURE_SESSION").unwrap_or_else(|_| DEFAULT_SESSION.into());
+    let synthetic = synthetic_turn()?;
+    let turn = synthetic.clone().unwrap_or_else(FixtureTurn::legacy);
     let route = installed_route()?;
     let rollout_model =
         env::var("HARNESS_IMPROVEMENT_FIXTURE_MODEL").unwrap_or_else(|_| route.model.clone());
@@ -143,7 +253,7 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             server.answer("thread/name/set", Answer::Result(json!({})));
             server.answer(
                 "turn/start",
-                Answer::Result(json!({"turn": {"id": TURN, "status": "inProgress"}})),
+                Answer::Result(json!({"turn": {"id": turn.id, "status": "inProgress"}})),
             );
             // Until the assignment is submitted this is the fresh empty thread
             // a pre-submission check must see (the host refuses a conversation
@@ -159,7 +269,7 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             server.push(json!({"method": "thread/started", "params": {"thread": {"id": session_for_thread.clone()}}}));
             server.push(json!({
             "method": "turn/started",
-            "params": {"threadId": session_for_thread.clone(), "turn": {"id": TURN, "status": "inProgress"}},
+            "params": {"threadId": session_for_thread.clone(), "turn": {"id": turn.id, "status": "inProgress"}},
         }));
             // Completion is pushed by the agent thread after its owned work,
             // including command-resolution evidence. Pushing it here lets the
@@ -180,7 +290,7 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                 if !server.requests_for("turn/start").is_empty() {
                     let control = control_mode();
                     if control != "complete" {
-                        record_control_marker(&session, &control);
+                        record_control_marker(&session, &control, turn.id);
                     }
                     if control == "hold" {
                         // The submitted turn stays open: the thread record
@@ -192,7 +302,7 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                             "thread/read",
                             Answer::Result(json!({"thread": {
                                 "id": session.clone(),
-                                "turns": [{"id": TURN, "status": "inProgress", "items": []}],
+                                "turns": [{"id": turn.id, "status": "inProgress", "items": []}],
                             }})),
                         );
                         server.answer("turn/interrupt", Answer::Result(json!({})));
@@ -213,14 +323,16 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                         Answer::Result(json!({"thread": {
                             "id": session.clone(),
                             "turns": [{
-                                "id": TURN,
+                                "id": turn.id,
                                 "status": "completed",
-                                "items": [{"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE}],
+                                "items": [{"id": turn.message_id, "type": "agentMessage", "text": turn.message}],
                             }],
                         }})),
                     );
                     record_selected_tools();
-                    let _ = commit_solution();
+                    if turn.commits {
+                        let _ = commit_solution();
+                    }
                     let heavy = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok();
                     let command_bound = heavy.then(|| run_owned_heavy(&server, &session));
                     let message_ms = unix_ms();
@@ -231,13 +343,17 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                         !heavy,
                         command_bound,
                         message_ms,
+                        &turn,
                     );
+                    if turn.role.is_some() {
+                        let _ = record_workflow_turn(&session, &turn, message_ms);
+                    }
                     server.push(json!({
                         "method": "item/started",
                         "params": {
                             "threadId": session.clone(),
                             "startedAtMs": message_ms,
-                            "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
+                            "item": {"id": turn.message_id, "type": "agentMessage", "text": turn.message},
                         },
                     }));
                     server.push(json!({
@@ -246,12 +362,12 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                             "threadId": session.clone(),
                             "startedAtMs": message_ms,
                             "completedAtMs": message_ms,
-                            "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
+                            "item": {"id": turn.message_id, "type": "agentMessage", "text": turn.message},
                         },
                     }));
                     server.push(json!({
                         "method": "turn/completed",
-                        "params": {"threadId": session.clone(), "turn": {"id": TURN, "status": "completed"}},
+                        "params": {"threadId": session.clone(), "turn": {"id": turn.id, "status": "completed"}},
                     }));
                     return;
                 }
@@ -1165,7 +1281,7 @@ fn control_mode() -> String {
 /// Records the assignment this child observed, when the caller named a marker
 /// path, so a model-free check waits for the child's own observation of the
 /// `hold` or `fail` mode instead of guessing from process timing.
-fn record_control_marker(session: &str, control: &str) {
+fn record_control_marker(session: &str, control: &str, turn_id: &str) {
     let Some(path) = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER") else {
         return;
     };
@@ -1177,9 +1293,67 @@ fn record_control_marker(session: &str, control: &str) {
         "schema": 1,
         "control": control,
         "session": session,
-        "turn": TURN,
+        "turn": turn_id,
     });
     let _ = fs::write(path, record.to_string());
+}
+
+/// Appends one synthetic workflow turn receipt under the arm's own
+/// `CODEX_HOME`. The receipt is not a controller protocol: it lets a
+/// model-free check prove which role actually ran, whether that role could
+/// commit, and whether the later lead turns observed the earlier participant
+/// artifacts. Nothing is written into the measured checkout.
+fn record_workflow_turn(session: &str, turn: &FixtureTurn, message_ms: i64) -> io::Result<()> {
+    let home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("the workflow receipt requires CODEX_HOME"))?;
+    let path = home.join(WORKFLOW_RECORD_FILE);
+    let prior = fs::read_to_string(&path).unwrap_or_default();
+    let prior_roles = prior
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| record["role"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let checkout = env::current_dir()?;
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&checkout)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let solution = fs::read_to_string(checkout.join("solution.txt")).ok();
+    let role = turn.role.unwrap_or("legacy");
+    let review_observed = prior_roles.iter().any(|role| role == "lead-review");
+    let correction_observed = prior_roles.iter().any(|role| role == "correction");
+    let lead_frame_observed = prior_roles.iter().any(|role| role == "lead-frame");
+    let record = json!({
+        "schema": 1,
+        "scenario": WORKFLOW_SCENARIO,
+        "role": role,
+        "turnId": turn.id,
+        "messageId": turn.message_id,
+        "responseId": turn.response_id,
+        "session": session,
+        "completedAtMs": message_ms,
+        "committed": turn.commits,
+        "head": head,
+        "solution": solution,
+        "leadFrameObserved": lead_frame_observed,
+        "reviewObserved": review_observed,
+        "correctionObserved": correction_observed,
+        "priorRoles": prior_roles,
+    });
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    use std::io::Write as _;
+    writeln!(file, "{record}")?;
+    Ok(())
 }
 
 /// The installed client route of this arm home: the explicit configuration the
@@ -1498,6 +1672,12 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {
 /// Writes the native rollout the observation owner reads for this session,
 /// with the installed route (or the explicitly overridden facts).
 ///
+/// The legacy (no-scenario) fixture keeps its single-turn file exactly: the
+/// same identities and one overwrite per invocation. A synthetic measured
+/// workflow turn appends its own turn to the same per-session rollout so the
+/// accounting owner can see every participant, retry and role on one retained
+/// native session; the session metadata line is written once.
+///
 /// `wait_call` names a single tool call that is the whole response. It is not
 /// assumed idle: the accounting owner still has to match it to one blocked
 /// admission. Publication time is not written as a request interval.
@@ -1508,22 +1688,48 @@ fn write_rollout(
     include_usage: bool,
     command_bound: Option<OwnedHeavy>,
     message_ms: i64,
+    turn: &FixtureTurn,
 ) -> io::Result<()> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("the fixture rollout requires CODEX_HOME"))?;
     let sessions = home.join("sessions").join("2026").join("10").join("01");
     fs::create_dir_all(&sessions)?;
-    let mut lines = vec![
-        json!({
+    let path = sessions.join(format!("rollout-{session}.jsonl"));
+    let synthetic = turn.role.is_some();
+    // Synthetic turns share one session rollout. Every earlier turn keeps its
+    // own bytes and only the first write carries the session metadata line;
+    // the legacy fixture keeps its single overwritten turn.
+    let mut prefix = String::new();
+    let mut lines = Vec::new();
+    if synthetic {
+        match fs::read_to_string(&path) {
+            Ok(prior) if !prior.is_empty() => {
+                prefix = prior;
+                if !prefix.ends_with('\n') {
+                    prefix.push('\n');
+                }
+            }
+            Ok(_) => lines.push(json!({
+                "type": "session_meta",
+                "payload": {"id": session, "base_instructions": "fixture"},
+            })),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => lines.push(json!({
+                "type": "session_meta",
+                "payload": {"id": session, "base_instructions": "fixture"},
+            })),
+            Err(error) => return Err(error),
+        }
+    } else {
+        lines.push(json!({
             "type": "session_meta",
             "payload": {"id": session, "base_instructions": "fixture"},
-        }),
-        json!({
-            "type": "turn_context",
-            "payload": {"model": model, "effort": effort, "turn_id": TURN},
-        }),
-    ];
+        }));
+    }
+    lines.push(json!({
+        "type": "turn_context",
+        "payload": {"model": model, "effort": effort, "turn_id": turn.id},
+    }));
     if let Some(command) = command_bound {
         let mut item = json!({
             "type": "CommandExecution",
@@ -1537,7 +1743,7 @@ fn write_rollout(
             "type": "event_msg",
             "payload": {
                 "type": "item_completed",
-                "turn_id": TURN,
+                "turn_id": turn.id,
                 "started_at_ms": command.started_at_ms,
                 "completed_at_ms": command.completed_at_ms,
                 "item": item
@@ -1547,10 +1753,10 @@ fn write_rollout(
             "type": "event_msg",
             "payload": {
                 "type": "item_completed",
-                "turn_id": TURN,
+                "turn_id": turn.id,
                 "started_at_ms": message_ms,
                 "completed_at_ms": message_ms,
-                "item": {"type": "AgentMessage", "id": "message-1"}
+                "item": {"type": "AgentMessage", "id": turn.message_id}
             }
         }));
         lines.push(json!({
@@ -1564,8 +1770,12 @@ fn write_rollout(
         lines.push(json!({
             "type": "token_usage_record",
             "payload": {
-                "response_id": "response-heavy",
-                "turn_id": TURN,
+                "response_id": if synthetic {
+                    format!("{}-heavy", turn.response_id)
+                } else {
+                    "response-heavy".to_owned()
+                },
+                "turn_id": turn.id,
                 "usage": {
                     "input_tokens": 12,
                     "cached_input_tokens": 0,
@@ -1579,7 +1789,7 @@ fn write_rollout(
         lines.push(json!({
             "type": "token_usage_record",
             "payload": {
-                "response_id": "response-1",
+                "response_id": turn.response_id,
                 "usage": {
                     "input_tokens": 100,
                     "cached_input_tokens": 40,
@@ -1595,8 +1805,7 @@ fn write_rollout(
         .map(|line| serde_json::to_string(line).map_err(io::Error::other))
         .collect::<io::Result<Vec<_>>>()?
         .join("\n");
-    fs::write(
-        sessions.join(format!("rollout-{session}.jsonl")),
-        format!("{text}\n"),
-    )
+    prefix.push_str(&text);
+    prefix.push('\n');
+    fs::write(path, prefix)
 }

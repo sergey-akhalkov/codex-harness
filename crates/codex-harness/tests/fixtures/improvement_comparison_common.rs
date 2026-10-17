@@ -523,7 +523,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(proj.join("Cargo.lock"), "# fixture lock\n").unwrap();
-        for directory in ["global/agents", ".agents/skills/arm-skill"] {
+        for directory in ["global/agents", "global/roles", ".agents/skills/arm-skill"] {
             fs::create_dir_all(proj.join(directory)).unwrap();
         }
         // Git does not track empty directories: keep the agents directory
@@ -559,6 +559,23 @@ impl Fixture {
         fs::write(
             proj.join(".agents/skills/arm-skill/SKILL.md"),
             "---\nname: arm-skill\ndescription: Fixture skill.\n---\n\nfixture skill body\n",
+        )
+        .unwrap();
+        // Role resolution happens inside every real arm conversation; the kit
+        // source therefore carries the same role inputs an installed kit has.
+        fs::write(
+            proj.join("global/roles.toml"),
+            "schema = 1\nshared_skills = [\"arm-skill\"]\n\n[roles.lead]\ninstructions = \"global/roles/lead.md\"\nskills = []\n\n[roles.executor]\ninstructions = \"global/roles/executor.md\"\nskills = []\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("global/roles/lead.md"),
+            "# Lead role\nfixture lead role instructions\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("global/roles/executor.md"),
+            "# Executor role\nfixture executor role instructions\n",
         )
         .unwrap();
         let init = openspec(
@@ -1892,16 +1909,24 @@ pub(super) fn attempt_receipt(fixture: &Fixture, attempt_id: &str) -> PathBuf {
 }
 
 /// Bounded wait until the host's own observation record of one attempt reached
-/// a terminal state. The host writes it while the visible console runs.
+/// a terminal state **and** recorded the terminal exit status. A completed
+/// state is written when the control driver sees the turn's terminal event,
+/// before the host finalizes the final message and exit code; returning early
+/// would let a caller restore that pre-finalization record over the host's own
+/// completed write. Only the finalized record is a settled attempt.
 pub(super) fn wait_for_terminal_receipt(receipt: &Path) -> Value {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
         if let Ok(bytes) = fs::read(receipt)
             && let Ok(record) = serde_json::from_slice::<Value>(&bytes)
-            && matches!(
-                record["observation"]["state"].as_str(),
-                Some("completed" | "failed" | "defect" | "interrupted" | "stopped")
-            )
+            && let Some(state) = record["observation"]["state"].as_str()
+            && match state {
+                "completed" | "failed" | "defect" => {
+                    record["observation"]["exitCode"].as_i64().is_some()
+                }
+                "interrupted" | "stopped" => true,
+                _ => false,
+            }
         {
             return record;
         }
