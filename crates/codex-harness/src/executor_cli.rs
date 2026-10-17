@@ -5444,6 +5444,7 @@ fn host_control_conversation(
     // thread's items, never from a transport acknowledgement; the surface
     // already held the terminal record through its tail grace, so the
     // accepted turn's items are read directly at this boundary.
+    let accepted_turn = conversation.turn().map(|turn| turn.turn_id.clone());
     let (final_message, cause) = match state {
         Lifecycle::Completed => match conversation.final_message() {
             Ok(FinalMessage::Present(text)) => {
@@ -5485,6 +5486,7 @@ fn host_control_conversation(
     };
     let exit = tracker.finish_control(&ControlOutcome {
         state: state.receipt_state(),
+        turn: accepted_turn.as_deref(),
         final_message,
         cause: cause.as_deref(),
     });

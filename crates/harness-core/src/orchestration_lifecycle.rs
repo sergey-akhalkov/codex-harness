@@ -379,6 +379,7 @@ mod tests {
             requirements: "synthetic".into(),
             stopped: true,
             active_lead: "default".into(),
+            purpose: Some("ordinary".into()),
             assignments: vec![Assignment {
                 id: "a1".into(),
                 profile: "ds".into(),
@@ -387,6 +388,7 @@ mod tests {
                 attempt: 1,
                 accepted: None,
                 defect: None,
+                purpose: Some("ordinary".into()),
             }],
         };
         fs::create_dir_all(home.join("worktrees/exec/repo")).unwrap();

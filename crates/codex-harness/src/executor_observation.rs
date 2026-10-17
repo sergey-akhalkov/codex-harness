@@ -193,6 +193,12 @@ pub(crate) struct RunObservation {
     /// Exact native session id observed from `thread.started`.
     #[serde(default)]
     pub session: Option<String>,
+    /// Exact native turn this run submitted. On the control route it is the
+    /// turn identity `turn/start` answered with, retained beside the completed
+    /// state and result locator so acceptance binds the accepted run's own
+    /// turn instead of inferring one from recency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
     /// Session recorded before a resume attempt, kept so a failed resume
     /// cannot lose the exact identity of the interrupted conversation.
     #[serde(default)]
@@ -315,6 +321,7 @@ impl RunObservation {
             reason: None,
             state: STATE_ACCEPTED.into(),
             session: None,
+            turn: None,
             previous_session: None,
             exit_code: None,
             events: 0,
@@ -345,6 +352,7 @@ impl RunObservation {
             reason: Some(reason.into()),
             state: STATE_UNOBSERVED.into(),
             session: None,
+            turn: None,
             previous_session: None,
             exit_code: None,
             events: 0,
@@ -982,6 +990,9 @@ impl RunTracker {
     /// or deviating run is never reported as a completed one.
     pub(crate) fn finish_control(&mut self, outcome: &ControlOutcome<'_>) -> i32 {
         end_clock(&mut self.observation);
+        if let Some(turn) = outcome.turn.map(str::trim).filter(|turn| !turn.is_empty()) {
+            self.observation.turn = Some(turn.to_owned());
+        }
         let (state, cause, exit) = match (outcome.state, outcome.final_message) {
             (STATE_COMPLETED, Some(FinalMessage::Present)) => (STATE_COMPLETED, None, 0),
             (STATE_COMPLETED, Some(FinalMessage::Empty)) => (
@@ -1132,6 +1143,8 @@ pub(crate) enum FinalMessage {
 /// turn completed) and the first recorded failure or protocol deviation.
 pub(crate) struct ControlOutcome<'a> {
     pub state: &'a str,
+    /// The exact accepted turn of this run, when the driver established one.
+    pub turn: Option<&'a str>,
     pub final_message: Option<FinalMessage>,
     pub cause: Option<&'a str>,
 }

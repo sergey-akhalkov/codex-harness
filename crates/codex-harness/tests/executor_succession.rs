@@ -656,6 +656,7 @@ fn write_task_record(home: &Path, workspace: &Path, session: &str) {
         requirements: "complete the owned succession probe".into(),
         stopped: false,
         active_lead: "default".into(),
+        purpose: Some("ordinary".into()),
         assignments: vec![Assignment {
             id: "a1".into(),
             profile: "ds".into(),
@@ -664,6 +665,7 @@ fn write_task_record(home: &Path, workspace: &Path, session: &str) {
             attempt: 1,
             accepted: None,
             defect: None,
+            purpose: Some("ordinary".into()),
         }],
     };
     harness_core::task_store::save(home, &record).unwrap();

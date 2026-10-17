@@ -110,6 +110,20 @@ pub struct AcceptanceBinding {
     pub executor_sessions: Vec<String>,
     pub lead_session: String,
     pub approved_by: String,
+    /// Exact native session of the accepted executor conversation. Absent
+    /// means the accepted run's own conversation is not established, so
+    /// automatic reflection refuses instead of choosing from the set.
+    #[serde(default)]
+    pub executor_session: Option<String>,
+    /// Exact completed native turn of the accepted executor run, copied from
+    /// the run's own observation record. Never inferred from recency.
+    #[serde(default)]
+    pub executor_turn: Option<String>,
+    /// Exact native turn of the accepting lead conversation. When the lead
+    /// accepts inside a still-running turn, this names that turn and the lead
+    /// stage waits for its completion before forking.
+    #[serde(default)]
+    pub lead_turn: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -149,7 +163,26 @@ impl AcceptanceBinding {
             executor_sessions,
             lead_session: lead_session.into(),
             approved_by: approved_by.into(),
+            executor_session: None,
+            executor_turn: None,
+            lead_turn: None,
         }
+    }
+
+    /// Binds the exact native identities this acceptance was derived from.
+    /// The turn fields deliberately do not participate in `acceptance_id`: a
+    /// lead turn may complete after the closure, and the same accepted work
+    /// must stay one idempotent record.
+    pub fn with_turns(
+        mut self,
+        executor_session: Option<String>,
+        executor_turn: Option<String>,
+        lead_turn: Option<String>,
+    ) -> Self {
+        self.executor_session = executor_session;
+        self.executor_turn = executor_turn;
+        self.lead_turn = lead_turn;
+        self
     }
 
     pub fn normalized(mut self) -> io::Result<Self> {
@@ -188,6 +221,28 @@ impl AcceptanceBinding {
             sessions.insert(session.to_owned());
         }
         self.executor_sessions = sessions.into_iter().collect();
+        fn normalize_identity(slot: &mut Option<String>, name: &str) -> io::Result<()> {
+            if let Some(value) = slot.as_mut() {
+                let trimmed = value.trim().to_owned();
+                if trimmed.is_empty() {
+                    *slot = None;
+                } else {
+                    require_text(name, &trimmed, MAX_TEXT_BYTES)?;
+                    *value = trimmed;
+                }
+            }
+            Ok(())
+        }
+        normalize_identity(&mut self.executor_session, "executor_session")?;
+        normalize_identity(&mut self.executor_turn, "executor_turn")?;
+        normalize_identity(&mut self.lead_turn, "lead_turn")?;
+        if let Some(session) = &self.executor_session
+            && !self.executor_sessions.iter().any(|item| item == session)
+        {
+            return Err(invalid(&format!(
+                "acceptance executor_session '{session}' is not one of executor_sessions"
+            )));
+        }
         let size = serde_json::to_vec(&self)?.len();
         if size > MAX_ACCEPTANCE_BYTES {
             return Err(invalid(&format!(
@@ -602,6 +657,10 @@ pub struct ReflectionJob {
     pub task_id: String,
     pub run: String,
     pub source_sessions: Vec<String>,
+    pub lead_session: String,
+    pub executor_session: Option<String>,
+    pub executor_turn: Option<String>,
+    pub lead_turn: Option<String>,
     pub context: Vec<String>,
     pub usage: StageUsage,
     pub remaining_tokens: u64,
@@ -635,6 +694,10 @@ pub struct StageStart {
     pub stage: Stage,
     pub attempt: u32,
     pub source_sessions: Vec<String>,
+    pub lead_session: String,
+    pub executor_session: Option<String>,
+    pub executor_turn: Option<String>,
+    pub lead_turn: Option<String>,
     pub usage: StageUsage,
     pub remaining_tokens: u64,
 }
@@ -1750,6 +1813,10 @@ impl ReflectionController {
             stage,
             attempt: slot.usage.attempts,
             source_sessions,
+            lead_session: record.binding.lead_session.clone(),
+            executor_session: record.binding.executor_session.clone(),
+            executor_turn: record.binding.executor_turn.clone(),
+            lead_turn: record.binding.lead_turn.clone(),
             usage: slot.usage.clone(),
             remaining_tokens,
         };
@@ -2588,6 +2655,10 @@ fn reflection_job(
         task_id: record.binding.task.clone(),
         run: record.binding.run.clone(),
         source_sessions,
+        lead_session: record.binding.lead_session.clone(),
+        executor_session: record.binding.executor_session.clone(),
+        executor_turn: record.binding.executor_turn.clone(),
+        lead_turn: record.binding.lead_turn.clone(),
         context,
         usage: slot.usage.clone(),
         remaining_tokens: state

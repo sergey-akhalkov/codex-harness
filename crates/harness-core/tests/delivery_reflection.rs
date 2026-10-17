@@ -999,3 +999,80 @@ fn durable_chain_unknown_capacity_and_cumulative_limits_survive_restart() {
     assert_eq!(record.usage_totals().tokens, 20);
     assert_eq!(record.executor.usage.attempts, 1);
 }
+
+#[test]
+fn acceptance_binds_exact_native_turns_and_identity_ignores_a_later_lead_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    let controller = board.controller();
+    activate(&controller, JournalPolicy::EnableIfMissing);
+    let task = board.create_task("Exact turn binding", Some(Purpose::Ordinary), None);
+    let accepted = binding(&task, Purpose::Ordinary, "turn").with_turns(
+        Some("executor-fixture".to_owned()),
+        Some("executor-turn-1".to_owned()),
+        Some("lead-turn-1".to_owned()),
+    );
+    let acceptance_id = accepted.acceptance_id().unwrap();
+    board.set_binding(&task, &accepted);
+    board.close(&task);
+
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let job = poll
+        .jobs
+        .iter()
+        .find(|job| job.task_id == task)
+        .expect("accepted ordinary closure yields one job");
+    assert_eq!(job.executor_session.as_deref(), Some("executor-fixture"));
+    assert_eq!(job.executor_turn.as_deref(), Some("executor-turn-1"));
+    assert_eq!(job.lead_turn.as_deref(), Some("lead-turn-1"));
+
+    let start = controller
+        .begin_stage(&acceptance_id, Stage::Executor)
+        .unwrap();
+    assert_eq!(
+        start.executor_session.as_deref(),
+        Some("executor-fixture")
+    );
+    assert_eq!(start.executor_turn.as_deref(), Some("executor-turn-1"));
+    assert_eq!(start.lead_turn.as_deref(), Some("lead-turn-1"));
+
+    // The accepting lead turn may still be running when the closure lands.
+    // Recording a different lead turn for the same accepted executor work must
+    // not fork the one closure into two records.
+    let later = accepted.clone().with_turns(
+        Some("executor-fixture".to_owned()),
+        Some("executor-turn-1".to_owned()),
+        Some("lead-turn-2".to_owned()),
+    );
+    assert_eq!(later.acceptance_id().unwrap(), acceptance_id);
+}
+
+#[test]
+fn acceptance_turn_identities_are_trimmed_and_must_name_a_recorded_session() {
+    let normalized = binding("bdct-task", Purpose::Ordinary, "trimmed")
+        .with_turns(
+            Some(" executor-fixture ".to_owned()),
+            Some("  ".to_owned()),
+            None,
+        )
+        .normalized()
+        .unwrap();
+    assert_eq!(
+        normalized.executor_session.as_deref(),
+        Some("executor-fixture")
+    );
+    assert_eq!(normalized.executor_turn, None);
+    assert_eq!(normalized.lead_turn, None);
+
+    let error = binding("bdct-task", Purpose::Ordinary, "mismatch")
+        .with_turns(Some("another-session".to_owned()), None, None)
+        .normalized()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("is not one of executor_sessions"),
+        "{error}"
+    );
+}

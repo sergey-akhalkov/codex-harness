@@ -1,6 +1,7 @@
 //! Non-interactive `bd` contract. The controller does not parse the board.
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::Path,
     process::{Command, Output},
@@ -425,6 +426,167 @@ fn run_actor(bd: &Path, project: &Path, actor: &str, args: &[&str]) -> io::Resul
         return Err(failed(args.first().unwrap_or(&"bd"), &out));
     }
     Ok(out)
+}
+
+/// One task as the lead sees it. A `bd show` answer that names another issue
+/// is refused instead of being adopted as this task.
+pub fn show_issue(bd: &Path, project: &Path, task: &str) -> io::Result<Value> {
+    let shown = json_ok(bd, project, &["show", task, "--json"])?;
+    let issue = match shown {
+        Value::Array(rows) => rows.into_iter().next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("bd show returned no issue for {task}"),
+            )
+        })?,
+        value => value,
+    };
+    if issue.get("id").and_then(Value::as_str) != Some(task) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bd show answered for another issue instead of {task}"),
+        ));
+    }
+    Ok(issue)
+}
+
+/// The metadata object of one shown issue, in the same shape the reflection
+/// event reader consumes.
+pub fn issue_metadata(issue: &Value) -> BTreeMap<String, String> {
+    issue
+        .get("metadata")
+        .and_then(Value::as_object)
+        .map(|metadata| {
+            metadata
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub struct AcceptanceClose {
+    pub issue: Value,
+    /// True when the identical accepted closure was already recorded; no
+    /// second write happened.
+    pub duplicate: bool,
+}
+
+/// Writes the exact acceptance metadata and closes the task with reason
+/// `accepted` as the approving lead. The actor is required: an unauthenticated
+/// or impersonated approval is refused. An identical existing closure is
+/// reported as a duplicate, while a different reason or different metadata
+/// refuses instead of overwriting durable evidence.
+pub fn close_accepted(
+    bd: &Path,
+    project: &Path,
+    actor: &str,
+    task: &str,
+    metadata: &BTreeMap<String, String>,
+) -> io::Result<AcceptanceClose> {
+    let actor = actor.trim();
+    if actor.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an accepted closure requires the approving lead actor",
+        ));
+    }
+    if metadata.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an accepted closure requires its acceptance metadata",
+        ));
+    }
+    let before = show_issue(bd, project, task)?;
+    let status = before
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status == "closed" {
+        let reason = before
+            .get("close_reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if reason != crate::delivery_reflection::ACCEPTED_CLOSE_REASON {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "task {task} is already closed with reason '{reason}', not accepted; a cancelled, reopened or lead-review closure is not acceptance and is never overwritten"
+                ),
+            ));
+        }
+        let recorded = issue_metadata(&before);
+        if metadata
+            .iter()
+            .any(|(key, value)| recorded.get(key) != Some(value))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "task {task} is already accepted with different acceptance metadata; the recorded approval is kept and is never rewritten"
+                ),
+            ));
+        }
+        return Ok(AcceptanceClose {
+            issue: before,
+            duplicate: true,
+        });
+    }
+    for (key, value) in metadata {
+        let pair = format!("{key}={value}");
+        json_ok_actor(
+            bd,
+            project,
+            actor,
+            &["update", task, "--set-metadata", &pair, "--json"],
+        )?;
+    }
+    json_ok_actor(
+        bd,
+        project,
+        actor,
+        &[
+            "close",
+            task,
+            "--reason",
+            crate::delivery_reflection::ACCEPTED_CLOSE_REASON,
+            "--json",
+        ],
+    )?;
+    let after = show_issue(bd, project, task)?;
+    let closed = after.get("status").and_then(Value::as_str) == Some("closed");
+    let accepted = after
+        .get("close_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason.trim() == crate::delivery_reflection::ACCEPTED_CLOSE_REASON);
+    if !closed || !accepted {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the accepted close of task {task} was not recorded as closed/accepted; the board answer is {}",
+                after
+            ),
+        ));
+    }
+    let recorded = issue_metadata(&after);
+    if metadata
+        .iter()
+        .any(|(key, value)| recorded.get(key) != Some(value))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the accepted close of task {task} did not retain its acceptance metadata"
+            ),
+        ));
+    }
+    Ok(AcceptanceClose {
+        issue: after,
+        duplicate: false,
+    })
 }
 
 pub(crate) fn seed_git(project: &Path) -> io::Result<()> {
