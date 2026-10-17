@@ -1543,56 +1543,8 @@ impl ReflectionController {
                 "the task's current purpose differs from the close event",
             )));
         }
-        let mut parent = task
-            .get("parent")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let mut seen = BTreeSet::new();
-        let mut depth = 0usize;
-        while let Some(parent_id) = parent.take() {
-            if depth >= MAX_ANCESTORS {
-                return Ok(EvaluatedEvent::Refused(refusal(
-                    event,
-                    RefusalCode::AncestorLimit,
-                    format!("purpose lineage exceeds {MAX_ANCESTORS} ancestors at '{parent_id}'"),
-                )));
-            }
-            if !seen.insert(parent_id.clone()) {
-                return Ok(EvaluatedEvent::Refused(refusal(
-                    event,
-                    RefusalCode::LineageUnavailable,
-                    format!("purpose lineage repeats '{parent_id}'"),
-                )));
-            }
-            let ancestor = self.task_by_id(&parent_id)?;
-            let ancestor_metadata = metadata_of(&ancestor);
-            if let Some(value) = ancestor_metadata.get(PURPOSE_METADATA) {
-                let ancestor_purpose = match Purpose::parse(value) {
-                    Ok(purpose) => purpose,
-                    Err(error) => {
-                        return Ok(EvaluatedEvent::Refused(refusal(
-                            event,
-                            RefusalCode::UnknownPurpose,
-                            format!("ancestor '{parent_id}': {error}"),
-                        )));
-                    }
-                };
-                if !ancestor_purpose.triggers_reflection() {
-                    return Ok(EvaluatedEvent::Refused(refusal(
-                        event,
-                        RefusalCode::NonTriggerPurpose,
-                        format!(
-                            "ancestor '{parent_id}' has {} purpose; descendants never auto-trigger",
-                            ancestor_purpose.as_str()
-                        ),
-                    )));
-                }
-            }
-            parent = ancestor
-                .get("parent")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            depth += 1;
+        if let Some((code, detail)) = self.purpose_lineage_refusal(&task)? {
+            return Ok(EvaluatedEvent::Refused(refusal(event, code, detail)));
         }
         let task_revision = required_string(&task, "revision")?;
         Ok(EvaluatedEvent::Eligible {
@@ -1699,6 +1651,17 @@ impl ReflectionController {
             return Err(recovery_error(
                 "board source or branch changed; poll and reconcile before beginning a stage",
             ));
+        }
+        // Admission may wait after poll. Revalidate the accepted work and its
+        // purpose lineage before spending an attempt or starting a model.
+        let binding_check =
+            self.check_active_binding(&state.binding.lead_session, Some(acceptance_id))?;
+        if !binding_check.is_active() {
+            return Err(conflict(&format!(
+                "cannot begin {} reflection: {}",
+                stage.as_str(),
+                binding_check.detail
+            )));
         }
         let active = state
             .records
@@ -2248,6 +2211,57 @@ impl ReflectionController {
         Ok(receipt)
     }
 
+    fn purpose_lineage_refusal(&self, task: &Value) -> io::Result<Option<(RefusalCode, String)>> {
+        let mut parent = task
+            .get("parent")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut seen = BTreeSet::new();
+        let mut depth = 0usize;
+        while let Some(parent_id) = parent.take() {
+            if depth >= MAX_ANCESTORS {
+                return Ok(Some((
+                    RefusalCode::AncestorLimit,
+                    format!("purpose lineage exceeds {MAX_ANCESTORS} ancestors at '{parent_id}'"),
+                )));
+            }
+            if !seen.insert(parent_id.clone()) {
+                return Ok(Some((
+                    RefusalCode::LineageUnavailable,
+                    format!("purpose lineage repeats '{parent_id}'"),
+                )));
+            }
+            let ancestor = self.task_by_id(&parent_id)?;
+            let ancestor_metadata = metadata_of(&ancestor);
+            if let Some(value) = ancestor_metadata.get(PURPOSE_METADATA) {
+                let ancestor_purpose = match Purpose::parse(value) {
+                    Ok(purpose) => purpose,
+                    Err(error) => {
+                        return Ok(Some((
+                            RefusalCode::UnknownPurpose,
+                            format!("ancestor '{parent_id}': {error}"),
+                        )));
+                    }
+                };
+                if !ancestor_purpose.triggers_reflection() {
+                    return Ok(Some((
+                        RefusalCode::NonTriggerPurpose,
+                        format!(
+                            "ancestor '{parent_id}' has {} purpose; descendants never auto-trigger",
+                            ancestor_purpose.as_str()
+                        ),
+                    )));
+                }
+            }
+            parent = ancestor
+                .get("parent")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            depth += 1;
+        }
+        Ok(None)
+    }
+
     /// Model-free read-only validation used by verified-improvement admission.
     /// This creates no directory or lock, advances no checkpoint and reports
     /// every stable binding field it could read. Ordinary journaled board
@@ -2415,6 +2429,11 @@ impl ReflectionController {
                     "task '{task_id}' now carries a different purpose than retained acceptance '{}'",
                     record.acceptance_id
                 );
+                return Ok(check);
+            }
+            if let Some((_, detail)) = self.purpose_lineage_refusal(&task)? {
+                check.status = BindingStatus::StaleSource;
+                check.detail = detail;
                 return Ok(check);
             }
             check.matched_acceptance_id = Some(record.acceptance_id.clone());

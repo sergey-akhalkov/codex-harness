@@ -535,6 +535,73 @@ fn initial_reports_rejections_and_nonordinary_lineage_never_trigger() {
 }
 
 #[test]
+fn queued_stages_revalidate_live_acceptance_and_ancestor_purpose_before_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    let controller = board.controller();
+    activate(&controller, JournalPolicy::EnableIfMissing);
+    let parent = board.create_task("Ordinary parent", Some(Purpose::Ordinary), None);
+    let task = board.create_task(
+        "Queued accepted work",
+        Some(Purpose::Ordinary),
+        Some(&parent),
+    );
+    let accepted = binding(&task, Purpose::Ordinary, "queued");
+    board.set_binding(&task, &accepted);
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    let acceptance_id = acceptance_for_task(&poll, &task);
+    let state_file = controller.state_file().unwrap();
+
+    board.reopen(&task);
+    let before = fs::read(&state_file).unwrap();
+    let error = controller
+        .begin_stage(&acceptance_id, Stage::Executor)
+        .unwrap_err();
+    assert!(error.to_string().contains("closed"), "{error}");
+    assert_eq!(before, fs::read(&state_file).unwrap());
+
+    board.close(&task);
+    let start = controller
+        .begin_stage(&acceptance_id, Stage::Executor)
+        .unwrap();
+    assert_eq!(start.attempt, 1);
+    controller
+        .retain_stage(
+            &acceptance_id,
+            Stage::Executor,
+            outcome(Finding::NoFinding, "No useful executor finding"),
+            UsageDelta {
+                turns: 1,
+                tokens: 100,
+            },
+        )
+        .unwrap();
+
+    board.set_metadata(&parent, PURPOSE_METADATA, Purpose::Improvement.as_str());
+    let before = fs::read(&state_file).unwrap();
+    let check = controller
+        .check_active_binding(LEAD, Some(&acceptance_id))
+        .unwrap();
+    assert_eq!(check.status, BindingStatus::StaleSource, "{check:?}");
+    let error = controller
+        .begin_stage(&acceptance_id, Stage::Lead)
+        .unwrap_err();
+    assert!(error.to_string().contains("ancestor"), "{error}");
+    assert_eq!(before, fs::read(&state_file).unwrap());
+
+    board.set_metadata(&parent, PURPOSE_METADATA, Purpose::Ordinary.as_str());
+    board.set_binding(&task, &binding(&task, Purpose::Ordinary, "superseded"));
+    let before = fs::read(&state_file).unwrap();
+    assert!(controller.begin_stage(&acceptance_id, Stage::Lead).is_err());
+    assert_eq!(before, fs::read(&state_file).unwrap());
+
+    board.set_binding(&task, &accepted);
+    let start = controller.begin_stage(&acceptance_id, Stage::Lead).unwrap();
+    assert_eq!(start.attempt, 1);
+}
+
+#[test]
 fn duplicate_reclose_and_new_identity_are_distinct_then_drift_is_exposed() {
     let temp = tempfile::tempdir().unwrap();
     let board = Board::new(temp.path());
