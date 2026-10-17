@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-10-16**.
+Last updated: **2026-10-17**.
 
 ## Public pack
 
@@ -123,12 +123,22 @@ cost. Routine in-scope workflow improvements need no separate specification;
 short tasks need no optimization ceremony. Preserve full acceptance, authority
 and recovery. The canonical details remain in the portable principles below.
 
-**2026-10-16, clarified:** an active delivery-improvement observer should turn
-one clear, attributable bottleneck into a bounded correction promptly. Do not
+**2026-10-17, revised:** replace the unaccepted persistent observer with
+post-acceptance self-reflection. A lead-accepted ordinary task's beads closure
+starts a native executor fork using `executor-self-reflection`; its retained
+result starts a lead fork using `lead-self-reflection`. The synthesis returns
+to the real lead, who owns decisions and assignments. Reflection and improvement
+work, including its descendants, does not trigger another automatic reflection.
+Use durable native events and retained stage identities, not model polling or
+a separate transcript feed. This is the selected design, not a delivery claim;
+the active [change](../openspec/changes/add-delivery-improvement/proposal.md)
+owns implementation and acceptance.
+
+One clear, attributable bottleneck should produce a bounded correction promptly. Do not
 wait for repeated episodes, votes or statistical proof when the available facts
 already support the remedy. Investigate only uncertainty that changes the
 decision, and verify the result proportionately through its actual use. Keep
-the observer module's adoption comparison separate from the handling of each
+the reflection mechanism's adoption comparison separate from the handling of each
 finding; preserve required acceptance and scope boundaries. The active change
 owns this [single-observation admission](../openspec/changes/add-delivery-improvement/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
 
