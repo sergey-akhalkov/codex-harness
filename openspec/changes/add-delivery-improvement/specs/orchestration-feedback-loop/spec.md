@@ -4,7 +4,7 @@
 
 ### Requirement: Feedback arrives as triage tasks
 
-Lead and executor feedback about the work, the orchestration, instructions, tools or blockers SHALL be recorded as board triage tasks with bounded context instead of real-time inter-agent chat. The lead SHALL triage accumulated feedback in batches at safe boundaries; routine triage mechanics (listing, merging, voting) SHALL NOT require model calls beyond the lead's bounded judgment. Feedback tasks SHALL preserve the concrete observation, affected scope and reporter identity without copying unbounded transcripts. While `delivery-improvement` is explicitly active, its designated observer SHALL be able to prepare these tasks and bounded semantic triage proposals from authorized events; the lead SHALL retain admission, priority and implementation decisions. Exceptional addressed notifications SHALL reference the durable item rather than replace it.
+Lead and executor feedback about the work, the orchestration, instructions, tools or blockers SHALL be recorded as board triage tasks with bounded context instead of real-time inter-agent chat. The lead SHALL triage accumulated feedback in batches at safe boundaries; routine triage mechanics (listing, merging, voting) SHALL NOT require model calls beyond the lead's bounded judgment. Feedback tasks SHALL preserve the concrete observation, affected scope and reporter identity without copying unbounded transcripts. While `delivery-improvement` is explicitly active, its executor and lead reflection forks SHALL return bounded proposals; only the real lead SHALL create or update these tasks and retain admission, priority and implementation decisions. Exceptional addressed notifications SHALL reference the durable item rather than replace it.
 
 #### Scenario: An executor reports friction twice
 - **WHEN** an executor records two separate friction observations during one assignment
@@ -14,9 +14,9 @@ Lead and executor feedback about the work, the orchestration, instructions, tool
 - **WHEN** the lead observes a repeated mistake across executors
 - **THEN** it records its own feedback task for triage rather than steering every session individually with duplicated context
 
-#### Scenario: An enabled observer finds actionable friction
-- **WHEN** the designated improvement session diagnoses an attributable problem from new visible exchanges, relevant board changes or requested code and check evidence
-- **THEN** it records or updates the bounded board item and submits it for the lead's next safe decision boundary without requiring the original reporter to repeat the observation
+#### Scenario: Role reflections find actionable friction
+- **WHEN** the accepted-task executor reflection and lead synthesis return an attributable problem
+- **THEN** the real lead records or updates the bounded board item at its next safe decision boundary without requiring the original reporter to repeat the observation or granting either fork board-write authority
 
 ### Requirement: Observations are routed by kind
 
@@ -40,7 +40,7 @@ Each observation SHALL be classified before it competes as an incubator vote. A 
 
 ### Requirement: Incubator deduplicates and accumulates votes
 
-The incubator SHALL contain unique improvement items only. During triage, the lead SHALL merge similar incoming feedback into an existing incubator item and record the merge visibly; a merged item or an explicit repeated report SHALL add exactly one vote attributable to a distinct episode and reporter. Repeated votes from the same reporter for the same episode SHALL NOT accumulate, and automated diagnostics SHALL NOT inflate votes. Item identity, merge history and vote provenance SHALL remain inspectable. An improvement observer's derived report SHALL preserve the originating evidence identity and SHALL NOT count as an independent vote for an already represented observation. A genuinely new episode SHALL retain its own provenance under the existing counting rules.
+The incubator SHALL contain unique improvement items only. During triage, the lead SHALL merge similar incoming feedback into an existing incubator item and record the merge visibly; a merged item or an explicit repeated report SHALL add exactly one vote attributable to a distinct episode and reporter. Repeated votes from the same reporter for the same episode SHALL NOT accumulate, and automated diagnostics SHALL NOT inflate votes. Item identity, merge history and vote provenance SHALL remain inspectable. A reflection's derived report SHALL preserve the originating evidence identity and SHALL NOT count as an independent vote for an already represented observation. A genuinely new episode SHALL retain its own provenance under the existing counting rules.
 
 #### Scenario: Similar feedback arrives from two executors
 - **WHEN** triage finds that new feedback describes an existing incubator item
@@ -50,8 +50,8 @@ The incubator SHALL contain unique improvement items only. During triage, the le
 - **WHEN** the same reporter would add several votes without a new distinct episode
 - **THEN** only one vote is counted and the attempt is visible in provenance
 
-#### Scenario: An observer restates a reported correction
-- **WHEN** an observer finding and an executor's feedback refer to the same originating episode
+#### Scenario: Reflection restates a reported correction
+- **WHEN** a reflection recommendation and an executor's feedback refer to the same originating episode
 - **THEN** the evidence and analysis are retained on the existing item without increasing its vote count merely because another model summarized it
 
 ### Requirement: Vote threshold promotes to backlog
@@ -67,7 +67,7 @@ A configurable vote threshold, defaulting to promotion after more than two votes
 - **THEN** it enters the OpenSpec workflow instead of being implemented directly from the backlog
 
 #### Scenario: An unverified idea is raised during improvement mode
-- **WHEN** the observer proposes a general instruction change without an attributable cause and checkable remedy
+- **WHEN** a reflection proposes a general instruction change without an attributable cause and checkable remedy
 - **THEN** the idea remains in the appropriate hypothesis or incubator path rather than receiving automatic vote-free implementation authority
 
 ### Requirement: Installed deterministic feedback operations
@@ -122,4 +122,17 @@ While `delivery-improvement` is active, the lead SHALL be able to admit a bounde
 
 #### Scenario: Ordinary optimization has an uncertain opportunity to repay
 - **WHEN** a proposed optimization lacks credible relevant reuse or its expected benefit does not justify investigation, implementation, verification and displaced delivery
-- **THEN** the lead records a bounded rejection or deferral on the existing item rather than assigning work merely to justify the observer; urgent correctness and integrity work retains its existing consequence path
+- **THEN** the lead records a bounded rejection or deferral on the existing item rather than assigning work merely to justify reflection; urgent correctness and integrity work retains its existing consequence path
+
+
+### Requirement: Improvement purpose survives task creation and delegation
+
+Tasks accepted from reflection SHALL be marked as improvement implementation by their existing creation/dispatch owner. Their implementation descendants SHALL retain that purpose. Reflection recommendations SHALL NOT themselves create tasks, and closing improvement work SHALL NOT automatically generate more reflection.
+
+#### Scenario: The real lead delegates a synthesized remedy
+- **WHEN** the lead admits and creates or updates an improvement task
+- **THEN** its dispatch and any implementation subtasks retain improvement purpose and normal acceptance while being excluded from the automatic accepted-ordinary-task trigger
+
+#### Scenario: A reflection result is retried
+- **WHEN** delivery or a board operation is reconciled after interruption
+- **THEN** source identity prevents duplicate task creation, duplicate counted votes and loss of the nonrecursive purpose
