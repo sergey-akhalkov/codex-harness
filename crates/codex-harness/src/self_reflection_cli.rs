@@ -376,7 +376,7 @@ fn execute(path: &Path) -> io::Result<i32> {
 /// route reads its request file and calls this; the automatic delivery
 /// controller builds the same request from accepted records.
 pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
-    let chain = prepare_chain(request)?;
+    let (chain, _lease) = prepare_chain(request)?;
     preflight_lead(&chain)?;
     let executor_state = run_executor(&chain)?;
     preflight_lead(&chain)?;
@@ -398,8 +398,18 @@ pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
 }
 
 /// Verifies (or creates) the immutable `chain.json` before any native work.
-pub(crate) fn prepare_chain(request: Request) -> io::Result<ChainState> {
+/// Hold the returned lease through both stages and delivery: reconciliation
+/// must never race the invocation that still owns the live conversation.
+pub(crate) fn prepare_chain(
+    request: Request,
+) -> io::Result<(ChainState, harness_core::process::ExclusiveFileLock)> {
     let chain = chain_state(request)?;
+    let lock_path = chain.state_dir.join("chain.lock");
+    let lease = harness_core::process::ExclusiveFileLock::try_acquire(&lock_path)?
+        .ok_or_else(|| invalid(format!(
+            "the chain is already running at {}; preserve the live owner and retry only after it finishes",
+            chain.state_dir.display()
+        )))?;
     let chain_path = chain.state_dir.join("chain.json");
     if chain_path.exists() {
         let retained: ChainState = read_json(&chain_path, MAX_REQUEST_BYTES)?;
@@ -412,7 +422,7 @@ pub(crate) fn prepare_chain(request: Request) -> io::Result<ChainState> {
     } else {
         write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
     }
-    Ok(chain)
+    Ok((chain, lease))
 }
 
 /// Refuses before any fork when the exact managed lead return surface is not

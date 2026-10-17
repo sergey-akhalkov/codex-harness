@@ -1371,6 +1371,66 @@ fn completed_stages_are_reused_without_duplicate_forks_or_turns() {
 }
 
 #[test]
+fn concurrent_chain_invocation_cannot_reconcile_or_overwrite_a_live_stage() {
+    let workspace = Workspace::new("concurrent-chain", LeadMode::Delivered);
+    let mut request = workspace.request("run-concurrent-chain");
+    request["boundSeconds"] = json!(8);
+    let first = spawn_chain(
+        &workspace,
+        &request,
+        "unknown-hold",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let retained = loop {
+        let path = workspace.state.join("executor-stage.json");
+        if path.exists() {
+            let state = read_json(&path);
+            if state["status"] == "turn-submitted" {
+                break state;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first chain never submitted its turn"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let before = request_counts(&workspace);
+    let second = run_chain(
+        &workspace,
+        &request,
+        "unknown-hold",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    let after_second = stage(&workspace, "executor-stage");
+    // Finish the owned first process even if the concurrent refusal is wrong.
+    let first = wait_session(first);
+    assert_ne!(first.outcome.exit_code, 0, "{}", first.transcript);
+    assert_refused(&second, "chain is already running");
+    assert_eq!(
+        after_second, retained,
+        "another invocation changed a live stage"
+    );
+    assert_eq!(request_counts(&workspace), before);
+
+    let replay = run_chain(
+        &workspace,
+        &request,
+        "unknown-hold",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_refused(&replay, "already ended as unknown");
+    assert_eq!(request_counts(&workspace), before);
+}
+
+#[test]
 fn queued_and_indeterminate_lead_returns_are_not_delivered_or_resent() {
     let queued = Workspace::new("queued", LeadMode::Queued);
     let request = queued.request("run-queued");
