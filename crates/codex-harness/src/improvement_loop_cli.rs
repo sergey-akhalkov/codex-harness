@@ -26,8 +26,12 @@ mod improvement_driver;
 mod improvement_workflow;
 
 use crate::executor_cli::{
-    ConversationState, VisibleAccepted, VisibleConversation, dispatch_visible_conversation,
-    executor_title, receipt_view, stop_owned_run,
+    ConversationState, PromptSource, VisibleAccepted, VisibleConversation,
+    VisibleExecutorContinuation, VisibleExecutorContinuationAccepted, VisibleLeadContinuation,
+    VisibleLeadContinuationAccepted, VisibleLeadConversation,
+    continue_visible_executor_conversation, continue_visible_lead_conversation,
+    dispatch_visible_conversation, dispatch_visible_lead_conversation, executor_title,
+    receipt_view, stop_owned_run,
 };
 use harness_core::board_feedback;
 use harness_core::board_hypothesis;

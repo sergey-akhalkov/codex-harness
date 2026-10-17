@@ -56,6 +56,7 @@ fn spec_fixture(root: &Path, name: &str) -> RunSpec {
         local_runner: None,
         qualification: None,
         comparison: None,
+        baseline_qualification: None,
         publication_scope: vec![PublicationStage::Experiment],
         oracle: "outcome-oracle:private-request".to_owned(),
         removal: None,
@@ -2207,4 +2208,168 @@ fn configured_retry_is_frozen_in_private_state_without_route_details() {
     assert!(!text.contains("127.0.0.1"), "{text}");
     assert!(!text.contains("http"), "{text}");
     assert!(!text.contains("synthetic-local"), "{text}");
+}
+
+fn workflow_fixture(corrections: u32, capacity: u32) -> WorkflowInputs {
+    WorkflowInputs {
+        schema: 1,
+        lead_profile: "default".to_owned(),
+        executor_profile: "ds".to_owned(),
+        max_corrections: corrections,
+        capacity,
+    }
+}
+
+fn participant(slot: u32, owner: &str, session: &str, profile: &str) -> WorkflowParticipant {
+    WorkflowParticipant {
+        slot,
+        owner: owner.to_owned(),
+        session: session.to_owned(),
+        profile: profile.to_owned(),
+    }
+}
+
+#[test]
+fn the_workflow_declaration_plans_every_declared_correction_and_review() {
+    let declared = workflow_fixture(2, 4);
+    declared.validate().unwrap();
+    assert_eq!(declared.planned_turns(), 7);
+    assert_eq!(declared.effective_capacity(), 4);
+    let omitted = workflow_fixture(0, 0);
+    omitted.validate().unwrap();
+    assert_eq!(omitted.planned_turns(), 3);
+    assert_eq!(omitted.effective_capacity(), 2);
+
+    let mut one_slot = workflow_fixture(0, 1);
+    assert!(one_slot.validate().is_err());
+    one_slot.capacity = 33;
+    assert!(one_slot.validate().is_err());
+    let mut same_profile = workflow_fixture(0, 2);
+    same_profile.executor_profile = same_profile.lead_profile.clone();
+    assert!(same_profile.validate().is_err());
+    let mut unbounded = workflow_fixture(u32::MAX, 2);
+    assert!(unbounded.validate().is_err());
+    unbounded.max_corrections = 0;
+    unbounded.schema = 2;
+    assert!(unbounded.validate().is_err());
+}
+
+#[test]
+fn a_review_decision_is_read_from_the_first_meaningful_line_only() {
+    assert_eq!(
+        parse_review_decision("ACCEPT: the artifact satisfies the assignment").unwrap(),
+        ReviewDecision::Accept
+    );
+    assert_eq!(
+        parse_review_decision("\n\n  correct - redo the bounded check\n").unwrap(),
+        ReviewDecision::Correct
+    );
+    assert_eq!(
+        parse_review_decision("Reject\nno evidence").unwrap(),
+        ReviewDecision::Reject
+    );
+    // Prose that never states a decision is not acceptance.
+    let error = parse_review_decision("reviewed the executor artifact; no work committed")
+        .expect_err("prose must not be read as acceptance");
+    assert!(error.to_string().contains("never infers a decision"));
+    assert!(parse_review_decision("   \n").is_err());
+}
+
+#[test]
+fn acceptance_finishes_without_a_confirmation_turn_and_each_correction_reviews_again() {
+    let declared = workflow_fixture(2, 3);
+    let mut state = WorkflowArmState::default();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Frame
+    );
+
+    state.lead = Some(participant(1, "lead-1", "session-lead", "default"));
+    state.lead_frame = Some("lframe-1".to_owned());
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Execute
+    );
+
+    state.executor = Some(participant(2, "exec-1", "session-exec", "ds"));
+    state.executor_attempt = Some("exec-1".to_owned());
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Review
+    );
+
+    state
+        .record_review("lreview-1", ReviewDecision::Correct)
+        .unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Correct
+    );
+    state.record_correction("corr-1", &declared).unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Review,
+        "a correction never counts as its own review"
+    );
+
+    state
+        .record_review("lreview-2", ReviewDecision::Correct)
+        .unwrap();
+    state.record_correction("corr-2", &declared).unwrap();
+    state
+        .record_review("lreview-3", ReviewDecision::Correct)
+        .unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Exhausted,
+        "the finite allowance ends the observation instead of dispatching another correction"
+    );
+    // The same review replayed after a controller crash does not duplicate the
+    // decision or require another confirmation-only lead turn.
+    state
+        .record_review("lreview-3", ReviewDecision::Accept)
+        .unwrap();
+    assert_eq!(state.lead_accepted, Some(true));
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Finalize
+    );
+    state.record_completion(true);
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Finalize
+    );
+}
+
+#[test]
+fn a_rejecting_review_ends_without_a_further_lead_turn() {
+    let declared = workflow_fixture(1, 2);
+    let mut state = WorkflowArmState {
+        lead: Some(participant(1, "lead-1", "session-lead", "default")),
+        executor: Some(participant(2, "exec-1", "session-exec", "ds")),
+        lead_frame: Some("lframe-1".to_owned()),
+        executor_attempt: Some("exec-1".to_owned()),
+        ..WorkflowArmState::default()
+    };
+    state
+        .record_review("lreview-1", ReviewDecision::Reject)
+        .unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Rejected
+    );
+    state.record_completion(false);
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Rejected
+    );
+    assert_eq!(state.lead_accepted, Some(false));
+}
+
+#[test]
+fn qualification_phases_do_not_require_the_comparison_owner() {
+    assert!(!Phase::BaselineQualification.requires_comparison_owner());
+    assert!(!Phase::BaselineQualificationRecorded.requires_comparison_owner());
+    assert!(Phase::BaselineAttempt.requires_comparison_owner());
+    assert!(Phase::Acceptance.requires_comparison_owner());
 }

@@ -2764,9 +2764,6 @@ fn freeze_or_verify_supervisor(
     Ok(())
 }
 
-/// Materialize the committed solution into the frozen acceptance workspace
-/// and run the unchanged supervisor's real-task oracle entry point with the
-/// frozen request bytes. The record is retained before its outcome is used.
 fn run_oracle(
     run: &Run,
     comparison: &ComparisonInputs,
@@ -2797,38 +2794,53 @@ fn run_oracle(
     freeze_or_verify_supervisor(run, comparison, true).map_err(|reason| {
         format!("the unchanged supervisor is required to evaluate this candidate: {reason}")
     })?;
-    let checkout = solution.checkout.to_string_lossy().into_owned();
-    git(
+    let record_path = run.store.comparison_arm_dir(arm).join("oracle.json");
+    execute_oracle(
+        &comparison.acceptance.request,
+        &comparison.acceptance.request_sha256,
         &workspace,
-        &[
-            "fetch",
-            "-q",
-            "--no-tags",
-            "--force",
-            &checkout,
-            &solution.revision,
-        ],
+        &solution.checkout,
+        &solution.revision,
+        &record_path,
+    )
+}
+
+/// Materialize one committed revision into the frozen acceptance workspace
+/// and run the unchanged supervisor's real-task oracle entry point with the
+/// frozen request bytes. Shared by the comparison arms and the one-arm
+/// baseline qualification: neither caller authors the request, and the
+/// retained record is written before its outcome is used.
+fn execute_oracle(
+    request: &Path,
+    request_sha256: &str,
+    workspace: &Path,
+    checkout: &Path,
+    revision: &str,
+    record_path: &Path,
+) -> Result<Acceptance, String> {
+    let checkout = checkout.to_string_lossy().into_owned();
+    git(
+        workspace,
+        &["fetch", "-q", "--no-tags", "--force", &checkout, revision],
     )
     .map_err(|error| format!("the solution could not be materialized for acceptance: {error}"))?;
-    git(
-        &workspace,
-        &["checkout", "-q", "--detach", "-f", &solution.revision],
-    )
-    .map_err(|error| format!("the acceptance workspace could not be checked out: {error}"))?;
-    git(&workspace, &["clean", "-fdxq"])
+    git(workspace, &["checkout", "-q", "--detach", "-f", revision])
+        .map_err(|error| format!("the acceptance workspace could not be checked out: {error}"))?;
+    git(workspace, &["clean", "-fdxq"])
         .map_err(|error| format!("the acceptance workspace could not be cleaned: {error}"))?;
     let workspace_preparation = "source-only-fresh-workspace".to_owned();
 
     let started_at = now_seconds();
     let supervisor = std::env::current_exe()
         .map_err(|error| format!("the supervisor executable is unavailable: {error}"))?;
+    let request_text = request.to_string_lossy();
     let output = Command::new(&supervisor)
         .args([
             "outcome-oracle",
             "--request",
-            &comparison.acceptance.request.to_string_lossy(),
+            request_text.as_ref(),
             "--request-sha256",
-            &comparison.acceptance.request_sha256,
+            request_sha256,
         ])
         .output()
         .map_err(|error| format!("the acceptance entry point could not start: {error}"))?;
@@ -2847,13 +2859,12 @@ fn run_oracle(
                 .unwrap_or("no failure cause recorded")
         ));
     }
-    let record_path = run.store.comparison_arm_dir(arm).join("oracle.json");
-    write_json_atomic(&record_path, &record)
+    write_json_atomic(record_path, &record)
         .map_err(|error| format!("the acceptance record could not be retained: {error}"))?;
     let passed = record["passed"] == true && record["checker_executed"] == true;
     Ok(Acceptance {
         passed,
-        record_path,
+        record_path: record_path.to_path_buf(),
         started_at,
         ended_at,
         workspace_preparation,
@@ -3664,11 +3675,51 @@ struct Sessions {
     tool_calls: Option<u64>,
 }
 
-/// Discover this attempt's own rollout files under the arm home and verify
-/// the observed model and reasoning effort through the rollout owner. A
-/// missing or mismatched session stays unverified with a named reason instead
-/// of being inferred.
 fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
+    let runtime_path = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.arm(arm_of_role(attempt.role)).runtime.clone());
+    let Some(runtime_path) = runtime_path else {
+        return Ok(Sessions {
+            paths: Vec::new(),
+            verified: false,
+            reason: Some("the arm runtime receipt is missing".to_owned()),
+            tool_calls: None,
+        });
+    };
+    let runtime: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
+    let (declared_model, declared_effort) = run
+        .spec
+        .comparison
+        .as_ref()
+        .map(|comparison| {
+            (
+                comparison.runtimes.client.runner.model.clone(),
+                comparison.runtimes.client.reasoning_effort.clone(),
+            )
+        })
+        .unwrap_or_default();
+    discover_attempt_sessions(
+        attempt,
+        &runtime.home,
+        &declared_model,
+        declared_effort.as_deref(),
+    )
+}
+
+/// Discover the rollout files of one attempt's exact native session under an
+/// explicit participant home and verify the observed model and effort. The
+/// baseline qualification has one prepared runtime instead of comparison
+/// arms, so it supplies the home and declared binding directly; the observed
+/// identity rules stay identical to the comparison path.
+fn discover_attempt_sessions(
+    attempt: &Attempt,
+    home: &Path,
+    declared_model: &str,
+    declared_effort: Option<&str>,
+) -> io::Result<Sessions> {
     let unverified = |reason: String| Sessions {
         paths: Vec::new(),
         verified: false,
@@ -3686,16 +3737,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
                 .to_owned(),
         ));
     };
-    let runtime_path = run
-        .cursor
-        .comparison
-        .as_ref()
-        .and_then(|state| state.arm(arm_of_role(attempt.role)).runtime.clone());
-    let Some(runtime_path) = runtime_path else {
-        return Ok(unverified("the arm runtime receipt is missing".to_owned()));
-    };
-    let runtime: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
-    let sessions = runtime.home.join("sessions");
+    let sessions = home.join("sessions");
     let mut paths = Vec::new();
     if sessions.is_dir() {
         let mut pending = vec![sessions];
@@ -3705,7 +3747,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
                 entries += 1;
                 if entries > MAX_ROLLOUT_ENTRIES {
                     return Ok(unverified(
-                        "the arm home holds more rollout files than the bounded scan allows"
+                        "the participant home holds more rollout files than the bounded scan allows"
                             .to_owned(),
                     ));
                 }
@@ -3724,17 +3766,6 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
     }
     paths.sort();
     paths.dedup();
-    let (declared_model, declared_effort) = run
-        .spec
-        .comparison
-        .as_ref()
-        .map(|comparison| {
-            (
-                comparison.runtimes.client.runner.model.clone(),
-                comparison.runtimes.client.reasoning_effort.clone(),
-            )
-        })
-        .unwrap_or_default();
     if paths.is_empty() {
         return Ok(unverified(format!(
             "no rollout was observed for the attempt's recorded session {expected}; the measured model and effort cannot be verified"
@@ -3764,9 +3795,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         let model_matches = model == declared_model
             || model == format!("openai/{declared_model}")
             || model == format!("xai/{declared_model}");
-        let effort_matches = declared_effort
-            .as_deref()
-            .is_none_or(|declared| effort == declared);
+        let effort_matches = declared_effort.is_none_or(|declared| effort == declared);
         // Identity conflicts disqualify the observation. Provider attribution
         // for a local alias stays a disclosed limit of the accounting, not a
         // reason to drop the measured rollout.
@@ -3805,7 +3834,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         if !effort_matches {
             return Ok(unverified(format!(
                 "the observation recorded reasoning effort {effort} instead of the declared {}",
-                declared_effort.as_deref().unwrap_or("default")
+                declared_effort.unwrap_or("default")
             )));
         }
         observed_model = Some(model.to_owned());

@@ -41,6 +41,8 @@ pub const RUN_SCHEMA: u32 = 1;
 pub const CURSOR_SCHEMA: u32 = 1;
 pub const OWNER_SCHEMA: u32 = 1;
 pub const VARIANTS_SCHEMA: u32 = 1;
+/// Schema of one explicit one-arm baseline qualification declaration.
+pub const BASELINE_QUALIFICATION_SCHEMA: u32 = 1;
 pub const MAX_RUN_SPEC_BYTES: u64 = 256 * 1024;
 pub const MAX_CURSOR_BYTES: u64 = 1024 * 1024;
 /// The cursor is bounded recovery data: old effects are dropped (with a
@@ -535,9 +537,68 @@ pub struct WorkflowInputs {
     pub lead_profile: String,
     /// The executor profile every executor turn must resolve.
     pub executor_profile: String,
-    /// Same-executor correction turns allowed after review (0 or 1).
+    /// Same-executor correction turns allowed after review. The allowance is
+    /// finite and predeclared: each correction adds one executor turn and one
+    /// required review turn, so the declared total stays inside the cursor's
+    /// bounded attempt capacity instead of relying on an arbitrary smaller cap.
     #[serde(default)]
     pub max_corrections: u32,
+    /// Frozen concurrent capacity for the workflow participants. Zero keeps
+    /// the documented minimum of two (one lead and one executor slot); any
+    /// declared value must leave room for both participants.
+    #[serde(default)]
+    pub capacity: u32,
+}
+
+impl WorkflowInputs {
+    /// Validate the declared participant composition. The turn plan is
+    /// `3 + 2N`: one lead frame, one executor turn, one review turn and, per
+    /// declared correction, one same-executor correction plus the review that
+    /// must follow it. The plan is checked against the cursor's bounded attempt
+    /// capacity rather than an arbitrary smaller correction count.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != 1 {
+            return Err(invalid(format!(
+                "the declared measured workflow uses unsupported schema {}; this controller reads schema 1",
+                self.schema
+            )));
+        }
+        token("workflow lead profile", &self.lead_profile, MAX_TOKEN)?;
+        token(
+            "workflow executor profile",
+            &self.executor_profile,
+            MAX_TOKEN,
+        )?;
+        if self.lead_profile == self.executor_profile {
+            return Err(invalid(
+                "the declared measured workflow names one profile for both lead and executor turns; the participants must resolve distinct configured bindings",
+            ));
+        }
+        if self.capacity == 1 || self.capacity > 32 {
+            return Err(invalid(
+                "the declared workflow capacity must leave room for a lead and an executor slot (2-32)",
+            ));
+        }
+        if u64::from(self.planned_turns()) > MAX_ATTEMPTS as u64 {
+            return Err(invalid(format!(
+                "the declared {} correction turn(s) need {} workflow turns, beyond the cursor's bounded {MAX_ATTEMPTS} attempt capacity",
+                self.max_corrections,
+                self.planned_turns()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The exact number of participant turns this declaration plans.
+    pub fn planned_turns(&self) -> u32 {
+        3u32.saturating_add(self.max_corrections.saturating_mul(2))
+    }
+
+    /// The frozen participant capacity; an omitted declaration keeps the
+    /// documented minimum of two slots.
+    pub fn effective_capacity(&self) -> u32 {
+        if self.capacity == 0 { 2 } else { self.capacity }
+    }
 }
 
 impl ComparisonInputs {
@@ -603,11 +664,7 @@ impl ComparisonInputs {
                 &workflow.executor_profile,
                 MAX_TOKEN,
             )?;
-            if workflow.max_corrections > 1 {
-                return Err(invalid(
-                    "the declared measured workflow allows more than one correction turn; the bounded acceptance capacity permits at most one",
-                ));
-            }
+            workflow.validate()?;
         }
         Ok(())
     }
@@ -617,6 +674,112 @@ impl ComparisonInputs {
     pub fn declared_policy(&self) -> io::Result<crate::improvement_policy::DeclaredComparison> {
         let policy: ComparisonPolicy = read_json(&self.policy, MAX_RUN_SPEC_BYTES)?;
         policy.declare()
+    }
+}
+
+/// The one prepared runtime a baseline qualification runs its single measured
+/// workflow in. It is the same runtime owner the comparison arms consume, with
+/// exactly one build instead of a baseline/candidate pair: qualification
+/// observes the control workflow before any comparison margin exists.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationRuntimeInputs {
+    /// The owned native build state publishing the immutable build.
+    pub state: PathBuf,
+    /// The prepared build inside that state.
+    pub build: PathBuf,
+    /// Bounded runtime label recorded in the retained accounting evidence.
+    pub label: String,
+    /// The explicit original Codex client; never a PATH lookup or fallback.
+    pub upstream: PathBuf,
+    /// The accepted client inputs (local route, overlay, catalogue).
+    pub client: ClientInputs,
+}
+
+impl QualificationRuntimeInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        absolute_directory("the prepared qualification runtime state", &self.state)?;
+        if !self.build.is_absolute() {
+            return Err(invalid(
+                "the prepared qualification build must be an absolute path inside its owned state",
+            ));
+        }
+        line("qualification runtime label", &self.label, MAX_REASON)?;
+        if !self.upstream.is_absolute() || !self.upstream.is_file() {
+            return Err(invalid(format!(
+                "the explicit qualification upstream client is missing at {}",
+                self.upstream.display()
+            )));
+        }
+        let endpoint = self.client.runner.endpoint.trim();
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(invalid(
+                "the declared qualification client endpoint must be an explicit http(s) URL",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The explicit one-arm baseline qualification declaration. It freezes the
+/// task snapshot, the single prepared runtime, the independent acceptance, the
+/// participant profiles and the finite correction allowance before any effect.
+/// It deliberately carries no comparison policy, candidate arm, margins or
+/// verdict inputs: those belong to the later measured comparison.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineQualificationInputs {
+    pub schema: u32,
+    pub task: TaskInputs,
+    pub runtime: QualificationRuntimeInputs,
+    pub acceptance: AcceptanceInputs,
+    pub workflow: WorkflowInputs,
+    /// Acceptance-runner-owned destination for the byte-for-byte copy of the
+    /// completed native result. It must stay outside the submitted product
+    /// checkout; the independent oracle reads it through its literal path.
+    pub report: PathBuf,
+}
+
+impl BaselineQualificationInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != BASELINE_QUALIFICATION_SCHEMA {
+            return Err(invalid(format!(
+                "baseline qualification inputs declare schema {}; this controller reads schema {BASELINE_QUALIFICATION_SCHEMA}",
+                self.schema
+            )));
+        }
+        self.task.validate()?;
+        self.runtime.validate()?;
+        self.acceptance.validate()?;
+        self.workflow.validate()?;
+        if !self.report.is_absolute() {
+            return Err(invalid(
+                "the qualification report path must be absolute and predeclared",
+            ));
+        }
+        if self
+            .report
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none()
+        {
+            return Err(invalid(
+                "the qualification report path must name a file, not a directory",
+            ));
+        }
+        if self.report.starts_with(&self.task.source) {
+            return Err(invalid(
+                "the qualification report must stay outside the frozen task source; the submitted product checkout cannot own its own acceptance input",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The frozen declaration digest recorded before the first turn. A changed
+    /// declaration refuses reuse instead of silently re-freezing margins,
+    /// bindings or the acceptance request.
+    pub fn digest(&self) -> io::Result<String> {
+        Ok(digest_bytes(&serde_json::to_vec(self)?))
     }
 }
 
@@ -654,6 +817,11 @@ pub struct RunSpec {
     /// engaged and no measured attempt is dispatched.
     #[serde(default)]
     pub comparison: Option<ComparisonInputs>,
+    /// The explicit one-arm baseline qualification declaration. Absent keeps
+    /// every legacy route unchanged; present drives one real lead/executor
+    /// control workflow without a candidate arm or comparison verdict.
+    #[serde(default)]
+    pub baseline_qualification: Option<BaselineQualificationInputs>,
     /// The stages this run's authority permits.
     pub publication_scope: Vec<PublicationStage>,
     /// The independent acceptance/oracle reference, outside candidate writes.
@@ -771,6 +939,44 @@ impl RunSpec {
             } else {
                 return Err(invalid(
                     "a declared comparison requires the explicit local runner it measures",
+                ));
+            }
+        }
+        if let Some(qualification) = &self.baseline_qualification {
+            qualification.validate()?;
+            if self.comparison.is_some() {
+                return Err(invalid(
+                    "a run cannot declare both a two-arm comparison and a one-arm baseline qualification; the qualification must finish before comparison margins are frozen",
+                ));
+            }
+            if self.runner.is_none() {
+                return Err(invalid(
+                    "a declared baseline qualification requires the runner profile that opens its visible conversations",
+                ));
+            }
+            let Some(local) = &self.local_runner else {
+                return Err(invalid(
+                    "a declared baseline qualification requires the explicit local runner its runtime client consumes",
+                ));
+            };
+            let client = &qualification.runtime.client.runner;
+            if client.endpoint != local.endpoint || client.model != local.model {
+                return Err(invalid(
+                    "the qualification client route must be the run's declared local runner: endpoint and model cannot differ",
+                ));
+            }
+            if self
+                .runner
+                .as_ref()
+                .is_some_and(|runner| runner.profile != qualification.workflow.executor_profile)
+            {
+                return Err(invalid(
+                    "the run's visible-dispatch profile must be the baseline qualification's declared executor profile; an executor fallback is not accepted",
+                ));
+            }
+            if qualification.report.starts_with(&self.project) {
+                return Err(invalid(
+                    "the qualification report path must stay outside the submitted product checkout",
                 ));
             }
         }
@@ -1034,6 +1240,13 @@ pub fn frozen_candidate_removal_digest(item: &str, comments: &[String]) -> Optio
 pub enum Phase {
     Planning,
     CandidateReady,
+    /// One declared one-arm baseline qualification is collecting control
+    /// observations through the real lead/executor workflow.
+    BaselineQualification,
+    /// The qualification completed and retained its native report, source
+    /// revision, oracle record and accounting row. This is a terminal phase
+    /// for the baseline slice; comparison margins remain a separate decision.
+    BaselineQualificationRecorded,
     BaselineAttempt,
     CandidateAttempt,
     Acceptance,
@@ -1049,6 +1262,8 @@ impl Phase {
         match self {
             Self::Planning => "planning",
             Self::CandidateReady => "candidate-ready",
+            Self::BaselineQualification => "baseline-qualification",
+            Self::BaselineQualificationRecorded => "baseline-qualification-recorded",
             Self::BaselineAttempt => "baseline-attempt",
             Self::CandidateAttempt => "candidate-attempt",
             Self::Acceptance => "acceptance",
@@ -1091,6 +1306,10 @@ pub enum AttemptRole {
     Candidate,
     /// The fresh bounded-lead framing turn of one measured workflow.
     LeadFrame,
+    /// The fresh executor turn of one baseline-qualification workflow. It
+    /// consumes the lead-authored assignment in the frozen dispatch checkout
+    /// and is not a measured comparison arm.
+    Executor,
     /// A same-lead review continuation after the executor turn.
     LeadReview,
     /// A bounded same-executor correction continuation.
@@ -1108,6 +1327,7 @@ impl AttemptRole {
             Self::Baseline => "baseline",
             Self::Candidate => "candidate",
             Self::LeadFrame => "lead-frame",
+            Self::Executor => "executor",
             Self::LeadReview => "lead-review",
             Self::Correction => "correction",
             Self::LeadAcceptance => "lead-acceptance",
@@ -1122,6 +1342,7 @@ impl AttemptRole {
             Self::Baseline => "base",
             Self::Candidate => "cand",
             Self::LeadFrame => "lframe",
+            Self::Executor => "exec",
             Self::LeadReview => "lreview",
             Self::Correction => "corr",
             Self::LeadAcceptance => "laccept",
@@ -1572,6 +1793,12 @@ pub enum EffectKind {
     /// The isolated baseline/candidate runtimes, frozen workload copies and
     /// fresh homes were prepared and verified model-free.
     ComparisonPrepared,
+    /// The one-arm baseline qualification froze its declaration, source
+    /// snapshot, participant bindings and single runtime before any turn.
+    BaselineQualificationPrepared,
+    /// The one-arm baseline qualification retained its native report copy,
+    /// source revision, independent oracle record and accounting row.
+    BaselineQualificationRecorded,
     /// One measured arm completed and passed (or failed) the frozen
     /// independent acceptance entry point.
     ComparisonArmAccepted,
@@ -1788,7 +2015,7 @@ pub struct WorkflowArmState {
     pub executor_attempt: Option<String>,
     #[serde(default)]
     pub review: Option<String>,
-    /// The exact first-line review decision (`accept` or `correct`).
+    /// The exact first-line review decision (`accept`, `correct` or `reject`).
     #[serde(default)]
     pub review_token: Option<String>,
     #[serde(default)]
@@ -1801,6 +2028,175 @@ pub struct WorkflowArmState {
     /// All declared turns settled and the lead decision recorded.
     #[serde(default)]
     pub completed: bool,
+}
+
+/// The exact first-line decision of one lead review. A review that returns no
+/// explicit decision is refused; acceptance is never inferred from prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Accept,
+    Correct,
+    Reject,
+}
+
+impl ReviewDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Correct => "correct",
+            Self::Reject => "reject",
+        }
+    }
+
+    pub fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "accept" => Ok(Self::Accept),
+            "correct" => Ok(Self::Correct),
+            "reject" => Ok(Self::Reject),
+            other => Err(invalid(format!(
+                "unrecognized review decision {other:?}; expected accept, correct or reject"
+            ))),
+        }
+    }
+}
+
+/// Parse the first meaningful review line. The lead must state its decision
+/// as the first word (`ACCEPT`, `CORRECT` or `REJECT`, any case); a message
+/// that only describes the work refuses instead of being read as acceptance.
+pub fn parse_review_decision(text: &str) -> io::Result<ReviewDecision> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| {
+            invalid("the lead review returned an empty result; no acceptance decision can be read")
+        })?;
+    let token = line
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    match token.to_ascii_uppercase().as_str() {
+        "ACCEPT" => Ok(ReviewDecision::Accept),
+        "CORRECT" => Ok(ReviewDecision::Correct),
+        "REJECT" => Ok(ReviewDecision::Reject),
+        _ => Err(invalid(format!(
+            "the lead review begins with {token:?} instead of ACCEPT, CORRECT or REJECT; the workflow never infers a decision from prose"
+        ))),
+    }
+}
+
+/// The next declared turn of one baseline-qualification workflow, derived
+/// only from retained state and the frozen declaration. The controller never
+/// invents a turn: each step names the exact participant conversation that
+/// must produce it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualificationStep {
+    /// Fresh bounded lead: frame the task and author the executor assignment.
+    Frame,
+    /// Fresh executor: consume the lead's assignment in the task checkout.
+    Execute,
+    /// Same lead: review the executor result and decide.
+    Review,
+    /// Same executor: apply one declared correction.
+    Correct,
+    /// The lead accepted: copy the native report and run the oracle.
+    Finalize,
+    /// The lead rejected the result.
+    Rejected,
+    /// The review asked for another correction after the finite allowance was
+    /// consumed; the observation ends without another executor turn.
+    Exhausted,
+}
+
+impl WorkflowArmState {
+    /// Derive the next turn from the retained identities. A correction clears
+    /// the review decision, so the turn after it must be a meaningful review;
+    /// acceptance never needs a confirmation-only lead turn.
+    pub fn next_step(&self, declared: &WorkflowInputs) -> io::Result<QualificationStep> {
+        if self.completed {
+            return Ok(match self.lead_accepted {
+                Some(true) => QualificationStep::Finalize,
+                _ => QualificationStep::Rejected,
+            });
+        }
+        if self.lead_frame.is_none() || self.lead.is_none() {
+            return Ok(QualificationStep::Frame);
+        }
+        if self.executor_attempt.is_none() || self.executor.is_none() {
+            return Ok(QualificationStep::Execute);
+        }
+        match self.review_token.as_deref() {
+            None => Ok(QualificationStep::Review),
+            Some("accept") => Ok(QualificationStep::Finalize),
+            Some("reject") => Ok(QualificationStep::Rejected),
+            Some("correct") => {
+                if self.corrections.len() as u32 >= declared.max_corrections {
+                    Ok(QualificationStep::Exhausted)
+                } else {
+                    Ok(QualificationStep::Correct)
+                }
+            }
+            Some(other) => Err(invalid(format!(
+                "the retained workflow records an unrecognized review decision {other:?}"
+            ))),
+        }
+    }
+
+    /// Record one completed review. Re-recording the same attempt is
+    /// idempotent so a controller crash between the effect and the cursor
+    /// write cannot duplicate the turn.
+    pub fn record_review(&mut self, attempt: &str, decision: ReviewDecision) -> io::Result<()> {
+        if let Some(existing) = &self.review
+            && existing != attempt
+        {
+            return Err(invalid(format!(
+                "the workflow already recorded review {existing}; {attempt} cannot replace it"
+            )));
+        }
+        self.review = Some(attempt.to_owned());
+        self.review_token = Some(decision.as_str().to_owned());
+        match decision {
+            ReviewDecision::Accept => self.lead_accepted = Some(true),
+            ReviewDecision::Reject => self.lead_accepted = Some(false),
+            ReviewDecision::Correct => {}
+        }
+        Ok(())
+    }
+
+    /// Record one dispatched correction after its executor turn settled. The
+    /// consumed allowance is counted here, and the cleared review decision
+    /// makes the next declared turn another meaningful review.
+    pub fn record_correction(
+        &mut self,
+        attempt: &str,
+        declared: &WorkflowInputs,
+    ) -> io::Result<()> {
+        if self.corrections.iter().any(|existing| existing == attempt) {
+            return Ok(());
+        }
+        if self.corrections.len() as u32 >= declared.max_corrections {
+            return Err(invalid(format!(
+                "the declared {} correction turn(s) are already consumed; no further correction can be dispatched",
+                declared.max_corrections
+            )));
+        }
+        if self.review_token.as_deref() != Some("correct") {
+            return Err(invalid(
+                "a correction requires a recorded CORRECT review that requested it",
+            ));
+        }
+        self.corrections.push(attempt.to_owned());
+        self.review = None;
+        self.review_token = None;
+        Ok(())
+    }
+
+    /// Mark the workflow's declared turns settled. `lead_accepted` is the
+    /// lead's decision, not the independent oracle's verdict.
+    pub fn record_completion(&mut self, lead_accepted: bool) {
+        self.lead_accepted = Some(lead_accepted);
+        self.completed = true;
+    }
 }
 
 /// The retained recovery state of one comparison arm. The prepared runtime
@@ -1924,6 +2320,119 @@ impl ComparisonState {
     }
 }
 
+pub const BASELINE_QUALIFICATION_STATE_SCHEMA: u32 = 1;
+
+/// One participant binding resolved from the installed configuration before
+/// the first turn and never re-resolved from a fallback. The accepted native
+/// dispatch must reproduce all of these values.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationBindingIdentity {
+    pub profile: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+impl QualificationBindingIdentity {
+    pub fn of(binding: &crate::orchestration_config::ProfileBinding) -> Self {
+        Self {
+            profile: binding.profile.clone(),
+            model: binding.model.clone(),
+            model_provider: binding.model_provider.clone(),
+            reasoning_effort: binding.reasoning_effort.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineQualificationState {
+    /// Schema of a retained qualification state; zero only in `Default`.
+    #[serde(default)]
+    pub schema: u32,
+    /// Digest of the frozen declaration; any later change refuses reuse.
+    #[serde(default)]
+    pub declaration_digest: String,
+    /// Frozen concurrent participant capacity.
+    #[serde(default)]
+    pub capacity: u32,
+    /// The retained prepared runtime receipt.
+    #[serde(default)]
+    pub runtime: Option<PathBuf>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub build: Option<PathBuf>,
+    /// The frozen single-commit task copy every dispatch is cloned from.
+    #[serde(default)]
+    pub task_copy: Option<PathBuf>,
+    /// The committed root revision of the frozen task copy, used for the
+    /// dispatch base and the executor ancestry check.
+    #[serde(default)]
+    pub task_base: Option<String>,
+    /// The frozen dispatch checkout derived from the task snapshot.
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// The fresh participant home the single prepared runtime installed into.
+    #[serde(default)]
+    pub home: Option<PathBuf>,
+    /// The frozen acceptance workspace the oracle checks.
+    #[serde(default)]
+    pub task_workspace: Option<PathBuf>,
+    /// The installed lead binding resolved before the first turn.
+    #[serde(default)]
+    pub lead_binding: Option<QualificationBindingIdentity>,
+    /// The installed executor binding resolved before the first turn.
+    #[serde(default)]
+    pub executor_binding: Option<QualificationBindingIdentity>,
+    /// The exact participant turns and their retained attempt identities.
+    #[serde(default)]
+    pub workflow: WorkflowArmState,
+    /// The exact committed source revision the latest completed executor (or
+    /// correction) turn left in the dispatch checkout. It may equal the
+    /// frozen base when the task required no product edit.
+    #[serde(default)]
+    pub source_revision: Option<String>,
+    /// The exact written clone of the latest completed executor result.
+    #[serde(default)]
+    pub report: Option<PathBuf>,
+    #[serde(default)]
+    pub report_sha256: Option<String>,
+    #[serde(default)]
+    pub report_bytes: Option<u64>,
+    /// The retained run-store result the report copy was made from.
+    #[serde(default)]
+    pub report_source: Option<PathBuf>,
+    /// The retained real-task oracle record.
+    #[serde(default)]
+    pub oracle: Option<PathBuf>,
+    #[serde(default)]
+    pub accepted: Option<bool>,
+    /// The retained accounting row of this qualification unit.
+    #[serde(default)]
+    pub row: Option<PathBuf>,
+    /// Why this qualification produced no usable result.
+    #[serde(default)]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub prepared_ms: Option<u64>,
+}
+
+impl BaselineQualificationState {
+    pub fn new(declaration_digest: String, capacity: u32) -> Self {
+        Self {
+            schema: BASELINE_QUALIFICATION_STATE_SCHEMA,
+            declaration_digest,
+            capacity,
+            ..Self::default()
+        }
+    }
+}
+
 /// The durable cursor: bounded recovery data referencing the board, planning
 /// and runtime identities. It never records a hypothesis decision.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1975,6 +2484,10 @@ pub struct Cursor {
     /// The declared sequential comparison and its retained recovery state.
     #[serde(default)]
     pub comparison: Option<ComparisonState>,
+    /// The declared one-arm baseline qualification and its retained recovery
+    /// state. Mutually exclusive with `comparison` at spec validation.
+    #[serde(default)]
+    pub baseline_qualification: Option<BaselineQualificationState>,
     pub updated_ms: u64,
 }
 
@@ -2002,6 +2515,7 @@ impl Cursor {
             intake: None,
             candidate: None,
             comparison: None,
+            baseline_qualification: None,
             updated_ms: now_ms(),
         }
     }

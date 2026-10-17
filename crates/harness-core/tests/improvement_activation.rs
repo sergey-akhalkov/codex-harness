@@ -837,6 +837,7 @@ fn run_spec(
         removal: None,
         evidence_root: None,
         comparison: None,
+        baseline_qualification: None,
     }
 }
 
