@@ -15,6 +15,8 @@ use std::{
     process::{Command, Output},
 };
 
+#[path = "delivery_reflection/native_import.rs"]
+mod native_import;
 const LEAD: &str = "lead-fixture";
 const APPROVER: &str = "board-contract";
 
