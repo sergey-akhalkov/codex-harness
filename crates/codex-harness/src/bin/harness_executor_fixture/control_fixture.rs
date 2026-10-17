@@ -62,6 +62,10 @@ const TURN: &str = "fixture-turn-1";
 /// Item id and function-call `call_id`. It is not passed to the heavy command.
 const HEAVY_CALL_ID: &str = "call_heavy_blocked_1";
 const FINAL_MESSAGE: &str = "fixture turn completed; the committed solution is in the bound slot";
+const INHERITED_MUTATOR_SERVER: &str = "inherited-mutator";
+const INHERITED_DOTTED_SERVER: &str = "odd.name";
+const INHERITED_MUTATOR_TOOL: &str = "write_owned_target";
+const INHERITED_APP: &str = "inherited-app";
 
 /// Serves one `app-server` invocation. Returns the process exit code; the
 /// caller's Job owns termination, exactly as it owns the real child.
@@ -287,6 +291,7 @@ struct ReflectionState {
     fork_model: Option<String>,
     fork_provider: Option<String>,
     fork_effort: Option<String>,
+    fork_config: Option<Value>,
     source_goal: Value,
     forked: bool,
     goal_cleared: bool,
@@ -316,6 +321,7 @@ impl ReflectionState {
             self.fork_model = value["model"].as_str().map(str::to_owned);
             self.fork_provider = value["modelProvider"].as_str().map(str::to_owned);
             self.fork_effort = value["reasoningEffort"].as_str().map(str::to_owned);
+            self.fork_config = value.get("config").cloned();
         }
         let turn_path = self.fixture_dir.join(format!("turn-{}.json", self.stage));
         if let Ok(bytes) = fs::read(&turn_path)
@@ -335,12 +341,14 @@ impl ReflectionState {
         self.fork_effort = request["config"]["model_reasoning_effort"]
             .as_str()
             .map(str::to_owned);
+        self.fork_config = request.get("config").cloned();
         let value = json!({
             "forkThread": self.fork_thread,
             "cwd": self.fork_cwd,
             "model": self.fork_model,
             "modelProvider": self.fork_provider,
             "reasoningEffort": self.fork_effort,
+            "config": self.fork_config,
         });
         let _ = fs::write(
             self.fixture_dir.join(format!("fork-{}.json", self.stage)),
@@ -363,18 +371,29 @@ impl ReflectionState {
 
     fn source_record(&self) -> Value {
         let (thread, turn) = self.source();
-        let last = if self.outcome == "source-drift" {
+        let later = matches!(self.outcome.as_str(), "source-drift" | "source-later-work");
+        let last = if later {
             format!("{turn}-moved")
         } else {
             turn.to_owned()
         };
+        let checkpoint_status = if self.outcome == "source-checkpoint-changed" && self.forked {
+            "inProgress"
+        } else {
+            "completed"
+        };
+        let checkpoint_text = if self.outcome == "source-drift" && self.forked {
+            "source checkpoint rewritten after the fork".to_owned()
+        } else {
+            format!("copied source work for {thread}")
+        };
         let mut turns = vec![reflection_turn(
             turn,
-            "completed",
-            &format!("copied source work for {thread}"),
+            checkpoint_status,
+            &checkpoint_text,
             None,
         )];
-        if last != turn {
+        if later {
             turns.push(reflection_turn(
                 &last,
                 "completed",
@@ -399,7 +418,11 @@ impl ReflectionState {
         )];
         if self.turn_started {
             let status = match self.outcome.as_str() {
-                "complete" | "missing-usage" => "completed",
+                "complete"
+                | "missing-usage"
+                | "mutator-window"
+                | "dotted-mutator-window"
+                | "source-later-work" => "completed",
                 "interrupted" => "interrupted",
                 "failed" => "failed",
                 _ => "inProgress",
@@ -445,6 +468,129 @@ impl ReflectionState {
             "cwd": params["cwd"].clone(),
             "sandbox": sandbox,
         })
+    }
+
+    /// Whether the recorded fork config disabled the inherited mutator, as the
+    /// real app-server would apply a fork-local override.
+    fn fork_mcp_disabled(&self, name: &str) -> bool {
+        self.fork_config
+            .as_ref()
+            .and_then(|config| config.get("mcp_servers"))
+            .and_then(|servers| servers.get(name))
+            .and_then(|server| server.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    }
+
+    /// Whether the recorded fork config disabled the inherited App.
+    fn fork_app_disabled(&self) -> bool {
+        self.fork_config
+            .as_ref()
+            .and_then(|config| config.get("apps"))
+            .and_then(|apps| apps.get(INHERITED_APP))
+            .and_then(|app| app.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    }
+
+    /// The source MCP catalogue always advertises the inherited mutator. A
+    /// fork receives the same server record only while its config leaves it
+    /// enabled; the default fork record is a disabled server with empty
+    /// inventories.
+    fn mcp_catalogue(&self, thread: &str) -> Answer {
+        let (source, _) = self.source();
+        if thread != source && thread != self.fork_thread {
+            return Answer::Error(json!({
+                "message": format!("synthetic reflection has no MCP owner {thread}")
+            }));
+        }
+        if thread == self.fork_thread && self.outcome == "mcp-catalogue-unavailable" {
+            return Answer::Error(json!({
+                "message": "the synthetic fork MCP catalogue is unavailable"
+            }));
+        }
+        // The dotted scenario advertises a second server whose name contains a
+        // legal dot. The fork-local override must suppress it by its literal
+        // name; the source catalogue keeps it enabled.
+        let names: &[&str] = if self.outcome == "dotted-mutator-window" {
+            &[INHERITED_MUTATOR_SERVER, INHERITED_DOTTED_SERVER]
+        } else {
+            &[INHERITED_MUTATOR_SERVER]
+        };
+        let mut servers = Vec::with_capacity(names.len());
+        for name in names {
+            let exposed = thread == source
+                || self.outcome == "mcp-exposed"
+                || (thread == self.fork_thread && !self.fork_mcp_disabled(name));
+            let mut server = json!({
+                "name": name,
+                "authStatus": "unsupported",
+                "runtimeStatus": if exposed { "connected" } else { "disabled" },
+                "resources": [],
+                "resourceTemplates": [],
+                "tools": {},
+            });
+            if exposed {
+                server["tools"] = json!({
+                    INHERITED_MUTATOR_TOOL: {
+                        "name": INHERITED_MUTATOR_TOOL,
+                        "description": "writes an owned target, dispatches, and mutates the board",
+                        "inputSchema": {"type": "object"},
+                    }
+                });
+            }
+            servers.push(server);
+        }
+        Answer::Result(json!({"data": servers}))
+    }
+
+    /// The source Apps catalogue always advertises one enabled App. The fork
+    /// sees it disabled only when its config names the per-App override.
+    fn app_catalogue(&self, thread: &str) -> Answer {
+        let (source, _) = self.source();
+        if thread != source && thread != self.fork_thread {
+            return Answer::Error(json!({
+                "message": format!("synthetic reflection has no Apps owner {thread}")
+            }));
+        }
+        let exposed = thread == source
+            || self.outcome == "app-exposed"
+            || (thread == self.fork_thread && !self.fork_app_disabled());
+        Answer::Result(json!({
+            "data": [{
+                "id": INHERITED_APP,
+                "name": "Inherited mutating app",
+                "isEnabled": exposed,
+                "isAccessible": exposed,
+            }]
+        }))
+    }
+
+    /// Records one attempt to invoke the inherited mutator and refuses before
+    /// any owned target, dispatch or board mutation exists. The durable record
+    /// is the evidence a check reads; the source conversation is untouched.
+    fn refuse_mutator_call(&self, params: &Value) -> Answer {
+        let server = params["server"].as_str().unwrap_or_default();
+        let attempt = json!({
+            "stage": self.stage,
+            "threadId": params["threadId"],
+            "server": server,
+            "tool": params["tool"],
+            "arguments": params["arguments"],
+            "disposition": "refused: inherited mutator is disabled for the reflection fork",
+        });
+        fs::create_dir_all(&self.fixture_dir).ok();
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.fixture_dir.join("mutator-attempts.jsonl"))
+        {
+            let _ = writeln!(file, "{attempt}");
+        }
+        Answer::Error(json!({
+            "code": -32000,
+            "message": format!("MCP server {server} is disabled for this reflection thread; no owned target, dispatch or board mutation was performed")
+        }))
     }
 }
 
@@ -557,6 +703,7 @@ fn reflection_state() -> ReflectionState {
         fork_model: None,
         fork_provider: None,
         fork_effort: None,
+        fork_config: None,
         source_goal: json!({
             "objective": "the accepted source goal must remain frozen",
             "status": "active",
@@ -661,6 +808,15 @@ fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: 
             });
             Answer::Result(route)
         }
+        "mcpServerStatus/list" => {
+            let thread = params["threadId"].as_str().unwrap_or_default().to_owned();
+            state.mcp_catalogue(&thread)
+        }
+        "app/list" => {
+            let thread = params["threadId"].as_str().unwrap_or_default().to_owned();
+            state.app_catalogue(&thread)
+        }
+        "mcpServer/tool/call" => state.refuse_mutator_call(params),
         "thread/name/set" => {
             if params["threadId"].as_str() != Some(state.fork_thread.as_str()) {
                 return Answer::Error(json!({"message": "only the reflection fork may be named"}));
@@ -702,8 +858,64 @@ fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: 
                     "fixture visibility loss",
                 );
             }
-            if matches!(state.outcome.as_str(), "complete" | "missing-usage") {
+            if matches!(
+                state.outcome.as_str(),
+                "complete"
+                    | "missing-usage"
+                    | "mutator-window"
+                    | "dotted-mutator-window"
+                    | "source-later-work"
+            ) {
                 let _ = write_reflection_rollout(state);
+            }
+            if state.outcome.ends_with("mutator-window") {
+                // Keep the fork endpoint live until the owning test has
+                // addressed it directly. The release marker is bounded so a
+                // lost test cannot hold the native turn open indefinitely.
+                let notifier = notifier.clone();
+                let fork_thread = state.fork_thread.clone();
+                let fork_turn = state.fork_turn.clone();
+                let result = state.result.clone();
+                let release = state
+                    .fixture_dir
+                    .join(format!("release-{}.marker", state.stage));
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while !release.exists() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    notifier.push(json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": fork_thread,
+                            "turnId": fork_turn,
+                            "item": {
+                                "id": format!("{fork_turn}-message"),
+                                "type": "agentMessage",
+                                "text": result,
+                            },
+                        },
+                    }));
+                    notifier.push(json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": fork_thread,
+                            "turnId": fork_turn,
+                            "item": {
+                                "id": format!("{fork_turn}-message"),
+                                "type": "agentMessage",
+                                "text": result,
+                            },
+                        },
+                    }));
+                    notifier.push(json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": fork_thread,
+                            "turn": {"id": fork_turn, "status": "completed"},
+                        },
+                    }));
+                });
             }
             notifier.push(json!({
                 "method": "turn/started",
@@ -713,7 +925,7 @@ fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: 
                 },
             }));
             match state.outcome.as_str() {
-                "complete" | "missing-usage" => {
+                "complete" | "missing-usage" | "source-later-work" => {
                     notifier.push(json!({
                         "method": "item/started",
                         "params": {

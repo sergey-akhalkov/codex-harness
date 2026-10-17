@@ -164,6 +164,9 @@ enum Frame {
 pub struct Wire {
     stream: TcpStream,
     buffer: Vec<u8>,
+    /// Client frames must be masked; server frames must not be. One frame
+    /// writer serves both directions of the same RFC 6455 double.
+    masked: bool,
 }
 
 /// What the canned endpoint accepts as its bearer.
@@ -228,9 +231,100 @@ impl Wire {
         let mut wire = Self {
             stream,
             buffer: Vec::new(),
+            masked: false,
         };
         wire.buffer.extend_from_slice(&received[head_end + 4..]);
         Ok(wire)
+    }
+
+    /// Connects as a native control client to one canned endpoint. The client
+    /// half matters for the checks that address the fork after it exists and
+    /// attempt an inherited tool call through the very endpoint the host
+    /// recorded.
+    pub fn connect(port: u16, token: &str) -> io::Result<Self> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let key = base64(b"harness-control!");
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer {token}\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 512];
+        let head_end = loop {
+            if let Some(index) = find(&received, b"\r\n\r\n") {
+                break index;
+            }
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                return Err(io::Error::other("client handshake closed early"));
+            }
+            received.extend_from_slice(&chunk[..read]);
+            if received.len() > 8192 {
+                return Err(io::Error::other("client handshake exceeds its bound"));
+            }
+        };
+        let head = String::from_utf8_lossy(&received[..head_end]).into_owned();
+        if !head.starts_with("HTTP/1.1 101") {
+            return Err(io::Error::other(format!(
+                "client handshake was refused: {}",
+                head.lines().next().unwrap_or_default()
+            )));
+        }
+        if header(&head, "sec-websocket-accept").as_deref() != Some(accept_key(&key).as_str()) {
+            return Err(io::Error::other(
+                "client handshake carried an unexpected accept key",
+            ));
+        }
+        let mut wire = Self {
+            stream,
+            buffer: Vec::new(),
+            masked: true,
+        };
+        wire.buffer.extend_from_slice(&received[head_end + 4..]);
+        Ok(wire)
+    }
+
+    /// Sends one JSON-RPC request and waits for its own answer, ignoring
+    /// notifications and answers to other requests.
+    pub fn call(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> io::Result<serde_json::Value> {
+        self.write_text(
+            &serde_json::json!({"id": id, "method": method, "params": params}).to_string(),
+        )?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::other(format!(
+                    "no answer to {method} within the client bound"
+                )));
+            }
+            match self.poll_text(remaining)? {
+                Poll::Message(text) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&text).map_err(|error| {
+                            io::Error::other(format!("answer is not JSON: {error}"))
+                        })?;
+                    if value.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                        return Ok(value);
+                    }
+                }
+                Poll::Closed => {
+                    return Err(io::Error::other(format!(
+                        "endpoint closed before answering {method}"
+                    )));
+                }
+                Poll::Idle => {}
+            }
+        }
     }
 
     pub fn poll_text(&mut self, timeout: Duration) -> io::Result<Poll> {
@@ -339,16 +433,28 @@ impl Wire {
     fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         let mut frame = vec![0x80 | opcode];
         let length = payload.len();
+        let mask_bit = if self.masked { 0x80 } else { 0 };
         if length < 126 {
-            frame.push(length as u8);
+            frame.push(mask_bit | length as u8);
         } else if length <= usize::from(u16::MAX) {
-            frame.push(126);
+            frame.push(mask_bit | 126);
             frame.extend_from_slice(&(length as u16).to_be_bytes());
         } else {
-            frame.push(127);
+            frame.push(mask_bit | 127);
             frame.extend_from_slice(&(length as u64).to_be_bytes());
         }
-        frame.extend_from_slice(payload);
+        if self.masked {
+            let mask = [0x5a, 0xa5, 0x3c, 0xc3];
+            frame.extend_from_slice(&mask);
+            frame.extend(
+                payload
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ mask[index % 4]),
+            );
+        } else {
+            frame.extend_from_slice(payload);
+        }
         self.stream.write_all(&frame)?;
         self.stream.flush()
     }
@@ -373,7 +479,14 @@ struct Canned {
     requests: Vec<serde_json::Value>,
     answers: HashMap<String, VecDeque<Answer>>,
     responder: Option<Responder>,
-    notifications: VecDeque<serde_json::Value>,
+    /// One queue per connected client. A real app-server notifies every
+    /// subscribed client, so a second control connection must not steal the
+    /// notifications the host is waiting for.
+    queues: Vec<Arc<Mutex<VecDeque<serde_json::Value>>>>,
+    /// Notifications pushed before the first client connected. They are
+    /// delivered to that first client when it registers, preserving the
+    /// ordinary fixture's start-before-connect order.
+    pending: VecDeque<serde_json::Value>,
     connections: usize,
     refusals: usize,
 }
@@ -394,6 +507,22 @@ impl Canned {
     }
 }
 
+/// Delivers one notification to every connected client's own queue. Before
+/// any client exists it is held for the first one, exactly as the previous
+/// single shared queue behaved.
+fn broadcast(state: &Arc<Mutex<Canned>>, notification: serde_json::Value) {
+    let mut canned = state.lock().unwrap();
+    if canned.queues.is_empty() {
+        canned.pending.push_back(notification);
+        return;
+    }
+    let queues = canned.queues.clone();
+    drop(canned);
+    for queue in queues {
+        queue.lock().unwrap().push_back(notification.clone());
+    }
+}
+
 /// A clonable push handle for a responder that must emit notifications while
 /// it answers a request. It is deliberately separate from the answer callback
 /// lock, so a responder may enqueue a notification without deadlocking.
@@ -404,11 +533,7 @@ pub struct Notifier {
 
 impl Notifier {
     pub fn push(&self, notification: serde_json::Value) {
-        self.state
-            .lock()
-            .unwrap()
-            .notifications
-            .push_back(notification);
+        broadcast(&self.state, notification);
     }
 }
 
@@ -490,11 +615,7 @@ impl Server {
     }
 
     pub fn push(&self, notification: serde_json::Value) {
-        self.state
-            .lock()
-            .unwrap()
-            .notifications
-            .push_back(notification);
+        broadcast(&self.state, notification);
     }
 
     pub fn requests(&self) -> Vec<serde_json::Value> {
@@ -542,8 +663,20 @@ fn serve(
                 let stop = Arc::clone(stop);
                 thread::spawn(move || match Wire::accept(stream, &bearer) {
                     Ok(mut wire) => {
-                        state.lock().unwrap().connections += 1;
-                        let _ = converse(&mut wire, &state, &stop);
+                        let queue = Arc::new(Mutex::new(VecDeque::new()));
+                        let pending: Vec<_> = {
+                            let mut canned = state.lock().unwrap();
+                            canned.connections += 1;
+                            canned.queues.push(Arc::clone(&queue));
+                            canned.pending.drain(..).collect()
+                        };
+                        queue.lock().unwrap().extend(pending);
+                        let _ = converse(&mut wire, &state, &stop, &queue);
+                        state
+                            .lock()
+                            .unwrap()
+                            .queues
+                            .retain(|entry| !Arc::ptr_eq(entry, &queue));
                     }
                     Err(_) => state.lock().unwrap().refusals += 1,
                 });
@@ -561,10 +694,14 @@ fn serve(
     }
 }
 
-fn converse(wire: &mut Wire, state: &Arc<Mutex<Canned>>, stop: &Arc<AtomicBool>) -> bool {
+fn converse(
+    wire: &mut Wire,
+    state: &Arc<Mutex<Canned>>,
+    stop: &Arc<AtomicBool>,
+    queue: &Arc<Mutex<VecDeque<serde_json::Value>>>,
+) -> bool {
     while !stop.load(Ordering::SeqCst) {
-        let queued: Vec<serde_json::Value> =
-            state.lock().unwrap().notifications.drain(..).collect();
+        let queued: Vec<serde_json::Value> = queue.lock().unwrap().drain(..).collect();
         for value in queued {
             if wire.write_text(&value.to_string()).is_err() {
                 return false;

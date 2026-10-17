@@ -9,7 +9,7 @@
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
 
-use control_endpoint::{Answer, Bearer, Server};
+use control_endpoint::{Answer, Bearer, Server, Wire};
 use harness_core::console::{ConsoleOutcome, ConsoleSession, ConsoleSpec};
 use harness_core::process::{Cancellation, CommandSpec, Deadline};
 use harness_core::role_context::{self, Role};
@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const EXECUTOR_SOURCE: &str = "fixture-executor-source";
@@ -41,6 +41,38 @@ const ACCEPTANCE: &str = "the reflection is retained and the synthesis reaches t
 const TOKEN: &str = "9f0c1d2e3a4b5c6d7e8f90123456789abcdef0123456789abcdef0123456789a";
 const EXECUTOR_RESULT: &str = "executor reflection: one evidenced remedy";
 const LEAD_RESULT: &str = "lead reflection: synthesized remedy";
+/// Every native feature channel that could expose an inherited mutation
+/// surface outside the read-only filesystem sandbox. The reflection fork must
+/// switch each one off in its own config.
+const BLOCKED_FEATURES: [&str; 27] = [
+    "features.apps",
+    "features.enable_mcp_apps",
+    "features.codex_apps_mcp_2026_07_28",
+    "features.plugins",
+    "features.remote_plugin",
+    "features.browser_use",
+    "features.browser_use_external",
+    "features.browser_use_full_cdp_access",
+    "features.browser_annotation_api",
+    "features.in_app_browser",
+    "features.computer_use",
+    "features.image_generation",
+    "features.artifact",
+    "features.code_mode",
+    "features.code_mode_host",
+    "features.hooks",
+    "features.goals",
+    "features.multi_agent",
+    "features.multi_agent_v2",
+    "features.agent_message_board",
+    "features.deferred_executor",
+    "features.request_permissions_tool",
+    "features.guardian_approval",
+    "features.use_agent_identity",
+    "features.send_message_to_user_async",
+    "features.workspace_dependencies",
+    "features.skill_mcp_dependency_install",
+];
 
 fn manager() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
@@ -82,6 +114,26 @@ fn role_facts() -> &'static RoleFacts {
             executor_instructions: executor.developer_instructions,
             lead_instructions: lead.developer_instructions,
         }
+    })
+}
+
+/// The live identity of this test process, in the shape a managed lead
+/// endpoint record carries for the app-server that serves it.
+fn live_endpoint_process() -> Value {
+    let program = std::env::current_exe().unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity = harness_core::process_service::ServiceProcess::observe(
+        std::process::id(),
+        &program,
+        0,
+        &user,
+    )
+    .unwrap()
+    .identity();
+    json!({
+        "pid": identity.pid,
+        "creationTime": identity.creation_time,
+        "program": program,
     })
 }
 
@@ -157,7 +209,8 @@ impl Workspace {
                     "schema": 1,
                     "port": lead.port,
                     "token": TOKEN,
-                    "threadId": LEAD_THREAD
+                    "threadId": LEAD_THREAD,
+                    "process": live_endpoint_process()
                 }))
                 .unwrap(),
             )
@@ -274,14 +327,26 @@ fn wait_session(session: ConsoleSession) -> ConsoleOutcome {
         .unwrap()
 }
 
-fn run_chain(
+fn wait_for_path(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} was not created within {timeout:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn spawn_chain(
     workspace: &Workspace,
     request: &Value,
     executor_outcome: &str,
     lead_outcome: &str,
     executor_result: &str,
     lead_result: &str,
-) -> ConsoleOutcome {
+) -> ConsoleSession {
     fs::write(
         &workspace.request,
         serde_json::to_vec_pretty(request).unwrap(),
@@ -356,8 +421,25 @@ fn run_chain(
     spec.env.insert("HARNESS_REFLECTION_SESSION".into(), None);
     spec.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
     spec.env.insert("WT_SESSION".into(), None);
-    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
-    wait_session(session)
+    ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap()
+}
+
+fn run_chain(
+    workspace: &Workspace,
+    request: &Value,
+    executor_outcome: &str,
+    lead_outcome: &str,
+    executor_result: &str,
+    lead_result: &str,
+) -> ConsoleOutcome {
+    wait_session(spawn_chain(
+        workspace,
+        request,
+        executor_outcome,
+        lead_outcome,
+        executor_result,
+        lead_result,
+    ))
 }
 
 fn read_json(path: &Path) -> Value {
@@ -380,6 +462,27 @@ fn fixture_requests(workspace: &Workspace, stage: &str, method: &str) -> Vec<Val
 
 fn request_param(request: &Value, key: &str) -> Value {
     request["params"][key].clone()
+}
+
+/// The exact stage/method/thread sequence the fixture observed, in arrival
+/// order. It distinguishes the pre-fork source catalogue read from the
+/// post-fork verification and proves the fork was named before its first turn.
+fn request_sequence(workspace: &Workspace) -> Vec<(String, String, String)> {
+    fs::read_to_string(workspace.fixture_dir.join("requests.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|entry| {
+            (
+                entry["stage"].as_str().unwrap_or_default().to_owned(),
+                entry["method"].as_str().unwrap_or_default().to_owned(),
+                entry["request"]["params"]["threadId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect()
 }
 
 fn assert_usage(stage: &Value, total: u64, cumulative: u64, response: &str, copied: &str) {
@@ -435,6 +538,43 @@ fn native_reflection_forks_preserve_sources_retain_results_and_charge_only_new_t
     assert_eq!(executor["fork"]["sourcePreserved"], true, "{executor}");
     assert_eq!(lead["fork"]["goalCleared"], true, "{lead}");
     assert_eq!(lead["fork"]["sourcePreserved"], true, "{lead}");
+    for stage in [&executor, &lead] {
+        assert_eq!(
+            stage["fork"]["suppressedMcpServers"],
+            json!(["inherited-mutator"]),
+            "{stage}"
+        );
+        assert_eq!(
+            stage["fork"]["suppressedApps"],
+            json!(["inherited-app"]),
+            "{stage}"
+        );
+        assert_eq!(
+            stage["fork"]["toolSurface"]["verified"],
+            json!(true),
+            "{stage}"
+        );
+        assert_eq!(
+            stage["fork"]["toolSurface"]["mcpServers"],
+            json!([{
+                "name": "inherited-mutator",
+                "runtimeStatus": "disabled",
+                "tools": 0,
+                "resources": 0,
+                "resourceTemplates": 0,
+            }]),
+            "{stage}"
+        );
+        assert_eq!(
+            stage["fork"]["toolSurface"]["apps"],
+            json!([{
+                "id": "inherited-app",
+                "enabled": false,
+                "accessible": false,
+            }]),
+            "{stage}"
+        );
+    }
     assert_eq!(executor["fork"]["sandbox"], "read-only", "{executor}");
     assert_eq!(
         executor["fork"]["cwd"],
@@ -473,6 +613,32 @@ fn native_reflection_forks_preserve_sources_retain_results_and_charge_only_new_t
     assert_eq!(params["modelProvider"], PROVIDER);
     assert_eq!(params["config"]["model_reasoning_effort"], EFFORT);
     assert_eq!(params["config"]["agents.enabled"], false);
+    assert_eq!(params["config"]["web_search"], "disabled");
+    assert_eq!(
+        params["config"]["mcp_servers"],
+        json!({"inherited-mutator": {"enabled": false}})
+    );
+    assert!(
+        params["config"]
+            .get("mcp_servers.inherited-mutator.enabled")
+            .is_none(),
+        "the fork override must use a literal table, not a dotted scalar: {params:?}"
+    );
+    assert_eq!(
+        params["config"]["apps"],
+        json!({"inherited-app": {"enabled": false}})
+    );
+    assert!(
+        params["config"].get("apps.inherited-app.enabled").is_none(),
+        "the fork override must use a literal table, not a dotted scalar: {params:?}"
+    );
+    for feature in BLOCKED_FEATURES {
+        assert_eq!(
+            params["config"][feature],
+            json!(false),
+            "the reflection fork left {feature} enabled: {params:?}"
+        );
+    }
     assert!(
         params["developerInstructions"]
             .as_str()
@@ -537,6 +703,53 @@ fn native_reflection_forks_preserve_sources_retain_results_and_charge_only_new_t
     assert!(
         !lead_instructions.contains(role_facts().executor_instructions.as_str()),
         "{lead_params:?}"
+    );
+
+    for method in ["mcpServerStatus/list", "app/list"] {
+        let reads = fixture_requests(&workspace, "executor-self-reflection", method);
+        assert_eq!(reads.len(), 3, "{method}: {reads:?}");
+        assert_eq!(
+            request_param(&reads[0], "threadId"),
+            EXECUTOR_SOURCE,
+            "{method}"
+        );
+        assert_eq!(
+            request_param(&reads[1], "threadId"),
+            EXECUTOR_FORK,
+            "{method}"
+        );
+        assert_eq!(
+            request_param(&reads[2], "threadId"),
+            EXECUTOR_SOURCE,
+            "{method}"
+        );
+    }
+    let sequence = request_sequence(&workspace);
+    let position = |stage: &str, method: &str, thread: &str| {
+        sequence
+            .iter()
+            .position(|(seen_stage, seen_method, seen_thread)| {
+                seen_stage == stage && seen_method == method && seen_thread == thread
+            })
+            .unwrap_or_else(|| panic!("{stage} {method} {thread} was not observed: {sequence:?}"))
+    };
+    let source_catalogue = position(
+        "executor-self-reflection",
+        "mcpServerStatus/list",
+        EXECUTOR_SOURCE,
+    );
+    let fork_verification = position(
+        "executor-self-reflection",
+        "mcpServerStatus/list",
+        EXECUTOR_FORK,
+    );
+    let fork_title = position("executor-self-reflection", "thread/name/set", EXECUTOR_FORK);
+    let fork_turn = position("executor-self-reflection", "turn/start", EXECUTOR_FORK);
+    assert!(
+        source_catalogue < fork_verification
+            && fork_verification < fork_title
+            && fork_title < fork_turn,
+        "source catalogue, fork verification, title and turn were not ordered: {sequence:?}"
     );
 
     let goal_clears = fixture_requests(&workspace, "executor-self-reflection", "thread/goal/clear");
@@ -758,6 +971,223 @@ fn source_run_and_effective_model_drift_refuse_before_any_fork() {
         "resolves model=other-model, not the declared deepseek-flash",
     );
     assert_eq!(request_counts(&model), before);
+}
+
+#[test]
+fn later_source_work_preserves_the_selected_checkpoint() {
+    let workspace = Workspace::new("source-later", LeadMode::Delivered);
+    let request = workspace.request("run-source-later");
+    let finished = run_chain(
+        &workspace,
+        &request,
+        "source-later-work",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let executor = stage(&workspace, "executor-stage");
+    assert_eq!(executor["status"], "completed", "{executor}");
+    assert_eq!(executor["fork"]["sourcePreserved"], true, "{executor}");
+    let later = format!("{EXECUTOR_SOURCE_TURN}-moved");
+    for key in ["sourceTurnsBefore", "sourceTurnsAfter"] {
+        assert_eq!(
+            executor["fork"][key],
+            json!([EXECUTOR_SOURCE_TURN, later.as_str()]),
+            "{key}: {executor}"
+        );
+    }
+    assert_eq!(stage(&workspace, "lead-stage")["status"], "completed");
+}
+
+#[test]
+fn selected_source_checkpoint_drift_refuses_before_turn() {
+    let workspace = Workspace::new("source-checkpoint-drift", LeadMode::Delivered);
+    let request = workspace.request("run-source-checkpoint-drift");
+    let finished = run_chain(
+        &workspace,
+        &request,
+        "source-drift",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert!(
+        finished.transcript.contains("selected source checkpoint")
+            && finished.transcript.contains("changed during the fork"),
+        "{}",
+        finished.transcript
+    );
+    let executor = stage(&workspace, "executor-stage");
+    assert_eq!(executor["status"], "failed", "{executor}");
+    assert!(
+        executor["error"].as_str().is_some_and(|error| {
+            error.contains("selected source checkpoint")
+                && error.contains("changed during the fork")
+        }),
+        "{executor}"
+    );
+    assert_eq!(request_counts(&workspace), (1, 0, 0, 0));
+    assert!(
+        !workspace.state.join("lead-stage.json").exists(),
+        "the lead stage must not start after the selected checkpoint drifted"
+    );
+}
+
+#[test]
+fn dotted_mcp_server_name_is_disabled_without_touching_source_configuration() {
+    let workspace = Workspace::new("dotted-mcp", LeadMode::Delivered);
+    let config_path = workspace.home.join(format!("{PROFILE}.config.toml"));
+    let source_config = format!(
+        "model = \"{MODEL}\"\nmodel_provider = \"{PROVIDER}\"\nmodel_reasoning_effort = \"{EFFORT}\"\n\n[mcp_servers.inherited-mutator]\nenabled = true\ncommand = \"synthetic-mutator\"\n\n[mcp_servers.\"odd.name\"]\nenabled = true\ncommand = \"synthetic-dotted-mutator\"\n"
+    );
+    fs::write(&config_path, &source_config).unwrap();
+    let before_config = fs::read(&config_path).unwrap();
+    let request = workspace.request("run-dotted-mcp");
+    let session = spawn_chain(
+        &workspace,
+        &request,
+        "dotted-mutator-window",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    let endpoint_path = workspace
+        .state
+        .join("executor-self-reflection-native")
+        .join("endpoint.json");
+    let turn_path = workspace
+        .fixture_dir
+        .join("turn-executor-self-reflection.json");
+    wait_for_path(&endpoint_path, Duration::from_secs(20));
+    wait_for_path(&turn_path, Duration::from_secs(20));
+    let endpoint = read_json(&endpoint_path);
+    let port = u16::try_from(endpoint["port"].as_u64().unwrap()).unwrap();
+    let token = endpoint["token"].as_str().unwrap();
+    let mut wire = Wire::connect(port, token).unwrap();
+    wire.call(
+        1,
+        "initialize",
+        json!({"clientInfo": {"name": "dotted-native-check", "version": "1"}}),
+    )
+    .unwrap();
+    let refusal = wire
+        .call(
+            2,
+            "mcpServer/tool/call",
+            json!({
+                "threadId": EXECUTOR_FORK,
+                "server": "odd.name",
+                "tool": "write_owned_target",
+                "arguments": {
+                    "ownedTarget": workspace.checkout.join("owned-target.txt").to_string_lossy(),
+                    "dispatch": workspace.checkout.join("dispatch.json").to_string_lossy(),
+                    "board": workspace.checkout.join(".beads").to_string_lossy(),
+                },
+            }),
+        )
+        .unwrap();
+    assert_eq!(refusal["error"]["code"], json!(-32000), "{refusal}");
+    assert!(
+        refusal["error"]["message"].as_str().is_some_and(|message| {
+            message.contains("odd.name") && message.contains("no owned target")
+        }),
+        "{refusal}"
+    );
+    let source = wire
+        .call(
+            3,
+            "mcpServerStatus/list",
+            json!({"threadId": EXECUTOR_SOURCE, "detail": "toolsAndAuthOnly", "limit": 100}),
+        )
+        .unwrap();
+    let source_servers = source["result"]["data"].as_array().unwrap();
+    let dotted = source_servers
+        .iter()
+        .find(|server| server["name"] == "odd.name")
+        .expect("the source keeps advertising odd.name");
+    assert_eq!(dotted["runtimeStatus"], "connected", "{source}");
+    assert!(
+        dotted["tools"].get("write_owned_target").is_some(),
+        "{source}"
+    );
+    fs::write(
+        workspace
+            .fixture_dir
+            .join("release-executor-self-reflection.marker"),
+        "release",
+    )
+    .unwrap();
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let attempts: Vec<Value> =
+        fs::read_to_string(workspace.fixture_dir.join("mutator-attempts.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(
+        attempts[0]["stage"], "executor-self-reflection",
+        "{attempts:?}"
+    );
+    assert_eq!(attempts[0]["threadId"], EXECUTOR_FORK, "{attempts:?}");
+    assert_eq!(attempts[0]["server"], "odd.name", "{attempts:?}");
+    assert_eq!(attempts[0]["tool"], "write_owned_target", "{attempts:?}");
+    assert!(
+        attempts[0]["disposition"]
+            .as_str()
+            .is_some_and(|value| value.contains("refused")),
+        "{attempts:?}"
+    );
+    assert!(!workspace.checkout.join("owned-target.txt").exists());
+    assert!(!workspace.checkout.join("dispatch.json").exists());
+    assert!(!workspace.checkout.join(".beads").exists());
+    assert_eq!(fs::read(&config_path).unwrap(), before_config);
+    let forks = fixture_requests(&workspace, "executor-self-reflection", "thread/fork");
+    assert_eq!(forks.len(), 1, "{forks:?}");
+    let config = &forks[0]["params"]["config"];
+    assert_eq!(
+        config["mcp_servers"],
+        json!({
+            "inherited-mutator": {"enabled": false},
+            "odd.name": {"enabled": false},
+        }),
+        "{config}"
+    );
+    assert!(
+        config.get("mcp_servers.odd.name.enabled").is_none(),
+        "a legal dotted server name must stay one literal table key: {config:?}"
+    );
+    let executor = stage(&workspace, "executor-stage");
+    assert_eq!(executor["status"], "completed", "{executor}");
+    assert_eq!(
+        executor["fork"]["suppressedMcpServers"],
+        json!(["inherited-mutator", "odd.name"]),
+        "{executor}"
+    );
+    assert_eq!(executor["fork"]["sourcePreserved"], true, "{executor}");
+    assert_eq!(
+        executor["fork"]["toolSurface"]["mcpServers"],
+        json!([
+            {
+                "name": "inherited-mutator",
+                "runtimeStatus": "disabled",
+                "tools": 0,
+                "resources": 0,
+                "resourceTemplates": 0,
+            },
+            {
+                "name": "odd.name",
+                "runtimeStatus": "disabled",
+                "tools": 0,
+                "resources": 0,
+                "resourceTemplates": 0,
+            }
+        ]),
+        "{executor}"
+    );
 }
 
 #[test]
@@ -1013,8 +1443,9 @@ fn queued_and_indeterminate_lead_returns_are_not_delivered_or_resent() {
 }
 
 #[test]
-fn failed_lead_return_can_retry_delivery_without_rerunning_stages() {
-    let workspace = Workspace::new("lead-failed", LeadMode::Unavailable);
+fn missing_lead_return_endpoint_refuses_before_stages_and_retries_once() {
+    let workspace = Workspace::new("lead-failed", LeadMode::Delivered);
+    fs::remove_file(&workspace.endpoint).unwrap();
     let request = workspace.request("run-lead-failed");
     let first = run_chain(
         &workspace,
@@ -1024,21 +1455,45 @@ fn failed_lead_return_can_retry_delivery_without_rerunning_stages() {
         EXECUTOR_RESULT,
         LEAD_RESULT,
     );
-    assert_eq!(first.outcome.exit_code, 3, "{}", first.transcript);
-    let delivery = read_json(&workspace.state.join("lead-delivery.json"));
-    assert_eq!(delivery["state"], "failed", "{delivery}");
-    let before = request_counts(&workspace);
-    assert_eq!(before.0, 1, "{before:?}");
-    assert_eq!(before.1, 1, "{before:?}");
-    assert_eq!(before.2, 1, "{before:?}");
-    assert_eq!(before.3, 1, "{before:?}");
+    assert_ne!(first.outcome.exit_code, 0, "{}", first.transcript);
+    assert!(
+        first
+            .transcript
+            .contains("is unavailable before model work"),
+        "{}",
+        first.transcript
+    );
+    assert!(
+        first
+            .transcript
+            .contains("no reflection fork or turn was started"),
+        "{}",
+        first.transcript
+    );
+    assert!(
+        first
+            .transcript
+            .contains("codex-harness lead start --session THREAD"),
+        "{}",
+        first.transcript
+    );
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert!(
+        !workspace.state.join("executor-stage.json").exists(),
+        "the missing lead endpoint must fail before the executor stage"
+    );
+    assert!(
+        !workspace.state.join("lead-stage.json").exists(),
+        "the missing lead endpoint must fail before the lead stage"
+    );
     fs::write(
         &workspace.endpoint,
         serde_json::to_vec_pretty(&json!({
             "schema": 1,
             "port": workspace.lead.port,
             "token": TOKEN,
-            "threadId": LEAD_THREAD
+            "threadId": LEAD_THREAD,
+            "process": live_endpoint_process()
         }))
         .unwrap(),
     )
@@ -1051,11 +1506,10 @@ fn failed_lead_return_can_retry_delivery_without_rerunning_stages() {
         EXECUTOR_RESULT,
         LEAD_RESULT,
     );
-    assert_eq!(second.outcome.exit_code, 3, "{}", second.transcript);
+    assert_eq!(second.outcome.exit_code, 0, "{}", second.transcript);
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
     let delivery = read_json(&workspace.state.join("lead-delivery.json"));
-    assert_eq!(delivery["state"], "queued", "{delivery}");
-    let after = request_counts(&workspace);
-    assert_eq!(after, before);
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
     assert_eq!(workspace.lead.requests_for("turn/start").len(), 1);
 }
 

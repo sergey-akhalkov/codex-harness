@@ -16,7 +16,7 @@
 
 use crate::executor_cli::control::{
     BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, ForkEvidence, Lifecycle,
-    write_staged,
+    endpoint_process_live, write_staged,
 };
 use crate::executor_cli::executor_message::{
     LeadThreadDelivery, content_id, deliver_to_lead_thread, observe_lead_thread,
@@ -59,6 +59,7 @@ const ROLLOUT_ENTRY_BOUND: usize = 20_000;
 const ROLLOUT_DEPTH: usize = 5;
 const ROLLOUT_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
+const LEAD_PREFLIGHT_BOUND: Duration = Duration::from_secs(20);
 
 const EXECUTOR_STAGE: &str = "executor-self-reflection";
 const LEAD_STAGE: &str = "lead-self-reflection";
@@ -377,6 +378,7 @@ fn execute(path: &Path) -> io::Result<i32> {
     } else {
         write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
     }
+    preflight_lead_return(&chain)?;
     let executor = prepare_stage(&chain, &chain.executor_stage, Role::ExecutorSelfReflection)?;
     let lead = prepare_stage(&chain, &chain.lead_stage, Role::LeadSelfReflection)?;
     let executor_state_path = chain.state_dir.join("executor-stage.json");
@@ -559,6 +561,63 @@ fn canonical_stage(stage: &StageDeclaration, label: &str) -> io::Result<StageDec
         checkout,
         title: stage.title.clone(),
     })
+}
+
+/// Proves the exact managed lead return surface is live before either
+/// reflection stage forks or submits model work. This reads the recorded
+/// endpoint, verifies its process and thread identities, then opens and reads
+/// the thread without sending an input. A missing, stale or mismatched return
+/// address is reported before any model-capable stage exists.
+fn preflight_lead_return(chain: &ChainState) -> io::Result<()> {
+    let endpoint = Endpoint::read(&chain.lead_return.endpoint).map_err(|error| {
+        invalid(format!(
+            "the real lead endpoint {} is unavailable before model work: {error}; no reflection fork or turn was started. Start or resume the managed lead with `codex-harness lead start --session THREAD`, then retry",
+            chain.lead_return.endpoint.display()
+        ))
+    })?;
+    let endpoint_thread = endpoint.thread_id.as_deref().ok_or_else(|| {
+        invalid(format!(
+            "the real lead endpoint {} names no thread before model work; no reflection fork or turn was started",
+            chain.lead_return.endpoint.display()
+        ))
+    })?;
+    if endpoint_thread != chain.lead_return.thread {
+        return Err(invalid(format!(
+            "the real lead endpoint belongs to thread {endpoint_thread}, not the declared return thread {}; no reflection fork or turn was started",
+            chain.lead_return.thread
+        )));
+    }
+    let process = endpoint.process.as_ref().ok_or_else(|| {
+        invalid(format!(
+            "the real lead endpoint {} records no app-server process identity; no reflection fork or turn was started",
+            chain.lead_return.endpoint.display()
+        ))
+    })?;
+    if !endpoint_process_live(process) {
+        return Err(invalid(format!(
+            "the real lead endpoint {} names a stale or non-live app-server process; no reflection fork or turn was started. Start or resume the managed lead with `codex-harness lead start --session THREAD`, then retry",
+            chain.lead_return.endpoint.display()
+        )));
+    }
+    let mut conversation = Conversation::attach(&endpoint, LEAD_PREFLIGHT_BOUND).map_err(|error| {
+        invalid(format!(
+            "the real lead endpoint {} did not accept a preflight connection: {error}; no reflection fork or turn was started",
+            chain.lead_return.endpoint.display()
+        ))
+    })?;
+    let thread = conversation.thread_state().map_err(|error| {
+        invalid(format!(
+            "the real lead thread {} could not be read before model work: {error}; no reflection fork or turn was started",
+            chain.lead_return.thread
+        ))
+    })?;
+    if thread["id"].as_str() != Some(chain.lead_return.thread.as_str()) {
+        return Err(invalid(format!(
+            "the live lead conversation is not thread {}; no reflection fork or turn was started",
+            chain.lead_return.thread
+        )));
+    }
+    Ok(())
 }
 
 fn prepare_stage(
@@ -1646,6 +1705,9 @@ fn stage_summary(state: &StageState) -> Value {
         "forkThread": state.fork.as_ref().map(|fork| fork.fork_thread.clone()),
         "goalCleared": state.fork.as_ref().map(|fork| fork.goal_cleared),
         "sourcePreserved": state.fork.as_ref().map(|fork| fork.source_preserved),
+        "suppressedMcpServers": state.fork.as_ref().map(|fork| fork.suppressed_mcp_servers.clone()),
+        "suppressedApps": state.fork.as_ref().map(|fork| fork.suppressed_apps.clone()),
+        "toolSurface": state.fork.as_ref().map(|fork| fork.tool_surface.clone()),
         "sandbox": state.fork.as_ref().map(|fork| fork.sandbox.clone()),
         "model": state.fork.as_ref().and_then(|fork| fork.model.clone()),
         "modelProvider": state.fork.as_ref().and_then(|fork| fork.model_provider.clone()),
