@@ -409,6 +409,13 @@ codex-harness executor watch --receipt FILE [--json]
 
 Keep one watcher per run. Short tool yields continue that watcher; at the supervision boundary use one compact `executor pool` snapshot and, only if progress is unclear, inspect the latest bounded evidence once. Process existence, log growth, elapsed time, silence and a missing patch prove neither progress nor a stall.
 
+For that diagnostic inspection, `detailTruncated=true` means the detail stream
+retains an initial prefix. Its tail can contain old commands while the receipt's
+`updatedMs` continues advancing. Check the event identity and freshness before
+acting. When current detail is missing, inspect bounded visible tool events
+from the exact native session; preserve the gap and leave the completion watcher
+running. Never interpret opaque reasoning or compaction state as activity.
+
 `executor run --file` is the visible host. It propagates the launcher outcome, treats an empty completion as an output defect, and never presents a completion record as proof that claimed checks passed. Exact-session recovery is the worktree resume command; cache loss uses the fresh restart below.
 
 An attachment timeout includes at most 4096 UTF-8 bytes of visible console text,
