@@ -6365,7 +6365,8 @@ fn inherit_lead_endpoint(
                 note = format!("; a previous record of this slot could not be retired: {error}");
             }
             println!(
-                "executor lead channel: unavailable ({cause}); `codex-harness lead message` delivers to an ordinary lead conversation through the installed native CLI's own queue route when the dispatch recorded the originating lead's own kit home and that home registers a verifiable installed launcher, and it reports this condition and its remedy instead of sending when either is unavailable. This dispatch continues as before{note}. Remedy for a managed channel: host the lead session through `codex-harness lead start`, which records a verified endpoint for its exact thread, then dispatch again"
+                "executor lead channel: unavailable ({cause}); new lead messages require a verified live endpoint and will otherwise refuse before sending. The native queue waits until the lead turn ends and is not a delivery fallback. This dispatch continues{note}. After closing the current lead frontend, resume the same thread with `codex-harness lead start --session {}`; preserve existing executor runs",
+                lead.thread_id
             );
         }
     }
