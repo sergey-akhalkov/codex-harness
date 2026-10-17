@@ -128,7 +128,7 @@ fn excerpt(text: &str, limit: usize) -> String {
 /// Replaces a state file through a staged write, so a reader, the lead reading
 /// the endpoint record while the run is live, never observes a partial record,
 /// and a failed staging leaves the previous bytes in place.
-fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| invalid("control state path has no directory"))?;
@@ -547,6 +547,16 @@ pub struct ControlPlan {
     /// conversations. Its own session marker, never the executor one, makes
     /// the kit's dispatch entries refuse inside its process tree.
     pub bounded_lead_session: bool,
+    /// Whether this plan serves a bounded, read-only self-reflection
+    /// conversation. A reflection fork stays single-agent exactly like an
+    /// executor, is refused every native agent tool, and carries its own
+    /// session marker instead of being mislabelled as an executor or bounded
+    /// lead. It may only fork an existing conversation; it never starts one.
+    pub reflection_session: bool,
+    /// Developer instructions for the conversation this plan starts or forks.
+    /// A reflection stage sets the resolved reflection role here; an ordinary
+    /// conversation leaves it unset and keeps the native instruction sources.
+    pub developer_instructions: Option<String>,
     /// Bound for readiness and for every request's answer.
     pub bound: Duration,
     /// Record-read timeout of one pump step.
@@ -578,6 +588,8 @@ impl ControlPlan {
             env: BTreeMap::new(),
             executor_session: true,
             bounded_lead_session: false,
+            reflection_session: false,
+            developer_instructions: None,
             bound: DEFAULT_BOUND,
             poll: DEFAULT_POLL,
         }
@@ -639,7 +651,7 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         OsString::from("--ws-token-file"),
         plan.paths.token.clone().into_os_string(),
     ];
-    if plan.executor_session || plan.bounded_lead_session {
+    if plan.executor_session || plan.bounded_lead_session || plan.reflection_session {
         // A managed lead session keeps the native agent capability: neither
         // this override nor the session marker reaches its app-server child.
         // A bounded lead conversation is a bounded decision participant, not
@@ -967,6 +979,32 @@ pub struct TurnStart {
     pub status: String,
 }
 
+/// What one source-preserving fork established before any reflection turn may
+/// start. The source thread and its goal are read before the fork and again
+/// after the fork's inherited goal has been cleared, so a fork that changed or
+/// resumed the source conversation is refused instead of being reported as a
+/// safe reflection context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkEvidence {
+    pub source_thread: String,
+    pub source_last_turn: String,
+    pub fork_thread: String,
+    pub source_turns_before: Vec<String>,
+    pub source_turns_after: Vec<String>,
+    pub source_goal_before: Value,
+    pub source_goal_after: Value,
+    pub fork_goal_before_clear: Value,
+    pub fork_goal_after_clear: Value,
+    pub goal_cleared: bool,
+    pub source_preserved: bool,
+    pub cwd: String,
+    pub sandbox: Value,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
 /// The answer to one bounded native request, exactly as the protocol delivered
 /// it.
 ///
@@ -1236,6 +1274,148 @@ impl Conversation {
         conversation.start_thread(plan)?;
         conversation.record_endpoint(plan)?;
         Ok(conversation)
+    }
+
+    /// Starts one harness-owned app-server child and forks an existing,
+    /// completed source thread at a stable boundary.
+    ///
+    /// The source thread is read and its goal captured before the fork. The
+    /// fork is requested with `deferGoalContinuation`, any inherited goal is
+    /// cleared and verified absent, and the source thread and goal are read
+    /// again and compared. Only then is the fork named and its endpoint
+    /// recorded, so every caller receives a read-only reflection context that
+    /// cannot silently continue the source work.
+    pub fn start_forking(
+        job: &Job,
+        plan: &ControlPlan,
+        source_thread: &str,
+        source_last_turn: &str,
+    ) -> io::Result<(Self, ForkEvidence)> {
+        if source_thread.is_empty() || source_last_turn.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a reflection fork requires the exact source thread and its completed last turn",
+            ));
+        }
+        if !plan.reflection_session {
+            return Err(invalid(
+                "a fork requires an explicitly read-only reflection plan; refusing to fork under an executor or lead plan",
+            ));
+        }
+        if plan.sandbox.as_deref() != Some("read-only") {
+            return Err(invalid(
+                "a reflection fork requires the read-only sandbox; refusing to start a fork that could edit files",
+            ));
+        }
+        if plan
+            .developer_instructions
+            .as_deref()
+            .is_none_or(|instructions| instructions.trim().is_empty())
+        {
+            return Err(invalid(
+                "a reflection fork requires the resolved reflection role instructions",
+            ));
+        }
+        if plan.title.trim().is_empty() {
+            return Err(invalid(
+                "a reflection fork requires a distinct visible title before any turn starts",
+            ));
+        }
+        let mut conversation = Self::open(job, plan)?;
+        let source_before = conversation.read_thread_record(source_thread)?;
+        let source_turns_before = turn_ids(&source_before)?;
+        let last = source_turns_before.last().ok_or_else(|| {
+            invalid(format!(
+                "source thread {source_thread} has no completed turn to fork from"
+            ))
+        })?;
+        if last != source_last_turn {
+            return Err(invalid(format!(
+                "source thread {source_thread} ends at turn {last}, not the declared stable boundary {source_last_turn}; refusing to fork a drifted conversation"
+            )));
+        }
+        let status = source_before["turns"]
+            .as_array()
+            .and_then(|turns| turns.last())
+            .and_then(|turn| turn["status"].as_str())
+            .unwrap_or_default();
+        if status != "completed" {
+            return Err(invalid(format!(
+                "source turn {source_last_turn} of thread {source_thread} is {status}, not completed; refusing to fork unfinished work"
+            )));
+        }
+        let source_goal_before = conversation.thread_goal(source_thread)?;
+        let forked = conversation.call(
+            "thread/fork",
+            fork_params(plan, source_thread, source_last_turn),
+        )?;
+        let fork_thread = forked["thread"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    "thread/fork answered without a thread identity; no reflection conversation exists",
+                )
+            })?
+            .to_owned();
+        if fork_thread == source_thread {
+            return Err(invalid(
+                "thread/fork answered with the source thread identity; refusing to treat the source as a fork",
+            ));
+        }
+        if let Err(mismatch) = plan.identity.verify(&forked) {
+            return Err(invalid(format!(
+                "the reflection fork did not preserve the declared routing: {mismatch}; no turn was started"
+            )));
+        }
+        verify_fork_environment(plan, &forked)?;
+        let fork_goal_before_clear = conversation.thread_goal(&fork_thread)?;
+        let goal_cleared = !fork_goal_before_clear.is_null();
+        if goal_cleared {
+            conversation.clear_thread_goal(&fork_thread)?;
+        }
+        let fork_goal_after_clear = conversation.thread_goal(&fork_thread)?;
+        if !fork_goal_after_clear.is_null() {
+            return Err(invalid(format!(
+                "forked thread {fork_thread} still carries an inherited goal after clear; refusing to start a turn that could continue the source work"
+            )));
+        }
+        let source_after = conversation.read_thread_record(source_thread)?;
+        let source_goal_after = conversation.thread_goal(source_thread)?;
+        let source_turns_after = turn_ids(&source_after)?;
+        let source_preserved =
+            source_after == source_before && source_goal_after == source_goal_before;
+        if !source_preserved {
+            return Err(invalid(format!(
+                "source thread {source_thread} or its goal changed during the fork; refusing to use a fork that altered its source"
+            )));
+        }
+        conversation.call(
+            "thread/name/set",
+            json!({"threadId": fork_thread, "name": plan.title}),
+        )?;
+        conversation.thread_id = fork_thread.clone();
+        conversation.endpoint.thread_id = Some(fork_thread.clone());
+        conversation.record_endpoint(plan)?;
+        let evidence = ForkEvidence {
+            source_thread: source_thread.to_owned(),
+            source_last_turn: source_last_turn.to_owned(),
+            fork_thread,
+            source_turns_before,
+            source_turns_after,
+            source_goal_before,
+            source_goal_after,
+            fork_goal_before_clear,
+            fork_goal_after_clear,
+            goal_cleared,
+            source_preserved,
+            cwd: forked["cwd"].as_str().unwrap_or_default().to_owned(),
+            sandbox: forked["sandbox"].clone(),
+            model: forked["model"].as_str().map(str::to_owned),
+            model_provider: forked["modelProvider"].as_str().map(str::to_owned),
+            reasoning_effort: forked["reasoningEffort"].as_str().map(str::to_owned),
+        };
+        Ok((conversation, evidence))
     }
 
     /// Starts the app-server and resumes one exact existing thread.
@@ -1679,6 +1859,91 @@ impl Conversation {
             )));
         }
         Ok(thread.clone())
+    }
+
+    /// Reads one exact thread record (`thread/read includeTurns`) and refuses
+    /// an answer that names another thread. This is the read used to verify a
+    /// fork's source boundary and its preservation, not a conversation's own
+    /// mutable state.
+    pub fn read_thread_record(&mut self, thread_id: &str) -> io::Result<Value> {
+        if thread_id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reading a thread record requires its exact identity",
+            ));
+        }
+        let read = match self.request(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": true}),
+        )? {
+            Reply::Result(result) => result,
+            Reply::Rejected(error) if error.to_string().contains("list_turns") => {
+                self.call("thread/read", json!({"threadId": thread_id}))?
+            }
+            Reply::Rejected(error) => {
+                return Err(io::Error::other(format!(
+                    "the native request thread/read was rejected: {}",
+                    excerpt(&error.to_string(), 400)
+                )));
+            }
+            Reply::Unanswered => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the native request thread/read was not answered within {:?}; the conversation state is unknown and must not be reported as progress",
+                        self.bound
+                    ),
+                ));
+            }
+        };
+        let thread = &read["thread"];
+        if thread["id"].as_str() != Some(thread_id) {
+            return Err(invalid(format!(
+                "thread/read answered for thread {} instead of {thread_id}; refusing to read another conversation",
+                thread["id"]
+            )));
+        }
+        Ok(thread.clone())
+    }
+
+    /// Reads one exact thread goal through the native goal owner. A null answer
+    /// means the thread has no goal; a missing or malformed answer is refused
+    /// rather than treated as an absent goal.
+    pub fn thread_goal(&mut self, thread_id: &str) -> io::Result<Value> {
+        if thread_id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reading a thread goal requires its exact identity",
+            ));
+        }
+        let answer = self.call("thread/goal/get", json!({"threadId": thread_id}))?;
+        match answer.get("goal") {
+            Some(goal @ (Value::Null | Value::Object(_))) => Ok(goal.clone()),
+            Some(other) => Err(invalid(format!(
+                "thread/goal/get answered with a non-goal value {}; refusing to guess goal state",
+                excerpt(&other.to_string(), 200)
+            ))),
+            None => Err(invalid(
+                "thread/goal/get answered without a goal field; refusing to guess goal state",
+            )),
+        }
+    }
+
+    /// Clears one thread goal as an automatic lifecycle mutation and verifies
+    /// that the native owner now reports no goal. A failed clear leaves the
+    /// conversation untouched and returns the error before any turn starts.
+    pub fn clear_thread_goal(&mut self, thread_id: &str) -> io::Result<()> {
+        self.call(
+            "thread/goal/clear",
+            json!({"threadId": thread_id, "origin": "automatic"}),
+        )?;
+        let goal = self.thread_goal(thread_id)?;
+        if !goal.is_null() {
+            return Err(invalid(format!(
+                "thread {thread_id} still reports a goal after thread/goal/clear; refusing to start a turn"
+            )));
+        }
+        Ok(())
     }
 
     /// The final assistant message of the accepted turn, taken from the thread
@@ -2153,6 +2418,9 @@ fn thread_params(plan: &ControlPlan) -> Value {
     if let Some(sandbox) = &plan.sandbox {
         params.insert("sandbox".into(), json!(sandbox));
     }
+    if let Some(instructions) = &plan.developer_instructions {
+        params.insert("developerInstructions".into(), json!(instructions));
+    }
     let mut config = Map::new();
     if let Some(effort) = &plan.identity.reasoning_effort {
         config.insert("model_reasoning_effort".into(), json!(effort));
@@ -2164,6 +2432,97 @@ fn thread_params(plan: &ControlPlan) -> Value {
         params.insert("config".into(), Value::Object(config));
     }
     Value::Object(params)
+}
+
+/// The exact `thread/fork` request of one reflection stage. The source is
+/// pinned by thread and last completed turn, the inherited goal's initial
+/// continuation is deferred, and the fork receives only the reflection
+/// routing, developer instructions and read-only sandbox this plan declares.
+fn fork_params(plan: &ControlPlan, source_thread: &str, source_last_turn: &str) -> Value {
+    let mut params = Map::new();
+    params.insert("threadId".into(), json!(source_thread));
+    params.insert("lastTurnId".into(), json!(source_last_turn));
+    params.insert("deferGoalContinuation".into(), json!(true));
+    params.insert("cwd".into(), json!(plan.slot));
+    if let Some(model) = &plan.identity.model {
+        params.insert("model".into(), json!(model));
+    }
+    if let Some(provider) = &plan.identity.model_provider {
+        params.insert("modelProvider".into(), json!(provider));
+    }
+    if let Some(policy) = &plan.approval_policy {
+        params.insert("approvalPolicy".into(), json!(policy));
+    }
+    if let Some(sandbox) = &plan.sandbox {
+        params.insert("sandbox".into(), json!(sandbox));
+    }
+    if let Some(instructions) = &plan.developer_instructions {
+        params.insert("developerInstructions".into(), json!(instructions));
+    }
+    let mut config = Map::new();
+    if let Some(effort) = &plan.identity.reasoning_effort {
+        config.insert("model_reasoning_effort".into(), json!(effort));
+    }
+    for (key, value) in &plan.overrides {
+        config.insert(key.clone(), value.clone());
+    }
+    config.insert("agents.enabled".into(), json!(false));
+    params.insert("config".into(), Value::Object(config));
+    Value::Object(params)
+}
+
+fn turn_ids(thread: &Value) -> io::Result<Vec<String>> {
+    let turns = thread["turns"]
+        .as_array()
+        .ok_or_else(|| invalid("a thread record carries no turns array"))?;
+    let mut ids = Vec::with_capacity(turns.len());
+    for turn in turns {
+        let id = turn["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid("a thread turn carries no identity"))?;
+        ids.push(id.to_owned());
+    }
+    Ok(ids)
+}
+
+/// Verifies the effective fork environment beyond the model binding: the
+/// declared working directory and a read-only sandbox. The native response
+/// reports a sandbox policy object; both that shape and a plain mode string are
+/// accepted only when they say read-only.
+fn verify_fork_environment(plan: &ControlPlan, forked: &Value) -> io::Result<()> {
+    let cwd = forked["cwd"]
+        .as_str()
+        .ok_or_else(|| invalid("thread/fork answered without an effective cwd"))?;
+    let expected = plan.slot.to_string_lossy();
+    if !cwd.eq_ignore_ascii_case(&expected) {
+        return Err(invalid(format!(
+            "thread/fork ran at {cwd} instead of the declared slot {expected}; no turn was started"
+        )));
+    }
+    if !sandbox_is_read_only(&forked["sandbox"]) {
+        return Err(invalid(format!(
+            "thread/fork did not report a read-only sandbox ({}); no turn was started",
+            excerpt(&forked["sandbox"].to_string(), 200)
+        )));
+    }
+    Ok(())
+}
+
+fn sandbox_is_read_only(value: &Value) -> bool {
+    let read_only = |text: &str| {
+        text.eq_ignore_ascii_case("read-only") || text.eq_ignore_ascii_case("readOnly")
+    };
+    match value {
+        Value::String(text) => read_only(text),
+        Value::Object(map) => map
+            .get("mode")
+            .or_else(|| map.get("type"))
+            .or_else(|| map.get("kind"))
+            .and_then(Value::as_str)
+            .is_some_and(read_only),
+        _ => false,
+    }
 }
 
 #[allow(dead_code)]

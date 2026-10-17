@@ -95,6 +95,7 @@ use harness_core::process::{Cancellation, Deadline, ExclusiveFileLock, ProcessId
 use harness_core::process_service::{self, ServiceProcess};
 use harness_core::task_succession;
 use harness_core::task_worktree;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -899,7 +900,7 @@ impl InputEvidence {
 /// literal text addressed to the same thread is one identity, so a repeat of it
 /// is a repeat and not a second delivery. The identity is a digest, so the
 /// receipt never carries the message text.
-fn content_id(thread_id: &str, text: &str) -> String {
+pub(crate) fn content_id(thread_id: &str, text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(thread_id.as_bytes());
     hasher.update([0u8]);
@@ -2802,6 +2803,143 @@ fn deliver_to_recorded_lead(
         message.payload.len(),
         message.spill,
         None,
+    )
+}
+
+/// The outcome of one ordinary lead-thread delivery as the lead conversation's
+/// own items establish it. Transport acceptance alone is never delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LeadThreadDelivery {
+    Delivered {
+        turn: String,
+        item: String,
+        by: String,
+    },
+    Queued {
+        turn: String,
+        detail: String,
+    },
+    Indeterminate {
+        detail: String,
+    },
+    Refused {
+        detail: String,
+    },
+}
+
+/// Sends one already-composed input to an exact live lead thread through the
+/// same transport owner `executor message` uses, without a dispatch receipt or
+/// a second conversation. The caller records its pending attempt before this
+/// call; a returned queued or indeterminate outcome is not delivery.
+pub(crate) fn deliver_to_lead_thread(
+    endpoint: &Endpoint,
+    lead_thread: &str,
+    client_message_id: &str,
+    envelope: &str,
+) -> io::Result<LeadThreadDelivery> {
+    let mut conversation = Conversation::attach(endpoint, CONTROL_BOUND).map_err(|error| {
+        invalid(&format!(
+            "the recorded lead endpoint did not accept a connection: {error}; nothing was sent and no second conversation was started"
+        ))
+    })?;
+    let thread = conversation.thread_state().map_err(|error| {
+        invalid(&format!(
+            "the recorded lead thread could not be read: {error}; nothing was sent"
+        ))
+    })?;
+    if thread["id"].as_str() != Some(lead_thread) {
+        return Err(invalid(&format!(
+            "the live lead conversation is not thread {lead_thread}; nothing was sent"
+        )));
+    }
+    let active = active_turn(&thread);
+    let (method, params) = request_params(lead_thread, client_message_id, envelope, &active);
+    match conversation.request(method, params) {
+        Ok(control::Reply::Result(result)) => {
+            let turn = answer_turn(&result);
+            match observe_input(
+                &mut conversation,
+                client_message_id,
+                envelope,
+                Instant::now() + EVIDENCE_WINDOW,
+            ) {
+                Some(evidence) => Ok(LeadThreadDelivery::Delivered {
+                    turn: evidence.turn,
+                    item: evidence.item,
+                    by: evidence.by.to_owned(),
+                }),
+                None if turn.is_empty() => Ok(LeadThreadDelivery::Indeterminate {
+                    detail: format!(
+                        "{method} answered without a turn identity, so which turn holds the input is unknown"
+                    ),
+                }),
+                None => Ok(LeadThreadDelivery::Queued {
+                    turn: turn.clone(),
+                    detail: format!(
+                        "accepted by {method} for turn {turn}; the lead conversation's own items do not show the input yet"
+                    ),
+                }),
+            }
+        }
+        Ok(control::Reply::Rejected(error)) => Ok(LeadThreadDelivery::Refused {
+            detail: format!(
+                "{method} was refused: {}; the input was not accepted by the lead conversation",
+                observation::excerpt(&error.to_string(), 400)
+            ),
+        }),
+        Ok(control::Reply::Unanswered) | Err(_) => Ok(LeadThreadDelivery::Indeterminate {
+            detail: format!(
+                "{method} was not answered within {}s, so whether the input reached the lead conversation is unknown",
+                CONTROL_BOUND.as_secs()
+            ),
+        }),
+    }
+}
+
+/// Reconciles an earlier attempt from the exact lead conversation's own items.
+/// This never transmits: a restart uses it to upgrade a recorded pending
+/// attempt to delivered, or to keep its fate explicitly unknown.
+pub(crate) fn observe_lead_thread(
+    endpoint: &Endpoint,
+    lead_thread: &str,
+    client_message_id: &str,
+    envelope: &str,
+) -> io::Result<LeadThreadDelivery> {
+    let mut conversation = Conversation::attach(endpoint, CONTROL_BOUND).map_err(|error| {
+        invalid(&format!(
+            "the recorded lead endpoint did not accept a connection: {error}; nothing was sent"
+        ))
+    })?;
+    let thread = conversation.thread_state().map_err(|error| {
+        invalid(&format!(
+            "the recorded lead thread could not be read: {error}; nothing was sent"
+        ))
+    })?;
+    if thread["id"].as_str() != Some(lead_thread) {
+        return Ok(LeadThreadDelivery::Indeterminate {
+            detail: format!(
+                "the live lead conversation is not thread {lead_thread}; the earlier attempt's fate is unknown"
+            ),
+        });
+    }
+    Ok(
+        match observe_input(
+            &mut conversation,
+            client_message_id,
+            envelope,
+            Instant::now() + EVIDENCE_WINDOW,
+        ) {
+            Some(evidence) => LeadThreadDelivery::Delivered {
+                turn: evidence.turn,
+                item: evidence.item,
+                by: evidence.by.to_owned(),
+            },
+            None => LeadThreadDelivery::Indeterminate {
+                detail: "the lead conversation's own items do not show the earlier attempt"
+                    .to_owned(),
+            },
+        },
     )
 }
 

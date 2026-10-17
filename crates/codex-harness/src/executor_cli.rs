@@ -37,11 +37,11 @@ use std::process::{Command, Stdio};
 
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
 #[path = "executor_control.rs"]
-mod control;
+pub(crate) mod control;
 #[path = "executor_input.rs"]
 mod executor_input;
 #[path = "executor_message.rs"]
-mod executor_message;
+pub(crate) mod executor_message;
 #[path = "executor_stop.rs"]
 mod executor_stop;
 #[path = "executor_observation.rs"]
@@ -979,6 +979,11 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     let spawn_hint = match role {
         Role::Executor => "codex-harness executor spawn",
         Role::Lead => "codex-harness lead dispatch",
+        Role::ExecutorSelfReflection | Role::LeadSelfReflection => {
+            return Err(invalid(
+                "reflection roles are not dispatch continuations; use `codex-harness self-reflection`",
+            ));
+        }
     };
     let mut source = None;
     let mut repository = None;
@@ -1135,6 +1140,11 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
                 ));
             }
             config.lead_profile.clone()
+        }
+        Role::ExecutorSelfReflection | Role::LeadSelfReflection => {
+            return Err(invalid(
+                "reflection roles use the self-reflection runner and cannot continue a dispatch slot",
+            ));
         }
     };
     let pool_size = worktree_pool_size(&config);
@@ -1373,7 +1383,7 @@ impl SpawnMode {
 /// written before this field existed keeps the full TUI it was hosted with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum NativePresentation {
+pub(crate) enum NativePresentation {
     #[default]
     NativeTui,
     NativeInline,
@@ -2115,6 +2125,9 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
             match request.role {
                 Role::Executor => executor_assignment::brief(assignment, &context),
                 Role::Lead => executor_assignment::lead_brief(assignment, &context),
+                Role::ExecutorSelfReflection | Role::LeadSelfReflection => Err(invalid(
+                    "reflection roles are not executor or lead dispatches",
+                )),
             }
         }
     }
@@ -2498,6 +2511,14 @@ fn role_title(role: Role, profile: &str, owner: &str) -> String {
     match role {
         Role::Executor => executor_title(profile, owner),
         Role::Lead => lead_dispatch_title(profile, owner),
+        Role::ExecutorSelfReflection => bounded_owner_title(
+            format!("ERefl ({}) - ", bounded_title_component(profile, 16)),
+            owner,
+        ),
+        Role::LeadSelfReflection => bounded_owner_title(
+            format!("LRefl ({}) - ", bounded_title_component(profile, 16)),
+            owner,
+        ),
     }
 }
 
@@ -2775,6 +2796,7 @@ fn admit_executor_run(request: &Dispatch, replacing: Option<u32>) -> io::Result<
         let subject = match request.role {
             Role::Executor => "executor concurrency",
             Role::Lead => "run concurrency",
+            Role::ExecutorSelfReflection | Role::LeadSelfReflection => "reflection concurrency",
         };
         return Err(invalid(&format!(
             "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {runs}; a free pool slot does not grant another active run - stop or wait for a run",
@@ -4733,7 +4755,7 @@ impl std::fmt::Display for FrontendLost {
 
 impl std::error::Error for FrontendLost {}
 
-struct OwnedFrontend {
+pub(crate) struct OwnedFrontend {
     job: Option<Job>,
     process: harness_core::process::OwnedProcess,
     program: PathBuf,
@@ -4749,10 +4771,11 @@ struct OwnedFrontend {
 /// suppression, and a managed lead session keeps the native agent capability
 /// of the interactive CLI it hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrontendRole {
+pub(crate) enum FrontendRole {
     Executor,
     BoundedLead,
     Lead,
+    Reflection,
 }
 
 impl FrontendRole {
@@ -4765,6 +4788,7 @@ impl FrontendRole {
             Self::Executor => "The assignment was not submitted",
             Self::BoundedLead => "No bounded lead conversation was exposed",
             Self::Lead => "No lead session was exposed",
+            Self::Reflection => "No reflection conversation was exposed",
         }
     }
 }
@@ -4774,7 +4798,7 @@ impl OwnedFrontend {
         self.process.identity()
     }
 
-    fn is_running(&self) -> io::Result<bool> {
+    pub(crate) fn is_running(&self) -> io::Result<bool> {
         self.process.is_running()
     }
 
@@ -4793,7 +4817,7 @@ impl OwnedFrontend {
         self.process.exit_code()
     }
 
-    fn close(mut self) -> io::Result<()> {
+    pub(crate) fn close(mut self) -> io::Result<()> {
         if let Some(job) = self.job.take() {
             job.terminate(0, CONTROL_CLEANUP)?;
         }
@@ -4935,7 +4959,7 @@ fn fail_with_frontend(
 /// lead frontends pin `agents.enabled=false`; the managed lead's own frontend
 /// keeps the native agent capability. That config override is not a permission
 /// override.
-fn attach_owned_frontend(
+pub(crate) fn attach_owned_frontend(
     plan: &ControlPlan,
     conversation: &Conversation,
     presentation: NativePresentation,
@@ -4983,7 +5007,7 @@ fn attach_owned_frontend(
                 ))
             })?,
         ),
-        FrontendRole::BoundedLead | FrontendRole::Lead => None,
+        FrontendRole::BoundedLead | FrontendRole::Lead | FrontendRole::Reflection => None,
     };
     let frontend_port = relay
         .as_ref()
@@ -5009,13 +5033,25 @@ fn attach_owned_frontend(
     for name in INHERITED_SESSION_ENV {
         spec.env.insert((*name).into(), None);
     }
-    if matches!(role, FrontendRole::Lead | FrontendRole::BoundedLead) {
+    if matches!(
+        role,
+        FrontendRole::Lead | FrontendRole::BoundedLead | FrontendRole::Reflection
+    ) {
         // A lead-role frontend must not inherit an executor marker: its
         // app-server has none, and a frontend that carried one would make the
         // lead's own nested CLI invocations look like executor sessions. An
         // executor frontend keeps the marker it was started with.
         spec.env.insert(EXECUTOR_SESSION_ENV.into(), None);
         spec.env.insert(control::EXECUTOR_RUN_ENV.into(), None);
+    }
+    if role == FrontendRole::Reflection {
+        // The frontend's own nested invocations must recognize the read-only
+        // reflection session and refuse dispatch or state mutations, exactly
+        // as the app-server child does for this stage.
+        spec.env.insert(
+            crate::self_reflection_cli::REFLECTION_SESSION_ENV.into(),
+            Some("1".into()),
+        );
     }
     spec.env
         .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
@@ -5059,7 +5095,10 @@ fn frontend_args(
         "-c".into(),
         "features.worktrees=false".into(),
     ];
-    if matches!(role, FrontendRole::Executor | FrontendRole::BoundedLead) {
+    if matches!(
+        role,
+        FrontendRole::Executor | FrontendRole::BoundedLead | FrontendRole::Reflection
+    ) {
         // Every frontend but the managed lead's own keeps the native agent
         // capability off: an executor or bounded lead conversation must not
         // re-expose the child-spawn tools through its own configuration.
@@ -5074,7 +5113,7 @@ fn frontend_args(
     args
 }
 
-fn wait_for_frontend(
+pub(crate) fn wait_for_frontend(
     frontend: &OwnedFrontend,
     conversation: &mut Conversation,
     resume_existing: bool,

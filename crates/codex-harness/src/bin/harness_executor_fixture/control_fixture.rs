@@ -42,14 +42,15 @@
 #[path = "../../../tests/fixtures/control_endpoint.rs"]
 mod control_endpoint;
 
-use control_endpoint::{Answer, Bearer, Server};
-use serde_json::json;
+use control_endpoint::{Answer, Bearer, Notifier, Server};
+use serde_json::{Value, json};
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -65,6 +66,9 @@ const FINAL_MESSAGE: &str = "fixture turn completed; the committed solution is i
 /// Serves one `app-server` invocation. Returns the process exit code; the
 /// caller's Job owns termination, exactly as it owns the real child.
 pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
+    if env::var_os("HARNESS_REFLECTION_SESSION").is_some() {
+        return run_reflection_app_server(args);
+    }
     // The dispatching side may direct this child to record the exact
     // invocation and role-marking environment it received, so the effective
     // role context is asserted from the child instead of inferred.
@@ -255,6 +259,642 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
     // The real app-server serves until its owning host ends it; this double
     // does the same.
     agent.join().ok();
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// State of one model-free self-reflection app-server. It answers the exact
+/// source, fork, goal and turn contract the native runner uses, without a
+/// model or installed CLI, and leaves the identities and rollout accounting a
+/// check can inspect.
+struct ReflectionState {
+    stage: String,
+    fixture_dir: PathBuf,
+    home: PathBuf,
+    executor_source: String,
+    executor_source_turn: String,
+    lead_source: String,
+    lead_source_turn: String,
+    fork_thread: String,
+    fork_turn: String,
+    outcome: String,
+    result: String,
+    model: String,
+    provider: String,
+    effort: String,
+    fork_cwd: Option<String>,
+    fork_model: Option<String>,
+    fork_provider: Option<String>,
+    fork_effort: Option<String>,
+    source_goal: Value,
+    forked: bool,
+    goal_cleared: bool,
+    turn_started: bool,
+}
+
+impl ReflectionState {
+    fn source(&self) -> (&str, &str) {
+        if self.stage == "executor-self-reflection" {
+            (&self.executor_source, &self.executor_source_turn)
+        } else {
+            (&self.lead_source, &self.lead_source_turn)
+        }
+    }
+
+    /// Restores the exact fork slot and submitted-turn marker a previous
+    /// fixture process wrote. Reconciliation after a restart must see the same
+    /// conversation, not a fresh in-memory one.
+    fn restore_markers(&mut self) {
+        let fork_path = self.fixture_dir.join(format!("fork-{}.json", self.stage));
+        if let Ok(bytes) = fs::read(&fork_path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && value["forkThread"].as_str() == Some(self.fork_thread.as_str())
+        {
+            self.forked = true;
+            self.fork_cwd = value["cwd"].as_str().map(str::to_owned);
+            self.fork_model = value["model"].as_str().map(str::to_owned);
+            self.fork_provider = value["modelProvider"].as_str().map(str::to_owned);
+            self.fork_effort = value["reasoningEffort"].as_str().map(str::to_owned);
+        }
+        let turn_path = self.fixture_dir.join(format!("turn-{}.json", self.stage));
+        if let Ok(bytes) = fs::read(&turn_path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && value["forkThread"].as_str() == Some(self.fork_thread.as_str())
+            && value["turnId"].as_str() == Some(self.fork_turn.as_str())
+            && value["started"] == json!(true)
+        {
+            self.turn_started = true;
+        }
+    }
+
+    fn record_fork(&mut self, request: &Value) {
+        self.fork_cwd = request["cwd"].as_str().map(str::to_owned);
+        self.fork_model = request["model"].as_str().map(str::to_owned);
+        self.fork_provider = request["modelProvider"].as_str().map(str::to_owned);
+        self.fork_effort = request["config"]["model_reasoning_effort"]
+            .as_str()
+            .map(str::to_owned);
+        let value = json!({
+            "forkThread": self.fork_thread,
+            "cwd": self.fork_cwd,
+            "model": self.fork_model,
+            "modelProvider": self.fork_provider,
+            "reasoningEffort": self.fork_effort,
+        });
+        let _ = fs::write(
+            self.fixture_dir.join(format!("fork-{}.json", self.stage)),
+            serde_json::to_vec_pretty(&value).unwrap_or_default(),
+        );
+    }
+
+    fn record_turn(&self) {
+        let value = json!({
+            "forkThread": self.fork_thread,
+            "turnId": self.fork_turn,
+            "started": true,
+            "outcome": self.outcome,
+        });
+        let _ = fs::write(
+            self.fixture_dir.join(format!("turn-{}.json", self.stage)),
+            serde_json::to_vec_pretty(&value).unwrap_or_default(),
+        );
+    }
+
+    fn source_record(&self) -> Value {
+        let (thread, turn) = self.source();
+        let last = if self.outcome == "source-drift" {
+            format!("{turn}-moved")
+        } else {
+            turn.to_owned()
+        };
+        let mut turns = vec![reflection_turn(
+            turn,
+            "completed",
+            &format!("copied source work for {thread}"),
+            None,
+        )];
+        if last != turn {
+            turns.push(reflection_turn(
+                &last,
+                "completed",
+                "source conversation moved after the declared boundary",
+                None,
+            ));
+        }
+        json!({
+            "id": thread,
+            "status": {"type": "idle"},
+            "turns": turns,
+        })
+    }
+
+    fn fork_record(&self) -> Value {
+        let (_, source_turn) = self.source();
+        let mut turns = vec![reflection_turn(
+            source_turn,
+            "completed",
+            "copied source work retained by the fork",
+            None,
+        )];
+        if self.turn_started {
+            let status = match self.outcome.as_str() {
+                "complete" | "missing-usage" => "completed",
+                "interrupted" => "interrupted",
+                "failed" => "failed",
+                _ => "inProgress",
+            };
+            let text = if status == "completed" {
+                Some(self.result.as_str())
+            } else {
+                None
+            };
+            let error = (status == "failed").then(
+                || json!({"message": "the synthetic reflection turn failed before a result"}),
+            );
+            turns.push(reflection_turn(
+                &self.fork_turn,
+                status,
+                text.unwrap_or(""),
+                error,
+            ));
+        }
+        json!({
+            "id": self.fork_thread,
+            "cwd": self.fork_cwd.clone().unwrap_or_else(|| self.home.to_string_lossy().into_owned()),
+            "status": {"type": "idle"},
+            "turns": turns,
+        })
+    }
+
+    fn route(&self, params: &Value) -> Value {
+        let model = if self.outcome == "model-drift" {
+            json!("wrong-reflection-model")
+        } else {
+            params["model"].clone()
+        };
+        let sandbox = if self.outcome == "sandbox-drift" {
+            json!("workspace-write")
+        } else {
+            params["sandbox"].clone()
+        };
+        json!({
+            "model": model,
+            "modelProvider": params["modelProvider"].clone(),
+            "reasoningEffort": params["config"]["model_reasoning_effort"].clone(),
+            "cwd": params["cwd"].clone(),
+            "sandbox": sandbox,
+        })
+    }
+}
+
+fn reflection_turn(id: &str, status: &str, text: &str, error: Option<Value>) -> Value {
+    let items = if status == "completed" {
+        json!([{"id": format!("{id}-message"), "type": "agentMessage", "text": text}])
+    } else {
+        json!([])
+    };
+    let mut turn = json!({"id": id, "status": status, "items": items});
+    if let Some(error) = error {
+        turn["error"] = error;
+    }
+    turn
+}
+
+fn reflection_env(name: &str, fallback: &str) -> String {
+    env::var(name).unwrap_or_else(|_| fallback.to_owned())
+}
+
+fn reflection_state() -> ReflectionState {
+    let stage = reflection_env("HARNESS_REFLECTION_STAGE", "reflection-fixture");
+    let home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let fixture_dir = env::var_os("HARNESS_REFLECTION_FIXTURE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("reflection-fixture"));
+    let executor_source = reflection_env(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_SOURCE_THREAD",
+        "fixture-executor-source",
+    );
+    let executor_source_turn = reflection_env(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_SOURCE_TURN",
+        "fixture-executor-source-turn",
+    );
+    let lead_source = reflection_env(
+        "HARNESS_REFLECTION_FIXTURE_LEAD_SOURCE_THREAD",
+        "fixture-lead-source",
+    );
+    let lead_source_turn = reflection_env(
+        "HARNESS_REFLECTION_FIXTURE_LEAD_SOURCE_TURN",
+        "fixture-lead-source-turn",
+    );
+    let (fork_thread, fork_turn) = if stage == "executor-self-reflection" {
+        (
+            reflection_env(
+                "HARNESS_REFLECTION_FIXTURE_EXECUTOR_FORK_THREAD",
+                "fixture-executor-reflection-fork",
+            ),
+            reflection_env(
+                "HARNESS_REFLECTION_FIXTURE_EXECUTOR_FORK_TURN",
+                "fixture-executor-reflection-turn",
+            ),
+        )
+    } else {
+        (
+            reflection_env(
+                "HARNESS_REFLECTION_FIXTURE_LEAD_FORK_THREAD",
+                "fixture-lead-reflection-fork",
+            ),
+            reflection_env(
+                "HARNESS_REFLECTION_FIXTURE_LEAD_FORK_TURN",
+                "fixture-lead-reflection-turn",
+            ),
+        )
+    };
+    let default_outcome = reflection_env("HARNESS_REFLECTION_FIXTURE_OUTCOME", "complete");
+    let outcome = if stage == "executor-self-reflection" {
+        reflection_env(
+            "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME",
+            &default_outcome,
+        )
+    } else {
+        reflection_env("HARNESS_REFLECTION_FIXTURE_LEAD_OUTCOME", &default_outcome)
+    };
+    let result = if stage == "executor-self-reflection" {
+        reflection_env(
+            "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT",
+            "synthetic executor reflection finding",
+        )
+    } else {
+        reflection_env(
+            "HARNESS_REFLECTION_FIXTURE_LEAD_RESULT",
+            "synthetic lead reflection synthesis",
+        )
+    };
+    let mut state = ReflectionState {
+        stage,
+        fixture_dir,
+        home,
+        executor_source,
+        executor_source_turn,
+        lead_source,
+        lead_source_turn,
+        fork_thread,
+        fork_turn,
+        outcome,
+        result,
+        model: reflection_env(
+            "HARNESS_REFLECTION_FIXTURE_MODEL",
+            "synthetic-reflection-model",
+        ),
+        provider: reflection_env(
+            "HARNESS_REFLECTION_FIXTURE_PROVIDER",
+            "synthetic-reflection-provider",
+        ),
+        effort: reflection_env("HARNESS_REFLECTION_FIXTURE_EFFORT", "max"),
+        fork_cwd: None,
+        fork_model: None,
+        fork_provider: None,
+        fork_effort: None,
+        source_goal: json!({
+            "objective": "the accepted source goal must remain frozen",
+            "status": "active",
+            "source": "synthetic-reflection-fixture",
+        }),
+        forked: false,
+        goal_cleared: false,
+        turn_started: false,
+    };
+    state.restore_markers();
+    state
+}
+
+fn record_reflection_request(state: &ReflectionState, request: &Value) {
+    let _ = fs::create_dir_all(&state.fixture_dir);
+    let path = state.fixture_dir.join("requests.jsonl");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let line = json!({
+            "stage": state.stage,
+            "method": request["method"],
+            "request": request,
+        });
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: &Value) -> Answer {
+    record_reflection_request(state, request);
+    let method = request["method"].as_str().unwrap_or_default();
+    let params = &request["params"];
+    match method {
+        "initialize" => Answer::Result(json!({
+            "serverInfo": {"name": "synthetic-self-reflection", "version": "1"}
+        })),
+        "thread/read" => {
+            let thread = params["threadId"].as_str().unwrap_or_default();
+            let (source, _) = state.source();
+            if thread == source {
+                Answer::Result(json!({"thread": state.source_record()}))
+            } else if thread == state.fork_thread {
+                Answer::Result(json!({"thread": state.fork_record()}))
+            } else {
+                Answer::Error(json!({
+                    "message": format!("synthetic reflection has no thread {thread}")
+                }))
+            }
+        }
+        "thread/goal/get" => {
+            let thread = params["threadId"].as_str().unwrap_or_default();
+            let (source, _) = state.source();
+            let goal = if thread == source {
+                state.source_goal.clone()
+            } else if thread == state.fork_thread {
+                if state.goal_cleared {
+                    Value::Null
+                } else {
+                    state.source_goal.clone()
+                }
+            } else {
+                return Answer::Error(json!({
+                    "message": format!("synthetic reflection has no goal owner {thread}")
+                }));
+            };
+            Answer::Result(json!({"goal": goal}))
+        }
+        "thread/goal/clear" => {
+            if params["threadId"].as_str() != Some(state.fork_thread.as_str()) {
+                return Answer::Error(json!({"message": "the source goal is not mutable"}));
+            }
+            if state.outcome != "goal-sticky" {
+                state.goal_cleared = true;
+            }
+            Answer::Result(json!({}))
+        }
+        "thread/fork" => {
+            let (source, source_turn) = state.source();
+            let source = source.to_owned();
+            let source_turn = source_turn.to_owned();
+            if state.forked {
+                return Answer::Error(json!({"message": "duplicate reflection fork refused"}));
+            }
+            if params["threadId"].as_str() != Some(source.as_str())
+                || params["lastTurnId"].as_str() != Some(source_turn.as_str())
+                || params["deferGoalContinuation"] != json!(true)
+            {
+                return Answer::Error(json!({
+                    "message": "the reflection fork does not name the exact source boundary"
+                }));
+            }
+            state.forked = true;
+            state.record_fork(params);
+            let mut route = state.route(params);
+            route["thread"] = json!({
+                "id": state.fork_thread,
+                "cwd": params["cwd"].clone(),
+                "turns": [reflection_turn(
+                    &source_turn,
+                    "completed",
+                    "copied source work retained by the fork",
+                    None,
+                )],
+            });
+            Answer::Result(route)
+        }
+        "thread/name/set" => {
+            if params["threadId"].as_str() != Some(state.fork_thread.as_str()) {
+                return Answer::Error(json!({"message": "only the reflection fork may be named"}));
+            }
+            let title = params["name"].as_str().unwrap_or_default();
+            if title.trim().is_empty() {
+                return Answer::Error(json!({"message": "the reflection title is empty"}));
+            }
+            let _ = fs::write(state.home.join("frontend-title.txt"), title);
+            Answer::Result(json!({}))
+        }
+        "thread/resume" => {
+            if params["threadId"].as_str() != Some(state.fork_thread.as_str()) {
+                return Answer::Error(
+                    json!({"message": "only the retained reflection fork may resume"}),
+                );
+            }
+            let mut route = json!({
+                "model": state.fork_model.clone().unwrap_or_else(|| state.model.clone()),
+                "modelProvider": state.fork_provider.clone().unwrap_or_else(|| state.provider.clone()),
+                "reasoningEffort": state.fork_effort.clone().unwrap_or_else(|| state.effort.clone()),
+                "thread": {"id": state.fork_thread, "cwd": state.fork_cwd.clone().unwrap_or_else(|| state.home.to_string_lossy().into_owned()), "turns": []},
+            });
+            route["thread"] = state.fork_record();
+            Answer::Result(route)
+        }
+        "turn/start" => {
+            if params["threadId"].as_str() != Some(state.fork_thread.as_str()) {
+                return Answer::Error(json!({"message": "the source turn is read-only"}));
+            }
+            if state.turn_started {
+                return Answer::Error(json!({"message": "duplicate reflection turn refused"}));
+            }
+            state.turn_started = true;
+            state.record_turn();
+            if state.outcome == "visibility-lost" {
+                let _ = fs::write(
+                    state.home.join("frontend-release"),
+                    "fixture visibility loss",
+                );
+            }
+            if matches!(state.outcome.as_str(), "complete" | "missing-usage") {
+                let _ = write_reflection_rollout(state);
+            }
+            notifier.push(json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": state.fork_thread,
+                    "turn": {"id": state.fork_turn, "status": "inProgress"},
+                },
+            }));
+            match state.outcome.as_str() {
+                "complete" | "missing-usage" => {
+                    notifier.push(json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": state.fork_thread,
+                            "turnId": state.fork_turn,
+                            "item": {
+                                "id": format!("{}-message", state.fork_turn),
+                                "type": "agentMessage",
+                                "text": state.result,
+                            },
+                        },
+                    }));
+                    notifier.push(json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": state.fork_thread,
+                            "turnId": state.fork_turn,
+                            "item": {
+                                "id": format!("{}-message", state.fork_turn),
+                                "type": "agentMessage",
+                                "text": state.result,
+                            },
+                        },
+                    }));
+                    notifier.push(json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": state.fork_thread,
+                            "turn": {"id": state.fork_turn, "status": "completed"},
+                        },
+                    }));
+                }
+                "interrupted" | "failed" => {
+                    let mut turn = json!({
+                        "id": state.fork_turn,
+                        "status": state.outcome,
+                    });
+                    if state.outcome == "failed" {
+                        turn["error"] = json!({"message": "synthetic reflection failure"});
+                    }
+                    notifier.push(json!({
+                        "method": "turn/completed",
+                        "params": {"threadId": state.fork_thread, "turn": turn},
+                    }));
+                }
+                "visibility-lost" | "unknown-hold" => {}
+                _ => {}
+            }
+            Answer::Result(json!({
+                "turn": {"id": state.fork_turn, "status": "inProgress"}
+            }))
+        }
+        _ => Answer::Result(json!({})),
+    }
+}
+
+fn reflection_usage(input: u64, cached: u64, output: u64, reasoning: u64, total: u64) -> Value {
+    json!({
+        "input_tokens": input,
+        "cached_input_tokens": cached,
+        "output_tokens": output,
+        "reasoning_output_tokens": reasoning,
+        "total_tokens": total,
+    })
+}
+
+fn write_reflection_rollout(state: &ReflectionState) -> io::Result<()> {
+    let sessions = state.home.join("sessions");
+    fs::create_dir_all(&sessions)?;
+    let (source_turn, source_usage, cumulative) = if state.stage == "executor-self-reflection" {
+        (
+            state.executor_source_turn.as_str(),
+            reflection_usage(400, 120, 50, 10, 450),
+            reflection_usage(500, 160, 70, 15, 570),
+        )
+    } else {
+        (
+            state.lead_source_turn.as_str(),
+            reflection_usage(600, 180, 80, 20, 680),
+            reflection_usage(800, 260, 120, 30, 920),
+        )
+    };
+    let mut new_usage = if state.stage == "executor-self-reflection" {
+        reflection_usage(100, 40, 20, 5, 120)
+    } else {
+        reflection_usage(200, 80, 40, 10, 240)
+    };
+    if state.outcome == "missing-usage" {
+        new_usage.as_object_mut().unwrap().remove("total_tokens");
+    }
+    let lines = [
+        json!({"type": "session_meta", "payload": {"id": state.fork_thread}}),
+        json!({
+            "type": "token_usage_record",
+            "payload": {
+                "turn_id": source_turn,
+                "response_id": format!("{}-copied-source", state.stage),
+                "usage": source_usage.clone(),
+                "turn_token_usage": source_usage.clone(),
+                "thread_token_usage": source_usage,
+            },
+        }),
+        json!({
+            "type": "token_usage_record",
+            "payload": {
+                "turn_id": state.fork_turn,
+                "response_id": format!("{}-new-turn", state.stage),
+                "usage": new_usage.clone(),
+                "turn_token_usage": new_usage,
+                "thread_token_usage": cumulative,
+            },
+        }),
+    ];
+    let text = lines
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        sessions.join(format!("{}.jsonl", state.stage)),
+        format!("{text}\n"),
+    )
+}
+
+/// Serves the self-reflection child contract. The runner still owns process
+/// creation, the read-only plan, frontend attachment and every request; this
+/// branch only answers those requests with inspectable synthetic identities.
+fn run_reflection_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
+    let listen = option(args, "--listen").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the reflection fixture app-server requires --listen ws://127.0.0.1:PORT",
+        )
+    })?;
+    let port = listen
+        .strip_prefix("ws://127.0.0.1:")
+        .and_then(|text| text.parse::<u16>().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the reflection fixture app-server cannot serve {listen}"),
+            )
+        })?;
+    let token_file = option(args, "--ws-token-file")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the reflection fixture app-server requires --ws-token-file",
+            )
+        })?;
+    fs::create_dir_all(
+        env::var_os("HARNESS_REFLECTION_FIXTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    )?;
+    let state = Arc::new(Mutex::new(reflection_state()));
+    {
+        let state = state.lock().unwrap();
+        let meta = json!({
+            "reflectionSession": env::var("HARNESS_REFLECTION_SESSION").unwrap_or_default(),
+            "stage": state.stage,
+            "cwd": env::current_dir().ok(),
+            "codexHome": state.home,
+        });
+        fs::create_dir_all(&state.fixture_dir)?;
+        fs::write(
+            state.fixture_dir.join(format!("meta-{}.json", state.stage)),
+            serde_json::to_vec_pretty(&meta)?,
+        )?;
+    }
+    let server = Server::start_on_with(port, Bearer::File(token_file), |server| {
+        let notifier = server.notifier();
+        server.answer_fn(move |request| {
+            let mut state = state.lock().unwrap();
+            reflection_answer(&mut state, &notifier, request)
+        });
+    });
+    // The real app-server serves until its owning Job ends it. Keep this
+    // fixture's endpoint alive for the same lifecycle.
+    let _server = server;
     loop {
         thread::sleep(Duration::from_secs(1));
     }

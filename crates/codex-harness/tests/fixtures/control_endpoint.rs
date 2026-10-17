@@ -372,10 +372,14 @@ pub enum Answer {
 struct Canned {
     requests: Vec<serde_json::Value>,
     answers: HashMap<String, VecDeque<Answer>>,
+    responder: Option<Responder>,
     notifications: VecDeque<serde_json::Value>,
     connections: usize,
     refusals: usize,
 }
+
+/// One request-aware answer callback shared by a canned endpoint.
+type Responder = Arc<dyn Fn(&serde_json::Value) -> Answer + Send + Sync>;
 
 impl Canned {
     /// Takes the next answer of one method; the last answer of a sequence
@@ -387,6 +391,24 @@ impl Canned {
             queue.push_back(answer.clone());
         }
         Some(answer)
+    }
+}
+
+/// A clonable push handle for a responder that must emit notifications while
+/// it answers a request. It is deliberately separate from the answer callback
+/// lock, so a responder may enqueue a notification without deadlocking.
+#[derive(Clone)]
+pub struct Notifier {
+    state: Arc<Mutex<Canned>>,
+}
+
+impl Notifier {
+    pub fn push(&self, notification: serde_json::Value) {
+        self.state
+            .lock()
+            .unwrap()
+            .notifications
+            .push_back(notification);
     }
 }
 
@@ -447,6 +469,24 @@ impl Server {
         canned
             .answers
             .insert(method.to_owned(), answers.into_iter().collect());
+    }
+
+    /// Answers every request through one request-aware responder. This is for
+    /// stateful fixtures whose answer depends on the exact request, including
+    /// reads that must change after a later `turn/start`.
+    pub fn answer_fn(
+        &self,
+        responder: impl Fn(&serde_json::Value) -> Answer + Send + Sync + 'static,
+    ) {
+        self.state.lock().unwrap().responder = Some(Arc::new(responder));
+    }
+
+    /// A cloneable handle that enqueues notifications for connected clients.
+    /// A responder may use it without holding the answer state lock.
+    pub fn notifier(&self) -> Notifier {
+        Notifier {
+            state: Arc::clone(&self.state),
+        }
     }
 
     pub fn push(&self, notification: serde_json::Value) {
@@ -521,8 +561,6 @@ fn serve(
     }
 }
 
-/// Serves one connection: queued notifications first, then the answers of the
-/// requests that arrive. Returns false when the connection is unusable.
 fn converse(wire: &mut Wire, state: &Arc<Mutex<Canned>>, stop: &Arc<AtomicBool>) -> bool {
     while !stop.load(Ordering::SeqCst) {
         let queued: Vec<serde_json::Value> =
@@ -542,11 +580,14 @@ fn converse(wire: &mut Wire, state: &Arc<Mutex<Canned>>, stop: &Arc<AtomicBool>)
                 // The app-server answers requests and stays silent for
                 // notifications such as `initialized`.
                 let answers = !id.is_null();
-                let answer = {
+                let (canned_answer, responder) = {
                     let mut canned = state.lock().unwrap();
-                    canned.requests.push(value);
-                    canned.take_answer(&method)
+                    canned.requests.push(value.clone());
+                    (canned.take_answer(&method), canned.responder.clone())
                 };
+                let answer = responder
+                    .as_ref()
+                    .map_or(canned_answer, |responder| Some(responder(&value)));
                 if !answers {
                     continue;
                 }

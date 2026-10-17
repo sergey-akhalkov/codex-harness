@@ -17,6 +17,11 @@ use std::{
 pub enum Role {
     Lead,
     Executor,
+    /// Bounded, read-only analysis of an accepted executor conversation.
+    ExecutorSelfReflection,
+    /// Bounded synthesis over a retained executor reflection and the lead
+    /// conversation it belongs to.
+    LeadSelfReflection,
 }
 
 impl Role {
@@ -24,6 +29,8 @@ impl Role {
         match self {
             Self::Lead => "lead",
             Self::Executor => "executor",
+            Self::ExecutorSelfReflection => "executor-self-reflection",
+            Self::LeadSelfReflection => "lead-self-reflection",
         }
     }
 }
@@ -92,9 +99,19 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
     let descriptor_text = read("global/roles.toml")?;
     let descriptor: Descriptor = toml::from_str(descriptor_text.trim_start_matches('\u{feff}'))
         .map_err(|_| invalid("invalid roles.toml or unknown role"))?;
-    if descriptor.schema != 1 || descriptor.roles.len() != 2 {
+    let ordinary = [Role::Lead, Role::Executor];
+    let reflection = [Role::ExecutorSelfReflection, Role::LeadSelfReflection];
+    let ordinary_present = ordinary
+        .iter()
+        .all(|role| descriptor.roles.contains_key(role));
+    let reflection_present = reflection
+        .iter()
+        .all(|role| descriptor.roles.contains_key(role));
+    let complete = (descriptor.roles.len() == 2 && ordinary_present)
+        || (descriptor.roles.len() == 4 && ordinary_present && reflection_present);
+    if descriptor.schema != 1 || !complete {
         return Err(invalid(
-            "roles.toml must define schema 1 and lead/executor roles",
+            "roles.toml must define schema 1 and exactly the lead/executor roles, or all four roles including executor-self-reflection and lead-self-reflection",
         ));
     }
     let common = read(&manifest.instructions)?;
