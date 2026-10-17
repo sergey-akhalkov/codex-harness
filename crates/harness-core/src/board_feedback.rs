@@ -378,6 +378,97 @@ pub enum PromotionEvidence {
     /// Lead consequence override for material correctness, integrity or safety
     /// evidence. Both fields are recorded verbatim.
     ConsequenceOverride { consequence: String, reason: String },
+    /// One verified correction within the current real lead's active mandate.
+    VerifiedImprovement(VerifiedImprovementRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedImprovementRequest {
+    codex_home: std::path::PathBuf,
+    lead_session: String,
+    work: String,
+    reason: String,
+}
+
+impl VerifiedImprovementRequest {
+    /// Capture the calling conversation; callers cannot supply another lead.
+    /// Promotion revalidates this identity and the active accepted work.
+    pub fn for_current_lead(codex_home: &Path, work: &str, reason: &str) -> io::Result<Self> {
+        let lead_session = std::env::var("CODEX_THREAD_ID").map_err(|_| {
+            invalid("verified improvement requires the current real lead conversation")
+        })?;
+        Ok(Self {
+            codex_home: codex_home.to_path_buf(),
+            lead_session: require_field("current lead session", &lead_session, MAX_REASON)?,
+            work: require_field("accepted work", work, MAX_REASON)?,
+            reason: require_field("improvement reason", reason, MAX_REASON)?,
+        })
+    }
+}
+
+/// Admission provenance stays on the consuming board, including for kit routing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedImprovementRecord {
+    pub binding: String,
+    pub revision: u64,
+    pub lead: String,
+    pub acceptance: String,
+    pub reason: String,
+}
+
+fn verify_improvement_request(
+    bd: &Path,
+    project: &Path,
+    request: &VerifiedImprovementRequest,
+) -> io::Result<VerifiedImprovementRecord> {
+    if std::env::var("CODEX_THREAD_ID").ok().as_deref() != Some(request.lead_session.as_str()) {
+        return Err(invalid(
+            "verified improvement belongs to another lead conversation",
+        ));
+    }
+    let controller =
+        crate::delivery_reflection::ReflectionController::new(bd, project, &request.codex_home);
+    let check = controller.check_active_binding(&request.lead_session, Some(&request.work))?;
+    if !check.is_active() {
+        return Err(invalid(format!(
+            "verified improvement refused: {}",
+            check.detail
+        )));
+    }
+    Ok(VerifiedImprovementRecord {
+        binding: check
+            .binding_id
+            .ok_or_else(|| invalid("active reflection binding has no identity"))?,
+        revision: check.revision,
+        lead: request.lead_session.clone(),
+        acceptance: check
+            .matched_acceptance_id
+            .ok_or_else(|| invalid("verified improvement has no exact accepted work"))?,
+        reason: request.reason.clone(),
+    })
+}
+
+fn promotion_basis(override_used: bool, verified: bool) -> &'static str {
+    if verified {
+        "verified-improvement"
+    } else if override_used {
+        "override"
+    } else {
+        "votes"
+    }
+}
+
+impl PromotionOutcome {
+    pub fn basis(&self) -> &'static str {
+        promotion_basis(self.override_used, self.verified.is_some())
+    }
+}
+
+impl PromotionRecord {
+    pub fn basis(&self) -> &'static str {
+        promotion_basis(self.override_used, self.verified.is_some())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +479,7 @@ pub struct PromotionOutcome {
     pub target: Option<String>,
     pub counted: usize,
     pub override_used: bool,
+    pub verified: Option<VerifiedImprovementRecord>,
     /// True when the board already recorded this exact promotion and the
     /// outcome is confirmed from that history: no promotion record was
     /// written, and only labels a partial run missed may have been reconciled.
@@ -406,6 +498,7 @@ pub struct PromotionRecord {
     pub route: PromotionRoute,
     pub counted: usize,
     pub override_used: bool,
+    pub verified: Option<VerifiedImprovementRecord>,
     pub target: Option<String>,
 }
 
@@ -1278,6 +1371,12 @@ pub fn promote_item(
             "kit concerns promote through promote_kit_concern so private consuming-project data stays off the kit board",
         ));
     }
+    let verified = match evidence {
+        PromotionEvidence::VerifiedImprovement(request) => {
+            Some(verify_improvement_request(bd, project, request)?)
+        }
+        _ => None,
+    };
     let snapshot = load_snapshot(bd, project, item_id)?
         .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
     let ledger = inspect_ledger(bd, project, item_id)?;
@@ -1323,13 +1422,18 @@ pub fn promote_item(
         counted,
         threshold: match evidence {
             PromotionEvidence::Votes { threshold } => Some(*threshold),
-            PromotionEvidence::ConsequenceOverride { .. } => None,
+            PromotionEvidence::ConsequenceOverride { .. }
+            | PromotionEvidence::VerifiedImprovement(_) => None,
         },
         target: target.as_deref(),
         override_note: override_note.as_ref(),
+        verified: verified.as_ref(),
     }
     .format();
     json_ok(bd, project, &["comment", item_id, "--json", &comment])?;
+    if verified.is_some() {
+        mark_improvement_purpose(bd, project, item_id, None)?;
+    }
     json_ok(
         bd,
         project,
@@ -1346,6 +1450,7 @@ pub fn promote_item(
         target,
         counted,
         override_used: override_note.is_some(),
+        verified,
         already_recorded: false,
     })
 }
@@ -1361,6 +1466,12 @@ pub fn promote_kit_concern(
     concern: &KitConcern,
     evidence: &PromotionEvidence,
 ) -> io::Result<PromotionOutcome> {
+    let verified = match evidence {
+        PromotionEvidence::VerifiedImprovement(request) => {
+            Some(verify_improvement_request(bd, project, request)?)
+        }
+        _ => None,
+    };
     let snapshot = load_snapshot(bd, project, item_id)?
         .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
     let ledger = inspect_ledger(bd, project, item_id)?;
@@ -1384,19 +1495,27 @@ pub fn promote_kit_concern(
     let (counted, override_note) = validate_evidence(&ledger, evidence)?;
     let concern = concern.bounded()?;
     let kit_id = create_kit_item(bd, kit_project, &concern)?;
+    if verified.is_some() {
+        mark_improvement_purpose(bd, kit_project, &kit_id, Some(KIT_ROUTING_ACTOR))?;
+    }
     let target = format!("kit:{kit_id}");
     let comment = PromotionComment {
         route: PromotionRoute::KitBacklog,
         counted,
         threshold: match evidence {
             PromotionEvidence::Votes { threshold } => Some(*threshold),
-            PromotionEvidence::ConsequenceOverride { .. } => None,
+            PromotionEvidence::ConsequenceOverride { .. }
+            | PromotionEvidence::VerifiedImprovement(_) => None,
         },
         target: Some(target.as_str()),
         override_note: override_note.as_ref(),
+        verified: verified.as_ref(),
     }
     .format();
     json_ok(bd, project, &["comment", item_id, "--json", &comment])?;
+    if verified.is_some() {
+        mark_improvement_purpose(bd, project, item_id, None)?;
+    }
     json_ok(
         bd,
         project,
@@ -1419,6 +1538,7 @@ pub fn promote_kit_concern(
         target: Some(target),
         counted,
         override_used: override_note.is_some(),
+        verified,
         already_recorded: false,
     })
 }
@@ -1537,15 +1657,12 @@ struct PromotionComment<'a> {
     threshold: Option<u32>,
     target: Option<&'a str>,
     override_note: Option<&'a (String, String)>,
+    verified: Option<&'a VerifiedImprovementRecord>,
 }
 
 impl PromotionComment<'_> {
     fn format(&self) -> String {
-        let basis = if self.override_note.is_some() {
-            "override"
-        } else {
-            "votes"
-        };
+        let basis = promotion_basis(self.override_note.is_some(), self.verified.is_some());
         let threshold = match self.threshold {
             Some(value) => value.to_string(),
             None => "none".to_owned(),
@@ -1559,6 +1676,11 @@ impl PromotionComment<'_> {
         if let Some((consequence, reason)) = self.override_note {
             text.push_str(&format!(" consequence={consequence} reason={reason}"));
         }
+        if let Some(verified) = self.verified {
+            let receipt = serde_json::to_string(verified)
+                .expect("promotion receipt contains only strings and an integer");
+            text.push_str(&format!(" verified={receipt}"));
+        }
         text
     }
 }
@@ -1569,6 +1691,8 @@ fn validate_evidence(
 ) -> io::Result<(usize, Option<(String, String)>)> {
     let counted = ledger.counted();
     match evidence {
+        // The promotion owner validates the live mandate before any effects.
+        PromotionEvidence::VerifiedImprovement(_) => Ok((counted, None)),
         PromotionEvidence::Votes { threshold } => {
             if *threshold < 2 {
                 return Err(invalid("vote threshold must be at least 2"));
@@ -1637,6 +1761,25 @@ fn require_open_incubator_snapshot(snapshot: &IssueSnapshot, item_id: &str) -> i
     Ok(())
 }
 
+fn mark_improvement_purpose(
+    bd: &Path,
+    project: &Path,
+    item: &str,
+    actor: Option<&str>,
+) -> io::Result<()> {
+    let metadata = format!(
+        "{}={}",
+        crate::delivery_reflection::PURPOSE_METADATA,
+        crate::delivery_reflection::Purpose::Improvement.as_str()
+    );
+    let args = ["update", item, "--set-metadata", &metadata, "--json"];
+    match actor {
+        Some(actor) => json_ok_actor(bd, project, actor, &args)?,
+        None => json_ok(bd, project, &args)?,
+    };
+    Ok(())
+}
+
 /// Completes a promotion whose record is already on the board. The recorded
 /// history is authoritative: the outcome is returned as recorded and only the
 /// label operations a partial run may have missed are reconciled, so a retry
@@ -1667,6 +1810,9 @@ fn reconcile_promotion(
             record.target.as_deref().unwrap_or("none")
         )));
     }
+    if record.verified.is_some() {
+        mark_improvement_purpose(bd, project, item_id, None)?;
+    }
     let incubating = labels.iter().any(|label| label == INCUBATOR_LABEL);
     let routed = labels.iter().any(|label| label == record.route.label());
     if incubating {
@@ -1689,6 +1835,7 @@ fn reconcile_promotion(
         target: record.target.clone(),
         counted: record.counted,
         override_used: record.override_used,
+        verified: record.verified.clone(),
         already_recorded: true,
     })
 }
@@ -2146,7 +2293,11 @@ fn parse_promotion_comment(comment: &str) -> Option<PromotionRecord> {
     let rest = comment.strip_prefix(PROMOTE_PREFIX)?.trim();
     // Free-text override fields follow the structured tokens and may contain
     // spaces, so only the head before them is parsed.
-    let head = rest.split(" consequence=").next()?;
+    let head = rest
+        .split(" consequence=")
+        .next()?
+        .split(" verified=")
+        .next()?;
     let mut route = None;
     let mut basis = None;
     let mut counted = None;
@@ -2168,10 +2319,25 @@ fn parse_promotion_comment(comment: &str) -> Option<PromotionRecord> {
             _ => {}
         }
     }
+    let basis = basis?;
+    let verified = match basis.as_str() {
+        "votes" | "override" => None,
+        "verified-improvement" => {
+            let (_, receipt) = rest.split_once(" verified=")?;
+            let record: VerifiedImprovementRecord = serde_json::from_str(receipt).ok()?;
+            require_field("binding", &record.binding, MAX_REASON).ok()?;
+            require_field("lead", &record.lead, MAX_REASON).ok()?;
+            require_field("acceptance", &record.acceptance, MAX_REASON).ok()?;
+            require_field("reason", &record.reason, MAX_REASON).ok()?;
+            Some(record)
+        }
+        _ => return None,
+    };
     Some(PromotionRecord {
         route: route?,
         counted: counted?,
-        override_used: basis? == "override",
+        override_used: basis == "override",
+        verified,
         target,
     })
 }
@@ -2960,6 +3126,7 @@ mod tests {
             threshold: Some(3),
             target: None,
             override_note: None,
+            verified: None,
         }
         .format();
         assert!(comment.contains("basis=votes"));
@@ -2970,6 +3137,7 @@ mod tests {
                 route: PromotionRoute::BacklogTask,
                 counted: 3,
                 override_used: false,
+                verified: None,
                 target: None,
             }
         );
@@ -2984,6 +3152,7 @@ mod tests {
             threshold: None,
             target: Some("kit:prb-1"),
             override_note: Some(&note),
+            verified: None,
         }
         .format();
         assert!(
@@ -2992,6 +3161,32 @@ mod tests {
         let ledger = parse_ledger(&[comment]);
         assert!(ledger.promotions[0].override_used);
         assert_eq!(ledger.promotions[0].target.as_deref(), Some("kit:prb-1"));
+
+        let verified = VerifiedImprovementRecord {
+            binding: "binding-fixture".into(),
+            revision: 1,
+            lead: "lead-fixture".into(),
+            acceptance: "acceptance-fixture".into(),
+            reason: "fix a verified wait; target=unrelated is only reason text".into(),
+        };
+        let comment = PromotionComment {
+            route: PromotionRoute::BacklogTask,
+            counted: 1,
+            threshold: None,
+            target: None,
+            override_note: None,
+            verified: Some(&verified),
+        }
+        .format();
+        let ledger = parse_ledger(&[comment]);
+        assert_eq!(ledger.promotions.len(), 1);
+        assert_eq!(ledger.promotions[0].basis(), "verified-improvement");
+        assert_eq!(ledger.promotions[0].verified.as_ref(), Some(&verified));
+        assert_eq!(ledger.promotions[0].target, None);
+        assert!(!ledger.promotions[0].override_used);
+        assert!(parse_promotion_comment(
+            "feedback-promote v1 route=backlog-task basis=verified-improvement counted=1 threshold=none target=none"
+        ).is_none());
 
         let ledger = parse_ledger(&[]);
         let error =

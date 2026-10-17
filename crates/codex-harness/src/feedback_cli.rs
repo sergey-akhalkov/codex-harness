@@ -39,7 +39,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback record --project DIRECTORY --source-feedback ID --observation TEXT --reporter ID --kind derived-evidence [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-admit --project DIRECTORY --mechanism TOKEN --conditions TOKEN --observation REF --predicted TEXT --counterexample TEXT --acceptance TEXT --spec REF --basis REF [--fresh-basis REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-search --project DIRECTORY [--mechanism TOKEN] [--conditions TOKEN] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-trial --project DIRECTORY --item ID --experiment ID --role candidate|workload --counterpart ID [--evidence REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-implement --project DIRECTORY --item ID --role candidate|workload --branch NAME --base REVISION --revision REVISION --worktree LOCATOR [--runtime ID] [--baseline-runtime ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-decision --project DIRECTORY --item ID --experiment ID --outcome adopt|reject|inconclusive --quality unchanged|improved|regressed|unmeasurable --matched N --tolerance-percent VALUE --baseline-seconds VALUE --candidate-seconds VALUE --baseline-arm NAME --candidate-arm NAME --accounting TERMS --baseline-revision REVISION --candidate-revision REVISION --acceptance REF --coverage TERMS --scope TOKEN --reason TOKEN [--detail TEXT] [--close yes] [--defer UNTIL] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-reconcile --project DIRECTORY --item ID --outcome reject|inconclusive --change NAME [--action retain|archive] [--openspec-project DIRECTORY] [--planning-root DIRECTORY] [--store ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-propose --project DIRECTORY --item ID --proposal REF --target TOKEN --evidence REF --loss TOKEN [--preview REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-decide --project DIRECTORY --item ID --decision approve|refuse|withdraw --proposal REF --target TOKEN [--actions experiment,integration,publication] --loss TOKEN [--basis REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-check --project DIRECTORY --item ID --proposal REF --target TOKEN --action experiment|integration|publication [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. `record --kind derived-evidence` requires --source-feedback and appends bounded analysis to that existing record without creating a feedback card or vote; source episode, reporter kind and parent come from the board record. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `feedback-derived`, `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` (v1 and v2) records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's recorded benefit-gate decision with its comparison consistency, its recorded evidence binding (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) and its limitations (the record is read back; it is not rerun or independently certified here). Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board.\nThe hypothesis verbs keep one durable `task` labeled hypothesis per hypothesis: admission searches open, closed and deferred cards first, reuses the prior same-condition conclusion and requires a recorded fresh basis before reconsideration, so a repeated trial creates no duplicate card; `hypothesis-trial` records the explicit candidate/workload relationship as a nonblocking `related` edge plus its experiment reference; `hypothesis-implement` records the candidate branch/base/revision/worktree and prepared runtime identities without adopting or closing anything; `hypothesis-decision` publishes the evidence-bound `benefit-gate v2` record (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) idempotently and refuses a decision its own comparison cannot support, then optionally closes or defers the card; `hypothesis-reconcile` reconciles an unadopted outcome with the change's actual task state read through the installed OpenSpec CLI: retention writes nothing, archival uses the supported non-synchronizing path only when every required task is actually done, and an unfinished required task is never closed through an outcome. The removal verbs keep the user's decision separate from measured benefit: `removal-propose` records each reviewed proposal version (any changed reviewed field, including the bounded prose detail, is appended as the new current version), `removal-decide` records the user's approve/refuse/withdraw bound to that exact reviewed content (an approval must name its reviewed loss, which must equal the recorded proposal's loss; the recorded `reviewed=` digest covers every reviewed field), and `removal-check` resolves the latest decision for one exact proposal/target/action (exit 0 only when authorized): an unreadable, incomplete-proposal or changed-proposal newer record never falls back to an older approval, a refusal or withdrawal authorizes nothing, a proposal version recorded after the decision needs a fresh decision before any further removal effect, and no benefit verdict is accepted as consent. No verb creates votes, another tracker or a model call.";
+const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback record --project DIRECTORY --source-feedback ID --observation TEXT --reporter ID --kind derived-evidence [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--verified-work WORK --improvement-reason TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-admit --project DIRECTORY --mechanism TOKEN --conditions TOKEN --observation REF --predicted TEXT --counterexample TEXT --acceptance TEXT --spec REF --basis REF [--fresh-basis REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-search --project DIRECTORY [--mechanism TOKEN] [--conditions TOKEN] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-trial --project DIRECTORY --item ID --experiment ID --role candidate|workload --counterpart ID [--evidence REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-implement --project DIRECTORY --item ID --role candidate|workload --branch NAME --base REVISION --revision REVISION --worktree LOCATOR [--runtime ID] [--baseline-runtime ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-decision --project DIRECTORY --item ID --experiment ID --outcome adopt|reject|inconclusive --quality unchanged|improved|regressed|unmeasurable --matched N --tolerance-percent VALUE --baseline-seconds VALUE --candidate-seconds VALUE --baseline-arm NAME --candidate-arm NAME --accounting TERMS --baseline-revision REVISION --candidate-revision REVISION --acceptance REF --coverage TERMS --scope TOKEN --reason TOKEN [--detail TEXT] [--close yes] [--defer UNTIL] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-reconcile --project DIRECTORY --item ID --outcome reject|inconclusive --change NAME [--action retain|archive] [--openspec-project DIRECTORY] [--planning-root DIRECTORY] [--store ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-propose --project DIRECTORY --item ID --proposal REF --target TOKEN --evidence REF --loss TOKEN [--preview REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-decide --project DIRECTORY --item ID --decision approve|refuse|withdraw --proposal REF --target TOKEN [--actions experiment,integration,publication] --loss TOKEN [--basis REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-check --project DIRECTORY --item ID --proposal REF --target TOKEN --action experiment|integration|publication [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. `record --kind derived-evidence` requires --source-feedback and appends bounded analysis to that existing record without creating a feedback card or vote; source episode, reporter kind and parent come from the board record. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `feedback-derived`, `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` (v1 and v2) records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's recorded benefit-gate decision with its comparison consistency, its recorded evidence binding (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) and its limitations (the record is read back; it is not rerun or independently certified here). Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board.\nThe hypothesis verbs keep one durable `task` labeled hypothesis per hypothesis: admission searches open, closed and deferred cards first, reuses the prior same-condition conclusion and requires a recorded fresh basis before reconsideration, so a repeated trial creates no duplicate card; `hypothesis-trial` records the explicit candidate/workload relationship as a nonblocking `related` edge plus its experiment reference; `hypothesis-implement` records the candidate branch/base/revision/worktree and prepared runtime identities without adopting or closing anything; `hypothesis-decision` publishes the evidence-bound `benefit-gate v2` record (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) idempotently and refuses a decision its own comparison cannot support, then optionally closes or defers the card; `hypothesis-reconcile` reconciles an unadopted outcome with the change's actual task state read through the installed OpenSpec CLI: retention writes nothing, archival uses the supported non-synchronizing path only when every required task is actually done, and an unfinished required task is never closed through an outcome. The removal verbs keep the user's decision separate from measured benefit: `removal-propose` records each reviewed proposal version (any changed reviewed field, including the bounded prose detail, is appended as the new current version), `removal-decide` records the user's approve/refuse/withdraw bound to that exact reviewed content (an approval must name its reviewed loss, which must equal the recorded proposal's loss; the recorded `reviewed=` digest covers every reviewed field), and `removal-check` resolves the latest decision for one exact proposal/target/action (exit 0 only when authorized): an unreadable, incomplete-proposal or changed-proposal newer record never falls back to an older approval, a refusal or withdrawal authorizes nothing, a proposal version recorded after the decision needs a fresh decision before any further removal effect, and no benefit verdict is accepted as consent. No verb creates votes, another tracker or a model call.";
 
 /// Bound on the caller-supplied triage decision document.
 const MAX_DECISIONS_BYTES: u64 = 256 * 1024;
@@ -428,11 +428,7 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
         println!(
             "promotion route={} basis={} counted={} target={}",
             promotion.route.as_str(),
-            if promotion.override_used {
-                "override"
-            } else {
-                "votes"
-            },
+            promotion.basis(),
             promotion.counted,
             promotion.target.as_deref().unwrap_or("none")
         );
@@ -656,6 +652,8 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
         "--scope",
         "--override-consequence",
         "--override-reason",
+        "--verified-work",
+        "--improvement-reason",
     ])?;
     let board = resolve_board(&options)?;
     let item = options.required("--item")?;
@@ -698,18 +696,40 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
     }
     let consequence = options.get("--override-consequence");
     let reason = options.get("--override-reason");
-    let evidence = match (consequence, reason) {
-        (Some(consequence), Some(reason)) => PromotionEvidence::ConsequenceOverride {
-            consequence: consequence.to_owned(),
-            reason: reason.to_owned(),
-        },
-        (None, None) => PromotionEvidence::Votes {
-            threshold: board.vote_threshold,
-        },
-        _ => {
+    let verified_work = options.get("--verified-work");
+    let improvement_reason = options.get("--improvement-reason");
+    let evidence = if verified_work.is_some() || improvement_reason.is_some() {
+        if consequence.is_some() || reason.is_some() {
             return Err(invalid(
-                "--override-consequence and --override-reason are both required for a consequence override",
+                "verified improvement cannot be combined with a consequence override",
             ));
+        }
+        let (Some(work), Some(reason)) = (verified_work, improvement_reason) else {
+            return Err(invalid(
+                "--verified-work and --improvement-reason are both required",
+            ));
+        };
+        PromotionEvidence::VerifiedImprovement(
+            board_feedback::VerifiedImprovementRequest::for_current_lead(
+                &harness_core::native_launcher::codex_home()?,
+                work,
+                reason,
+            )?,
+        )
+    } else {
+        match (consequence, reason) {
+            (Some(consequence), Some(reason)) => PromotionEvidence::ConsequenceOverride {
+                consequence: consequence.to_owned(),
+                reason: reason.to_owned(),
+            },
+            (None, None) => PromotionEvidence::Votes {
+                threshold: board.vote_threshold,
+            },
+            _ => {
+                return Err(invalid(
+                    "--override-consequence and --override-reason are both required for a consequence override",
+                ));
+            }
         }
     };
     let route = match route {
@@ -731,13 +751,9 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
             "promotion already recorded: {} route={} basis={} counted={} threshold={} target={} limits={} (no promotion record was written; any missing labels are reconciled)",
             outcome.item_id,
             outcome.route.as_str(),
-            if outcome.override_used {
-                "override"
-            } else {
-                "votes"
-            },
+            outcome.basis(),
             outcome.counted,
-            if outcome.override_used {
+            if outcome.basis() != "votes" {
                 "none".to_owned()
             } else {
                 board.vote_threshold.to_string()
@@ -751,13 +767,9 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
         "promoted {} route={} basis={} counted={} threshold={} target={} limits={}",
         outcome.item_id,
         outcome.route.as_str(),
-        if outcome.override_used {
-            "override"
-        } else {
-            "votes"
-        },
+        outcome.basis(),
         outcome.counted,
-        if outcome.override_used {
+        if outcome.basis() != "votes" {
             "none".to_owned()
         } else {
             board.vote_threshold.to_string()

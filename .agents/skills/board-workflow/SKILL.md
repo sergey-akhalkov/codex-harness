@@ -143,6 +143,24 @@ episode, project path or raw observation. Promotion keeps every vote, merge and
 route comment as history and confers eligibility for planning, not
 implementation authority; it never writes a skill package.
 
+An active reflection mandate also permits one evidenced bounded correction
+without waiting for repeated reports. The real lead uses
+`feedback promote --project <project> --item <id> --verified-work <accepted-work> --improvement-reason "evidence and correction"`
+with the appropriate route above. The command derives the caller from
+`CODEX_THREAD_ID`, checks the current project/lead binding and live accepted
+work, and refuses missing, unrelated, reopened or stale work before writing.
+The reason is bounded to 160 UTF-8 bytes. Reflection forks cannot use the
+real lead's binding. This is `basis=verified-improvement`, separate from votes
+and the material-consequence override; the two flag pairs cannot be combined.
+
+Promotion retains the existing votes, records the work binding on the private
+source item and marks the remedy `harness.purpose=improvement`. A kit remedy
+receives only its explicit public summary/scope, improvement purpose and the
+neutral routing actor; private work/lead references stay on the source board.
+Retries reuse the recorded promotion and repair incomplete source labels/purpose
+without another task or vote. This admission does not waive ordinary routing,
+OpenSpec, skill evaluation, acceptance or the benefit gate below.
+
 Lead consequence override: with material correctness, integrity or safety
 evidence, pass both `--override-consequence TEXT` and `--override-reason TEXT`.
 The command records the override and preserves vote history. A completed retry

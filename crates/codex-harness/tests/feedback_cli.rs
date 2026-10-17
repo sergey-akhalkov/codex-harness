@@ -961,6 +961,343 @@ fn partial_triage_failure_reports_the_applied_prefix_and_recovers() {
     board.drop();
 }
 
+fn accepted_reflection_work(
+    board: &Board,
+) -> (
+    harness_core::delivery_reflection::ReflectionController,
+    String,
+    String,
+) {
+    use harness_core::delivery_reflection::{
+        AcceptanceBinding, ActivationRequest, JournalPolicy, Purpose, ReflectionController,
+        acceptance_metadata,
+    };
+    let controller = ReflectionController::new(&board.bd, &board.project, &board.home);
+    controller
+        .activate(&ActivationRequest {
+            lead_session: "lead-fixture".into(),
+            run: None,
+            boundary: None,
+            journal: JournalPolicy::EnableIfMissing,
+            limits: None,
+        })
+        .unwrap();
+    let task = bd_json(
+        &board.bd,
+        &board.project,
+        &[
+            "create",
+            "Accepted ordinary task",
+            "--type",
+            "task",
+            "--parent",
+            &board.feature,
+            "--json",
+        ],
+    );
+    let task = task["id"].as_str().unwrap().to_owned();
+    let binding = AcceptanceBinding::new(
+        &task,
+        "run-fixture",
+        "assignment-fixture",
+        "result-fixture",
+        "revision-fixture",
+        vec!["executor-fixture".into()],
+        "lead-fixture",
+        "feedback-cli-test",
+        Purpose::Ordinary,
+    );
+    for (key, value) in acceptance_metadata(&binding).unwrap() {
+        let pair = format!("{key}={value}");
+        bd_json(
+            &board.bd,
+            &board.project,
+            &["update", &task, "--set-metadata", &pair, "--json"],
+        );
+    }
+    bd_json(
+        &board.bd,
+        &board.project,
+        &["close", &task, "--reason", "accepted", "--json"],
+    );
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    (controller, task, binding.acceptance_id().unwrap())
+}
+
+fn verified_promotion_command(
+    board: &Board,
+    item: &str,
+    work: &str,
+    lead: Option<&str>,
+) -> Command {
+    let mut command = board.feedback_command(&[
+        "promote",
+        "--item",
+        item,
+        "--verified-work",
+        work,
+        "--improvement-reason",
+        "remove the verified redundant wait",
+    ]);
+    command.env("CODEX_HOME", &board.home);
+    match lead {
+        Some(lead) => {
+            command.env("CODEX_THREAD_ID", lead);
+        }
+        None => {
+            command.env_remove("CODEX_THREAD_ID");
+        }
+    }
+    command
+}
+
+#[test]
+fn verified_improvement_uses_one_episode_and_repairs_partial_promotion_without_votes() {
+    let board = Board::new("verified-promotion");
+    let item = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
+    let decisions = board.decisions("admit.json", &[(&item, "process", None)]);
+    let out = board.feedback(&["triage", "--decisions", decisions.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+    let out = board.record_derived(&item, "reflection-a", "the same wait can be removed");
+    assert!(out.status.success(), "{}", output_text(&out));
+    let ordinary = board.feedback(&["promote", "--item", &item]);
+    assert!(!ordinary.status.success());
+    assert!(output_text(&ordinary).contains("below the configured threshold"));
+
+    let (_controller, _task, work) = accepted_reflection_work(&board);
+    let out = verified_promotion_command(&board, &item, &work, Some("lead-fixture"))
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("basis=verified-improvement counted=1 threshold=none"),
+        "{text}"
+    );
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &item]));
+    assert!(ledger.contains("votes=1 counted=1"), "{ledger}");
+    assert!(ledger.contains("promotions=1 derived=1"), "{ledger}");
+    assert!(ledger.contains("basis=verified-improvement"), "{ledger}");
+    let shown = bd_json(&board.bd, &board.project, &["show", &item, "--json"]);
+    assert_eq!(shown[0]["metadata"]["harness.purpose"], "improvement");
+    let comments = board.comment_texts(&item);
+
+    // Reconstruct an interrupted post-record transition using the actual board.
+    bd_json(
+        &board.bd,
+        &board.project,
+        &["label", "add", &item, "incubator", "--json"],
+    );
+    bd_json(
+        &board.bd,
+        &board.project,
+        &["label", "remove", &item, "backlog", "--json"],
+    );
+    bd_json(
+        &board.bd,
+        &board.project,
+        &[
+            "update",
+            &item,
+            "--set-metadata",
+            "harness.purpose=ordinary",
+            "--json",
+        ],
+    );
+    let out = verified_promotion_command(&board, &item, &work, Some("lead-fixture"))
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("promotion already recorded"), "{text}");
+    assert!(text.contains("basis=verified-improvement"), "{text}");
+    assert_eq!(comments, board.comment_texts(&item));
+    let shown = bd_json(&board.bd, &board.project, &["show", &item, "--json"]);
+    assert_eq!(shown[0]["metadata"]["harness.purpose"], "improvement");
+    let labels = board.labels(&item);
+    assert!(labels.iter().any(|label| label == "backlog"));
+    assert!(!labels.iter().any(|label| label == "incubator"));
+    board.drop();
+}
+
+#[test]
+fn verified_improvement_kit_route_keeps_private_provenance_out_of_public_writes() {
+    let board = Board::new("verified-consumer");
+    let kit = Board::new("verified-kit");
+    let item = board.record(
+        "private-fixture observation",
+        "private-fixture-reporter",
+        "private-fixture-episode",
+        "executor",
+    );
+    let decisions = board.decisions("admit.json", &[(&item, "kit-concern", None)]);
+    let out = board.feedback(&["triage", "--decisions", decisions.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+    let (_controller, _task, work) = accepted_reflection_work(&board);
+    let out = bd_run(
+        &kit.bd,
+        &kit.project,
+        &["config", "set", "events-journal", "true"],
+    );
+    assert!(out.status.success(), "{}", output_text(&out));
+
+    let promote = || {
+        verified_promotion_command(&board, &item, &work, Some("lead-fixture"))
+            .args([
+                "--route",
+                "kit-backlog",
+                "--kit-project",
+                kit.project.to_str().unwrap(),
+                "--summary",
+                "Remove redundant dispatch wait",
+                "--scope",
+                "executor dispatch",
+            ])
+            .env("BEADS_ACTOR", "private-fixture-actor")
+            .output()
+            .unwrap()
+    };
+    let out = promote();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("basis=verified-improvement counted=1 threshold=none"),
+        "{text}"
+    );
+    let items = bd_json(
+        &kit.bd,
+        &kit.project,
+        &["list", "--label", "kit-feedback", "--json"],
+    );
+    let rows = items.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{items}");
+    let kit_id = rows[0]["id"].as_str().unwrap();
+    let shown = bd_json(&kit.bd, &kit.project, &["show", kit_id, "--json"]);
+    assert_eq!(shown[0]["metadata"]["harness.purpose"], "improvement");
+    let journal = bd_run(&kit.bd, &kit.project, &["events", "export"]);
+    assert!(journal.status.success(), "{}", output_text(&journal));
+    let public = format!("{shown}\n{}", String::from_utf8_lossy(&journal.stdout));
+    assert!(public.contains("feedback-routing"), "{public}");
+    for private in [
+        "private-fixture",
+        "lead-fixture",
+        "executor-fixture",
+        "remove the verified redundant wait",
+        &work,
+        &item,
+        board.project.to_str().unwrap(),
+    ] {
+        assert!(
+            !public.contains(private),
+            "public board contains {private}: {public}"
+        );
+    }
+    let source_comments = board.comment_texts(&item);
+    assert!(source_comments.iter().any(|text| {
+        text.contains("basis=verified-improvement")
+            && text.contains("lead-fixture")
+            && text.contains(&work)
+    }));
+    let out = promote();
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert!(output_text(&out).contains("promotion already recorded"));
+    assert_eq!(board.comment_texts(&item), source_comments);
+    let after = bd_json(
+        &kit.bd,
+        &kit.project,
+        &["list", "--label", "kit-feedback", "--json"],
+    );
+    assert_eq!(after, items);
+    let replay_journal = bd_run(&kit.bd, &kit.project, &["events", "export"]);
+    assert!(
+        replay_journal.status.success(),
+        "{}",
+        output_text(&replay_journal)
+    );
+    assert_eq!(journal.stdout, replay_journal.stdout);
+    kit.drop();
+    board.drop();
+}
+
+#[test]
+fn verified_improvement_refuses_inactive_wrong_lead_unrelated_and_stale_work_before_writes() {
+    let board = Board::new("verified-refusals");
+    let item = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
+    let decisions = board.decisions("admit.json", &[(&item, "process", None)]);
+    let out = board.feedback(&["triage", "--decisions", decisions.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+    let before = board.comment_texts(&item);
+    let out = verified_promotion_command(&board, &item, "missing-work", Some("lead-fixture"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(output_text(&out).contains("no delivery-reflection lifecycle"));
+    assert_eq!(before, board.comment_texts(&item));
+
+    let (controller, task, work) = accepted_reflection_work(&board);
+    for (lead, requested_work, expected) in [
+        (None, work.as_str(), "current real lead"),
+        (Some("executor-fixture"), work.as_str(), "active lead"),
+        (
+            Some("lead-fixture"),
+            "unrelated-work",
+            "matches no retained acceptance",
+        ),
+    ] {
+        let out = verified_promotion_command(&board, &item, requested_work, lead)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", output_text(&out));
+        assert!(
+            output_text(&out).contains(expected),
+            "{}",
+            output_text(&out)
+        );
+        assert_eq!(before, board.comment_texts(&item));
+    }
+
+    bd_json(&board.bd, &board.project, &["reopen", &task, "--json"]);
+    let out = verified_promotion_command(&board, &item, &work, Some("lead-fixture"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        output_text(&out).contains("closed"),
+        "{}",
+        output_text(&out)
+    );
+    assert_eq!(before, board.comment_texts(&item));
+    bd_json(
+        &board.bd,
+        &board.project,
+        &["close", &task, "--reason", "accepted", "--json"],
+    );
+
+    let out = verified_promotion_command(&board, &item, &work, Some("lead-fixture"))
+        .args([
+            "--override-consequence",
+            "critical",
+            "--override-reason",
+            "mixed basis",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(output_text(&out).contains("cannot be combined"));
+    assert_eq!(before, board.comment_texts(&item));
+
+    controller.stop().unwrap();
+    let out = verified_promotion_command(&board, &item, &work, Some("lead-fixture"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(output_text(&out).contains("stopped"));
+    assert_eq!(before, board.comment_texts(&item));
+    assert!(board.labels(&item).iter().any(|label| label == "incubator"));
+    board.drop();
+}
+
 #[test]
 fn promotion_is_explicit_recorded_and_never_repeated() {
     let board = Board::new("promote");
