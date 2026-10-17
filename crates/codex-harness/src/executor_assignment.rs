@@ -19,6 +19,7 @@
 //! reaches a managed session through its role context instead of being
 //! restated in every brief.
 
+use harness_core::delivery_reflection::Purpose;
 use serde::Deserialize;
 use std::{
     collections::BTreeSet,
@@ -83,6 +84,9 @@ pub struct Assignment {
     /// Consumer of the returned result; omitted means the dispatching lead.
     #[serde(default)]
     pub consumer: Option<String>,
+    /// Owned task purpose. Omitted means unspecified rather than ordinary.
+    #[serde(default)]
+    pub purpose: Option<String>,
     /// Additional triggers that return the decision to the consumer; the
     /// standing boundaries apply in every case.
     #[serde(default)]
@@ -146,6 +150,10 @@ impl Assignment {
         if let Some(consumer) = &self.consumer {
             require_text("consumer", consumer, MAX_ITEM_BYTES)?;
         }
+        if let Some(purpose) = &self.purpose {
+            require_text("purpose", purpose, MAX_ITEM_BYTES)?;
+            Purpose::parse(purpose)?;
+        }
         if self.acceptance.is_empty() {
             return Err(invalid(
                 "assignment acceptance is empty; name at least one checkable acceptance item",
@@ -208,6 +216,11 @@ fn render_brief(
 ) -> io::Result<String> {
     assignment.validate_paths(context.checkout)?;
     let consumer = consumer_text(assignment);
+    let purpose = assignment
+        .purpose
+        .as_deref()
+        .map(Purpose::parse)
+        .transpose()?;
     let boundaries = assignment
         .escalate
         .iter()
@@ -222,6 +235,9 @@ fn render_brief(
     text.push_str(&format!("source: {}\n", context.source.display()));
     text.push_str(&format!("owner: {}\n", context.owner));
     text.push_str(&format!("consumer: {consumer}\n"));
+    if let Some(purpose) = purpose {
+        text.push_str(&format!("purpose: {}\n", purpose.as_str()));
+    }
     push_list(
         &mut text,
         "inputs (declared; verified regular files inside the checkout)",

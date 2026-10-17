@@ -12,6 +12,8 @@ const DEFAULT_INCUBATOR_CAP: u32 = 32;
 const DEFAULT_FEEDBACK_BATCH: u32 = 8;
 const DEFAULT_WORKTREE_LIMIT: u32 = 6;
 
+use crate::delivery_reflection::ReflectionLimits;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Orchestration {
@@ -37,6 +39,10 @@ pub struct Orchestration {
     /// not reset or retired and needs lead attention.
     #[serde(default = "default_worktree_limit")]
     pub worktree_limit: u32,
+    /// Optional finite budget and capacity for accepted-task reflection.
+    /// Omitted configurations use `ReflectionLimits::default()`.
+    #[serde(default)]
+    pub reflection_limits: Option<ReflectionLimits>,
 }
 
 fn default_vote_threshold() -> u32 {
@@ -304,6 +310,9 @@ pub fn validate(config: &Orchestration, installed: &BTreeSet<String>) -> io::Res
             "orchestration worktree_limit must be a positive integer at most 64",
         ));
     }
+    if let Some(limits) = &config.reflection_limits {
+        limits.validate()?;
+    }
     Ok(())
 }
 
@@ -430,6 +439,59 @@ mod tests {
     }
 
     #[test]
+    fn reflection_limits_are_optional_and_validated() {
+        let config = parse(
+            br#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
+max_concurrent_executors = 2
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.reflection_limits, None);
+        validate(&config, &installed(&["default", "ds"])).unwrap();
+
+        let config = parse(
+            br#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
+max_concurrent_executors = 2
+
+[reflection_limits]
+max_active_stages = 1
+max_attempts_per_stage = 2
+max_turns_per_stage = 4
+max_tokens_per_stage = 100
+max_tokens_per_record = 200
+max_events_per_poll = 10
+"#,
+        )
+        .unwrap();
+        let limits = config.reflection_limits.as_ref().unwrap();
+        assert_eq!(limits.max_active_stages, 1);
+        assert_eq!(limits.max_tokens_per_record, 200);
+        validate(&config, &installed(&["default", "ds"])).unwrap();
+
+        let mut invalid = config;
+        invalid
+            .reflection_limits
+            .as_mut()
+            .unwrap()
+            .max_active_stages = 0;
+        let error = validate(&invalid, &installed(&["default", "ds"])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reflection max_active_stages must be between 1 and 8"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn missing_profile_and_invalid_limit_are_explicit() {
         let config = Orchestration {
             schema: 1,
@@ -442,6 +504,7 @@ mod tests {
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
             worktree_limit: 6,
+            reflection_limits: None,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(
@@ -461,6 +524,7 @@ mod tests {
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
             worktree_limit: 6,
+            reflection_limits: None,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(
@@ -480,6 +544,7 @@ mod tests {
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
             worktree_limit: 6,
+            reflection_limits: None,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(

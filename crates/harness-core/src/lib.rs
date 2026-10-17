@@ -33,6 +33,7 @@ pub mod core_check;
 pub mod core_disconnect;
 pub mod core_install;
 pub mod core_runtime;
+pub mod delivery_reflection;
 pub mod dependency_apply;
 pub mod dependency_archive;
 mod dependency_assets;

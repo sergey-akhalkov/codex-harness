@@ -372,6 +372,10 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "{text}"
     );
     assert!(
+        !text.contains("purpose:"),
+        "an omitted purpose stays unspecified: {text}"
+    );
+    assert!(
         text.contains(
             "escalate to the lead that dispatched this assignment (additional boundaries)"
         ),
@@ -399,6 +403,7 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "declared.json",
         &[
             ("consumer", json!("the lead of epic sample-3mu")),
+            ("purpose", json!("improvement")),
             (
                 "escalate",
                 json!(["any change to the synthetic fixture layout"]),
@@ -414,6 +419,7 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         text.contains("consumer: the lead of epic sample-3mu"),
         "{text}"
     );
+    assert!(text.contains("purpose: improvement"), "{text}");
     assert!(
         text.contains("escalate to the lead of epic sample-3mu (additional boundaries)"),
         "{text}"
@@ -463,6 +469,18 @@ fn malformed_contract_fields_are_refused_without_writing() {
             "escalate",
             json!([""]),
             "assignment escalate[0] is empty",
+        ),
+        (
+            "unknown-purpose.json",
+            "purpose",
+            json!("auto"),
+            "purpose 'auto' is not ordinary, reflection or improvement",
+        ),
+        (
+            "empty-purpose.json",
+            "purpose",
+            json!(""),
+            "assignment purpose is empty",
         ),
         (
             "renamed-field.json",
