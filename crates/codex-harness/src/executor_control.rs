@@ -104,7 +104,7 @@ const RETRY: Duration = Duration::from_millis(50);
 /// A reflection catalogue is read in bounded pages; an endless or malformed
 /// cursor fails closed instead of guessing an empty tool surface.
 const MAX_CATALOGUE_PAGES: usize = 64;
-const REFLECTION_FEATURE_SWITCHES: [&str; 27] = [
+const REFLECTION_FEATURE_SWITCHES: [&str; 26] = [
     "features.apps",
     "features.enable_mcp_apps",
     "features.codex_apps_mcp_2026_07_28",
@@ -119,7 +119,6 @@ const REFLECTION_FEATURE_SWITCHES: [&str; 27] = [
     "features.image_generation",
     "features.artifact",
     "features.code_mode",
-    "features.code_mode_host",
     "features.hooks",
     "features.goals",
     "features.multi_agent",
@@ -707,6 +706,10 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         }
         args.push(OsString::from("-c"));
         args.push(OsString::from("web_search=\"disabled\""));
+        // The native tool transport is required for permitted reads. Tool
+        // authority stays bounded by the fork sandbox and closed catalogues.
+        args.push(OsString::from("-c"));
+        args.push(OsString::from("features.code_mode_host=true"));
     }
     args
 }
@@ -2550,6 +2553,7 @@ fn fork_params(
         config.insert(feature.into(), json!(false));
     }
     config.insert("web_search".into(), json!("disabled"));
+    config.insert("features.code_mode_host".into(), json!(true));
     if !suppressed_mcp_servers.is_empty() {
         config.insert(
             "mcp_servers".into(),

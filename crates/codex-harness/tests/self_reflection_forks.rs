@@ -44,7 +44,7 @@ const LEAD_RESULT: &str = "lead reflection: synthesized remedy";
 /// Every native feature channel that could expose an inherited mutation
 /// surface outside the read-only filesystem sandbox. The reflection fork must
 /// switch each one off in its own config.
-const BLOCKED_FEATURES: [&str; 27] = [
+const BLOCKED_FEATURES: [&str; 26] = [
     "features.apps",
     "features.enable_mcp_apps",
     "features.codex_apps_mcp_2026_07_28",
@@ -59,7 +59,6 @@ const BLOCKED_FEATURES: [&str; 27] = [
     "features.image_generation",
     "features.artifact",
     "features.code_mode",
-    "features.code_mode_host",
     "features.hooks",
     "features.goals",
     "features.multi_agent",

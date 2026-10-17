@@ -631,6 +631,70 @@ fn lead_message_reaches_the_native_owning_thread() {
     drop(fixture.job);
 }
 
+/// Canned controls use the same shell and patch tools as the read-only fork.
+/// The writable source proves the operations are valid; the fork must retain
+/// its permitted read while both mutations are refused. No real model runs.
+fn reflection_probe_response(request: &Value, proof: &Path) -> Value {
+    let reflection = contains_payload(request, "Bounded read-only executor self-reflection.");
+    let probing = reflection || contains_payload(request, "accepted executor work");
+    let prefix = if reflection { "reflection" } else { "source" };
+    let shell_call = format!("{prefix}-read-only-proof");
+    let write_call = format!("{prefix}-write-proof");
+    let patch_call = format!("{prefix}-patch-proof");
+    let completed = |call: &str| {
+        request["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("function_call_output" | "custom_tool_call_output")
+                ) && item["call_id"] == call
+            })
+        })
+    };
+    if probing && (!completed(&shell_call) || !completed(&write_call)) {
+        let reading = !completed(&shell_call);
+        let target = if reflection {
+            proof.to_path_buf()
+        } else {
+            proof.with_file_name("writable-control.txt")
+        };
+        let path = native_path(&target).to_string_lossy().replace('\'', "''");
+        let command = if reading {
+            format!("Get-Content -LiteralPath '{path}' -Raw")
+        } else {
+            format!(
+                "Set-Content -LiteralPath '{path}' -Value 'forbidden-write' -NoNewline -ErrorAction Stop"
+            )
+        };
+        let arguments = serde_json::to_string(&json!({
+            "cmd":command,
+            "shell":control_responses::owned_pwsh(),
+            "login":false,
+            "yield_time_ms":10000,
+            "max_output_tokens":1000,
+        }))
+        .unwrap();
+        return json!({
+            "type":"custom_tool_call", "call_id":if reading { shell_call } else { write_call },
+            "namespace":"functions", "name":"exec",
+            "input":format!("const result = await tools.exec_command({arguments}); text(result);"),
+        });
+    }
+    if probing && !completed(&patch_call) {
+        let target = proof.with_file_name(format!("{prefix}-patch-proof.txt"));
+        let path = native_path(&target).to_string_lossy().replace('\\', "/");
+        let patch = format!("*** Begin Patch\n*** Add File: {path}\n+patch-write\n*** End Patch");
+        let input = serde_json::to_string(&patch).unwrap();
+        return json!({
+            "type":"custom_tool_call", "call_id":patch_call,
+            "namespace":"functions", "name":"exec",
+            "input":format!("const result = await tools.apply_patch({input}); text(result);"),
+        });
+    }
+    json!({"type":"message","id":"msg-native-reflection","role":"assistant",
+        "content":[{"type":"output_text","text":"NO FINDING"}]})
+}
+
 /// The checkout's real self-reflection entry point against the installed native
 /// app-server and frontend. Only Responses are canned; source threads, forks,
 /// tool catalogues, retained turns and delivery use native components.
@@ -638,10 +702,12 @@ fn lead_message_reaches_the_native_owning_thread() {
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE and native frontend; owned canned Responses and MCP; no live model"]
 fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead() {
     let owned_root = BrokerRoot::prepare().unwrap().keep();
-    let responses = control_responses::Responses::routed(owned_root.path().into(), |_| {
-        json!({"type":"message","id":"msg-native-reflection","role":"assistant",
-            "content":[{"type":"output_text","text":"NO FINDING"}]})
-    });
+    let proof = owned_root.path().join("workspace/readonly-proof.txt");
+    let provider_proof = proof.clone();
+    let responses =
+        control_responses::Responses::routed(owned_root.path().into(), move |request| {
+            reflection_probe_response(request, &provider_proof)
+        });
     let fixture = fixture_with_responses(owned_root, responses);
     let root = fixture.root.path();
     let home = root.join("home");
@@ -652,6 +718,13 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
             .unwrap(),
     );
     println!("native reflection evidence: {}", root.display());
+    let proof_contents = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+    fs::write(&proof, &proof_contents).unwrap();
+    fs::write(
+        proof.with_file_name("writable-control.txt"),
+        &proof_contents,
+    )
+    .unwrap();
     let config_path = home.join("config.toml");
     let unrelated = skill_catalog_responses::unrelated_probe_mcp(&home).replace(
         "mcp_servers.unrelated_probe",
@@ -660,7 +733,10 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
     let original_config = fs::read_to_string(&config_path).unwrap();
     fs::write(
         &config_path,
-        format!("{original_config}\n{unrelated}\n[profiles.reflection_fixture]\nmodel = \"gpt-6-astra\"\nmodel_provider = \"control_fixture\"\nmodel_reasoning_effort = \"low\"\n"),
+        // This isolated home uses the native restricted-token backend without
+        // provisioning machine-wide users. Installed elevated-backend acceptance
+        // remains a separate check; no owner sandbox configuration is changed.
+        format!("{original_config}\n{unrelated}\n[windows]\nsandbox = \"unelevated\"\n[profiles.reflection_fixture]\nmodel = \"gpt-6-astra\"\nmodel_provider = \"control_fixture\"\nmodel_reasoning_effort = \"low\"\n"),
     ).unwrap();
     let config_before = fs::read(&config_path).unwrap();
     let mcp_config: toml::Table = unrelated.parse().unwrap();
@@ -724,6 +800,18 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
         );
         sources.push((thread, turn, completed["thread"]["turns"].clone(), goal));
     }
+    assert_eq!(
+        fs::read_to_string(proof.with_file_name("writable-control.txt")).unwrap(),
+        "forbidden-write",
+        "the ordinary native source must execute the writable shell control"
+    );
+    assert_eq!(
+        fs::read_to_string(proof.with_file_name("source-patch-proof.txt"))
+            .unwrap()
+            .trim(),
+        "patch-write",
+        "the ordinary native source must execute the writable patch control"
+    );
     let endpoint_dir = record_native_lead(&fixture, &sources[1].0, "native-reflection-return");
     let state_dir = root.join("reflection-state");
     let stage = |role: harness_core::role_context::Role| {
@@ -833,8 +921,51 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
             !requests.is_empty(),
             "no native provider input for {fork_id}"
         );
+        if index == 0 {
+            assert!(
+                requests.iter().any(|body| {
+                    body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            matches!(
+                                item["type"].as_str(),
+                                Some("function_call_output" | "custom_tool_call_output")
+                            ) && item["call_id"] == "reflection-read-only-proof"
+                                && contains_payload(&item["output"], &proof_contents)
+                        })
+                    })
+                }),
+                "the native read-only tool must perform a real permitted read; evidence {}",
+                root.display()
+            );
+            assert_eq!(
+                fs::read_to_string(&proof).unwrap(),
+                proof_contents,
+                "the read-only reflection changed its owned proof file"
+            );
+            assert!(
+                !proof.with_file_name("reflection-patch-proof.txt").exists(),
+                "the read-only reflection wrote through apply_patch"
+            );
+            for call in ["reflection-write-proof", "reflection-patch-proof"] {
+                assert!(
+                    requests
+                        .iter()
+                        .any(|body| body["input"].as_array().is_some_and(|items| items
+                            .iter()
+                            .any(|item| matches!(
+                                item["type"].as_str(),
+                                Some("function_call_output" | "custom_tool_call_output")
+                            ) && item["call_id"] == call))),
+                    "the native mutation attempt {call} must return its own result"
+                );
+            }
+        }
         for body in requests {
             let surface = control_responses::tool_catalogue::tool_surface(&body.to_string());
+            assert!(
+                !surface.1.is_empty(),
+                "missing native tool surface for {fork_id}"
+            );
             assert!(
                 !surface.1.contains("unrelated.probe") && !surface.1.contains("unrelated_probe"),
                 "{surface:?}"
