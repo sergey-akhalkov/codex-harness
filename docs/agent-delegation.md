@@ -423,6 +423,18 @@ Steer a continuing run by piping content into `codex-harness executor message`; 
 
 An executor asks through `codex-harness lead message` from piped/text/file input; `--notify` sends a no-reply notice. The request reference lets the lead answer with `codex-harness executor message --reply-to MESSAGE_ID`, continuing the same conversation without reconstructing an address or resuming. `lead start` registers the lead endpoint that spawn inherits; that managed endpoint steers an active turn and starts an idle one on the exact thread. When a dispatch recorded no per-spawn endpoint, the command resolves only the managed registry record for that exact originating thread under the lead home recorded at dispatch, which `lead start --session THREAD` publishes after resuming the same thread. It never starts a second conversation or listener, never uses a registry record from another home or for another thread, and never replaces a malformed, mismatched or stale per-spawn endpoint.
 
+New control endpoints name the child's resolved executable image, not the
+mutable `harness/bin/codex.exe` link. A record written by an older build can
+still name that link after an installation update retargets it. Endpoint
+validation may recover such an existing record only when the exact pid,
+creation time and caller account still match the running child, and its
+running image and the link's current target are distinct sibling published
+builds with the link's executable name. The live thread is still checked
+afterward, so the message reaches the recorded conversation without rewriting
+the endpoint or interrupting the worker. A reused pid, foreign image or build
+family, renamed executable, different account or wrong thread still refuses;
+strict service and termination identity checks do not use this recovery.
+
 The installed native queue is idle-only: its queue operation dispatches only
 when the target turn is idle, so it cannot deliver an operational message
 during the lead's current turn and `lead message` does not use it. With no

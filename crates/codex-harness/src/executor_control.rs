@@ -858,8 +858,11 @@ pub fn registered_lead(codex_home: &Path, thread_id: &str) -> RegisteredLead {
 }
 
 /// Whether the recorded endpoint process is still the process that serves it:
-/// pid, creation time and image must match the current process table. A bare
-/// pid, a missing image, an unverifiable identity or a reused pid is not
+/// pid, creation time and image must match the current process table. A record
+/// written before spawn-time image resolution may keep naming the installed
+/// launcher symlink after an install retargets it; endpoint validation accepts
+/// that only for the same exact process image in a sibling published build.
+/// A bare pid, a missing image, an unverifiable identity or a reused pid is not
 /// liveness, so a stale address can never be inherited or delivered to.
 pub fn endpoint_process_live(process: &EndpointProcess) -> bool {
     if process.pid == 0 || process.creation_time == 0 || !process.program.is_file() {
@@ -869,7 +872,7 @@ pub fn endpoint_process_live(process: &EndpointProcess) -> bool {
         return false;
     };
     matches!(
-        harness_core::process_service::ServiceProcess::inspect(
+        harness_core::process_service::ServiceProcess::inspect_endpoint(
             ProcessIdentity {
                 pid: process.pid,
                 creation_time: process.creation_time,
@@ -2505,6 +2508,15 @@ fn spawn_app_server(
         _ => free_loopback_port()?,
     };
     let mut spec = app_server_spec(plan, port);
+    // Resolve the installed launcher before CreateProcess. The endpoint must
+    // name the image this child actually runs, not a link that a later install
+    // can retarget while the child keeps serving.
+    spec.program = spec.program.canonicalize().map_err(|error| {
+        invalid(format!(
+            "control launcher {} could not be resolved: {error}",
+            spec.program.display()
+        ))
+    })?;
     let log = fs::File::create(&plan.paths.log).map_err(|error| {
         invalid(format!(
             "control app-server log {}: {error}",
@@ -2551,7 +2563,7 @@ fn spawn_app_server(
         EndpointProcess {
             pid: identity.pid,
             creation_time: identity.creation_time,
-            program: plan.launcher.clone(),
+            program: spec.program.clone(),
         },
     );
     Ok((process, connection, endpoint))

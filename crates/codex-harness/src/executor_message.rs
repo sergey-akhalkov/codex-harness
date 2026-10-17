@@ -503,7 +503,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "the recorded control endpoint names no app-server child, so the address cannot be verified; nothing was delivered",
         ));
     };
-    match ServiceProcess::inspect(
+    match ServiceProcess::inspect_endpoint(
         ProcessIdentity {
             pid: child.pid,
             creation_time: child.creation_time,
@@ -2001,6 +2001,35 @@ fn require_live(pid: u32, created: u64, program: &Path, reason: &str) -> io::Res
     }
 }
 
+/// Endpoint records may predate spawn-time image resolution. Their exact
+/// process and thread still have to match; the narrower sibling-build alias
+/// recovery lives in the process owner, while host lineage keeps the strict
+/// check above.
+fn require_live_endpoint(pid: u32, created: u64, program: &Path, reason: &str) -> io::Result<()> {
+    if pid == 0 || created == 0 || !program.is_file() {
+        return Err(invalid(&format!("{reason}; refusing before any send")));
+    }
+    let user = process_service::current_user().map_err(|error| {
+        invalid(&format!(
+            "{reason}: the caller account is unavailable: {error}; refusing before any send"
+        ))
+    })?;
+    match ServiceProcess::inspect_endpoint(
+        ProcessIdentity {
+            pid,
+            creation_time: created,
+        },
+        program,
+        &user,
+    ) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(invalid(&format!("{reason}; refusing before any send"))),
+        Err(error) => Err(invalid(&format!(
+            "{reason}: {error}; refusing before any send"
+        ))),
+    }
+}
+
 fn caller_in_lineage(host_pid: u32) -> bool {
     ancestor_pids().contains(&host_pid)
 }
@@ -2155,7 +2184,7 @@ fn verify_lead_endpoint(run: &SpawnedRun, endpoint: Endpoint) -> io::Result<Lead
             "the recorded endpoint names no process",
         ));
     };
-    require_live(
+    require_live_endpoint(
         process.pid,
         process.creation_time,
         &process.program,

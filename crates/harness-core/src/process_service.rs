@@ -575,6 +575,30 @@ impl ServiceProcess {
         program: &Path,
         expected_user: &str,
     ) -> io::Result<Option<Self>> {
+        Self::inspect_with(identity, program, expected_user, false)
+    }
+
+    /// Read an app-server endpoint identity. This is the strict identity check
+    /// of [`Self::inspect`], plus one narrow recovery for records written
+    /// before the endpoint recorded its resolved image: if the recorded
+    /// program is still a symlink whose target was retargeted by an install,
+    /// the running image may be a sibling published build with the same
+    /// executable name. The exact pid, creation time and account still have
+    /// to match. This never broadens service or termination validation.
+    pub fn inspect_endpoint(
+        identity: ProcessIdentity,
+        program: &Path,
+        expected_user: &str,
+    ) -> io::Result<Option<Self>> {
+        Self::inspect_with(identity, program, expected_user, true)
+    }
+
+    fn inspect_with(
+        identity: ProcessIdentity,
+        program: &Path,
+        expected_user: &str,
+        endpoint: bool,
+    ) -> io::Result<Option<Self>> {
         let process = match Self::open(identity.pid) {
             Ok(process) => process,
             Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
@@ -585,7 +609,11 @@ impl ServiceProcess {
         if process.identity != identity || !process.is_running()? {
             return Ok(None);
         }
-        process.validate(program, expected_user)?;
+        if endpoint {
+            process.validate_endpoint(program, expected_user)?;
+        } else {
+            process.validate(program, expected_user)?;
+        }
         Ok(Some(process))
     }
 
@@ -621,7 +649,7 @@ impl ServiceProcess {
         })
     }
 
-    fn validate(&self, program: &Path, expected_user: &str) -> io::Result<()> {
+    fn image(&self) -> io::Result<PathBuf> {
         let mut image = vec![0u16; 32768];
         let mut length = image.len() as u32;
         checked(unsafe {
@@ -633,9 +661,25 @@ impl ServiceProcess {
             )
         })?;
         use std::os::windows::ffi::OsStringExt;
-        let actual = PathBuf::from(std::ffi::OsString::from_wide(&image[..length as usize]))
-            .canonicalize()?;
-        if actual != program.canonicalize()? || user(self.handle.as_raw_handle())? != expected_user
+        PathBuf::from(std::ffi::OsString::from_wide(&image[..length as usize])).canonicalize()
+    }
+
+    fn validate(&self, program: &Path, expected_user: &str) -> io::Result<()> {
+        if self.image()? != program.canonicalize()?
+            || user(self.handle.as_raw_handle())? != expected_user
+        {
+            return Err(io::Error::other(
+                "service process identity mismatch; preserving process",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_endpoint(&self, program: &Path, expected_user: &str) -> io::Result<()> {
+        let actual = self.image()?;
+        let current = program.canonicalize()?;
+        if (actual != current && !retargeted_build_alias(program, &actual, &current)?)
+            || user(self.handle.as_raw_handle())? != expected_user
         {
             return Err(io::Error::other(
                 "service process identity mismatch; preserving process",
@@ -717,6 +761,34 @@ impl ServiceProcess {
         checked(unsafe { TerminateProcess(handle.as_raw_handle(), exit_code) })?;
         Ok(true)
     }
+}
+
+/// A pre-canonical endpoint recorded the installed launcher symlink. A later
+/// install can point that symlink at another published build while the child
+/// keeps running the image it launched. The exact process identity and account
+/// are checked separately; this helper only establishes that both the running
+/// image and the alias's current target are distinct sibling build outputs with
+/// the alias's executable name. A foreign target is never accepted.
+fn retargeted_build_alias(program: &Path, actual: &Path, current: &Path) -> io::Result<bool> {
+    if !std::fs::symlink_metadata(program)?.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let (Some(name), Some(actual_dir), Some(current_dir)) =
+        (program.file_name(), actual.parent(), current.parent())
+    else {
+        return Ok(false);
+    };
+    if actual.file_name() != Some(name)
+        || current.file_name() != Some(name)
+        || actual_dir == current_dir
+    {
+        return Ok(false);
+    }
+    let (Some(actual_builds), Some(current_builds)) = (actual_dir.parent(), current_dir.parent())
+    else {
+        return Ok(false);
+    };
+    Ok(actual_builds == current_builds && actual.is_file() && current.is_file())
 }
 
 /// Kernel-verified coverage of one retained service process. `Covered` needs a
