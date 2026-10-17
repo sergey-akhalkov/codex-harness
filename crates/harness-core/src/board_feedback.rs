@@ -33,6 +33,7 @@ pub const KIT_FORWARDED_LABEL: &str = "kit-forwarded";
 pub const KIT_FEEDBACK_LABEL: &str = "kit-feedback";
 
 const VOTE_PREFIX: &str = "feedback-vote v1";
+const DERIVED_PREFIX: &str = "feedback-derived v1";
 const MERGE_PREFIX: &str = "feedback-merge v1";
 const ROUTE_PREFIX: &str = "feedback-route v1";
 const PROMOTE_PREFIX: &str = "feedback-promote v1";
@@ -182,6 +183,28 @@ pub struct VoteRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedRecord {
+    /// The feedback item whose episode this analysis restates.
+    pub source: String,
+    pub source_reporter: String,
+    pub source_kind: ReporterKind,
+    /// The observer that produced the analysis.
+    pub reporter: String,
+    pub episode: String,
+    pub parent_id: String,
+    pub analysis: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedFeedbackReceipt {
+    pub record: DerivedRecord,
+    /// The item that received the analysis comment. It is the source itself
+    /// until the source has been merged, then its canonical item.
+    pub target_id: String,
+    pub written: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeRecord {
     pub from: String,
     pub into: String,
@@ -190,6 +213,7 @@ pub struct MergeRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteLedger {
     pub votes: Vec<VoteRecord>,
+    pub derived: Vec<DerivedRecord>,
     pub merges: Vec<MergeRecord>,
     pub routes: Vec<RouteRecord>,
     pub promotions: Vec<PromotionRecord>,
@@ -502,12 +526,15 @@ pub fn decide_vote(existing: &[VoteRecord], candidate: &VoteCandidate) -> VoteDe
 
 pub fn parse_ledger(comments: &[String]) -> VoteLedger {
     let mut votes = Vec::new();
+    let mut derived = Vec::new();
     let mut merges = Vec::new();
     let mut routes = Vec::new();
     let mut promotions = Vec::new();
     for comment in comments {
         if let Some(vote) = parse_vote_comment(comment) {
             votes.push(vote);
+        } else if let Some(record) = parse_derived_comment(comment) {
+            derived.push(record);
         } else if let Some(merge) = parse_merge_comment(comment) {
             merges.push(merge);
         } else if let Some(route) = parse_route_comment(comment) {
@@ -518,6 +545,7 @@ pub fn parse_ledger(comments: &[String]) -> VoteLedger {
     }
     VoteLedger {
         votes,
+        derived,
         merges,
         routes,
         promotions,
@@ -532,6 +560,19 @@ pub fn format_vote_comment(candidate: &VoteCandidate, decision: &VoteDecision) -
         candidate.kind.as_str(),
         if decision.counted { "true" } else { "false" },
         decision.reason.as_str()
+    )
+}
+
+fn format_derived_comment(record: &DerivedRecord) -> String {
+    format!(
+        "{DERIVED_PREFIX} source={} source_reporter={} source_kind={} reporter={} episode={} parent={} analysis={}",
+        record.source,
+        record.source_reporter,
+        record.source_kind.as_str(),
+        record.reporter,
+        record.episode,
+        record.parent_id,
+        record.analysis
     )
 }
 
@@ -573,6 +614,106 @@ pub fn record_feedback(
         ],
     )?;
     string_field(&created, "id")
+}
+
+/// Records bounded observer analysis against its originating feedback item.
+///
+/// The source is read before any write: it must be an existing bounded
+/// feedback record, and it must not itself be derived evidence. Episode and
+/// source identity come from that record, not from the observer's assertions.
+/// The analysis is appended as a `feedback-derived` comment, so it creates no
+/// feedback card and no vote. If the source has already been merged, the
+/// comment is attached to its canonical item; later merges copy any existing
+/// derived comments through the ordinary triage seam.
+pub fn record_derived_feedback(
+    bd: &Path,
+    project: &Path,
+    source_id: &str,
+    reporter: &str,
+    analysis: &str,
+) -> io::Result<DerivedFeedbackReceipt> {
+    let source_id = require_token("source feedback", source_id, MAX_PARENT)?;
+    let reporter = require_token("reporter", reporter, MAX_REPORTER)?;
+    let analysis = require_field("analysis", analysis, MAX_OBSERVATION)?;
+    let source = load_snapshot(bd, project, &source_id)?;
+    let source = source.ok_or_else(|| {
+        invalid(format!(
+            "source feedback {source_id} is missing; pass --source-feedback naming an existing feedback item"
+        ))
+    })?;
+    let feedback = source.feedback.ok_or_else(|| {
+        invalid(format!(
+            "source feedback {source_id} is not a bounded feedback record; pass --source-feedback naming an existing feedback item"
+        ))
+    })?;
+    if feedback.kind == ReporterKind::DerivedEvidence {
+        return Err(invalid(format!(
+            "source feedback {source_id} is itself derived evidence; link the primary feedback item"
+        )));
+    }
+    let target_id = canonical_feedback_target(bd, project, &source_id, source.duplicates)?;
+    let record = DerivedRecord {
+        source: source_id,
+        source_reporter: feedback.reporter,
+        source_kind: feedback.kind,
+        reporter,
+        episode: feedback.episode,
+        parent_id: feedback.parent_id,
+        analysis,
+    };
+    let comment = format_derived_comment(&record);
+    let comments = list_comments(bd, project, &target_id)?;
+    let written = if comments.iter().any(|existing| existing == &comment) {
+        false
+    } else {
+        json_ok(bd, project, &["comment", &target_id, "--json", &comment])?;
+        true
+    };
+    Ok(DerivedFeedbackReceipt {
+        record,
+        target_id,
+        written,
+    })
+}
+
+/// Follows the board's existing duplicate dependency to the canonical item.
+/// The source metadata stays bound to the original feedback record; only the
+/// comment target moves. A cycle is corrupt board state and refuses the write.
+fn canonical_feedback_target(
+    bd: &Path,
+    project: &Path,
+    source_id: &str,
+    mut duplicate: Option<String>,
+) -> io::Result<String> {
+    let mut current = source_id.to_owned();
+    let mut seen = vec![current.clone()];
+    while let Some(next) = duplicate {
+        if seen.iter().any(|id| id == &next) {
+            return Err(invalid(format!(
+                "source feedback duplicate chain is cyclic at {next}"
+            )));
+        }
+        seen.push(next.clone());
+        let snapshot = load_snapshot(bd, project, &next)?;
+        let snapshot = snapshot.ok_or_else(|| {
+            invalid(format!(
+                "source feedback {source_id} points to missing duplicate target {next}"
+            ))
+        })?;
+        let feedback = snapshot.feedback.ok_or_else(|| {
+            invalid(format!(
+                "source feedback {source_id} points to {next}, which is not a bounded feedback record"
+            ))
+        })?;
+        if feedback.kind == ReporterKind::DerivedEvidence {
+            return Err(invalid(format!(
+                "source feedback {source_id} points to {next}, which is itself derived evidence"
+            )));
+        }
+        current = next;
+        duplicate = snapshot.duplicates;
+    }
+    Ok(current)
 }
 
 pub fn list_feedback(bd: &Path, project: &Path) -> io::Result<Vec<FeedbackRow>> {
@@ -940,6 +1081,7 @@ fn apply_action_kind(
                     ],
                 )?;
             }
+            copy_derived_evidence(bd, project, &action.feedback_id, canonical)?;
             let (vote, ledger) = record_vote(bd, project, canonical, &candidate)?;
             let applied = AppliedAction {
                 feedback_id: action.feedback_id.clone(),
@@ -1727,6 +1869,31 @@ fn bounded_slug(value: &str) -> String {
     slug.trim_matches('-').to_owned()
 }
 
+/// Carries derived-analysis comments from a merged feedback item to its
+/// canonical item. Existing comments are compared exactly, so an interrupted
+/// or retried merge applies only the comments still missing.
+fn copy_derived_evidence(
+    bd: &Path,
+    project: &Path,
+    incoming: &str,
+    canonical: &str,
+) -> io::Result<()> {
+    if incoming == canonical {
+        return Ok(());
+    }
+    let mut existing = list_comments(bd, project, canonical)?;
+    for comment in list_comments(bd, project, incoming)? {
+        if parse_derived_comment(&comment).is_none()
+            || existing.iter().any(|present| present == &comment)
+        {
+            continue;
+        }
+        json_ok(bd, project, &["comment", canonical, "--json", &comment])?;
+        existing.push(comment);
+    }
+    Ok(())
+}
+
 fn record_vote(
     bd: &Path,
     project: &Path,
@@ -1765,7 +1932,17 @@ struct IssueSnapshot {
 fn load_snapshot(bd: &Path, project: &Path, id: &str) -> io::Result<Option<IssueSnapshot>> {
     let shown = json_ok(bd, project, &["show", id, "--json"])?;
     let issue = issue_object(&shown, id)?;
-    let feedback = parse_description(issue_description(issue)).ok();
+    let mut feedback = parse_description(issue_description(issue)).ok();
+    // The bounded description does not repeat the parent; the board stores it
+    // as the issue's structural parent, which is the authoritative provenance.
+    if let Some(feedback) = feedback.as_mut()
+        && let Some(parent) = issue
+            .get("parent")
+            .and_then(Value::as_str)
+            .filter(|parent| !parent.is_empty())
+    {
+        feedback.parent_id = parent.to_owned();
+    }
     Ok(Some(IssueSnapshot {
         status: issue_status(issue),
         labels: issue_labels(issue),
@@ -1885,6 +2062,40 @@ fn parse_vote_comment(comment: &str) -> Option<VoteRecord> {
         kind: kind?,
         counted: counted?,
         reason: reason?,
+    })
+}
+
+fn parse_derived_comment(comment: &str) -> Option<DerivedRecord> {
+    let rest = comment.strip_prefix(DERIVED_PREFIX)?.trim_start();
+    let (head, analysis) = rest.split_once(" analysis=")?;
+    let mut source = None;
+    let mut source_reporter = None;
+    let mut source_kind = None;
+    let mut reporter = None;
+    let mut episode = None;
+    let mut parent_id = None;
+    for part in head.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "source" => source = Some(value.to_owned()),
+            "source_reporter" => source_reporter = Some(value.to_owned()),
+            "source_kind" => source_kind = ReporterKind::parse(value).ok(),
+            "reporter" => reporter = Some(value.to_owned()),
+            "episode" => episode = Some(value.to_owned()),
+            "parent" => parent_id = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    Some(DerivedRecord {
+        source: source?,
+        source_reporter: source_reporter?,
+        source_kind: source_kind?,
+        reporter: reporter?,
+        episode: episode?,
+        parent_id: parent_id?,
+        analysis: analysis.to_owned(),
     })
 }
 
@@ -2230,6 +2441,23 @@ mod tests {
     }
 
     #[test]
+    fn derived_comment_round_trip_retains_source_and_never_counts_as_a_vote() {
+        let record = DerivedRecord {
+            source: "bdct-1.1.2".to_owned(),
+            source_reporter: "exec-b".to_owned(),
+            source_kind: ReporterKind::Executor,
+            reporter: "observer-a".to_owned(),
+            episode: "e2".to_owned(),
+            parent_id: "bdct-1.1".to_owned(),
+            analysis: "the wait follows the tool result".to_owned(),
+        };
+        let ledger = parse_ledger(&[format_derived_comment(&record)]);
+        assert_eq!(ledger.derived, vec![record]);
+        assert_eq!(ledger.votes.len(), 0);
+        assert_eq!(ledger.counted(), 0);
+    }
+
+    #[test]
     fn kit_batch_limit_matches_orchestration_knob() {
         let text = include_str!("../../../global/orchestration.toml");
         assert!(text.contains("feedback_batch_limit = 8"));
@@ -2241,6 +2469,8 @@ mod tests {
         let board = include_str!("../../../.agents/skills/board-workflow/SKILL.md");
         let lead = include_str!("../../../.agents/skills/team-lead/SKILL.md");
         assert!(board.contains("codex-harness feedback record"));
+        assert!(board.contains("--source-feedback"));
+        assert!(board.contains("feedback-derived v1"));
         assert!(board.contains("Do not use `bd find-duplicates`"));
         assert!(board.contains("codex-harness feedback triage"));
         assert!(board.contains("codex-harness feedback promote"));
@@ -3508,6 +3738,16 @@ mod tests {
             ReporterKind::Lead,
             &parent,
         );
+        let derived = record_derived_feedback(
+            &bd,
+            &project,
+            &second,
+            "observer-private",
+            "private analysis of the dispatch naming mismatch",
+        )
+        .unwrap();
+        assert!(derived.written);
+        assert_eq!(derived.target_id, second);
         apply_routed_triage(
             &bd,
             &project,
@@ -3531,6 +3771,12 @@ mod tests {
             DEFAULT_FEEDBACK_BATCH_LIMIT,
         )
         .unwrap();
+        // The merge carries the derived analysis to the canonical private
+        // item; promotion must not carry it into the kit board.
+        let private_ledger = inspect_ledger(&bd, &project, &first).unwrap();
+        assert_eq!(private_ledger.derived.len(), 1);
+        assert_eq!(private_ledger.derived[0].source, second);
+        assert_eq!(private_ledger.counted(), 3);
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let threshold = crate::orchestration_config::load(&root)
@@ -3578,9 +3824,23 @@ mod tests {
             description.contains("board-workflow skill: document promotion and hygiene labels")
         );
         assert!(description.contains("scope: kit skill: board-workflow"));
-        for private in [observation, "exec-k", "e7", &parent] {
+        for private in [
+            observation,
+            "exec-k",
+            "e7",
+            &parent,
+            "private analysis of the dispatch naming mismatch",
+            "observer-private",
+            second.as_str(),
+        ] {
             assert!(!description.contains(private), "kit item leaked {private}");
         }
+        let kit_comments = list_comments(&bd, &kit_project, &kit_id).unwrap();
+        assert!(
+            !kit_comments
+                .iter()
+                .any(|comment| comment.starts_with("feedback-derived v1"))
+        );
         assert!(
             issue_labels(kit_item)
                 .iter()

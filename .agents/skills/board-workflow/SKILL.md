@@ -53,6 +53,25 @@ codex-harness feedback record --project <project> --parent <feature> --observati
 Do not paste transcripts. `--kind diagnostic` records the observation but must
 not count as a vote.
 
+An improvement observer's restatement is derived analysis, not another report
+or vote. Link it to the existing feedback item whose episode it analyzes:
+
+```powershell
+codex-harness feedback record --project <project> --source-feedback <item> --observation "bounded analysis" --reporter observer-a --kind derived-evidence
+```
+
+`--source-feedback` is required for derived intake and is only valid with
+`--kind derived-evidence`. Omit `--episode`, `--scope` and `--parent`: the
+source board record owns them. The command validates the source before writing,
+then records a `feedback-derived v1` comment on that item (or its canonical
+item after a merge). It creates no feedback card and no vote. Identical replay
+returns `record=already-recorded`. A missing, non-feedback or already-derived
+source is refused before any board write. `feedback ledger` reports
+`derived=<n>` with each retained source and observer; merge triage copies
+derived comments to the canonical item once, so retries and partial failures
+preserve attribution without counting another episode. Derived analysis stays
+private consuming-project provenance and is not kit-ready wording.
+
 ## Batch triage
 
 The lead selects similarity and kind at a safe boundary. Inspect

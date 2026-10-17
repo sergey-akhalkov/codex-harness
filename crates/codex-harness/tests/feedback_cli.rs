@@ -200,6 +200,46 @@ impl Board {
         id
     }
 
+    fn record_derived(&self, source: &str, reporter: &str, analysis: &str) -> std::process::Output {
+        self.feedback(&[
+            "record",
+            "--source-feedback",
+            source,
+            "--observation",
+            analysis,
+            "--reporter",
+            reporter,
+            "--kind",
+            "derived-evidence",
+        ])
+    }
+
+    /// Creates an old-style derived card directly on the board so source
+    /// validation can prove it refuses a derived-of-derived link.
+    fn legacy_derived(&self, reporter: &str, episode: &str) -> String {
+        let description = format!(
+            "observation: legacy derived analysis\nscope: synthetic\nreporter: {reporter}\nepisode: {episode}\nkind: derived-evidence\n"
+        );
+        let created = bd_json(
+            &self.bd,
+            &self.project,
+            &[
+                "create",
+                "Feedback: legacy derived analysis",
+                "--type",
+                "task",
+                "--labels",
+                "feedback",
+                "--parent",
+                &self.feature,
+                "--description",
+                &description,
+                "--json",
+            ],
+        );
+        created["id"].as_str().unwrap().to_owned()
+    }
+
     fn decisions(&self, name: &str, entries: &[(&str, &str, Option<&str>)]) -> PathBuf {
         let path = self.root.join(name);
         let decisions: Vec<Value> = entries
@@ -266,6 +306,50 @@ impl Board {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn feedback_ids(&self) -> Vec<String> {
+        let listed = bd_json(
+            &self.bd,
+            &self.project,
+            &[
+                "list", "--label", "feedback", "--status", "open", "--json", "--brief",
+            ],
+        );
+        listed
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn derived_comments(&self, id: &str) -> Vec<String> {
+        self.comment_texts(id)
+            .into_iter()
+            .filter(|text| text.starts_with("feedback-derived v1"))
+            .collect()
+    }
+
+    /// A board task outside the bounded feedback shape, so derived intake can
+    /// prove it refuses an unrelated source before any write.
+    fn plain_task(&self, title: &str) -> String {
+        let created = bd_json(
+            &self.bd,
+            &self.project,
+            &[
+                "create",
+                title,
+                "--type",
+                "task",
+                "--parent",
+                &self.feature,
+                "--json",
+            ],
+        );
+        created["id"].as_str().unwrap().to_owned()
     }
 
     fn drop(self) {
@@ -516,72 +600,315 @@ fn bounded_triage_counts_once_and_excludes_diagnostics() {
 }
 
 #[test]
-fn derived_evidence_preserves_the_source_episode_without_manufacturing_votes() {
-    let board = Board::new("derived-evidence");
-    // Analysis may arrive before its source report is triaged. It must not
-    // become a vote just because the source is not in the ledger yet.
-    let derived = board.record(
-        "analysis of an observed dispatch wait",
-        "observer-a",
-        "source-e1",
-        "derived-evidence",
-    );
-    let initial = board.decisions("derived-first.json", &[(&derived, "process", None)]);
-    let out = board.feedback(&["triage", "--decisions", initial.to_str().unwrap()]);
+fn derived_intake_links_the_source_without_a_vote_or_another_card() {
+    let board = Board::new("derived-link");
+    let source = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
+    let cards = board.feedback_ids();
+
+    // The analysis arrives before triage and must not become its own card or
+    // vote. Source identity comes from the board record, not the CLI.
+    let out = board.record_derived(&source, "observer-a", "the wait follows each tool result");
     let text = output_text(&out);
     assert!(out.status.success(), "{text}");
-    assert!(text.contains("vote=derived-evidence"), "{text}");
-    let ledger = board.feedback(&["ledger", "--item", &derived]);
-    let text = output_text(&ledger);
-    assert!(ledger.status.success(), "{text}");
-    assert!(text.contains("votes=1 counted=0"), "{text}");
-
-    let original = board.record(
-        "the observed dispatch wait",
-        "exec-a",
-        "source-e1",
-        "executor",
-    );
-    let second_analysis = board.record(
-        "another analysis of the same source episode",
-        "observer-b",
-        "source-e1",
-        "derived-evidence",
-    );
-    let batch = board.decisions(
-        "original-and-analysis.json",
-        &[
-            (&original, "process", Some(&derived)),
-            (&second_analysis, "process", Some(&derived)),
-        ],
-    );
-    // Both initial application and retry retain exactly the original vote.
-    for _ in 0..2 {
-        let out = board.feedback(&["triage", "--decisions", batch.to_str().unwrap()]);
-        let text = output_text(&out);
-        assert!(out.status.success(), "{text}");
-        assert!(text.contains("vote=derived-evidence"), "{text}");
-        let ledger = board.feedback(&["ledger", "--item", &derived]);
-        let text = output_text(&ledger);
-        assert!(ledger.status.success(), "{text}");
-        assert!(text.contains("counted=1 merges=2"), "{text}");
-        assert!(text.contains("episode=source-e1"), "{text}");
-        assert!(text.contains("reporter=observer-a"), "{text}");
-        assert!(text.contains("reporter=observer-b"), "{text}");
-        assert!(
-            text.contains("counted=false reason=derived-evidence"),
-            "{text}"
-        );
-    }
-    let candidates = board.feedback(&["candidates"]);
-    let text = output_text(&candidates);
-    assert!(candidates.status.success(), "{text}");
     assert!(
-        text.contains("promotion candidates: 0 at threshold=2"),
+        text.contains(&format!("derived feedback source={source} target={source}")),
         "{text}"
     );
-    let promotion = board.feedback(&["promote", "--item", &derived]);
-    assert!(!promotion.status.success(), "{}", output_text(&promotion));
+    assert!(text.contains("source_reporter=exec-a"), "{text}");
+    assert!(text.contains("source_kind=executor"), "{text}");
+    assert!(text.contains("episode=e1"), "{text}");
+    assert!(
+        text.contains(&format!("parent={}", board.feature)),
+        "{text}"
+    );
+    assert!(text.contains("record=written votes=0"), "{text}");
+    assert_eq!(board.feedback_ids(), cards, "derived intake created a card");
+
+    // Identical replay is harmless and reports the recorded outcome.
+    let out = board.record_derived(&source, "observer-a", "the wait follows each tool result");
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("record=already-recorded votes=0"), "{text}");
+    assert_eq!(board.derived_comments(&source).len(), 1, "{text}");
+
+    // Triage counts the source once. A second observer restating the same
+    // episode retains analysis without adding a vote.
+    let batch = board.decisions("source.json", &[(&source, "process", None)]);
+    let out = board.feedback(&["triage", "--decisions", batch.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+    let out = board.record_derived(
+        &source,
+        "observer-b",
+        "another restatement of the same episode",
+    );
+    assert!(out.status.success(), "{}", output_text(&out));
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &source]));
+    assert!(ledger.contains("votes=1 counted=1"), "{ledger}");
+    assert!(ledger.contains("derived=2"), "{ledger}");
+    assert!(ledger.contains("reporter=observer-a"), "{ledger}");
+    assert!(ledger.contains("reporter=observer-b"), "{ledger}");
+
+    // A genuinely independent episode still accumulates its own vote.
+    let independent = board.record("dispatch waits after tools too", "exec-b", "e2", "executor");
+    let batch = board.decisions(
+        "independent.json",
+        &[(&independent, "process", Some(&source))],
+    );
+    let out = board.feedback(&["triage", "--decisions", batch.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &source]));
+    assert!(ledger.contains("votes=2 counted=2"), "{ledger}");
+
+    // Replaying the analysis after triage still changes neither count.
+    let out = board.record_derived(&source, "observer-a", "the wait follows each tool result");
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("record=already-recorded"), "{text}");
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &source]));
+    assert!(ledger.contains("votes=2 counted=2"), "{ledger}");
+    assert!(ledger.contains("derived=2"), "{ledger}");
+    board.drop();
+}
+
+#[test]
+fn derived_intake_refuses_invalid_sources_before_any_board_write() {
+    let board = Board::new("derived-refusal");
+    let source = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
+    let unrelated = board.plain_task("Feedback-like task outside the bounded shape");
+    let legacy = board.legacy_derived("observer-old", "e9");
+    let cards = board.feedback_ids();
+    let source_state = board.board_state(&source);
+
+    // Missing source.
+    let out = board.record_derived("bdct-absent.9", "observer-a", "analysis of nothing");
+    assert!(!out.status.success(), "{}", output_text(&out));
+
+    // Existing but unrelated board item.
+    let out = board.record_derived(&unrelated, "observer-a", "analysis of a plain task");
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("not a bounded feedback record"), "{text}");
+
+    // A legacy derived card cannot be restated into a second derived record.
+    let out = board.record_derived(&legacy, "observer-b", "analysis of an analysis");
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("itself derived evidence"), "{text}");
+
+    // Caller-supplied source identity is rejected instead of trusted.
+    let out = board.feedback(&[
+        "record",
+        "--source-feedback",
+        &source,
+        "--observation",
+        "analysis",
+        "--reporter",
+        "observer-a",
+        "--episode",
+        "spoofed",
+        "--kind",
+        "derived-evidence",
+    ]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("omit --episode, --scope and --parent"),
+        "{text}"
+    );
+
+    // `--source-feedback` is not an alternate identity for ordinary intake.
+    let out = board.feedback(&[
+        "record",
+        "--source-feedback",
+        &source,
+        "--observation",
+        "analysis",
+        "--scope",
+        "synthetic",
+        "--reporter",
+        "observer-a",
+        "--episode",
+        "e1",
+        "--kind",
+        "executor",
+        "--parent",
+        &board.feature,
+    ]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("--source-feedback is only valid with --kind derived-evidence"),
+        "{text}"
+    );
+
+    // Derived intake without its source refused before any board effect.
+    let out = board.feedback(&[
+        "record",
+        "--observation",
+        "analysis",
+        "--reporter",
+        "observer-a",
+        "--kind",
+        "derived-evidence",
+    ]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("--source-feedback is required"), "{text}");
+
+    assert_eq!(
+        board.feedback_ids(),
+        cards,
+        "a refused intake created a card"
+    );
+    assert_eq!(board.board_state(&source), source_state);
+    assert!(board.derived_comments(&unrelated).is_empty());
+    assert!(board.derived_comments(&legacy).is_empty());
+    board.drop();
+}
+
+#[test]
+fn derived_provenance_survives_merge_and_partial_retry() {
+    let board = Board::new("derived-merge");
+    let canonical = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
+    let incoming = board.record("the wait repeats under load", "exec-b", "e2", "executor");
+    let out = board.record_derived(
+        &incoming,
+        "observer-a",
+        "analysis of the load-dependent wait",
+    );
+    assert!(out.status.success(), "{}", output_text(&out));
+    let batch = board.decisions("canonical.json", &[(&canonical, "process", None)]);
+    let out = board.feedback(&["triage", "--decisions", batch.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+
+    // Partial batch: the merge applies and copies the derived comment before
+    // the missing action fails.
+    let partial = board.decisions(
+        "partial.json",
+        &[
+            (&incoming, "process", Some(&canonical)),
+            ("bdct-absent.9", "process", None),
+        ],
+    );
+    let out = board.feedback(&["triage", "--decisions", partial.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "applied feedback {incoming} route=incubator target={canonical} vote=counted"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("failed: feedback bdct-absent.9 kind=process"),
+        "{text}"
+    );
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &canonical]));
+    assert!(
+        ledger.contains("votes=2 counted=2 merges=1 routes=2"),
+        "{ledger}"
+    );
+    assert!(ledger.contains("derived=1"), "{ledger}");
+    assert!(
+        ledger.contains(&format!(
+            "derived source={incoming} source_reporter=exec-b source_kind=executor reporter=observer-a episode=e2"
+        )),
+        "{ledger}"
+    );
+    assert_eq!(board.derived_comments(&canonical).len(), 1, "{ledger}");
+
+    // Retry converges: no second merge, derived copy or counted episode.
+    let out = board.feedback(&["triage", "--decisions", partial.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("vote=repeat"), "{text}");
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &canonical]));
+    assert!(
+        ledger.contains("votes=3 counted=2 merges=1 routes=2"),
+        "{ledger}"
+    );
+    assert!(ledger.contains("derived=1"), "{ledger}");
+    assert_eq!(board.derived_comments(&canonical).len(), 1, "{ledger}");
+
+    // Analysis of the already-merged source attaches to the canonical item
+    // while retaining the original source identity.
+    let out = board.record_derived(
+        &incoming,
+        "observer-b",
+        "a later analysis of the same episode",
+    );
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("source={incoming} target={canonical}")),
+        "{text}"
+    );
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &canonical]));
+    assert!(ledger.contains("votes=3 counted=2"), "{ledger}");
+    assert!(ledger.contains("derived=2"), "{ledger}");
+    board.drop();
+}
+
+#[test]
+fn derived_copy_recovers_an_interrupted_merge_without_duplicates() {
+    let board = Board::new("derived-interrupted");
+    let canonical = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
+    let incoming = board.record("the same wait under load", "exec-b", "e2", "executor");
+    let out = board.record_derived(
+        &incoming,
+        "observer-a",
+        "analysis retained before the merge",
+    );
+    assert!(out.status.success(), "{}", output_text(&out));
+    let batch = board.decisions("canonical.json", &[(&canonical, "process", None)]);
+    let out = board.feedback(&["triage", "--decisions", batch.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+
+    // Simulate a run interrupted after `bd duplicate` and its merge comment
+    // but before derived evidence was copied.
+    let _ = bd_json(
+        &board.bd,
+        &board.project,
+        &["duplicate", &incoming, "--of", &canonical, "--json"],
+    );
+    let _ = bd_json(
+        &board.bd,
+        &board.project,
+        &[
+            "comment",
+            &canonical,
+            "--json",
+            &format!("feedback-merge v1 from={incoming} into={canonical}"),
+        ],
+    );
+    assert!(board.derived_comments(&canonical).is_empty());
+
+    // Retrying the same action recognizes the recorded merge and applies only
+    // the missing derived comment plus the one distinct vote.
+    let merge = board.decisions("merge.json", &[(&incoming, "process", Some(&canonical))]);
+    let out = board.feedback(&["triage", "--decisions", merge.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &canonical]));
+    assert!(
+        ledger.contains("votes=2 counted=2 merges=1 routes=2"),
+        "{ledger}"
+    );
+    assert!(ledger.contains("derived=1"), "{ledger}");
+    assert_eq!(board.derived_comments(&canonical).len(), 1, "{ledger}");
+
+    // A second retry adds nothing.
+    let out = board.feedback(&["triage", "--decisions", merge.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert!(
+        output_text(&out).contains("vote=repeat"),
+        "{}",
+        output_text(&out)
+    );
+    assert_eq!(board.derived_comments(&canonical).len(), 1);
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &canonical]));
+    assert!(ledger.contains("votes=3 counted=2"), "{ledger}");
+    assert!(ledger.contains("derived=1"), "{ledger}");
     board.drop();
 }
 
