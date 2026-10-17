@@ -243,6 +243,8 @@ multi_agent = true
 multi_agent_v2 = false
 [analytics]
 enabled = false
+[tui]
+screen_reader_detection_done = true
 [projects.{trusted}]
 trust_level = "trusted"
 "#,
@@ -506,24 +508,52 @@ fn wait_for_active_continuation(root: &Path, thread: &str, turn: &str) -> Value 
     }
 }
 
+/// Reads every native turn of one thread through the paginated RPC the
+/// installed app-server actually implements. `thread/read includeTurns`
+/// reaches its unimplemented `list_turns` path (-32601, "list_turns is not
+/// supported yet"), so completion and source-prefix checks must not depend on
+/// it.
+fn thread_turns(owner: &mut Client, thread: &str) -> Vec<Value> {
+    let mut turns = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..64 {
+        let mut params = json!({
+            "threadId": thread,
+            "itemsView": "full",
+            "sortDirection": "asc",
+            "limit": 100,
+        });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = owner.request("thread/turns/list", params);
+        turns.extend(page["data"].as_array().cloned().unwrap_or_default());
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            return turns;
+        }
+    }
+    panic!("thread/turns/list did not terminate for {thread}");
+}
+
 fn wait_for_turn_completion(owner: &mut Client, thread: &str, turn: &str) -> Value {
     let until = Instant::now() + WAIT;
     loop {
-        let state = owner.request(
-            "thread/read",
-            json!({"threadId": thread, "includeTurns": true}),
-        );
-        let completed = state["thread"]["turns"].as_array().is_some_and(|turns| {
-            turns
-                .iter()
-                .any(|candidate| candidate["id"] == turn && candidate["status"] == "completed")
-        });
+        let state = owner.request("thread/read", json!({"threadId": thread}));
+        let turns = thread_turns(owner, thread);
+        let completed = turns
+            .iter()
+            .any(|candidate| candidate["id"] == turn && candidate["status"] == "completed");
+        let returned = json!({"thread": {
+            "status": state["thread"]["status"].clone(),
+            "turns": turns,
+        }});
         if completed && state["thread"]["status"]["type"] == "idle" {
-            return state;
+            return returned;
         }
         assert!(
             Instant::now() < until,
-            "the original active turn {turn} did not complete after its tool was released: {state}"
+            "the original active turn {turn} did not complete after its tool was released: {returned}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -673,7 +703,26 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
             }),
             "source must expose the actual MCP before suppression: {catalogue}"
         );
-        sources.push((thread, turn, completed["thread"]["turns"].clone()));
+        // A paused goal is ordinary live source state. The reflection fork must
+        // leave the source goal and its turns untouched, and its own goal
+        // exposure must stay suppressed so no automatic continuation starts.
+        let goal = owner.request(
+            "thread/goal/set",
+            json!({
+                "threadId":thread,
+                "objective":format!("preserve the accepted {label} source work"),
+                "status":"paused",
+            }),
+        )["goal"]
+            .clone();
+        assert_eq!(goal["status"], "paused", "{goal}");
+        let after_goal = thread_turns(&mut owner, &thread);
+        assert_eq!(
+            Value::Array(after_goal),
+            completed["thread"]["turns"],
+            "setting a paused goal started an automatic continuation"
+        );
+        sources.push((thread, turn, completed["thread"]["turns"].clone(), goal));
     }
     let endpoint_dir = record_native_lead(&fixture, &sources[1].0, "native-reflection-return");
     let state_dir = root.join("reflection-state");
@@ -741,8 +790,29 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
             read_json(&state_dir.join(format!("{label}-stage.json"))).expect("retained stage");
         assert_eq!(retained["result"], "NO FINDING", "{retained}");
         let fork = &retained["fork"];
+        let fork_id = fork["forkThread"].as_str().unwrap();
+        assert_ne!(fork_id, sources[index].0);
         assert_eq!(fork["sourcePreserved"], true, "{fork}");
+        let seeded = &sources[index].3;
+        for boundary in ["sourceGoalBefore", "sourceGoalAfter"] {
+            assert_eq!(fork[boundary]["threadId"], sources[index].0, "{fork}");
+            assert_eq!(fork[boundary]["objective"], seeded["objective"], "{fork}");
+            assert_eq!(fork[boundary]["status"], "paused", "{fork}");
+        }
+        assert_eq!(
+            fork["sourceGoalAfter"], fork["sourceGoalBefore"],
+            "the fork changed the live source goal: {fork}"
+        );
+        // The production fork sets `features.goals=false` in its own thread
+        // config. Native `thread/fork` therefore copies the source turns but
+        // exposes no goal on the fork at all, so the fork has no inherited goal
+        // whose continuation could start. A goals-enabled fork of the same
+        // source does inherit the paused goal, which is why the fork-local
+        // switch is the enforced boundary rather than `deferGoalContinuation`
+        // (that forward-compatible field is not in this upstream's schema).
+        assert_eq!(fork["forkGoalBeforeClear"], Value::Null, "{fork}");
         assert_eq!(fork["forkGoalAfterClear"], Value::Null, "{fork}");
+        assert_eq!(fork["goalCleared"], false, "{fork}");
         assert_eq!(fork["toolSurface"]["verified"], true, "{fork}");
         assert_eq!(
             fork["suppressedMcpServers"],
@@ -750,8 +820,6 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
             "{fork}"
         );
         assert_eq!(fork["sourceThread"], sources[index].0, "{fork}");
-        let fork_id = fork["forkThread"].as_str().unwrap();
-        assert_ne!(fork_id, sources[index].0);
         let requests: Vec<Value> = fs::read_dir(root)
             .unwrap()
             .flatten()
@@ -771,18 +839,43 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
                 !surface.1.contains("unrelated.probe") && !surface.1.contains("unrelated_probe"),
                 "{surface:?}"
             );
+            assert_eq!(
+                RequestIdentity::from_request(&body).unwrap().turn,
+                retained["turnId"].as_str().unwrap(),
+                "the reflection fork ran a turn other than its recorded stage turn: {body}"
+            );
         }
-        let original = owner.request(
-            "thread/read",
-            json!({
-                "threadId":sources[index].0, "includeTurns":true,
-            }),
-        );
-        let turns = original["thread"]["turns"].as_array().unwrap();
+        let fork_turns = thread_turns(&mut owner, fork_id);
+        let copied = sources[index].2.as_array().unwrap();
         assert_eq!(
-            &turns[..sources[index].2.as_array().unwrap().len()],
-            sources[index].2.as_array().unwrap()
+            fork_turns.len(),
+            copied.len() + 1,
+            "the reflection fork ran an automatic continuation: {fork_turns:?}"
         );
+        assert_eq!(
+            &fork_turns[..copied.len()],
+            copied,
+            "the fork did not preserve the exact source checkpoint: {fork_turns:?}"
+        );
+        assert_eq!(
+            fork_turns.last().unwrap()["id"],
+            retained["turnId"],
+            "{fork_turns:?}"
+        );
+        let turns = thread_turns(&mut owner, &sources[index].0);
+        let original = sources[index].2.as_array().unwrap();
+        assert_eq!(
+            &turns[..original.len()],
+            original,
+            "the source checkpoint prefix moved: {turns:?}"
+        );
+        if index == 0 {
+            assert_eq!(
+                turns.len(),
+                original.len(),
+                "the executor source gained an automatic goal continuation: {turns:?}"
+            );
+        }
         let catalogue = owner.request(
             "mcpServerStatus/list",
             json!({
@@ -799,7 +892,8 @@ fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead(
             "source MCP must survive the fork: {catalogue}"
         );
     }
-    let delivery: Value = read_json(&state_dir.join("delivery.json")).expect("retained delivery");
+    let delivery: Value =
+        read_json(&state_dir.join("lead-delivery.json")).expect("retained delivery");
     assert_eq!(delivery["state"], "delivered", "{delivery}");
     assert!(
         fs::read_dir(root)
@@ -884,18 +978,13 @@ fn lead_message_steers_the_active_native_owning_thread_with(harness: &Path, arm:
             .collect::<Vec<_>>(),
         fs::read_to_string(root.join("server-stderr.txt")).unwrap_or_default()
     );
-    let active_state = owner.request(
-        "thread/read",
-        json!({"threadId": thread, "includeTurns": true}),
-    );
-    let active = active_state["thread"]["turns"]
-        .as_array()
-        .unwrap()
+    let active_turns = thread_turns(&mut owner, &thread);
+    let active = active_turns
         .iter()
         .rev()
         .find(|candidate| candidate["status"] == "inProgress")
         .and_then(|candidate| candidate["id"].as_str());
-    assert_eq!(active, Some(turn.as_str()), "{active_state}");
+    assert_eq!(active, Some(turn.as_str()), "{active_turns:?}");
 
     let generation = "generation-native-active-lead";
     record_native_lead(&fixture, &thread, generation);
@@ -3404,6 +3493,8 @@ skill_search = false
 skip_host_skill_discovery = true
 [analytics]
 enabled = false
+[tui]
+screen_reader_detection_done = true
 [projects.{trusted}]
 trust_level = "trusted"
 "#,

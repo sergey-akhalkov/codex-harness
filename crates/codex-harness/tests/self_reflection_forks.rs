@@ -478,7 +478,7 @@ fn request_sequence(workspace: &Workspace) -> Vec<(String, String, String)> {
                 entry["method"].as_str().unwrap_or_default().to_owned(),
                 entry["request"]["params"]["threadId"]
                     .as_str()
-                    .unwrap_or_default()
+                    .unwrap_or("<process>")
                     .to_owned(),
             )
         })
@@ -710,8 +710,8 @@ fn native_reflection_forks_preserve_sources_retain_results_and_charge_only_new_t
         assert_eq!(reads.len(), 3, "{method}: {reads:?}");
         assert_eq!(
             request_param(&reads[0], "threadId"),
-            EXECUTOR_SOURCE,
-            "{method}"
+            Value::Null,
+            "the pre-fork read uses the fresh process catalogue: {method}"
         );
         assert_eq!(
             request_param(&reads[1], "threadId"),
@@ -720,8 +720,8 @@ fn native_reflection_forks_preserve_sources_retain_results_and_charge_only_new_t
         );
         assert_eq!(
             request_param(&reads[2], "threadId"),
-            EXECUTOR_SOURCE,
-            "{method}"
+            Value::Null,
+            "the post-fork source read uses the fresh process catalogue: {method}"
         );
     }
     let sequence = request_sequence(&workspace);
@@ -736,7 +736,7 @@ fn native_reflection_forks_preserve_sources_retain_results_and_charge_only_new_t
     let source_catalogue = position(
         "executor-self-reflection",
         "mcpServerStatus/list",
-        EXECUTOR_SOURCE,
+        "<process>",
     );
     let fork_verification = position(
         "executor-self-reflection",

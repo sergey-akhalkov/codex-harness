@@ -497,14 +497,15 @@ impl ReflectionState {
     /// fork receives the same server record only while its config leaves it
     /// enabled; the default fork record is a disabled server with empty
     /// inventories.
-    fn mcp_catalogue(&self, thread: &str) -> Answer {
+    fn mcp_catalogue(&self, thread: Option<&str>) -> Answer {
         let (source, _) = self.source();
-        if thread != source && thread != self.fork_thread {
+        if thread.is_some_and(|thread| thread != source && thread != self.fork_thread) {
             return Answer::Error(json!({
-                "message": format!("synthetic reflection has no MCP owner {thread}")
+                "message": format!("synthetic reflection has no MCP owner {}", thread.unwrap_or_default())
             }));
         }
-        if thread == self.fork_thread && self.outcome == "mcp-catalogue-unavailable" {
+        if thread == Some(self.fork_thread.as_str()) && self.outcome == "mcp-catalogue-unavailable"
+        {
             return Answer::Error(json!({
                 "message": "the synthetic fork MCP catalogue is unavailable"
             }));
@@ -519,9 +520,10 @@ impl ReflectionState {
         };
         let mut servers = Vec::with_capacity(names.len());
         for name in names {
-            let exposed = thread == source
+            let exposed = thread.is_none()
+                || thread == Some(source)
                 || self.outcome == "mcp-exposed"
-                || (thread == self.fork_thread && !self.fork_mcp_disabled(name));
+                || (thread == Some(self.fork_thread.as_str()) && !self.fork_mcp_disabled(name));
             let mut server = json!({
                 "name": name,
                 "authStatus": "unsupported",
@@ -546,16 +548,17 @@ impl ReflectionState {
 
     /// The source Apps catalogue always advertises one enabled App. The fork
     /// sees it disabled only when its config names the per-App override.
-    fn app_catalogue(&self, thread: &str) -> Answer {
+    fn app_catalogue(&self, thread: Option<&str>) -> Answer {
         let (source, _) = self.source();
-        if thread != source && thread != self.fork_thread {
+        if thread.is_some_and(|thread| thread != source && thread != self.fork_thread) {
             return Answer::Error(json!({
-                "message": format!("synthetic reflection has no Apps owner {thread}")
+                "message": format!("synthetic reflection has no Apps owner {}", thread.unwrap_or_default())
             }));
         }
-        let exposed = thread == source
+        let exposed = thread.is_none()
+            || thread == Some(source)
             || self.outcome == "app-exposed"
-            || (thread == self.fork_thread && !self.fork_app_disabled());
+            || (thread == Some(self.fork_thread.as_str()) && !self.fork_app_disabled());
         Answer::Result(json!({
             "data": [{
                 "id": INHERITED_APP,
@@ -809,12 +812,12 @@ fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: 
             Answer::Result(route)
         }
         "mcpServerStatus/list" => {
-            let thread = params["threadId"].as_str().unwrap_or_default().to_owned();
-            state.mcp_catalogue(&thread)
+            let thread = params["threadId"].as_str().map(str::to_owned);
+            state.mcp_catalogue(thread.as_deref())
         }
         "app/list" => {
-            let thread = params["threadId"].as_str().unwrap_or_default().to_owned();
-            state.app_catalogue(&thread)
+            let thread = params["threadId"].as_str().map(str::to_owned);
+            state.app_catalogue(thread.as_deref())
         }
         "mcpServer/tool/call" => state.refuse_mutator_call(params),
         "thread/name/set" => {

@@ -694,7 +694,14 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         // The reflection child is a fresh process. Denying these channels at
         // process scope prevents a persisted source thread from activating a
         // plugin, app, hook, browser or computer tool before `thread/fork`.
-        for feature in REFLECTION_FEATURE_SWITCHES {
+        // `features.goals` is deliberately not disabled at process scope: the
+        // same app-server serves the controller's source/fork goal reads and
+        // the fork-local clear, and that stable feature also gates those RPCs.
+        // The fork's own config below keeps inherited goal tools off.
+        for feature in REFLECTION_FEATURE_SWITCHES
+            .iter()
+            .filter(|feature| **feature != "features.goals")
+        {
             args.push(OsString::from("-c"));
             args.push(OsString::from(format!("{feature}=false")));
         }
@@ -1377,8 +1384,8 @@ impl Conversation {
             completed_checkpoint(&source_before, source_last_turn)?;
         let checkpoint_prefix_before = checkpoint_prefix(&source_before, checkpoint_index_before)?;
         let source_goal_before = conversation.thread_goal(source_thread)?;
-        let source_mcp_before = mcp_catalogue(&mut conversation, source_thread)?;
-        let source_apps_before = app_catalogue(&mut conversation, source_thread)?;
+        let source_mcp_before = mcp_catalogue(&mut conversation, None)?;
+        let source_apps_before = app_catalogue(&mut conversation, None)?;
         let suppressed_mcp_servers = inherited_mcp_servers(&source_mcp_before)?;
         let suppressed_apps = enabled_app_ids(&source_apps_before)?;
         let forked = conversation.call(
@@ -1438,8 +1445,8 @@ impl Conversation {
         let checkpoint_prefix_after = checkpoint_prefix(&source_after, checkpoint_index_after)?;
         let source_turns_after = turn_ids(&source_after)?;
         let source_goal_after = conversation.thread_goal(source_thread)?;
-        let source_mcp_after = mcp_catalogue(&mut conversation, source_thread)?;
-        let source_apps_after = app_catalogue(&mut conversation, source_thread)?;
+        let source_mcp_after = mcp_catalogue(&mut conversation, None)?;
+        let source_apps_after = app_catalogue(&mut conversation, None)?;
         let source_preserved = checkpoint_index_after == checkpoint_index_before
             && checkpoint_after == checkpoint_before
             && checkpoint_prefix_after == checkpoint_prefix_before
@@ -2616,13 +2623,24 @@ fn checkpoint_prefix(thread: &Value, checkpoint_index: usize) -> io::Result<Vec<
         .ok_or_else(|| invalid("the selected source checkpoint moved outside the thread"))
 }
 
-/// Reads the complete MCP catalogue for one thread without invoking a tool.
-fn mcp_catalogue(conversation: &mut Conversation, thread_id: &str) -> io::Result<Vec<Value>> {
+/// Reads the complete MCP catalogue without invoking a tool. A loaded thread
+/// (`Some`) reuses that conversation's MCP connections; `None` reads the
+/// process catalogue, which is what a fresh reflection app-server inherits and
+/// what `thread/fork` carries into the read-only fork. A source thread owned by
+/// another live app-server cannot be resumed here ("already has an active
+/// writer"), and its rollout records no MCP configuration, so a thread-scoped
+/// read of an unloaded source would not describe the fork's inherited set.
+fn mcp_catalogue(
+    conversation: &mut Conversation,
+    thread_id: Option<&str>,
+) -> io::Result<Vec<Value>> {
     let mut cursor: Option<String> = None;
     let mut entries = Vec::new();
     for _ in 0..MAX_CATALOGUE_PAGES {
         let mut params = Map::new();
-        params.insert("threadId".into(), json!(thread_id));
+        if let Some(thread_id) = thread_id {
+            params.insert("threadId".into(), json!(thread_id));
+        }
         params.insert("detail".into(), json!("toolsAndAuthOnly"));
         params.insert("limit".into(), json!(100));
         if let Some(current) = &cursor {
@@ -2657,13 +2675,20 @@ fn mcp_catalogue(conversation: &mut Conversation, thread_id: &str) -> io::Result
     ))
 }
 
-/// Reads the complete Apps catalogue for one thread without opening an app.
-fn app_catalogue(conversation: &mut Conversation, thread_id: &str) -> io::Result<Vec<Value>> {
+/// Reads the complete Apps catalogue without opening an app. As with the MCP
+/// catalogue, `None` reads the process catalogue a fresh reflection app-server
+/// inherits; a loaded fork uses its own thread scope.
+fn app_catalogue(
+    conversation: &mut Conversation,
+    thread_id: Option<&str>,
+) -> io::Result<Vec<Value>> {
     let mut cursor: Option<String> = None;
     let mut entries = Vec::new();
     for _ in 0..MAX_CATALOGUE_PAGES {
         let mut params = Map::new();
-        params.insert("threadId".into(), json!(thread_id));
+        if let Some(thread_id) = thread_id {
+            params.insert("threadId".into(), json!(thread_id));
+        }
         params.insert("limit".into(), json!(100));
         if let Some(current) = &cursor {
             params.insert("cursor".into(), json!(current));
@@ -2781,7 +2806,7 @@ fn verify_reflection_tool_surface(
     fork_thread: &str,
     suppressed_apps: &[String],
 ) -> io::Result<Value> {
-    let mcp = mcp_catalogue(conversation, fork_thread)?;
+    let mcp = mcp_catalogue(conversation, Some(fork_thread))?;
     let mut mcp_summary = Vec::with_capacity(mcp.len());
     for server in mcp {
         let name = server["name"]
@@ -2827,7 +2852,7 @@ fn verify_reflection_tool_surface(
             "resourceTemplates": 0,
         }));
     }
-    let apps = app_catalogue(conversation, fork_thread)?;
+    let apps = app_catalogue(conversation, Some(fork_thread))?;
     let mut app_summary = Vec::with_capacity(apps.len());
     for app in apps {
         let id = app["id"]
@@ -2885,7 +2910,7 @@ fn verify_fork_environment(plan: &ControlPlan, forked: &Value) -> io::Result<()>
         .as_str()
         .ok_or_else(|| invalid("thread/fork answered without an effective cwd"))?;
     let expected = plan.slot.to_string_lossy();
-    if !cwd.eq_ignore_ascii_case(&expected) {
+    if !normalize_slot(cwd).eq_ignore_ascii_case(&normalize_slot(&expected)) {
         return Err(invalid(format!(
             "thread/fork ran at {cwd} instead of the declared slot {expected}; no turn was started"
         )));
