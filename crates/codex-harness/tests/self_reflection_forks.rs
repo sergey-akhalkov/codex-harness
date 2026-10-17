@@ -6,6 +6,8 @@
 //! are synthetic fixture responses. No model, subscription or installed CLI is
 //! used.
 
+#[path = "self_reflection_forks/accepted.rs"]
+mod accepted;
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
 
@@ -149,6 +151,7 @@ struct LeadState {
     accepted: bool,
     client_id: Option<String>,
     text: Option<String>,
+    source_turn: Option<String>,
 }
 
 struct Workspace {
@@ -280,8 +283,12 @@ fn configure_lead(server: &Server, mode: LeadMode, state: Arc<Mutex<LeadState>>)
             "initialize" => Answer::Result(json!({})),
             "thread/read" => {
                 let state = state.lock().unwrap();
-                let turns = if state.accepted && mode == LeadMode::Delivered {
-                    json!([{
+                let mut turns = Vec::new();
+                if let Some(turn) = &state.source_turn {
+                    turns.push(json!({"id": turn, "status": "completed", "items": []}));
+                }
+                if state.accepted && mode == LeadMode::Delivered {
+                    turns.push(json!({
                         "id": LEAD_TURN,
                         "status": "completed",
                         "items": [{
@@ -290,10 +297,8 @@ fn configure_lead(server: &Server, mode: LeadMode, state: Arc<Mutex<LeadState>>)
                             "clientId": state.client_id.clone(),
                             "content": [{"type": "text", "text": state.text.clone()}]
                         }]
-                    }])
-                } else {
-                    json!([])
-                };
+                    }));
+                }
                 Answer::Result(json!({
                     "thread": {"id": LEAD_THREAD, "status": {"type": "idle"}, "turns": turns}
                 }))
@@ -346,6 +351,26 @@ fn spawn_chain(
     executor_result: &str,
     lead_result: &str,
 ) -> ConsoleSession {
+    spawn_chain_in_board(
+        workspace,
+        request,
+        executor_outcome,
+        lead_outcome,
+        executor_result,
+        lead_result,
+        None,
+    )
+}
+
+fn spawn_chain_in_board(
+    workspace: &Workspace,
+    request: &Value,
+    executor_outcome: &str,
+    lead_outcome: &str,
+    executor_result: &str,
+    lead_result: &str,
+    board: Option<&Path>,
+) -> ConsoleSession {
     fs::write(
         &workspace.request,
         serde_json::to_vec_pretty(request).unwrap(),
@@ -357,6 +382,10 @@ fn spawn_chain(
         "--request".into(),
         workspace.request.as_os_str().to_owned(),
     ];
+    if let Some(board) = board {
+        spec.args
+            .extend(["--accepted-board".into(), board.as_os_str().to_owned()]);
+    }
     spec.env.insert(
         "CODEX_HOME".into(),
         Some(workspace.home.as_os_str().to_owned()),
@@ -379,7 +408,7 @@ fn spawn_chain(
     );
     spec.env.insert(
         "HARNESS_REFLECTION_FIXTURE_LEAD_SOURCE_THREAD".into(),
-        Some(LEAD_SOURCE.into()),
+        Some(request["leadSource"]["thread"].as_str().unwrap().into()),
     );
     spec.env.insert(
         "HARNESS_REFLECTION_FIXTURE_LEAD_SOURCE_TURN".into(),

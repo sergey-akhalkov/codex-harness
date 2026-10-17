@@ -43,6 +43,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod accepted;
 /// Set on every reflection app-server and frontend. `main` refuses every
 /// `codex-harness` command in a process tree carrying it, so a reflection fork
 /// cannot dispatch work, edit board state or start another conversation.
@@ -316,6 +317,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         ));
     }
     let mut request_path: Option<PathBuf> = None;
+    let mut board: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].to_string_lossy().as_ref() {
@@ -323,12 +325,16 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 print_help();
                 return Ok(0);
             }
-            "--request" => {
+            option @ ("--request" | "--accepted-board") => {
                 index += 1;
                 let value = args
                     .get(index)
-                    .ok_or_else(|| invalid("--request requires a file path"))?;
-                request_path = Some(PathBuf::from(value));
+                    .ok_or_else(|| invalid(format!("{option} requires a path")))?;
+                if option == "--request" {
+                    request_path = Some(PathBuf::from(value));
+                } else {
+                    board = Some(PathBuf::from(value));
+                }
             }
             other => {
                 return Err(invalid(format!(
@@ -343,12 +349,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "self-reflection requires --request PATH; run `codex-harness self-reflection --help`",
         )
     })?;
-    execute(&request_path)
+    execute(&request_path, board.as_deref())
 }
 
 fn print_help() {
     println!(
-        "codex-harness self-reflection --request PATH\n\
+        "codex-harness self-reflection --request PATH [--accepted-board DIRECTORY]\n\
          \n\
          Runs two bounded, read-only native forks over exact completed source turns:\n\
            executor self-reflection  -> retained result and new-turn usage\n\
@@ -361,15 +367,24 @@ fn print_help() {
          fork or turn request; a restart reuses completed stages and never repeats\n\
          a fork, turn or delivery whose outcome is unknown.\n\
          \n\
+         --accepted-board connects an already activated native board to this low-level\n\
+         runner. The request must match one retained eligible accepted closure. Stage\n\
+         outcomes, new-turn usage and observed delivery update that same ledger;\n\
+         missing usage blocks the next stage. This does not enable an automatic watcher.\n\
+         \n\
          Exit: 0 complete and delivered; 3 stages retained but lead delivery is\n\
          queued, indeterminate or failed and must be reconciled; nonzero error on\n\
          refusal, drift or an unreconciled stage."
     );
 }
 
-fn execute(path: &Path) -> io::Result<i32> {
+fn execute(path: &Path, board: Option<&Path>) -> io::Result<i32> {
     let request: Request = read_json(path, MAX_REQUEST_BYTES)?;
-    execute_request(request)
+    if let Some(board) = board {
+        accepted::execute(request, board)
+    } else {
+        execute_request(request)
+    }
 }
 
 /// One chain through the same native runner. The manual `self-reflection`
@@ -382,6 +397,15 @@ pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
     preflight_lead(&chain)?;
     let lead_state = run_lead(&chain, &executor_state)?;
     let delivery = deliver_synthesis(&chain, &executor_state, &lead_state)?;
+    print_result(&chain, &executor_state, &lead_state, &delivery)
+}
+
+fn print_result(
+    chain: &ChainState,
+    executor: &StageState,
+    lead: &StageState,
+    delivery: &DeliveryState,
+) -> io::Result<i32> {
     let delivered = delivery.state == "delivered";
     let result = json!({
         "schema": SCHEMA,
@@ -389,8 +413,8 @@ pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
         "run": chain.run,
         "acceptance": chain.acceptance,
         "complete": delivered,
-        "executor": stage_summary(&executor_state),
-        "lead": stage_summary(&lead_state),
+        "executor": stage_summary(executor),
+        "lead": stage_summary(lead),
         "delivery": delivery,
     });
     println!("{}", serde_json::to_string_pretty(&result)?);

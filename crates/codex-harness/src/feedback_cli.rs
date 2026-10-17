@@ -246,7 +246,7 @@ fn board_cli_unavailable(detail: &str) -> io::Error {
     harness_core::board_cli::unavailable(detail)
 }
 
-fn discover_bd() -> io::Result<PathBuf> {
+pub(crate) fn discover_bd() -> io::Result<PathBuf> {
     if let Some(home) = std::env::var_os("CODEX_HOME") {
         let candidate = PathBuf::from(home).join("harness/bin").join(bd_name());
         if candidate.is_file() {
