@@ -578,9 +578,7 @@ pub fn close_accepted(
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "the accepted close of task {task} did not retain its acceptance metadata"
-            ),
+            format!("the accepted close of task {task} did not retain its acceptance metadata"),
         ));
     }
     Ok(AcceptanceClose {

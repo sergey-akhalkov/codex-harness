@@ -304,19 +304,10 @@ mod tests {
             "{error}"
         );
 
-        let next = seed_assignment(
-            "a2",
-            "ds",
-            "t2",
-            Path::new("wt"),
-            rec.purpose.as_deref(),
-        );
+        let next = seed_assignment("a2", "ds", "t2", Path::new("wt"), rec.purpose.as_deref());
         assert_eq!(next.purpose.as_deref(), Some("improvement"));
         rec.assignments.push(next);
         let error = validate_purpose(&rec).unwrap_err();
-        assert!(
-            error.to_string().contains("contradicts task"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("contradicts task"), "{error}");
     }
 }

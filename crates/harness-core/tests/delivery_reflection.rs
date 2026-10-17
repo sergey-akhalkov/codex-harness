@@ -1030,10 +1030,7 @@ fn acceptance_binds_exact_native_turns_and_identity_ignores_a_later_lead_turn() 
     let start = controller
         .begin_stage(&acceptance_id, Stage::Executor)
         .unwrap();
-    assert_eq!(
-        start.executor_session.as_deref(),
-        Some("executor-fixture")
-    );
+    assert_eq!(start.executor_session.as_deref(), Some("executor-fixture"));
     assert_eq!(start.executor_turn.as_deref(), Some("executor-turn-1"));
     assert_eq!(start.lead_turn.as_deref(), Some("lead-turn-1"));
 
