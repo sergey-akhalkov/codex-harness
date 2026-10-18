@@ -86,7 +86,7 @@ struct FixtureTurn {
     id: &'static str,
     message_id: &'static str,
     response_id: &'static str,
-    message: &'static str,
+    message: String,
     commits: bool,
 }
 
@@ -97,7 +97,7 @@ impl FixtureTurn {
             id: TURN,
             message_id: "message-1",
             response_id: "response-1",
-            message: FINAL_MESSAGE,
+            message: FINAL_MESSAGE.to_owned(),
             commits: true,
         }
     }
@@ -122,13 +122,15 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
             "HARNESS_IMPROVEMENT_FIXTURE_ROLE is required with the measured-workflow scenario",
         )
     })?;
-    let turn = match role.as_str() {
+    let mut turn = match role.as_str() {
         "lead-frame" => FixtureTurn {
             role: Some("lead-frame"),
             id: "fixture-turn-lead-frame",
             message_id: "message-lead-frame",
             response_id: "response-lead-frame",
-            message: "lead-frame: framed the measured task and participants; no executor work committed",
+            message:
+                "lead-frame: framed the measured task and participants; no executor work committed"
+                    .to_owned(),
             commits: false,
         },
         "executor" => FixtureTurn {
@@ -136,7 +138,7 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
             id: "fixture-turn-executor",
             message_id: "message-executor",
             response_id: "response-executor",
-            message: "executor: completed the measured task and committed its solution",
+            message: "executor: completed the measured task and committed its solution".to_owned(),
             commits: true,
         },
         "lead-review" => FixtureTurn {
@@ -144,7 +146,8 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
             id: "fixture-turn-lead-review",
             message_id: "message-lead-review",
             response_id: "response-lead-review",
-            message: "lead-review: reviewed the executor artifact; no executor work committed",
+            message: "lead-review: reviewed the executor artifact; no executor work committed"
+                .to_owned(),
             commits: false,
         },
         "correction" => FixtureTurn {
@@ -152,7 +155,7 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
             id: "fixture-turn-correction",
             message_id: "message-correction",
             response_id: "response-correction",
-            message: "correction: applied the bounded correction requested by the lead",
+            message: "correction: applied the bounded correction requested by the lead".to_owned(),
             commits: true,
         },
         "lead-acceptance" => FixtureTurn {
@@ -160,7 +163,8 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
             id: "fixture-turn-lead-acceptance",
             message_id: "message-lead-acceptance",
             response_id: "response-lead-acceptance",
-            message: "lead-acceptance: accepted the reviewed result; no executor work committed",
+            message: "lead-acceptance: accepted the reviewed result; no executor work committed"
+                .to_owned(),
             commits: false,
         },
         _ => {
@@ -172,6 +176,15 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
             ));
         }
     };
+    if let Ok(result) = env::var("HARNESS_IMPROVEMENT_FIXTURE_RESULT") {
+        if result.len() > 256 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "synthetic result exceeds its bound",
+            ));
+        }
+        turn.message = result;
+    }
     Ok(Some(turn))
 }
 

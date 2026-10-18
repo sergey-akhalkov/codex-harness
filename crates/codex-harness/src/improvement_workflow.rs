@@ -128,6 +128,9 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
     if run.cursor.phase == Phase::Stopped {
         return Ok(notes);
     }
+    if run.spec.baseline_qualification.is_some() {
+        return super::improvement_qualification::advance(run);
+    }
     if let Some(candidate) = run.cursor.candidate.clone() {
         if candidate.is_ready() {
             retain_candidate_ready(run, &candidate, &mut notes)?;

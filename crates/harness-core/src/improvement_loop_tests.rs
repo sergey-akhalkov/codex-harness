@@ -2373,3 +2373,123 @@ fn qualification_phases_do_not_require_the_comparison_owner() {
     assert!(Phase::BaselineAttempt.requires_comparison_owner());
     assert!(Phase::Acceptance.requires_comparison_owner());
 }
+
+#[test]
+fn baseline_qualification_requires_frozen_task_and_one_explicit_runtime_route() {
+    use crate::improvement_runtime::FileIdentity;
+    let root = fixture_root("qualification-inputs");
+    let mut spec = comparison_spec(root.path(), "qualification-inputs");
+    let comparison = spec.comparison.take().unwrap();
+    let local = spec.local_runner.take();
+    spec.qualification = None;
+    let prompt = root.path().join("task.txt");
+    fs::write(
+        &prompt,
+        "Implement the declared task and preserve its acceptance.",
+    )
+    .unwrap();
+    let config = root.path().join("native.toml");
+    fs::write(&config, "model='gpt-6-astra'\nmodel_reasoning_effort='xhigh'\n[profiles.ds]\nmodel='deepseek-flash'\nmodel_reasoning_effort='max'\n").unwrap();
+    let identity = |path: &Path| FileIdentity {
+        path: path.to_path_buf(),
+        sha256: crate::build_identity::hash_file(path).unwrap(),
+    };
+    spec.baseline_qualification = Some(BaselineQualificationInputs {
+        schema: BASELINE_QUALIFICATION_SCHEMA,
+        task: comparison.task,
+        task_prompt: identity(&prompt),
+        runtime: QualificationRuntimeInputs {
+            state: comparison.runtimes.state,
+            build: comparison.runtimes.baseline_build,
+            label: "accepted-control".to_owned(),
+            upstream: comparison.runtimes.upstream,
+            client: None,
+            native_config: Some(identity(&config)),
+            private_inputs: Vec::new(),
+        },
+        acceptance: comparison.acceptance,
+        workflow: workflow_fixture(1, 2),
+        report: root.path().join("result.txt"),
+    });
+    spec.validate().unwrap();
+    let frozen = spec
+        .baseline_qualification
+        .as_ref()
+        .unwrap()
+        .digest()
+        .unwrap();
+    let mut ambiguous = spec.clone();
+    ambiguous
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .client = Some(comparison.runtimes.client.clone());
+    assert!(ambiguous.validate().is_err());
+    let mut alternate = spec.clone();
+    alternate.local_runner = local.clone();
+    assert!(alternate.validate().is_err());
+    let mut missing = spec.clone();
+    missing
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .native_config = None;
+    assert!(missing.validate().is_err());
+    let mut changed = spec.clone();
+    changed
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .task_prompt
+        .sha256 = "0".repeat(64);
+    assert!(changed.validate().is_err());
+    let mut changed_route = spec.clone();
+    changed_route
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .native_config
+        .as_mut()
+        .unwrap()
+        .sha256 = "0".repeat(64);
+    assert!(changed_route.validate().is_err());
+    fs::write(&prompt, "").unwrap();
+    let mut empty = spec.clone();
+    empty.baseline_qualification.as_mut().unwrap().task_prompt = identity(&prompt);
+    assert!(empty.validate().is_err());
+    fs::write(
+        &prompt,
+        "Implement the declared task and preserve its acceptance.",
+    )
+    .unwrap();
+    assert_eq!(
+        spec.baseline_qualification
+            .as_ref()
+            .unwrap()
+            .digest()
+            .unwrap(),
+        frozen
+    );
+
+    let mut local_spec = spec.clone();
+    local_spec.local_runner = local;
+    local_spec.qualification = Some(root.path().join("qualification.json"));
+    let runtime = &mut local_spec.baseline_qualification.as_mut().unwrap().runtime;
+    runtime.native_config = None;
+    runtime.client = Some(comparison.runtimes.client);
+    local_spec.validate().unwrap();
+    local_spec
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .client
+        .as_mut()
+        .unwrap()
+        .runner
+        .model = "different".to_owned();
+    assert!(local_spec.validate().is_err());
+}

@@ -1092,6 +1092,21 @@ and drives the sequential measured pair (baseline before candidate, one
 measured conversation at a time); without them the run stops at
 `candidate-ready`.
 
+The in-development `baseline_qualification` input prepares one ordinary
+control workflow separately from the two-arm comparison. It freezes the task
+instructions as `task_prompt: {path, sha256}` and takes exactly one runtime
+route: the existing local `client`, or `native_config: {path, sha256}` with
+explicit lead and executor profiles. Native configuration is copied only into
+a fresh owned home before installation; explicitly named `private_inputs`
+use the runtime owner's existing validation and identity records. A changed
+task, configuration or participant binding refuses further dispatch.
+
+The currently checked increment opens a visible lead frame and retains its
+structured assignment through the native completion receipt. `resume`
+reconciles that exact generation and does not repeat the frame. Executor work,
+lead review and independent acceptance remain pending; this preparation is
+not a qualified comparison and does not activate self-reflection candidates.
+
 `select` activates an already prepared baseline or candidate runtime through
 the shared build-selection owner, records the identity it actually consumed
 and performs no model call, build or source edit. It refuses while a measured

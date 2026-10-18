@@ -210,6 +210,118 @@ fn one_real_control_backed_pair_settles_through_native_observation() {
     assert!(!generation.is_empty());
 }
 
+#[test]
+fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("qualification-native-frame");
+    let launcher = std::path::PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+    fixture_build(
+        &fixture.state,
+        "h-build",
+        &fixture.proj,
+        &launcher,
+        "baseline",
+    );
+    fixture.write_spec(&[], None);
+    let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    let previous = spec["comparison"].take();
+    let config = fixture
+        .spec
+        .with_file_name("qualification-native-config.toml");
+    fs::write(&config, "model = 'gpt-6-astra'\nmodel_provider = 'openai'\nmodel_reasoning_effort = 'xhigh'\n[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n").unwrap();
+    let prompt = fixture.spec.with_file_name("qualification-task.txt");
+    fs::write(&prompt, "Read the frozen add-workload OpenSpec task and frame its implementation inside solution.txt and sleep_ms. Preserve its independent acceptance.").unwrap();
+    spec["local_runner"] = Value::Null;
+    spec["qualification"] = Value::Null;
+    spec["baseline_qualification"] = json!({
+        "schema": 1,
+        "task": previous["task"],
+        "task_prompt": {"path": prompt, "sha256": build_identity::hash_file(&prompt).unwrap()},
+        "runtime": {
+            "state": fixture.state, "build": fixture.state.join("builds/h-build"),
+            "label": "accepted-native-runtime", "upstream": fixture.upstream,
+            "native_config": {"path": config, "sha256": build_identity::hash_file(&config).unwrap()},
+            "private_inputs": []
+        },
+        "acceptance": previous["acceptance"],
+        "workflow": {"schema":1,"lead_profile":"default","executor_profile":"ds","max_corrections":1,"capacity":2},
+        "report": fixture.spec.with_file_name("qualification-result.txt")
+    });
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let assignment = json!({
+        "schema":1, "objective":"Implement the frozen workload in the bound checkout.",
+        "inputs":[], "outputs":["solution.txt"], "invariants":["Preserve frozen acceptance."],
+        "acceptance":["The independent workload check must pass."], "consumer":"qualification controller", "escalate":[]
+    }).to_string();
+    let environment = [
+        CONTROL_CHILD_MODE,
+        ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
+        ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", "lead-frame"),
+        ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", assignment.as_str()),
+    ];
+    let started = fixture.improve_with_env(
+        &[
+            "start",
+            "--run",
+            fixture.run.to_str().unwrap(),
+            "--spec",
+            fixture.spec.to_str().unwrap(),
+            "--supervision",
+            "once",
+        ],
+        &environment,
+    );
+    assert!(started.status.success(), "{}", text(&started));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["phase"], "baseline-qualification", "{cursor}");
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1, "{cursor}");
+    let attempt = &cursor["attempts"][0];
+    assert_eq!(attempt["role"], "lead-frame");
+    assert_eq!(attempt["profile"], "default");
+    assert_eq!(attempt["model"], "gpt-6-astra");
+    assert_eq!(attempt["reasoning_effort"], "xhigh");
+    let receipt = std::path::PathBuf::from(attempt["receipt"].as_str().unwrap());
+    let terminal = wait_for_terminal_receipt(&receipt);
+    assert_eq!(terminal["observation"]["state"], "completed", "{terminal}");
+
+    let original = fs::read(&receipt).unwrap();
+    let mut foreign: Value = serde_json::from_slice(&original).unwrap();
+    foreign["originatingLead"]["runGeneration"] = json!("unrelated-generation");
+    fs::write(&receipt, serde_json::to_vec(&foreign).unwrap()).unwrap();
+    let refused = fixture.resume();
+    assert!(refused.status.success(), "{}", text(&refused));
+    assert!(fixture.cursor()["baseline_qualification"]["workflow"]["lead"].is_null());
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
+    fs::write(&receipt, original).unwrap();
+
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let cursor = fixture.cursor();
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(qualification["lead_binding"]["model"], "gpt-6-astra");
+    assert_eq!(qualification["executor_binding"]["model"], "deepseek-flash");
+    assert_eq!(qualification["executor_binding"]["reasoning_effort"], "max");
+    assert_eq!(qualification["workflow"]["lead"]["profile"], "default");
+    assert!(
+        qualification["workflow"]["lead"]["session"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(qualification["workflow"]["executor"], Value::Null);
+    assert!(qualification["accepted"].is_null());
+    let retained = std::path::PathBuf::from(
+        cursor["attempts"][0]["retained"]["result"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_to_string(retained).unwrap(), assignment);
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
+    let stopped = fixture.stop();
+    assert!(stopped.status.success(), "{}", text(&stopped));
+}
+
 /// An existing kit workload already carries its own executor declaration; the
 /// native dispatch must select that configured profile, bind the qualified
 /// local route under it and leave the frozen task tree unchanged.

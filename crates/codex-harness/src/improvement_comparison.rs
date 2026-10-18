@@ -2196,7 +2196,7 @@ fn attempt_ordinal(attempt_id: &str) -> u32 {
 /// declaration the visible dispatch owner reads from its source checkout. The
 /// declaration is host dispatch state, not task content, and is never
 /// committed.
-fn ensure_dispatch_checkout(source: &Path, binding: &ArmBinding) -> Result<(), String> {
+pub(super) fn ensure_dispatch_checkout(source: &Path, binding: &ArmBinding) -> Result<(), String> {
     if !source.exists() {
         git(
             &binding.workload.source,

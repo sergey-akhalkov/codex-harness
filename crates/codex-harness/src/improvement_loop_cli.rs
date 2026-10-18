@@ -22,6 +22,8 @@
 mod improvement_comparison;
 #[path = "improvement_driver.rs"]
 mod improvement_driver;
+#[path = "improvement_qualification.rs"]
+mod improvement_qualification;
 #[path = "improvement_workflow.rs"]
 mod improvement_workflow;
 

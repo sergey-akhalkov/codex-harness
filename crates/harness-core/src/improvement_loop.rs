@@ -677,23 +677,26 @@ impl ComparisonInputs {
     }
 }
 
-/// The one prepared runtime a baseline qualification runs its single measured
-/// workflow in. It is the same runtime owner the comparison arms consume, with
-/// exactly one build instead of a baseline/candidate pair: qualification
-/// observes the control workflow before any comparison margin exists.
+/// One immutable runtime prepared for an ordinary control workflow.
+/// Local comparisons retain their explicit route; native role workflows use
+/// a frozen base configuration and explicitly named private profile/auth files.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationRuntimeInputs {
-    /// The owned native build state publishing the immutable build.
     pub state: PathBuf,
-    /// The prepared build inside that state.
     pub build: PathBuf,
-    /// Bounded runtime label recorded in the retained accounting evidence.
     pub label: String,
-    /// The explicit original Codex client; never a PATH lookup or fallback.
     pub upstream: PathBuf,
-    /// The accepted client inputs (local route, overlay, catalogue).
-    pub client: ClientInputs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientInputs>,
+    /// Explicit native base configuration, frozen before preparation. It is
+    /// copied into a fresh owned home before the existing installer connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_config: Option<crate::improvement_runtime::FileIdentity>,
+    /// Explicit files such as a named executor profile and native auth. The
+    /// existing runtime owner validates destinations and retains their hashes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_inputs: Vec<crate::improvement_runtime::PrivateInput>,
 }
 
 impl QualificationRuntimeInputs {
@@ -711,11 +714,47 @@ impl QualificationRuntimeInputs {
                 self.upstream.display()
             )));
         }
-        let endpoint = self.client.runner.endpoint.trim();
-        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-            return Err(invalid(
-                "the declared qualification client endpoint must be an explicit http(s) URL",
-            ));
+        match (&self.client, &self.native_config) {
+            (Some(client), None) => {
+                let endpoint = client.runner.endpoint.trim();
+                if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                    return Err(invalid(
+                        "the declared qualification client endpoint must be an explicit http(s) URL",
+                    ));
+                }
+            }
+            (None, Some(config)) => {
+                if !config.path.is_absolute()
+                    || !config.path.is_file()
+                    || fs::metadata(&config.path)?.len() > MAX_RUN_SPEC_BYTES
+                    || crate::build_identity::hash_file(&config.path)? != config.sha256
+                {
+                    return Err(invalid(
+                        "the declared native qualification configuration is missing, oversized or changed; preserve the run and supply its exact frozen input",
+                    ));
+                }
+                let text = fs::read_to_string(&config.path)?;
+                let table: toml::Table = toml::from_str(text.trim_start_matches('\u{feff}'))
+                    .map_err(|_| {
+                        invalid("the declared native qualification configuration is not valid TOML")
+                    })?;
+                for field in ["model", "model_reasoning_effort"] {
+                    if table
+                        .get(field)
+                        .and_then(toml::Value::as_str)
+                        .is_none_or(|value| value.trim().is_empty())
+                    {
+                        return Err(invalid(format!(
+                            "the native qualification configuration must explicitly declare {field}"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "qualification requires exactly one declared local client or frozen native configuration; no implicit model route is selected",
+                ));
+            }
         }
         Ok(())
     }
@@ -731,6 +770,9 @@ impl QualificationRuntimeInputs {
 pub struct BaselineQualificationInputs {
     pub schema: u32,
     pub task: TaskInputs,
+    /// Ordinary task instructions, frozen separately from the experiment's
+    /// hypothesis and acceptance policy. The lead receives these exact bytes.
+    pub task_prompt: crate::improvement_runtime::FileIdentity,
     pub runtime: QualificationRuntimeInputs,
     pub acceptance: AcceptanceInputs,
     pub workflow: WorkflowInputs,
@@ -749,6 +791,21 @@ impl BaselineQualificationInputs {
             )));
         }
         self.task.validate()?;
+        if !self.task_prompt.path.is_absolute()
+            || !self.task_prompt.path.is_file()
+            || fs::metadata(&self.task_prompt.path)?.len() > MAX_RUN_SPEC_BYTES
+            || crate::build_identity::hash_file(&self.task_prompt.path)? != self.task_prompt.sha256
+        {
+            return Err(invalid(
+                "the qualification task prompt is missing, oversized or changed; supply its exact frozen ordinary task instructions",
+            ));
+        }
+        if fs::read_to_string(&self.task_prompt.path)?
+            .trim()
+            .is_empty()
+        {
+            return Err(invalid("the qualification task prompt must not be empty"));
+        }
         self.runtime.validate()?;
         self.acceptance.validate()?;
         self.workflow.validate()?;
@@ -954,16 +1011,16 @@ impl RunSpec {
                     "a declared baseline qualification requires the runner profile that opens its visible conversations",
                 ));
             }
-            let Some(local) = &self.local_runner else {
-                return Err(invalid(
-                    "a declared baseline qualification requires the explicit local runner its runtime client consumes",
-                ));
-            };
-            let client = &qualification.runtime.client.runner;
-            if client.endpoint != local.endpoint || client.model != local.model {
-                return Err(invalid(
-                    "the qualification client route must be the run's declared local runner: endpoint and model cannot differ",
-                ));
+            match (&qualification.runtime.client, &self.local_runner) {
+                (Some(client), Some(local))
+                    if client.runner.endpoint == local.endpoint
+                        && client.runner.model == local.model => {}
+                (None, None) => {}
+                _ => {
+                    return Err(invalid(
+                        "qualification must consume its declared local runner or its explicit native configuration without an alternate local route",
+                    ));
+                }
             }
             if self
                 .runner
