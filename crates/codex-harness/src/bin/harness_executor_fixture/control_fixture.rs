@@ -516,6 +516,33 @@ impl ReflectionState {
         );
     }
 
+    /// Records the final-looking assistant item this fixture exposed while the
+    /// native turn stayed in progress. The receipt is fixture evidence only:
+    /// the consumer still has to establish native completion before treating
+    /// the text as a retained outcome.
+    fn record_visible_text(&self) {
+        let item = json!({
+            "id": format!("{}-message", self.fork_turn),
+            "type": "agentMessage",
+            "text": self.result,
+        });
+        let value = json!({
+            "schema": 1,
+            "stage": self.stage,
+            "thread": self.fork_thread,
+            "turn": self.fork_turn,
+            "turnStatus": "inProgress",
+            "events": ["item/started", "item/completed"],
+            "item": item,
+            "nativeCompletion": false,
+        });
+        let _ = fs::write(
+            self.fixture_dir
+                .join(format!("visible-{}.json", self.stage)),
+            serde_json::to_vec_pretty(&value).unwrap_or_default(),
+        );
+    }
+
     fn source_record(&self) -> Value {
         let (thread, turn) = self.source();
         let later = matches!(self.outcome.as_str(), "source-drift" | "source-later-work");
@@ -582,12 +609,15 @@ impl ReflectionState {
             let error = (status == "failed").then(
                 || json!({"message": "the synthetic reflection turn failed before a result"}),
             );
-            turns.push(reflection_turn(
-                &self.fork_turn,
-                status,
-                text.unwrap_or(""),
-                error,
-            ));
+            let mut turn = reflection_turn(&self.fork_turn, status, text.unwrap_or(""), error);
+            if status == "inProgress" && self.outcome == "unknown-hold" {
+                turn["items"] = json!([{
+                    "id": format!("{}-message", self.fork_turn),
+                    "type": "agentMessage",
+                    "text": self.result,
+                }]);
+            }
+            turns.push(turn);
         }
         json!({
             "id": self.fork_thread,
@@ -1154,7 +1184,35 @@ fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: 
                         "params": {"threadId": state.fork_thread, "turn": turn},
                     }));
                 }
-                "visibility-lost" | "unknown-hold" => {}
+                "unknown-hold" => {
+                    // A submitted turn exposes a final-looking assistant item
+                    // but never establishes native completion. This is the
+                    // visible-only boundary: downstream work must not treat
+                    // the text as the stage outcome.
+                    let item = json!({
+                        "id": format!("{}-message", state.fork_turn),
+                        "type": "agentMessage",
+                        "text": state.result,
+                    });
+                    notifier.push(json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": state.fork_thread,
+                            "turnId": state.fork_turn,
+                            "item": item.clone(),
+                        },
+                    }));
+                    notifier.push(json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": state.fork_thread,
+                            "turnId": state.fork_turn,
+                            "item": item,
+                        },
+                    }));
+                    state.record_visible_text();
+                }
+                "visibility-lost" => {}
                 _ => {}
             }
             Answer::Result(json!({

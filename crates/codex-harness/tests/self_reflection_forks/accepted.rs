@@ -10,6 +10,7 @@ use harness_core::{
 };
 
 const ACTOR: &str = "reflection-fixture-lead";
+const ACCEPTED_EXECUTOR_RESULT: &str = "NO FINDING";
 
 pub(super) fn native(workspace: &Workspace, program: &str, args: &[&str]) -> std::process::Output {
     let output = Command::new(program)
@@ -128,7 +129,7 @@ fn run_accepted(workspace: &Workspace, request: &Value, executor_outcome: &str) 
         request,
         executor_outcome,
         "complete",
-        "NO FINDING",
+        ACCEPTED_EXECUTOR_RESULT,
         LEAD_RESULT,
         Some(&workspace.checkout),
     ))
@@ -218,17 +219,37 @@ fn submitted_turn_without_native_completion_is_retained_and_blocks_the_lead() {
     let workspace = Workspace::new("accepted-incomplete-turn", LeadMode::Delivered);
     let (controller, mut request, acceptance) = accepted(&workspace);
     request["boundSeconds"] = json!(1);
-    // The fixture cannot currently emit final-looking agent text while leaving
-    // the native turn non-completed: complete/missing-usage/source-later-work
-    // pair text with turn/completed, interrupted/failed are textless terminals,
-    // and unknown-hold emits neither. This holds a genuinely submitted turn
-    // open without a terminal event, the closest truthful native boundary.
+    // The fixture's incomplete-turn outcome emits the same final-looking
+    // assistant text a completed stage would retain, but never sends
+    // turn/completed. Visible text alone must not advance the chain.
     let incomplete = run_accepted(&workspace, &request, "unknown-hold");
     assert_refused(&incomplete, "no terminal native state");
 
+    let visible = read_json(
+        &workspace
+            .fixture_dir
+            .join("visible-executor-self-reflection.json"),
+    );
+    assert_eq!(visible["stage"], "executor-self-reflection", "{visible}");
+    assert_eq!(visible["thread"], EXECUTOR_FORK, "{visible}");
+    assert_eq!(visible["turn"], EXECUTOR_FORK_TURN, "{visible}");
+    assert_eq!(visible["turnStatus"], "inProgress", "{visible}");
+    assert_eq!(visible["item"]["type"], "agentMessage", "{visible}");
+    assert_eq!(
+        visible["item"]["text"], ACCEPTED_EXECUTOR_RESULT,
+        "{visible}"
+    );
+    assert_eq!(
+        visible["events"],
+        json!(["item/started", "item/completed"]),
+        "{visible}"
+    );
+    assert_eq!(visible["nativeCompletion"], false, "{visible}");
+
     let executor = stage(&workspace, "executor-stage");
     assert_eq!(executor["status"], "unknown", "{executor}");
-    assert!(executor["turnId"].is_string(), "{executor}");
+    assert_eq!(executor["fork"]["forkThread"], EXECUTOR_FORK, "{executor}");
+    assert_eq!(executor["turnId"], EXECUTOR_FORK_TURN, "{executor}");
     assert!(executor["result"].is_null(), "{executor}");
     assert!(executor["resultState"].is_null(), "{executor}");
     assert!(
@@ -264,6 +285,10 @@ fn submitted_turn_without_native_completion_is_retained_and_blocks_the_lead() {
     let retry = run_accepted(&workspace, &request, "complete");
     assert_refused(&retry, "requires explicit recovery");
     assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/resume").is_empty(),
+        "the refused retry resumed the incomplete attempt"
+    );
     assert_eq!(stage(&workspace, "executor-stage"), executor);
     assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
     assert!(!workspace.state.join("lead-stage.json").exists());
