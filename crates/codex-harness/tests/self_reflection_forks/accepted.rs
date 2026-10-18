@@ -28,7 +28,7 @@ fn native(workspace: &Workspace, program: &str, args: &[&str]) -> std::process::
     output
 }
 
-fn accepted(workspace: &Workspace) -> (ReflectionController, Value, String) {
+pub(super) fn accepted(workspace: &Workspace) -> (ReflectionController, Value, String) {
     native(workspace, "git", &["init", "-q", "--initial-branch=main"]);
     native(
         workspace,

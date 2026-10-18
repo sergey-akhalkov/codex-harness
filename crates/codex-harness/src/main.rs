@@ -338,6 +338,9 @@ fn run() -> io::Result<i32> {
             "codex-harness self-reflection --request PATH (two read-only model forks over exact accepted source turns; see self-reflection --help)"
         );
         println!(
+            "codex-harness delivery-improvement enable|status|disable|process --project DIRECTORY (accepted-task reflection lifecycle; see delivery-improvement --help)"
+        );
+        println!(
             "codex-harness feedback record|list|ledger|triage|candidates|promote --project DIRECTORY [--bd FILE] [--source CHECKOUT] ... (bd-backed feedback loop; no model calls)"
         );
         println!(
@@ -487,6 +490,11 @@ fn run() -> io::Result<i32> {
     if args[0] == "self-reflection" {
         verify_runtime()?;
         return self_reflection_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "delivery-improvement" {
+        verify_runtime()?;
+        return self_reflection_cli::lifecycle::run(&args[1..]);
     }
     #[cfg(windows)]
     if args[0] == "worktree" {

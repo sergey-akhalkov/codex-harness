@@ -44,6 +44,7 @@ use std::{
 };
 
 mod accepted;
+pub(crate) mod lifecycle;
 /// Set on every reflection app-server and frontend. `main` refuses every
 /// `codex-harness` command in a process tree carrying it, so a reflection fork
 /// cannot dispatch work, edit board state or start another conversation.
@@ -919,6 +920,17 @@ fn preflight_lead_return(chain: &ChainState) -> io::Result<()> {
     Ok(())
 }
 
+/// Native Codex defaults an omitted provider to OpenAI. Retain that effective
+/// route explicitly while still refusing missing model or effort. See the
+/// upstream config reference: https://developers.openai.com/codex/config-reference/
+fn reflection_binding(home: &Path, profile: &str) -> io::Result<ProfileBinding> {
+    let mut binding = orchestration_config::binding(home, profile)?;
+    if binding.model_provider.is_none() {
+        binding.model_provider = Some("openai".to_owned());
+    }
+    Ok(binding)
+}
+
 fn prepare_stage(
     chain: &ChainState,
     declaration: &StageDeclaration,
@@ -944,7 +956,7 @@ fn prepare_stage(
             declaration.revision
         )));
     }
-    let binding = orchestration_config::binding(&chain.codex_home, &declaration.profile).map_err(
+    let binding = reflection_binding(&chain.codex_home, &declaration.profile).map_err(
         |error| {
             invalid(format!(
                 "the declared {} profile {} is not an installed binding: {error}; no fork or turn was requested",

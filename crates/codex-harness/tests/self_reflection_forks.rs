@@ -10,6 +10,8 @@
 mod accepted;
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
+#[path = "self_reflection_forks/lifecycle.rs"]
+mod lifecycle;
 
 use control_endpoint::{Answer, Bearer, Server, Wire};
 use harness_core::console::{ConsoleOutcome, ConsoleSession, ConsoleSpec};
@@ -371,6 +373,27 @@ fn spawn_chain_in_board(
     lead_result: &str,
     board: Option<&Path>,
 ) -> ConsoleSession {
+    let spec = chain_spec(
+        workspace,
+        request,
+        executor_outcome,
+        lead_outcome,
+        executor_result,
+        lead_result,
+        board,
+    );
+    ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap()
+}
+
+fn chain_spec(
+    workspace: &Workspace,
+    request: &Value,
+    executor_outcome: &str,
+    lead_outcome: &str,
+    executor_result: &str,
+    lead_result: &str,
+    board: Option<&Path>,
+) -> CommandSpec {
     fs::write(
         &workspace.request,
         serde_json::to_vec_pretty(request).unwrap(),
@@ -449,7 +472,7 @@ fn spawn_chain_in_board(
     spec.env.insert("HARNESS_REFLECTION_SESSION".into(), None);
     spec.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
     spec.env.insert("WT_SESSION".into(), None);
-    ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap()
+    spec
 }
 
 fn run_chain(
