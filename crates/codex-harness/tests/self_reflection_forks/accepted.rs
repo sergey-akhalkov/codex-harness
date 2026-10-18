@@ -232,22 +232,25 @@ fn occupied_shared_capacity_keeps_the_closure_pending_then_freed_capacity_runs_i
     fs::create_dir_all(&pool).unwrap();
     // Model-free native lease fixture: the test process actually owns every
     // recorded live PID/creation identity. No worktree position is allocated.
-    let leases: Vec<_> = (1..=config.max_concurrent_executors)
-        .map(|index| {
-            let path = pool.join(format!("lease-{index}.json"));
-            fs::write(
-                &path,
-                serde_json::to_vec(&json!({
-                    "schema": 1, "owner": format!("ordinary-fixture-{index}"),
-                    "index": index, "path": workspace.checkout,
-                    "pid": identity.pid, "created": identity.creation_time, "program": program,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            path
-        })
-        .collect();
+    let occupy_capacity = || {
+        (1..=config.max_concurrent_executors)
+            .map(|index| {
+                let path = pool.join(format!("lease-{index}.json"));
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&json!({
+                        "schema": 1, "owner": format!("ordinary-fixture-{index}"),
+                        "index": index, "path": workspace.checkout,
+                        "pid": identity.pid, "created": identity.creation_time, "program": program,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                path
+            })
+            .collect::<Vec<_>>()
+    };
+    let leases = occupy_capacity();
     let blocked = run_accepted(&workspace, &request, "complete");
     assert_refused(&blocked, "reflection concurrency is full");
     assert_eq!(controller.record(&acceptance).unwrap().unwrap(), before);
@@ -262,6 +265,20 @@ fn occupied_shared_capacity_keeps_the_closure_pending_then_freed_capacity_runs_i
         controller.record(&acceptance).unwrap().unwrap().delivery,
         DeliveryState::Consumed
     );
+    let retained = controller.record(&acceptance).unwrap().unwrap();
+    let calls = request_counts(&workspace);
+    let occupied_again = occupy_capacity();
+    let replay = run_accepted(&workspace, &request, "complete");
+    assert_eq!(replay.outcome.exit_code, 0, "{}", replay.transcript);
+    assert_eq!(
+        request_counts(&workspace),
+        calls,
+        "reuse starts no model work"
+    );
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), retained);
+    for path in occupied_again {
+        fs::remove_file(path).unwrap();
+    }
     for index in 1..=pool_size {
         assert!(
             harness_core::task_worktree::load_slot_record(
