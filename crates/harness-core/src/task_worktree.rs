@@ -21,6 +21,7 @@
 //! holding unreviewed work, and any slot holding a task binding, stays held
 //! until the lead merges it, records an explicit discard or releases the task.
 use crate::build_identity::hash_bytes;
+use crate::delivery_reflection::{Purpose, SourceIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -478,6 +479,110 @@ pub enum ReservationLiveness {
     Uncertain,
 }
 
+/// The verified consumer-board task one ordinary assignment executes, retained
+/// with the slot and dispatch receipt. The board scope, issue and assignment
+/// content hash are the binding identity; the board revision is the observation
+/// taken at resolution. An absent `purpose` is explicitly unknown and never
+/// becomes ordinary by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SlotAssignmentBinding {
+    pub source: SourceIdentity,
+    pub issue: String,
+    pub assignment_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    pub purpose_source: String,
+}
+
+impl SlotAssignmentBinding {
+    /// The effective purpose, or `None` when the declaration and its known
+    /// board lineage left it unknown.
+    pub fn effective_purpose(&self) -> io::Result<Option<Purpose>> {
+        self.purpose.as_deref().map(Purpose::parse).transpose()
+    }
+
+    /// Acceptance and reflection eligibility require a validated purpose.
+    /// Unknown is retained as unknown, not silently treated as eligible.
+    pub fn purpose_known(&self) -> bool {
+        self.purpose.is_some()
+    }
+
+    /// The identity that makes a repeated dispatch the same binding. Board
+    /// revision churn and provenance wording do not create a new binding;
+    /// a different board scope, issue, assignment content or effective
+    /// purpose is a conflict.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.source.same_scope(&other.source)
+            && self.issue == other.issue
+            && self.assignment_sha256 == other.assignment_sha256
+            && self.purpose == other.purpose
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        for (field, value) in [
+            ("project_id", &self.source.project_id),
+            ("beads_dir", &self.source.beads_dir),
+            ("database", &self.source.database),
+            ("repo_root", &self.source.repo_root),
+            ("branch", &self.source.branch),
+            ("commit", &self.source.commit),
+            ("issue", &self.issue),
+            ("purpose_source", &self.purpose_source),
+        ] {
+            if value.trim().is_empty() {
+                return Err(pool_error(&format!(
+                    "assignment binding has an empty {field}; the lead resolves or removes the record"
+                )));
+            }
+        }
+        if self.assignment_sha256.len() != 64
+            || !self
+                .assignment_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(pool_error(
+                "assignment binding has no sha256 assignment content identity; the lead resolves or removes the record",
+            ));
+        }
+        if self.issue.chars().any(char::is_whitespace) {
+            return Err(pool_error(
+                "assignment binding issue id contains whitespace; the lead resolves or removes the record",
+            ));
+        }
+        let source_valid = match self.purpose_source.as_str() {
+            "declared" | "board" | "unknown" => true,
+            source => source
+                .strip_prefix("ancestor:")
+                .is_some_and(|ancestor| !ancestor.is_empty()),
+        };
+        if !source_valid {
+            return Err(pool_error(
+                "assignment binding has an unrecognized purpose source; the lead resolves or removes the record",
+            ));
+        }
+        match self.purpose.as_deref() {
+            Some(raw) => {
+                Purpose::parse(raw)?;
+                if self.purpose_source == "unknown" {
+                    return Err(pool_error(
+                        "assignment binding records a known purpose with unknown provenance; the lead resolves or removes the record",
+                    ));
+                }
+            }
+            None => {
+                if self.purpose_source != "unknown" {
+                    return Err(pool_error(
+                        "assignment binding records unknown purpose with a known provenance; the lead resolves or removes the record",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Kit-local task-state record of one pool slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -511,6 +616,10 @@ pub struct SlotRecord {
     /// records written before startup reservations, which keep session liveness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup: Option<StartupReservation>,
+    /// Verified consumer-board task and assignment identity of the run this
+    /// binding holds. Absent on legacy records and unbound dispatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<Box<SlotAssignmentBinding>>,
 }
 
 /// Private slot state root shared by every checkout of one repository. The
@@ -734,6 +843,15 @@ fn validate_slot_record(path: &Path, index: u32, record: &SlotRecord) -> io::Res
             )));
         }
         (None, None) => {}
+    }
+    if let Some(assignment) = &record.assignment {
+        if record.task.is_none() {
+            return Err(pool_error(&format!(
+                "slot record {} records an assignment binding without a durable task; the lead resolves or removes the record",
+                path.display()
+            )));
+        }
+        assignment.validate()?;
     }
     Ok(())
 }
@@ -1000,6 +1118,7 @@ pub fn claim_slot_for(
             disposition: None,
             reason: None,
             startup: startup.cloned(),
+            assignment: None,
         };
         if create_slot_record(&record_path, &claim)? {
             return Ok(SlotClaim::Claimed(claim));
@@ -1478,6 +1597,7 @@ fn release_slot_with(
                 owner: None,
                 task: None,
                 handle: None,
+                assignment: None,
                 base: Some(commit.clone()),
                 disposition: Some(disposition),
                 reason: Some(reason.to_owned()),
@@ -2628,6 +2748,57 @@ pub fn handoff_task_to_session(
     )))
 }
 
+/// Attach the verified consumer-board task and assignment identity to one
+/// held durable slot binding. The task and generation handle must still own
+/// the slot. Repeating the exact binding is idempotent; a different binding
+/// for the same held task is refused with the record untouched, so an
+/// ordinary dispatch cannot silently replace the work it continues.
+pub fn bind_slot_assignment(
+    codex_home: &Path,
+    source: &Path,
+    index: u32,
+    task: &str,
+    handle: &str,
+    assignment: SlotAssignmentBinding,
+) -> io::Result<SlotRecord> {
+    assignment.validate()?;
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let _lock = lock_slot(codex_home, &root, index)?;
+    refuse_record_conflict(&layout, index)?;
+    let record = load_record_at(&layout, index)?.ok_or_else(|| {
+        pool_error(&format!(
+            "slot {index} has no durable task binding to attach board task '{}' to",
+            assignment.issue
+        ))
+    })?;
+    if record.task.as_deref() != Some(task) || record.handle.as_deref() != Some(handle) {
+        return Err(pool_error(&format!(
+            "slot {index} is no longer bound to task '{task}' generation {handle}; the board binding was not written"
+        )));
+    }
+    if let Some(recorded) = &record.assignment {
+        if recorded.same_binding(&assignment) {
+            return Ok(record);
+        }
+        return Err(pool_error(&format!(
+            "slot {index} task '{task}' is already bound to board task '{}' with assignment {} and purpose {}; refusing board task '{}' with assignment {} and purpose {}",
+            recorded.issue,
+            recorded.assignment_sha256,
+            recorded.purpose.as_deref().unwrap_or("unknown"),
+            assignment.issue,
+            assignment.assignment_sha256,
+            assignment.purpose.as_deref().unwrap_or("unknown")
+        )));
+    }
+    let bound = SlotRecord {
+        assignment: Some(Box::new(assignment)),
+        ..record
+    };
+    write_slot_record(&layout.resolved(index), &bound)?;
+    Ok(bound)
+}
+
 // Public release API kept arity-compatible with its existing callers.
 #[allow(clippy::too_many_arguments)]
 pub fn release_task(
@@ -2907,6 +3078,7 @@ fn claim_task_slot(
             disposition: None,
             reason: None,
             startup: startup.cloned(),
+            assignment: None,
         };
         if create_slot_record(&record_path, &claim)? {
             return Ok(TaskSlotClaim::Claimed(claim));
@@ -3150,6 +3322,11 @@ fn abort_task_claim(
             disposition: None,
             reason: Some(format!("task acquisition aborted: {cause}")),
             startup: None,
+            assignment: if retained {
+                record.assignment.clone()
+            } else {
+                None
+            },
             ..record
         },
     )
@@ -3359,6 +3536,7 @@ fn abort_claim(
         SlotContent::Reusable => SlotState::Free,
         SlotContent::Unreviewed(_) | SlotContent::Missing(_) => SlotState::AwaitingReview,
     };
+    let retained = state == SlotState::AwaitingReview;
     write_slot_record(
         &layout.resolved(index),
         &SlotRecord {
@@ -3367,6 +3545,11 @@ fn abort_claim(
             disposition: None,
             reason: Some(format!("dispatch aborted: {cause}")),
             startup: None,
+            assignment: if retained {
+                record.assignment.clone()
+            } else {
+                None
+            },
             ..record
         },
     )
@@ -3386,6 +3569,7 @@ fn free_slot_record(pool: &Pool, slot: &PoolSlot) -> SlotRecord {
         disposition: None,
         reason: None,
         startup: None,
+        assignment: None,
     }
 }
 
@@ -4363,7 +4547,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// same path, or two linked worktrees of one Git repository. Legacy records
 /// written from a linked checkout keep their old `source` path and are still
 /// this repository's records; they are normalized on their next mutation.
-fn same_repository(left: &Path, right: &Path) -> bool {
+pub fn same_repository(left: &Path, right: &Path) -> bool {
     if same_path(left, right) {
         return true;
     }
@@ -5517,6 +5701,7 @@ mod tests {
             disposition: None,
             reason: None,
             startup: None,
+            assignment: None,
         };
         let legacy = SlotRecord {
             source: linked.clone(),
@@ -6394,6 +6579,7 @@ mod tests {
             disposition: None,
             reason: None,
             startup: None,
+            assignment: None,
         };
         fs::write(&path, serde_json::to_vec_pretty(&in_flight).unwrap()).unwrap();
         // The same task is already being acquired elsewhere: the caller gets
@@ -6444,6 +6630,7 @@ mod tests {
                 created: 1,
                 program: std::env::current_exe().unwrap(),
             }),
+            assignment: None,
         };
         fs::write(&path, serde_json::to_vec_pretty(&abandoned).unwrap()).unwrap();
         // The reservation never admitted work (clean tree at the exact base),

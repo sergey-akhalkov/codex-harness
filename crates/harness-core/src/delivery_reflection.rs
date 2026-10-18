@@ -317,6 +317,40 @@ impl SourceIdentity {
     }
 }
 
+/// Reads the canonical board scope and current board revision through the
+/// native `bd` commands. Ordinary dispatch resolves a declared consumer-board
+/// task through this same reader before it claims a slot or starts a model.
+pub fn board_source_identity(bd: &Path, project: &Path) -> io::Result<SourceIdentity> {
+    let context = board_json(bd, project, &["context", "--json"])?;
+    let vc = board_json(bd, project, &["vc", "status", "--json"])?;
+    Ok(SourceIdentity {
+        project_id: required_string(&context, "project_id")?,
+        beads_dir: required_string(&context, "beads_dir")?,
+        database: required_string(&context, "database")?,
+        repo_root: context
+            .get("repo_root")
+            .or_else(|| context.get("cwd_repo_root"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("bd context has no repo_root"))?
+            .to_owned(),
+        branch: required_string(&vc, "branch")?,
+        commit: required_string(&vc, "commit")?,
+    })
+}
+
+fn board_json(bd: &Path, project: &Path, args: &[&str]) -> io::Result<Value> {
+    let out = board_cli::run(bd, project, args)?;
+    if !out.status.success() {
+        return Err(board_failure("bd", args, &out));
+    }
+    serde_json::from_slice(&out.stdout).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bd {} did not return JSON: {error}", args.join(" ")),
+        )
+    })
+}
+
 fn default_max_active_stages() -> u32 {
     2
 }
@@ -983,21 +1017,7 @@ impl ReflectionController {
     }
 
     fn current_source(&self) -> io::Result<SourceIdentity> {
-        let context = self.json(&["context", "--json"])?;
-        let vc = self.json(&["vc", "status", "--json"])?;
-        Ok(SourceIdentity {
-            project_id: required_string(&context, "project_id")?,
-            beads_dir: required_string(&context, "beads_dir")?,
-            database: required_string(&context, "database")?,
-            repo_root: context
-                .get("repo_root")
-                .or_else(|| context.get("cwd_repo_root"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("bd context has no repo_root"))?
-                .to_owned(),
-            branch: required_string(&vc, "branch")?,
-            commit: required_string(&vc, "commit")?,
-        })
+        board_source_identity(&self.bd, &self.project)
     }
 
     fn json(&self, args: &[&str]) -> io::Result<Value> {

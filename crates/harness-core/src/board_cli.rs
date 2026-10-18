@@ -467,6 +467,33 @@ pub fn issue_metadata(issue: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Records only the `harness.purpose` key on one board task. `bd update
+/// --set-metadata` is the existing per-key mutation; unrelated metadata stays
+/// on the issue, and the caller verifies the re-read answer before dispatch.
+pub fn set_purpose_metadata(
+    bd: &Path,
+    project: &Path,
+    task: &str,
+    purpose: crate::delivery_reflection::Purpose,
+) -> io::Result<Value> {
+    let key = crate::delivery_reflection::PURPOSE_METADATA;
+    let pair = format!("{key}={}", purpose.as_str());
+    json_ok(
+        bd,
+        project,
+        &["update", task, "--set-metadata", &pair, "--json"],
+    )?;
+    let issue = show_issue(bd, project, task)?;
+    let recorded = issue_metadata(&issue);
+    if recorded.get(key).map(String::as_str) != Some(purpose.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bd did not record {pair} on task {task}; the board answer is {issue}"),
+        ));
+    }
+    Ok(issue)
+}
+
 pub struct AcceptanceClose {
     pub issue: Value,
     /// True when the identical accepted closure was already recorded; no

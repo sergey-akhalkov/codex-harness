@@ -19,8 +19,14 @@
 //! reaches a managed session through its role context instead of being
 //! restated in every brief.
 
-use harness_core::delivery_reflection::Purpose;
-use serde::Deserialize;
+use harness_core::{
+    board_cli,
+    build_identity::hash_bytes,
+    delivery_reflection::{self, PURPOSE_METADATA, Purpose},
+    task_worktree::{self, SlotAssignmentBinding},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::BTreeSet,
     fs, io,
@@ -72,7 +78,7 @@ pub fn free_text_brief(text: &str) -> String {
     rendered
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Assignment {
     pub schema: u32,
@@ -87,6 +93,11 @@ pub struct Assignment {
     /// Owned task purpose. Omitted means unspecified rather than ordinary.
     #[serde(default)]
     pub purpose: Option<String>,
+    /// The consuming repository's native board issue this assignment executes.
+    /// It is the lead's exact issue id, never prose parsed from another field.
+    /// Omitted assignments keep the legacy unbound dispatch path.
+    #[serde(default)]
+    pub board_task: Option<String>,
     /// Additional triggers that return the decision to the consumer; the
     /// standing boundaries apply in every case.
     #[serde(default)]
@@ -154,6 +165,14 @@ impl Assignment {
             require_text("purpose", purpose, MAX_ITEM_BYTES)?;
             Purpose::parse(purpose)?;
         }
+        if let Some(task) = &self.board_task {
+            require_text("board_task", task, MAX_ITEM_BYTES)?;
+            if task.chars().any(char::is_whitespace) {
+                return Err(invalid(
+                    "board_task must be one exact board issue id without whitespace; it is never parsed from prose",
+                ));
+            }
+        }
         if self.acceptance.is_empty() {
             return Err(invalid(
                 "assignment acceptance is empty; name at least one checkable acceptance item",
@@ -186,6 +205,197 @@ impl Assignment {
         }
         Ok(())
     }
+
+    /// The content identity retained beside a consumer-board binding. It is
+    /// the semantic assignment document after schema validation, so a resume
+    /// can prove it continues the same declaration rather than a same-named
+    /// task with different work.
+    pub fn content_sha256(&self) -> io::Result<String> {
+        Ok(hash_bytes(&serde_json::to_vec(self).map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidData, error)
+        })?))
+    }
+}
+
+/// Resolves the assignment's declared `board_task` in the consuming
+/// repository's native board, before any slot claim or model effect. The
+/// returned binding carries the canonical board scope, the exact issue, a
+/// sha256 of this assignment document and the effective purpose. An explicit
+/// purpose is the lead's declaration; a known nonordinary ancestor purpose is
+/// inherited; contradictions and unavailable ancestors refuse. A task with no
+/// known purpose stays explicitly unknown rather than becoming ordinary.
+pub fn bind_board_task(
+    assignment: &Assignment,
+    repository: &Path,
+    bd: &Path,
+) -> io::Result<SlotAssignmentBinding> {
+    let issue_id = assignment.board_task.as_deref().ok_or_else(|| {
+        invalid("bind_board_task requires assignment.board_task; legacy assignments have no board binding")
+    })?;
+    if issue_id.trim().is_empty() || issue_id.chars().any(char::is_whitespace) {
+        return Err(invalid(
+            "board_task must be one exact board issue id without whitespace; it is never parsed from prose",
+        ));
+    }
+    let before = delivery_reflection::board_source_identity(bd, repository)?;
+    if !task_worktree::same_repository(Path::new(&before.repo_root), repository) {
+        return Err(invalid(&format!(
+            "board task '{issue_id}' resolved from board scope {} (repo_root {}), which is not the consuming repository {}; refusing a stale or foreign board binding",
+            before.project_id,
+            before.repo_root,
+            repository.display()
+        )));
+    }
+    let issue = board_cli::show_issue(bd, repository, issue_id)?;
+    let own = issue_purpose(&issue)?;
+    let inherited = inherited_nonordinary_purpose(bd, repository, &issue)?;
+    let declared = assignment
+        .purpose
+        .as_deref()
+        .map(Purpose::parse)
+        .transpose()?;
+    if let Some(declared) = declared
+        && declared != Purpose::Ordinary
+        && own.is_none()
+        && inherited.is_none()
+    {
+        return Err(invalid(&format!(
+            "assignment declares nonordinary purpose '{}' but board task '{issue_id}' has no board or ancestor purpose; nonordinary purposes are inherited, while only an ordinary declaration belongs to the lead",
+            declared.as_str()
+        )));
+    }
+    if let (Some(declared), Some(own)) = (declared, own)
+        && declared != own
+    {
+        return Err(invalid(&format!(
+            "assignment declares purpose '{}' but board task '{issue_id}' records purpose '{}'",
+            declared.as_str(),
+            own.as_str()
+        )));
+    }
+    if let Some((ancestor, ancestor_id)) = inherited.as_ref() {
+        if let Some(declared) = declared
+            && declared != *ancestor
+        {
+            return Err(invalid(&format!(
+                "assignment declares purpose '{}' but ancestor '{ancestor_id}' declares nonordinary purpose '{}'; a descendant does not silently leave its purpose lineage",
+                declared.as_str(),
+                ancestor.as_str()
+            )));
+        }
+        if let Some(own) = own
+            && own != *ancestor
+        {
+            return Err(invalid(&format!(
+                "board task '{issue_id}' records purpose '{}' but ancestor '{ancestor_id}' declares nonordinary purpose '{}'",
+                own.as_str(),
+                ancestor.as_str()
+            )));
+        }
+    }
+    let (effective, purpose_source) = match (declared, own, inherited.as_ref()) {
+        (Some(purpose), _, _) => (Some(purpose), "declared".to_owned()),
+        (None, Some(purpose), _) => (Some(purpose), "board".to_owned()),
+        (None, None, Some((purpose, ancestor_id))) => {
+            (Some(*purpose), format!("ancestor:{ancestor_id}"))
+        }
+        (None, None, None) => (None, "unknown".to_owned()),
+    };
+    if let Some(effective) = effective
+        && own.is_none()
+    {
+        let before_metadata = board_cli::issue_metadata(&issue);
+        let refreshed = board_cli::set_purpose_metadata(bd, repository, issue_id, effective)?;
+        let after_metadata = board_cli::issue_metadata(&refreshed);
+        for (key, value) in &before_metadata {
+            if key != PURPOSE_METADATA && after_metadata.get(key) != Some(value) {
+                return Err(invalid(&format!(
+                    "recording harness.purpose on board task '{issue_id}' changed unrelated metadata '{key}'; the dispatch is refused instead of trusting a rewritten task"
+                )));
+            }
+        }
+    }
+    // The metadata write advances the board revision; the retained source
+    // observation names the revision after the write. Scope churn during
+    // resolution is a conflict, not a binding.
+    let after = delivery_reflection::board_source_identity(bd, repository)?;
+    if !before.same_scope(&after) {
+        return Err(invalid(&format!(
+            "board scope changed while resolving task '{issue_id}'; retry the dispatch"
+        )));
+    }
+    let assignment_sha256 = assignment.content_sha256()?;
+    Ok(SlotAssignmentBinding {
+        source: after,
+        issue: issue_id.to_owned(),
+        assignment_sha256,
+        purpose: effective.map(|purpose| purpose.as_str().to_owned()),
+        purpose_source,
+    })
+}
+
+fn issue_purpose(issue: &Value) -> io::Result<Option<Purpose>> {
+    match board_cli::issue_metadata(issue).get(PURPOSE_METADATA) {
+        Some(raw) => Ok(Some(Purpose::parse(raw)?)),
+        None => Ok(None),
+    }
+}
+
+/// The nearest nonordinary purpose declared anywhere in the parent chain.
+/// Ordinary ancestor work is never inherited: a child does not become
+/// ordinary merely because a task above it exists. Two different nonordinary
+/// ancestor declarations refuse instead of choosing one.
+fn inherited_nonordinary_purpose(
+    bd: &Path,
+    repository: &Path,
+    issue: &Value,
+) -> io::Result<Option<(Purpose, String)>> {
+    let mut parent = issue
+        .get("parent")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut seen = BTreeSet::new();
+    let mut depth = 0usize;
+    let mut found = None;
+    while let Some(parent_id) = parent.take() {
+        if depth >= delivery_reflection::MAX_ANCESTORS {
+            return Err(invalid(&format!(
+                "purpose lineage exceeds {} ancestors at '{parent_id}'",
+                delivery_reflection::MAX_ANCESTORS
+            )));
+        }
+        if !seen.insert(parent_id.clone()) {
+            return Err(invalid(&format!(
+                "purpose lineage repeats ancestor '{parent_id}'"
+            )));
+        }
+        let ancestor = board_cli::show_issue(bd, repository, &parent_id).map_err(|error| {
+            invalid(&format!(
+                "board task ancestor '{parent_id}' is unavailable: {error}"
+            ))
+        })?;
+        if let Some(purpose) = issue_purpose(&ancestor)?
+            && purpose != Purpose::Ordinary
+        {
+            match &found {
+                None => found = Some((purpose, parent_id.clone())),
+                Some((existing, _)) if *existing != purpose => {
+                    return Err(invalid(&format!(
+                        "board task ancestors declare conflicting nonordinary purposes '{}' and '{}'",
+                        existing.as_str(),
+                        purpose.as_str()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        parent = ancestor
+            .get("parent")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        depth += 1;
+    }
+    Ok(found)
 }
 
 /// Validates the declared paths and renders the brief an executor session

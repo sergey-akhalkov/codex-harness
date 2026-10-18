@@ -5,7 +5,7 @@
 //! launcher, so no model, subscription or terminal is involved.
 #![cfg(windows)]
 
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -128,6 +128,230 @@ impl Fixture {
     fn drop(self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// The same owned checkout plus a controlled CODEX_HOME for the real
+/// `executor spawn` entry point. The launcher is deliberately absent: a
+/// dispatch must reach the durable pool binding and then stop at the missing
+/// launcher, so no model, subscription or terminal is involved.
+struct SpawnFixture {
+    base: Fixture,
+    home: PathBuf,
+}
+
+impl SpawnFixture {
+    fn new(name: &str) -> Self {
+        let base = Fixture::new(name);
+        let home = base.root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
+        Self { base, home }
+    }
+
+    /// Installs the real bd executable into the controlled home and initializes
+    /// one synthetic board in the consuming source checkout.
+    fn with_board(name: &str) -> Self {
+        let fixture = Self::new(name);
+        let bin = fixture.home.join("harness/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::copy(bd_executable(), bin.join("bd.exe")).unwrap();
+        let out = fixture.bd_run(&[
+            "init",
+            "--skip-agents",
+            "--non-interactive",
+            "--quiet",
+            "--prefix",
+            "assign",
+        ]);
+        assert!(out.status.success(), "{}", bd_failed("init", &out));
+        fixture
+    }
+
+    fn bd(&self) -> PathBuf {
+        self.home.join("harness/bin/bd.exe")
+    }
+
+    fn bd_run(&self, args: &[&str]) -> std::process::Output {
+        Command::new(self.bd())
+            .args(args)
+            .current_dir(&self.base.source)
+            .env("BD_NON_INTERACTIVE", "1")
+            .env("BEADS_ACTOR", "executor-assignment-test")
+            .output()
+            .unwrap()
+    }
+
+    fn bd_json(&self, args: &[&str]) -> Value {
+        let out = self.bd_run(args);
+        assert!(
+            out.status.success(),
+            "{}",
+            bd_failed(args.first().copied().unwrap_or("bd"), &out)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "bd {} did not return JSON: {error}\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    fn create_issue(&self, title: &str, issue_type: &str, parent: Option<&str>) -> String {
+        let mut args = vec!["create", title, "--type", issue_type];
+        if let Some(parent) = parent {
+            args.push("--parent");
+            args.push(parent);
+        }
+        args.push("--json");
+        self.bd_json(&args)["id"].as_str().unwrap().to_owned()
+    }
+
+    fn set_metadata(&self, issue: &str, key: &str, value: &str) {
+        let pair = format!("{key}={value}");
+        self.bd_json(&["update", issue, "--set-metadata", &pair, "--json"]);
+    }
+
+    fn show(&self, issue: &str) -> Value {
+        let shown = self.bd_json(&["show", issue, "--json"]);
+        shown
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .unwrap_or(shown)
+    }
+
+    fn assignment(&self, name: &str, board_task: &str, purpose: Option<&str>) -> PathBuf {
+        let mut contract = json!({
+            "schema": 1,
+            "objective": "run the synthetic board-bound assignment",
+            "board_task": board_task,
+            "inputs": ["README.md"],
+            "outputs": ["out/bound.txt"],
+            "invariants": ["keep the change inside the checkout"],
+            "acceptance": ["the synthetic check passes"],
+        });
+        if let Some(purpose) = purpose {
+            contract["purpose"] = json!(purpose);
+        }
+        let path = self.base.root.join(name);
+        fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        path
+    }
+
+    fn legacy_assignment(&self, name: &str) -> PathBuf {
+        let path = self.base.root.join(name);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "objective": "legacy structured assignment without a board binding",
+                "inputs": ["README.md"],
+                "outputs": ["out/legacy.txt"],
+                "invariants": ["keep the change inside the checkout"],
+                "acceptance": ["the synthetic check passes"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    /// The real dispatch entry point, pointed at the controlled home and the
+    /// exact local base. The missing launcher is the intended stop after the
+    /// pool/slot owner wrote its durable binding.
+    fn spawn(&self, prompt: &[&str], extra: &[&str]) -> std::process::Output {
+        let base = self.base.head();
+        let mut command = Command::new(manager());
+        command.args([
+            "executor",
+            "spawn",
+            "--source",
+            self.base.source.to_str().unwrap(),
+            "--codex-home",
+            self.home.to_str().unwrap(),
+            "--profile",
+            "ds",
+            "--base",
+            &base,
+        ]);
+        command.args(prompt);
+        command.args(extra);
+        command.env("CODEX_HOME", &self.home);
+        command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+        for key in [
+            "HARNESS_EXECUTOR_SESSION",
+            "CODEX_SESSION_ID",
+            "HARNESS_EXECUTOR_RUN",
+            "HARNESS_ORIGINATING_LEAD",
+            "HARNESS_LEAD_THREAD",
+            "HARNESS_LEAD_RECIPIENT",
+        ] {
+            command.env_remove(key);
+        }
+        command.output().unwrap()
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.home.join("harness/executor-pool")
+    }
+
+    fn record(&self, index: u32) -> Value {
+        serde_json::from_slice(&fs::read(self.record_path(index)).unwrap()).unwrap()
+    }
+
+    fn record_path(&self, index: u32) -> PathBuf {
+        let source = fs::read_dir(self.state_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .expect("one pool state directory per source checkout");
+        source.join(format!("slot-{index}.json"))
+    }
+
+    fn drop_fixture(self) {
+        self.base.drop();
+    }
+}
+
+fn bd_name() -> &'static str {
+    "bd.exe"
+}
+
+fn bd_executable() -> PathBuf {
+    if let Some(value) = std::env::var_os("HARNESS_BD_EXE") {
+        let candidate = PathBuf::from(value);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        let candidate = PathBuf::from(home).join("harness/bin").join(bd_name());
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let lower = dir.to_string_lossy().to_ascii_lowercase();
+            if lower.ends_with(r"\windowsapps") || lower.contains(r"\windowsapps\\") {
+                continue;
+            }
+            let candidate = dir.join(bd_name());
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+}
+
+fn bd_failed(op: &str, out: &std::process::Output) -> String {
+    format!(
+        "bd {op} failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 fn output_text(out: &std::process::Output) -> String {
@@ -546,4 +770,298 @@ fn escaping_reparse_points_are_rejected_for_inputs_and_outputs() {
         "the escape must not create anything outside the checkout"
     );
     fixture.drop();
+}
+
+/// A normal structured assignment that names a consumer-board task reaches the
+/// real dispatch owner and leaves a durable slot binding: canonical board
+/// scope, issue, assignment content hash and the declared purpose. The
+/// missing launcher is the intended stop after that write.
+#[test]
+fn board_bound_assignment_records_verified_task_purpose_and_identity() {
+    let fixture = SpawnFixture::with_board("bound-identity");
+    let task = fixture.create_issue("Bound ordinary task", "task", None);
+    let assignment = fixture.assignment("bound.json", &task, Some("ordinary"));
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-bound"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "the dispatch must reach the launcher only after the slot binding: {text}"
+    );
+    let record = fixture.record(1);
+    assert_eq!(record["state"], "occupied", "{record}");
+    let binding = &record["assignment"];
+    assert_eq!(binding["issue"], task, "{record}");
+    assert_eq!(binding["purpose"], "ordinary", "{record}");
+    assert_eq!(binding["purposeSource"], "declared", "{record}");
+    let sha = binding["assignmentSha256"].as_str().expect("content hash");
+    assert_eq!(sha.len(), 64, "{record}");
+    assert!(
+        sha.chars().all(|value| value.is_ascii_hexdigit()),
+        "{record}"
+    );
+    let context = fixture.bd_json(&["context", "--json"]);
+    assert_eq!(binding["source"]["project_id"], context["project_id"]);
+    assert_eq!(binding["source"]["database"], context["database"]);
+    assert_eq!(binding["source"]["beads_dir"], context["beads_dir"]);
+    assert!(!binding["source"]["commit"].as_str().unwrap().is_empty());
+    assert!(
+        Path::new(binding["source"]["repo_root"].as_str().unwrap()).ends_with("proj"),
+        "{record}"
+    );
+    let shown = fixture.show(&task);
+    assert_eq!(shown["metadata"]["harness.purpose"], "ordinary", "{shown}");
+    fixture.drop_fixture();
+}
+
+/// A known nonordinary purpose on the board lineage is retained on the child
+/// binding and written to the child's existing `harness.purpose` metadata
+/// without disturbing unrelated metadata.
+#[test]
+fn board_bound_assignment_inherits_known_nonordinary_purpose() {
+    let fixture = SpawnFixture::with_board("bound-inherit");
+    let epic = fixture.create_issue("Improvement epic", "epic", None);
+    fixture.set_metadata(&epic, "harness.purpose", "improvement");
+    let child = fixture.create_issue("Improvement child", "task", Some(&epic));
+    fixture.set_metadata(&child, "synthetic.keep", "kept");
+    let assignment = fixture.assignment("inherit.json", &child, None);
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-inherit"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let record = fixture.record(1);
+    let binding = &record["assignment"];
+    assert_eq!(binding["issue"], child, "{record}");
+    assert_eq!(binding["purpose"], "improvement", "{record}");
+    assert_eq!(
+        binding["purposeSource"],
+        format!("ancestor:{epic}"),
+        "{record}"
+    );
+    let shown = fixture.show(&child);
+    assert_eq!(
+        shown["metadata"]["harness.purpose"], "improvement",
+        "{shown}"
+    );
+    assert_eq!(shown["metadata"]["synthetic.keep"], "kept", "{shown}");
+    fixture.drop_fixture();
+}
+
+/// An ordinary declaration under a nonordinary ancestor contradicts the
+/// retained lineage and is refused before a slot claim or a launcher.
+#[test]
+fn conflicting_purpose_declaration_refuses_before_slot_or_launcher() {
+    let fixture = SpawnFixture::with_board("bound-conflict");
+    let epic = fixture.create_issue("Improvement epic", "epic", None);
+    fixture.set_metadata(&epic, "harness.purpose", "improvement");
+    let child = fixture.create_issue("Improvement child", "task", Some(&epic));
+    let assignment = fixture.assignment("conflict.json", &child, Some("ordinary"));
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-conflict"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("does not silently leave its purpose lineage"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("installed Codex launcher"),
+        "the refusal must precede every launch stage: {text}"
+    );
+    assert!(
+        !fixture.state_dir().exists(),
+        "a refused declaration must not claim a slot"
+    );
+    let shown = fixture.show(&child);
+    assert!(
+        shown
+            .get("metadata")
+            .and_then(|metadata| metadata.get("harness.purpose"))
+            .is_none(),
+        "a refused declaration must not write board purpose metadata: {shown}"
+    );
+    fixture.drop_fixture();
+}
+
+/// A bound dispatch cannot manufacture a nonordinary purpose by declaration;
+/// improvement and reflection purposes must come from the task or its lineage.
+#[test]
+fn unbacked_nonordinary_declaration_refuses_before_slot_or_launcher() {
+    let fixture = SpawnFixture::with_board("bound-unbacked");
+    let task = fixture.create_issue("Unbacked improvement", "task", None);
+    let assignment = fixture.assignment("unbacked.json", &task, Some("improvement"));
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-unbacked"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("nonordinary purposes are inherited"),
+        "{text}"
+    );
+    assert!(!text.contains("installed Codex launcher"), "{text}");
+    assert!(
+        !fixture.state_dir().exists(),
+        "an unbacked declaration must not claim a slot"
+    );
+    let shown = fixture.show(&task);
+    assert!(
+        shown
+            .get("metadata")
+            .and_then(|metadata| metadata.get("harness.purpose"))
+            .is_none(),
+        "an unbacked declaration must not write board purpose metadata: {shown}"
+    );
+    fixture.drop_fixture();
+}
+
+/// A board task id that the consuming board cannot resolve refuses before a
+/// slot claim or launcher, rather than becoming an unbound ordinary dispatch.
+#[test]
+fn unknown_board_task_refuses_before_slot_or_launcher() {
+    let fixture = SpawnFixture::with_board("bound-missing");
+    let missing = "assign-missing";
+    let assignment = fixture.assignment("missing.json", missing, Some("ordinary"));
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-missing"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("show failed") && text.contains(missing),
+        "{text}"
+    );
+    assert!(!text.contains("installed Codex launcher"), "{text}");
+    assert!(
+        !fixture.state_dir().exists(),
+        "an unknown board task must not claim a slot"
+    );
+    fixture.drop_fixture();
+}
+
+/// A task with no declared purpose and no nonordinary ancestor is retained as
+/// explicitly unknown, not inferred as ordinary, while the ordinary dispatch
+/// itself still works.
+#[test]
+fn unknown_purpose_is_retained_as_unknown_not_ordinary() {
+    let fixture = SpawnFixture::with_board("bound-unknown");
+    let task = fixture.create_issue("Unknown purpose task", "task", None);
+    let assignment = fixture.assignment("unknown.json", &task, None);
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-unknown"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let record = fixture.record(1);
+    let binding = &record["assignment"];
+    assert_eq!(binding["issue"], task, "{record}");
+    assert!(binding["purpose"].is_null(), "{record}");
+    assert_eq!(binding["purposeSource"], "unknown", "{record}");
+    let shown = fixture.show(&task);
+    assert!(
+        shown
+            .get("metadata")
+            .and_then(|metadata| metadata.get("harness.purpose"))
+            .is_none(),
+        "{shown}"
+    );
+    fixture.drop_fixture();
+}
+
+/// A repeated owner continues its exact slot binding; a different board task
+/// on that binding is refused and the original binding stays intact.
+#[test]
+fn conflicting_recorded_board_binding_refuses_a_retry() {
+    let fixture = SpawnFixture::with_board("bound-retry");
+    let first = fixture.create_issue("First bound task", "task", None);
+    let second = fixture.create_issue("Second bound task", "task", None);
+    let first_assignment = fixture.assignment("first.json", &first, None);
+    let second_assignment = fixture.assignment("second.json", &second, None);
+    let out = fixture.spawn(
+        &["--assignment", first_assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-retry"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let before = fixture.record(1);
+    assert_eq!(before["assignment"]["issue"], first, "{before}");
+
+    let out = fixture.spawn(
+        &["--assignment", second_assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-retry"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("is already bound to board task"),
+        "the recorded binding conflict must be named: {text}"
+    );
+    assert!(!text.contains("installed Codex launcher"), "{text}");
+    let after = fixture.record(1);
+    assert_eq!(
+        after["assignment"], before["assignment"],
+        "the refused retry must not replace the binding"
+    );
+    assert_eq!(after["handle"], before["handle"], "{after}");
+    fixture.drop_fixture();
+}
+
+/// Free text never resolves a board: the dispatch reaches the launcher and
+/// records no assignment binding.
+#[test]
+fn free_text_dispatch_keeps_an_unbound_slot_record() {
+    let fixture = SpawnFixture::new("free-text");
+    let out = fixture.spawn(&["--exec", "free text assignment"], &[]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let record = fixture.record(1);
+    assert!(record["assignment"].is_null(), "{record}");
+    assert!(
+        !fixture.base.source.join(".beads").exists(),
+        "free text must not initialize or contact a board"
+    );
+    fixture.drop_fixture();
+}
+
+/// A schema-1 assignment without `board_task` keeps the legacy unbound path.
+#[test]
+fn legacy_structured_dispatch_keeps_an_unbound_slot_record() {
+    let fixture = SpawnFixture::new("legacy-structure");
+    let assignment = fixture.legacy_assignment("legacy.json");
+    let out = fixture.spawn(&["--assignment", assignment.to_str().unwrap()], &[]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let record = fixture.record(1);
+    assert!(record["assignment"].is_null(), "{record}");
+    fixture.drop_fixture();
 }

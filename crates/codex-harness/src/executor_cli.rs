@@ -4,6 +4,7 @@
 //! succession, OFAP 4.1).
 #![cfg(windows)]
 
+use harness_core::delivery_reflection::Purpose;
 use harness_core::native_launcher;
 #[cfg(test)]
 use harness_core::orchestration_config::executor_session_args;
@@ -1183,7 +1184,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     // preserving its checkout and partial work without a reset. A legacy
     // session record keeps the existing adoption so an interrupted
     // pre-migration session still resumes the same slot.
-    let (index, path, base, task, handle) = match task_worktree::load_slot_record(
+    let (index, path, base, task, handle, assignment) = match task_worktree::load_slot_record(
         &codex_home,
         &repository,
         slot,
@@ -1210,6 +1211,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
                 continued.base.clone().unwrap_or_default(),
                 Some(task),
                 continued.handle,
+                record.assignment.as_deref().cloned(),
             )
         }
         _ => {
@@ -1221,6 +1223,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
                 record.base.clone().unwrap_or_default(),
                 None,
                 None,
+                record.assignment.as_deref().cloned(),
             )
         }
     };
@@ -1238,6 +1241,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         branch,
         task,
         handle,
+        assignment,
     };
     // The slot is adopted without a reset, so a rejected structured
     // assignment keeps its claim and its partial work for the next resume.
@@ -1699,6 +1703,11 @@ struct SlotBinding {
     task: Option<String>,
     #[serde(default)]
     handle: Option<String>,
+    /// Verified consumer-board task and assignment identity, when the
+    /// structured assignment declared `board_task`. An unknown purpose is
+    /// retained as unknown, not inferred from the task binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignment: Option<task_worktree::SlotAssignmentBinding>,
 }
 
 impl SlotBinding {
@@ -1719,8 +1728,32 @@ struct PreparedDispatch {
     route: HostRoute,
 }
 
+/// Resolve a structured assignment's declared consumer-board task before any
+/// slot is claimed, reset or bound. Legacy free-text and structured
+/// assignments without `board_task` never discover or contact a board.
+fn resolve_assignment_binding(
+    request: &Dispatch,
+) -> io::Result<Option<task_worktree::SlotAssignmentBinding>> {
+    let PromptSource::Structured(assignment) = &request.prompt else {
+        return Ok(None);
+    };
+    let Some(issue) = assignment.board_task.as_deref() else {
+        return Ok(None);
+    };
+    let bd = crate::feedback_cli::discover_bd().map_err(|error| {
+        invalid(&format!(
+            "board task '{issue}' is declared but the consumer board executable is unavailable: {error}"
+        ))
+    })?;
+    executor_assignment::bind_board_task(assignment, request.repository, &bd).map(Some)
+}
+
 fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
     let bound = orchestration_config::binding(request.codex_home, request.profile)?;
+    // A board refusal is decided against the consuming repository before the
+    // slot is claimed, so a conflicting or unavailable task has no checkout
+    // effect and starts no model.
+    let assignment = resolve_assignment_binding(request)?;
     let slot = acquire_pool_slot(request)?;
     let binding = SlotBinding {
         index: slot.index,
@@ -1733,6 +1766,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         branch: slot.branch.clone(),
         task: slot.task.clone(),
         handle: slot.handle.clone(),
+        assignment,
     };
     // A structured assignment is validated against the checkout that was
     // actually allocated, before any launcher process starts.
@@ -1740,6 +1774,26 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         Ok(prompt) => prompt,
         Err(error) => return Err(release_unused_claim(request, &binding, error)),
     };
+    // Attach the verified binding to the existing durable slot record. This
+    // runs after path validation and before any launcher. A recorded binding
+    // conflict is refused with the slot and its work untouched; unlike a
+    // rejected new assignment, it must not discard a binding the lead holds.
+    if let Some(assignment) = binding.assignment.as_ref() {
+        let (Some(task), Some(handle)) = (binding.task.as_deref(), binding.handle.as_deref())
+        else {
+            return Err(invalid(
+                "the selected slot has no durable task binding; a board-bound assignment requires one and was not dispatched",
+            ));
+        };
+        task_worktree::bind_slot_assignment(
+            request.codex_home,
+            request.repository,
+            binding.index,
+            task,
+            handle,
+            assignment.clone(),
+        )?;
+    }
     let paths = run_paths(request.codex_home, request.repository, binding.index)?;
     // Default and both presentation spellings share one control lifecycle.
     // The native frontend is attached by the host; explicit exec qualifies
@@ -2808,6 +2862,60 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
     match &request.prompt {
         PromptSource::FreeText(text) => Ok(executor_assignment::free_text_brief(text)),
         PromptSource::Structured(assignment) => {
+            let recorded = binding.assignment.as_ref();
+            if let Some(declared) = assignment.board_task.as_deref() {
+                match recorded {
+                    Some(recorded) if recorded.issue == declared => {
+                        let content = assignment.content_sha256()?;
+                        if content != recorded.assignment_sha256 {
+                            return Err(invalid(&format!(
+                                "board task '{declared}' on slot {} carries assignment {content}, not the recorded assignment {}; a changed assignment is a new bound run, not a silent continuation",
+                                binding.index, recorded.assignment_sha256
+                            )));
+                        }
+                    }
+                    Some(recorded) => {
+                        return Err(invalid(&format!(
+                            "slot {} is bound to board task '{}', not '{}'; continue the recorded binding or dispatch the other task into its own slot",
+                            binding.index, recorded.issue, declared
+                        )));
+                    }
+                    None => {
+                        return Err(invalid(&format!(
+                            "board task '{declared}' has no recorded binding on slot {}; dispatch it as a fresh bound assignment instead of resuming an unbound slot",
+                            binding.index
+                        )));
+                    }
+                }
+            }
+            // The brief carries the effective purpose: the lead's explicit
+            // declaration when present, otherwise the purpose retained on the
+            // slot binding. An unknown purpose stays absent.
+            let mut effective = assignment.clone();
+            if let Some(recorded) = recorded {
+                match (assignment.purpose.as_deref(), recorded.purpose.as_deref()) {
+                    (Some(declared), Some(bound)) => {
+                        let declared = Purpose::parse(declared)?;
+                        let bound = Purpose::parse(bound)?;
+                        if declared != bound {
+                            return Err(invalid(&format!(
+                                "assignment purpose '{}' contradicts the recorded binding purpose '{}' on slot {}",
+                                declared.as_str(),
+                                bound.as_str(),
+                                binding.index
+                            )));
+                        }
+                    }
+                    (Some(_), None) => {
+                        return Err(invalid(&format!(
+                            "slot {} records an unknown purpose for this binding; dispatch the declaration as a new bound assignment instead of changing the retained binding",
+                            binding.index
+                        )));
+                    }
+                    (None, Some(bound)) => effective.purpose = Some(bound.to_owned()),
+                    (None, None) => {}
+                }
+            }
             let context = executor_assignment::AssignmentContext {
                 checkout: &binding.path,
                 base: &binding.base,
@@ -2817,8 +2925,8 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
             // The brief heading names the role the conversation actually
             // runs as; the declared contract itself is identical.
             match request.role {
-                Role::Executor => executor_assignment::brief(assignment, &context),
-                Role::Lead => executor_assignment::lead_brief(assignment, &context),
+                Role::Executor => executor_assignment::brief(&effective, &context),
+                Role::Lead => executor_assignment::lead_brief(&effective, &context),
                 Role::ExecutorSelfReflection | Role::LeadSelfReflection => Err(invalid(
                     "reflection roles are not executor or lead dispatches",
                 )),
@@ -8411,6 +8519,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         let text = resolve_prompt(&request, &binding).unwrap();
         assert!(text.starts_with("finish the sample outcome"), "{text}");
@@ -10289,6 +10398,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         let line = slot_summary(Role::Executor, &binding, None);
         for expected in [
@@ -10326,6 +10436,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         assert!(
             record_lease(&home, &binding).is_err(),
@@ -10396,6 +10507,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         // A hand-edited receipt meets the slot state reconciliation leaves
         // behind: no owner, so no ownership comparison can ever succeed.
@@ -11018,6 +11130,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         write_test_slot_record(&home, &source, &binding);
         let report = slot_report(
@@ -11174,6 +11287,7 @@ mod tests {
             branch: None,
             task: None,
             handle: None,
+            assignment: None,
         };
         let mut run = RunObservation::accepted(
             PathBuf::from(r"C:\s\message-1.txt"),
