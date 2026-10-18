@@ -935,7 +935,7 @@ pub struct StageStart {
 /// The cumulative allowance state visible before a new native stage attempt.
 /// Native enforcement uses both the stage and accepted-record counters so a
 /// tool or context overrun cannot wait for a later admission check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageAdmission {
     pub stage_turns_used: u64,
     pub stage_turns_limit: u64,

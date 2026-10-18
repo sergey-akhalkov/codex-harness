@@ -1,13 +1,14 @@
 //! Foreground surface runner for one reflection stage.
 //!
 //! The managed lead host's journal consumer is model-free and has no terminal.
-//! A fresh stage still needs a visibly titled native frontend whose attachment
-//! is verified before the model turn is submitted. Exactly one foreground
-//! trampoline therefore runs the existing stage body in its own visible
-//! console; the consumer waits for that process and reads its retained
-//! `StageState`. Reuse, reconciliation and every refusal stay in the model-free
-//! consumer, and no second stage is started when the trampoline's outcome is
-//! unknown.
+//! A stage still needs a visibly titled native frontend whenever it can attach
+//! one or submit model work: a fresh stage admits its first turn, a submitted
+//! turn is reconciled, and a retained pre-submission fork resumes the exact
+//! existing thread. Exactly one foreground trampoline therefore runs the
+//! existing stage body in its own visible console; the consumer waits for that
+//! process and reads its retained `StageState`. Completed, refused and other
+//! non-recoverable retained states stay model-free in the consumer, and no
+//! second runner is started when the trampoline's outcome is unknown.
 
 use super::*;
 use harness_core::process::{
@@ -20,70 +21,6 @@ const RUNNER_SCHEMA: u32 = 1;
 /// above the stage's own native turn bound and never extends model work.
 const SURFACE_MARGIN: u64 = 120;
 const SURFACE_CLEANUP: Duration = Duration::from_secs(10);
-
-/// `StageAdmission` is serialized by its owner but does not implement
-/// deserialization. This exact mirror carries the same public allowances into
-/// the trampoline; the parent remains the only owner that begins a stage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct AdmissionState {
-    stage_turns_used: u64,
-    stage_turns_limit: u64,
-    stage_tokens_used: u64,
-    stage_tokens_limit: u64,
-    stage_investigations_used: u64,
-    stage_investigations_limit: u64,
-    stage_context_bytes_used: u64,
-    stage_context_bytes_limit: u64,
-    record_investigations_used: u64,
-    record_investigations_limit: u64,
-    record_context_bytes_used: u64,
-    record_context_bytes_limit: u64,
-    record_tokens_used: u64,
-    record_tokens_limit: u64,
-}
-
-impl From<&StageAdmission> for AdmissionState {
-    fn from(admission: &StageAdmission) -> Self {
-        Self {
-            stage_turns_used: admission.stage_turns_used,
-            stage_turns_limit: admission.stage_turns_limit,
-            stage_tokens_used: admission.stage_tokens_used,
-            stage_tokens_limit: admission.stage_tokens_limit,
-            stage_investigations_used: admission.stage_investigations_used,
-            stage_investigations_limit: admission.stage_investigations_limit,
-            stage_context_bytes_used: admission.stage_context_bytes_used,
-            stage_context_bytes_limit: admission.stage_context_bytes_limit,
-            record_investigations_used: admission.record_investigations_used,
-            record_investigations_limit: admission.record_investigations_limit,
-            record_context_bytes_used: admission.record_context_bytes_used,
-            record_context_bytes_limit: admission.record_context_bytes_limit,
-            record_tokens_used: admission.record_tokens_used,
-            record_tokens_limit: admission.record_tokens_limit,
-        }
-    }
-}
-
-impl From<&AdmissionState> for StageAdmission {
-    fn from(state: &AdmissionState) -> Self {
-        Self {
-            stage_turns_used: state.stage_turns_used,
-            stage_turns_limit: state.stage_turns_limit,
-            stage_tokens_used: state.stage_tokens_used,
-            stage_tokens_limit: state.stage_tokens_limit,
-            stage_investigations_used: state.stage_investigations_used,
-            stage_investigations_limit: state.stage_investigations_limit,
-            stage_context_bytes_used: state.stage_context_bytes_used,
-            stage_context_bytes_limit: state.stage_context_bytes_limit,
-            record_investigations_used: state.record_investigations_used,
-            record_investigations_limit: state.record_investigations_limit,
-            record_context_bytes_used: state.record_context_bytes_used,
-            record_context_bytes_limit: state.record_context_bytes_limit,
-            record_tokens_used: state.record_tokens_used,
-            record_tokens_limit: state.record_tokens_limit,
-        }
-    }
-}
 
 /// The exact inputs of one foreground stage. The child re-resolves the role and
 /// profile and refuses title drift before starting; it never re-begins stage
@@ -98,7 +35,7 @@ struct StageRequest {
     state_path: PathBuf,
     result_path: PathBuf,
     native_title: String,
-    admission: Option<AdmissionState>,
+    admission: Option<StageAdmission>,
     coordinator: ProcessIdentity,
     coordinator_program: PathBuf,
 }
@@ -129,8 +66,9 @@ struct StageResult {
     surface: SurfaceEvidence,
 }
 
-/// Runs one fresh stage in its own visible console, or delegates a model-free
-/// continuation/refusal to the existing stage body in this process.
+/// Runs a stage that can attach a frontend or submit model work in its own
+/// visible console, and delegates every model-free retained outcome to the
+/// existing stage body in this process.
 pub(super) fn run_stage_in_surface(
     chain: &ChainState,
     stage: Stage,
@@ -146,13 +84,24 @@ pub(super) fn run_stage_in_surface(
     } else {
         None
     };
-    let fresh = retained
-        .as_ref()
-        .is_none_or(|state| state.status == StageStatus::NotStarted);
-    // Only a fresh stage with a fresh admission can start model work. A
-    // retained completed stage, a submitted turn and every refusal are handled
-    // by the existing stage body without a terminal.
-    if !fresh || admission.is_none() {
+    // The existing stage body owns every transition, but it may attach a
+    // frontend or submit model work while doing so: a submitted turn is
+    // reconciled, and a known pre-submission loss resumes its retained fork and
+    // admits the initial turn. Those states need the same titled foreground
+    // surface as a fresh stage. Completed and non-recoverable retained states
+    // stay model-free and are handled in this process.
+    let use_foreground = match retained.as_ref() {
+        None => admission.is_some(),
+        Some(state) => match state.status {
+            StageStatus::NotStarted => admission.is_some(),
+            StageStatus::TurnSubmitted => true,
+            StageStatus::VisibilityLost => {
+                state.turn_id.is_none() && state.fork.is_some() && admission.is_some()
+            }
+            _ => false,
+        },
+    };
+    if !use_foreground {
         return run_stage(
             chain,
             stage,
@@ -171,7 +120,7 @@ pub(super) fn run_stage_in_surface(
         prepared,
         state_path,
         prompt,
-        admission.expect("checked above"),
+        admission,
     )
 }
 
@@ -182,7 +131,7 @@ fn launch_surface(
     prepared: &PreparedStage,
     state_path: &Path,
     prompt: String,
-    admission: &StageAdmission,
+    admission: Option<&StageAdmission>,
 ) -> io::Result<StageState> {
     let directory = state_path
         .parent()
@@ -219,7 +168,7 @@ fn launch_surface(
         state_path: state_path.to_owned(),
         result_path: result_path.clone(),
         native_title: prepared.native_title.clone(),
-        admission: Some(AdmissionState::from(admission)),
+        admission: admission.cloned(),
         coordinator,
         coordinator_program: coordinator_program.clone(),
     };
@@ -488,7 +437,6 @@ pub(super) fn execute_stage_runner(request_path: &Path) -> io::Result<i32> {
             request.role
         )));
     }
-    let admission = request.admission.as_ref().map(StageAdmission::from);
     let outcome = run_stage(
         &request.chain,
         stage,
@@ -497,7 +445,7 @@ pub(super) fn execute_stage_runner(request_path: &Path) -> io::Result<i32> {
         &prepared,
         &request.state_path,
         request.prompt,
-        admission.as_ref(),
+        request.admission.as_ref(),
     );
     if harness_core::process_service::ServiceProcess::inspect(
         request.coordinator,

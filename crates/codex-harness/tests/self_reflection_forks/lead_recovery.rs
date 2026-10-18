@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use std::{
     ffi::OsString,
     fs,
+    os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -1092,11 +1093,10 @@ fn host_status(home: &Path, lead: &str) -> Option<(PathBuf, Value, String)> {
 /// The managed lead host's existing model-free `_serve` consumer runs the two
 /// pending reflection stages in their own visibly titled foreground surfaces,
 /// retains the real executor and lead results, and delivers the synthesis
-/// exactly once. The isolated source home enables the upstream goal RPC so the
-/// production fork preflight can read the source goal; the fork request itself
-/// still carries the production fork-local feature/goal suppression. The
-/// goals-disabled source-home correction is a separate owner's work and is not
-/// relaxed here.
+/// exactly once. The ordinary source home config uses `features.goals = false`;
+/// the reflection app-server's process-scope admin override still supports the
+/// source goal reads and clears the production fork preflight needs, while the
+/// fork keeps its own production `features.goals = false`.
 #[test]
 #[ignore = "requires the installed native upstream and the checkout-built launcher; owned canned Responses; no live model"]
 fn native_managed_host_runs_reflections_in_distinct_surfaces_and_delivers_once() {
@@ -1135,11 +1135,11 @@ fn native_managed_host_runs_reflections_in_distinct_surfaces_and_delivers_once()
         }
         message(FIRST_REPLY)
     });
-    // The managed host's fork preflight reads the source goal through
-    // `thread/goal/get`; this isolated home enables that upstream RPC. The
-    // fork's own request still carries `features.goals = false` from the
-    // production feature switches.
-    write_config(&home, &checkout, responses.port, true);
+    // The ordinary source home keeps `features.goals = false`. The production
+    // goal fix serves the fork preflight's source goal reads and clears through
+    // the reflection app-server's process-scope admin override, while the fork
+    // itself keeps the production `features.goals = false` suppression.
+    write_config(&home, &checkout, responses.port, false);
     let entry = manager();
     let registry = home.join("harness/lead-endpoints");
     fs::create_dir_all(&registry).unwrap();
@@ -1539,4 +1539,818 @@ fn native_managed_host_runs_reflections_in_distinct_surfaces_and_delivers_once()
         lead_pid,
         evidence.display()
     );
+}
+
+/// Reads one durable stage state until it names the expected status. The
+/// owning runner rewrites this file several times around a native turn.
+fn wait_for_stage_status(state_path: &Path, status: &str) -> Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let current = fs::read(state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if current
+            .as_ref()
+            .is_some_and(|value| value["status"] == status)
+        {
+            return current.unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} did not reach status {status}: {current:?}",
+            state_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// TurnSubmitted reconciliation attaches a frontend, so it cannot run in the
+/// model-free consumer's redirected pipe. The provider response is held until
+/// the exact fork and turn are retained; the state file then refuses the
+/// terminal replace so the first host fails with `turn-submitted` still
+/// durable. The supported same-thread successor must reconcile that exact turn
+/// in a new visibly titled foreground surface, with no second fork or provider
+/// turn and one delivered synthesis.
+#[test]
+#[ignore = "requires the installed native upstream and the checkout-built launcher; owned canned Responses; no live model"]
+fn native_managed_host_reconciles_retained_submitted_turn_in_a_new_surface() {
+    // Read sharing stays open so the accepted owner can still classify the
+    // retained turn; write and delete sharing stay closed so the staged
+    // terminal replace cannot overwrite the submitted state.
+    const SHARE_READ_ONLY: u32 = 0x1;
+    let evidence = tempfile::Builder::new()
+        .prefix("lead-recovery-managed-retained-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let home = evidence.join("home");
+    fs::create_dir_all(home.join("harness")).unwrap();
+    let upstream = installed_upstream();
+    let build = launcher_build(&home, &checkout);
+    write_registration(&home, &build, &upstream);
+    let release = evidence.join("executor-release");
+    let provider_release = release.clone();
+    let responses =
+        control_responses::Responses::routed(evidence.join("provider"), move |request| {
+            if title_generation_request(request) {
+                return message("Managed retained fixture");
+            }
+            let prompt = request["input"].to_string();
+            if prompt.contains(LEAD_PROMPT_MARKER) {
+                if !prompt.contains(EXECUTOR_RESULT_TEXT) {
+                    return message("LEAD-RECOVERY-MISSING-EXECUTOR-RESULT");
+                }
+                return message(LEAD_RESULT_TEXT);
+            }
+            if prompt.contains(EXECUTOR_PROMPT_MARKER) {
+                let until = Instant::now() + WAIT;
+                while !provider_release.is_file() {
+                    assert!(
+                        Instant::now() < until,
+                        "the test never released the held executor reflection response"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                return message(EXECUTOR_RESULT_TEXT);
+            }
+            if prompt.contains("LEAD-RECOVERY-OWNED-EXECUTOR-SOURCE") {
+                return message(EXECUTOR_SOURCE_REPLY);
+            }
+            message(FIRST_REPLY)
+        });
+    // The ordinary source home keeps `features.goals = false`; the reflection
+    // app-server's process-scope admin override serves the source goal reads
+    // and clears while the fork keeps its own goal suppression.
+    write_config(&home, &checkout, responses.port, false);
+    let entry = manager();
+    let registry = home.join("harness/lead-endpoints");
+    fs::create_dir_all(&registry).unwrap();
+    println!("managed retained recovery evidence: {}", evidence.display());
+
+    let (executor_thread, executor_turn) = native_executor_source(&home, &build, &evidence);
+
+    let host = spawn_lead(
+        &entry,
+        &home,
+        &checkout,
+        None,
+        Some(FIRST_PROMPT),
+        &evidence,
+    );
+    let (_, endpoint) = wait_for_endpoint(&registry, WAIT);
+    let thread = endpoint["threadId"].as_str().unwrap().to_owned();
+    let port = u16::try_from(endpoint["port"].as_u64().unwrap()).unwrap();
+    let token = endpoint["token"].as_str().unwrap().to_owned();
+    let (host_identity, host_program) = endpoint_process(&endpoint);
+    assert!(process_is_live(host_identity, &host_program));
+    assert_eq!(endpoint_records(&registry).len(), 1);
+    let first_turn = completed_turn(port, &token, &thread);
+    let board = evidence.join("board");
+    let (state_path, task, acceptance) = accepted_board(
+        &home,
+        &board,
+        &executor_thread,
+        &executor_turn,
+        &thread,
+        &first_turn,
+    );
+    let accepted_binding = {
+        let state: ReflectionState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state
+            .records
+            .get(&acceptance)
+            .expect("the accepted record's binding")
+            .binding
+            .clone()
+    };
+    eprintln!(
+        "accepted board: task {task} acceptance {acceptance} executor {executor_thread}/{executor_turn} lead {thread}/{first_turn}"
+    );
+
+    let chain_dir = state_path.with_extension("").join(&acceptance);
+    let executor_stage = chain_dir.join("executor-stage.json");
+    let lead_stage = chain_dir.join("lead-stage.json");
+    let delivery_path = chain_dir.join("lead-delivery.json");
+    let executor_surface_path = executor_stage.with_extension("surface.json");
+    let lead_surface_path = lead_stage.with_extension("surface.json");
+
+    let submitted = wait_for_stage_status(&executor_stage, "turn-submitted");
+    assert!(
+        wait_until(WAIT, || {
+            reflection_request_count(&evidence, EXECUTOR_PROMPT_MARKER) == 1
+        }),
+        "the executor reflection never reached the held canned provider response"
+    );
+    let fork_thread = submitted["fork"]["forkThread"]
+        .as_str()
+        .expect("the submitted stage retains its fork")
+        .to_owned();
+    let turn_id = submitted["turnId"]
+        .as_str()
+        .expect("the submitted stage retains its turn")
+        .to_owned();
+    assert!(
+        !fork_thread.is_empty() && !turn_id.is_empty(),
+        "{submitted}"
+    );
+    let (_, running_status, _) = host_status(&home, &thread).expect("the managed host status");
+    assert_eq!(running_status["state"], "running", "{running_status}");
+    let controller_pid = running_status["process"]["pid"].as_u64().unwrap();
+    let controller_created = running_status["process"]["creationTime"].as_u64().unwrap();
+    let controller_program = PathBuf::from(running_status["process"]["program"].as_str().unwrap());
+    let controller_identity = ProcessIdentity {
+        pid: u32::try_from(controller_pid).unwrap(),
+        creation_time: controller_created,
+    };
+    assert!(process_is_live(controller_identity, &controller_program));
+
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_ONLY)
+        .open(&executor_stage)
+        .expect("guard the submitted stage state against the terminal replace");
+    fs::write(&release, "release the held executor response").unwrap();
+    assert!(
+        wait_until(WAIT, || {
+            host_status(&home, &thread).is_some_and(|(_, status, _)| status["state"] == "failed")
+        }),
+        "the model-free host did not stop after the terminal stage write was refused"
+    );
+    let (_, failed_status, failed_log) = host_status(&home, &thread).unwrap();
+    assert!(
+        failed_log.contains("foreground surface"),
+        "the failing first host kept no foreground evidence:\n{failed_status}\n{failed_log}"
+    );
+    let failed_surface: Value =
+        serde_json::from_slice(&fs::read(&executor_surface_path).unwrap()).unwrap();
+    assert_eq!(failed_surface["consoleAttached"], true, "{failed_surface}");
+    assert_eq!(
+        failed_surface["captionBefore"], failed_surface["nativeTitle"],
+        "{failed_surface}"
+    );
+    let failed_surface_identity = (
+        failed_surface["identity"]["pid"].as_u64().unwrap(),
+        failed_surface["identity"]["creation_time"]
+            .as_u64()
+            .unwrap(),
+    );
+
+    let outcome = quit_session(host, &entry);
+    assert_eq!(
+        outcome.outcome.reason,
+        StopReason::Exited,
+        "{}",
+        outcome.transcript
+    );
+    assert_eq!(outcome.outcome.exit_code, 0, "{}", outcome.transcript);
+    wait_process_gone(
+        host_identity,
+        &host_program,
+        "the first managed host app-server",
+    );
+    wait_process_gone(
+        controller_identity,
+        &controller_program,
+        "the failed journal consumer",
+    );
+    drop(guard);
+
+    let after_failure = read_json(&executor_stage);
+    assert_eq!(after_failure["status"], "turn-submitted", "{after_failure}");
+    assert_eq!(after_failure["fork"]["forkThread"], fork_thread);
+    assert_eq!(after_failure["turnId"], turn_id);
+    let in_flight: ReflectionState =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let in_flight = in_flight
+        .records
+        .get(&acceptance)
+        .expect("the accepted record stays retained");
+    assert_eq!(
+        in_flight.executor.state,
+        RecordedStageState::InFlight,
+        "{in_flight:?}"
+    );
+    assert_eq!(in_flight.executor.usage.attempts, 1, "{in_flight:?}");
+    assert_eq!(in_flight.executor.usage.turns, 0, "{in_flight:?}");
+
+    // The first host's failed receipt stays on disk under the same lead
+    // thread. Only a status written after this successor started describes
+    // the successor's own controller.
+    let successor_started = std::time::SystemTime::now();
+    let successor = spawn_lead(&entry, &home, &checkout, Some(&thread), None, &evidence);
+    let (_, successor_endpoint) = wait_for_replacement_endpoint(&registry, host_identity.pid, WAIT);
+    let successor_port = u16::try_from(successor_endpoint["port"].as_u64().unwrap()).unwrap();
+    let successor_token = successor_endpoint["token"].as_str().unwrap().to_owned();
+    let (successor_identity, successor_program) = endpoint_process(&successor_endpoint);
+    assert!(process_is_live(successor_identity, &successor_program));
+    assert_eq!(
+        successor_endpoint["threadId"].as_str(),
+        Some(thread.as_str()),
+        "the successor must resume the exact same lead thread"
+    );
+
+    let deadline = Instant::now() + COMPLETE_WAIT;
+    let mut observed_status = Value::Null;
+    let mut observed_log = String::new();
+    let record = loop {
+        let state = fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ReflectionState>(&bytes).ok())
+            .and_then(|state| state.records.get(&acceptance).cloned());
+        if let Some((path, status, log)) = host_status(&home, &thread) {
+            let fresh = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified >= successor_started);
+            if fresh && status["state"] == "failed" {
+                panic!("the successor host failed before delivery: {status}\nlog:\n{log}");
+            }
+            observed_status = status;
+            observed_log = log;
+        }
+        let complete = state.as_ref().is_some_and(|record| {
+            record.executor.state == RecordedStageState::Retained
+                && record.lead.state == RecordedStageState::Retained
+                && record.delivery == RecordedDeliveryState::Consumed
+        });
+        if complete {
+            break state.expect("the completed acceptance retains its record");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the successor did not reconcile the retained turn and deliver; record={state:?} status={observed_status}\nlog:\n{observed_log}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!("successor host status: {observed_status}\nhost log:\n{observed_log}");
+
+    assert_eq!(
+        record.executor.state,
+        RecordedStageState::Retained,
+        "{record:?}"
+    );
+    assert_eq!(
+        record.executor.usage.attempts, 1,
+        "reconciliation began a second accepted attempt: {record:?}"
+    );
+    assert_eq!(
+        record.executor.usage.turns, 1,
+        "reconciliation did not retain exactly the one submitted turn: {record:?}"
+    );
+    assert!(record.executor.usage.tokens > 0, "{record:?}");
+    assert_eq!(
+        record
+            .executor
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.summary.as_str()),
+        Some(EXECUTOR_RESULT_TEXT),
+        "{record:?}"
+    );
+    assert_eq!(
+        record.lead.state,
+        RecordedStageState::Retained,
+        "{record:?}"
+    );
+    assert_eq!(record.lead.usage.attempts, 1, "{record:?}");
+    assert_eq!(
+        record.delivery,
+        RecordedDeliveryState::Consumed,
+        "{record:?}"
+    );
+    assert_eq!(
+        record.binding, accepted_binding,
+        "the accepted task/acceptance binding changed during retained recovery"
+    );
+    assert_eq!(record.binding.task, task);
+    assert_eq!(record.acceptance_id, acceptance);
+    assert_eq!(
+        record.binding.executor_session.as_deref(),
+        Some(executor_thread.as_str())
+    );
+    assert_eq!(
+        record.binding.executor_turn.as_deref(),
+        Some(executor_turn.as_str())
+    );
+    assert_eq!(record.binding.lead_session, thread);
+    assert_eq!(
+        record.binding.lead_turn.as_deref(),
+        Some(first_turn.as_str())
+    );
+
+    let executor_native: Value = read_json(&executor_stage);
+    assert_eq!(executor_native["status"], "completed", "{executor_native}");
+    assert_eq!(
+        executor_native["fork"]["forkThread"], fork_thread,
+        "reconciliation forked again: {executor_native}"
+    );
+    assert_eq!(
+        executor_native["turnId"], turn_id,
+        "reconciliation submitted another turn: {executor_native}"
+    );
+    assert_eq!(
+        executor_native["result"], EXECUTOR_RESULT_TEXT,
+        "{executor_native}"
+    );
+    assert_eq!(executor_native["usageKnown"], true, "{executor_native}");
+    let lead_native: Value = read_json(&lead_stage);
+    assert_eq!(lead_native["status"], "completed", "{lead_native}");
+    assert_eq!(lead_native["result"], LEAD_RESULT_TEXT, "{lead_native}");
+    assert_eq!(
+        reflection_request_count(&evidence, EXECUTOR_PROMPT_MARKER),
+        1,
+        "the retained executor turn was submitted to the provider twice"
+    );
+    assert_eq!(
+        reflection_request_count(&evidence, LEAD_PROMPT_MARKER),
+        1,
+        "the lead reflection did not run exactly once"
+    );
+
+    let (_, final_status, _) = host_status(&home, &thread).expect("the successor host status");
+    assert_eq!(final_status["state"], "running", "{final_status}");
+    let successor_controller_pid = final_status["process"]["pid"].as_u64().unwrap();
+    let successor_controller_created = final_status["process"]["creationTime"].as_u64().unwrap();
+    let successor_controller_program =
+        PathBuf::from(final_status["process"]["program"].as_str().unwrap());
+    assert_ne!(
+        successor_controller_pid, controller_pid,
+        "the successor kept the failed consumer"
+    );
+    let successor_controller_identity = ProcessIdentity {
+        pid: u32::try_from(successor_controller_pid).unwrap(),
+        creation_time: successor_controller_created,
+    };
+    assert!(process_is_live(
+        successor_controller_identity,
+        &successor_controller_program
+    ));
+    let reconciled_surface: Value = read_json(&executor_surface_path);
+    assert_eq!(
+        reconciled_surface["role"], "executor-self-reflection",
+        "{reconciled_surface}"
+    );
+    assert_eq!(
+        reconciled_surface["consoleAttached"], true,
+        "{reconciled_surface}"
+    );
+    assert_eq!(
+        reconciled_surface["captionBefore"], reconciled_surface["nativeTitle"],
+        "{reconciled_surface}"
+    );
+    assert!(
+        reconciled_surface["nativeTitle"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("ERefl ")),
+        "{reconciled_surface}"
+    );
+    assert_eq!(
+        reconciled_surface["coordinator"]["pid"], successor_controller_pid,
+        "{reconciled_surface}"
+    );
+    assert_eq!(
+        reconciled_surface["coordinator"]["creation_time"], successor_controller_created,
+        "{reconciled_surface}"
+    );
+    assert!(
+        same_program(
+            Path::new(reconciled_surface["coordinatorProgram"].as_str().unwrap()),
+            &successor_controller_program
+        ),
+        "the reconciling surface belongs to another controller: {reconciled_surface}"
+    );
+    assert!(
+        same_program(
+            Path::new(reconciled_surface["program"].as_str().unwrap()),
+            &successor_controller_program
+        ),
+        "the reconciling trampoline is not the exact controller binary: {reconciled_surface}"
+    );
+    let reconciled_surface_identity = (
+        reconciled_surface["identity"]["pid"].as_u64().unwrap(),
+        reconciled_surface["identity"]["creation_time"]
+            .as_u64()
+            .unwrap(),
+    );
+    assert_ne!(
+        reconciled_surface_identity, failed_surface_identity,
+        "reconciliation reused the failed foreground process"
+    );
+    let lead_surface: Value = read_json(&lead_surface_path);
+    assert_eq!(lead_surface["consoleAttached"], true, "{lead_surface}");
+    assert!(
+        lead_surface["nativeTitle"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("LRefl ")),
+        "{lead_surface}"
+    );
+
+    let delivery: Value = serde_json::from_slice(&fs::read(&delivery_path).unwrap()).unwrap();
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    assert_eq!(delivery["by"], "clientId", "{delivery}");
+    let client_message_id = delivery["clientMessageId"].as_str().unwrap().to_owned();
+    assert!(!client_message_id.is_empty());
+    assert_eq!(
+        record.delivery_receipt.as_deref(),
+        Some(client_message_id.as_str()),
+        "{record:?}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            delivered_user_message_items(
+                successor_port,
+                &successor_token,
+                &thread,
+                &client_message_id,
+            ) == 1
+        }),
+        "the resumed lead conversation did not show exactly one delivered synthesis"
+    );
+
+    std::thread::sleep(Duration::from_secs(6));
+    let after: ReflectionState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let after_record = after.records.get(&acceptance).unwrap();
+    assert_eq!(after_record.executor.usage.attempts, 1, "{after_record:?}");
+    assert_eq!(
+        reflection_request_count(&evidence, EXECUTOR_PROMPT_MARKER),
+        1,
+        "the settled successor submitted the retained turn again"
+    );
+    assert_eq!(
+        delivered_user_message_items(
+            successor_port,
+            &successor_token,
+            &thread,
+            &client_message_id,
+        ),
+        1,
+        "the retained delivery was replayed"
+    );
+    let issue = board_cli::show_issue(Path::new("bd.exe"), &board, &task).unwrap();
+    assert_eq!(issue["status"], "closed", "{issue}");
+
+    let outcome = quit_session(successor, &entry);
+    assert_eq!(
+        outcome.outcome.reason,
+        StopReason::Exited,
+        "{}",
+        outcome.transcript
+    );
+    assert_eq!(outcome.outcome.exit_code, 0, "{}", outcome.transcript);
+    wait_process_gone(
+        successor_identity,
+        &successor_program,
+        "the successor app-server",
+    );
+    assert!(
+        endpoint_records(&registry).is_empty(),
+        "no endpoint record may outlive either host"
+    );
+    eprintln!(
+        "managed retained recovery: task {task} acceptance {acceptance} fork {fork_thread} turn {turn_id}; old host pid {} successor pid {}; evidence {}",
+        host_identity.pid,
+        successor_identity.pid,
+        evidence.display()
+    );
+}
+
+/// Asserts that one retained surface artifact proves a distinct titled console
+/// owned by the invoking accepted process, with the executor role title, and
+/// returns the foreground process identity so cleanup can be checked.
+fn assert_foreground_surface(
+    surface: &Value,
+    coordinator: ProcessIdentity,
+    prefix: &str,
+) -> ProcessIdentity {
+    assert_eq!(surface["schema"], 1, "{surface}");
+    assert_eq!(surface["role"], "executor-self-reflection", "{surface}");
+    assert_eq!(surface["consoleAttached"], true, "{surface}");
+    assert_eq!(
+        surface["captionBefore"], surface["nativeTitle"],
+        "{surface}"
+    );
+    assert!(
+        surface["nativeTitle"].as_str().is_some_and(|title| {
+            title.starts_with(prefix) && title.contains("/deepseek/") && title.contains("/max#")
+        }),
+        "{surface}"
+    );
+    assert_eq!(surface["coordinator"]["pid"], coordinator.pid, "{surface}");
+    assert_eq!(
+        surface["coordinator"]["creation_time"], coordinator.creation_time,
+        "{surface}"
+    );
+    assert!(
+        same_program(
+            Path::new(surface["coordinatorProgram"].as_str().unwrap()),
+            &manager()
+        ),
+        "{surface}"
+    );
+    assert!(
+        same_program(Path::new(surface["program"].as_str().unwrap()), &manager()),
+        "{surface}"
+    );
+    let identity = ProcessIdentity {
+        pid: u32::try_from(surface["identity"]["pid"].as_u64().unwrap()).unwrap(),
+        creation_time: surface["identity"]["creation_time"].as_u64().unwrap(),
+    };
+    assert_ne!(
+        identity.pid, coordinator.pid,
+        "the retained stage must own a new foreground process: {surface}"
+    );
+    identity
+}
+
+/// A pre-submission surface loss retains the exact fork, measured work and no
+/// turn. The accepted owner must recover that fork through the same foreground
+/// boundary as a fresh stage: an immediate retry must refuse without visibility
+/// and stay retryable, and the later attempt must resume the one fork, submit
+/// its initial turn once and deliver once.
+#[test]
+fn native_accepted_pre_submission_loss_recovers_retained_fork_in_a_titled_surface() {
+    let workspace = Workspace::new("lead-recovery-pre-submission", LeadMode::Delivered);
+    let (controller, request, acceptance) = accepted::accepted(&workspace);
+    let state_dir = workspace.state.clone();
+    let executor_stage = state_dir.join("executor-stage.json");
+    let executor_surface = executor_stage.with_extension("surface.json");
+    let release = workspace.home.join("frontend-release");
+
+    // The owned frontend exits as soon as this marker exists. The first pass
+    // still creates and measures the exact fork, then loses its surface before
+    // any turn is submitted.
+    fs::write(&release, "pre-submission surface loss").unwrap();
+    let first = ConsoleSession::spawn(ConsoleSpec::new(chain_spec(
+        &workspace,
+        &request,
+        "mutator-window",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+        Some(&workspace.checkout),
+    )))
+    .unwrap();
+    let first_identity = first.identity();
+    let lost = wait_for_stage_status(&executor_stage, "visibility-lost");
+    assert_eq!(lost["fork"]["forkThread"], EXECUTOR_FORK, "{lost}");
+    assert!(lost["turnId"].is_null(), "{lost}");
+    assert!(
+        lost["error"].as_str().is_some_and(|error| {
+            error.contains("no turn was submitted") && error.contains("retryable")
+        }),
+        "{lost}"
+    );
+    let accepted_work_before = read_json(&state_dir.join("chain.json"))["acceptedWork"].clone();
+    let work_before = lost["work"].clone();
+    let source_context_before = lost["sourceContextBytes"].clone();
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 0, 0, 0),
+        "the first pass submitted model work"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "the first pass started a new thread instead of forking the source"
+    );
+    let in_flight = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(in_flight.executor.state, RecordedStageState::InFlight);
+    assert_eq!(in_flight.executor.usage.attempts, 1);
+    assert_eq!(in_flight.executor.usage.turns, 0);
+    let finished = wait_session(first);
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let first_surface: Value = read_json(&executor_surface);
+    let first_surface_identity =
+        assert_foreground_surface(&first_surface, first_identity, "ERefl ");
+    wait_process_gone(
+        first_surface_identity,
+        Path::new(first_surface["program"].as_str().unwrap()),
+        "the first executor foreground surface",
+    );
+    assert_eq!(read_json(&executor_stage), lost);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        in_flight,
+        "the pre-submission loss changed the accepted ledger"
+    );
+
+    // The retry still cannot restore visibility. It must resume the retained
+    // fork in a new titled foreground surface, refuse without submitting a
+    // turn, and keep the exact in-flight ledger for another attempt.
+    let second = ConsoleSession::spawn(ConsoleSpec::new(chain_spec(
+        &workspace,
+        &request,
+        "mutator-window",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+        Some(&workspace.checkout),
+    )))
+    .unwrap();
+    let second_identity = second.identity();
+    let refused = wait_session(second);
+    assert_ne!(refused.outcome.exit_code, 0, "{}", refused.transcript);
+    assert!(
+        refused
+            .transcript
+            .contains("pre-submission reflection recovery")
+            && refused.transcript.contains("No turn was submitted"),
+        "{}",
+        refused.transcript
+    );
+    let still_lost = read_json(&executor_stage);
+    assert_eq!(still_lost["status"], "visibility-lost", "{still_lost}");
+    assert_eq!(
+        still_lost["fork"]["forkThread"], EXECUTOR_FORK,
+        "{still_lost}"
+    );
+    assert!(still_lost["turnId"].is_null(), "{still_lost}");
+    assert_eq!(still_lost["work"], work_before, "{still_lost}");
+    assert_eq!(
+        still_lost["sourceContextBytes"], source_context_before,
+        "{still_lost}"
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 0, 0, 0),
+        "the refused retry submitted model work"
+    );
+    let retry_resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(retry_resumes.len(), 1, "{retry_resumes:?}");
+    assert_eq!(
+        retry_resumes[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{retry_resumes:?}"
+    );
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        in_flight,
+        "the refused retry changed the accepted ledger"
+    );
+    let retry_surface: Value = read_json(&executor_surface);
+    let retry_surface_identity =
+        assert_foreground_surface(&retry_surface, second_identity, "ERefl ");
+    wait_process_gone(
+        retry_surface_identity,
+        Path::new(retry_surface["program"].as_str().unwrap()),
+        "the refused executor retry surface",
+    );
+
+    // Visibility returns. The same retained fork must now become visible,
+    // submit its initial turn once, complete the stages and deliver once.
+    fs::remove_file(&release).unwrap();
+    let recovering = ConsoleSession::spawn(ConsoleSpec::new(chain_spec(
+        &workspace,
+        &request,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+        Some(&workspace.checkout),
+    )))
+    .unwrap();
+    let recovering_identity = recovering.identity();
+    let recovered = wait_session(recovering);
+    assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
+
+    let executor = read_json(&executor_stage);
+    assert_eq!(executor["status"], "completed", "{executor}");
+    assert_eq!(executor["fork"]["forkThread"], EXECUTOR_FORK, "{executor}");
+    assert_eq!(executor["turnId"], EXECUTOR_FORK_TURN, "{executor}");
+    assert_eq!(executor["result"], EXECUTOR_RESULT, "{executor}");
+    assert_eq!(executor["work"], work_before, "{executor}");
+    assert_eq!(
+        executor["sourceContextBytes"], source_context_before,
+        "{executor}"
+    );
+    assert_usage(
+        &executor,
+        120,
+        570,
+        "executor-self-reflection-new-turn",
+        EXECUTOR_SOURCE_TURN,
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 1, 1, 1),
+        "recovery forked or submitted a stage twice"
+    );
+    let executor_turns = fixture_requests(&workspace, "executor-self-reflection", "turn/start");
+    assert_eq!(executor_turns.len(), 1, "{executor_turns:?}");
+    assert_eq!(
+        executor_turns[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{executor_turns:?}"
+    );
+    let resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(resumes.len(), 2, "{resumes:?}");
+    for resume in &resumes {
+        assert_eq!(resume["params"]["threadId"], EXECUTOR_FORK, "{resumes:?}");
+    }
+    assert_eq!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/name/set").len(),
+        1,
+        "the retained fork was relabelled during recovery"
+    );
+    assert_eq!(
+        read_json(&state_dir.join("chain.json"))["acceptedWork"],
+        accepted_work_before,
+        "recovery changed the accepted context"
+    );
+    let recovered_surface: Value = read_json(&executor_surface);
+    let recovered_surface_identity =
+        assert_foreground_surface(&recovered_surface, recovering_identity, "ERefl ");
+    wait_process_gone(
+        recovered_surface_identity,
+        Path::new(recovered_surface["program"].as_str().unwrap()),
+        "the recovered executor foreground surface",
+    );
+
+    let lead = read_json(&state_dir.join("lead-stage.json"));
+    assert_eq!(lead["status"], "completed", "{lead}");
+    assert_eq!(lead["fork"]["forkThread"], LEAD_FORK, "{lead}");
+    assert_eq!(lead["turnId"], LEAD_FORK_TURN, "{lead}");
+    assert_eq!(lead["result"], LEAD_RESULT, "{lead}");
+    let delivery = read_json(&state_dir.join("lead-delivery.json"));
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    assert_eq!(delivery["by"], "clientId", "{delivery}");
+    let lead_requests = workspace.lead.requests_for("turn/start");
+    assert_eq!(lead_requests.len(), 1, "{lead_requests:?}");
+    assert_eq!(
+        lead_requests[0]["params"]["clientUserMessageId"], delivery["clientMessageId"],
+        "{lead_requests:?}"
+    );
+    assert_eq!(
+        workspace.lead_state.lock().unwrap().client_id.as_deref(),
+        delivery["clientMessageId"].as_str(),
+        "the delivered client-id message was replaced or repeated"
+    );
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, RecordedStageState::Retained);
+    assert_eq!(
+        record.executor.usage.attempts, 1,
+        "pre-submission recovery began a second stage attempt"
+    );
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 0);
+    assert_eq!(
+        record.executor.usage.context_bytes,
+        executor["work"]["context_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(record.lead.state, RecordedStageState::Retained);
+    assert_eq!(record.lead.usage.attempts, 1);
+    assert_eq!(record.lead.usage.turns, 1);
+    assert_eq!(record.lead.usage.tokens, 240);
+    assert_eq!(record.usage_totals().tokens, 360);
+    assert_eq!(record.delivery, RecordedDeliveryState::Consumed);
+    assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
+
+    eprintln!(
+        "pre-submission retained recovery evidence: {}",
+        workspace.root().display()
+    );
+    std::mem::forget(workspace);
 }
