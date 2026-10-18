@@ -2298,16 +2298,97 @@ fn reconcile_submitted(
         .turn_id
         .clone()
         .ok_or_else(|| invalid("a submitted stage carries no turn identity to reconcile"))?;
+    let retain_unrestored = |mut state: StageState, cause: String| -> io::Result<StageState> {
+        state.error = Some(format!(
+            "native visibility restoration for retained fork {fork_thread} turn {turn} did not complete: {cause}. No new turn was started; the submitted turn remains recoverable"
+        ));
+        finish(state_path, state)
+    };
     let stage_root = state_path
         .parent()
         .ok_or_else(|| invalid("the stage state path has no directory"))?
         .join(format!("{}-reconcile", declaration.role));
-    let plan = stage_plan(chain, declaration, prepared, &stage_root)?;
-    let job = Job::new(Limits::default())?;
-    let mut conversation = Conversation::start_resuming(&job, &plan, &fork_thread)?;
+    let plan = match stage_plan(chain, declaration, prepared, &stage_root) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return retain_unrestored(
+                state,
+                format!("the reconciliation plan could not be prepared: {error}"),
+            );
+        }
+    };
+    let job = match Job::new(Limits::default()) {
+        Ok(job) => job,
+        Err(error) => {
+            return retain_unrestored(
+                state,
+                format!("the reconciliation process could not be created: {error}"),
+            );
+        }
+    };
+    let mut conversation = match Conversation::start_resuming(&job, &plan, &fork_thread) {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            return retain_unrestored(
+                state,
+                format!("the retained reflection fork could not be resumed: {error}"),
+            );
+        }
+    };
+    let frontend = match attach_owned_frontend(
+        &plan,
+        &conversation,
+        NativePresentation::NativeTui,
+        FrontendRole::Reflection,
+    ) {
+        Ok(frontend) => frontend,
+        Err(error) => {
+            return retain_unrestored(
+                state,
+                format!("the owned reflection frontend could not be attached: {error}"),
+            );
+        }
+    };
+    if let Err(error) = wait_for_frontend(&frontend, &mut conversation, true, &plan.title) {
+        let retained = retain_unrestored(
+            state,
+            format!("the owned reflection frontend did not attach: {error}"),
+        );
+        let _ = frontend.close();
+        return retained;
+    }
     let until = Instant::now() + Duration::from_secs(chain.bound_seconds);
     loop {
-        let thread = conversation.read_thread_record(&fork_thread)?;
+        match frontend.is_running() {
+            Ok(true) => {}
+            Ok(false) => {
+                let retained = retain_unrestored(
+                    state,
+                    "the restored reflection surface closed before reconciliation".to_owned(),
+                );
+                let _ = frontend.close();
+                return retained;
+            }
+            Err(error) => {
+                let retained = retain_unrestored(
+                    state,
+                    format!("the restored reflection surface could not be verified: {error}"),
+                );
+                let _ = frontend.close();
+                return retained;
+            }
+        }
+        let thread = match conversation.read_thread_record(&fork_thread) {
+            Ok(thread) => thread,
+            Err(error) => {
+                let retained = retain_unrestored(
+                    state,
+                    format!("the retained turn could not be read: {error}"),
+                );
+                let _ = frontend.close();
+                return retained;
+            }
+        };
         let record = thread["turns"]
             .as_array()
             .and_then(|turns| turns.iter().find(|item| item["id"].as_str() == Some(&turn)));
@@ -2316,7 +2397,7 @@ fn reconcile_submitted(
             .unwrap_or_default();
         match status {
             "completed" => {
-                return retain_completed(
+                let retained = retain_completed(
                     chain,
                     &mut conversation,
                     state,
@@ -2324,6 +2405,8 @@ fn reconcile_submitted(
                     state_path,
                     admission,
                 );
+                let _ = frontend.close();
+                return retained;
             }
             "failed" | "interrupted" => {
                 state.status = if status == "failed" {
@@ -2334,7 +2417,9 @@ fn reconcile_submitted(
                 state.error = Some(format!(
                     "reconciliation observed the retained turn {turn} as {status}; it is not replayed"
                 ));
-                return finish(state_path, state);
+                let retained = finish(state_path, state);
+                let _ = frontend.close();
+                return retained;
             }
             _ => {}
         }
@@ -2343,7 +2428,9 @@ fn reconcile_submitted(
             state.error = Some(format!(
                 "reconciliation did not establish a terminal state for retained turn {turn}; it is not replayed"
             ));
-            return finish(state_path, state);
+            let retained = finish(state_path, state);
+            let _ = frontend.close();
+            return retained;
         }
         thread::sleep(POLL);
     }

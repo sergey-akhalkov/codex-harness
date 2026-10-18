@@ -19,6 +19,8 @@ mod installed;
 mod lifecycle;
 #[path = "fixtures/reflection_install.rs"]
 mod reflection_install;
+#[path = "self_reflection_forks/visibility.rs"]
+mod visibility;
 
 use control_endpoint::{Answer, Bearer, Server, Wire};
 use harness_core::console::{ConsoleOutcome, ConsoleSession, ConsoleSpec};
