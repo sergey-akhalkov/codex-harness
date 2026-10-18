@@ -1106,6 +1106,12 @@ impl RunTracker {
                 }
             }
         }
+        // The exact turn this stream completed is an observed fact for the
+        // run's retained acceptance record; it is never inferred from the
+        // latest event time or a completion label.
+        if self.saw_turn_completed {
+            self.observation.turn = self.accepted_turn.clone();
+        }
         if self.oversize > 0 {
             let note = format!(
                 "{} oversize event lines were dropped from the stream",
@@ -1539,7 +1545,7 @@ fn mark_pending_messages(value: &mut Value, stop_ms: u64) -> Vec<String> {
     marked
 }
 
-fn read_receipt_value(receipt: &Path) -> io::Result<Value> {
+pub(crate) fn read_receipt_value(receipt: &Path) -> io::Result<Value> {
     let bytes = fs::read(receipt)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
@@ -1972,6 +1978,14 @@ pub(crate) fn run_observed(
     // output failure below must not lose the true final state.
     let record = update_receipt(receipt, &tracker.observation);
     let _ = fs::remove_file(&spool);
+    // Retain this run's completion facts beside its run generation. This is
+    // best effort: a retention failure is reported as a note and never
+    // rewrites the run's own outcome or discards ordinary output.
+    let completion_note = if record.is_ok() {
+        super::completion_retention_note(receipt, &tracker.observation)
+    } else {
+        None
+    };
     let observation = &tracker.observation;
     let mut stdout = io::stdout();
     match observation.state.as_str() {
@@ -2013,6 +2027,9 @@ pub(crate) fn run_observed(
                 )?;
             }
         }
+    }
+    if let Some(note) = completion_note {
+        writeln!(stdout, "note: {note}")?;
     }
     // Mirror the launcher's own policy: an ordinary session exit preserves the
     // CLI's remaining background members, while an abnormal host death still

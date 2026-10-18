@@ -1268,6 +1268,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         }
     };
     let paths = run_paths(&codex_home, &repository, binding.index)?;
+    let submitted_assignment = submitted_assignment(&request.prompt)?;
     // Resume keeps the exact session on the managed presentation. Restart
     // starts a fresh conversation and carries the predecessor separately.
     let route = continuation_route(
@@ -1276,39 +1277,55 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         &session,
         &predecessor,
         BoundIdentity::resolve(&bound),
+        submitted_assignment,
     );
     launch_bound(&request, &binding, route, &bound, &paths)
 }
 
-/// Managed continuation route. Resume attaches the native frontend to the
-/// recorded session. Restart starts a fresh conversation, keeps the original
-/// task beside a bounded handoff, and does not resume the predecessor thread.
 fn continuation_route(
     fresh: bool,
     prompt: &str,
     session: &str,
     predecessor: &serde_json::Value,
     identity: BoundIdentity,
+    submitted: task_worktree::AssignmentSubmission,
 ) -> HostRoute {
-    let (assignment, original, resume_session) = if fresh {
+    let (assignment, original, resume_session, submitted) = if fresh {
         (
             restart_assignment(prompt, session, predecessor),
             Some(prompt.to_owned()),
             None,
+            // The submitted text is the restart handoff, not the assignment
+            // document, so it never reads as the bound structured submission.
+            task_worktree::AssignmentSubmission::restart(),
         )
     } else {
-        (prompt.to_owned(), None, Some(session.to_owned()))
+        (prompt.to_owned(), None, Some(session.to_owned()), submitted)
     };
     HostRoute::Control(Box::new(ControlReceipt {
         schema: CONTROL_SCHEMA,
         assignment,
         original_assignment: original,
+        submitted_assignment: Some(submitted),
         identity,
         presentation: NativePresentation::NativeTui,
         port: None,
         resume_session,
         role: None,
     }))
+}
+
+/// The assignment identity the run actually submits. A structured document is
+/// recorded with its own content hash; free text is recorded as free text. The
+/// receipt keeps this marker beside the rendered brief so completion retention
+/// can prove the bound structured assignment was the submitted one.
+fn submitted_assignment(prompt: &PromptSource) -> io::Result<task_worktree::AssignmentSubmission> {
+    match prompt {
+        PromptSource::FreeText(_) => Ok(task_worktree::AssignmentSubmission::free_text()),
+        PromptSource::Structured(assignment) => Ok(
+            task_worktree::AssignmentSubmission::structured(assignment.content_sha256()?),
+        ),
+    }
 }
 
 /// The checkpoint stays in the existing receipt and the original rollout.
@@ -1484,6 +1501,13 @@ struct ControlReceipt {
     /// Retain the original task independently of a restart's bounded handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_assignment: Option<String>,
+    /// The exact assignment identity this run submitted. `structured` carries
+    /// the submitted document's content hash, so retention can compare it with
+    /// the slot's verified board binding; free text and restart handoffs are
+    /// recorded as themselves. Absent on receipts written before this field,
+    /// which are never ordinary-acceptance eligible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submitted_assignment: Option<task_worktree::AssignmentSubmission>,
     /// The profile binding this dispatch resolved. The driver pins it on the
     /// started thread and refuses a conversation whose thread reports another
     /// model, provider or reasoning effort.
@@ -1787,6 +1811,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         Ok(prompt) => prompt,
         Err(error) => return Err(release_unused_claim(request, &binding, error)),
     };
+    let submitted_assignment = submitted_assignment(&request.prompt)?;
     // Attach the verified binding to the existing durable slot record. This
     // runs after path validation and before any launcher. A recorded binding
     // conflict is refused with the slot and its work untouched; unlike a
@@ -1815,6 +1840,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         schema: CONTROL_SCHEMA,
         assignment: prompt,
         original_assignment: None,
+        submitted_assignment: Some(submitted_assignment),
         identity: BoundIdentity::resolve(&bound),
         presentation: request.mode.presentation(),
         port: None,
@@ -3707,6 +3733,109 @@ fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPath
         result: dir.join(format!("message-{index}.txt")),
         detail: dir.join(format!("stream-{index}.jsonl")),
     })
+}
+
+/// Builds one run's exact completion facts from its terminal dispatch receipt
+/// and hands them to the durable completion owner under the pool state root.
+/// The captured `originatingLead.runGeneration` is the run identity; the slot
+/// index and its files are provenance only and may be reused afterwards.
+pub(crate) fn retain_terminal_completion(
+    receipt: &Path,
+    run: &RunObservation,
+) -> io::Result<Option<task_worktree::RetainedCompletion>> {
+    let value = observation::read_receipt_value(receipt)?;
+    let Some(generation) = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let slot = &value["slot"];
+    if slot.is_null() {
+        return Ok(None);
+    }
+    let state_dir = receipt
+        .parent()
+        .ok_or_else(|| invalid("dispatch receipt has no state directory"))?;
+    let index = slot["index"]
+        .as_u64()
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| {
+            invalid(
+                "the receipt's slot binding records no pool index; completion facts were not retained",
+            )
+        })?;
+    let owner = slot["owner"]
+        .as_str()
+        .filter(|owner| !owner.trim().is_empty())
+        .ok_or_else(|| {
+            invalid(
+                "the receipt's slot binding records no owner; completion facts were not retained",
+            )
+        })?;
+    let checkout = slot["path"]
+        .as_str()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            invalid(
+                "the receipt's slot binding records no checkout path; completion facts were not retained",
+            )
+        })?;
+    let assignment = match slot.get("assignment").filter(|value| !value.is_null()) {
+        Some(value) => Some(
+            serde_json::from_value::<task_worktree::SlotAssignmentBinding>(value.clone()).map_err(
+                |error| {
+                    invalid(&format!(
+                        "the receipt's board assignment binding is not readable, so completion facts were not retained: {error}"
+                    ))
+                },
+            )?,
+        ),
+        None => None,
+    };
+    let submitted_assignment = value["control"]["submittedAssignment"]
+        .as_object()
+        .and_then(|_| {
+            serde_json::from_value::<task_worktree::AssignmentSubmission>(
+                value["control"]["submittedAssignment"].clone(),
+            )
+            .ok()
+        });
+    let facts = task_worktree::CompletionFacts {
+        run_generation: generation.to_owned(),
+        slot: index,
+        owner: owner.to_owned(),
+        checkout,
+        task: slot["task"].as_str().map(str::to_owned),
+        handle: slot["handle"].as_str().map(str::to_owned),
+        assignment,
+        submitted_assignment,
+        role: value["control"]["role"]["role"].as_str().map(str::to_owned),
+        state: run.state.clone(),
+        exit_code: run.exit_code,
+        session: run.session.clone(),
+        turn: run.turn.clone(),
+        result: run.result.clone(),
+    };
+    task_worktree::retain_completion(state_dir, &facts).map(Some)
+}
+
+/// One visible, bounded note for a run whose completion was retained as
+/// ineligible or could not be retained at all. It never changes the run's own
+/// outcome, its receipt, or the ordinary output already produced.
+pub(crate) fn completion_retention_note(receipt: &Path, run: &RunObservation) -> Option<String> {
+    match retain_terminal_completion(receipt, run) {
+        Ok(Some(retained)) if !retained.eligibility.eligible => Some(format!(
+            "completion {} is retained but not acceptance-eligible: {}",
+            retained.run_generation,
+            retained.eligibility.reasons.join("; ")
+        )),
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "completion facts were not retained; the run's own output is unchanged: {error}"
+        )),
+    }
 }
 
 /// Record this process as the live host of a bound slot. A slot that was
@@ -6335,6 +6464,13 @@ fn host_control_conversation(
         cause: cause.as_deref(),
     });
     let record = observation::update_receipt(receipt, &tracker.observation);
+    // Retain this run's exact completion facts beside the run generation.
+    // This is best effort: retention never rewrites the run's outcome.
+    let completion_note = if record.is_ok() {
+        completion_retention_note(receipt, &tracker.observation)
+    } else {
+        None
+    };
     let attached = frontend.is_some();
     if record.is_ok()
         && let Some(frontend) = frontend.as_ref()
@@ -6400,6 +6536,13 @@ fn host_control_conversation(
             "the terminal run record could not be written: {error}; control log: {}",
             plan.paths.log.display()
         )));
+    }
+    if let Some(note) = completion_note {
+        if attached {
+            note_log(&plan.paths.log, &format!("completion retention: {note}"));
+        } else {
+            let _ = writeln!(stdout, "note: {note}");
+        }
     }
     stdout.flush()?;
     Ok(exit)
@@ -9736,6 +9879,7 @@ mod tests {
             schema: CONTROL_SCHEMA,
             assignment: assignment.to_owned(),
             original_assignment: None,
+            submitted_assignment: Some(task_worktree::AssignmentSubmission::free_text()),
             identity: BoundIdentity::resolve(&bound),
             presentation: NativePresentation::NativeInline,
             port: None,
@@ -9815,6 +9959,7 @@ mod tests {
                 schema: CONTROL_SCHEMA,
                 assignment: assignment.to_owned(),
                 original_assignment: None,
+                submitted_assignment: Some(task_worktree::AssignmentSubmission::free_text()),
                 identity: BoundIdentity::resolve(&bound),
                 presentation: NativePresentation::NativeTui,
                 port: None,
@@ -10134,6 +10279,7 @@ mod tests {
                     schema: CONTROL_SCHEMA,
                     assignment: "Continue the outcome.".into(),
                     original_assignment: None,
+                    submitted_assignment: Some(task_worktree::AssignmentSubmission::free_text()),
                     identity: BoundIdentity::resolve(&bound),
                     presentation: NativePresentation::NativeTui,
                     port: None,
@@ -10600,7 +10746,14 @@ mod tests {
         let predecessor = json!({
             "control": {"assignment": prompt, "originalAssignment": prompt}
         });
-        let resume = continuation_route(false, prompt, session, &predecessor, identity.clone());
+        let resume = continuation_route(
+            false,
+            prompt,
+            session,
+            &predecessor,
+            identity.clone(),
+            task_worktree::AssignmentSubmission::structured("fixture-assignment-hash"),
+        );
         let HostRoute::Control(control) = &resume;
         assert!(
             resume.args().is_empty(),
@@ -10610,15 +10763,34 @@ mod tests {
         assert_eq!(control.resume_session.as_deref(), Some(session));
         assert_eq!(control.assignment, prompt);
         assert!(control.original_assignment.is_none());
+        assert_eq!(
+            control.submitted_assignment,
+            Some(task_worktree::AssignmentSubmission::structured(
+                "fixture-assignment-hash"
+            )),
+            "resume preserves the structured assignment identity"
+        );
         assert!(!control.assignment.contains("fresh conversation"));
 
-        let restart = continuation_route(true, prompt, session, &predecessor, identity);
+        let restart = continuation_route(
+            true,
+            prompt,
+            session,
+            &predecessor,
+            identity,
+            task_worktree::AssignmentSubmission::structured("fixture-assignment-hash"),
+        );
         let HostRoute::Control(control) = &restart;
         assert!(
             control.resume_session.is_none(),
             "restart must not resume the predecessor thread"
         );
         assert_eq!(control.original_assignment.as_deref(), Some(prompt));
+        assert_eq!(
+            control.submitted_assignment,
+            Some(task_worktree::AssignmentSubmission::restart()),
+            "a restart handoff is never the bound structured assignment"
+        );
         assert!(control.assignment.contains(session), "{control:?}");
         assert!(control.assignment.contains("do not reset"), "{control:?}");
         assert!(

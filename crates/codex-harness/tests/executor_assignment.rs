@@ -12,6 +12,9 @@ use std::{
     process::Command,
 };
 
+#[path = "fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
+
 fn manager() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
 }
@@ -261,6 +264,10 @@ impl SpawnFixture {
     /// exact local base. The missing launcher is the intended stop after the
     /// pool/slot owner wrote its durable binding.
     fn spawn(&self, prompt: &[&str], extra: &[&str]) -> std::process::Output {
+        self.spawn_command(prompt, extra).output().unwrap()
+    }
+
+    fn spawn_command(&self, prompt: &[&str], extra: &[&str]) -> Command {
         let base = self.base.head();
         let mut command = Command::new(manager());
         command.args([
@@ -279,6 +286,66 @@ impl SpawnFixture {
         command.args(extra);
         command.env("CODEX_HOME", &self.home);
         command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+        for key in [
+            "HARNESS_EXECUTOR_SESSION",
+            "CODEX_SESSION_ID",
+            "HARNESS_EXECUTOR_RUN",
+            "HARNESS_ORIGINATING_LEAD",
+            "HARNESS_LEAD_THREAD",
+            "HARNESS_LEAD_RECIPIENT",
+        ] {
+            command.env_remove(key);
+        }
+        command
+    }
+
+    /// One explicit continuation of the recorded slot session through the real
+    /// `executor resume` owner. Free text is recorded as itself, not as the
+    /// slot's bound structured assignment.
+    fn resume_command(&self, owner: &str, session: &str, prompt: &str) -> Command {
+        let mut command = Command::new(manager());
+        command.args([
+            "executor",
+            "resume",
+            "--source",
+            self.base.source.to_str().unwrap(),
+            "--codex-home",
+            self.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            owner,
+            "--session",
+            session,
+            "--exec",
+            prompt,
+        ]);
+        command.env("CODEX_HOME", &self.home);
+        command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+        for key in [
+            "HARNESS_EXECUTOR_SESSION",
+            "CODEX_SESSION_ID",
+            "HARNESS_EXECUTOR_RUN",
+            "HARNESS_ORIGINATING_LEAD",
+            "HARNESS_LEAD_THREAD",
+            "HARNESS_LEAD_RECIPIENT",
+        ] {
+            command.env_remove(key);
+        }
+        command
+    }
+
+    fn release(&self, extra: &[&str]) -> std::process::Output {
+        let mut command = Command::new(manager());
+        command.args([
+            "executor",
+            "release",
+            "--source",
+            self.base.source.to_str().unwrap(),
+            "--codex-home",
+            self.home.to_str().unwrap(),
+        ]);
+        command.args(extra);
         for key in [
             "HARNESS_EXECUTOR_SESSION",
             "CODEX_SESSION_ID",
@@ -365,6 +432,20 @@ fn output_text(out: &std::process::Output) -> String {
 fn configure(cwd: &Path) {
     git(cwd, &["config", "user.email", "executor@example.test"]);
     git(cwd, &["config", "user.name", "Executor"]);
+}
+
+/// Install the native CLI test double where the launcher owner resolves it.
+fn install_launcher(home: &Path, exe: &Path) {
+    let launcher = home.join("harness/bin/codex.exe");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    if fs::hard_link(exe, &launcher).is_err() {
+        fs::copy(exe, &launcher).unwrap_or_else(|error| {
+            panic!(
+                "the fixture home could not install the native CLI {}: {error}",
+                exe.display()
+            )
+        });
+    }
 }
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -1063,5 +1144,321 @@ fn legacy_structured_dispatch_keeps_an_unbound_slot_record() {
     );
     let record = fixture.record(1);
     assert!(record["assignment"].is_null(), "{record}");
+    fixture.drop_fixture();
+}
+
+/// One completed ordinary executor's exact native facts are retained by run
+/// generation, so releasing and reusing the slot index cannot replace them.
+/// A later free-text continuation of the same bound slot is retained as
+/// explicitly ineligible while its ordinary output and receipt stay usable.
+#[test]
+fn completed_ordinary_facts_survive_slot_reuse_and_free_text_is_ineligible() {
+    let fixture = SpawnFixture::with_board("completion-retained");
+    // The continuation resolves the recorded upstream; no dispatch fetches or
+    // rewrites it. A local path keeps this check offline.
+    git(
+        &fixture.base.source,
+        &[
+            "remote",
+            "add",
+            "origin",
+            fixture.base.source.to_str().unwrap(),
+        ],
+    );
+    install_launcher(
+        &fixture.home,
+        Path::new(env!("CARGO_BIN_EXE_harness-executor-fixture")),
+    );
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    // The controlled child reports its started-thread identity from the
+    // active config, so the explicit route must be present there too before
+    // dispatch appends the workspace trust entry.
+    fs::write(
+        fixture.home.join("config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let kit = synthetic_role_build::kit_source(&fixture.base.root);
+    let build = synthetic_role_build::recorded_build(&fixture.base.root, &kit);
+    synthetic_role_build::register(&fixture.home, &fixture.base.root, &build);
+
+    let final_message = "fixture turn completed; the committed solution is in the bound slot";
+    let first_task = fixture.create_issue("Completed ordinary task", "task", None);
+    let first_assignment =
+        fixture.assignment("completion-first.json", &first_task, Some("ordinary"));
+    let first_session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let mut command = fixture.spawn_command(
+        &["--assignment", first_assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-completion-a"],
+    );
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", first_session);
+    command.env_remove("WT_SESSION");
+    let first_run = command.output().unwrap();
+    let text = output_text(&first_run);
+    assert_eq!(first_run.status.code(), Some(0), "{text}");
+
+    let state = harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.base.source)
+        .expect("pool state directory");
+    let receipt_path = state.join("spawn-1.json");
+    let slot_message = state.join("message-1.txt");
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    let first_generation = receipt["originatingLead"]["runGeneration"]
+        .as_str()
+        .expect("run generation")
+        .to_owned();
+    assert_eq!(receipt["control"]["role"]["role"], "executor", "{receipt}");
+    assert_eq!(
+        receipt["control"]["submittedAssignment"]["kind"], "structured",
+        "{receipt}"
+    );
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], first_session,
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["observation"]["turn"], "fixture-turn-1",
+        "the completed turn is observed, not inferred: {receipt}"
+    );
+    assert_eq!(
+        receipt["slot"]["assignment"]["issue"], first_task,
+        "{receipt}"
+    );
+    assert!(
+        receipt["slot"]["handle"]
+            .as_str()
+            .is_some_and(|handle| !handle.is_empty()),
+        "{receipt}"
+    );
+    assert_eq!(fs::read_to_string(&slot_message).unwrap(), final_message);
+    let first_revision = git_output(&fixture.base.slot, &["rev-parse", "HEAD"]);
+    assert!(
+        git_output(
+            &fixture.base.slot,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        )
+        .is_empty(),
+        "the completed fixture run leaves the bound checkout clean"
+    );
+
+    let load = |generation: &str| {
+        harness_core::task_worktree::load_retained_completion(
+            &fixture.home,
+            &fixture.base.source,
+            generation,
+        )
+        .unwrap()
+    };
+    let first = load(&first_generation).expect("the first completion is retained");
+    println!("retained-first={}", serde_json::to_string(&first).unwrap());
+    assert!(first.eligibility.eligible, "{first:?}");
+    assert!(first.eligibility.reasons.is_empty(), "{first:?}");
+    assert_eq!(first.run_generation, first_generation);
+    assert_eq!(first.slot, 1);
+    assert_eq!(first.owner, "exec-ds-completion-a");
+    assert_eq!(first.task.as_deref(), Some("exec-ds-completion-a"));
+    assert_eq!(first.role.as_deref(), Some("executor"));
+    assert_eq!(first.state, "completed");
+    assert_eq!(first.exit_code, Some(0));
+    assert_eq!(first.session.as_deref(), Some(first_session));
+    assert_eq!(first.turn.as_deref(), Some("fixture-turn-1"));
+    let binding = first.assignment.as_ref().expect("board assignment binding");
+    assert_eq!(binding.issue, first_task);
+    assert_eq!(binding.purpose.as_deref(), Some("ordinary"));
+    assert_eq!(
+        first.submitted_assignment,
+        Some(
+            harness_core::task_worktree::AssignmentSubmission::structured(
+                binding.assignment_sha256.clone()
+            )
+        )
+    );
+    let result = first.result.as_ref().expect("retained result artifact");
+    assert!(result.locator.is_file(), "{result:?}");
+    assert_eq!(
+        result.sha256,
+        harness_core::build_identity::hash_file(&result.locator).unwrap()
+    );
+    assert_eq!(result.bytes, fs::metadata(&result.locator).unwrap().len());
+    assert_eq!(
+        first.source.revision.as_deref(),
+        Some(first_revision.as_str())
+    );
+    assert_eq!(first.source.dirty, Some(false));
+
+    let released = fixture.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "synthetic completion accepted",
+    ]);
+    let text = output_text(&released);
+    assert_eq!(released.status.code(), Some(0), "{text}");
+    let retained_result = first.result.as_ref().expect("retained result");
+    assert!(
+        retained_result.locator.is_file(),
+        "the per-run retained copy survives release, independent of the slot index"
+    );
+    assert_eq!(
+        harness_core::build_identity::hash_file(&retained_result.locator).unwrap(),
+        retained_result.sha256,
+        "release must not alter the retained acceptance input"
+    );
+    assert_eq!(
+        load(&first_generation).expect("retained through release"),
+        first,
+        "release must not change the completed run's retained facts or result"
+    );
+
+    let second_task = fixture.create_issue("Second completed task", "task", None);
+    let second_assignment =
+        fixture.assignment("completion-second.json", &second_task, Some("ordinary"));
+    let second_session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f6";
+    let mut command = fixture.spawn_command(
+        &["--assignment", second_assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-completion-b"],
+    );
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", second_session);
+    command.env_remove("WT_SESSION");
+    let second_run = command.output().unwrap();
+    let text = output_text(&second_run);
+    assert_eq!(second_run.status.code(), Some(0), "{text}");
+
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        receipt["slot"]["assignment"]["issue"], second_task,
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["observation"]["session"], second_session,
+        "{receipt}"
+    );
+    let second_generation = receipt["originatingLead"]["runGeneration"]
+        .as_str()
+        .expect("second run generation")
+        .to_owned();
+    assert_ne!(first_generation, second_generation);
+    assert_eq!(
+        load(&first_generation).expect("first retained after slot reuse"),
+        first,
+        "reusing the slot must not replace the previous run's acceptance input"
+    );
+    let second = load(&second_generation).expect("the second completion is retained");
+    println!(
+        "retained-second={}",
+        serde_json::to_string(&second).unwrap()
+    );
+    assert!(second.eligibility.eligible, "{second:?}");
+    assert_eq!(second.task.as_deref(), Some("exec-ds-completion-b"));
+    assert_eq!(
+        fs::read_to_string(&slot_message).unwrap(),
+        final_message,
+        "the slot-indexed result now belongs to the reused slot's run"
+    );
+
+    let first_list = harness_core::task_worktree::retained_completions_for_task(
+        &fixture.home,
+        &fixture.base.source,
+        &first_task,
+    )
+    .unwrap();
+    assert_eq!(first_list.len(), 1, "{first_list:?}");
+    assert_eq!(first_list[0].run_generation, first_generation);
+    let second_list = harness_core::task_worktree::retained_completions_for_task(
+        &fixture.home,
+        &fixture.base.source,
+        &second_task,
+    )
+    .unwrap();
+    assert_eq!(second_list.len(), 1, "{second_list:?}");
+    assert_eq!(second_list[0].run_generation, second_generation);
+
+    // A free-text continuation keeps the bound slot's board binding but must
+    // never read as the bound structured assignment. Its own output remains
+    // ordinary and inspectable while acceptance eligibility is refused.
+    let mut command = fixture.resume_command(
+        "exec-ds-completion-b",
+        second_session,
+        "continue with free text",
+    );
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", second_session);
+    command.env_remove("WT_SESSION");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "{text}");
+    // `resume --exec` returns at dispatch acceptance. The terminal
+    // ineligibility is asserted from the retained facts below, which are the
+    // authority for acceptance rather than this process's transient output.
+
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        receipt["control"]["submittedAssignment"]["kind"], "freeText",
+        "{receipt}"
+    );
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], second_session,
+        "{receipt}"
+    );
+    let third_generation = receipt["originatingLead"]["runGeneration"]
+        .as_str()
+        .expect("continuation run generation")
+        .to_owned();
+    assert_ne!(third_generation, second_generation);
+    let third = load(&third_generation).expect("the continuation completion is retained");
+    println!(
+        "retained-free-text={}",
+        serde_json::to_string(&third).unwrap()
+    );
+    assert!(
+        !third.eligibility.eligible,
+        "free text must not claim the bound structured assignment: {third:?}"
+    );
+    assert!(
+        third
+            .eligibility
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("freeText")),
+        "{:?}",
+        third.eligibility.reasons
+    );
+    assert_eq!(third.task.as_deref(), Some("exec-ds-completion-b"));
+    assert_eq!(
+        third
+            .assignment
+            .as_ref()
+            .map(|binding| binding.issue.as_str()),
+        Some(second_task.as_str()),
+        "the free-text continuation keeps the bound board issue for review"
+    );
+    assert_eq!(
+        fs::read_to_string(&slot_message).unwrap(),
+        final_message,
+        "an ineligible completion keeps its ordinary output available"
+    );
+    assert_eq!(
+        load(&first_generation).expect("first retained through continuation"),
+        first
+    );
+    assert_eq!(
+        load(&second_generation).expect("second retained through continuation"),
+        second
+    );
+
     fixture.drop_fixture();
 }
