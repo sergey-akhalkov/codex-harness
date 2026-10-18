@@ -59,7 +59,7 @@ profile or a non-positive limit without substituting another route. `default`
 is the native session with no `--profile` flag. Other names must exist as
 `CODEX_HOME/<name>.config.toml` or `[profiles.<name>]`. Pool capacity comes
 from `worktree_pool_size`, independent of `max_concurrent_executors`; the
-shipped default is four for each, and `worktree_limit` stays
+shipped default is six for each, and `worktree_limit` stays
 compatibility-only. Install and update materialize the explicit setting for a
 configuration written before the capacity split - including a checkout still
 carrying the old shipped defaults - writing its former effective capacity
@@ -72,8 +72,8 @@ schema = 1
 lead_profile = "default"
 successor_lead_profile = "default"
 executor_profiles = ["ds"]
-max_concurrent_executors = 4
-worktree_pool_size = 4
+max_concurrent_executors = 6
+worktree_pool_size = 6
 ```
 
 Dispatch an executor with the installed launcher:
