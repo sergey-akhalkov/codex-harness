@@ -1,4 +1,5 @@
 use super::*;
+use harness_core::delivery_reflection::{DeliveryState, StageState as RecordedStageState};
 
 fn terminate_pid(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -314,5 +315,128 @@ fn native_visibility_recovery_loss_preserves_submitted_identity_and_recovers() {
         executor_rollout(&workspace.home),
         (rollout_path, rollout_bytes),
         "recovery changed the original turn's rollout cost evidence"
+    );
+}
+
+#[test]
+fn native_accepted_visibility_loss_recovers_exact_submitted_turn_without_second_fork_or_turn() {
+    let workspace = Workspace::new("accepted-visibility-recovery", LeadMode::Delivered);
+    let (controller, request, acceptance) = accepted::accepted(&workspace);
+
+    let session = spawn_chain_in_board(
+        &workspace,
+        &request,
+        "mutator-window",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+        Some(&workspace.checkout),
+    );
+    let pid = session.identity().pid;
+    let submitted = wait_for_submitted_stage(&workspace);
+    let accepted_work_before =
+        read_json(&workspace.state.join("chain.json"))["acceptedWork"].clone();
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        submitted["fork"]["forkThread"], EXECUTOR_FORK,
+        "{submitted}"
+    );
+    assert_eq!(submitted["turnId"], EXECUTOR_FORK_TURN, "{submitted}");
+    let work_before = submitted["work"].clone();
+    let source_context_before = submitted["sourceContextBytes"].clone();
+    let in_flight = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(in_flight.executor.state, RecordedStageState::InFlight);
+    let (rollout_path, rollout_bytes) = executor_rollout(&workspace.home);
+
+    terminate_pid(pid);
+    let lost = wait_session(session);
+    assert_ne!(lost.outcome.exit_code, 0, "{}", lost.transcript);
+    assert_eq!(stage(&workspace, "executor-stage"), submitted);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        in_flight,
+        "the owning process loss changed the accepted ledger"
+    );
+
+    let _ = fs::remove_file(workspace.home.join("frontend-argv.txt"));
+    let _ = fs::remove_file(workspace.home.join("frontend-release"));
+    workspace.lead_state.lock().unwrap().source_turn_active = true;
+    let recovering = spawn_chain_in_board(
+        &workspace,
+        &request,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+        Some(&workspace.checkout),
+    );
+    wait_until(
+        || {
+            fs::read(workspace.state.join("executor-stage.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|stage| stage["status"] == "completed")
+        },
+        Duration::from_secs(20),
+        "the accepted executor stage was not recovered",
+    );
+    assert_exact_reflection_frontend(&workspace);
+    workspace.lead_state.lock().unwrap().source_turn_active = false;
+    let recovered = wait_session(recovering);
+    assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
+
+    let executor = stage(&workspace, "executor-stage");
+    assert_eq!(executor["status"], "completed", "{executor}");
+    assert_eq!(executor["fork"]["forkThread"], EXECUTOR_FORK, "{executor}");
+    assert_eq!(executor["turnId"], EXECUTOR_FORK_TURN, "{executor}");
+    assert_eq!(executor["result"], EXECUTOR_RESULT, "{executor}");
+    assert_eq!(executor["work"], work_before, "{executor}");
+    assert_eq!(
+        executor["sourceContextBytes"], source_context_before,
+        "{executor}"
+    );
+    assert_usage(
+        &executor,
+        120,
+        570,
+        "executor-self-reflection-new-turn",
+        EXECUTOR_SOURCE_TURN,
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 1, 1, 1),
+        "recovery forked or submitted the executor a second time"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "recovery started a new thread"
+    );
+    let resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    assert_eq!(
+        resumes[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{resumes:?}"
+    );
+    assert_eq!(
+        executor_rollout(&workspace.home),
+        (rollout_path, rollout_bytes),
+        "recovery changed the original turn's rollout cost evidence"
+    );
+    assert_eq!(
+        read_json(&workspace.state.join("chain.json"))["acceptedWork"],
+        accepted_work_before,
+        "recovery changed the accepted context"
+    );
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, RecordedStageState::Retained);
+    assert_eq!(record.lead.state, RecordedStageState::Retained);
+    assert_eq!(record.delivery, DeliveryState::Consumed);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 0);
+    assert_eq!(
+        record.executor.usage.context_bytes,
+        executor["work"]["context_bytes"].as_u64().unwrap()
     );
 }
