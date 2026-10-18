@@ -22,6 +22,7 @@ const ACTION_EVIDENCE_SCHEMA: u32 = 1;
 const ACTION_EVIDENCE_DIR: &str = "baseline-qualification/action-evidence";
 const MAX_ACTION_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ACTION_LINE_BYTES: usize = 1024 * 1024;
+const FRAMING_CORRECTION_ID: &str = "lead-frame-correction-1";
 
 pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
     let inputs = run
@@ -62,41 +63,79 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
                     "the lead frame cannot be consumed: {reason}"
                 )));
             }
-            let retained = attempt
-                .retained
-                .as_ref()
-                .ok_or_else(|| invalid("the completed lead frame has no retained evidence"))?;
-            let result = retained
-                .result
-                .as_ref()
-                .ok_or_else(|| invalid("the completed lead frame has no retained result"))?;
-            if retained.result_sha256.as_deref()
-                != Some(build_identity::hash_file(result)?.as_str())
-            {
-                return Err(invalid(
-                    "the retained lead frame changed; no executor assignment was dispatched",
-                ));
+            // Establish the exact lead participant before parsing the
+            // assignment. A deterministic format defect must never lose the
+            // conversation that is allowed to correct it.
+            let observed = participant(&attempt).map_err(|error| {
+                invalid(format!(
+                    "the completed lead frame {id} cannot establish its exact native participant: {error}; no executor was consumed"
+                ))
+            })?;
+            match state.workflow.lead.clone() {
+                Some(lead) if lead != observed => {
+                    return refuse_framing(
+                        run,
+                        &mut state,
+                        format!(
+                            "the completed lead frame {id} now names slot {} owner {} session {} profile {} instead of the recorded lead slot {} owner {} session {} profile {}; no executor or correction was dispatched and every retained turn stays in place",
+                            observed.slot,
+                            observed.owner,
+                            observed.session,
+                            observed.profile,
+                            lead.slot,
+                            lead.owner,
+                            lead.session,
+                            lead.profile
+                        ),
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    state.workflow.lead = Some(observed);
+                    persist(run, &state)?;
+                }
             }
-            crate::executor_assignment::Assignment::load(result)?;
-            let binding = attempt
-                .binding
-                .as_ref()
-                .ok_or_else(|| invalid("the lead frame has no exact native dispatch binding"))?;
-            let session = binding
-                .session
-                .clone()
-                .ok_or_else(|| invalid("the lead frame has no exact native session"))?;
-            if state.workflow.lead.is_none() {
-                state.workflow.lead = Some(WorkflowParticipant {
-                    slot: binding.slot,
-                    owner: binding.owner.clone(),
-                    session,
-                    profile: attempt.profile,
-                });
-                run.cursor.baseline_qualification = Some(state.clone());
-                run.store.save_cursor(&run.cursor)?;
+            let result = retained_result(&attempt)?;
+            let checkout = state
+                .checkout
+                .as_deref()
+                .ok_or_else(|| invalid("prepared qualification has no dispatch checkout"))?;
+            match framing_assignment(&result, checkout, inputs.task.read_only) {
+                Ok(_) => {
+                    if state.workflow.lead_frame_correction.is_some()
+                        || run.cursor.attempt(FRAMING_CORRECTION_ID).is_some()
+                    {
+                        return refuse_framing(
+                            run,
+                            &mut state,
+                            format!(
+                                "the original lead frame {id} is already a valid assignment, but a framing format correction is recorded; preserve this inconsistent state and dispatch nothing"
+                            ),
+                        );
+                    }
+                    return advance_work(run, &inputs, &mut state, &runtime);
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    if state.workflow.lead_frame_correction.is_none() {
+                        if run.cursor.attempt(FRAMING_CORRECTION_ID).is_some() {
+                            return refuse_framing(
+                                run,
+                                &mut state,
+                                format!(
+                                    "the original lead frame {id} is invalid, and a framing correction attempt {FRAMING_CORRECTION_ID} exists without its recorded intent; every retained turn stays in place and no replacement correction is dispatched"
+                                ),
+                            );
+                        }
+                        return prepare_framing_correction(
+                            run, &inputs, &mut state, &runtime, &attempt, &error,
+                        );
+                    }
+                    return handle_framing_correction(
+                        run, &inputs, &mut state, &runtime, &id, &error,
+                    );
+                }
+                Err(error) => return Err(error),
             }
-            return advance_work(run, &inputs, &mut state, &runtime);
         }
         let evidence = match (
             attempt.state,
@@ -169,12 +208,15 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
     let id = format!("lead-frame-{ordinal}");
     let owner = dispatch_owner(&run.spec.run, AttemptRole::LeadFrame, ordinal);
     let prompt = format!(
-        "Frame this ordinary task for an executor in the assigned frozen checkout. Read the relevant project guidance and actual inputs. Do not implement changes or dispatch anyone. Return one usable structured executor assignment as JSON with schema=1, objective, inputs, outputs, invariants, acceptance, consumer and escalate. Every file path must be relative to this checkout and verified here. {}. Preserve all task acceptance. Do not add experiment labels or comparison policy.\n\nTask instructions:\n{}",
+        "Frame this ordinary task for an executor in the assigned frozen checkout at {} (committed base {}). Read the relevant project guidance and actual inputs. Do not implement changes or dispatch anyone. {}. Preserve all task acceptance. Do not add experiment labels or comparison policy.\n\n{}\n\nTask instructions:\n{}",
+        source.display(),
+        base,
         if inputs.task.read_only {
             "This is a read-only task: return the requested result in the executor response; do not edit files or create a commit".to_owned()
         } else {
             format!("Writable scope: {}", inputs.task.writable_scope.join(", "))
         },
+        crate::executor_assignment::framing_contract(),
         fs::read_to_string(&inputs.task_prompt.path)?
     );
     let prompt_path = run.store.assignments_dir().join(format!("{id}.txt"));
@@ -297,6 +339,17 @@ fn pending(attempt: &Attempt) -> Vec<String> {
     )]
 }
 
+/// The lead turn whose result becomes the executor assignment: the one
+/// accepted format correction when it exists, otherwise the original frame.
+fn active_lead_frame(state: &BaselineQualificationState) -> io::Result<&str> {
+    state
+        .workflow
+        .lead_frame_correction
+        .as_deref()
+        .or(state.workflow.lead_frame.as_deref())
+        .ok_or_else(|| invalid("recorded lead frame is missing"))
+}
+
 fn advance_work(
     run: &mut Run,
     inputs: &BaselineQualificationInputs,
@@ -304,11 +357,7 @@ fn advance_work(
     runtime: &ArmRuntime,
 ) -> io::Result<Vec<String>> {
     if inputs.semantic_review.is_some() {
-        let frame_id = state
-            .workflow
-            .lead_frame
-            .as_deref()
-            .ok_or_else(|| invalid("recorded lead frame is missing"))?;
+        let frame_id = active_lead_frame(state)?;
         let frame = run
             .cursor
             .attempt(frame_id)
@@ -319,7 +368,7 @@ fn advance_work(
     if state.workflow.executor_attempt.is_none() {
         let frame = run
             .cursor
-            .attempt(state.workflow.lead_frame.as_deref().unwrap())
+            .attempt(active_lead_frame(state)?)
             .ok_or_else(|| invalid("recorded frame is missing"))?;
         let assignment = retained_result(frame)?;
         return dispatch_turn(
@@ -459,6 +508,239 @@ fn advance_work(
         other => Err(invalid(format!(
             "unexpected qualification step after framing/execution: {other:?}"
         ))),
+    }
+}
+
+/// Records a deterministic framing refusal without erasing any retained turn,
+/// result, receipt or cost, and without dispatching another model turn.
+fn refuse_framing(
+    run: &mut Run,
+    state: &mut BaselineQualificationState,
+    message: String,
+) -> io::Result<Vec<String>> {
+    state.condition = Some(message.clone());
+    persist(run, state)?;
+    Ok(vec![message])
+}
+
+/// The one deterministic framing verdict: the retained result must load as
+/// the strict assignment schema, its declared paths must exist or remain
+/// inside the checkout, and a read-only task may not declare outputs. Every
+/// failure here is an `InvalidInput` framing defect, never a task answer or a
+/// replacement success.
+fn framing_assignment(
+    result: &Path,
+    checkout: &Path,
+    read_only: bool,
+) -> io::Result<crate::executor_assignment::Assignment> {
+    let assignment = crate::executor_assignment::Assignment::load(result)?;
+    assignment.validate_paths(checkout)?;
+    if read_only && !assignment.outputs.is_empty() {
+        return Err(invalid(format!(
+            "the task is read-only, so outputs must be []; the assignment declares {} output path(s)",
+            assignment.outputs.len()
+        )));
+    }
+    Ok(assignment)
+}
+
+/// Keeps the original deterministic defect beside the retained result without
+/// changing the result bytes, digest or terminal evidence.
+fn record_framing_defect(run: &mut Run, attempt_id: &str, error: &io::Error) {
+    let Some(attempt) = run
+        .cursor
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        return;
+    };
+    let detail = format!("deterministic assignment format defect: {error}");
+    match attempt.reason.as_mut() {
+        Some(reason) if reason.contains(&detail) => {}
+        Some(reason) => {
+            reason.push_str("; ");
+            reason.push_str(&detail);
+        }
+        None => attempt.reason = Some(detail),
+    }
+    attempt.updated_ms = now_ms();
+}
+
+/// The one bounded same-lead format continuation. The original visible stream
+/// is snapshotted before its pool slot can be reused, the defect and the
+/// correction intent are persisted before the launch, and the prompt carries
+/// the native validation error plus the canonical schema contract. It never
+/// asks the lead to implement, rediscover the task or dispatch anyone.
+fn prepare_framing_correction(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    runtime: &ArmRuntime,
+    original: &Attempt,
+    error: &io::Error,
+) -> io::Result<Vec<String>> {
+    retain_action_stream(run, original)?;
+    record_framing_defect(run, &original.id, error);
+    let facts = DispatchFacts {
+        runner_declared: run.spec.runner.is_some(),
+        launcher: Some(runtime.home.join("harness/bin/codex.exe")),
+        ..DispatchFacts::default()
+    };
+    if let DispatchGate::Blocked { reason } =
+        dispatch_gate(&run.cursor, AttemptRole::LeadFrame, &facts)
+    {
+        return refuse_framing(run, state, reason);
+    }
+    let prompt = framing_correction_prompt(inputs, state, error)?;
+    fs::create_dir_all(run.store.assignments_dir())?;
+    let path = run
+        .store
+        .assignments_dir()
+        .join(format!("{FRAMING_CORRECTION_ID}.txt"));
+    fs::write(&path, &prompt)?;
+    state.workflow.lead_frame_correction = Some(FRAMING_CORRECTION_ID.to_owned());
+    persist(run, state)?;
+    dispatch_turn(
+        run,
+        inputs,
+        state,
+        runtime,
+        AttemptRole::LeadFrame,
+        FRAMING_CORRECTION_ID.to_owned(),
+        path,
+    )
+}
+
+fn framing_correction_prompt(
+    inputs: &BaselineQualificationInputs,
+    state: &BaselineQualificationState,
+    error: &io::Error,
+) -> io::Result<String> {
+    let checkout = state
+        .checkout
+        .as_deref()
+        .ok_or_else(|| invalid("prepared qualification has no dispatch checkout"))?;
+    let base = state
+        .task_base
+        .as_deref()
+        .ok_or_else(|| invalid("prepared qualification has no frozen task base"))?;
+    let scope = if inputs.task.read_only {
+        "This is a read-only task: outputs must be the empty array [] and you must not edit files or create a commit.".to_owned()
+    } else {
+        format!("Writable scope: {}", inputs.task.writable_scope.join(", "))
+    };
+    Ok(format!(
+        "Your previous framing reply was retained unchanged but could not be loaded as a structured executor assignment. This is the single bounded format correction for that same task and the same lead conversation. Do not implement changes, rediscover the task or dispatch anyone; only restate the identical task framing as one valid Assignment JSON document.\n\nThe native validation error was:\n{}\n\nThe assignment checkout is {} and its committed base is {}.\n{}\n\n{}\n\nFrozen task instructions:\n{}",
+        error,
+        checkout.display(),
+        base,
+        scope,
+        crate::executor_assignment::framing_contract(),
+        fs::read_to_string(&inputs.task_prompt.path)?
+    ))
+}
+
+/// Consumes the single recorded format continuation. A missing, failed,
+/// unknown or differently bound correction is a retained stop with no model
+/// dispatch; a second malformed result ends the workflow explicitly. Only an
+/// exact-session, exact-participant, valid correction reaches the ordinary
+/// executor dispatch.
+fn handle_framing_correction(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    runtime: &ArmRuntime,
+    original_id: &str,
+    original_error: &io::Error,
+) -> io::Result<Vec<String>> {
+    let Some(correction_id) = state.workflow.lead_frame_correction.clone() else {
+        return Err(invalid(
+            "the framing correction handler ran without a recorded correction intent",
+        ));
+    };
+    let Some(correction) = run.cursor.attempt(&correction_id).cloned() else {
+        return refuse_framing(
+            run,
+            state,
+            format!(
+                "the single framing format correction {correction_id} was requested for {original_id} ({original_error}) but its attempt record is missing; the original result and costs are preserved and no model turn is dispatched"
+            ),
+        );
+    };
+    match correction.state {
+        AttemptState::Completed => {}
+        AttemptState::Requested | AttemptState::Started => return Ok(pending(&correction)),
+        other => {
+            return refuse_framing(
+                run,
+                state,
+                format!(
+                    "the single framing format correction {correction_id} is {other:?}; its exact native outcome and every retained result stay in place and no model turn is dispatched"
+                ),
+            );
+        }
+    }
+    let Some(lead) = state.workflow.lead.clone() else {
+        return Err(invalid("the recorded lead participant is missing"));
+    };
+    let observed = match participant(&correction) {
+        Ok(observed) => observed,
+        Err(error) => {
+            return refuse_framing(
+                run,
+                state,
+                format!(
+                    "the completed framing correction {correction_id} has no exact native participant ({error}); no executor was dispatched and its retained evidence is preserved"
+                ),
+            );
+        }
+    };
+    if observed != lead {
+        return refuse_framing(
+            run,
+            state,
+            format!(
+                "the framing correction {correction_id} resumed slot {} owner {} session {} profile {} instead of the recorded lead slot {} owner {} session {} profile {}; no executor was dispatched and both turns are retained",
+                observed.slot,
+                observed.owner,
+                observed.session,
+                observed.profile,
+                lead.slot,
+                lead.owner,
+                lead.session,
+                lead.profile
+            ),
+        );
+    }
+    let result = match retained_result(&correction) {
+        Ok(result) => result,
+        Err(error) => {
+            return refuse_framing(
+                run,
+                state,
+                format!(
+                    "the framing correction {correction_id} cannot be consumed: {error}; no executor was dispatched"
+                ),
+            );
+        }
+    };
+    let checkout = state
+        .checkout
+        .as_deref()
+        .ok_or_else(|| invalid("prepared qualification has no dispatch checkout"))?;
+    match framing_assignment(&result, checkout, inputs.task.read_only) {
+        Ok(_) => advance_work(run, inputs, state, runtime),
+        Err(error) => {
+            record_framing_defect(run, &correction_id, &error);
+            refuse_framing(
+                run,
+                state,
+                format!(
+                    "the original lead frame {original_id} was invalid ({original_error}) and its single same-session correction {correction_id} is also invalid ({error}); the workflow stops here with both turns, results and costs retained and no executor, third lead turn or replacement success dispatched"
+                ),
+            )
+        }
     }
 }
 
@@ -2739,7 +3021,7 @@ fn dispatch_turn(
         return Ok(vec![reason]);
     }
     let selected = match role {
-        AttemptRole::LeadReview => state.lead_binding.as_ref(),
+        AttemptRole::LeadFrame | AttemptRole::LeadReview => state.lead_binding.as_ref(),
         AttemptRole::SemanticReview => state
             .semantic_review
             .as_ref()
@@ -2749,7 +3031,7 @@ fn dispatch_turn(
     .ok_or_else(|| invalid("prepared participant binding is missing"))?
     .clone();
     let prior = match role {
-        AttemptRole::LeadReview => state.workflow.lead.clone(),
+        AttemptRole::LeadFrame | AttemptRole::LeadReview => state.workflow.lead.clone(),
         AttemptRole::Correction => state.workflow.executor.clone(),
         AttemptRole::SemanticReview => state
             .semantic_review
@@ -2762,7 +3044,7 @@ fn dispatch_turn(
         .map(|p| p.owner.clone())
         .unwrap_or_else(|| dispatch_owner(&run.spec.run, role, 1));
     let title_role = match role {
-        AttemptRole::LeadReview => "CLead",
+        AttemptRole::LeadFrame | AttemptRole::LeadReview => "CLead",
         AttemptRole::SemanticReview => "CReview",
         _ => "CEx",
     };
@@ -2789,6 +3071,9 @@ fn dispatch_turn(
         updated_ms: now_ms(),
     })?;
     match role {
+        AttemptRole::LeadFrame => {
+            state.workflow.lead_frame_correction = Some(id.clone());
+        }
         AttemptRole::Executor => state.workflow.executor_attempt = Some(id.clone()),
         AttemptRole::LeadReview => state.workflow.review = Some(id.clone()),
         _ => {}
@@ -2815,6 +3100,46 @@ fn dispatch_turn(
             base: state.task_base.clone(),
             assignment: input,
         }),
+        AttemptRole::LeadFrame => {
+            let p =
+                prior.ok_or_else(|| invalid("framing correction has no exact lead participant"))?;
+            let expected_slot = p.slot;
+            let expected_owner = p.owner.clone();
+            let expected_session = p.session.clone();
+            let expected_profile = p.profile.clone();
+            continue_visible_lead_conversation(&VisibleLeadContinuation {
+                codex_home: dispatch_home.clone(),
+                source,
+                slot: p.slot,
+                owner: p.owner,
+                session: p.session,
+                prompt: fs::read_to_string(input)?,
+            })
+            .and_then(|a| {
+                if a.slot != expected_slot
+                    || a.owner != expected_owner
+                    || a.session != expected_session
+                    || a.profile != expected_profile
+                {
+                    return Err(invalid(format!(
+                        "the framing correction accepted slot {} owner {} session {} profile {} instead of the recorded lead slot {expected_slot} owner {expected_owner} session {expected_session} profile {expected_profile}",
+                        a.slot, a.owner, a.session, a.profile
+                    )));
+                }
+                Ok(VisibleAccepted {
+                    owner: a.owner,
+                    title: format!("CLead ({}) - {owner}", selected.profile),
+                    slot: a.slot,
+                    model: selected.model.clone(),
+                    model_provider: selected.model_provider.clone(),
+                    reasoning_effort: selected.reasoning_effort.clone(),
+                    checkout: a.checkout,
+                    receipt: a.receipt,
+                    result: a.result,
+                    detail: a.detail,
+                })
+            })
+        }
         AttemptRole::LeadReview => {
             let p = prior.ok_or_else(|| invalid("review has no exact lead participant"))?;
             continue_visible_lead_conversation(&VisibleLeadContinuation {

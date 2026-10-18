@@ -419,6 +419,42 @@ pub fn lead_brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> i
     render_brief(assignment, context, "Structured lead assignment (schema 1)")
 }
 
+const FRAMING_CONTRACT_EXAMPLE: &str = r#"{
+  "schema": 1,
+  "objective": "State the exact bounded task outcome.",
+  "inputs": [],
+  "outputs": [],
+  "invariants": ["Preserve the frozen task and checkout scope."],
+  "acceptance": ["Name at least one checkable acceptance item."],
+  "consumer": "qualification controller",
+  "escalate": []
+}"#;
+
+/// The authoritative prompt contract for an ordinary lead's framing turn.
+/// Both the initial request and its one bounded format correction render this
+/// text, so schema facts and limits have one owner.
+pub fn framing_contract() -> String {
+    let mut text = String::new();
+    text.push_str(
+        "Return exactly one JSON object, with no prose or code fences. Assignment schema 1 is strict and rejects unknown fields.\n",
+    );
+    text.push_str(&format!(
+        "- Required fields are \"schema\", \"objective\", \"inputs\", \"outputs\", \"invariants\", and \"acceptance\".\n\
+         - Optional fields are \"consumer\", \"purpose\", \"board_task\", and \"escalate\".\n\
+         - The complete document must be at most {MAX_ASSIGNMENT_BYTES} bytes; the rendered assignment brief must be at most {MAX_BRIEF_BYTES} bytes.\n\
+         - \"objective\" is a non-empty string of at most {MAX_OBJECTIVE_BYTES} bytes.\n\
+         - \"inputs\" and \"outputs\" must be JSON arrays of plain checkout-relative path strings, never objects. Each array has at most {MAX_LIST_ITEMS} entries, each path is at most {MAX_RELATIVE_PATH_BYTES} bytes, and paths must not be rooted, traverse with \"..\", contain \":\", name an empty file or repeat within their array.\n\
+         - Every input must already exist as a regular file inside the checkout. An output may be new, but it must remain inside the checkout.\n\
+         - For a read-only task, \"outputs\" must be the empty array [].\n\
+         - \"invariants\", \"acceptance\", and \"escalate\" must be arrays of strings. Each array has at most {MAX_LIST_ITEMS} entries and each string is at most {MAX_ITEM_BYTES} bytes; \"acceptance\" must contain at least one item.\n\
+         - When present, \"consumer\", \"purpose\", and \"board_task\" are non-empty strings of at most {MAX_ITEM_BYTES} bytes; \"purpose\" is exactly \"ordinary\", \"reflection\" or \"improvement\"; \"board_task\" is one exact issue id without whitespace.\n\
+         \nExample shape (the empty arrays are a read-only default; replace values with the actual task facts):\n"
+    ));
+    text.push_str(FRAMING_CONTRACT_EXAMPLE);
+    text.push('\n');
+    text
+}
+
 fn render_brief(
     assignment: &Assignment,
     context: &AssignmentContext<'_>,

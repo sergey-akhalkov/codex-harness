@@ -2354,6 +2354,9 @@ pub struct WorkflowArmState {
     pub executor: Option<WorkflowParticipant>,
     #[serde(default)]
     pub lead_frame: Option<String>,
+    /// The one malformed-frame format correction continuation, if requested.
+    #[serde(default)]
+    pub lead_frame_correction: Option<String>,
     #[serde(default)]
     pub executor_attempt: Option<String>,
     #[serde(default)]
