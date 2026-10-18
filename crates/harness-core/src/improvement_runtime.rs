@@ -2295,7 +2295,12 @@ pub fn verify_consumption_with_trust(
             }
             let bytes = fs::read(&destination)?;
             if bytes.len() as u64 > FILE_LIMIT
-                || !private_input_matches_with_native_trust(&bytes, &private.sha256, runtime)
+                || !private_input_matches_with_native_trust(
+                    &bytes,
+                    &private.sha256,
+                    &private.destination,
+                    runtime,
+                )
             {
                 return Err(invalid(format!(
                     "the private runner input {} changed since preparation",
@@ -2484,6 +2489,21 @@ fn strip_native_profile_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<
         .map(|stripped| stripped.as_bytes().to_vec())
 }
 
+/// The native profile file contract is a root-level `<profile>.config.toml`
+/// (`orchestration_config::profile_config`). Other private runner inputs keep
+/// their frozen bytes even when they carry the exact hook approval record.
+fn native_profile_config_destination(destination: &str) -> bool {
+    let mut components = Path::new(destination).components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".config.toml"))
+            .is_some_and(|profile| !profile.is_empty())
+}
+
 /// Accepts a private runner input only at its frozen digest, or after removing
 /// the one exact native hook approval and reconstructing the prepared CRLF
 /// bytes. The native serializer rewrites line endings to LF; no other byte
@@ -2491,10 +2511,14 @@ fn strip_native_profile_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<
 fn private_input_matches_with_native_trust(
     bytes: &[u8],
     expected_sha256: &str,
+    destination: &str,
     runtime: &ArmRuntime,
 ) -> bool {
     if build_identity::hash_bytes(bytes) == expected_sha256 {
         return true;
+    }
+    if !native_profile_config_destination(destination) {
+        return false;
     }
     let Some(stripped) = strip_native_profile_trust(bytes, runtime) else {
         return false;

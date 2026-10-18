@@ -1071,6 +1071,10 @@ fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
         b"sandbox_mode = \"read-only\"\r\nmodel = \"fixture-glyph-1\"\r\nmodel_reasoning_effort = \"high\"\r\napproval_policy = \"never\"\r\n\r\n[features]\r\ncode_mode = false\r\n",
     )
     .unwrap();
+    // A retained non-profile private input keeps its exact frozen bytes; the
+    // native profile's consent normalization must never apply to it.
+    let private_notes = root.join("private/notes.txt");
+    fs::write(&private_notes, b"reviewer notes\r\nline two\r\n").unwrap();
     let request = ArmRequest {
         variant: prepare_variant(&state, Arm::Baseline, "H", &build).unwrap(),
         home: home.clone(),
@@ -1079,20 +1083,43 @@ fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
         upstream: fixtures.upstream.clone(),
         timeout: Duration::from_secs(60),
         client: Some(local_client(&catalogue, Some(&overlay))),
-        private_inputs: vec![PrivateInput {
-            source: private_profile,
-            destination: "ds.config.toml".into(),
-        }],
+        private_inputs: vec![
+            PrivateInput {
+                source: private_profile,
+                destination: "ds.config.toml".into(),
+            },
+            PrivateInput {
+                source: private_notes,
+                destination: "notes.txt".into(),
+            },
+        ],
         protected: Vec::new(),
     };
     let mut runtime = install_arm(&request).unwrap();
     verify_consumption(&runtime).unwrap();
     let private_profile = runtime.home.join("ds.config.toml");
     let prepared_private = fs::read(&private_profile).unwrap();
+    let profile_private = runtime
+        .private
+        .iter()
+        .find(|input| input.destination == "ds.config.toml")
+        .expect("the native profile private input is retained");
     assert_eq!(
-        runtime.private[0].sha256,
+        profile_private.sha256,
         build_identity::hash_bytes(&prepared_private),
         "the frozen private profile identity is unchanged"
+    );
+    let private_notes = runtime.home.join("notes.txt");
+    let prepared_notes = fs::read(&private_notes).unwrap();
+    let notes_private = runtime
+        .private
+        .iter()
+        .find(|input| input.destination == "notes.txt")
+        .expect("the non-profile private input is retained");
+    assert_eq!(
+        notes_private.sha256,
+        build_identity::hash_bytes(&prepared_notes),
+        "the frozen non-profile private identity is unchanged"
     );
     let config = runtime.configuration.as_ref().unwrap().path.clone();
     let installed = fs::read(&config).unwrap();
@@ -1166,10 +1193,26 @@ fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
     verify_consumption(&runtime).unwrap();
     verify_consumption(&runtime).unwrap();
     assert_eq!(
-        runtime.private[0].sha256,
+        profile_private.sha256,
         build_identity::hash_bytes(&prepared_private),
         "native consent does not replace the frozen private profile identity"
     );
+
+    // The exact accepted block is profile consent only for the native profile
+    // destination. Appended to a retained non-profile input it corrupts that
+    // input and must refuse even though ds.config.toml still verifies.
+    let notes_with_profile_trust = format!(
+        "{}{profile_record}",
+        std::str::from_utf8(&prepared_notes).unwrap()
+    );
+    fs::write(&private_notes, &notes_with_profile_trust).unwrap();
+    let error = verify_consumption(&runtime).unwrap_err().to_string();
+    assert!(
+        error.contains("private runner input notes.txt changed since preparation"),
+        "profile consent was applied to an unrelated private input: {error}"
+    );
+    fs::write(&private_notes, &prepared_notes).unwrap();
+    verify_consumption(&runtime).unwrap();
 
     let mut profile_counterexamples: Vec<(&str, String)> = Vec::new();
     profile_counterexamples.push((
