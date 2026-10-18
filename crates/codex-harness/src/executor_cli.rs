@@ -37,6 +37,7 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
+mod acceptance;
 #[path = "executor_control.rs"]
 pub(crate) mod control;
 #[path = "executor_input.rs"]
@@ -71,6 +72,7 @@ const USAGE: &str = concat!(
     "codex-harness executor assignment --source CHECKOUT [--repository REPO] --slot N --assignment FILE [--base REV] [--owner ID]\n",
     "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
     "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY [--repository REPO]\n",
+    "codex-harness executor accept TASK --project DIRECTORY [--source CHECKOUT] [--codex-home DIRECTORY] [--run GENERATION]\n  Accept retained structured executor work as the live lead: derive the exact assignment, result, executor session/turn and current lead turn, close TASK through the board owner, and report reflection eligibility. Repeating the same accepted result is a no-op.\n",
     "codex-harness executor stop [--source CHECKOUT] [--codex-home DIRECTORY] [--repository REPO] [--slot N] [--owner ID] [--session SESSION_ID] [--timeout SECONDS]\n",
     "codex-harness executor message [--source CHECKOUT] [--codex-home DIRECTORY] [--repository REPO] [--slot N] [--owner ID] [--session SESSION_ID] [--text TEXT | --file FILE]\n",
     "codex-harness executor message --reply-to MESSAGE_ID [--text TEXT | --file FILE]\n",
@@ -167,6 +169,11 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
             refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             succeed(&args[1..])
+        }
+        Some("accept") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+            acceptance::run(&args[1..])
         }
         _ => Err(invalid("invalid native executor options")),
     }

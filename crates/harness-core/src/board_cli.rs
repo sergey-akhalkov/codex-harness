@@ -501,11 +501,13 @@ pub struct AcceptanceClose {
     pub duplicate: bool,
 }
 
-/// Writes the exact acceptance metadata and closes the task with reason
-/// `accepted` as the approving lead. The actor is required: an unauthenticated
-/// or impersonated approval is refused. An identical existing closure is
-/// reported as a duplicate, while a different reason or different metadata
-/// refuses instead of overwriting durable evidence.
+/// Writes the supplied acceptance metadata and closes the task with reason
+/// `accepted`, attributing the write to the supplied actor. The caller must
+/// first authenticate that actor as the actual approving lead; this function
+/// performs board bookkeeping and cannot validate a native conversation on its
+/// own. An identical existing closure is reported as a duplicate, while a
+/// different reason or different metadata refuses instead of overwriting
+/// durable evidence.
 pub fn close_accepted(
     bd: &Path,
     project: &Path,

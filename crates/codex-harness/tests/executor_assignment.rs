@@ -5,15 +5,31 @@
 //! launcher, so no model, subscription or terminal is involved.
 #![cfg(windows)]
 
+use harness_core::{
+    delivery_reflection::{
+        ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, JournalPolicy, Purpose,
+        ReflectionController, SourceIdentity,
+    },
+    process_service::{self, ServiceProcess},
+    task_worktree::{
+        self, AssignmentSubmission, CompletionFacts, RetainedCompletion, SlotAssignmentBinding,
+    },
+};
 use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    thread,
+    time::Duration,
 };
 
+#[path = "fixtures/control_endpoint.rs"]
+mod control_endpoint;
 #[path = "fixtures/synthetic_role_build.rs"]
 mod synthetic_role_build;
+
+use control_endpoint::{Answer, Bearer, Server};
 
 fn manager() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
@@ -378,6 +394,248 @@ impl SpawnFixture {
 
     fn drop_fixture(self) {
         self.base.drop();
+    }
+}
+
+const ACCEPTANCE_LEAD: &str = "lead-acceptance";
+const ACCEPTANCE_LEAD_TURN: &str = "lead-turn-1";
+const ACCEPTANCE_EXECUTOR_SESSION: &str = "executor-session-1";
+const ACCEPTANCE_EXECUTOR_TURN: &str = "executor-turn-1";
+const ACCEPTANCE_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// One owned board and executor checkout plus a real loopback control
+/// endpoint. The lead registry record names this test process so `registered_lead`
+/// exercises its live-process check, while every board effect stays in the
+/// fixture root.
+struct AcceptanceFixture {
+    spawn: SpawnFixture,
+    server: Server,
+    lead_thread: String,
+    lead_turn: String,
+}
+
+impl AcceptanceFixture {
+    fn new(name: &str) -> Self {
+        let spawn = SpawnFixture::with_board(name);
+        let server = Server::start(Bearer::Value(ACCEPTANCE_TOKEN.to_owned()));
+        server.answer("initialize", Answer::Result(json!({})));
+        let fixture = Self {
+            spawn,
+            server,
+            lead_thread: ACCEPTANCE_LEAD.to_owned(),
+            lead_turn: ACCEPTANCE_LEAD_TURN.to_owned(),
+        };
+        fixture.set_lead_turns(vec![
+            json!({"id": "lead-turn-0", "status": "completed"}),
+            json!({"id": fixture.lead_turn, "status": "inProgress"}),
+        ]);
+        fixture.register_endpoint(fixture.server.port, &fixture.lead_thread);
+        fixture
+    }
+
+    fn project(&self) -> &Path {
+        &self.spawn.base.source
+    }
+
+    fn checkout(&self) -> &Path {
+        &self.spawn.base.slot
+    }
+
+    fn home(&self) -> &Path {
+        &self.spawn.home
+    }
+
+    fn set_lead_turns(&self, turns: Vec<Value>) {
+        self.server.answer(
+            "thread/read",
+            Answer::Result(json!({
+                "thread": {"id": self.lead_thread, "turns": turns},
+            })),
+        );
+    }
+
+    fn register_endpoint(&self, port: u16, thread: &str) {
+        let user = process_service::current_user().unwrap();
+        let program = std::env::current_exe().unwrap();
+        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        let registry = self.home().join("harness/lead-endpoints");
+        fs::create_dir_all(&registry).unwrap();
+        fs::write(
+            registry.join(format!("{thread}.json")),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "port": port,
+                "token": ACCEPTANCE_TOKEN,
+                "threadId": thread,
+                "process": {
+                    "pid": identity.pid,
+                    "creationTime": identity.creation_time,
+                    "program": program,
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn create_task(&self, title: &str, purpose: Option<Purpose>) -> String {
+        let task = self.spawn.create_issue(title, "task", None);
+        if let Some(purpose) = purpose {
+            self.spawn
+                .set_metadata(&task, "harness.purpose", purpose.as_str());
+        }
+        task
+    }
+
+    fn controller(&self) -> ReflectionController {
+        ReflectionController::new(self.spawn.bd(), self.project(), self.home())
+    }
+
+    fn activate(&self) -> ReflectionController {
+        let controller = self.controller();
+        controller
+            .activate(&ActivationRequest {
+                lead_session: self.lead_thread.clone(),
+                run: Some("acceptance-run".to_owned()),
+                boundary: None,
+                journal: JournalPolicy::EnableIfMissing,
+                limits: None,
+            })
+            .unwrap();
+        controller
+    }
+
+    fn board_source(&self) -> SourceIdentity {
+        harness_core::delivery_reflection::board_source_identity(&self.spawn.bd(), self.project())
+            .unwrap()
+    }
+
+    fn retain(
+        &self,
+        task: &str,
+        purpose: Purpose,
+        run: &str,
+        state: &str,
+        source: Option<SourceIdentity>,
+    ) -> RetainedCompletion {
+        thread::sleep(Duration::from_millis(10));
+        let assignment_sha256 = harness_core::build_identity::hash_bytes(run.as_bytes());
+        let assignment = SlotAssignmentBinding {
+            source: source.unwrap_or_else(|| self.board_source()),
+            issue: task.to_owned(),
+            assignment_sha256: assignment_sha256.clone(),
+            purpose: Some(purpose.as_str().to_owned()),
+            purpose_source: "board".to_owned(),
+        };
+        let result = self.spawn.base.root.join(format!("result-{run}.txt"));
+        fs::write(&result, format!("synthetic result for {run}\n")).unwrap();
+        let state_dir = task_worktree::pool_state_dir(self.home(), self.checkout()).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        task_worktree::retain_completion(
+            &state_dir,
+            &CompletionFacts {
+                run_generation: run.to_owned(),
+                slot: 1,
+                owner: "executor-acceptance".to_owned(),
+                checkout: self.checkout().to_path_buf(),
+                task: Some("executor-slot-binding".to_owned()),
+                handle: Some(format!("handle-{run}")),
+                assignment: Some(assignment),
+                submitted_assignment: Some(AssignmentSubmission::structured(assignment_sha256)),
+                role: Some("executor".to_owned()),
+                state: state.to_owned(),
+                exit_code: Some(if state == "completed" { 0 } else { 1 }),
+                session: Some(ACCEPTANCE_EXECUTOR_SESSION.to_owned()),
+                turn: Some(ACCEPTANCE_EXECUTOR_TURN.to_owned()),
+                result: Some(result),
+            },
+        )
+        .unwrap()
+    }
+
+    fn set_recorded_ms(&self, run: &str, recorded_ms: u64) {
+        let state_dir = task_worktree::pool_state_dir(self.home(), self.checkout()).unwrap();
+        let manifest = state_dir
+            .join("completions")
+            .join(run)
+            .join("completion.json");
+        let mut record: RetainedCompletion =
+            serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        record.recorded_ms = recorded_ms;
+        fs::write(&manifest, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    }
+
+    fn accept_raw(&self, thread: &str, task: &str, run: Option<&str>) -> std::process::Output {
+        let mut command = Command::new(manager());
+        command.args([
+            "executor",
+            "accept",
+            task,
+            "--project",
+            self.project().to_str().unwrap(),
+            "--source",
+            self.checkout().to_str().unwrap(),
+            "--codex-home",
+            self.home().to_str().unwrap(),
+        ]);
+        if let Some(run) = run {
+            command.args(["--run", run]);
+        }
+        command
+            .env("CODEX_HOME", self.home())
+            .env("CODEX_THREAD_ID", thread);
+        for key in [
+            "CODEX_SESSION_ID",
+            "HARNESS_EXECUTOR_SESSION",
+            "HARNESS_BOUNDED_LEAD_SESSION",
+            "HARNESS_EXECUTOR_RUN",
+            "HARNESS_ORIGINATING_LEAD",
+            "HARNESS_LEAD_THREAD",
+            "HARNESS_LEAD_RECIPIENT",
+        ] {
+            command.env_remove(key);
+        }
+        command.output().unwrap()
+    }
+
+    fn accept(&self, task: &str, run: Option<&str>) -> Value {
+        let out = self.accept_raw(&self.lead_thread, task, run);
+        let text = output_text(&out);
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("executor accept did not return JSON: {error}\n{text}"))
+    }
+
+    fn refuse(&self, task: &str, run: Option<&str>) -> String {
+        let out = self.accept_raw(&self.lead_thread, task, run);
+        let text = output_text(&out);
+        assert_eq!(out.status.code(), Some(2), "{text}");
+        text
+    }
+
+    fn show(&self, task: &str) -> Value {
+        self.spawn.show(task)
+    }
+
+    fn acceptance(&self, task: &str) -> Option<String> {
+        self.show(task)
+            .get("metadata")
+            .and_then(|metadata| metadata.get(ACCEPTANCE_METADATA))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    fn close_with_reason(&self, task: &str, reason: &str) {
+        self.spawn
+            .bd_json(&["close", task, "--reason", reason, "--json"]);
+    }
+
+    fn drop_fixture(self) {
+        let Self { spawn, server, .. } = self;
+        drop(server);
+        spawn.drop_fixture();
     }
 }
 
@@ -1460,5 +1718,403 @@ fn completed_ordinary_facts_survive_slot_reuse_and_free_text_is_ineligible() {
         second
     );
 
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_ordinary_binds_exact_turns_emits_one_job_and_repeat_is_a_noop() {
+    let fixture = AcceptanceFixture::new("accept-ordinary");
+    let controller = fixture.activate();
+    let task = fixture.create_task("Accept ordinary work", Some(Purpose::Ordinary));
+    let retained = fixture.retain(&task, Purpose::Ordinary, "run-1", "completed", None);
+    assert!(retained.eligibility.eligible, "{retained:?}");
+
+    let receipt = fixture.accept(&task, None);
+    let acceptance_id = receipt["acceptanceId"].as_str().unwrap().to_owned();
+    assert_eq!(receipt["status"], "accepted", "{receipt}");
+    assert_eq!(receipt["duplicate"], false, "{receipt}");
+    assert_eq!(receipt["run"], "run-1", "{receipt}");
+    assert_eq!(
+        receipt["executorSession"], ACCEPTANCE_EXECUTOR_SESSION,
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["executorTurn"], ACCEPTANCE_EXECUTOR_TURN,
+        "{receipt}"
+    );
+    assert_eq!(receipt["leadSession"], ACCEPTANCE_LEAD, "{receipt}");
+    assert_eq!(receipt["leadTurn"], ACCEPTANCE_LEAD_TURN, "{receipt}");
+    assert_eq!(
+        receipt["currentLeadTurn"], ACCEPTANCE_LEAD_TURN,
+        "{receipt}"
+    );
+    assert_eq!(receipt["reflection"]["status"], "active", "{receipt}");
+    assert_eq!(receipt["reflection"]["automaticTrigger"], true, "{receipt}");
+    assert_eq!(receipt["modelCalls"], 0, "{receipt}");
+    let recorded = fixture.acceptance(&task).expect("accepted metadata");
+    let binding: AcceptanceBinding = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(binding.task, task);
+    assert_eq!(binding.run, "run-1");
+    assert_eq!(binding.lead_session, ACCEPTANCE_LEAD);
+    assert_eq!(binding.lead_turn.as_deref(), Some(ACCEPTANCE_LEAD_TURN));
+    assert_eq!(
+        binding.executor_turn.as_deref(),
+        Some(ACCEPTANCE_EXECUTOR_TURN)
+    );
+
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.model_calls, 0, "{poll:?}");
+    assert_eq!(poll.jobs.len(), 1, "{poll:?}");
+    let job = &poll.jobs[0];
+    assert_eq!(job.acceptance_id, acceptance_id, "{job:?}");
+    assert_eq!(job.stage.as_str(), "executor", "{job:?}");
+    assert_eq!(job.task_id, task, "{job:?}");
+    assert_eq!(
+        job.source_sessions,
+        vec![ACCEPTANCE_EXECUTOR_SESSION.to_owned()],
+        "{job:?}"
+    );
+    assert_eq!(
+        job.executor_session.as_deref(),
+        Some(ACCEPTANCE_EXECUTOR_SESSION),
+        "{job:?}"
+    );
+    assert_eq!(
+        job.executor_turn.as_deref(),
+        Some(ACCEPTANCE_EXECUTOR_TURN),
+        "{job:?}"
+    );
+    assert_eq!(
+        job.lead_turn.as_deref(),
+        Some(ACCEPTANCE_LEAD_TURN),
+        "{job:?}"
+    );
+    assert_eq!(job.lead_session, ACCEPTANCE_LEAD, "{job:?}");
+    assert_eq!(job.run, "run-1", "{job:?}");
+    for exact in [
+        format!("assignment={}", binding.assignment),
+        format!("result={}", binding.result),
+        format!("revision={}", binding.revision),
+    ] {
+        assert!(job.context.contains(&exact), "{exact} missing from {job:?}");
+    }
+
+    // A later caller turn and a newer ineligible correction do not change the
+    // accepted identity or select the newer run for the repeat.
+    fixture.set_lead_turns(vec![
+        json!({"id": ACCEPTANCE_LEAD_TURN, "status": "completed"}),
+        json!({"id": "lead-turn-2", "status": "inProgress"}),
+    ]);
+    let newer = fixture.retain(&task, Purpose::Ordinary, "run-2", "failed", None);
+    assert!(!newer.eligibility.eligible, "{newer:?}");
+    let repeat = fixture.accept(&task, None);
+    assert_eq!(repeat["duplicate"], true, "{repeat}");
+    assert_eq!(repeat["acceptanceId"], acceptance_id, "{repeat}");
+    assert_eq!(repeat["run"], "run-1", "{repeat}");
+    assert_eq!(repeat["leadTurn"], ACCEPTANCE_LEAD_TURN, "{repeat}");
+    assert_eq!(repeat["currentLeadTurn"], "lead-turn-2", "{repeat}");
+    assert_eq!(repeat["reflection"]["automaticTrigger"], true, "{repeat}");
+    assert_eq!(
+        fixture.acceptance(&task).as_deref(),
+        Some(recorded.as_str())
+    );
+
+    let after_repeat = controller.poll().unwrap();
+    assert_eq!(after_repeat.events_seen, 0, "{after_repeat:?}");
+    assert_eq!(after_repeat.accepted, 0, "{after_repeat:?}");
+    assert_eq!(after_repeat.duplicates, 0, "{after_repeat:?}");
+    assert_eq!(after_repeat.jobs.len(), 1, "{after_repeat:?}");
+    assert_eq!(
+        after_repeat.jobs[0].acceptance_id, acceptance_id,
+        "{after_repeat:?}"
+    );
+    assert_eq!(after_repeat.model_calls, 0, "{after_repeat:?}");
+    let mismatch = fixture.refuse(&task, Some("run-2"));
+    assert!(
+        mismatch.contains("does not match the recorded accepted run"),
+        "{mismatch}"
+    );
+    assert_eq!(
+        fixture.acceptance(&task).as_deref(),
+        Some(recorded.as_str())
+    );
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_with_reflection_mode_off_keeps_the_ordinary_close() {
+    let fixture = AcceptanceFixture::new("accept-mode-off");
+    let task = fixture.create_task("Accept without reflection", Some(Purpose::Ordinary));
+    fixture.retain(&task, Purpose::Ordinary, "run-off", "completed", None);
+
+    let receipt = fixture.accept(&task, None);
+    assert_eq!(receipt["status"], "accepted", "{receipt}");
+    assert_eq!(receipt["duplicate"], false, "{receipt}");
+    assert_eq!(receipt["reflection"]["status"], "inactive", "{receipt}");
+    assert_eq!(
+        receipt["reflection"]["automaticTrigger"], false,
+        "{receipt}"
+    );
+    assert_eq!(receipt["modelCalls"], 0, "{receipt}");
+    let shown = fixture.show(&task);
+    assert_eq!(shown["status"], "closed", "{shown}");
+    assert_eq!(shown["close_reason"], "accepted", "{shown}");
+    assert!(fixture.acceptance(&task).is_some(), "{shown}");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_improvement_work_never_auto_triggers_reflection() {
+    let fixture = AcceptanceFixture::new("accept-improvement");
+    let controller = fixture.activate();
+    let task = fixture.create_task("Accept improvement work", Some(Purpose::Improvement));
+    fixture.retain(
+        &task,
+        Purpose::Improvement,
+        "run-improvement",
+        "completed",
+        None,
+    );
+
+    let receipt = fixture.accept(&task, None);
+    assert_eq!(receipt["status"], "accepted", "{receipt}");
+    assert_eq!(receipt["purpose"], "improvement", "{receipt}");
+    assert_eq!(
+        receipt["reflection"]["automaticTrigger"], false,
+        "{receipt}"
+    );
+    assert!(
+        receipt["reflection"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("never auto-triggers reflection")),
+        "{receipt}"
+    );
+    let poll = controller.poll().unwrap();
+    assert!(poll.jobs.is_empty(), "{poll:?}");
+    assert_eq!(poll.model_calls, 0, "{poll:?}");
+    assert_eq!(fixture.show(&task)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_refuses_a_foreign_live_lead_without_board_effects() {
+    let fixture = AcceptanceFixture::new("accept-foreign-lead");
+    let controller = fixture.activate();
+    let task = fixture.create_task("Foreign lead task", Some(Purpose::Ordinary));
+    fixture.retain(
+        &task,
+        Purpose::Ordinary,
+        "run-foreign-lead",
+        "completed",
+        None,
+    );
+    let before = fixture.acceptance(&task);
+
+    let foreign_thread = "lead-foreign";
+    let foreign_server = Server::start(Bearer::Value(ACCEPTANCE_TOKEN.to_owned()));
+    foreign_server.answer("initialize", Answer::Result(json!({})));
+    foreign_server.answer(
+        "thread/read",
+        Answer::Result(json!({
+            "thread": {
+                "id": foreign_thread,
+                "turns": [{"id": "foreign-turn", "status": "inProgress"}],
+            },
+        })),
+    );
+    fixture.register_endpoint(foreign_server.port, foreign_thread);
+    let out = fixture.accept_raw(foreign_thread, &task, None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("WrongLead"), "{text}");
+    assert!(text.contains("not expected 'lead-foreign'"), "{text}");
+    assert_eq!(fixture.acceptance(&task), before);
+    assert_ne!(fixture.show(&task)["status"], "closed");
+    assert_eq!(controller.poll().unwrap().jobs.len(), 0);
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_requires_exactly_one_in_progress_lead_turn() {
+    let fixture = AcceptanceFixture::new("accept-turn-count");
+    let task = fixture.create_task("Exact turn count", Some(Purpose::Ordinary));
+    fixture.retain(
+        &task,
+        Purpose::Ordinary,
+        "run-turn-count",
+        "completed",
+        None,
+    );
+    let before = fixture.acceptance(&task);
+
+    fixture.set_lead_turns(vec![json!({"id": "lead-turn-0", "status": "completed"})]);
+    let none = fixture.refuse(&task, None);
+    assert!(none.contains("has 0 in-progress native turns"), "{none}");
+
+    fixture.set_lead_turns(vec![
+        json!({"id": "lead-turn-a", "status": "inProgress"}),
+        json!({"id": "lead-turn-b", "status": "inProgress"}),
+    ]);
+    let multiple = fixture.refuse(&task, None);
+    assert!(
+        multiple.contains("has 2 in-progress native turns"),
+        "{multiple}"
+    );
+    assert_eq!(fixture.acceptance(&task), before);
+    assert_ne!(fixture.show(&task)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_uses_exact_run_or_refuses_a_newer_ineligible_completion() {
+    let fixture = AcceptanceFixture::new("accept-run-selection");
+    let task = fixture.create_task("Run selection", Some(Purpose::Ordinary));
+    fixture.retain(&task, Purpose::Ordinary, "run-1", "completed", None);
+    fixture.retain(&task, Purpose::Ordinary, "run-2", "failed", None);
+    let before = fixture.acceptance(&task);
+
+    let newest = fixture.refuse(&task, None);
+    assert!(newest.contains("run-2"), "{newest}");
+    assert!(newest.contains("not a completed zero-exit"), "{newest}");
+    assert_eq!(fixture.acceptance(&task), before);
+    assert_ne!(fixture.show(&task)["status"], "closed");
+
+    let unrelated = fixture.create_task("Unrelated task", Some(Purpose::Ordinary));
+    fixture.retain(
+        &unrelated,
+        Purpose::Ordinary,
+        "run-unrelated",
+        "completed",
+        None,
+    );
+    let foreign = fixture.refuse(&task, Some("run-unrelated"));
+    assert!(
+        foreign.contains("retained for another board task"),
+        "{foreign}"
+    );
+    assert_eq!(fixture.acceptance(&task), before);
+
+    let accepted = fixture.accept(&task, Some("run-1"));
+    assert_eq!(accepted["run"], "run-1", "{accepted}");
+    assert_eq!(accepted["duplicate"], false, "{accepted}");
+    assert_eq!(fixture.show(&task)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_requires_run_when_the_newest_generations_share_a_timestamp() {
+    let fixture = AcceptanceFixture::new("accept-run-timestamp");
+    let task = fixture.create_task("Timestamp ambiguity", Some(Purpose::Ordinary));
+    let first = fixture.retain(&task, Purpose::Ordinary, "run-a", "completed", None);
+    let second = fixture.retain(&task, Purpose::Ordinary, "run-b", "completed", None);
+    assert!(second.recorded_ms > first.recorded_ms);
+    fixture.set_recorded_ms("run-a", second.recorded_ms);
+
+    let ambiguous = fixture.refuse(&task, None);
+    assert!(ambiguous.contains("same newest timestamp"), "{ambiguous}");
+    assert!(ambiguous.contains("--run GENERATION"), "{ambiguous}");
+    assert_eq!(fixture.acceptance(&task), None);
+    assert_ne!(fixture.show(&task)["status"], "closed");
+
+    let accepted = fixture.accept(&task, Some("run-b"));
+    assert_eq!(accepted["run"], "run-b", "{accepted}");
+    assert_eq!(accepted["duplicate"], false, "{accepted}");
+    assert_eq!(fixture.show(&task)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_refuses_a_stale_board_source_without_metadata() {
+    let fixture = AcceptanceFixture::new("accept-stale-source");
+    let task = fixture.create_task("Stale source", Some(Purpose::Ordinary));
+    let mut stale = fixture.board_source();
+    stale.project_id = "another-board-project".to_owned();
+    fixture.retain(
+        &task,
+        Purpose::Ordinary,
+        "run-stale",
+        "completed",
+        Some(stale),
+    );
+
+    let refused = fixture.refuse(&task, None);
+    assert!(refused.contains("stale board source"), "{refused}");
+    assert!(fixture.acceptance(&task).is_none(), "{refused}");
+    assert_ne!(fixture.show(&task)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_refuses_a_changed_result_without_rewriting_acceptance() {
+    let fixture = AcceptanceFixture::new("accept-changed-result");
+    let task = fixture.create_task("Changed result", Some(Purpose::Ordinary));
+    let retained = fixture.retain(&task, Purpose::Ordinary, "run-result", "completed", None);
+    fixture.accept(&task, None);
+    let before = fixture.acceptance(&task).expect("accepted metadata");
+    let locator = retained
+        .result
+        .as_ref()
+        .expect("retained result")
+        .locator
+        .clone();
+    fs::write(locator, "changed after acceptance\n").unwrap();
+
+    let refused = fixture.refuse(&task, None);
+    assert!(refused.contains("retained result artifact"), "{refused}");
+    assert!(refused.contains("not acceptable"), "{refused}");
+    assert_eq!(fixture.acceptance(&task).as_deref(), Some(before.as_str()));
+    assert_eq!(fixture.show(&task)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_refuses_unknown_purpose_and_another_close_reason() {
+    let fixture = AcceptanceFixture::new("accept-refusals");
+    let unknown = fixture.create_task("Unknown purpose", None);
+    let refused = fixture.refuse(&unknown, None);
+    assert!(refused.contains("records no harness.purpose"), "{refused}");
+    assert!(fixture.acceptance(&unknown).is_none(), "{refused}");
+
+    let cancelled = fixture.create_task("Cancelled work", Some(Purpose::Ordinary));
+    fixture.close_with_reason(&cancelled, "cancelled");
+    let refused = fixture.refuse(&cancelled, None);
+    assert!(refused.contains("not accepted"), "{refused}");
+    assert!(refused.contains("cancelled"), "{refused}");
+    assert!(fixture.acceptance(&cancelled).is_none(), "{refused}");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accepted_without_exact_turn_metadata_repeats_but_is_reflection_ineligible() {
+    let fixture = AcceptanceFixture::new("accept-missing-turns");
+    let task = fixture.create_task("Legacy accepted record", Some(Purpose::Ordinary));
+    fixture.retain(&task, Purpose::Ordinary, "run-legacy", "completed", None);
+    let first = fixture.accept(&task, None);
+    let acceptance_id = first["acceptanceId"].as_str().unwrap().to_owned();
+    let recorded = fixture.acceptance(&task).expect("accepted metadata");
+    let binding: AcceptanceBinding = serde_json::from_str(&recorded).unwrap();
+    let stripped = binding.with_turns(None, None, None);
+    let stripped_raw = serde_json::to_string(&stripped).unwrap();
+    fixture
+        .spawn
+        .set_metadata(&task, ACCEPTANCE_METADATA, &stripped_raw);
+
+    let repeat = fixture.accept(&task, None);
+    assert_eq!(repeat["duplicate"], true, "{repeat}");
+    assert_eq!(repeat["acceptanceId"], acceptance_id, "{repeat}");
+    assert!(repeat["executorSession"].is_null(), "{repeat}");
+    assert!(repeat["executorTurn"].is_null(), "{repeat}");
+    assert!(repeat["leadTurn"].is_null(), "{repeat}");
+    assert_eq!(repeat["reflection"]["automaticTrigger"], false, "{repeat}");
+    assert!(
+        repeat["reflection"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no exact executor session")),
+        "{repeat}"
+    );
+    assert_eq!(
+        fixture.acceptance(&task).as_deref(),
+        Some(stripped_raw.as_str())
+    );
     fixture.drop_fixture();
 }

@@ -254,6 +254,36 @@ On a new lead session: read the board first (`lead_review`, assignee `lead`,
 ready work). Create new tasks for new situation; do not re-open completed
 verification.
 
+### Structured acceptance
+
+After reviewing a structured executor result, accept it from the real managed
+lead conversation:
+
+```powershell
+codex-harness executor accept <task> --project <project>
+```
+
+Add the common `--source <checkout>` or `--codex-home <directory>` only when
+they differ from the project/default home. The command authenticates the current
+native lead endpoint, derives the assignment, result, executor session/turn and
+current lead turn from the retained completion, then records acceptance and
+closes through the board owner. Do not hand-author identity or request JSON, and
+do not substitute a plain close when that structured completion should be
+accepted.
+
+Use `--run <generation>` only to resolve an explicitly reported ambiguous
+selection, never as an automatic fallback or to make an ineligible run eligible.
+A repeat for the same accepted result is a no-op. Foreign leads, stale board
+scope or purpose, changed results, cancelled/unrelated closures, and missing or
+ambiguous exact turns are refused before board effects.
+
+Automatic reflection requires an active reflection binding, ordinary purpose,
+and exact executor and lead turns. Improvement work and a mode-off binding
+close normally and run no reflection. A legacy accepted record without exact
+turn provenance still repeats but reports reflection ineligibility. Tasks
+without a structured retained completion keep the existing ordinary `bd close`
+workflow.
+
 For a requested continuous improvement loop, use `self-improvement-loop` and
 the [sequential comparison record guide](references/self-improvement.md).
 It keeps hypotheses and scoped removal decisions on this board while the
