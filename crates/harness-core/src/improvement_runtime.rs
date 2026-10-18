@@ -2244,13 +2244,19 @@ pub fn verify_consumption_with_trust(
             // same file before the first model request
             // (`executor_cli::ensure_workspace_trust` appends one
             // `[projects.'<workspace>'] trust_level = "trusted"` block per
-            // slot), so a prepared arm legitimately gains exactly the
-            // trailing entries of the workspaces its owner authorized for
-            // dispatch. Accept nothing else: removing exactly those blocks
-            // must reproduce the prepared bytes.
-            let restored = strip_appended_trust(&bytes, trusted_workspaces)
-                .filter(|stripped| build_identity::hash_bytes(stripped) == configuration.sha256);
-            if restored.is_none() {
+            // slot), and the native client records the user's approval of
+            // this arm's unchanged token hook. A prepared arm legitimately
+            // gains exactly those entries; removing them must reproduce the
+            // prepared bytes.
+            let restored =
+                strip_appended_trust(&bytes, trusted_workspaces).is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| {
+                        strip_native_hook_trust(candidate, runtime).is_some_and(|stripped| {
+                            build_identity::hash_bytes(&stripped) == configuration.sha256
+                        })
+                    })
+                });
+            if !restored {
                 return Err(invalid("the arm configuration changed since preparation"));
             }
         }
@@ -2361,29 +2367,156 @@ pub fn select_arm(
 /// Removes the trailing trusted-project blocks the ordinary dispatch appends
 /// to an arm configuration (`executor_cli::ensure_workspace_trust` writes
 /// `\n[projects.'<workspace>']\ntrust_level = "trusted"\n` once per slot) for
-/// exactly the workspaces authorized for the arm's own dispatcher.
+/// exactly the workspaces authorized for the arm's own dispatcher, yielding
+/// every intermediate state so a prepared configuration that already ends
+/// with trusted-project blocks can still match its frozen digest.
 /// Anything else - an appended comment, another projects entry, another
 /// workspace or a changed trust level - keeps its bytes and therefore still
 /// fails the comparison.
-fn strip_appended_trust(bytes: &[u8], trusted_workspaces: &[PathBuf]) -> Option<Vec<u8>> {
+fn strip_appended_trust(bytes: &[u8], trusted_workspaces: &[PathBuf]) -> Option<Vec<Vec<u8>>> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut current = text;
-    loop {
-        let Some(rest) = current.strip_suffix("\ntrust_level = \"trusted\"\n") else {
-            return Some(current.as_bytes().to_vec());
-        };
+    let mut candidates = vec![current.as_bytes().to_vec()];
+    while let Some(rest) = current.strip_suffix("\ntrust_level = \"trusted\"\n") {
         let section = rest.rsplit('\n').next()?;
-        let named = section.strip_prefix("[projects.'")?.strip_suffix("']")?;
+        let Some(named) = section
+            .strip_prefix("[projects.'")
+            .and_then(|named| named.strip_suffix("']"))
+        else {
+            break;
+        };
         if named.is_empty()
             || named.contains('\'')
             || !trusted_workspaces
                 .iter()
                 .any(|workspace| same_trust_workspace(named, workspace))
         {
-            return None;
+            break;
         }
         current = &rest[..rest.len() - section.len() - 1];
+        candidates.push(current.as_bytes().to_vec());
     }
+    Some(candidates)
+}
+
+/// Removes exactly the local hook approval the native client appends after
+/// the user accepts this arm's own unchanged token-hook definition. The trust
+/// key comes from the retained `hooks.json` link and the digest from the
+/// retained definition, so a foreign path, another event or handler, a changed
+/// definition or any additional field keeps its bytes and still fails the
+/// frozen configuration comparison.
+fn strip_native_hook_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<u8>> {
+    let Some(component) = runtime
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+    else {
+        return Some(bytes.to_vec());
+    };
+    let Some(link) = component
+        .links
+        .iter()
+        .find(|link| link.name == "hooks.json")
+    else {
+        return Some(bytes.to_vec());
+    };
+    let definition_path = checked_link(&link.destination, &link.source, false).ok()?;
+    let metadata = fs::metadata(&definition_path).ok()?;
+    if !metadata.is_file() || metadata.len() > COMPONENT_FILE_LIMIT {
+        return None;
+    }
+    let definition: serde_json::Value =
+        serde_json::from_slice(&fs::read(&definition_path).ok()?).ok()?;
+    let digest = normalized_hook_trust_hash(&definition)?;
+    let destination = link.destination.to_string_lossy();
+    if destination.contains('\'') || destination.contains('\n') || destination.contains('\r') {
+        return None;
+    }
+    let block =
+        format!("\n[hooks.state.'{destination}:pre_tool_use:0:0']\ntrusted_hash = \"{digest}\"\n");
+    // The exact native record is required: a changed digest, key or extra
+    // field does not match and remains part of the frozen comparison.
+    let text = std::str::from_utf8(bytes).ok()?;
+    match text.matches(&block).count() {
+        0 => Some(bytes.to_vec()),
+        1 => Some(text.replacen(&block, "", 1).into_bytes()),
+        _ => None,
+    }
+}
+
+/// Mirrors the native client's hook trust identity for a `hooks.json`
+/// definition: the normalized command handler for `PreToolUse[0].hooks[0]`,
+/// serialized as TOML, converted to JSON with sorted object keys, and hashed.
+/// The digest is derived from the retained definition so a changed command or
+/// handler cannot reuse an earlier approval.
+fn normalized_hook_trust_hash(definition: &serde_json::Value) -> Option<String> {
+    let group = definition
+        .get("hooks")?
+        .get("PreToolUse")?
+        .as_array()?
+        .first()?;
+    let matcher = match group.get("matcher") {
+        Some(value) => Some(value.as_str()?),
+        None => None,
+    };
+    let handler = group.get("hooks")?.as_array()?.first()?;
+    if handler.get("type")?.as_str()? != "command" {
+        return None;
+    }
+    let command = handler.get("command")?.as_str()?;
+    if command.trim().is_empty() {
+        return None;
+    }
+    let timeout = match handler.get("timeout") {
+        Some(value) => i64::try_from(value.as_u64()?.max(1)).ok()?,
+        None => 600,
+    };
+    let is_async = match handler.get("async") {
+        Some(value) => value.as_bool()?,
+        None => false,
+    };
+    let status_message = match handler.get("statusMessage") {
+        Some(value) => Some(value.as_str()?),
+        None => None,
+    };
+    let additional_context_limit = match handler.get("additionalContextLimit") {
+        Some(value) => Some(i64::try_from(value.as_u64()?).ok()?),
+        None => None,
+    }
+    .filter(|limit| *limit != 2_500);
+    let mut normalized = toml::Table::new();
+    normalized.insert("type".into(), toml::Value::String("command".into()));
+    normalized.insert("command".into(), toml::Value::String(command.into()));
+    normalized.insert("timeout".into(), toml::Value::Integer(timeout));
+    normalized.insert("async".into(), toml::Value::Boolean(is_async));
+    if let Some(status_message) = status_message {
+        normalized.insert(
+            "statusMessage".into(),
+            toml::Value::String(status_message.into()),
+        );
+    }
+    if let Some(limit) = additional_context_limit {
+        normalized.insert("additionalContextLimit".into(), toml::Value::Integer(limit));
+    }
+    let mut identity = toml::Table::new();
+    identity.insert(
+        "event_name".into(),
+        toml::Value::String("pre_tool_use".into()),
+    );
+    if let Some(matcher) = matcher {
+        identity.insert("matcher".into(), toml::Value::String(matcher.into()));
+    }
+    identity.insert(
+        "hooks".into(),
+        toml::Value::Array(vec![toml::Value::Table(normalized)]),
+    );
+    let mut json = serde_json::to_value(toml::Value::Table(identity)).ok()?;
+    json.sort_all_objects();
+    let serialized = serde_json::to_vec(&json).ok()?;
+    Some(format!(
+        "sha256:{}",
+        build_identity::hash_bytes(&serialized)
+    ))
 }
 
 /// The ordinary dispatch writes the allocated workspace path lowercased. Path

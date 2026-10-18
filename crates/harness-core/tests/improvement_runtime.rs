@@ -975,6 +975,283 @@ fn consumption_authorizes_only_recorded_dispatch_workspaces() {
     verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
 }
 
+/// Native approval of the unchanged token-hook definition appends exactly one
+/// local `hooks.state` record and no other configuration change. That record is
+/// accepted only for this arm's own retained hooks.json and its actual
+/// definition; the frozen configuration, model, authority, hook enablement and
+/// every unrelated edit stay enforced.
+#[test]
+fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-hook-trust-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let source = kit_source(root, "kit-hook-trust", "hook-trust");
+    for relative in [
+        "crates/harness-rtk/Cargo.toml",
+        "crates/harness-rtk/src/main.rs",
+    ] {
+        let path = source.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, relative.as_bytes()).unwrap();
+    }
+    let hooks = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "harness-rtk.exe hook",
+                    "timeout": 2
+                }]
+            }]
+        }
+    });
+    fs::write(
+        source.join("global/rtk-hooks.json"),
+        serde_json::to_vec(&hooks).unwrap(),
+    )
+    .unwrap();
+    let build = fixture_build(
+        &state,
+        "hook-trust",
+        &source,
+        &fixtures.launcher,
+        "hook-trust",
+    );
+    let home = prepare_home(&root.join("homes/hook-trust")).unwrap();
+    let user_home = prepare_home(&root.join("homes/hook-trust-user")).unwrap();
+    let dependency_user_home = prepare_home(&root.join("homes/hook-trust-dep")).unwrap();
+    let vendor = home.join("harness/rtk/packages/0.48.0/rtk.exe");
+    fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+    fs::write(&vendor, b"staged-rtk-for-hook-trust").unwrap();
+    fs::write(
+        source.join("global/rtk.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": "0.48.0",
+            "executableSha256": build_identity::hash_file(&vendor).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let identity =
+        harness_core::token_workflow_lifecycle::component_source_identity(&source).unwrap();
+    let adapter = home.join(format!("harness/rtk/build/{identity}/harness-rtk.exe"));
+    fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+    fs::write(&adapter, b"staged-adapter-for-hook-trust").unwrap();
+    fs::write(
+        adapter.parent().unwrap().join("build.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "sourceIdentity": identity,
+            "binarySha256": build_identity::hash_file(&adapter).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let catalogue = root.join("model-catalogue.json");
+    fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    let overlay = root.join("qualified-client.config.toml");
+    fs::write(
+        &overlay,
+        "model_context_window = 65536\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\n",
+    )
+    .unwrap();
+    let request = ArmRequest {
+        variant: prepare_variant(&state, Arm::Baseline, "H", &build).unwrap(),
+        home: home.clone(),
+        user_home,
+        dependency_user_home,
+        upstream: fixtures.upstream.clone(),
+        timeout: Duration::from_secs(60),
+        client: Some(local_client(&catalogue, Some(&overlay))),
+        private_inputs: Vec::new(),
+        protected: Vec::new(),
+    };
+    let mut runtime = install_arm(&request).unwrap();
+    verify_consumption(&runtime).unwrap();
+    let config = runtime.configuration.as_ref().unwrap().path.clone();
+    let installed = fs::read(&config).unwrap();
+    let installed_text = std::str::from_utf8(&installed).unwrap();
+    assert!(
+        installed_text.contains("approval_policy = \"never\""),
+        "the prepared arm records its authority: {installed_text}"
+    );
+    assert!(
+        installed_text.contains("hooks = true"),
+        "the prepared arm enables the retained token hook: {installed_text}"
+    );
+    // A prepared arm may already end with ordinary trusted-project entries.
+    // They belong to the frozen bytes; only the native approval and the
+    // dispatcher's authorized workspace entry are appended later.
+    let prepared_workspace = root.join("prepared-workspace");
+    let prepared = format!(
+        "{installed_text}\n[projects.'{}']\ntrust_level = \"trusted\"\n",
+        prepared_workspace.to_string_lossy().to_ascii_lowercase()
+    )
+    .into_bytes();
+    fs::write(&config, &prepared).unwrap();
+    runtime.configuration.as_mut().unwrap().sha256 = build_identity::hash_bytes(&prepared);
+    verify_consumption(&runtime).unwrap();
+    let prepared_text = std::str::from_utf8(&prepared).unwrap();
+    let component = runtime
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+        .expect("the token workflow is retained");
+    let link = component
+        .links
+        .iter()
+        .find(|link| link.name == "hooks.json")
+        .expect("the retained hook definition is recorded");
+    assert_eq!(
+        link.sha256,
+        build_identity::hash_file(&link.source).unwrap(),
+        "the retained definition is the source identity"
+    );
+    // The native client derives this digest from the normalized handler; the
+    // value below is the approval its UI records for this exact definition.
+    let known_digest = "sha256:1914caf6f4ea4f558efc894660fb096e808a44e7de9061c688d172c05450f135";
+    let key = format!("{}:pre_tool_use:0:0", link.destination.to_string_lossy());
+    let marker = "# END codex-harness MCP registrations";
+    let native_block =
+        |key: &str, digest: &str| format!("\n[hooks.state.'{key}']\ntrusted_hash = \"{digest}\"\n");
+    let insert_native = |text: &str, key: &str, digest: &str| {
+        let mut text = text.to_owned();
+        let at = text.find(marker).unwrap_or(text.len());
+        text.insert_str(at, &native_block(key, digest));
+        text
+    };
+    let workspace = root.join("checkout-wt1");
+    let workspace_block = format!(
+        "\n[projects.'{}']\ntrust_level = \"trusted\"\n",
+        workspace.to_string_lossy().to_ascii_lowercase()
+    );
+
+    // The native approval alone is accepted without inventing workspace
+    // authority; the dispatch's own workspace entry then needs its recorded
+    // authorization exactly as before.
+    let hook_only = insert_native(prepared_text, &key, known_digest);
+    fs::write(&config, &hook_only).unwrap();
+    verify_consumption(&runtime).unwrap();
+    let approved = format!("{hook_only}{workspace_block}");
+    fs::write(&config, &approved).unwrap();
+    assert!(
+        verify_consumption(&runtime).is_err(),
+        "an unrecorded workspace trust entry was accepted by the strict check"
+    );
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+    assert_eq!(fs::read(&config).unwrap(), approved.as_bytes());
+    assert_eq!(
+        runtime.configuration.as_ref().unwrap().sha256,
+        build_identity::hash_bytes(&prepared),
+        "the frozen configuration digest is unchanged"
+    );
+
+    let mut counterexamples: Vec<(&str, String)> = Vec::new();
+    counterexamples.push((
+        "a wrong hook approval digest",
+        approved.replace(
+            known_digest,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    ));
+    counterexamples.push((
+        "a foreign hook definition",
+        approved.replace(
+            &key,
+            &format!(
+                "{}:pre_tool_use:0:0",
+                root.join("foreign-hooks.json").display()
+            ),
+        ),
+    ));
+    counterexamples.push((
+        "a different handler index",
+        approved.replace(":pre_tool_use:0:0", ":pre_tool_use:0:1"),
+    ));
+    counterexamples.push((
+        "an extra trust field",
+        approved.replace(
+            &format!("trusted_hash = \"{known_digest}\""),
+            &format!("trusted_hash = \"{known_digest}\"\nenabled = true"),
+        ),
+    ));
+    counterexamples.push((
+        "a duplicate trust record",
+        insert_native(&approved, &key, known_digest),
+    ));
+    counterexamples.push((
+        "ordinary model drift",
+        approved.replace("fixture-glyph-1", "fixture-glyph-2"),
+    ));
+    counterexamples.push((
+        "authority drift",
+        approved.replace(
+            "approval_policy = \"never\"",
+            "approval_policy = \"on-request\"",
+        ),
+    ));
+    counterexamples.push((
+        "changed hook enablement",
+        approved.replace("hooks = true", "hooks = false"),
+    ));
+    counterexamples.push((
+        "an unrelated configuration addition",
+        format!("{approved}\n[fixture-extra]\nvalue = 1\n"),
+    ));
+    for (name, text) in counterexamples {
+        assert_ne!(text, approved, "{name} did not change the approved bytes");
+        fs::write(&config, text).unwrap();
+        let error = verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("configuration changed since preparation"),
+            "{name}: {error}"
+        );
+    }
+
+    // The definition identity stays authoritative: a changed command refuses
+    // even when the configuration still carries the previously approved hash.
+    let original_definition = fs::read(&link.source).unwrap();
+    let changed = serde_json::to_vec(&serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "harness-rtk.exe changed",
+                    "timeout": 2
+                }]
+            }]
+        }
+    }))
+    .unwrap();
+    fs::write(&link.source, &changed).unwrap();
+    fs::write(&config, &approved).unwrap();
+    let error = verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("changed since preparation"),
+        "a changed hook command was accepted: {error}"
+    );
+    fs::write(&link.source, &original_definition).unwrap();
+
+    // The exact approved bytes remain usable after the counterexamples.
+    fs::write(&config, &approved).unwrap();
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+    retire_arm(&runtime).unwrap();
+}
+
 /// Refusals: overlap, missing or mismatched inputs, ambient homes and partial
 /// installation state never produce an apparently ready arm.
 #[test]
