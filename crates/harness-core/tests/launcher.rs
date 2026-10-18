@@ -10,6 +10,106 @@ fn argv(values: &[&str]) -> Vec<OsString> {
 }
 
 #[test]
+fn role_context_preserves_native_inputs_and_maintenance_boundaries() {
+    use harness_core::launcher::{context_arguments, with_context_overrides};
+    let cwd = std::path::Path::new("workspace");
+    for args in [
+        argv(&["--help"]),
+        argv(&["login"]),
+        argv(&["app-server"]),
+        argv(&["--remote", "ws://localhost:1234", "resume", "thread"]),
+    ] {
+        assert!(context_arguments(&args, cwd).unwrap().is_none(), "{args:?}");
+    }
+    for args in [
+        argv(&[]),
+        argv(&["a prompt"]),
+        argv(&["exec", "prompt"]),
+        argv(&["resume", "thread"]),
+        argv(&["fork", "--last"]),
+        argv(&["--profile", "custom", "prompt"]),
+    ] {
+        assert!(context_arguments(&args, cwd).unwrap().is_some(), "{args:?}");
+    }
+    let args = argv(&[
+        "-pcustom",
+        "--cd=target",
+        "-cdeveloper_instructions=first",
+        "exec",
+        "--config",
+        "developer_instructions='last'",
+        "--",
+        "-p",
+        "prompt",
+    ]);
+    let context = context_arguments(&args, cwd).unwrap().unwrap();
+    assert_eq!(context.cwd, cwd.join("target"));
+    assert_eq!(context.profile.as_deref(), Some("custom"));
+    assert_eq!(
+        context.overrides,
+        [
+            "developer_instructions=first",
+            "developer_instructions='last'"
+        ]
+    );
+    let overrides = toml::Table::from_iter([("developer_instructions".into(), "composed".into())]);
+    let output = with_context_overrides(&args, &overrides);
+    let separator = output.iter().position(|value| value == "--").unwrap();
+    assert_eq!(&output[separator..], &argv(&["--", "-p", "prompt"]));
+    let command = output.iter().position(|value| value == "exec").unwrap();
+    assert_eq!(&output[command..], &argv(&["exec", "--", "-p", "prompt"]));
+    let effective = context_arguments(&output, cwd).unwrap().unwrap();
+    assert_eq!(effective.cwd, context.cwd);
+    assert_eq!(effective.profile, context.profile);
+    assert_eq!(
+        effective.overrides.last().unwrap(),
+        "developer_instructions=\"composed\""
+    );
+}
+
+#[test]
+fn role_configs_share_root_scope_without_consuming_other_option_values() {
+    use harness_core::launcher::with_context_overrides;
+    let args = argv(&[
+        "-c",
+        "approval_policy='never'",
+        "debug",
+        "prompt-input",
+        "--config=sandbox_mode='danger-full-access'",
+        "--model",
+        "-custom-model",
+        "--",
+        "-c",
+        "literal prompt",
+    ]);
+    let overrides = toml::Table::from_iter([("developer_instructions".into(), "composed".into())]);
+    let output = with_context_overrides(&args, &overrides);
+    let command = output.iter().position(|value| value == "debug").unwrap();
+    assert_eq!(
+        &output[command..],
+        &argv(&[
+            "debug",
+            "prompt-input",
+            "--model",
+            "-custom-model",
+            "--",
+            "-c",
+            "literal prompt",
+        ])
+    );
+    assert_eq!(
+        &output[..command],
+        &argv(&[
+            "-c",
+            "approval_policy='never'",
+            "--config=sandbox_mode='danger-full-access'",
+            "-c",
+            "developer_instructions=\"composed\"",
+        ])
+    );
+}
+
+#[test]
 fn executor_launches_keep_the_agent_capability_off() {
     let plain = argv(&["exec", "hello"]);
     assert_eq!(executor_limited(plain.clone(), false), plain);

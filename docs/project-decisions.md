@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-10-04**.
+Last updated: **2026-10-16**.
 
 ## Public pack
 
@@ -123,6 +123,21 @@ cost. Routine in-scope workflow improvements need no separate specification;
 short tasks need no optimization ceremony. Preserve full acceptance, authority
 and recovery. The canonical details remain in the portable principles below.
 
+**2026-10-16, clarified:** an active delivery-improvement observer should turn
+one clear, attributable bottleneck into a bounded correction promptly. Do not
+wait for repeated episodes, votes or statistical proof when the available facts
+already support the remedy. Investigate only uncertainty that changes the
+decision, and verify the result proportionately through its actual use. Keep
+the observer module's adoption comparison separate from the handling of each
+finding; preserve required acceptance and scope boundaries. The active change
+owns this [single-observation admission](../openspec/changes/add-delivery-improvement/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
+
+The user also authorized isolated candidate implementation in parallel with
+comparison preparation to shorten delivery. The candidate remains inactive;
+the [evaluation and acceptance gates](../openspec/changes/add-delivery-improvement/design.md#parallel-candidate-implementation-and-predeclared-evaluation)
+remain unchanged. This accepts possible unused implementation, not a lower
+acceptance standard.
+
 Deliver a quality, verified end-to-end MVP through real components as early as
 possible, then complete the whole agreed result. Small transparent operating
 restrictions are allowed; they do not authorize simplifying promised product
@@ -210,6 +225,20 @@ own the policy and the [working-principles specification](../openspec/specs/glob
 owns its scenarios. No new skill, report protocol or recurring review ritual is
 required.
 
+**2026-10-12, confirmed (user decision):** Interface obviousness is a universal
+obligation for UI/UX, CLI, APIs, methods, functions, libraries, configuration,
+tools, instructions and agent workflows: interface owners carry routine
+preparation, coordination, validation and completion, and usability is judged
+on the complete everyday lifecycle, not command count or an agent's ability to
+overcome difficulty. Newly evidenced material friction and concrete improvement
+opportunities are surfaced with their consequence while reports can still
+change the work; a workflow that materially compounds waste or unreliability is
+escalated with an evidenced remedy instead of repeated workaround. The
+[portable principles](../global/principles-of-work.md#developer-experience) own
+the policy; the
+[working-principles specification](../openspec/specs/global-working-principles/spec.md)
+owns its scenarios.
+
 ## Official Codex CLI
 
 The base remains official Codex CLI with global configuration, skills, agents,
@@ -237,6 +266,23 @@ no longer used and no fallback routes to them. This supersedes the earlier
 default routing of executors and succession to external subscriptions. Effort
 names are model-specific; do not promise unsupported combinations or silently
 substitute.
+
+**2026-10-15, reaffirmed:** executor dispatch uses only `ds`; neither xAI nor
+Z.AI profiles or models may be used as an alternative or fallback. Native
+acceptance fixtures use the supported model names too, so test output cannot
+suggest that a retired provider was invoked. A local canned transport remains
+distinct from actual model execution.
+
+**2026-10-16, verified delivery:** shared principles, role fragments and skill
+membership have separate declared owners in `global/roles.toml`. Ordinary
+sessions use the lead context and managed executors use the executor context.
+Saved-session resume keeps its original developer text while the live skill
+catalogue refreshes; a fresh restart adopts the new role revision. Required-load
+accounting includes invoked bodies, required references and generated briefs,
+so moving text is not a saving. The bounded comparison supports source-load
+reduction and the exercised artifact checks, but establishes no causal delivery
+time or quota improvement; see the [calibration record](memory/skill-evolution.md#role-context-comparison).
+No independent optimization is admitted from prompt size alone.
 
 Every active conversation needs its own visible terminal surface with a
 distinct title: lead, workers and any model-backed helpers. Show assignment,
@@ -578,10 +624,10 @@ with an unrestricted context);
 portable defaults disable the Apps feature while machine-local values win;
 per-model default effort is max for zai/glm-5.3 and xhigh for
 xai/grok-4.6 and Astra when no explicit effort is selected; the portable
-principles stay at most 24 KiB with every normative rule preserved (24,320
-bytes after the 2026-09-26 trim). Removing the locally installed GitHub plugin is a
-machine-local action, not a kit requirement. Screenshot policy was already
-fixed separately and stays unchanged.
+principles stay at most 24 KiB with every normative rule preserved.
+Removing the locally installed GitHub plugin is a machine-local action, not a
+kit requirement. Screenshot policy was already fixed separately and stays
+unchanged.
 
 Operational notes from the 2026-09-15 activation: the transitional dependency
 layer cannot stage BasedPyright updates, so registry drift now resolves as
@@ -644,6 +690,22 @@ adopted lane reuse at a conservative -11.8% delivery time; the warm lane keeps
 its `target/` gigabytes, and
 [executor worktrees](agent-delegation.md#executor-worktrees) documents the
 supported operation and limits.
+
+**2026-10-13, confirmed:** one shared pool serves ordinary isolated tasks and
+executor dispatch in a repository. Pool capacity is the explicit, independent
+`worktree_pool_size` (shipped as four) rather than `max_concurrent_executors`,
+and `worktree_limit` remains compatibility-only. Install and update
+materialize the explicit setting for a configuration written before the
+capacity split, preserving its former effective capacity and never selecting
+the compatibility limit; afterwards, executor-limit changes cannot resize the
+pool. Pool records publish the `ownershipSchema: 2` discriminator so an older
+harness refuses upgraded records before applying its liveness rules, keeping
+held tasks unavailable to it during rollback; deleting ownership records is
+not a rollback procedure. The standalone `isolated-worktree` skill and its
+disposable-tree recipe are retired now that the installed common task path
+passed, with the surviving guidance maintained in the pool guide and the
+team-lead skill. Current contract:
+[shared worktree pool](../openspec/specs/isolated-worktree-workflow/spec.md).
 
 **2026-09-19, confirmed:** the feedback loop's kit-level backlog is the kit
 checkout's own `bd` board, addressed explicitly by the lead session
@@ -758,6 +820,19 @@ implementation, remeasurement and the final decision with verified adoption or
 restoration. Existing routine observations can seed the investigation; complete
 validated artifacts and frozen experiment acceptance precede candidate edits.
 An ordinary evaluation workload does not need an artificial second hypothesis.
+
+**2026-10-15, confirmed:** improvement work follows collected data, analysis
+and a falsifiable hypothesis, a predeclared solution/experiment, implementation,
+and practical verification of the predicted effect. Planning validity, a passing
+functional test or a completed task alone is not evidence of improvement. Bind
+the baseline and candidate to attributable inputs and concrete outcome metrics
+where applicable; missing evidence leaves the hypothesis unqualified. Rejected
+or inconclusive candidate code must not remain in accepted source or active
+installations. Remove or revert that candidate's introduced effects through the
+existing recovery owners, verify restored behavior and preserve the comparison
+evidence and recoverable patch outside accepted delivery. This is scoped cleanup
+of the experiment, not permission to delete unrelated accepted capabilities or
+erase failed results. Existing quality and informed-removal constraints remain.
 
 Within established run authority, the loop chooses and executes these phases
 autonomously, retaining supported candidates, restoring the accepted runtime

@@ -20,6 +20,13 @@
 //!
 //! Mode switches (all optional, all explicit):
 //! - `HARNESS_IMPROVEMENT_FIXTURE_SESSION`: the thread identity to serve;
+//! - `HARNESS_IMPROVEMENT_FIXTURE_CONTROL`: what the controlled agent does
+//!   once the host submitted its assignment: `complete` (default) finishes the
+//!   turn, `hold` keeps the turn open without ever completing it so the real
+//!   stop owner can interrupt and end this run, and `fail` ends this child
+//!   with a nonzero exit code before any completion. With
+//!   `HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER` the child records the
+//!   assignment it observed before `hold` or `fail` takes effect;
 //! - `HARNESS_IMPROVEMENT_FIXTURE_MODEL` / `..._EFFORT`: override the model and
 //!   reasoning effort recorded in the native rollout (the wrong-observation
 //!   counterexamples); the default echoes the arm's installed configuration;
@@ -58,6 +65,12 @@ const FINAL_MESSAGE: &str = "fixture turn completed; the committed solution is i
 /// Serves one `app-server` invocation. Returns the process exit code; the
 /// caller's Job owns termination, exactly as it owns the real child.
 pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
+    // The dispatching side may direct this child to record the exact
+    // invocation and role-marking environment it received, so the effective
+    // role context is asserted from the child instead of inferred.
+    if let Some(path) = env::var_os("HARNESS_EXECUTOR_FIXTURE_RECORD") {
+        record_child(PathBuf::from(path))?;
+    }
     let listen = option(args, "--listen").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -124,23 +137,17 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                 "turn/start",
                 Answer::Result(json!({"turn": {"id": TURN, "status": "inProgress"}})),
             );
-            // The first read must see an empty thread (the host refuses a
-            // conversation whose fresh thread already has turns); the second read
-            // serves the completed turn's final assistant message.
-            server.answer_sequence(
-            "thread/read",
-            vec![
+            // Until the assignment is submitted this is the fresh empty thread
+            // a pre-submission check must see (the host refuses a conversation
+            // whose fresh thread already has turns). The agent thread below
+            // replaces this answer with the completed turn as soon as
+            // `turn/start` arrives, so every read after submission - in any
+            // read order or count the attaching route uses - observes the
+            // turn's final assistant message.
+            server.answer(
+                "thread/read",
                 Answer::Result(json!({"thread": {"id": session_for_thread.clone(), "turns": []}})),
-                Answer::Result(json!({"thread": {
-                    "id": session_for_thread.clone(),
-                    "turns": [{
-                        "id": TURN,
-                        "status": "completed",
-                        "items": [{"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE}],
-                    }],
-                }})),
-            ],
-        );
+            );
             server.push(json!({"method": "thread/started", "params": {"thread": {"id": session_for_thread.clone()}}}));
             server.push(json!({
             "method": "turn/started",
@@ -163,6 +170,47 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             let until = Instant::now() + Duration::from_secs(120);
             while Instant::now() < until {
                 if !server.requests_for("turn/start").is_empty() {
+                    let control = control_mode();
+                    if control != "complete" {
+                        record_control_marker(&session, &control);
+                    }
+                    if control == "hold" {
+                        // The submitted turn stays open: the thread record
+                        // names it as the active turn, so the real stop owner
+                        // addresses its interruption through it, and no
+                        // completion is ever pushed - the run stays live until
+                        // its own owner ends it.
+                        server.answer(
+                            "thread/read",
+                            Answer::Result(json!({"thread": {
+                                "id": session.clone(),
+                                "turns": [{"id": TURN, "status": "inProgress", "items": []}],
+                            }})),
+                        );
+                        server.answer("turn/interrupt", Answer::Result(json!({})));
+                        return;
+                    }
+                    if control == "fail" {
+                        // A failing child: the host observes the closed
+                        // connection and records the failure outcome while the
+                        // slot, the binding and the partial work stay.
+                        thread::sleep(Duration::from_millis(250));
+                        std::process::exit(9);
+                    }
+                    // The thread is no longer fresh: the compatibility route
+                    // reads it only here, while a native frontend read the
+                    // empty thread before this assignment was submitted.
+                    server.answer(
+                        "thread/read",
+                        Answer::Result(json!({"thread": {
+                            "id": session.clone(),
+                            "turns": [{
+                                "id": TURN,
+                                "status": "completed",
+                                "items": [{"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE}],
+                            }],
+                        }})),
+                    );
                     record_selected_tools();
                     let _ = commit_solution();
                     let heavy = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok();
@@ -218,6 +266,65 @@ fn option(args: &[std::ffi::OsString], name: &str) -> Option<String> {
         .and_then(|index| args.get(index + 1))
         .and_then(|value| value.to_str())
         .map(str::to_owned)
+}
+
+/// Records this child's own invocation and role-marking environment when the
+/// host names an output path, so a model-free check asserts the effective
+/// role context and routing argv the app-server actually received instead of
+/// inferring them from the dispatching process. Every ordinary run records
+/// nothing.
+fn record_child(path: PathBuf) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let argv = env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let marker = |name: &str| match env::var(name) {
+        Ok(value) => json!(value),
+        Err(_) => json!(null),
+    };
+    let record = json!({
+        "schema": 1,
+        "argv": argv,
+        "executorSession": marker("HARNESS_EXECUTOR_SESSION"),
+        "boundedLeadSession": marker("HARNESS_BOUNDED_LEAD_SESSION"),
+        "contextRole": marker("HARNESS_CONTEXT_ROLE"),
+        "contextRevision": marker("HARNESS_CONTEXT_REVISION"),
+        "currentDir": env::current_dir().ok().map(|path| path.display().to_string()),
+    });
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&record).map_err(io::Error::other)?,
+    )?;
+    Ok(())
+}
+
+/// The controlled behavior of this child once the host submitted its
+/// assignment; the default completes the turn exactly as before.
+fn control_mode() -> String {
+    env::var("HARNESS_IMPROVEMENT_FIXTURE_CONTROL").unwrap_or_else(|_| "complete".into())
+}
+
+/// Records the assignment this child observed, when the caller named a marker
+/// path, so a model-free check waits for the child's own observation of the
+/// `hold` or `fail` mode instead of guessing from process timing.
+fn record_control_marker(session: &str, control: &str) {
+    let Some(path) = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let record = json!({
+        "schema": 1,
+        "control": control,
+        "session": session,
+        "turn": TURN,
+    });
+    let _ = fs::write(path, record.to_string());
 }
 
 /// The installed client route of this arm home: the explicit configuration the

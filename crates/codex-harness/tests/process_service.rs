@@ -289,6 +289,20 @@ fn service_survives_first_client_job_and_reclaims_its_child() {
         .is_err()
     );
     assert!(
+        ServiceProcess::inspect_endpoint(
+            service.identity(),
+            &std::env::current_exe().unwrap(),
+            &current_user().unwrap(),
+        )
+        .is_err(),
+        "endpoint recovery must still reject a foreign running image"
+    );
+    assert!(
+        ServiceProcess::inspect_endpoint(service.identity(), Path::new(FIXTURE), "wrong-user",)
+            .is_err(),
+        "endpoint recovery must still reject a foreign account"
+    );
+    assert!(
         ServiceProcess::observe(
             service.identity().pid,
             Path::new(FIXTURE),

@@ -8,13 +8,16 @@
 //! limits and every declared path are checked against the allocated checkout
 //! before a launcher process opens a model conversation, and the rendered
 //! brief carries the actual checkout, the committed base and the exact
-//! relative paths together with the executor's own work cycle and the compact
-//! evidence result the consumer expects back.
+//! relative paths.
 //!
-//! This module owns the installed exchange guidance for both dispatch paths:
-//! the structured brief renders it with the declared consumer, and a free-text
-//! assignment receives the identical rule, so the lead channel, its waiting
-//! behavior and the board-first rule are stated once instead of per caller.
+//! Both dispatch paths render the same small task contract: the caller's
+//! literal text or the declared assignment, the named consumer, the concrete
+//! installed feedback command and the task-specific boundaries. Standing
+//! responsibility guidance - the work cycle, base verification, the
+//! heavy-command lane, when escalation is justified, the waiting behavior and
+//! the compact result shape - is owned once by the executor role fragment and
+//! reaches a managed session through its role context instead of being
+//! restated in every brief.
 
 use serde::Deserialize;
 use std::{
@@ -38,68 +41,33 @@ pub const MAX_BRIEF_BYTES: usize = 16 * 1024;
 /// consumer: the lead that dispatched it is always the direct consumer.
 pub const DEFAULT_CONSUMER: &str = "the lead that dispatched this assignment";
 
-/// Escalation boundaries every assignment carries. Declared `escalate` items
-/// are added to these; they never replace them, because a change to the agreed
-/// outcome, a material architecture change, missing authority and an
-/// unobtainable dependency always return to the consumer.
-pub const STANDING_ESCALATIONS: [&str; 4] = [
-    "a change to the agreed outcome or scope",
-    "a material architecture or design change",
-    "missing authority or access",
-    "a concrete dependency you cannot obtain",
-];
-
 /// The one escalation channel every assignment names. The installed command
 /// addresses the originating lead itself, so no recipient, slot, session,
 /// checkout or endpoint is discovered, supplied or taught here.
 pub const LEAD_CHANNEL_COMMAND: &str = "codex-harness lead message";
 
-/// What one question costs and how it is answered: the run stays live and
-/// independent work continues, so no polling loop, keep-alive ritual or resume
-/// is needed to wait. One owner for this wording, so the structured brief and
-/// the free-text assignment teach the same rule.
-const WAITING_RULE: &str = "An unanswered request keeps the run, session and worktree available while it waits for the reply - no polling, keep-alive loop or resume - and independent authorized work may continue. An executor watch result of 3 means answer that request; it is not completion, failure or a resume trigger.\n";
-
-/// The standing boundaries every assignment carries, without the declared
-/// additions.
-fn standing_escalations() -> Vec<String> {
-    STANDING_ESCALATIONS.map(str::to_owned).to_vec()
-}
-
-/// The escalation rule that precedes the boundary list: the single installed
-/// command, its default reply request and its no-reply notice form, when asking
-/// is justified at all, and what stays with the executor and the bd board.
-///
-/// The command's first-choice content form is taught here: the message is piped
-/// on standard input (or given as `--text` short text), the caller never has to
-/// know a size limit, and a large message is delivered automatically through the
-/// harness-owned file that holds it - no temporary file is created or named by
-/// the caller.
-fn lead_channel_heading(consumer: &str) -> String {
-    format!(
-        "escalate to {consumer} by piping {LEAD_CHANNEL_COMMAND} (short --text fallback); it addresses the originating lead with no recipient, slot, session or endpoint and spills long content automatically. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue"
-    )
-}
-
-/// Renders the escalation rule, its boundary list and the waiting rule that
-/// every newly dispatched or continued executor receives, whether it was
-/// dispatched as free text or as a structured assignment. Escalation stays
-/// exceptional: routine progress, repeated status and ordinary implementation
-/// errors belong to the executor.
-fn push_lead_channel(text: &mut String, consumer: &str, escalations: &[String]) {
-    push_list(text, &lead_channel_heading(consumer), escalations);
-    text.push_str(WAITING_RULE);
+/// The task-specific feedback addressing every assignment carries: who
+/// consumes the returned result and the concrete installed command that
+/// reaches them. The standing exchange rules around it - when escalation is
+/// justified, the waiting behavior and the compact result shape - are owned
+/// by the executor role fragment, which a managed session receives once, so
+/// they are not restated here.
+fn push_feedback_address(text: &mut String, consumer: &str) {
+    text.push_str(&format!(
+        "feedback: return the result and any decision you escalate to {consumer} through {LEAD_CHANNEL_COMMAND} (short --text fallback).\n"
+    ));
 }
 
 /// The free-text assignment one session receives: the caller's own text stays
-/// first and literal, and the installed guidance follows it, so a free-text
-/// caller does not have to restate the rule by hand. Resume and restart render
-/// through this same function, and a restart keeps the text it recorded, so no
-/// path needs a second copy of the guidance.
+/// first and literal, followed by the same small task contract every managed
+/// assignment renders - the implicit consumer and the concrete installed
+/// feedback command. Resume and restart render through this same function, and
+/// a restart keeps the text it recorded, so no path needs a second copy of the
+/// standing guidance.
 pub fn free_text_brief(text: &str) -> String {
     let mut rendered = text.trim_end().to_owned();
     rendered.push_str("\n\n");
-    push_lead_channel(&mut rendered, DEFAULT_CONSUMER, &standing_escalations());
+    push_feedback_address(&mut rendered, DEFAULT_CONSUMER);
     rendered
 }
 
@@ -212,21 +180,42 @@ impl Assignment {
     }
 }
 
-/// Validates the declared paths and renders the brief the session receives.
-/// The same function serves dispatch and the model-free `executor assignment`
-/// path, so a lead can exercise the exact rendering without a model request.
+/// Validates the declared paths and renders the brief an executor session
+/// receives. The same function serves dispatch and the model-free `executor
+/// assignment` path, so a session-role caller can exercise the exact rendering
+/// without a model request.
 pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Result<String> {
+    render_brief(
+        assignment,
+        context,
+        "Structured executor assignment (schema 1)",
+    )
+}
+
+/// Renders the same declared contract under the lead-role heading. A bounded
+/// experimental lead conversation receives the identical brief - objective,
+/// checkout, base, owned paths, checks, consumer, feedback address and
+/// boundaries - and its heading names its own role instead of presenting the
+/// conversation as an executor session.
+pub fn lead_brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Result<String> {
+    render_brief(assignment, context, "Structured lead assignment (schema 1)")
+}
+
+fn render_brief(
+    assignment: &Assignment,
+    context: &AssignmentContext<'_>,
+    heading: &str,
+) -> io::Result<String> {
     assignment.validate_paths(context.checkout)?;
     let consumer = consumer_text(assignment);
-    let mut escalations = standing_escalations();
-    escalations.extend(
-        assignment
-            .escalate
-            .iter()
-            .map(|item| item.trim().to_owned()),
-    );
+    let boundaries = assignment
+        .escalate
+        .iter()
+        .map(|item| item.trim().to_owned())
+        .collect::<Vec<_>>();
     let mut text = String::new();
-    text.push_str("Structured executor assignment (schema 1)\n");
+    text.push_str(heading);
+    text.push('\n');
     text.push_str(&format!("objective: {}\n", assignment.objective.trim()));
     text.push_str(&format!("checkout: {}\n", context.checkout.display()));
     text.push_str(&format!("base: {}\n", context.base));
@@ -245,21 +234,12 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
     );
     push_list(&mut text, "invariants", &assignment.invariants);
     push_list(&mut text, "acceptance", &assignment.acceptance);
-    push_lead_channel(&mut text, consumer, &escalations);
-    text.push_str(
-        "work cycle (yours): read the declared inputs yourself - source bodies are supplied only when reading is unavailable - investigate the current source and callers before editing, implement the outcome you own, run the applicable checks through the real entry point, then correct your own local errors and repeat.\n",
+    push_list(
+        &mut text,
+        &format!("escalate to {consumer} (additional boundaries)"),
+        &boundaries,
     );
-    text.push_str(
-        "Before editing, verify the checkout is at the base above (git rev-parse HEAD) and report a mismatch instead of editing. Choose the installed skills this assignment needs and announce their first use. Keep every change inside the checkout and leave partial work resumable for a continuation.\n",
-    );
-    text.push_str(
-        "Run heavy builds and checks through codex-harness heavy -- PROGRAM ARGS. It queues against the shared account budget without a lead grant; keep the default account and budget unless the assignment explicitly authorizes another. Ordinary source reads and edits need no heavy-command slot.\n",
-    );
-    text.push_str(
-        &format!(
-            "When the outcome is complete, report a compact result: done and remaining work, the checkout and base you worked from, the exact files touched, how each acceptance item was verified with the checks actually run, limitations, the decision you need from {consumer}, and where the full detail lives.\n"
-        ),
-    );
+    push_feedback_address(&mut text, consumer);
     if text.len() > MAX_BRIEF_BYTES {
         return Err(invalid(&format!(
             "the rendered assignment brief is {} bytes; the limit is {MAX_BRIEF_BYTES}",
@@ -513,20 +493,43 @@ mod tests {
         Assignment::load(&path).unwrap()
     }
 
-    /// The escalation wording this change replaces. The rule must replace it
-    /// rather than grow beside it, so the renderer keeps no copy.
+    /// The escalation wording an earlier renderer used. The rule must leave
+    /// rather than grow beside the final contract, so the renderer keeps no
+    /// copy.
     const SUPERSEDED_ESCALATION_HEADING: &str = "escalate to {consumer} (everything else, including ordinary implementation errors, is yours to resolve)";
 
-    /// The exact rule and waiting behavior an assignment must render. The
-    /// acceptance for this change is this rendered text, so the expectation is
-    /// literal: a wording change has to update it deliberately.
-    fn expected_lead_channel(consumer: &str) -> String {
+    /// The exact feedback addressing a brief must render: the named consumer
+    /// and the concrete installed command, so a dispatched session knows where
+    /// a result or an escalated decision returns.
+    fn expected_feedback_line(consumer: &str) -> String {
         format!(
-            "escalate to {consumer} by piping codex-harness lead message (short --text fallback); it addresses the originating lead with no recipient, slot, session or endpoint and spills long content automatically. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue:\n"
+            "feedback: return the result and any decision you escalate to {consumer} through codex-harness lead message (short --text fallback).\n"
         )
     }
 
-    const EXPECTED_WAITING_RULE: &str = "An unanswered request keeps the run, session and worktree available while it waits for the reply - no polling, keep-alive loop or resume - and independent authorized work may continue. An executor watch result of 3 means answer that request; it is not completion, failure or a resume trigger.\n";
+    /// Standing exchange guidance owned by the executor role fragment. The
+    /// role file carries these obligations; the assignment renderer must not
+    /// restate them in any brief.
+    const ROLE_OWNED_STANDING_PHRASES: [&str; 9] = [
+        "by piping codex-harness lead message",
+        "It asks for a reply unless --notify",
+        "Ask only after investigating the available facts",
+        "ordinary implementation errors and routine progress, is yours",
+        "durable blockers, decisions and results stay on the bd issue",
+        "no polling, keep-alive loop or resume",
+        "An executor watch result of 3 means answer that request",
+        "report a compact result: done and remaining work",
+        "spills long content automatically",
+    ];
+
+    /// The small task contract every brief renders with no standing exchange
+    /// guidance: the role fragment is the single owner of the standing rules.
+    fn assert_small_task_contract(text: &str, consumer: &str) {
+        assert!(text.contains(&expected_feedback_line(consumer)), "{text}");
+        for standing in ROLE_OWNED_STANDING_PHRASES {
+            assert!(!text.contains(standing), "{standing}\n{text}");
+        }
+    }
 
     #[test]
     fn schema_version_fields_and_limits_are_strict() {
@@ -647,39 +650,60 @@ mod tests {
         assert!(text.contains("- the named check passes"));
         assert!(text.contains(&format!("source: {}", source.display())));
         assert_eq!(text.matches("source:").count(), 1, "{text}");
-        assert!(
-            text.contains("verify the checkout is at the base above"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Choose the installed skills this assignment needs"),
-            "{text}"
-        );
-        // The result consumer, the escalation boundaries and the executor's
-        // own cycle are part of the rendered contract, not of the caller's
-        // prose.
+        // The consumer and the concrete feedback address are part of the
+        // rendered contract, not of the caller's prose. The standing exchange
+        // guidance around them lives in the executor role fragment and is not
+        // restated in the brief.
         assert!(
             text.contains(&format!("consumer: {DEFAULT_CONSUMER}")),
             "{text}"
         );
-        assert!(
-            text.contains(&expected_lead_channel(DEFAULT_CONSUMER)),
-            "{text}"
-        );
-        for boundary in STANDING_ESCALATIONS {
-            assert!(
-                text.contains(&format!("- {boundary}\n")),
-                "{boundary}\n{text}"
-            );
+        assert_small_task_contract(&text, DEFAULT_CONSUMER);
+        // The standing work-cycle, base-verification and heavy-command text is
+        // not restated in the brief: a managed session receives it once
+        // through its role context.
+        for standing in [
+            "work cycle (yours)",
+            "verify the checkout is at the base above",
+            "Run heavy builds and checks through codex-harness heavy",
+        ] {
+            assert!(!text.contains(standing), "{standing}\n{text}");
         }
-        assert!(
-            text.contains("work cycle (yours): read the declared inputs yourself"),
-            "{text}"
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The bounded lead conversation receives the same declared contract
+    /// under its own heading: one rendering path serves both roles, only the
+    /// first line names the role the conversation actually runs as.
+    #[test]
+    fn the_lead_brief_keeps_the_contract_under_its_own_heading() {
+        let root = temp_root("lead-brief");
+        fs::write(root.join("input.txt"), "input\n").unwrap();
+        let assignment = checked_in(
+            &root,
+            "assignment.json",
+            &document("Bound the lead route", &["input.txt"], &["out/result.txt"]),
         );
+        let context = AssignmentContext {
+            checkout: &root,
+            base: "0123456789abcdef0123456789abcdef01234567",
+            owner: "lead-exp-1",
+            source: &root,
+        };
+        let lead = lead_brief(&assignment, &context).unwrap();
+        let executor = brief(&assignment, &context).unwrap();
         assert!(
-            text.contains("report a compact result: done and remaining work"),
-            "{text}"
+            lead.starts_with("Structured lead assignment (schema 1)\n"),
+            "{lead}"
         );
+        assert_eq!(
+            lead.strip_prefix("Structured lead assignment (schema 1)\n"),
+            executor.strip_prefix("Structured executor assignment (schema 1)\n"),
+            "the contract below the heading is identical"
+        );
+        assert!(lead.contains("owner: lead-exp-1"), "{lead}");
+        assert!(lead.contains("- input.txt"), "{lead}");
+        assert!(lead.contains("- out/result.txt"), "{lead}");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -706,14 +730,7 @@ mod tests {
         assert_eq!(minimal.consumer, None);
         assert!(minimal.escalate.is_empty());
         let text = brief(&minimal, &context).unwrap();
-        assert!(
-            text.contains(&expected_lead_channel(DEFAULT_CONSUMER)),
-            "{text}"
-        );
-        assert!(
-            text.contains("the decision you need from the lead that dispatched this assignment"),
-            "{text}"
-        );
+        assert_small_task_contract(&text, DEFAULT_CONSUMER);
 
         // A declared consumer and extra triggers are carried into the brief,
         // and the standing boundaries are not replaced by them.
@@ -728,20 +745,19 @@ mod tests {
             text.contains("consumer: the lead of epic sample-3mu"),
             "{text}"
         );
+        assert_small_task_contract(&text, "the lead of epic sample-3mu");
         assert!(
-            text.contains(&expected_lead_channel("the lead of epic sample-3mu")),
+            text.contains("escalate to the lead of epic sample-3mu (additional boundaries)"),
             "{text}"
         );
         assert!(
             text.contains("- any change to the synthetic crate layout"),
             "{text}"
         );
+        // Standing boundaries stay owned by the role fragment: declared
+        // triggers extend that contract instead of copying it into the brief.
         assert!(
-            text.contains("- a material architecture or design change"),
-            "{text}"
-        );
-        assert!(
-            text.contains("the decision you need from the lead of epic sample-3mu"),
+            !text.contains("- a material architecture or design change"),
             "{text}"
         );
 
@@ -815,10 +831,11 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// The guidance an executor receives must stay a small, bounded addition to
-    /// one fixed payload: this test binds the canonical payload, the rendered
-    /// size and the replacement of the superseded escalation wording, so the
-    /// instruction-size report can be reproduced from the source.
+    /// The task contract an executor receives must stay a small, bounded
+    /// addition to one fixed payload: this test binds the canonical payload,
+    /// the rendered size, the small feedback addressing and the removal of the
+    /// standing exchange wording, so the instruction-load accounting can be
+    /// reproduced from the source.
     #[test]
     fn one_fixed_payload_keeps_the_rendered_guidance_concise() {
         let root = std::env::temp_dir().join("executor-assignment-measure-fixed");
@@ -845,7 +862,7 @@ mod tests {
             ],
             "outputs": ["crates/sample/src/first.rs"],
             "invariants": [
-                "Rendered structured briefs must concisely explain the sample command, its default reply request, its notice switch, automatic waiting with no keep-alive or polling, independent work, board ownership, and the answer-required watch result.",
+                "Rendered structured briefs must name the task-specific consumer and the concrete feedback address without restating the standing exchange guidance owned by the executor role.",
                 "Guidance is exceptional only: material ambiguity, an authority or access boundary, or an unresolvable dependency after investigation; ordinary implementation errors and routine progress stay off-channel.",
                 "Do not teach address discovery, receipt editing, process identity checks, resume rituals, recursive delegation or re-enabling native agent tools.",
                 "Keep the addition within MAX_BRIEF_BYTES and replace superseded wording rather than appending a second workflow where possible.",
@@ -869,11 +886,7 @@ mod tests {
             },
         )
         .unwrap();
-        let guidance = format!(
-            "{}{}",
-            expected_lead_channel(DEFAULT_CONSUMER),
-            EXPECTED_WAITING_RULE
-        );
+        let guidance = expected_feedback_line(DEFAULT_CONSUMER);
         println!("CANONICAL_BRIEF_BYTES {}", text.len());
         println!("CANONICAL_BRIEF_WORDS {}", text.split_whitespace().count());
         println!("CANONICAL_GUIDANCE_BYTES {}", guidance.len());
@@ -893,17 +906,18 @@ mod tests {
         );
         assert!(
             !text.contains(SUPERSEDED_ESCALATION_HEADING),
-            "the superseded escalation wording is replaced, not kept beside the rule: {text}"
+            "the superseded escalation wording is replaced, not kept beside the contract: {text}"
         );
+        assert_small_task_contract(&text, DEFAULT_CONSUMER);
         let _ = fs::remove_dir_all(root);
     }
 
-    /// The guidance a real dispatch renders: the one lead command, its default
-    /// reply request and its notice form, when asking is justified, what stays
-    /// with the executor, and the waiting rule that removes every keep-alive
-    /// ritual - with no address, process or resume mechanics taught beside it.
+    /// The one feedback address a real dispatch renders: the named consumer
+    /// and the concrete installed command, with none of the standing exchange
+    /// rules - when to ask, the waiting behavior or the result shape - which
+    /// the executor role fragment owns.
     #[test]
-    fn the_rendered_guidance_names_the_lead_channel_and_nothing_else() {
+    fn the_feedback_address_is_rendered_without_standing_guidance() {
         let root = temp_root("guidance");
         fs::write(root.join("input.txt"), "input\n").unwrap();
         let assignment = checked_in(
@@ -921,37 +935,12 @@ mod tests {
             },
         )
         .unwrap();
-        let start = text.find("escalate to").expect("the rule is rendered");
-        let end = text
-            .find("work cycle (yours)")
-            .expect("the executor's cycle follows the rule");
-        let rendered = &text[start..end];
-        assert_eq!(rendered.matches("escalate to").count(), 1, "{rendered}");
-        assert!(
-            rendered.starts_with(&expected_lead_channel(DEFAULT_CONSUMER)),
-            "{rendered}"
-        );
-        assert!(rendered.ends_with(EXPECTED_WAITING_RULE), "{rendered}");
-        for required in [
-            "codex-harness lead message",
-            "by piping codex-harness lead message",
-            "short --text fallback",
-            "spills long content automatically",
-            "asks for a reply unless --notify marks a notice that needs none",
-            "after investigating the available facts",
-            "a material ambiguity, or an authority/access boundary",
-            "ordinary implementation errors and routine progress, is yours",
-            "durable blockers, decisions and results stay on the bd issue",
-            "no polling, keep-alive loop or resume",
-            "independent authorized work may continue",
-            "An executor watch result of 3 means answer that request",
-        ] {
-            assert!(rendered.contains(required), "{required}\n{rendered}");
-        }
-        // The rule is the whole workflow: nothing teaches recipient or session
-        // discovery, receipt editing, process identity checks, a resume ritual,
-        // recursive delegation, re-enabling the native agent tools, a message
-        // size rule, a transport detail or a caller-created message file.
+        assert_small_task_contract(&text, DEFAULT_CONSUMER);
+        assert_eq!(text.matches("feedback:").count(), 1, "{text}");
+        // The contract teaches no address or session discovery, receipt
+        // editing, process identity checks, a resume ritual, recursive
+        // delegation, a message size rule, a transport detail or a
+        // caller-created message file.
         for forbidden in [
             "--session",
             "CODEX_",
@@ -968,30 +957,26 @@ mod tests {
             "KiB",
             "MiB",
         ] {
-            assert!(!rendered.contains(forbidden), "{forbidden}\n{rendered}");
+            assert!(!text.contains(forbidden), "{forbidden}\n{text}");
         }
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Free text is a supported dispatch path, so it receives the identical
-    /// rule: the caller's text stays first and literal and the same block
-    /// follows it. One owner for the wording means the structured brief and a
-    /// free-text assignment cannot drift into two workflows.
+    /// Free text is a supported dispatch path, so it renders the same small
+    /// task contract: the caller's text stays first and literal, and the
+    /// implicit consumer plus the concrete feedback address follow it. Neither
+    /// form restates the standing guidance owned by the executor role
+    /// fragment.
     #[test]
-    fn free_text_and_structured_assignments_teach_one_guidance_rule() {
+    fn free_text_and_structured_assignments_render_one_task_contract() {
         let literal = "Réparer le contrat - keep 'quoted' text and --notify literal, суммарный контроль\nsecond line";
         let free = free_text_brief(literal);
         assert!(free.starts_with(literal), "{free}");
-        let mut block = expected_lead_channel(DEFAULT_CONSUMER);
-        for boundary in STANDING_ESCALATIONS {
-            block.push_str(&format!("- {boundary}\n"));
-        }
-        block.push_str(EXPECTED_WAITING_RULE);
-        assert!(free.contains(&block), "{free}");
-        assert_eq!(free.matches("escalate to").count(), 1, "{free}");
+        assert_small_task_contract(&free, DEFAULT_CONSUMER);
+        assert_eq!(free.matches("feedback:").count(), 1, "{free}");
 
-        // The same rendered block reaches the structured path, so an executor
-        // cannot receive two versions of the rule.
+        // The same feedback contract reaches the structured path, so an
+        // executor cannot receive two versions of the address.
         let root = temp_root("one-rule");
         fs::write(root.join("input.txt"), "input\n").unwrap();
         let assignment = checked_in(
@@ -1009,9 +994,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(structured.contains(&block), "{structured}");
+        assert_small_task_contract(&structured, DEFAULT_CONSUMER);
+        assert!(
+            structured.contains(&expected_feedback_line(DEFAULT_CONSUMER)),
+            "{structured}"
+        );
         // A caller's trailing blank line is dropped instead of being rendered
-        // into the rule; nothing else about the text is rewritten.
+        // into the contract; nothing else about the text is rewritten.
         let padded = free_text_brief("do the work\n\n");
         assert!(padded.starts_with("do the work\n"), "{padded}");
         let _ = fs::remove_dir_all(root);
@@ -1058,9 +1047,7 @@ mod tests {
         assert_eq!(ascii.invariants[0].chars().count(), 200);
         let text = brief(&ascii, &context).unwrap();
         assert!(text.len() <= MAX_BRIEF_BYTES, "{}", text.len());
-        for boundary in STANDING_ESCALATIONS {
-            assert!(text.contains(boundary), "{boundary}\n{text}");
-        }
+        assert_small_task_contract(&text, DEFAULT_CONSUMER);
         let _ = fs::remove_dir_all(root);
     }
 }

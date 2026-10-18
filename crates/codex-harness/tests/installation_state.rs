@@ -9,6 +9,10 @@ use std::{
     process::{Command, Output},
 };
 
+#[path = "fixtures/synthetic_role_build.rs"]
+#[allow(dead_code)]
+mod synthetic_role_build;
+
 struct Fixture {
     root: tempfile::TempDir,
     home: PathBuf,
@@ -79,6 +83,64 @@ impl Fixture {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("private version sentinel"));
         assert_eq!(fs::read(&self.state).unwrap(), expected);
     }
+}
+
+#[test]
+fn deploy_reset_rejects_a_foreign_source_build_before_removing_owned_links() {
+    let f = Fixture::new();
+    let original = synthetic_role_build::kit_source(&f.root.path().join("original"));
+    let requested = synthetic_role_build::kit_source(&f.root.path().join("requested"));
+    let build = synthetic_role_build::recorded_build(f.root.path(), &original);
+    assert_eq!(
+        harness_core::build_identity::source_identity(&original)
+            .unwrap()
+            .sha256,
+        harness_core::build_identity::source_identity(&requested)
+            .unwrap()
+            .sha256,
+        "the failure must concern the checkout path, not changed source contents"
+    );
+
+    let mut metadata = f.metadata();
+    metadata["links"].as_array_mut().unwrap().truncate(1);
+    metadata["links"][0]["owned"] = json!(true);
+    let target = PathBuf::from(metadata["links"][0]["source"].as_str().unwrap());
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, b"existing safeguards").unwrap();
+    let prior_metadata = f.write(&metadata);
+    let instructions = f.home.join("AGENTS.md");
+    symlink_file(&target, &instructions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["deploy", "--reset", "--source"])
+        .arg(&requested)
+        .arg("--build")
+        .arg(&build)
+        .arg("--codex-home")
+        .arg(&f.home)
+        .arg("--user-home")
+        .arg(&f.user)
+        .current_dir(f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read_link(&instructions).unwrap(), target);
+    assert_eq!(fs::read(&instructions).unwrap(), b"existing safeguards");
+    assert_eq!(fs::read(&f.state).unwrap(), prior_metadata);
+    assert!(
+        !fs::read_dir(f.state.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("installation.reset-"))
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("build belongs to another source checkout"),
+        "{output:?}"
+    );
 }
 
 #[test]
@@ -814,5 +876,61 @@ fn escape(text: &str) -> String {
         assert!(sleeper.0.try_wait().unwrap().is_none());
         assert!(!tree.cpu.join("cpu-budget.json").exists());
         assert!(!tree.source.join("target").exists());
+    }
+
+    #[test]
+    fn install_update_materialize_legacy_pool_capacity_without_moving_other_settings() {
+        let tree = tree();
+        let home = tree.root.join("codex-pool");
+        let user = tree.root.join("user-pool");
+        let config = tree.source.join("global/orchestration.toml");
+        fs::write(
+            &config,
+            "# user comment retained\nschema = 1\nlead_profile = \"default\"\n\
+             successor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\n\
+             max_concurrent_executors = 2\nvote_threshold = 3\n\
+             incubator_size_cap = 32\nfeedback_batch_limit = 8\nworktree_limit = 6\n",
+        )
+        .unwrap();
+        let legacy = fs::read(&config).unwrap();
+
+        let preview = lifecycle(&tree, "install", true, &home, &user, &tree.upstream);
+        assert_eq!(preview["status"], "preview");
+        assert_eq!(fs::read(&config).unwrap(), legacy, "preview writes nothing");
+
+        let installed = lifecycle(&tree, "install", false, &home, &user, &tree.upstream);
+        assert_eq!(installed["status"], "connected");
+        let materialized = fs::read_to_string(&config).unwrap();
+        assert!(
+            materialized.contains("# user comment retained"),
+            "{materialized}"
+        );
+        assert!(
+            materialized.contains("max_concurrent_executors = 2"),
+            "{materialized}"
+        );
+        assert!(
+            materialized.contains("worktree_pool_size = 2"),
+            "{materialized}"
+        );
+        assert!(
+            materialized.contains("worktree_limit = 6"),
+            "{materialized}"
+        );
+        assert_eq!(
+            harness_core::orchestration_config::parse(materialized.as_bytes())
+                .unwrap()
+                .worktree_pool_size,
+            Some(2),
+            "the legacy configuration's effective capacity is preserved explicitly"
+        );
+
+        let updated = lifecycle(&tree, "update", false, &home, &user, &tree.replacement);
+        assert_eq!(updated["status"], "connected");
+        assert_eq!(
+            fs::read(&config).unwrap(),
+            materialized.as_bytes(),
+            "a later update leaves the materialized setting and every user choice as they are"
+        );
     }
 }

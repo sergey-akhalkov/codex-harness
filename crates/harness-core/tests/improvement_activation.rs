@@ -532,6 +532,7 @@ fn policy() -> ComparisonPolicy {
             evaluation_seconds: 5.0,
             maintenance_seconds_per_task: 0.5,
         },
+        conjunction: None,
     }
 }
 

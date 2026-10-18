@@ -516,6 +516,76 @@ fn bounded_triage_counts_once_and_excludes_diagnostics() {
 }
 
 #[test]
+fn derived_evidence_preserves_the_source_episode_without_manufacturing_votes() {
+    let board = Board::new("derived-evidence");
+    // Analysis may arrive before its source report is triaged. It must not
+    // become a vote just because the source is not in the ledger yet.
+    let derived = board.record(
+        "analysis of an observed dispatch wait",
+        "observer-a",
+        "source-e1",
+        "derived-evidence",
+    );
+    let initial = board.decisions("derived-first.json", &[(&derived, "process", None)]);
+    let out = board.feedback(&["triage", "--decisions", initial.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("vote=derived-evidence"), "{text}");
+    let ledger = board.feedback(&["ledger", "--item", &derived]);
+    let text = output_text(&ledger);
+    assert!(ledger.status.success(), "{text}");
+    assert!(text.contains("votes=1 counted=0"), "{text}");
+
+    let original = board.record(
+        "the observed dispatch wait",
+        "exec-a",
+        "source-e1",
+        "executor",
+    );
+    let second_analysis = board.record(
+        "another analysis of the same source episode",
+        "observer-b",
+        "source-e1",
+        "derived-evidence",
+    );
+    let batch = board.decisions(
+        "original-and-analysis.json",
+        &[
+            (&original, "process", Some(&derived)),
+            (&second_analysis, "process", Some(&derived)),
+        ],
+    );
+    // Both initial application and retry retain exactly the original vote.
+    for _ in 0..2 {
+        let out = board.feedback(&["triage", "--decisions", batch.to_str().unwrap()]);
+        let text = output_text(&out);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("vote=derived-evidence"), "{text}");
+        let ledger = board.feedback(&["ledger", "--item", &derived]);
+        let text = output_text(&ledger);
+        assert!(ledger.status.success(), "{text}");
+        assert!(text.contains("counted=1 merges=2"), "{text}");
+        assert!(text.contains("episode=source-e1"), "{text}");
+        assert!(text.contains("reporter=observer-a"), "{text}");
+        assert!(text.contains("reporter=observer-b"), "{text}");
+        assert!(
+            text.contains("counted=false reason=derived-evidence"),
+            "{text}"
+        );
+    }
+    let candidates = board.feedback(&["candidates"]);
+    let text = output_text(&candidates);
+    assert!(candidates.status.success(), "{text}");
+    assert!(
+        text.contains("promotion candidates: 0 at threshold=2"),
+        "{text}"
+    );
+    let promotion = board.feedback(&["promote", "--item", &derived]);
+    assert!(!promotion.status.success(), "{}", output_text(&promotion));
+    board.drop();
+}
+
+#[test]
 fn partial_triage_failure_reports_the_applied_prefix_and_recovers() {
     let board = Board::new("partial");
     let first = board.record("dispatch waits after tools", "exec-a", "e1", "executor");

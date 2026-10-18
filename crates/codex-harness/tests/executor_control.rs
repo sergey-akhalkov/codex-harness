@@ -19,8 +19,8 @@ mod cache_usage;
 mod executor_control;
 
 use executor_control::{
-    BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, FinalMessage, Lifecycle,
-    MAX_EVENTS_PER_PUMP, app_server_spec,
+    BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, EndpointProcess,
+    FinalMessage, Lifecycle, MAX_EVENTS_PER_PUMP, app_server_spec, endpoint_process_live,
 };
 use harness_core::{
     console::{ConsoleSession, ConsoleSpec},
@@ -357,7 +357,11 @@ fn spawned_child_serves_the_documented_command_environment_and_endpoint() {
         .expect("a recorded child identity");
     assert_eq!(recorded.pid, child.pid);
     assert_eq!(recorded.creation_time, child.creation_time);
-    assert_eq!(recorded.program, PathBuf::from(FIXTURE));
+    assert_eq!(
+        recorded.program.canonicalize().unwrap(),
+        PathBuf::from(FIXTURE).canonicalize().unwrap(),
+        "the endpoint records the resolved child image"
+    );
 
     // The child ran the exact documented command environment.
     let requests = fixture.server.requests();
@@ -395,6 +399,96 @@ fn spawned_child_serves_the_documented_command_environment_and_endpoint() {
     assert_eq!(start["config"]["model_reasoning_effort"], EFFORT);
     assert_eq!(requests[3]["params"]["threadId"], THREAD);
     assert_eq!(requests[3]["params"]["name"], "control fixture assignment");
+    drop(conversation);
+    fixture.terminate();
+}
+
+#[test]
+fn a_retargeted_launcher_alias_keeps_the_running_child_and_recovers_its_legacy_record() {
+    let mut fixture = fixture();
+    let root = fixture._root.path().to_path_buf();
+    let builds = root.join("native/builds");
+    let old = builds.join("old/codex.exe");
+    let new = builds.join("new/codex.exe");
+    let foreign = root.join("foreign/codex.exe");
+    for target in [&old, &new, &foreign] {
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(FIXTURE, target).unwrap();
+    }
+    let alias = root.join("harness/bin/codex.exe");
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    std::os::windows::fs::symlink_file(&old, &alias).unwrap();
+    fixture.plan.launcher = alias.clone();
+
+    let conversation = fixture
+        .start()
+        .expect("the child started through the mutable launcher alias");
+    let endpoint = Endpoint::read(&fixture.endpoint_path()).unwrap();
+    let recorded = endpoint.process.clone().expect("the child identity");
+    assert_eq!(recorded.pid, conversation.process_identity().unwrap().pid);
+
+    // The installation update replaces the alias, not the running image. The
+    // exact pid and creation time still belong to that old image.
+    fs::remove_file(&alias).unwrap();
+    std::os::windows::fs::symlink_file(&new, &alias).unwrap();
+    let legacy = EndpointProcess {
+        program: alias.clone(),
+        ..recorded.clone()
+    };
+    assert!(
+        endpoint_process_live(&legacy),
+        "a legacy alias record must stay addressable after its launcher target changes"
+    );
+    assert_eq!(
+        recorded.program,
+        old.canonicalize().unwrap(),
+        "a new endpoint record names the immutable image it actually launched"
+    );
+    assert!(
+        endpoint_process_live(&recorded),
+        "the canonical endpoint record still names the running image"
+    );
+
+    let user = process_service::current_user().unwrap();
+    assert!(
+        ServiceProcess::inspect(
+            ProcessIdentity {
+                pid: legacy.pid,
+                creation_time: legacy.creation_time,
+            },
+            &legacy.program,
+            &user,
+        )
+        .is_err(),
+        "strict process validation must not adopt a retargeted alias"
+    );
+    assert!(
+        ServiceProcess::inspect_endpoint(
+            ProcessIdentity {
+                pid: legacy.pid,
+                creation_time: legacy.creation_time,
+            },
+            &legacy.program,
+            "wrong-user",
+        )
+        .is_err(),
+        "endpoint recovery still requires the exact account"
+    );
+    let stale = EndpointProcess {
+        creation_time: legacy.creation_time + 1,
+        ..legacy.clone()
+    };
+    assert!(
+        !endpoint_process_live(&stale),
+        "a reused pid or stale creation time is never an endpoint"
+    );
+    fs::remove_file(&alias).unwrap();
+    std::os::windows::fs::symlink_file(&foreign, &alias).unwrap();
+    assert!(
+        !endpoint_process_live(&legacy),
+        "an alias aimed outside the installed build family cannot reidentify the child"
+    );
+
     drop(conversation);
     fixture.terminate();
 }
@@ -1984,7 +2078,17 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
     assert_eq!(endpoint["schema"], 1, "{endpoint}");
     assert_eq!(endpoint["port"], pooled.server.port, "{endpoint}");
     assert_eq!(endpoint["threadId"], THREAD, "{endpoint}");
-    assert_eq!(endpoint["process"]["program"], FIXTURE, "{endpoint}");
+    // The endpoint records the child image in the host's normalized spelling,
+    // which names the same file as the compile-time fixture path; compare the
+    // resolved files rather than one separator spelling of them.
+    let recorded_program = endpoint["process"]["program"]
+        .as_str()
+        .expect("the endpoint records its child image path");
+    assert_eq!(
+        fs::canonicalize(recorded_program).unwrap(),
+        fs::canonicalize(FIXTURE).unwrap(),
+        "the endpoint names the exact fixture image: {endpoint}"
+    );
     let token = fs::read_to_string(pooled.state.join("endpoint-1.token")).unwrap();
     assert_eq!(endpoint["token"], token.trim(), "{endpoint}");
     let child_pid = endpoint["process"]["pid"].as_u64().unwrap() as u32;
@@ -2049,6 +2153,68 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
         "{watched_text}"
     );
     assert!(watched_text.contains(FINAL), "{watched_text}");
+}
+
+/// A dispatch receipt that recorded a responsibility role applies it to the
+/// hosted conversation: the host reports the effective role and its revision,
+/// and the ordinary control route still completes the run.
+#[test]
+fn a_recorded_role_composition_reaches_the_hosted_conversation() {
+    let pooled = Pooled::new("role-recorded", Answer::Result(thread_start_answer()), true);
+    let mut receipt = pooled.receipt();
+    receipt["control"]["role"] = json!({
+        "role": "executor",
+        "revision": "fixture-revision",
+        "args": [
+            "-c",
+            "developer_instructions=\"Fixture executor responsibility\""
+        ]
+    });
+    fs::write(
+        &pooled.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the assignment reaches the thread under the recorded role",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(
+            "role context: role=executor revision=fixture-revision saved=fixture-revision previous=none"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("state: turn completed (completed)"), "{text}");
+    assert!(text.contains("result: completed"), "{text}");
+}
+
+/// A receipt written before role recording applies no owned role text and says
+/// so; the conversation still hosts and completes, and a later resume or
+/// restart records the current role on its own dispatch.
+#[test]
+fn a_legacy_receipt_without_a_recorded_role_still_hosts_and_reports_unrecorded() {
+    let pooled = Pooled::new("role-legacy", Answer::Result(thread_start_answer()), true);
+    assert!(pooled.receipt()["control"]["role"].is_null());
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the assignment reaches the thread with no recorded role",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("role context: unrecorded"),
+        "a legacy receipt reports its unrecorded role instead of inventing one: {text}"
+    );
+    assert!(text.contains("result: completed"), "{text}");
 }
 
 /// The non-DeepSeek identity the cache-guard dispatches run with: support is

@@ -1,5 +1,6 @@
 //! Model-free skill-evolution helpers.
 
+use harness_core::{orchestration_config, role_context::Role};
 use serde_json::json;
 use skill_evolution::isolation::{self, Request};
 use skill_evolution::{catalogue, delivery, identity, ledger, session, usage};
@@ -26,7 +27,7 @@ const CATALOGUE_LIMIT: u64 = 16 * 1024;
 const COMMANDS: [(&str, &str); 5] = [
     (
         "catalogue",
-        "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps; raw native evidence stays in a private temporary root and a missing native read reports unavailable rather than a local scan. --limit accepts 1024-1048576 bytes (default 16384); rerun with a larger --limit for omitted entries.",
+        "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--role lead|executor] [--profile ID] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps; raw native evidence stays in a private temporary root and a missing native read reports unavailable rather than a local scan. --role composes the installed build's recorded responsibility role (developer text and skill memberships) onto the native read exactly as a managed session receives it, so the catalogue shows that role's effective set; it refuses when the role inputs are missing instead of reporting a different set. --profile ID adds the native profile layer the managed session selected for that role (the installed profile file or its profiles.<name> table; default adds nothing), so the layers that profile carries reach both the resolved role context and the native read, and the composed role and profile are reported as role_context=role=...;profile=...;revision=...; no model routing is composed. --limit accepts 1024-1048576 bytes (default 16384); rerun with a larger --limit for omitted entries.",
     ),
     (
         "isolate",
@@ -105,11 +106,38 @@ fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
         None => default_codex_home()?.canonicalize()?,
     };
     let upstream = opts.remove("--upstream").map(PathBuf::from);
+    let role = match opts.remove("--role") {
+        Some(value) if value == "lead" => Some(Role::Lead),
+        Some(value) if value == "executor" => Some(Role::Executor),
+        Some(_) => return Err(invalid()),
+        None => None,
+    };
+    let profile = match opts.remove("--profile") {
+        Some(value) => Some(value.to_str().ok_or_else(invalid)?.to_owned()),
+        None => None,
+    };
     let timeout = number(opts.remove("--timeout"))?.unwrap_or(CATALOGUE_TIMEOUT);
     let limit = number(opts.remove("--limit"))?.unwrap_or(CATALOGUE_LIMIT);
     if !opts.is_empty() || !(1..=300).contains(&timeout) || !(1024..=1024 * 1024).contains(&limit) {
         return Err(invalid());
     }
+    if profile.is_some() && role.is_none() {
+        return Err(io::Error::other(
+            "--profile applies one selected native profile layer to the composed role context; pass --role lead|executor with it",
+        ));
+    }
+    // An explicitly requested role is resolved from the installed build's
+    // recorded source before the native read, with the selected profile's
+    // layers, so the read sees the same effective context a managed session
+    // receives; a missing role or profile input refuses the command instead
+    // of reporting a set the managed session would not see.
+    let (extra, report) = match role {
+        Some(role) => {
+            let (args, report) = role_context_args(&home, &case, profile.as_deref(), role)?;
+            (args, Some(report))
+        }
+        None => (Vec::new(), None),
+    };
     let private = tempfile::Builder::new()
         .prefix("codex-skills-catalogue-")
         .tempdir()?;
@@ -117,22 +145,33 @@ fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
     if root.starts_with(repository()) {
         return Err(invalid());
     }
+    let print_view = |view: &catalogue::View| -> io::Result<()> {
+        let mut out = String::new();
+        if let Some(report) = &report {
+            out.push_str(report);
+            out.push('\n');
+        }
+        out.push_str(&delivery::render(view, limit as usize)?);
+        print!("{out}");
+        Ok(())
+    };
     match native_catalogue(
         &case,
         &home,
         upstream.as_deref(),
+        &extra,
         timeout,
         limit as usize,
         &root,
     ) {
         Ok(view) => {
-            print!("{}", delivery::render(&view, limit as usize)?);
+            print_view(&view)?;
             Ok(0)
         }
         Err(error) => {
             let evidence = private.keep().canonicalize()?;
             let view = catalogue::View::unavailable(error.to_string());
-            print!("{}", delivery::render(&view, limit as usize)?);
+            print_view(&view)?;
             eprintln!(
                 "native skill discovery failed; private evidence: {}",
                 evidence.display()
@@ -185,11 +224,68 @@ fn registered_upstream(home: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| detail("records no upstream executable".to_owned()))
 }
 
-#[cfg_attr(not(windows), allow(unused_variables))]
+/// The role composition one explicit `--role` request applies to the native
+/// read -- the installed build's resolved developer text and skill
+/// memberships under the selected profile layer, rendered exactly as the
+/// managed host renders them for its app-server child -- plus the honest
+/// one-line report of the role, profile and revision that were composed.
+fn role_context_args(
+    home: &Path,
+    case: &Path,
+    profile_id: Option<&str>,
+    role: Role,
+) -> io::Result<(Vec<String>, String)> {
+    let profile = profile_id
+        .map(|id| selected_profile(home, id))
+        .transpose()
+        .map_err(|error| role_refusal(role, profile_id, error))?;
+    let launch = harness_core::native_launcher::role_launch(
+        home,
+        case,
+        profile.as_ref(),
+        &toml::Table::new(),
+        role,
+    )
+    .map_err(|error| role_refusal(role, profile_id, error))?;
+    let report = format!(
+        "role_context=role={};profile={};revision={}",
+        launch.role.label(),
+        profile_id.unwrap_or("none"),
+        launch.revision
+    );
+    Ok((launch.args, report))
+}
+
+/// The native profile layer a managed session's selected profile supplies,
+/// validated exactly as a dispatch validates its binding so a profile that is
+/// not installed refuses instead of silently composing nothing. The catalogue
+/// stays model-free and role/model independent: the profile's routing values
+/// are never resolved or used, only the context layers the role composition
+/// retains from it.
+fn selected_profile(home: &Path, id: &str) -> io::Result<toml::Table> {
+    if id == "default" {
+        return Ok(toml::Table::new());
+    }
+    orchestration_config::binding(home, id)?;
+    orchestration_config::profile_config(home, id)
+}
+
+/// The catalogue's refusal for a requested role context it cannot compose.
+fn role_refusal(role: Role, profile: Option<&str>, error: io::Error) -> io::Error {
+    let profile = profile
+        .map(|id| format!(" --profile {id}"))
+        .unwrap_or_default();
+    io::Error::other(format!(
+        "role context for --role {}{profile}: {error}; the catalogue refuses to report a set the managed session would not see",
+        role.label()
+    ))
+}
+
 fn native_catalogue(
     case: &Path,
     home: &Path,
     upstream: Option<&Path>,
+    extra: &[String],
     timeout: u64,
     limit: usize,
     root: &Path,
@@ -216,7 +312,7 @@ fn native_catalogue(
                 case,
                 working_directory: case,
                 home,
-                extra: &[],
+                extra,
                 root,
                 timeout: Duration::from_secs(timeout),
                 output_limit: 16 * 1024 * 1024,

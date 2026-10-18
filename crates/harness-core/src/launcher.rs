@@ -307,6 +307,15 @@ pub fn xai_shim_requested(args: &[OsString]) -> bool {
 }
 
 pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {
+    let mut result = Vec::new();
+    if session_selection(args, true) {
+        result.extend(["--profile".into(), "harness".into()]);
+    }
+    result.extend_from_slice(args);
+    result
+}
+
+fn session_selection(args: &[OsString], preserve_profile: bool) -> bool {
     let mut command = None;
     let mut debug = None;
     let mut positional = false;
@@ -322,8 +331,7 @@ pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {
             || arg
                 .strip_prefix('-')
                 .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c == 'h' || c == 'V'))
-            || option(arg, "--profile")
-            || arg.starts_with("-p")
+            || (preserve_profile && (option(arg, "--profile") || arg.starts_with("-p")))
             || option(arg, "--remote")
         {
             preserve = true;
@@ -363,11 +371,102 @@ pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {
         command,
         None | Some("exec" | "e" | "review" | "resume" | "fork")
     ) || (command == Some("debug") && debug == Some("prompt-input"));
-    let mut result = Vec::new();
-    if session && !preserve {
-        result.extend(["--profile".into(), "harness".into()]);
+    session && !preserve
+}
+
+/// Context inputs for a local model session. Routing and prompt arguments stay
+/// untouched; maintenance commands and remote attachments have no local role.
+pub struct ContextArguments {
+    pub cwd: PathBuf,
+    pub profile: Option<String>,
+    pub overrides: Vec<String>,
+}
+
+pub fn context_arguments(args: &[OsString], cwd: &Path) -> io::Result<Option<ContextArguments>> {
+    if !session_selection(args, false) {
+        return Ok(None);
     }
-    result.extend_from_slice(args);
+    let mut result = ContextArguments {
+        cwd: cwd.to_owned(),
+        profile: None,
+        overrides: Vec::new(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        if image(arg) {
+            skip_images(args, &mut i);
+            i += 1;
+            continue;
+        }
+        let mut selected = None;
+        for (short, long) in [("-C", "--cd"), ("-p", "--profile"), ("-c", "--config")] {
+            let value = if arg == short || arg == long {
+                i += 1;
+                Some(
+                    args.get(i)
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| {
+                            io::Error::other(format!("{long} requires a UTF-8 value"))
+                        })?,
+                )
+            } else {
+                arg.strip_prefix(&format!("{long}="))
+                    .or_else(|| arg.strip_prefix(short).filter(|value| !value.is_empty()))
+                    .map(|value| value.strip_prefix('=').unwrap_or(value))
+            };
+            if let Some(value) = value {
+                selected = Some((short, value));
+                break;
+            }
+        }
+        match selected {
+            Some(("-C", value)) => result.cwd = cwd.join(value),
+            Some(("-p", value)) => result.profile = Some(value.to_owned()),
+            Some(("-c", value)) => result.overrides.push(value.to_owned()),
+            _ if VALUES.contains(&arg) => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(Some(result))
+}
+
+/// Keep all config overrides in the root command's argument scope. Native
+/// subcommand config vectors replace the root vector, so appending role
+/// settings after `exec` or `debug prompt-input` loses shared defaults.
+/// Explicit configs retain encounter order; composed context wins last.
+pub fn with_context_overrides(args: &[OsString], overrides: &toml::Table) -> Vec<OsString> {
+    let mut result = Vec::new();
+    let mut command = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            command.extend_from_slice(&args[i..]);
+            break;
+        }
+        let config = option(arg, "--config") || arg.starts_with("-c");
+        let start = i;
+        if image(arg) {
+            skip_images(args, &mut i);
+        } else if VALUES.contains(&arg) && i + 1 < args.len() {
+            i += 1;
+        }
+        i += 1;
+        if config {
+            result.extend_from_slice(&args[start..i]);
+        } else {
+            command.extend_from_slice(&args[start..i]);
+        }
+    }
+    for (key, value) in overrides {
+        result.extend(["-c".into(), format!("{key}={value}").into()]);
+    }
+    result.extend(command);
     result
 }
 

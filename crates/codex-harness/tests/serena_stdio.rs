@@ -35,18 +35,163 @@ fn native_semantic_acceptance_checks_real_backends_and_edit_readback() {
         .into_iter()
         .flatten()
         .any(|row| row["id"] == "delphi" && row["status"] == "adopted");
-    let expected = if pascal {
-        json!(["rust", "python", "pascal"])
-    } else {
-        json!(["rust", "python"])
-    };
-    assert_eq!(report["languages"], expected);
+    let mut expected = vec!["rust", "python"];
+    if pascal {
+        expected.push("pascal");
+    }
+    if inventory["languages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| row["id"] == "cpp" && row["status"] == "adopted")
+    {
+        expected.push("cpp");
+    }
+    assert_eq!(report["languages"], json!(expected));
     assert_eq!(report["owned_state_removed"], true);
     assert_eq!(
         report["manager_sha256"],
         harness_core::build_identity::hash_file(Path::new(env!("CARGO_BIN_EXE_codex-harness")))
             .unwrap()
     );
+}
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY with adopted pasls"]
+fn pascal_startup_skips_eager_build_copy_index_and_keeps_navigation() {
+    let registry = PathBuf::from(
+        std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit adopted registry"),
+    );
+    let root = tempfile::Builder::new()
+        .prefix("harness-pascal-startup-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!(
+        "Pascal startup evidence (retained on failure): {}",
+        root.display()
+    );
+    let project = root.join("project");
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(project.join(".serena")).unwrap();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(project.join(".build/copy")).unwrap();
+    fs::write(
+        project.join(".serena/project.yml"),
+        "project_name: pascal-startup\nlanguage_servers: [pascal]\nencoding: utf-8\nignored_paths: ['.build/**']\n",
+    ).unwrap();
+    fs::write(
+        project.join("src/values.pas"),
+        "unit values;\ninterface\nfunction acceptance_value: Integer;\nimplementation\nfunction acceptance_value: Integer;\nbegin\n  acceptance_value := 7101;\nend;\nend.\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/caller.pas"),
+        "unit caller;\ninterface\nuses values;\nfunction consume: Integer;\nimplementation\nfunction consume: Integer;\nbegin\n  consume := acceptance_value;\nend;\nend.\n",
+    ).unwrap();
+    fs::write(
+        project.join(".build/copy/ignored_copy.pas"),
+        "unit ignored_copy;\ninterface\nimplementation\nfunction ignored_marker: Integer;\nbegin\n  ignored_marker := 9919;\nend;\nend.\n",
+    )
+    .unwrap();
+    let cleanup = OwnedBroker(codex_home.clone());
+    let mut proxy = Proxy::start(&root, &codex_home, &registry, &project, &adopted_console());
+    let reply = proxy.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "pascal-startup-regression", "version": "1"}
+        }),
+    );
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let mut id = 1;
+    let mut call = |name: &str, arguments: Value| {
+        id += 1;
+        let reply = proxy.request(
+            id,
+            "tools/call",
+            json!({"name": name, "arguments": arguments}),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        reply["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect::<String>()
+    };
+    let overview = call(
+        "get_symbols_overview",
+        json!({"relative_path":"src/values.pas","depth":1,"max_answer_chars":3800}),
+    );
+    assert!(overview.contains("acceptance_value"), "{overview}");
+    let found = call(
+        "find_symbol",
+        json!({"name_path_pattern":"acceptance_value","include_body":true,
+            "max_matches":4,"max_answer_chars":3800}),
+    );
+    assert!(
+        found.contains("7101") && found.contains("values.pas"),
+        "{found}"
+    );
+    let ignored = call(
+        "find_symbol",
+        json!({"name_path_pattern":"ignored_marker","max_matches":1,"max_answer_chars":1000}),
+    );
+    assert!(
+        !ignored.contains("9919") && !ignored.contains("ignored_copy.pas"),
+        "{ignored}"
+    );
+    call(
+        "get_symbols_overview",
+        json!({"relative_path":"src/caller.pas","depth":1,"max_answer_chars":3800}),
+    );
+    let references = call(
+        "find_referencing_symbols",
+        json!({"relative_path":"src/values.pas","name_path":"interface/acceptance_value","max_answer_chars":3800}),
+    );
+    assert!(
+        references.contains("consume") && references.contains("caller.pas"),
+        "{references}"
+    );
+
+    // Inspect the real server's load events, not just the generated setting.
+    // A tiny ignored copy reproduces the erroneous eager load without inducing OOM.
+    let mut pending = vec![codex_home.join("harness/serena-home/workers")];
+    let mut logs = String::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_name().to_string_lossy().starts_with("mcp_") {
+                logs.push_str(&fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+    }
+    assert!(
+        logs.contains("Language server initialization completed"),
+        "missing startup evidence: {}",
+        root.display()
+    );
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("Reloaded") && line.contains("values.pas")),
+        "missing positive load evidence: {}",
+        root.display()
+    );
+    assert!(
+        !logs
+            .lines()
+            .any(|line| line.contains("Reloaded") && line.contains("ignored_copy.pas")),
+        "pasls eagerly loaded an ignored build copy; evidence: {}",
+        root.display()
+    );
+    proxy.finish();
+    drop(cleanup);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -236,14 +381,22 @@ impl Drop for OwnedBroker {
                 return Ok(());
             }
             let record: Value = serde_json::from_slice(&fs::read(path)?)?;
-            let root = BrokerRoot::open(Path::new(record["root"].as_str().unwrap()))?;
-            let outcome = broker_launch::retire(
-                &root,
-                Deadline::after(Duration::from_secs(60))?,
-                &Cancellation::default(),
-            )?;
-            if matches!(outcome, broker_launch::Retirement::Pending { .. }) {
-                return Err(std::io::Error::other("owned test broker cleanup pending"));
+            let mut locations = vec![record["root"].as_str().unwrap()];
+            if let Some(generations) = record["generations"].as_array() {
+                locations.extend(generations.iter().filter_map(|item| item["root"].as_str()));
+            }
+            locations.sort_unstable();
+            locations.dedup();
+            for location in locations {
+                let root = BrokerRoot::open(Path::new(location))?;
+                let outcome = broker_launch::retire(
+                    &root,
+                    Deadline::after(Duration::from_secs(60))?,
+                    &Cancellation::default(),
+                )?;
+                if matches!(outcome, broker_launch::Retirement::Pending { .. }) {
+                    return Err(std::io::Error::other("owned test broker cleanup pending"));
+                }
             }
             Ok(())
         })();
@@ -570,7 +723,25 @@ impl Proxy {
         console: &Path,
         seconds: &str,
     ) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        Self::start_program(
+            Path::new(env!("CARGO_BIN_EXE_codex-harness")),
+            codex_home,
+            registry,
+            project,
+            console,
+            seconds,
+        )
+    }
+
+    fn start_program(
+        program: &Path,
+        codex_home: &Path,
+        registry: &Path,
+        project: &Path,
+        console: &Path,
+        seconds: &str,
+    ) -> Self {
+        let mut child = Command::new(program)
             .arg("mcp")
             .arg("serena")
             .arg("--serena")
@@ -1400,4 +1571,88 @@ fn unlimited_managed_connection_survives_delayed_input_and_serves_requests() {
     assert_eq!(later["id"], 2, "{later}");
     // Closing the client terminates the proxy without an orphan transport.
     proxy.finish();
+}
+
+#[test]
+#[ignore = "requires HARNESS_CODE_TOOLS_REGISTRY and HARNESS_TEST_NEXT_MANAGER with a distinct native build"]
+fn open_session_restarts_its_broker_after_installed_manager_link_changes() {
+    use std::os::windows::fs::symlink_file;
+
+    let console = adopted_console();
+    let registry = PathBuf::from(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let codex_home = root.path().join("codex-home");
+    let cleanup = OwnedBroker(codex_home.clone());
+    let project = crate_project(root.path(), "delivery restart", 719);
+    let first_image = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    let next_image = PathBuf::from(
+        std::env::var_os("HARNESS_TEST_NEXT_MANAGER")
+            .expect("explicit distinct native manager build"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert_ne!(
+        harness_core::build_identity::hash_file(&first_image).unwrap(),
+        harness_core::build_identity::hash_file(&next_image).unwrap(),
+        "the replacement must be a distinct real build",
+    );
+    let installed = root.path().join("codex-harness.exe");
+    symlink_file(&first_image, &installed).unwrap();
+    let initialize = json!({
+        "protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "delivery-restart", "version": "0.1.0"}
+    });
+    let mut first =
+        Proxy::start_program(&installed, &codex_home, &registry, &project, &console, "0");
+    eprintln!(
+        "installed-link regression: initializing {}",
+        root.path().display()
+    );
+    let reply = first.request(1, "initialize", initialize.clone());
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    assert!(symbol_text(&mut first, 2).contains("719"));
+    eprintln!("installed-link regression: first semantic query passed");
+    let anchor = codex_home.join("harness/runtime/serena-broker.json");
+    let before: Value = serde_json::from_slice(&fs::read(&anchor).unwrap()).unwrap();
+
+    fs::remove_file(&installed).unwrap();
+    symlink_file(&next_image, &installed).unwrap();
+    cleanup.crash();
+    eprintln!("installed-link regression: link changed and owned broker exited");
+    let reply = first.request(
+        3,
+        "tools/call",
+        json!({
+            "name": "find_symbol", "arguments": {
+                "relative_path": "src/lib.rs", "name_path_pattern": "shared",
+                "include_body": true
+            }
+        }),
+    );
+    assert_eq!(reply["id"], 3, "{reply}");
+    assert!(
+        reply.get("error").is_none(),
+        "broker restart after delivery: {reply}"
+    );
+    assert!(reply["result"].to_string().contains("719"), "{reply}");
+
+    let mut second =
+        Proxy::start_program(&installed, &codex_home, &registry, &project, &console, "0");
+    let reply = second.request(11, "initialize", initialize);
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let after: Value = serde_json::from_slice(&fs::read(&anchor).unwrap()).unwrap();
+    let generations = after["generations"].as_array().unwrap();
+    assert_eq!(
+        generations.len(),
+        2,
+        "new session must use the new image: {after}"
+    );
+    assert_ne!(generations[0]["source"], generations[1]["source"]);
+    assert_ne!(generations[0]["root"], generations[1]["root"]);
+    assert_eq!(before["generations"][0], generations[0]);
+    assert!(symbol_text(&mut second, 12).contains("719"));
+    assert!(symbol_text(&mut first, 4).contains("719"));
+    first.finish();
+    second.finish();
+    drop(cleanup);
 }

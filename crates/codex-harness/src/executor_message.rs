@@ -60,6 +60,19 @@
 //! lead-message write merges under the receipt lock, so a concurrent request or
 //! answer is never replaced by a stale snapshot.
 //!
+//! A lead message is transmitted only through a live managed endpoint whose
+//! process and thread identity are verified. When a dispatch recorded no
+//! endpoint, a managed resume of that exact thread publishes a registry record
+//! under the originating lead's own home; that record can be resolved without
+//! starting a second server or conversation. No endpoint means an explicit
+//! refusal with the same-thread resume remedy. The installed native queue is
+//! not a send fallback because it dispatches only when the target turn is idle;
+//! an operational message must not wait silently for the current turn. An
+//! earlier queued or indeterminate attempt may still be reconciled from the
+//! lead's stored items, but that read-only path never transmits, never claims
+//! this invocation queued anything, and never permits the same text to be sent
+//! again.
+//!
 //! A completed, stopped, interrupted or unavailable run gets its actual state
 //! with the exact-session `executor resume` remedy, and a surface without a
 //! recorded control endpoint (tui mode, legacy receipts) is reported as
@@ -77,7 +90,7 @@ use super::observation::{
 use super::{
     SessionLease, invalid, lease_path, option_text, read_lease, receipt_binding, receipt_path,
 };
-use harness_core::orchestration_config;
+use harness_core::orchestration_config::{self, worktree_pool_size};
 use harness_core::process::{Cancellation, Deadline, ExclusiveFileLock, ProcessIdentity};
 use harness_core::process_service::{self, ServiceProcess};
 use harness_core::task_succession;
@@ -87,7 +100,7 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     fs, io,
-    io::Write,
+    io::{BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -99,6 +112,13 @@ const CONTROL_BOUND: Duration = Duration::from_secs(20);
 /// before the acceptance answer is reported as queued instead of delivered.
 const EVIDENCE_WINDOW: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(200);
+/// Bounds of one evidence pass over the conversation's own rollout tree: how
+/// many files are visited, how much of a leading metadata row is read, and how
+/// much of the newest tail of one file is read. They bound the observation,
+/// never the message.
+const ROLLOUT_FILES_BOUND: usize = 4096;
+const ROLLOUT_META_PREFIX: u64 = 64 * 1024;
+const ROLLOUT_TAIL_BOUND: u64 = 8 * 1024 * 1024;
 /// The inline delivery bound of one message: what is sent below it is always the
 /// literal text (a file is a correction, not a task re-send), and above it the
 /// shared spill owner delivers the complete payload as a pointer envelope. The
@@ -124,6 +144,10 @@ const STATUS_UNDELIVERED: &str = "undelivered";
 
 struct Request {
     source: PathBuf,
+    /// The target repository whose pool, slot records and receipts address
+    /// this run; it equals `source` unless `--repository` selected an
+    /// independent consuming repository.
+    repository: PathBuf,
     codex_home: PathBuf,
     slot: u32,
     owner: String,
@@ -139,6 +163,7 @@ impl Request {
     fn parse(args: &[OsString]) -> io::Result<Self> {
         let mut source = None;
         let mut codex_home = None;
+        let mut repository = None;
         let mut slot = None;
         let mut owner = None;
         let mut session = None;
@@ -156,6 +181,7 @@ impl Request {
             match key {
                 "--source" => source = Some(PathBuf::from(value)),
                 "--codex-home" => codex_home = Some(PathBuf::from(value)),
+                "--repository" => repository = Some(PathBuf::from(value)),
                 "--slot" => slot = Some(option_text(value)?),
                 "--owner" => owner = Some(option_text(value)?),
                 "--session" => session = Some(option_text(value)?),
@@ -202,6 +228,7 @@ impl Request {
                 &ExplicitAddress {
                     source,
                     codex_home,
+                    repository,
                     slot,
                     owner,
                     session,
@@ -214,10 +241,17 @@ impl Request {
         // then verified exactly as an explicitly typed value is.
         let codex_home = executor_input::codex_home(codex_home)?;
         let source = executor_input::source(source, &codex_home)?;
-        let run =
-            executor_input::resolve_run(&codex_home, &source, slot, owner.as_deref(), "message")?;
+        let repository = repository.unwrap_or_else(|| source.clone());
+        let run = executor_input::resolve_run(
+            &codex_home,
+            &repository,
+            slot,
+            owner.as_deref(),
+            "message",
+        )?;
         Ok(Self {
             source,
+            repository,
             codex_home,
             slot: run.slot,
             owner: run.owner,
@@ -259,10 +293,10 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // bound to the addressed owner, and an explicit --session must be the
     // session the receipt recorded.
     let config = orchestration_config::load(&request.source)?;
-    let layout = task_worktree::pool(&request.source, config.max_concurrent_executors)?;
+    let layout = task_worktree::pool(&request.repository, worktree_pool_size(&config))?;
     layout.slot(request.slot)?;
     let record =
-        task_worktree::load_slot_record(&request.codex_home, &request.source, request.slot)?
+        task_worktree::load_slot_record(&request.codex_home, &request.repository, request.slot)?
             .ok_or_else(|| {
                 invalid(&format!(
                     "slot {} has no recorded session binding; message addresses a dispatched run, so dispatch or resume that session first",
@@ -280,7 +314,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             )));
         }
     }
-    let receipt = receipt_path(&request.codex_home, &request.source, request.slot)?;
+    let receipt = receipt_path(&request.codex_home, &request.repository, request.slot)?;
     let bytes = fs::read(&receipt).map_err(|error| {
         invalid(&format!(
             "executor message needs the dispatch receipt {} to name the exact run: {error}; dispatch `codex-harness executor spawn` first",
@@ -360,7 +394,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             started,
         );
     }
-    let paths = ControlPaths::for_slot(&request.codex_home, &request.source, request.slot)?;
+    let paths = ControlPaths::for_slot(&request.codex_home, &request.repository, request.slot)?;
     let endpoint = match Endpoint::read(&paths.endpoint) {
         Ok(endpoint) => endpoint,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -368,10 +402,11 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 &request,
                 &receipt,
                 format!(
-                    "the run has not recorded its control endpoint yet (state {state}), so its conversation is not addressable; it may still be starting - observe it with `codex-harness executor watch --source {} --codex-home {} --slot {}` and message again once its conversation is recorded",
+                    "the run has not recorded its control endpoint yet (state {state}), so its conversation is not addressable; it may still be starting - observe it with `codex-harness executor watch --source {} --codex-home {} --slot {}{}` and message again once its conversation is recorded",
                     request.source.display(),
                     request.codex_home.display(),
-                    request.slot
+                    request.slot,
+                    executor_input::repository_flag(&request.source, &request.repository)
                 ),
                 &remedy,
                 started,
@@ -399,7 +434,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // it, and the app-server child that serves the conversation.
     let lease = read_lease(&lease_path(
         &request.codex_home,
-        &request.source,
+        &request.repository,
         request.slot,
     )?)
     .filter(|lease| lease.owner == request.owner && lease.index == request.slot);
@@ -468,7 +503,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "the recorded control endpoint names no app-server child, so the address cannot be verified; nothing was delivered",
         ));
     };
-    match ServiceProcess::inspect(
+    match ServiceProcess::inspect_endpoint(
         ProcessIdentity {
             pid: child.pid,
             creation_time: child.creation_time,
@@ -1311,11 +1346,12 @@ fn record_attempt(receipt: &Path, entry: Value) -> io::Result<()> {
 
 fn resume_remedy(request: &Request) -> String {
     format!(
-        "codex-harness executor resume --source {} --codex-home {} --slot {} --owner {}{}",
+        "codex-harness executor resume --source {} --codex-home {} --slot {} --owner {}{}{}",
         request.source.display(),
         request.codex_home.display(),
         request.slot,
         request.owner,
+        executor_input::repository_flag(&request.source, &request.repository),
         match &request.session {
             Some(session) => format!(" --session {session}"),
             None => String::new(),
@@ -1595,7 +1631,7 @@ codex-harness lead message [--text TEXT | --file FILE] [--notify]
   address. The default asks for a reply; --notify does not.
 ";
 
-const PAYLOAD_MARK: &str = "\n---payload---\n";
+pub(crate) const PAYLOAD_MARK: &str = "\n---payload---\n";
 const KIND_REQUEST: &str = "reply-request";
 const KIND_NOTICE: &str = "notification";
 const UNAVAILABLE: &str = "unavailable";
@@ -1611,6 +1647,14 @@ struct SpawnedRun {
     /// The kit home this run's records live under: the owner of the spill
     /// directory a message too large for one conversation input is written to.
     home: PathBuf,
+    /// The originating lead's own kit home, captured with the rest of the
+    /// recorded relationship. The executor's selected home is never assumed
+    /// to be the same: dispatch accepts an explicit `--codex-home`, and the
+    /// managed lead registry and the lead conversation's own stored items are
+    /// read only at this recorded home. `None` when the dispatching process
+    /// could not resolve its native home; recovery then requires a fresh
+    /// dispatch from the resumed lead rather than guessing a home.
+    lead_home: Option<PathBuf>,
     lead_thread: String,
     generation: String,
     owner: String,
@@ -1629,7 +1673,12 @@ struct SpawnedRun {
 /// spawn command legitimately exits after starting the host. A copied marker,
 /// cwd, label, or most recent session is not authority. Delivery uses the
 /// existing app-server owner: `turn/steer` on an active turn and `turn/start`
-/// on an idle thread. No listener is started.
+/// on an idle thread. A lead that never recorded a per-spawn endpoint is
+/// resolved only from the managed registry for the exact recorded thread
+/// under its own recorded home. When no live verified endpoint exists, the
+/// command refuses before composing the envelope, writing a spill, recording
+/// an attempt or creating a reply hold. It never starts the idle-only native
+/// queue, a listener, daemon or second conversation.
 pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!("{LEAD_USAGE}");
@@ -1666,7 +1715,18 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
     {
         return report_recorded_lead_repeat(&run, &id, kind, previous, payload.len());
     }
-    let endpoint = verified_lead_endpoint(&run)?;
+    let route = resolve_lead_route(&run)?;
+    // A missing live endpoint is a definite capability refusal. With no earlier
+    // attempt of this exact text, nothing is composed, spilled, recorded or
+    // started: no header, no spill file, no attempt entry and no reply hold.
+    // An earlier attempt may already be in the lead conversation, so its
+    // identity is still reconciled read-only from that conversation's own
+    // stored items; that path never transmits.
+    if previous.is_none()
+        && let LeadRoute::Unavailable { reason } = &route
+    {
+        return Err(endpoint_unavailable(&run, reason));
+    }
     let reply = if input.notify {
         "not-requested".to_owned()
     } else {
@@ -1705,7 +1765,19 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
         payload: &payload,
         spill: delivery.spill.as_ref(),
     };
-    deliver_to_recorded_lead(&run, &endpoint, &message, previous.as_ref())
+    match &route {
+        LeadRoute::Endpoint(endpoint) => {
+            deliver_to_recorded_lead(&run, endpoint, &message, previous.as_ref())
+        }
+        LeadRoute::Unavailable { reason } => {
+            let previous = previous.as_ref().ok_or_else(|| {
+                invalid(
+                    "no verified lead endpoint is available; nothing was sent and nothing was recorded",
+                )
+            })?;
+            reconcile_unavailable_lead(&run, &message, previous, reason)
+        }
+    }
 }
 
 fn parse_lead_input(args: &[OsString]) -> io::Result<LeadInput> {
@@ -1834,6 +1906,7 @@ fn resolve_spawned_run() -> io::Result<SpawnedRun> {
     Ok(SpawnedRun {
         receipt,
         home: PathBuf::from(&home),
+        lead_home: lead.home,
         lead_thread: lead.thread_id,
         generation: lead.run_generation,
         owner: registered_text(&value["slot"]["owner"]),
@@ -1854,7 +1927,7 @@ fn registered_text(value: &Value) -> String {
         .to_owned()
 }
 
-fn matching_receipts(home: &Path, marker: &str) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn matching_receipts(home: &Path, marker: &str) -> io::Result<Vec<PathBuf>> {
     let root = home.join("harness/executor-pool");
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -1913,6 +1986,35 @@ fn require_live(pid: u32, created: u64, program: &Path, reason: &str) -> io::Res
         ))
     })?;
     match ServiceProcess::inspect(
+        ProcessIdentity {
+            pid,
+            creation_time: created,
+        },
+        program,
+        &user,
+    ) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(invalid(&format!("{reason}; refusing before any send"))),
+        Err(error) => Err(invalid(&format!(
+            "{reason}: {error}; refusing before any send"
+        ))),
+    }
+}
+
+/// Endpoint records may predate spawn-time image resolution. Their exact
+/// process and thread still have to match; the narrower sibling-build alias
+/// recovery lives in the process owner, while host lineage keeps the strict
+/// check above.
+fn require_live_endpoint(pid: u32, created: u64, program: &Path, reason: &str) -> io::Result<()> {
+    if pid == 0 || created == 0 || !program.is_file() {
+        return Err(invalid(&format!("{reason}; refusing before any send")));
+    }
+    let user = process_service::current_user().map_err(|error| {
+        invalid(&format!(
+            "{reason}: the caller account is unavailable: {error}; refusing before any send"
+        ))
+    })?;
+    match ServiceProcess::inspect_endpoint(
         ProcessIdentity {
             pid,
             creation_time: created,
@@ -2005,57 +2107,142 @@ fn parent_process_id(pid: u32) -> Option<u32> {
     u32::try_from(basic.inherited_from_unique_process_id).ok()
 }
 
-fn verified_lead_endpoint(run: &SpawnedRun) -> io::Result<Endpoint> {
+/// The verified delivery route of one run's originating lead: a live managed
+/// endpoint recorded beside this spawn, or the live registry record published
+/// when that exact thread was resumed through the managed lifecycle. A
+/// recorded endpoint that is malformed, mismatched or stale fails closed and
+/// is never replaced by another address. No live route is an explicit
+/// capability refusal; there is no idle-only queue fallback.
+enum LeadRoute {
+    Endpoint(Endpoint),
+    Unavailable { reason: String },
+}
+
+fn resolve_lead_route(run: &SpawnedRun) -> io::Result<LeadRoute> {
     let path = run
         .receipt
         .parent()
-        .ok_or_else(|| fresh_launch(&run.lead_thread, "the receipt has no directory"))?
+        .ok_or_else(|| {
+            invalid(
+                "the dispatch receipt has no directory, so the exact lead endpoint inherited for this spawn cannot be located; nothing was sent",
+            )
+        })?
         .join(format!("lead-endpoint-{}.json", run.slot));
-    let endpoint = match Endpoint::read(&path) {
-        Ok(endpoint) => endpoint,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(fresh_launch(
-                &run.lead_thread,
-                "no lead-endpoint record exists beside the spawn receipt",
-            ));
-        }
-        Err(error) => {
-            return Err(invalid(&format!(
-                "recorded lead endpoint {} is not usable: {error}; nothing was sent and no daemon, listener, or second conversation was started",
+    match Endpoint::read(&path) {
+        Ok(endpoint) => verify_lead_endpoint(run, endpoint),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => resolve_registered_lead(run),
+        Err(error) => Err(stale_endpoint_refusal(
+            run,
+            &format!(
+                "the recorded lead endpoint {} is not usable: {error}",
                 path.display()
-            )));
-        }
+            ),
+        )),
+    }
+}
+
+/// A missing per-spawn endpoint may be recovered only from the registry
+/// published for the exact recorded lead thread under the originating lead's
+/// own recorded home. The registry is read through the same fail-closed
+/// resolver used by managed lifecycle code, which verifies the record's thread
+/// and the recorded app-server process. The executor's own home and the
+/// most-recent-session environment are never consulted.
+fn resolve_registered_lead(run: &SpawnedRun) -> io::Result<LeadRoute> {
+    let Some(lead_home) = run.lead_home.as_deref() else {
+        return Ok(LeadRoute::Unavailable {
+            reason: "no endpoint was inherited beside the spawn receipt, and dispatch recorded no originating lead home from which the exact thread's managed registry could be read".to_owned(),
+        });
     };
+    match control::registered_lead(lead_home, &run.lead_thread) {
+        control::RegisteredLead::Live(endpoint) => verify_lead_endpoint(run, *endpoint),
+        control::RegisteredLead::Unavailable(cause) => Ok(LeadRoute::Unavailable {
+            reason: format!(
+                "no endpoint was inherited beside the spawn receipt, and the recorded originating lead home {} has no live registered endpoint for this exact thread ({cause})",
+                lead_home.display()
+            ),
+        }),
+    }
+}
+
+/// One recorded managed endpoint, verified as the address of the exact
+/// originating thread before any send. A mismatched, incomplete or stale
+/// per-spawn record fails closed; the command never substitutes a later
+/// registry record for an address the dispatch already recorded.
+fn verify_lead_endpoint(run: &SpawnedRun, endpoint: Endpoint) -> io::Result<LeadRoute> {
     if endpoint.thread_id.as_deref() != Some(run.lead_thread.as_str()) {
-        return Err(invalid(&format!(
-            "recorded lead endpoint names a different thread than originating lead {}; refusing before any send",
-            run.lead_thread
-        )));
+        return Err(stale_endpoint_refusal(
+            run,
+            &format!(
+                "the recorded lead endpoint names a different thread than originating lead {}",
+                run.lead_thread
+            ),
+        ));
     }
     let Some(process) = endpoint.process.as_ref() else {
-        return Err(fresh_launch(
-            &run.lead_thread,
-            "the endpoint record names no process",
+        return Err(stale_endpoint_refusal(
+            run,
+            "the recorded endpoint names no process",
         ));
     };
-    require_live(
+    require_live_endpoint(
         process.pid,
         process.creation_time,
         &process.program,
-        "no verified lead endpoint is recorded: its process is not live",
+        "the recorded lead endpoint process is not live",
     )
-    .map_err(|_| {
-        fresh_launch(
-            &run.lead_thread,
-            "the recorded endpoint process is not live",
-        )
-    })?;
-    Ok(endpoint)
+    .map_err(|_| stale_endpoint_refusal(run, "the recorded endpoint process is not live"))?;
+    Ok(LeadRoute::Endpoint(endpoint))
 }
 
-fn fresh_launch(thread: &str, reason: &str) -> io::Error {
+/// The supported same-thread resume command for the originating lead. The
+/// source and home are the relationship recorded at dispatch; neither is
+/// inferred from the executor's current environment.
+fn managed_resume_command(run: &SpawnedRun) -> String {
+    let literal = |value: String| format!("'{}'", value.replace('\'', "''"));
+    match run.lead_home.as_deref() {
+        Some(home) => format!(
+            "codex-harness lead start --source {} --codex-home {} --session {}",
+            literal(run.checkout.clone()),
+            literal(home.display().to_string()),
+            literal(run.lead_thread.clone())
+        ),
+        None => format!(
+            "codex-harness lead start --session {}",
+            literal(run.lead_thread.clone())
+        ),
+    }
+}
+
+/// A missing live endpoint is an explicit capability refusal made before any
+/// header, spill file, attempt record or child process. The remedy preserves
+/// the exact registered lead thread instead of suggesting a new conversation.
+fn endpoint_unavailable(run: &SpawnedRun, reason: &str) -> io::Error {
+    let next = if run.lead_home.is_some() {
+        format!(
+            "have the originating lead resume that same thread in its own terminal with `{}`, which publishes a verified endpoint for this exact thread, then repeat this message; an existing queued or indeterminate attempt is reconciled before any new send",
+            managed_resume_command(run)
+        )
+    } else {
+        format!(
+            "resume that exact thread from the lead's own installed kit home with `{}`, then dispatch this executor again so the new receipt records that home",
+            managed_resume_command(run)
+        )
+    };
     invalid(&format!(
-        "no verified lead endpoint is recorded for originating lead thread {thread}: {reason}. Ordinary leads expose no delivery endpoint. This command does not start a daemon, listener, or second conversation. Next action: fresh-launch the lead session so this same thread records a verified app-server endpoint, then dispatch the executor again. Nothing was sent"
+        "no verified lead endpoint is available for originating lead thread {}: {reason}. Nothing was sent and no request or reply hold was recorded. The installed native queue was not started because its queue operation dispatches only when the lead turn is idle and cannot deliver this operational message now. Next action: {next}",
+        run.lead_thread
+    ))
+}
+
+/// An endpoint record that exists but cannot name the live originating thread
+/// fails closed. Silently replacing it with a later registry address or the
+/// native queue would change the route after dispatch; a fresh dispatch is
+/// required to inherit the resumed session's verified endpoint.
+fn stale_endpoint_refusal(run: &SpawnedRun, reason: &str) -> io::Error {
+    invalid(&format!(
+        "no verified lead endpoint is available for originating lead thread {}: {reason}. Nothing was sent, no request or reply hold was recorded, and no listener, second conversation, alternate registry address, or native queue was started. Next action: have the originating lead resume the same thread in its own terminal with `{}`, then dispatch this executor again so the new run inherits its verified endpoint; an existing queued or indeterminate attempt stays recorded for reconciliation",
+        run.lead_thread,
+        managed_resume_command(run)
     ))
 }
 
@@ -2618,11 +2805,301 @@ fn deliver_to_recorded_lead(
     )
 }
 
+/// A repeat of an earlier attempt while no live endpoint exists is reconciled
+/// read-only from the addressed lead conversation's own stored items. Observed
+/// evidence upgrades the recorded attempt to delivered; an attempt the native
+/// transport already accepted stays one queued input; a pending or
+/// indeterminate attempt stays unresolved under its own identity. Nothing is
+/// transmitted and the installed native queue is never started, so this
+/// invocation cannot claim that it queued anything. The exact recorded attempt
+/// id and its content are preserved, so a later recovery of the same thread
+/// reconciles the same identity instead of sending a second copy.
+fn reconcile_unavailable_lead(
+    run: &SpawnedRun,
+    message: &LeadMessage<'_>,
+    previous: &Value,
+    reason: &str,
+) -> io::Result<i32> {
+    let status = recorded_status(previous).to_owned();
+    let method = previous["method"].as_str().unwrap_or_default().to_owned();
+    let attempts = previous["attempts"].as_u64().unwrap_or(0);
+    let detail = previous["detail"].as_str().unwrap_or_default().to_owned();
+    if status == STATUS_DELIVERED {
+        return report_recorded_lead_repeat(
+            run,
+            message.id,
+            message.kind,
+            previous,
+            message.payload.len(),
+        );
+    }
+    // The lead home was captured with the relationship; when the dispatching
+    // process recorded none, the conversation's own items cannot be read at
+    // this address, and the held attempt is reported from its own record
+    // instead of being upgraded.
+    let evidence = run.lead_home.as_deref().and_then(|lead_home| {
+        ordinary_input_evidence(
+            lead_home,
+            &run.lead_thread,
+            message.id,
+            message.envelope,
+            Instant::now() + EVIDENCE_WINDOW,
+        )
+    });
+    if let Some(evidence) = evidence {
+        let attempt = LeadAttempt {
+            status: STATUS_DELIVERED,
+            method,
+            attempts,
+            detail: format!(
+                "the input is in the lead conversation's own stored items ({evidence}); the recorded attempt was upgraded from {status} by that evidence, and whether the lead applied it is the lead's own report"
+            ),
+        };
+        record_lead_message(run, message, &attempt)?;
+        return report_lead_message(
+            run,
+            message.id,
+            message.kind,
+            &attempt,
+            message.payload.len(),
+            message.spill,
+            Some(
+                "nothing was sent: the earlier attempt is in the lead conversation, so the same words cannot be delivered twice".to_owned(),
+            ),
+        );
+    }
+    match status.as_str() {
+        STATUS_QUEUED => {
+            let attempt = LeadAttempt {
+                status: STATUS_QUEUED,
+                method,
+                attempts,
+                detail,
+            };
+            report_lead_message(
+                run,
+                message.id,
+                message.kind,
+                &attempt,
+                message.payload.len(),
+                message.spill,
+                Some(format!(
+                    "nothing was sent again: the native transport accepted the earlier attempt, which is one input for the lead conversation, so the same words cannot be delivered twice. The recorded request stands; answer or stop it explicitly. No live verified lead endpoint is available now ({reason}); the installed native queue was not started because its queue operation dispatches only when the lead turn is idle"
+                )),
+            )
+        }
+        // A pending attempt stopped before its outcome was recorded, and an
+        // indeterminate one lost its answer: both may or may not have reached
+        // the lead, so the recorded identity stays unresolved and the repeat is
+        // refused rather than risking a second copy.
+        _ => {
+            let detail = format!(
+                "the earlier attempt ({method}) is recorded as {status} and the lead conversation's own stored items do not show it, so whether it reached the lead is unknown. No live verified lead endpoint is available now ({reason}), so nothing was sent by this invocation; the installed native queue was not started because its queue operation dispatches only when the lead turn is idle"
+            );
+            let attempt = LeadAttempt {
+                status: STATUS_INDETERMINATE,
+                method,
+                attempts,
+                detail,
+            };
+            record_lead_message(run, message, &attempt)?;
+            report_lead_message(
+                run,
+                message.id,
+                message.kind,
+                &attempt,
+                message.payload.len(),
+                message.spill,
+                Some(
+                    "nothing was sent again: an earlier attempt of this exact text may already be in the lead conversation, so a repeat could deliver it twice. Next action: inspect the lead conversation; if the words are genuinely absent, send them again with a distinguishing first line".to_owned(),
+                ),
+            )
+        }
+    }
+}
+
+/// The addressed ordinary conversation's own stored evidence of one input: the
+/// user message row carrying this exact envelope, in a rollout whose own
+/// session metadata names the exact lead thread. A filename, transcript,
+/// rendered text, exit status or process state is never identity or delivery.
+/// The search is bounded to the given instant and to its own read bounds; a
+/// scan that finds nothing within them reports absence instead of blocking.
+fn ordinary_input_evidence(
+    home: &Path,
+    thread: &str,
+    id: &str,
+    envelope: &str,
+    until: Instant,
+) -> Option<String> {
+    loop {
+        if let Some(detail) = session_input_row(&home.join("sessions"), thread, id, envelope) {
+            return Some(detail);
+        }
+        let now = Instant::now();
+        if now >= until {
+            return None;
+        }
+        thread::sleep(POLL.min(until - now));
+    }
+}
+
+/// One pass over the conversation's own rollout tree: a file's own session
+/// metadata must name the exact thread before any row of it is considered,
+/// and the newest files are read first because a just-submitted input is
+/// appended at the end of its rollout.
+fn session_input_row(sessions: &Path, thread: &str, id: &str, envelope: &str) -> Option<String> {
+    let mut files = Vec::new();
+    collect_rollouts(sessions, &mut files, 0);
+    files.sort();
+    for file in files.into_iter().rev() {
+        // A rollout filename carries its own conversation id, so the name
+        // narrows the candidates cheaply; it is never identity by itself: the
+        // file's own session metadata must still name the exact thread.
+        if !rollout_name_names(&file, thread) {
+            continue;
+        }
+        if rollout_session(&file).as_deref() != Some(thread) {
+            continue;
+        }
+        if rollout_carries_input(&file, id, envelope) {
+            return Some(file.display().to_string());
+        }
+    }
+    None
+}
+
+/// Whether one rollout file's own name follows the native convention and
+/// carries the thread id as a substring, the same narrowing the existing
+/// successor locator uses. This only selects candidates for the metadata
+/// check that follows; it is never identity.
+fn rollout_name_names(file: &Path, thread: &str) -> bool {
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.contains(thread))
+}
+
+/// Collects the rollout files under one sessions tree, bounded in count and
+/// depth so one evidence pass visits a bounded tree.
+fn collect_rollouts(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 8 || files.len() >= ROLLOUT_FILES_BOUND {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollouts(&path, files, depth + 1);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            files.push(path);
+        }
+        if files.len() >= ROLLOUT_FILES_BOUND {
+            return;
+        }
+    }
+}
+
+/// The conversation identity one rollout file's own metadata records, from its
+/// leading rows only. The filename is never consulted.
+fn rollout_session(file: &Path) -> Option<String> {
+    // The take bound caps the reader itself, so no single metadata line can
+    // allocate past the prefix this pass is allowed to read.
+    let mut reader = BufReader::new(fs::File::open(file).ok()?.take(ROLLOUT_META_PREFIX));
+    let mut line = String::new();
+    let mut read = 0u64;
+    loop {
+        line.clear();
+        let count = reader.read_line(&mut line).ok()?;
+        if count == 0 {
+            return None;
+        }
+        read += count as u64;
+        if line.contains("session_meta")
+            && let Ok(row) = serde_json::from_str::<Value>(&line)
+            && row["type"] == "session_meta"
+        {
+            let session = row["payload"]["id"]
+                .as_str()
+                .or_else(|| row["payload"]["session_id"].as_str());
+            if let Some(session) = session {
+                return Some(session.to_owned());
+            }
+        }
+        if read >= ROLLOUT_META_PREFIX {
+            return None;
+        }
+    }
+}
+
+/// Whether one rollout file holds the stored user message row carrying this
+/// exact envelope at its newest end. The read starts at a bounded distance
+/// from the end because a just-submitted input is appended there; a partial
+/// first line is simply not parseable and is skipped.
+fn rollout_carries_input(file: &Path, id: &str, envelope: &str) -> bool {
+    let Ok(mut handle) = fs::File::open(file) else {
+        return false;
+    };
+    let length = handle.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = length.saturating_sub(ROLLOUT_TAIL_BOUND);
+    if start > 0 && handle.seek(io::SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    // The take bound caps the read itself, so a file that keeps growing while
+    // this pass reads it cannot extend the pass beyond its own bound.
+    let mut reader = BufReader::new(handle.take(ROLLOUT_TAIL_BOUND));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let Ok(count) = reader.read_line(&mut line) else {
+            return false;
+        };
+        if count == 0 {
+            return false;
+        }
+        if !line.contains(id) {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if user_row_text(&row).is_some_and(|text| text.contains(envelope)) {
+            return true;
+        }
+    }
+}
+
+/// The visible text of one stored user message row, when that row is a user
+/// message; any other row shape is not delivery evidence.
+fn user_row_text(row: &Value) -> Option<String> {
+    if row["type"] != "response_item"
+        || row["payload"]["type"] != "message"
+        || row["payload"]["role"] != "user"
+    {
+        return None;
+    }
+    if let Some(text) = row["payload"]["content"].as_str() {
+        return Some(text.to_owned());
+    }
+    let parts = row["payload"]["content"].as_array()?;
+    let mut text = String::new();
+    for part in parts {
+        if let Some(part) = part["text"].as_str() {
+            text.push_str(part);
+        }
+    }
+    Some(text)
+}
+
 /// Address fields supplied beside `--reply-to`. A present field that does not
 /// name the resolved run is a contradiction and is refused before delivery.
 struct ExplicitAddress {
     source: Option<PathBuf>,
     codex_home: Option<PathBuf>,
+    repository: Option<PathBuf>,
     slot: Option<u32>,
     owner: Option<String>,
     session: Option<String>,
@@ -2654,11 +3131,13 @@ fn retired_reply(id: &str) -> io::Error {
 /// nothing, so the refusal names that run's own recorded state and the
 /// supported continuation instead of leaving the lead to guess or address a
 /// replacement conversation.
+#[allow(clippy::too_many_arguments)]
 fn retired_reply_after_end(
     id: &str,
     state: &str,
     home: &Path,
     source: Option<&str>,
+    repository: Option<&str>,
     slot: Option<u64>,
     owner: Option<&str>,
     session: Option<&str>,
@@ -2673,8 +3152,12 @@ fn retired_reply_after_end(
                 }
             ),
             format!(
-                "`codex-harness executor resume --source {source} --codex-home {} --slot {slot} --owner {owner}{}` continues that exact recorded session",
+                "`codex-harness executor resume --source {source} --codex-home {} --slot {slot} --owner {owner}{}{}` continues that exact recorded session",
                 home.display(),
+                repository
+                    .filter(|repository| !source.eq_ignore_ascii_case(repository))
+                    .map(|repository| format!(" --repository {repository}"))
+                    .unwrap_or_default(),
                 match session {
                     Some(session) => format!(" --session {session}"),
                     None => String::new(),
@@ -2801,6 +3284,10 @@ fn reject_contradictory(explicit: &ExplicitAddress, request: &Request) -> io::Re
         .source
         .as_deref()
         .is_some_and(|path| addresses_differ(path, &request.source));
+    let repository = explicit
+        .repository
+        .as_deref()
+        .is_some_and(|path| addresses_differ(path, &request.repository));
     let home = explicit
         .codex_home
         .as_deref()
@@ -2814,7 +3301,7 @@ fn reject_contradictory(explicit: &ExplicitAddress, request: &Request) -> io::Re
         .session
         .as_deref()
         .is_some_and(|session| Some(session) != request.session.as_deref());
-    if source || home || slot || owner || session {
+    if source || repository || home || slot || owner || session {
         return Err(invalid(
             "contradictory explicit address mixed with --reply-to; refusing before any send",
         ));
@@ -2876,6 +3363,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
             state,
             &home,
             value["slot"]["source"].as_str(),
+            value["slot"]["repository"].as_str(),
             value["slot"]["index"].as_u64(),
             value["slot"]["owner"].as_str(),
             value["observation"]["session"].as_str(),
@@ -2887,6 +3375,13 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
             .as_str()
             .ok_or_else(|| retired_reply(id))?,
     );
+    // The receipt records where the run's pool lives; a receipt written before
+    // the configuration-source split records its single checkout in `source`,
+    // which was both roles.
+    let repository = value["slot"]["repository"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| source.clone());
     let worktree = PathBuf::from(value["slot"]["path"].as_str().unwrap_or(""));
     let slot = u32::try_from(
         value["slot"]["index"]
@@ -2911,7 +3406,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
             "reused slot {slot} or generation cannot receive reply {id}; refusing before any send"
         )));
     }
-    let record = task_worktree::load_slot_record(&home, &source, slot).map_err(|error| {
+    let record = task_worktree::load_slot_record(&home, &repository, slot).map_err(|error| {
         invalid(&format!(
             "reused slot {slot} cannot receive reply {id}: {error}; refusing before any send"
         ))
@@ -2923,7 +3418,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
     };
     if record.index != slot
         || record.owner.as_deref() != Some(owner.as_str())
-        || addresses_differ(&record.source, &source)
+        || addresses_differ(&record.source, &repository)
         || addresses_differ(&record.path, &worktree)
     {
         return Err(invalid(&format!(
@@ -2932,6 +3427,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
     }
     let request = Request {
         source,
+        repository,
         codex_home: home,
         slot,
         owner,
@@ -2979,10 +3475,11 @@ fn report_indeterminate(
     write_spill_detail(&mut out, recorded_spill(previous).as_ref())?;
     writeln!(
         out,
-        "next action: inspect the conversation (the run's own tab, or `codex-harness executor watch --source {} --codex-home {} --slot {}`); if the input is genuinely absent, send the correction again with a distinguishing first line, or continue the exact session with `{remedy}`",
+        "next action: inspect the conversation (the run's own tab, or `codex-harness executor watch --source {} --codex-home {} --slot {}{}`); if the input is genuinely absent, send the correction again with a distinguishing first line, or continue the exact session with `{remedy}`",
         request.source.display(),
         request.codex_home.display(),
-        request.slot
+        request.slot,
+        executor_input::repository_flag(&request.source, &request.repository)
     )?;
     writeln!(out, "receipt: {}", receipt.display())?;
     Ok(1)

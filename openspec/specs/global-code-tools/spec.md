@@ -168,6 +168,21 @@ and SDK information SHALL NOT be rewritten.
 - **WHEN** an observed executable or prerequisite is modified while its recorded paths still exist
 - **THEN** startup checks only that the recorded paths exist and does not claim content integrity; the observed fingerprints remain the recorded identity
 
+### Requirement: Pascal startup avoids redundant eager source loading
+
+Managed Pascal startup SHALL serve working-source semantic requests without
+eagerly loading build copies excluded by Serena merely to initialize a second
+workspace symbol index. Serena symbol search, document symbols, bodies, semantic
+edits and cross-unit navigation SHALL remain available through the adopted backend.
+
+#### Scenario: Build copies accumulate between sessions
+- **WHEN** a Pascal project contains excluded generated source copies and a new managed worker serves a semantic request
+- **THEN** startup does not load those copies into a redundant workspace symbol index and returns the requested working-source symbols
+
+#### Scenario: Navigation and editing after startup
+- **WHEN** a managed session searches working Pascal units, follows a cross-unit relationship and edits an owned fixture symbol
+- **THEN** the expected units and symbol bodies are returned and the edit is confirmed by semantic and disk readback
+
 ### Requirement: Workspace and session isolation
 
 Project-sensitive calls, language-server state and diagnostics SHALL be bound
@@ -448,3 +463,15 @@ The broker's aggregate committed-memory allowance SHALL include the service allo
 #### Scenario: Resource bound is updated
 - **WHEN** the broker configures its aggregate allowance before starting workers
 - **THEN** the actual native limit matches the computed allowance and CPU, kill-on-close and handle-inheritance settings remain intact
+
+### Requirement: Open Serena sessions retain their manager generation
+
+An open managed Serena session SHALL retain a consistent manager generation for broker identity and launch after an installation update. A subsequent broker restart SHALL preserve the session's selected project and response identity without launching a different build through a changed installation link. Existing integrity, ownership and bounded recovery checks SHALL remain effective.
+
+#### Scenario: Installed manager link changes before broker restart
+- **WHEN** the installed manager link changes while a Serena session remains open and its broker later exits
+- **THEN** the next symbol query returns the selected project's symbol body with its original request id using the session's retained manager generation
+
+#### Scenario: New session after delivery
+- **WHEN** a new Serena session starts through the updated installation link
+- **THEN** it uses the newly installed manager generation without replacing the older session's live broker

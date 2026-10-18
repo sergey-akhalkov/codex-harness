@@ -21,7 +21,7 @@ use super::{
     SessionLease, invalid, lease_path, option_text, parse_seconds, read_lease, receipt_binding,
     receipt_path,
 };
-use harness_core::orchestration_config;
+use harness_core::orchestration_config::{self, worktree_pool_size};
 use harness_core::process::{Deadline, ProcessIdentity};
 use harness_core::process_service::{self, ServiceProcess};
 use harness_core::task_control::ControlConnection;
@@ -54,6 +54,10 @@ const MEMBER_LIMIT: usize = 512;
 
 struct Request {
     source: PathBuf,
+    /// The target repository whose pool, slot records and receipts address
+    /// this run; it equals `source` unless `--repository` selected an
+    /// independent consuming repository.
+    repository: PathBuf,
     codex_home: PathBuf,
     slot: u32,
     owner: String,
@@ -65,6 +69,7 @@ impl Request {
     fn parse(args: &[OsString]) -> io::Result<Self> {
         let mut source = None;
         let mut codex_home = None;
+        let mut repository = None;
         let mut slot = None;
         let mut owner = None;
         let mut session = None;
@@ -80,6 +85,7 @@ impl Request {
             match key {
                 "--source" => source = Some(PathBuf::from(value)),
                 "--codex-home" => codex_home = Some(PathBuf::from(value)),
+                "--repository" => repository = Some(PathBuf::from(value)),
                 "--slot" => slot = Some(option_text(value)?),
                 "--owner" => owner = Some(option_text(value)?),
                 "--session" => session = Some(option_text(value)?),
@@ -93,6 +99,7 @@ impl Request {
         // and then verified exactly as an explicitly typed value is.
         let codex_home = executor_input::codex_home(codex_home)?;
         let source = executor_input::source(source, &codex_home)?;
+        let repository = repository.unwrap_or_else(|| source.clone());
         let slot = slot
             .map(|slot| {
                 slot.parse::<u32>()
@@ -100,9 +107,10 @@ impl Request {
             })
             .transpose()?;
         let run =
-            executor_input::resolve_run(&codex_home, &source, slot, owner.as_deref(), "stop")?;
+            executor_input::resolve_run(&codex_home, &repository, slot, owner.as_deref(), "stop")?;
         Ok(Self {
             source,
+            repository,
             codex_home,
             slot: run.slot,
             owner: run.owner,
@@ -119,10 +127,10 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // Address one recorded run: the slot must be bound to the addressed owner,
     // and an explicit --session must be the session the receipt recorded.
     let config = orchestration_config::load(&request.source)?;
-    let layout = task_worktree::pool(&request.source, config.max_concurrent_executors)?;
+    let layout = task_worktree::pool(&request.repository, worktree_pool_size(&config))?;
     layout.slot(request.slot)?;
     let record =
-        task_worktree::load_slot_record(&request.codex_home, &request.source, request.slot)?
+        task_worktree::load_slot_record(&request.codex_home, &request.repository, request.slot)?
             .ok_or_else(|| {
                 invalid(&format!(
                     "slot {} has no recorded session binding; stop addresses a dispatched run, so dispatch or resume that session first",
@@ -140,7 +148,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             )));
         }
     }
-    let receipt = receipt_path(&request.codex_home, &request.source, request.slot)?;
+    let receipt = receipt_path(&request.codex_home, &request.repository, request.slot)?;
     let bytes = fs::read(&receipt).map_err(|error| {
         invalid(&format!(
             "executor stop needs the dispatch receipt {} to name the exact run: {error}; dispatch `codex-harness executor spawn` first",
@@ -243,7 +251,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // exist, because a disagreement means the address no longer names one run.
     let lease = read_lease(&lease_path(
         &request.codex_home,
-        &request.source,
+        &request.repository,
         request.slot,
     )?)
     .filter(|lease| lease.owner == request.owner && lease.index == request.slot);
@@ -587,11 +595,12 @@ fn finish(
         request.slot, request.owner
     );
     println!(
-        "continue: codex-harness executor resume --source {} --codex-home {} --slot {} --owner {}{}",
+        "continue: codex-harness executor resume --source {} --codex-home {} --slot {} --owner {}{}{}",
         request.source.display(),
         request.codex_home.display(),
         request.slot,
         request.owner,
+        executor_input::repository_flag(&request.source, &request.repository),
         match &request.session {
             Some(session) => format!(" --session {session}"),
             None => String::new(),

@@ -7,17 +7,16 @@ schema = 1
 lead_profile = "default"
 successor_lead_profile = "default"
 executor_profiles = ["ds"]
-# Also sizes the harness-owned executor worktree pool: dispatch creates,
-# synchronizes and binds sibling slots `<repository-name>-wt1` .. `-wtN`, and
-# refuses dispatch when all are held by live sessions instead of allocating
-# another tree.
+# Active executor runs allowed at once. Held ordinary, experiment, review and
+# executor tasks consume the independent managed pool capacity below.
 max_concurrent_executors = 4
+# Managed worktree capacity, separate from active executor admission. Positions
+# are created lazily and reused; a full pool refuses overflow.
+worktree_pool_size = 4
 # Promote an incubator item after more than two distinct votes (threshold 3).
 vote_threshold = 3
 incubator_size_cap = 32
 feedback_batch_limit = 8
-# Superseded by the pool size above (`max_concurrent_executors`). Accepted for
-# compatibility with existing installations; dispatch no longer warns at this
-# threshold because the pool invariant bounds the worktree count by
-# construction.
+# Compatibility-only warning limit. It does not size the managed pool;
+# worktree_pool_size enforces the hard capacity.
 worktree_limit = 6

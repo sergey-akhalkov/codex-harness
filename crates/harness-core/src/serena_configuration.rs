@@ -107,6 +107,10 @@ pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Val
             let source = required_directory(paths["fpc_source"].as_str(), "FPC source directory")?;
             setting["pp"] = json!(fpc.to_string_lossy().into_owned());
             setting["fpcdir"] = json!(source.to_string_lossy().into_owned());
+            // Serena indexes eligible files through documentSymbol itself.
+            // pasls's separate eager workspace index ignores those exclusions
+            // and can exhaust memory on accumulated build copies at initialize.
+            setting["initializationOptions"] = json!({"workspaceSymbols": false});
         }
         if serena_id == "csharp" {
             // Roslyn resolves its dependency provider before using ls_base_cmd.
@@ -364,6 +368,10 @@ fn render(settings: &BTreeMap<String, Value>) -> String {
                     item.as_str().unwrap_or_default()
                 ));
             }
+        }
+        // JSON flow mappings are valid YAML and preserve scalar types/escaping.
+        if let Some(options) = value.get("initializationOptions") {
+            text.push_str(&format!("    initializationOptions: {options}\n"));
         }
         // Backend settings such as the pasls CodeTools inputs stay plain
         // scalars next to the explicit launch command.

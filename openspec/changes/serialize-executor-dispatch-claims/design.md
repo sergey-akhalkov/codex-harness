@@ -75,3 +75,12 @@ existing pool guidance with observed startup contention/recovery behavior.
 Only supported benefit and applicable integration/publication authority may
 advance an experimental baseline or live installation. Rejection retains useful
 artifacts without synchronizing the unadopted requirement delta into main specs.
+
+Reconciled 2026-10-14: the mechanism this design selected - the existing pool
+admission guard plus a process startup reservation held until the host lease -
+is already integrated through `unify-reusable-worktree-pool` task 2.2, with the
+failing pre-correction control and the corrected deterministic gate checks
+retained there. This design remains the specification of the independent
+experiment: its frozen checker, unchanged/corrected/interrupted controls and
+parent accounting have not run, so the delta is not adopted and this change
+stays open.

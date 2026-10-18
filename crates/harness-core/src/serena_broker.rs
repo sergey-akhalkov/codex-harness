@@ -105,13 +105,13 @@ fn serena_rpc_recoverable(error: &io::Error) -> bool {
     text.contains("tree cleanup was not confirmed") || text.contains("route echo is incomplete")
 }
 
-pub fn source(configuration: &Configuration) -> io::Result<String> {
+fn source(configuration: &Configuration, manager: &Path) -> io::Result<String> {
     let serena_home =
         crate::serena_configuration::prepare(&configuration.registry, &configuration.codex_home)?;
     Ok(build_identity::hash_bytes(
         serde_json::to_string(&json!({
             "protocol":"coding-agents-harness/serena-broker/v1",
-            "manager":build_identity::hash_file(&std::env::current_exe()?)?,
+            "manager":build_identity::hash_file(manager)?,
             "serena":build_identity::hash_file(&configuration.serena)?,
             "registry":build_identity::hash_file(&configuration.registry)?,
             "resources":build_identity::hash_file(
@@ -249,6 +249,7 @@ pub fn root(
 
 pub struct Client {
     configuration: Configuration,
+    program: PathBuf,
     root: Mutex<PathBuf>,
     source: String,
     client: String,
@@ -260,7 +261,10 @@ impl Client {
         deadline: Deadline,
         cancel: &Cancellation,
     ) -> io::Result<Self> {
-        let source = source(&configuration)?;
+        // Installation links can move while this conversation remains open.
+        // Identity and every later launch must use the same immutable image.
+        let program = std::env::current_exe()?.canonicalize()?;
+        let source = source(&configuration, &program)?;
         let root = root(&configuration.codex_home, &source, deadline, cancel)?;
         let key = crate::broker_endpoint::random_key()?;
         // The pool's client identities are 32 hex characters, matching the
@@ -268,6 +272,7 @@ impl Client {
         let client = key[..32].to_owned();
         Ok(Self {
             configuration,
+            program,
             root: Mutex::new(root),
             source,
             client,
@@ -359,7 +364,7 @@ impl Client {
         let mut location = self.location()?;
         let endpoint = match broker_launch::ensure(
             &BrokerRoot::open(&location)?,
-            &std::env::current_exe()?,
+            &self.program,
             arguments.clone(),
             environment.clone(),
             &self.source,
@@ -375,7 +380,7 @@ impl Client {
                 self.relocate(&location)?;
                 broker_launch::ensure(
                     &BrokerRoot::open(&location)?,
-                    &std::env::current_exe()?,
+                    &self.program,
                     arguments.clone(),
                     environment.clone(),
                     &self.source,
@@ -633,7 +638,7 @@ pub fn serve(
     expected: &str,
     configuration: Configuration,
 ) -> io::Result<()> {
-    if source(&configuration)? != expected {
+    if source(&configuration, &std::env::current_exe()?)? != expected {
         return Err(io::Error::other(
             "Serena broker source changed before startup",
         ));

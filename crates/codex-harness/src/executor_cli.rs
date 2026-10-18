@@ -4,20 +4,22 @@
 //! succession, OFAP 4.1).
 #![cfg(windows)]
 
+use harness_core::native_launcher;
 #[cfg(test)]
 use harness_core::orchestration_config::executor_session_args;
 use harness_core::orchestration_config::{
-    self, EXECUTOR_SESSION_ENV, ProfileBinding, executor_profile, load,
+    self, EXECUTOR_SESSION_ENV, ProfileBinding, executor_profile, load, worktree_pool_size,
 };
 use harness_core::process::{Job, Limits, StopReason};
 use harness_core::process_service::ServiceProcess;
+use harness_core::role_context::Role;
 use harness_core::task_control::ControlConnection;
 use harness_core::task_succession::{
     self, Boundary, NativeFacts, Reload, ReloadExpectation, Request as SuccessionRequest,
     SessionFacts, SuccessorPlan,
 };
 use harness_core::task_view;
-use harness_core::task_worktree::{self, AcquiredSlot, LaneDisposition, SlotDisposition};
+use harness_core::task_worktree::{self, LaneDisposition, SlotDisposition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -60,29 +62,29 @@ use observation::{
 use warning::{Relay, WarningQueue};
 
 const USAGE: &str = concat!(
-    "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
-    "codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
-    "codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session PREVIOUS_SESSION_ID] [--profile ID] [--exec PROMPT|- | --assignment FILE]\n  Start a NEW conversation in the same occupied worktree, preserving partial work and reusing the recorded assignment by default. The successor records the predecessor session and publishes a new control endpoint; a stale endpoint is not an address of that conversation. Never releases or resets the slot.\n",
-    "codex-harness executor watch [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N | --receipt FILE] [--owner ID] [--timeout SECONDS] [--poll MILLISECONDS] [--json]\n",
-    "codex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\n",
-    "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
-    "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\n",
-    "codex-harness executor stop [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N] [--owner ID] [--session SESSION_ID] [--timeout SECONDS]\n",
-    "codex-harness executor message [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N] [--owner ID] [--session SESSION_ID] [--text TEXT | --file FILE]\n",
+    "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--repository REPO] [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--task ID --handle HANDLE] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
+    "codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --slot N --owner ID [--session SESSION_ID] [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
+    "codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --slot N --owner ID [--session PREVIOUS_SESSION_ID] [--profile ID] [--exec PROMPT|- | --assignment FILE]\n  Start a NEW conversation in the same occupied worktree, preserving partial work and reusing the recorded assignment by default. The successor records the predecessor session and publishes a new control endpoint; a stale endpoint is not an address of that conversation. Never releases or resets the slot.\n",
+    "codex-harness executor watch [--source CHECKOUT] [--codex-home DIRECTORY] [--repository REPO] [--slot N | --receipt FILE] [--owner ID] [--timeout SECONDS] [--poll MILLISECONDS] [--json]\n",
+    "codex-harness executor assignment --source CHECKOUT [--repository REPO] --slot N --assignment FILE [--base REV] [--owner ID]\n",
+    "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
+    "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY [--repository REPO]\n",
+    "codex-harness executor stop [--source CHECKOUT] [--codex-home DIRECTORY] [--repository REPO] [--slot N] [--owner ID] [--session SESSION_ID] [--timeout SECONDS]\n",
+    "codex-harness executor message [--source CHECKOUT] [--codex-home DIRECTORY] [--repository REPO] [--slot N] [--owner ID] [--session SESSION_ID] [--text TEXT | --file FILE]\n",
     "codex-harness executor message --reply-to MESSAGE_ID [--text TEXT | --file FILE]\n",
     "codex-harness lead message [--text TEXT | --file FILE] [--notify]\n",
     "  Content: pipe standard input first (or --text - explicitly); short --text and UTF-8 --file remain fallbacks. Long content spills automatically to a harness file whose pointer and receipt report size and path (delivery=spill, payloadPath, payloadBytes). Address fields are optional: harness records resolve the sole live run; ambiguity asks for --slot, and explicit values win and verify unchanged.\n",
     "codex-harness executor run LAUNCHER [ARG...]\n",
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
-    "The originating lead is the dispatching process CODEX_THREAD_ID, captured before the host environment is cleared. A missing or blank id, a caller-supplied lead or recipient, and a copied, stale or sibling run marker are refused before any model request. Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (siblings named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set, restoring the user's foreground window and selected tab afterwards; --terminal-window targets an explicitly named window, and a window that cannot be addressed (another virtual desktop or a blocked activation) gets the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use. Without WT_SESSION spawn opens a visible console. The tab host exits 0 after the session ends, including a recorded failure; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace must be the source checkout or one of its pool slots; an ad-hoc worktree path is refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
+    "The originating lead is the dispatching process CODEX_THREAD_ID, captured before the host environment is cleared. A missing or blank id, a caller-supplied lead or recipient, and a copied, stale or sibling run marker are refused before any model request. Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (siblings named <repository>-wt1..N, sized to worktree_pool_size) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set, restoring the user's foreground window and selected tab afterwards; --terminal-window targets an explicitly named window, and a window that cannot be addressed (another virtual desktop or a blocked activation) gets the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use. Without WT_SESSION spawn opens a visible console. The tab host exits 0 after the session ends, including a recorded failure; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace must be the source checkout or one of its pool slots; an ad-hoc worktree path is refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. --repository REPO names the target repository whose pool, slot records, receipts and leases are used, so the configuration source and the consuming repository stay separate; it defaults to the --source checkout. --task ID --handle HANDLE continues the exact ordinary-task binding handed to this executor in the same checkout instead of acquiring a fresh slot, and the handle proves that snapshot was not superseded. ",
     "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts it inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding and no model request, attaches the native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt - the address `executor message`, `executor stop` and the lead's reply use - and records the run's lifecycle state with the exact native session identity, the final-message locator and the bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. An attachment failure is reported before any assignment request. A thread that does not report the bound routing refuses the conversation. Every managed executor run also monitors its exact session's recorded per-response usage for repeated cache loss, regardless of provider or model: routine status stays in the receipt and host log, degraded coverage goes through the attached native frontend's own warning view when one exists (recorded in `cacheGuard.diagnosticDelivery` as a native-format send or as undelivered, never as a warning a person confirmed seeing), no cache-guard line is written into the terminal that frontend owns, and a runtime-proven sustained loss stops the owned tree as a non-success outcome with an explicit fresh-session recovery command. ",
     "Explicit --mode exec uses that same observed lifecycle with the native inline TUI (--no-alt-screen), not a second renderer. Historical unmanaged tui and legacy receipts keep the coverage they recorded. `executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues, and 3 when the run is live with an unresolved reply request. Exit 3 is action required: the result names the exact run and the bounded request references with their one-command reply, the run keeps its session, slot, worktree and partial work, and the lead answers and runs watch again - it is never a completion, output defect, unavailable-coverage or release result. ",
     "An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A tab or console host exits 0 after recording that outcome so the tab closes. Resume continues one exact interrupted session on its recorded slot through the managed native TUI: the host starts a control-backed app-server, resumes that exact thread, retires any stale control endpoint, and attaches one native Codex TUI to that session without fetch, reset, clean, a new conversation or a replay of completed work. Without --session it consumes the exact identity the dispatch receipt recorded, keeps it across failed resume attempts, and refuses instead of choosing by recency. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. ",
     "Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. `executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifying each by the recorded identity and terminating survivors so a child command is reported actually terminated. The stopped run's tab closes because that run's own host process ends; no terminal command is ever sent, so the lead's window and sibling tabs are untouched. Nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. ",
     "Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). `executor message` delivers one literal correction into the addressed run's own live conversation under the content and address rules above, then verifies the recorded binding, exact session, lease, host and conversation before acting. `--reply-to MESSAGE_ID` is the lead's reply to one request from its own executor and takes only that id plus content. The id resolves from the lifecycle record written by `lead message`, then this same steer/start owner delivers the unchanged payload to that exact executor run. Another lead, an unknown or retired id, a reused slot or generation, and a contradictory explicit address are refused before anything is sent. ",
     "Delivery goes to the same thread through the run's kit-local control endpoint (`endpoint-N.json`): a running turn is steered with `turn/steer` at the nearest supported point and is never interrupted, an idle thread gets a new turn on its own thread. The result distinguishes delivered (observed in the conversation's own items), queued (accepted by the recorded turn; not yet visible), error (the endpoint refused; nothing delivered) and indeterminate (unanswered, so whether it was applied is unknown); acceptance is never reported as the executor having applied it. Every attempt is recorded with its content identity: an already delivered or queued text is reported instead of sent again, an indeterminate attempt refuses the repeat, and only a definite error may be sent again. A completed, stopped, interrupted, failed or unavailable run reports its actual state with the exact-session continuation remedy, and a surface that records no control endpoint (a historical unmanaged or legacy receipt) is reported as unsupported instead of pretending delivery. ",
-    "Exit codes: 0 delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. `lead message` is the executor's only return channel: content under the rules above goes to the originating lead recorded for its own live run, with no recipient, slot, session, checkout or endpoint; --notify sends a notice that requests no reply. A caller outside that run's recorded relationship, a stale or foreign marker and a caller-supplied address are refused before anything is sent. Routine progress stays on the beads board rather than this channel. A structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and partial work. ",
+    "Exit codes: 0 delivered or queued, 1 a native error or an indeterminate result with delivery still unknown, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. `lead message` is the executor's only return channel: content under the rules above goes to the originating lead recorded for its own live run, with no recipient, slot, session, checkout or endpoint; --notify sends a notice that requests no reply. A caller outside that run's recorded relationship, a stale or foreign marker and a caller-supplied address are refused before anything is sent. Routine progress stays on the beads board rather than this channel. A structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and partial work. ",
     "`executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified. Assignments also accept `--exec -` for piped free text.\n",
 );
 const STARTUP: Duration = Duration::from_secs(20);
@@ -129,15 +131,18 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("spawn") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             spawn(&args[1..])
         }
         Some("resume") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             resume(&args[1..])
         }
         Some("restart") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
-            continue_slot(&args[1..], true)
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+            continue_slot(&args[1..], true, Role::Executor)
         }
         Some("watch") => watch(&args[1..]),
         Some("release") => release(&args[1..]),
@@ -153,10 +158,12 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         Some("assignment") => assignment_check(&args[1..]),
         Some("run") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             run_exec(&args[1..])
         }
         Some("succeed") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             succeed(&args[1..])
         }
         _ => Err(invalid("invalid native executor options")),
@@ -174,25 +181,58 @@ codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session
   routing and cwd stay unchanged; no daemon or second conversation. PROMPT is
   submitted only after the frontend attaches.
 ";
+/// Usage of the bounded lead conversation entries: `dispatch` starts one
+/// fresh pooled lead conversation, and `resume` continues an exact recorded
+/// one on its slot. Both reuse the executor lifecycle owners - slot, receipt,
+/// observation, lease, terminal - with the configured lead profile and the
+/// lead role composition, and neither resolves an executor profile.
+const LEAD_DISPATCH_USAGE: &str = "\
+codex-harness lead dispatch --source CHECKOUT --codex-home DIRECTORY --owner LABEL (--exec PROMPT | --assignment FILE) [--base COMMIT]
+  Dispatch one fresh bounded visible lead conversation: the configured lead profile
+  (global/orchestration.toml lead_profile), the lead role composition, the managed
+  native frontend and a pooled slot with its own receipt, observation and terminal.
+  The owner label names this conversation for later resume and stop. The conversation
+  is bounded: native agent tools stay off and the kit's dispatch entries refuse inside
+  it, so it returns decisions to the lead that dispatched it instead of starting
+  another model conversation.
+codex-harness lead resume --source CHECKOUT --codex-home DIRECTORY --owner LABEL --slot N [--session THREAD_ID] (--exec PROMPT | --assignment FILE)
+  Continue the exact recorded lead conversation on its slot without resetting its
+  checkout: --session names the thread, or the slot's receipt records it. A receipt
+  recorded for another role is refused before any model request.";
 
 /// `codex-harness lead`: the lead side of the executor exchange.
 ///
-/// `start` hosts one managed native lead session, and `message` is a spawned
-/// executor's own channel back to the lead that dispatched it; the caller of
-/// `message` supplies no address.
+/// `start` hosts one managed native lead session, `dispatch` starts one fresh
+/// bounded lead conversation and `resume` continues an exact recorded one on
+/// its slot; `message` is a spawned executor's own channel back to the lead
+/// that dispatched it, and the caller of `message` supplies no address.
 pub fn lead(args: &[OsString]) -> io::Result<i32> {
     match args.first().and_then(|arg| arg.to_str()) {
         None | Some("--help") => {
-            println!("{LEAD_START_USAGE}\n{}", executor_message::LEAD_USAGE);
+            println!(
+                "{LEAD_START_USAGE}\n{LEAD_DISPATCH_USAGE}\n{}",
+                executor_message::LEAD_USAGE
+            );
             Ok(0)
         }
         Some("start") => {
             refuse_lead_hosting(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             lead_start(&args[1..])
+        }
+        Some("dispatch") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+            lead_dispatch(&args[1..])
+        }
+        Some("resume") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_recursion(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+            lead_resume(&args[1..])
         }
         Some("message") => executor_message::lead_message(&args[1..]),
         _ => Err(invalid(
-            "invalid lead command: expected `codex-harness lead start` or `codex-harness lead message` with --text or --file",
+            "invalid lead command: expected `codex-harness lead start`, `codex-harness lead dispatch`, `codex-harness lead resume` or `codex-harness lead message` with --text or --file",
         )),
     }
 }
@@ -205,6 +245,42 @@ fn refuse_lead_hosting(marker: Option<OsString>) -> io::Result<()> {
     if marker.is_some() {
         return Err(invalid(
             "executor sessions cannot host a lead session: this process runs inside an executor (HARNESS_EXECUTOR_SESSION is set); ask the lead that dispatched this run through `codex-harness lead message` instead of creating a conversation",
+        ));
+    }
+    Ok(())
+}
+
+/// The environment marker a bounded lead conversation sets on the process
+/// tree it hosts. The conversation is a bounded decision participant, not
+/// another dispatch owner: it never starts a further model conversation, so
+/// the dispatch entries and the internal dispatch paths refuse here while the
+/// participant returns its decisions to the lead that dispatched it.
+const BOUNDED_LEAD_SESSION_ENV: &str = "HARNESS_BOUNDED_LEAD_SESSION";
+
+/// A bounded lead conversation never spawns another lead conversation: its
+/// own tools carry the marker, so nested hosting or dispatch is refused here
+/// before any slot, process or model request.
+fn refuse_bounded_lead_recursion(marker: Option<OsString>) -> io::Result<()> {
+    if marker.is_some() {
+        return Err(invalid(
+            "bounded lead conversations cannot host or dispatch another lead conversation: this process runs inside one (HARNESS_BOUNDED_LEAD_SESSION is set); return the decision to the lead that dispatched this conversation instead of creating another lead",
+        ));
+    }
+    Ok(())
+}
+
+/// A bounded lead conversation is a bounded decision participant, not another
+/// dispatch owner: it never starts a further model conversation through the
+/// dispatch entries or through the internal dispatch paths. Its own tools
+/// carry the marker, so executor dispatch, executor continuation and receipt
+/// hosting are refused here before any slot, process or model request, and the
+/// refusal names the channel back to the lead that dispatched the
+/// conversation. Ordinary executor work from the lead that dispatched it, and
+/// from a managed lead session, is untouched.
+fn refuse_bounded_lead_dispatch(marker: Option<OsString>) -> io::Result<()> {
+    if marker.is_some() {
+        return Err(invalid(
+            "bounded lead conversations cannot dispatch executors or host another model conversation: this process runs inside one (HARNESS_BOUNDED_LEAD_SESSION is set); return the decision to the lead that dispatched this conversation instead of starting another conversation",
         ));
     }
     Ok(())
@@ -372,6 +448,89 @@ fn invalid_lead_option(key: &str) -> String {
     )
 }
 
+fn invalid_lead_dispatch_option(key: &str) -> String {
+    format!(
+        "invalid lead dispatch option {key}: `codex-harness lead dispatch` accepts --source CHECKOUT, --codex-home DIRECTORY, --owner LABEL, --base COMMIT, --exec PROMPT and --assignment FILE only"
+    )
+}
+
+/// `codex-harness lead dispatch`: one fresh bounded lead conversation through
+/// the pooled dispatch owner. The configured lead profile, the lead role
+/// composition and the managed frontend are resolved by the shared dispatch
+/// path; this entry only parses the bounded request.
+fn lead_dispatch(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!("{LEAD_DISPATCH_USAGE}");
+        return Ok(0);
+    }
+    let mut source = None;
+    let mut codex_home = None;
+    let mut owner = None;
+    let mut base = None;
+    let mut prompt = None;
+    let mut assignment_file = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid(&invalid_lead_dispatch_option("<not Unicode>")))?;
+        if control::supplied_lead_option(key) {
+            return Err(invalid(
+                "caller-supplied lead id or recipient is not authority; refusing before a model request",
+            ));
+        }
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid(&invalid_lead_dispatch_option(key)))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--codex-home" => codex_home = Some(PathBuf::from(value)),
+            "--owner" => owner = Some(option_text(value)?),
+            "--base" => base = Some(option_text(value)?),
+            "--exec" => {
+                prompt = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid(&invalid_lead_dispatch_option(key)))?
+                        .to_owned(),
+                )
+            }
+            "--assignment" => assignment_file = Some(PathBuf::from(value)),
+            _ => return Err(invalid(&invalid_lead_dispatch_option(key))),
+        }
+    }
+    let source = required(source, "--source")?;
+    let codex_home = required(codex_home, "--codex-home")?;
+    let owner = owner.filter(|owner| !owner.trim().is_empty()).ok_or_else(|| {
+        invalid(
+            "lead dispatch --owner is required: the label names this conversation for resume and stop",
+        )
+    })?;
+    let prompt = parse_prompt(prompt, assignment_file)?;
+    let request = VisibleLeadConversation {
+        codex_home,
+        source,
+        owner,
+        base,
+        prompt,
+    };
+    // Acceptance is this route's result, exactly as it is for the executor
+    // controller route: the receipt and observation carry the conversation's
+    // own later lifecycle, which the caller watches instead of blocking here.
+    dispatch_visible_lead_conversation(&request).map(|_| 0)
+}
+
+/// `codex-harness lead resume`: continues the exact recorded lead conversation
+/// on its slot through the shared continuation owner, which reads the slot's
+/// predecessor receipt and refuses a role mismatch before any launch.
+fn lead_resume(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!("{LEAD_DISPATCH_USAGE}");
+        return Ok(0);
+    }
+    continue_slot(args, false, Role::Lead)
+}
+
 /// The title a managed lead conversation carries, so the native frontend's
 /// named-thread caption identifies this session exactly as an executor title
 /// identifies its assignment.
@@ -414,6 +573,45 @@ fn host_lead_session(
         plan.args.push("-c".into());
         plan.args.push(config.into());
     }
+    // The lead role is resolved from the installed build's recorded source
+    // before the app-server starts; a missing owned role input refuses this
+    // host with its exact cause and starts nothing. A resumed conversation
+    // reports that the earlier revision was not recorded: the current
+    // revision's text reaches turns only through a fresh conversation,
+    // because a resumed native thread keeps the developer text saved at its
+    // start.
+    let role = native_launcher::role_launch(
+        &request.codex_home,
+        &request.source,
+        Some(&orchestration_config::profile_config(&request.codex_home, profile)?),
+        &toml::Table::new(),
+        Role::Lead,
+    )
+    .map_err(|error| {
+        invalid(&format!(
+            "lead role context: {error}; no app-server child was started; repair the registered build, global/roles.toml and the role files it names before starting"
+        ))
+    })?;
+    plan.args
+        .extend(role.args.iter().cloned().map(OsString::from));
+    plan.env.insert(
+        "HARNESS_CONTEXT_ROLE".into(),
+        Some(role.role.label().into()),
+    );
+    plan.env.insert(
+        "HARNESS_CONTEXT_REVISION".into(),
+        Some(role.revision.clone().into()),
+    );
+    println!(
+        "lead role context: role={} revision={} previous={}",
+        role.role.label(),
+        role.revision,
+        if request.session.is_some() {
+            "unrecorded (the earlier host's revision was not recorded; a fresh start consumes this revision, while a resumed native thread keeps the developer text saved at its start)"
+        } else {
+            "none"
+        }
+    );
     println!(
         "lead session: profile={profile} model={} provider={} effort={} cwd={}",
         bound.model.as_deref().unwrap_or("default"),
@@ -618,9 +816,12 @@ fn refuse_executor_dispatch(marker: Option<OsString>) -> io::Result<()> {
 
 fn spawn(args: &[OsString]) -> io::Result<i32> {
     let mut source = None;
+    let mut repository = None;
     let mut codex_home = None;
     let mut workspace = None;
     let mut profile = None;
+    let mut task = None;
+    let mut handle = None;
     let mut terminal_profile = None;
     let mut terminal_window = None;
     let mut mode = None;
@@ -643,8 +844,11 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
             .ok_or_else(|| invalid("invalid native executor options"))?;
         match key {
             "--source" => source = Some(PathBuf::from(value)),
+            "--repository" => repository = Some(PathBuf::from(value)),
             "--codex-home" => codex_home = Some(PathBuf::from(value)),
             "--workspace" => workspace = Some(PathBuf::from(value)),
+            "--task" => task = Some(option_text(value)?),
+            "--handle" => handle = Some(option_text(value)?),
             "--base" => base = Some(option_text(value)?),
             "--owner" => owner = Some(option_text(value)?),
             "--profile" => {
@@ -693,9 +897,27 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     }
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
+    let repository = repository.unwrap_or_else(|| source.clone());
     let prompt = parse_prompt(prompt, assignment_file)?;
+    let task = task
+        .map(|task| task.trim().to_owned())
+        .filter(|task| !task.is_empty());
+    let handle = handle
+        .map(|handle| handle.trim().to_owned())
+        .filter(|handle| !handle.is_empty());
+    if task.is_some() != handle.is_some() {
+        return Err(invalid(
+            "executor spawn --task ID and --handle HANDLE belong together: the handle proves the handoff snapshot was not superseded after release or reassignment",
+        ));
+    }
+    if task.is_some() && base.is_some() {
+        return Err(invalid(
+            "executor spawn --task continues the recorded binding at its own base: --base must not select a different snapshot for the handed-off task",
+        ));
+    }
     if !source.is_absolute()
         || !codex_home.is_absolute()
+        || !repository.is_absolute()
         || workspace.as_ref().is_some_and(|path| !path.is_absolute())
     {
         return Err(invalid("executor spawn paths must be absolute"));
@@ -703,20 +925,30 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let config = load(&source)?;
     let profile = executor_profile(&config, profile.as_deref())?.to_owned();
     let mode = SpawnMode::parse(mode.as_deref())?;
-    let pool_size = config.max_concurrent_executors;
-    let named_slot = named_slot(&source, pool_size, workspace.as_deref())?;
+    let pool_size = worktree_pool_size(&config);
+    let named_slot = named_slot(&repository, pool_size, workspace.as_deref())?;
+    if task.is_some() && named_slot.is_some() {
+        return Err(invalid(
+            "executor spawn --task continues the existing slot of the handed-off task: --workspace must not name a different slot for a handoff",
+        ));
+    }
     let owner = owner
         .filter(|owner| !owner.trim().is_empty())
         .unwrap_or_else(|| format!("exec-{profile}-{}", std::process::id()));
     dispatch(&Dispatch {
         codex_home: &codex_home,
         source: &source,
+        repository: &repository,
         pool_size,
+        max_concurrency: config.max_concurrent_executors,
         named_slot,
         owner: &owner,
         base: base.as_deref(),
+        task: task.as_deref(),
+        handle: handle.as_deref(),
         profile: &profile,
         prompt,
+        role: Role::Executor,
         mode,
         resumed_session: None,
         terminal_profile: terminal_profile.as_deref(),
@@ -730,13 +962,26 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
 /// thread and attaches the native frontend to it, instead of starting another
 /// conversation or replaying completed work.
 fn resume(args: &[OsString]) -> io::Result<i32> {
-    continue_slot(args, false)
+    continue_slot(args, false, Role::Executor)
 }
 
 /// A restart adopts the same occupied slot but starts a fresh conversation;
 /// resume retains the exact old conversation. Neither path resets the tree.
-fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
+/// The caller names the responsibility role: an executor continuation
+/// resolves the listed executor profiles, a bounded lead continuation resolves
+/// the configured lead profile and may never select another one.
+fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> {
+    // The continuation entry keeps its executor spelling; a lead continuation
+    // names its own role in every refusal and report.
+    let verb = format!("{} resume", role.label());
+    // The installed command a refusal directs the caller to when the slot has
+    // no recorded session: spawning the dispatch again is role-specific.
+    let spawn_hint = match role {
+        Role::Executor => "codex-harness executor spawn",
+        Role::Lead => "codex-harness lead dispatch",
+    };
     let mut source = None;
+    let mut repository = None;
     let mut codex_home = None;
     let mut profile = None;
     let mut terminal_profile = None;
@@ -761,14 +1006,15 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
             .ok_or_else(|| invalid("invalid native executor options"))?;
         match key {
             "--source" => source = Some(PathBuf::from(value)),
+            "--repository" => repository = Some(PathBuf::from(value)),
             "--codex-home" => codex_home = Some(PathBuf::from(value)),
             "--slot" => {
                 let text = value
                     .to_str()
-                    .ok_or_else(|| invalid("executor resume --slot must be a slot number"))?;
+                    .ok_or_else(|| invalid(&format!("{verb} --slot must be a slot number")))?;
                 slot = Some(
                     text.parse::<u32>()
-                        .map_err(|_| invalid("executor resume --slot must be a slot number"))?,
+                        .map_err(|_| invalid(&format!("{verb} --slot must be a slot number")))?,
                 );
             }
             "--owner" => owner = Some(option_text(value)?),
@@ -818,12 +1064,13 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
     }
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
-    let slot = slot.ok_or_else(|| invalid("executor resume --slot is required"))?;
+    let repository = repository.unwrap_or_else(|| source.clone());
+    let slot = slot.ok_or_else(|| invalid(&format!("{verb} --slot is required")))?;
     let owner = owner
         .filter(|owner| !owner.trim().is_empty())
-        .ok_or_else(|| invalid("executor resume --owner is required"))?;
-    if !source.is_absolute() || !codex_home.is_absolute() {
-        return Err(invalid("executor resume paths must be absolute"));
+        .ok_or_else(|| invalid(&format!("{verb} --owner is required")))?;
+    if !source.is_absolute() || !codex_home.is_absolute() || !repository.is_absolute() {
+        return Err(invalid(&format!("{verb} paths must be absolute")));
     }
     let (session, identity) = match session {
         Some(text) => (
@@ -831,20 +1078,20 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
             "explicit --session",
         ),
         None => (
-            recorded_session(&codex_home, &source, slot, &owner)?,
+            recorded_session(&codex_home, &repository, slot, &owner, &verb, spawn_hint)?,
             "recorded dispatch receipt",
         ),
     };
     let mut predecessor = serde_json::Value::Null;
     if fresh {
-        let recorded = recorded_session(&codex_home, &source, slot, &owner)?;
+        let recorded = recorded_session(&codex_home, &repository, slot, &owner, &verb, spawn_hint)?;
         if recorded != session {
             return Err(invalid(
                 "executor restart refused: the exact previous session no longer occupies this slot",
             ));
         }
         predecessor =
-            serde_json::from_slice(&fs::read(receipt_path(&codex_home, &source, slot)?)?)?;
+            serde_json::from_slice(&fs::read(receipt_path(&codex_home, &repository, slot)?)?)?;
         if prompt.is_none() && assignment_file.is_none() {
             prompt = predecessor["control"]["originalAssignment"]
                 .as_str()
@@ -873,39 +1120,113 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
     };
     let session_label = if fresh { "previous-session" } else { "session" };
     println!(
-        "executor {action}: slot={slot} owner={owner} {session_label}={session} identity={identity}"
+        "{} {action}: slot={slot} owner={owner} {session_label}={session} identity={identity}",
+        role.label()
     );
     let config = load(&source)?;
-    let profile = executor_profile(&config, profile.as_deref())?.to_owned();
+    // A lead continuation continues the configured lead profile only: it can
+    // never select or fall back to an executor profile.
+    let profile = match role {
+        Role::Executor => executor_profile(&config, profile.as_deref())?.to_owned(),
+        Role::Lead => {
+            if profile.is_some() {
+                return Err(invalid(
+                    "lead resume continues the configured lead profile: --profile is not accepted",
+                ));
+            }
+            config.lead_profile.clone()
+        }
+    };
+    let pool_size = worktree_pool_size(&config);
     let request = Dispatch {
         codex_home: &codex_home,
         source: &source,
-        pool_size: config.max_concurrent_executors,
+        repository: &repository,
+        pool_size,
+        max_concurrency: config.max_concurrent_executors,
         named_slot: None,
         owner: &owner,
         base: None,
+        task: None,
+        handle: None,
         profile: &profile,
         prompt,
+        role,
         mode: SpawnMode::Exec,
         resumed_session: Some(&session),
         terminal_profile: terminal_profile.as_deref(),
         terminal_window: terminal_window.as_deref(),
     };
     let bound = orchestration_config::binding(&codex_home, &profile)?;
-    refuse_a_live_owner(&codex_home, &source, &owner)?;
-    let live = |owner: &str| owner_live(&codex_home, &source, owner);
-    let pool = task_worktree::pool(&source, config.max_concurrent_executors)?;
-    let record = task_worktree::adopt_slot(&codex_home, &pool, slot, &owner, &live)?;
-    task_worktree::hold_startup_reservation(&codex_home, &source, slot, &owner)?;
-    let (remote, branch) = task_worktree::upstream(&record.path)?;
+    refuse_a_live_owner(&codex_home, &repository, &owner)?;
+    // Resuming or restarting reactivates the recorded run on its own slot;
+    // it consumes executor concurrency like any other run, so a full
+    // allowance is reported before the slot is touched. The admission
+    // decision and the startup reservation at the end of this section are
+    // one atomic step under the pool admission lock; the lock never covers
+    // the upstream read or the launch below.
+    let admission = task_worktree::begin_pool_admission(&codex_home, &repository)?;
+    admit_executor_run(&request, Some(slot))?;
+    let live = |owner: &str| owner_live(&codex_home, &repository, owner);
+    // A durable task binding continues through the common task owner,
+    // preserving its checkout and partial work without a reset. A legacy
+    // session record keeps the existing adoption so an interrupted
+    // pre-migration session still resumes the same slot.
+    let (index, path, base, task, handle) = match task_worktree::load_slot_record(
+        &codex_home,
+        &repository,
+        slot,
+    )? {
+        Some(record) if record.task.is_some() => {
+            let task = record.task.clone().unwrap_or_default();
+            let continued = task_worktree::continue_task_for_session(
+                &codex_home,
+                &repository,
+                &task,
+                record.handle.as_deref(),
+                &owner,
+                &live,
+            )?;
+            if continued.index != slot {
+                return Err(invalid(&format!(
+                    "task '{task}' is held in slot {} instead of the requested slot {slot}; continue the recorded slot",
+                    continued.index
+                )));
+            }
+            (
+                continued.index,
+                continued.path,
+                continued.base.clone().unwrap_or_default(),
+                Some(task),
+                continued.handle,
+            )
+        }
+        _ => {
+            let pool = task_worktree::pool(&repository, pool_size)?;
+            let record = task_worktree::adopt_slot(&codex_home, &pool, slot, &owner, &live)?;
+            (
+                record.index,
+                record.path.clone(),
+                record.base.clone().unwrap_or_default(),
+                None,
+                None,
+            )
+        }
+    };
+    task_worktree::hold_startup_reservation(&codex_home, &repository, index, &owner)?;
+    drop(admission);
+    let (remote, branch) = task_worktree::upstream(&path)?;
     let binding = SlotBinding {
-        index: record.index,
-        path: record.path.clone(),
+        index,
+        path,
         source: source.to_path_buf(),
+        repository: Some(repository.clone()),
         owner: owner.clone(),
-        base: record.base.clone().unwrap_or_default(),
+        base,
         remote,
         branch,
+        task,
+        handle,
     };
     // The slot is adopted without a reset, so a rejected structured
     // assignment keeps its claim and its partial work for the next resume.
@@ -918,7 +1239,7 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
             )));
         }
     };
-    let paths = run_paths(&codex_home, &source, binding.index)?;
+    let paths = run_paths(&codex_home, &repository, binding.index)?;
     // Resume keeps the exact session on the managed presentation. Restart
     // starts a fresh conversation and carries the predecessor separately.
     let route = continuation_route(
@@ -958,6 +1279,7 @@ fn continuation_route(
         presentation: NativePresentation::NativeTui,
         port: None,
         resume_session,
+        role: None,
     }))
 }
 
@@ -998,7 +1320,7 @@ fn named_slot(source: &Path, pool_size: u32, workspace: Option<&Path>) -> io::Re
     match task_worktree::slot_index(source, workspace)? {
         Some(index) if index <= pool_size => Ok(Some(index)),
         Some(index) => Err(invalid(&format!(
-            "executor isolation comes from the harness pool: {} is slot {index}, outside the configured pool of {pool_size} (max_concurrent_executors); dispatch with --source {} instead of the extra lane",
+            "executor isolation comes from the harness pool: {} is slot {index}, outside the configured pool of {pool_size} (worktree_pool_size); dispatch with --repository {} instead of the extra lane",
             workspace.display(),
             source.display()
         ))),
@@ -1070,17 +1392,35 @@ impl NativePresentation {
     }
 }
 
-/// One pooled dispatch. The slot is selected, synchronized and bound before any
-/// launcher process starts, so the session never runs from a stale base.
 struct Dispatch<'a> {
     codex_home: &'a Path,
+    /// The kit/configuration checkout: its orchestration configuration names
+    /// the profiles and both limits.
     source: &'a Path,
+    /// The target repository whose pool, slot records and receipts this
+    /// dispatch uses; it equals `source` unless `--repository` selected an
+    /// independent consuming repository.
+    repository: &'a Path,
     pool_size: u32,
+    /// Executor concurrency: active runs are admitted against
+    /// `max_concurrent_executors`, independently of the directory capacity
+    /// `pool_size` counts.
+    max_concurrency: u32,
     named_slot: Option<u32>,
     owner: &'a str,
     base: Option<&'a str>,
+    /// Explicit handoff of a held ordinary-task binding to this executor
+    /// session: the dispatch continues that binding and never acquires or
+    /// resets another checkout.
+    task: Option<&'a str>,
+    handle: Option<&'a str>,
     profile: &'a str,
     prompt: PromptSource,
+    /// The responsibility role this dispatch resolves and records. The role
+    /// selects the owned composition, the printed identity, the console title
+    /// and - at host time - the managed frontend shape; a continued
+    /// conversation never changes it silently.
+    role: Role,
     mode: SpawnMode,
     /// Exact session a resume continues; its identity is carried into the new
     /// observation so a failed resume attempt cannot lose it.
@@ -1094,7 +1434,8 @@ struct Dispatch<'a> {
 /// caller's own text.
 /// The structured variant is rendered into the brief against the bound slot
 /// after allocation, so the model never sees a checkout it is not running in.
-enum PromptSource {
+#[derive(Clone)]
+pub(crate) enum PromptSource {
     FreeText(String),
     Structured(executor_assignment::Assignment),
 }
@@ -1133,6 +1474,126 @@ struct ControlReceipt {
     /// this session instead of creating another conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_session: Option<String>,
+    /// The responsibility-role composition resolved before anything launched:
+    /// the role, the owned revision it resolved at and the exact `-c` pairs
+    /// the host applies to its app-server child. Absent on a receipt written
+    /// before role recording existed; recovery is a fresh dispatch, resume or
+    /// restart, which records the current role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<RoleReceipt>,
+}
+
+/// One recorded role composition. `revision` is what this dispatch resolved
+/// from the current sources: the text a fresh conversation consumes. `saved`
+/// is the developer text the native conversation actually keeps: a fresh
+/// start or restart loads `revision`, while a resume keeps the text saved at
+/// the thread's start, carried forward unchanged across repeated resumes.
+/// `previous` is the predecessor dispatch's own record and is never presented
+/// as the saved text. A receipt without `saved` keeps explicit uncertainty
+/// for a continued thread (see `known_saved`); it is never presented as
+/// having consumed this dispatch's freshly resolved revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RoleReceipt {
+    role: String,
+    revision: String,
+    args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<PreviousRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PreviousRole {
+    /// Whether the predecessor receipt recorded a role at all.
+    recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+}
+
+impl RoleReceipt {
+    /// The saved-developer-text fact of this composition: what the native
+    /// conversation actually keeps. A resumed thread keeps the text saved at
+    /// its start while its live catalogue still refreshes, so a carried saved
+    /// revision is never folded into the freshly resolved one; an unknown
+    /// original text is reported as unrecorded instead of guessed.
+    fn saved_clause(&self) -> String {
+        let known = self.known_saved();
+        match known.as_deref() {
+            Some(saved) if saved == self.revision.as_str() => format!("saved={saved}"),
+            Some(saved) => format!(
+                "saved={saved} (this thread keeps the developer text saved at its start while its live catalogue still refreshes; a fresh conversation consumes revision {})",
+                self.revision
+            ),
+            None => format!(
+                "saved=unrecorded (the developer text saved at this thread's start is not reliably recorded; a fresh conversation consumes revision {})",
+                self.revision
+            ),
+        }
+    }
+
+    /// The predecessor-dispatch fact of this composition: the revision the
+    /// continued dispatch resolved at its own start, named as that dispatch's
+    /// record and never as the text the current conversation runs under.
+    fn previous_clause(&self) -> String {
+        match &self.previous {
+            None => "previous=none".to_owned(),
+            Some(previous) if previous.recorded => format!(
+                "previous=recorded revision={} (the predecessor dispatch recorded that revision)",
+                previous.revision.as_deref().unwrap_or("unrecorded")
+            ),
+            Some(_) => "previous=unrecorded (the continued session's role predates role recording)"
+                .to_owned(),
+        }
+    }
+
+    /// The honest one-line report of the effective role: the freshly resolved
+    /// revision, the developer text actually saved in this conversation, and
+    /// what the continued predecessor dispatch recorded.
+    fn summary(&self) -> String {
+        format!(
+            "role={} revision={} {} {}",
+            self.role,
+            self.revision,
+            self.saved_clause(),
+            self.previous_clause()
+        )
+    }
+
+    /// The developer text this composition is known to keep: the persisted
+    /// saved revision, or, for a receipt written before that field existed,
+    /// the resolved revision of a fresh start (`previous` none), whose text
+    /// that start consumed. A continued receipt without either record stays
+    /// unknown: its freshly resolved revision is not claimed as saved.
+    fn known_saved(&self) -> Option<String> {
+        if let Some(saved) = &self.saved {
+            return Some(saved.clone());
+        }
+        if self.previous.is_none() {
+            Some(self.revision.clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// The recorded role of one receipt document. A receipt written before role
+/// recording returns `None`: the host applies nothing and reports the role as
+/// unrecorded instead of inventing or re-resolving one at host time.
+fn role_from_receipt(value: &serde_json::Value) -> io::Result<Option<RoleReceipt>> {
+    let role = &value["control"]["role"];
+    if role.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(role.clone())
+        .map(Some)
+        .map_err(|error| {
+            invalid(&format!(
+                "dispatch receipt role context is invalid: {error}"
+            ))
+        })
 }
 
 /// Record schema of the control route inside one dispatch receipt.
@@ -1160,6 +1621,13 @@ impl HostRoute {
 
     fn presentation_label(&self) -> &'static str {
         self.control().presentation.as_str()
+    }
+
+    /// Records the role composition the dispatch resolved before launching.
+    fn set_role(&mut self, role: RoleReceipt) {
+        match self {
+            Self::Control(control) => control.role = Some(role),
+        }
     }
 }
 
@@ -1202,11 +1670,32 @@ fn parse_prompt(
 struct SlotBinding {
     index: u32,
     path: PathBuf,
+    /// The kit/configuration checkout that dispatched this run.
     source: PathBuf,
+    /// The target repository whose pool and state own this binding; receipts
+    /// written before the configuration-source split recorded the single
+    /// checkout in `source`, which was both roles.
+    #[serde(default)]
+    repository: Option<PathBuf>,
     owner: String,
     base: String,
     remote: String,
     branch: Option<String>,
+    /// Durable task binding of this run, when the dispatch went through the
+    /// common task owner: an executor-owned task, or the ordinary task handed
+    /// to this session.
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    handle: Option<String>,
+}
+
+impl SlotBinding {
+    /// The target repository whose pool and slot state this binding belongs
+    /// to. A receipt written before the split has `source` as both roles.
+    fn repository(&self) -> &Path {
+        self.repository.as_deref().unwrap_or(&self.source)
+    }
 }
 
 /// One dispatch prepared up to (not including) opening its surface: the bound
@@ -1226,10 +1715,13 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         index: slot.index,
         path: slot.path.clone(),
         source: request.source.to_path_buf(),
+        repository: Some(request.repository.to_path_buf()),
         owner: request.owner.to_owned(),
         base: slot.base.clone(),
         remote: slot.remote.clone(),
         branch: slot.branch.clone(),
+        task: slot.task.clone(),
+        handle: slot.handle.clone(),
     };
     // A structured assignment is validated against the checkout that was
     // actually allocated, before any launcher process starts.
@@ -1237,7 +1729,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         Ok(prompt) => prompt,
         Err(error) => return Err(release_unused_claim(request, &binding, error)),
     };
-    let paths = run_paths(request.codex_home, request.source, binding.index)?;
+    let paths = run_paths(request.codex_home, request.repository, binding.index)?;
     // Default and both presentation spellings share one control lifecycle.
     // The native frontend is attached by the host; explicit exec qualifies
     // that frontend as inline instead of launching an unobserved CLI.
@@ -1249,6 +1741,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         presentation: request.mode.presentation(),
         port: None,
         resume_session: None,
+        role: None,
     }));
     Ok(PreparedDispatch {
         binding,
@@ -1306,6 +1799,7 @@ pub(crate) fn dispatch_visible_conversation(
     request: &VisibleConversation,
 ) -> io::Result<VisibleAccepted> {
     refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+    refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
     if !request.source.is_absolute() || !request.codex_home.is_absolute() {
         return Err(invalid(
             "visible conversation source and codex home must be absolute paths",
@@ -1317,12 +1811,17 @@ pub(crate) fn dispatch_visible_conversation(
     let dispatch = Dispatch {
         codex_home: &request.codex_home,
         source: &request.source,
-        pool_size: config.max_concurrent_executors,
+        repository: &request.source,
+        pool_size: worktree_pool_size(&config),
+        max_concurrency: config.max_concurrent_executors,
         named_slot: None,
         owner: &request.owner,
         base: request.base.as_deref(),
+        task: None,
+        handle: None,
         profile: &profile,
         prompt: PromptSource::Structured(assignment),
+        role: Role::Executor,
         mode: SpawnMode::Tui,
         resumed_session: None,
         terminal_profile: None,
@@ -1332,6 +1831,83 @@ pub(crate) fn dispatch_visible_conversation(
     let accepted = VisibleAccepted {
         owner: prepared.binding.owner.clone(),
         title: executor_title(&profile, &prepared.binding.owner),
+        slot: prepared.binding.index,
+        model: prepared.bound.model.clone(),
+        model_provider: prepared.bound.model_provider.clone(),
+        reasoning_effort: prepared.bound.reasoning_effort.clone(),
+        checkout: prepared.binding.path.clone(),
+        receipt: prepared.paths.receipt.clone(),
+        result: prepared.paths.result.clone(),
+        detail: prepared.paths.detail.clone(),
+    };
+    launch_bound(
+        &dispatch,
+        &prepared.binding,
+        prepared.route,
+        &prepared.bound,
+        &prepared.paths,
+    )?;
+    Ok(accepted)
+}
+
+/// One bounded visible lead conversation requested from the dispatch side. It
+/// reuses the pooled dispatch owner verbatim - slot allocation, the configured
+/// lead profile, the lead role composition, the native frontend attach wait
+/// and the receipt/observation artifacts - and it never resolves an executor
+/// profile: a bounded experimental lead is the configured lead, not an
+/// executor that pretends to lead. `lead resume` continues an exact recorded
+/// conversation on its slot through the shared continuation owner.
+pub(crate) struct VisibleLeadConversation {
+    pub codex_home: PathBuf,
+    pub source: PathBuf,
+    /// Bounded, distinct owner label; the console title derives from it and
+    /// `lead resume` continues this conversation by the same label.
+    pub owner: String,
+    pub base: Option<String>,
+    pub prompt: PromptSource,
+}
+
+/// Dispatches one fresh bounded lead conversation through the pooled dispatch
+/// owner. The configured `lead_profile` binding and the lead role composition
+/// are resolved and recorded before anything launches; a missing role input or
+/// a full active-run allowance refuses here with the slot still bound.
+pub(crate) fn dispatch_visible_lead_conversation(
+    request: &VisibleLeadConversation,
+) -> io::Result<VisibleAccepted> {
+    refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+    refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+    if !request.source.is_absolute() || !request.codex_home.is_absolute() {
+        return Err(invalid(
+            "bounded lead source and codex home must be absolute paths",
+        ));
+    }
+    let config = load(&request.source)?;
+    // The configured lead profile only: a bounded lead never falls back to an
+    // executor profile and no caller flag can select one.
+    let profile = config.lead_profile.clone();
+    let dispatch = Dispatch {
+        codex_home: &request.codex_home,
+        source: &request.source,
+        repository: &request.source,
+        pool_size: worktree_pool_size(&config),
+        max_concurrency: config.max_concurrent_executors,
+        named_slot: None,
+        owner: &request.owner,
+        base: request.base.as_deref(),
+        task: None,
+        handle: None,
+        profile: &profile,
+        prompt: request.prompt.clone(),
+        role: Role::Lead,
+        mode: SpawnMode::Tui,
+        resumed_session: None,
+        terminal_profile: None,
+        terminal_window: None,
+    };
+    let prepared = prepare_dispatch(&dispatch)?;
+    let accepted = VisibleAccepted {
+        owner: prepared.binding.owner.clone(),
+        title: lead_dispatch_title(&profile, &prepared.binding.owner),
         slot: prepared.binding.index,
         model: prepared.bound.model.clone(),
         model_provider: prepared.bound.model_provider.clone(),
@@ -1527,15 +2103,20 @@ pub(crate) fn stop_owned_run(
 fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<String> {
     match &request.prompt {
         PromptSource::FreeText(text) => Ok(executor_assignment::free_text_brief(text)),
-        PromptSource::Structured(assignment) => executor_assignment::brief(
-            assignment,
-            &executor_assignment::AssignmentContext {
+        PromptSource::Structured(assignment) => {
+            let context = executor_assignment::AssignmentContext {
                 checkout: &binding.path,
                 base: &binding.base,
                 owner: &binding.owner,
                 source: request.source,
-            },
-        ),
+            };
+            // The brief heading names the role the conversation actually
+            // runs as; the declared contract itself is identical.
+            match request.role {
+                Role::Executor => executor_assignment::brief(assignment, &context),
+                Role::Lead => executor_assignment::lead_brief(assignment, &context),
+            }
+        }
     }
 }
 
@@ -1546,18 +2127,44 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
 /// never destroyed. Resume deliberately does not release its claim, because
 /// that slot holds the interrupted session's partial work.
 fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Error) -> io::Error {
-    let released = task_worktree::pool(request.source, request.pool_size).and_then(|pool| {
-        let live = |owner: &str| owner_live(request.codex_home, request.source, owner);
-        task_worktree::release_slot(
+    let live = |owner: &str| owner_live(request.codex_home, binding.repository(), owner);
+    // A handed-off ordinary task never loses its binding to a rejected
+    // assignment: its checkout, task identity and partial work stay exactly
+    // as the lead handed them over, for the lead to continue or release.
+    if request.task.is_some()
+        && let Some(task) = binding.task.as_deref()
+    {
+        return io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; handed-off task '{task}' stays bound in slot {} with its checkout and partial work for the lead to continue or release explicitly",
+                binding.index
+            ),
+        );
+    }
+    let released = match binding.task.as_deref() {
+        Some(task) => task_worktree::release_task(
             request.codex_home,
-            &pool,
-            binding.index,
+            binding.repository(),
+            task,
             SlotDisposition::Discarded,
             "structured assignment was rejected before the model started",
             &binding.base,
+            binding.handle.as_deref(),
             &live,
-        )
-    });
+        ),
+        None => task_worktree::pool(binding.repository(), request.pool_size).and_then(|pool| {
+            task_worktree::release_slot(
+                request.codex_home,
+                &pool,
+                binding.index,
+                SlotDisposition::Discarded,
+                "structured assignment was rejected before the model started",
+                &binding.base,
+                &live,
+            )
+        }),
+    };
     let note = match released {
         Ok(LaneDisposition::Reused { base }) => format!(
             "; slot {} was returned to the pool at {base}",
@@ -1581,7 +2188,7 @@ fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Er
 fn launch_bound(
     request: &Dispatch,
     binding: &SlotBinding,
-    route: HostRoute,
+    mut route: HostRoute,
     bound: &ProfileBinding,
     paths: &RunPaths,
 ) -> io::Result<i32> {
@@ -1593,13 +2200,17 @@ fn launch_bound(
     let lead = control::establish_originating_lead(state_dir)?;
     record_originating_lead(&paths.receipt, &lead)?;
     inherit_lead_endpoint(state_dir, request.codex_home, &lead, binding.index)?;
-    println!("{}", slot_summary(binding, request.named_slot));
+    println!(
+        "{}",
+        slot_summary(request.role, binding, request.named_slot)
+    );
     report_inventory(request)?;
     ensure_workspace_trust(request.codex_home, &binding.path)?;
     // Visible before a missing launcher aborts, so a dispatch that never
     // opens a window still names the presentation it selected.
     println!(
-        "executor presentation: mode={} presentation={} model={} provider={} effort={} cwd={}",
+        "{} presentation: mode={} presentation={} model={} provider={} effort={} cwd={}",
+        request.role.label(),
         request.mode.as_str(),
         route.presentation_label(),
         bound.model.as_deref().unwrap_or("unknown"),
@@ -1617,6 +2228,29 @@ fn launch_bound(
             binding.owner
         )));
     }
+    // The managed role composition is resolved from the installed build's
+    // recorded source before anything launches: missing or inconsistent owned
+    // role inputs refuse the dispatch here, with the slot still bound and
+    // reused by the next dispatch and with no launcher or model request,
+    // instead of hosting a conversation without its responsibility role.
+    // A resume attaches to the saved native thread and keeps its developer
+    // text; a restart starts a fresh conversation that consumes this
+    // dispatch's resolved text. Only resume marks route resume_session.
+    let role = role_receipt(
+        request,
+        binding,
+        &paths.receipt,
+        route.control().resume_session.is_some(),
+    )?;
+    println!(
+        "{} role context: role={} revision={} {} {}",
+        request.role.label(),
+        role.role,
+        role.revision,
+        role.saved_clause(),
+        role.previous_clause()
+    );
+    route.set_role(role);
     // Managed spellings, including exact-session resume and fresh restart,
     // record native coverage. A legacy launcher receipt still records coverage
     // when its mode is observed exec; it does not guess an identity for a
@@ -1634,12 +2268,13 @@ fn launch_bound(
         None,
     )?;
     println!(
-        "executor shell: {} ({}) policy={}",
+        "{} shell: {} ({}) policy={}",
+        request.role.label(),
         shell.version,
         shell.executable.display(),
         shell.sandbox_mode
     );
-    let title = executor_title(request.profile, &binding.owner);
+    let title = role_title(request.role, request.profile, &binding.owner);
     let session = std::env::var_os("WT_SESSION");
     let client = windows_terminal_client();
     if prefers_terminal_tab(session.as_deref(), client.as_deref()) {
@@ -1663,11 +2298,148 @@ fn launch_bound(
     }
 }
 
-/// The observable outcome of slot allocation: the lead reads the mapping here
-/// and reloads the same fields from `executor pool` or the kit-local record.
-fn slot_summary(binding: &SlotBinding, named: Option<u32>) -> String {
+/// The managed dispatch role resolved before launch, executor or bounded lead.
+/// The installed build's recorded source supplies the owned role inputs; a
+/// missing or inconsistent input refuses the dispatch with the exact cause,
+/// keeping the slot bound for the next dispatch and making no launcher or model
+/// request. A native resume (`resumes_saved_thread`) keeps the developer text
+/// saved at the continued thread's start, so the receipt persists that text's
+/// known revision instead of overwriting it with this dispatch's freshly
+/// resolved one. The requested role must match the role the continued receipt
+/// recorded; a mismatch refuses before any launcher or model request.
+fn role_receipt(
+    request: &Dispatch,
+    binding: &SlotBinding,
+    receipt: &Path,
+    resumes_saved_thread: bool,
+) -> io::Result<RoleReceipt> {
+    let requested = request.role;
+    let profile = orchestration_config::profile_config(request.codex_home, request.profile)?;
+    let launch = native_launcher::role_launch(
+        request.codex_home,
+        &binding.path,
+        Some(&profile),
+        &toml::Table::new(),
+        requested,
+    )
+    .map_err(|error| {
+        invalid(&format!(
+            "{} role context: {error}; slot {} stays bound to {} and is reused by the next dispatch, no launcher or model request was made; repair the registered build, global/roles.toml and the role files it names before dispatching",
+            requested.label(),
+            binding.index,
+            binding.owner
+        ))
+    })?;
+    let (previous, saved) = continued_role(
+        receipt,
+        request.resumed_session.is_some(),
+        resumes_saved_thread,
+        &launch.revision,
+        requested,
+    )?;
+    Ok(RoleReceipt {
+        role: launch.role.label().to_owned(),
+        revision: launch.revision,
+        args: launch.args,
+        previous,
+        saved,
+    })
+}
+
+/// What a continued dispatch reads from the receipt it is about to replace:
+/// the predecessor dispatch claim for honest reporting and, when the native
+/// conversation is resumed rather than restarted, the developer text that
+/// conversation is known to keep. A restart starts a fresh conversation, so
+/// it consumes this dispatch's resolved text. A fresh spawn continues nothing
+/// and records no predecessor claim. A missing or pre-recording receipt
+/// records no saved text for a resume, while a restart still consumes this
+/// dispatch's resolved text. The requested role must match the role the
+/// receipt recorded: a different recorded role refuses here, before any
+/// launcher or model request, instead of converting the conversation.
+fn continued_role(
+    receipt: &Path,
+    continues_session: bool,
+    resumes_saved_thread: bool,
+    resolved: &str,
+    requested: Role,
+) -> io::Result<(Option<PreviousRole>, Option<String>)> {
+    if !continues_session {
+        return Ok((None, Some(resolved.to_owned())));
+    }
+    let bytes = match fs::read(receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((
+                Some(PreviousRole {
+                    recorded: false,
+                    revision: None,
+                }),
+                restart_saved(resumes_saved_thread, resolved),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the dispatch receipt {} continues a session but is not JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    Ok(match role_from_receipt(&value)? {
+        Some(role) if role.role != requested.label() => {
+            // A continued conversation never changes responsibility role: the
+            // recorded composition is the developer text and skill catalogue
+            // the thread actually runs under, so continuing it as another role
+            // would present a role the conversation does not have.
+            return Err(invalid(&format!(
+                "role mismatch: the continued receipt records a {} conversation, and this dispatch would continue it as {}; continue it with the recorded role's own entry, or start a fresh conversation under another owner",
+                role.role,
+                requested.label()
+            )));
+        }
+        Some(role) => {
+            let saved = if resumes_saved_thread {
+                role.known_saved()
+            } else {
+                Some(resolved.to_owned())
+            };
+            (
+                Some(PreviousRole {
+                    recorded: true,
+                    revision: Some(role.revision),
+                }),
+                saved,
+            )
+        }
+        None => (
+            Some(PreviousRole {
+                recorded: false,
+                revision: None,
+            }),
+            restart_saved(resumes_saved_thread, resolved),
+        ),
+    })
+}
+
+/// The saved developer text of a restart: a restarted conversation is a
+/// fresh start that loads this dispatch's resolved text, whatever the
+/// replaced receipt recorded. A resume keeps the receipt's known text
+/// instead, which is `None` when that text is not reliably recorded.
+fn restart_saved(resumes_saved_thread: bool, resolved: &str) -> Option<String> {
+    if resumes_saved_thread {
+        None
+    } else {
+        Some(resolved.to_owned())
+    }
+}
+
+/// The observable outcome of slot allocation: the caller reads the mapping
+/// here and reloads the same fields from `executor pool` or the kit-local
+/// record.
+fn slot_summary(role: Role, binding: &SlotBinding, named: Option<u32>) -> String {
     let mut line = format!(
-        "executor slot: index={} path={} base={} owner={} remote={}{} source={}",
+        "{} slot: index={} path={} base={} owner={} remote={}{} source={} repository={} task={} handle={}",
+        role.label(),
         binding.index,
         binding.path.display(),
         binding.base,
@@ -1678,7 +2450,10 @@ fn slot_summary(binding: &SlotBinding, named: Option<u32>) -> String {
             .as_deref()
             .map(|branch| format!("/{branch}"))
             .unwrap_or_default(),
-        binding.source.display()
+        binding.source.display(),
+        binding.repository().display(),
+        binding.task.as_deref().unwrap_or("-"),
+        binding.handle.as_deref().unwrap_or("-")
     );
     if let Some(named) = named.filter(|named| *named != binding.index) {
         line.push_str(&format!(
@@ -1702,7 +2477,31 @@ pub(crate) const EXECUTOR_TITLE_LIMIT: usize = 48;
 pub(crate) fn executor_title(profile: &str, owner: &str) -> String {
     // The profile is bounded first so the total title stays within the limit
     // even for an unusually long configured profile name.
-    let prefix = format!("CEx ({}) - ", bounded_title_component(profile, 16));
+    bounded_owner_title(
+        format!("CEx ({}) - ", bounded_title_component(profile, 16)),
+        owner,
+    )
+}
+
+/// The console title of one bounded lead conversation: distinct from both the
+/// interactive lead title and any executor title, and bounded like them.
+fn lead_dispatch_title(profile: &str, owner: &str) -> String {
+    bounded_owner_title(
+        format!("CLead ({}) - ", bounded_title_component(profile, 16)),
+        owner,
+    )
+}
+
+/// The console, thread and window title of one dispatch, selected by its
+/// responsibility role.
+fn role_title(role: Role, profile: &str, owner: &str) -> String {
+    match role {
+        Role::Executor => executor_title(profile, owner),
+        Role::Lead => lead_dispatch_title(profile, owner),
+    }
+}
+
+fn bounded_owner_title(prefix: String, owner: &str) -> String {
     let budget = EXECUTOR_TITLE_LIMIT
         .saturating_sub(prefix.chars().count())
         .max(8);
@@ -1729,7 +2528,7 @@ fn bounded_title_component(value: &str, max: usize) -> String {
 /// inside the configured pool and never absorbs or deletes foreign or legacy
 /// trees, so the lead reviews them.
 fn report_inventory(request: &Dispatch) -> io::Result<()> {
-    let audit = task_worktree::audit_pool(request.source, request.pool_size)?;
+    let audit = task_worktree::audit_pool(request.repository, request.pool_size)?;
     if !audit.foreign.is_empty() {
         println!(
             "pool inventory (lead review): foreign worktrees: {}",
@@ -1754,22 +2553,235 @@ fn display_paths(paths: &[PathBuf]) -> String {
         .join("; ")
 }
 
+/// One acquired pool position as the dispatch records it: the durable task
+/// binding of the common owner (an executor-owned task, or the ordinary task
+/// handed to this session), the checkout and its exact committed base.
+struct BoundSlot {
+    index: u32,
+    path: PathBuf,
+    base: String,
+    remote: String,
+    branch: Option<String>,
+    task: Option<String>,
+    handle: Option<String>,
+}
+
 /// The pool core owns selection, claims, synchronization and slot records; the
-/// CLI supplies the session identity, the creating process reservation, and
-/// the process-level liveness of its host.
-fn acquire_pool_slot(request: &Dispatch) -> io::Result<AcquiredSlot> {
-    let live = |owner: &str| owner_live(request.codex_home, request.source, owner);
-    refuse_a_live_owner(request.codex_home, request.source, request.owner)?;
+/// CLI supplies the session identity, the target repository, the creating
+/// process reservation and the process-level liveness of its host. Executor
+/// dispatches are durable task bindings of the same common owner the generic
+/// worktree commands use, so one hard pool serves both: a fresh dispatch
+/// acquires its own `--owner` label as the task, an explicit `--task/--handle`
+/// continues a handed-off ordinary task in place, and a repeated `--owner`
+/// continues its held binding without a reset or a second checkout.
+fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
+    let live = |owner: &str| owner_live(request.codex_home, request.repository, owner);
+    refuse_a_live_owner(request.codex_home, request.repository, request.owner)?;
+    let inventory =
+        task_worktree::task_inventory(request.codex_home, request.repository, request.pool_size)?;
+    let free_position = inventory
+        .iter()
+        .any(|slot| slot.state == task_worktree::TaskState::Free);
+    if let (Some(task), Some(handle)) = (request.task, request.handle) {
+        // The handoff rebinds the task's held position to this session: it
+        // starts an executor run, so it is admitted like any other; the
+        // admission decision and the rebinding's startup reservation are one
+        // atomic step under the pool admission lock, held to the end of this
+        // branch.
+        let _admission =
+            task_worktree::begin_pool_admission(request.codex_home, request.repository)?;
+        admit_executor_run(
+            request,
+            held_binding(&inventory, task).map(|slot| slot.index),
+        )?;
+        let slot = task_worktree::handoff_task_to_session(
+            request.codex_home,
+            request.repository,
+            task,
+            handle,
+            request.owner,
+            &live,
+        )?;
+        return Ok(bound_slot(slot, None));
+    }
+    let held = held_binding(&inventory, request.owner).map(|slot| slot.index);
+    // A dispatch lands on a free position or continues this owner's held
+    // binding; when the pool can place it nowhere, the pool core reports its
+    // own capacity refusal and executor admission must not shadow it. This
+    // first check refuses before the upstream refresh below; the admission
+    // lock then re-decides it atomically with the startup reservation.
+    if held.is_some() || free_position {
+        admit_executor_run(request, held)?;
+    }
     let startup = task_worktree::current_startup_reservation()?;
-    task_worktree::acquire_slot_for_startup(
+    // An explicit base is resolved locally and never fetched. Without a base,
+    // a binding this owner already holds continues without network access; a
+    // fresh acquisition refreshes the configured upstream once here, before
+    // any slot changes, and passes the resolved commit as the exact base.
+    let (base, fetched) = match request.base {
+        Some(base) => (Some(base.to_owned()), None),
+        None => match held {
+            Some(_) => (None, None),
+            None => {
+                let (commit, remote, branch) =
+                    task_worktree::refresh_upstream_base(request.repository)?;
+                (Some(commit), Some((remote, branch)))
+            }
+        },
+    };
+    // The upstream refresh stays outside every pool lock; the admission
+    // decision and the claim below are one atomic step, so two simultaneous
+    // dispatches cannot both count an empty allowance and then claim
+    // different free slots.
+    let admission = task_worktree::begin_pool_admission(request.codex_home, request.repository)?;
+    if held.is_some() || free_position {
+        admit_executor_run(request, held)?;
+    }
+    // The admission decision, the pool claim and the startup reservation
+    // are one atomic step under the guard. The slow worktree preparation
+    // stays outside it: a reserved position already excludes rivals through
+    // the live startup reservation, so independent startups prepare
+    // concurrently within the allowance. Walked positions are not repaired
+    // here either: `repair_walked_slots` is false, so no cold checkout
+    // preparation runs under the shared guard, while the position this
+    // dispatch claims is still materialized by `prepare_task_startup` after
+    // the guard is released.
+    let begin = task_worktree::begin_task_startup(
         request.codex_home,
-        request.source,
+        request.repository,
         request.pool_size,
         request.owner,
-        request.base,
-        &startup,
+        base.as_deref(),
+        Some(&startup),
+        false,
         &live,
-    )
+    )?;
+    // A continued binding records no startup reservation through the claim
+    // path, so every successful begin holds one here, still under the guard:
+    // the interval before the host lease can never be reclaimed by another
+    // dispatch, and preparation runs with no unreserved gap.
+    let index = match &begin {
+        task_worktree::TaskStartup::Held(slot) => slot.index,
+        task_worktree::TaskStartup::Reserved { slot, .. } => slot.index,
+    };
+    task_worktree::hold_startup_reservation(
+        request.codex_home,
+        request.repository,
+        index,
+        request.owner,
+    )?;
+    drop(admission);
+    let prepared = task_worktree::prepare_task_startup(
+        request.codex_home,
+        request.repository,
+        request.pool_size,
+        begin,
+    )?;
+    Ok(bound_slot(prepared, fetched))
+}
+
+/// The upstream pair one receipt reports: the refreshed pair of a default
+/// acquisition, else the locally inspected upstream of the bound checkout.
+fn bound_slot(slot: task_worktree::TaskSlot, fetched: Option<(String, String)>) -> BoundSlot {
+    let (remote, branch) = match fetched {
+        Some((remote, branch)) => (remote, Some(branch)),
+        None => task_worktree::upstream(&slot.path).unwrap_or_default(),
+    };
+    BoundSlot {
+        index: slot.index,
+        path: slot.path,
+        base: slot.base.unwrap_or_default(),
+        remote,
+        branch,
+        task: slot.task,
+        handle: slot.handle,
+    }
+}
+
+/// The durable binding one exact task already holds, at any recorded state: a
+/// held binding is continued without a reset, and a preserved one is left for
+/// the pool core to refuse with its own recorded reason.
+fn held_binding<'a>(
+    inventory: &'a [task_worktree::TaskSlot],
+    task: &str,
+) -> Option<&'a task_worktree::TaskSlot> {
+    inventory.iter().find(|slot| {
+        slot.task.as_deref() == Some(task) && slot.state != task_worktree::TaskState::Free
+    })
+}
+
+/// Slot indexes and owners of the repository's active executor runs: a run is
+/// active while its host lease is live or its dispatch still holds an
+/// exclusive startup claim. A held, suspended or cleanly exited task keeps
+/// pool capacity but not concurrency, and an ordinary task's held position
+/// never consumes it. `replacing` names the slot this dispatch reactivates,
+/// which does not count against itself.
+fn active_executor_runs(
+    codex_home: &Path,
+    repository: &Path,
+    pool_size: u32,
+    replacing: Option<u32>,
+) -> io::Result<Vec<(u32, String)>> {
+    let mut active = Vec::new();
+    for index in 1..=pool_size.min(task_worktree::MAX_POOL_SLOTS) {
+        if Some(index) == replacing {
+            continue;
+        }
+        let lease = read_lease(&lease_path(codex_home, repository, index)?);
+        if let Some(lease) = lease
+            && lease_live(&lease)
+        {
+            active.push((index, lease.owner));
+            continue;
+        }
+        let Some(record) = task_worktree::load_slot_record(codex_home, repository, index)? else {
+            continue;
+        };
+        let Some(owner) = record.owner else {
+            continue;
+        };
+        if record
+            .startup
+            .as_ref()
+            .is_some_and(task_worktree::startup_exclusive)
+        {
+            active.push((index, owner));
+        }
+    }
+    Ok(active)
+}
+
+/// Executor admission is separate from pool capacity: `max_concurrent_executors`
+/// bounds active runs, so one lead (or a successor with the same configuration)
+/// cannot multiply the allowance by dispatching along free pool slots. A
+/// bounded lead conversation counts as one active run like any other dispatch.
+fn admit_executor_run(request: &Dispatch, replacing: Option<u32>) -> io::Result<()> {
+    let active = active_executor_runs(
+        request.codex_home,
+        request.repository,
+        request.pool_size,
+        replacing,
+    )?;
+    let limit = request.max_concurrency.max(1);
+    if active.len() as u32 >= limit {
+        let runs = active
+            .iter()
+            .map(|(index, owner)| format!("slot {index} is running '{owner}'"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // A bounded lead conversation consumes the same active-run allowance
+        // as an executor run; the refusal names the shared limit truthfully
+        // for both roles.
+        let subject = match request.role {
+            Role::Executor => "executor concurrency",
+            Role::Lead => "run concurrency",
+        };
+        return Err(invalid(&format!(
+            "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {runs}; a free pool slot does not grant another active run - stop or wait for a run",
+            active.len()
+        )));
+    }
+    Ok(())
 }
 
 /// A dispatch never shares its slot with a live session that already claims
@@ -1834,9 +2846,12 @@ fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPath
 /// Record this process as the live host of a bound slot. A slot that was
 /// rebound to another session is refused instead of sharing the tree. Publishing
 /// the lease ends startup exclusion: the lease, not the creating process, is
-/// authoritative from this write onward.
+/// authoritative from this write onward. The lease names the canonical image
+/// of the running process: the installed launcher is a symlink a later deploy
+/// can retarget, so only the resolved path keeps naming the exact process the
+/// dispatch receipt records and the lease must agree with.
 fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
-    let record = task_worktree::load_slot_record(codex_home, &binding.source, binding.index)?
+    let record = task_worktree::load_slot_record(codex_home, binding.repository(), binding.index)?
         .ok_or_else(|| {
             invalid(&format!(
                 "slot {} has no recorded session binding",
@@ -1860,6 +2875,7 @@ fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
         )));
     }
     let program = std::env::current_exe()
+        .and_then(|program| program.canonicalize())
         .map_err(|error| invalid(&format!("executor session host path: {error}")))?;
     let user = harness_core::process_service::current_user()?;
     let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)?.identity();
@@ -1872,14 +2888,14 @@ fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
         created: identity.creation_time,
         program,
     };
-    let path = lease_path(codex_home, &binding.source, binding.index)?;
+    let path = lease_path(codex_home, binding.repository(), binding.index)?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     fs::write(&path, serde_json::to_vec_pretty(&lease)?)?;
     task_worktree::release_startup_reservation(
         codex_home,
-        &binding.source,
+        binding.repository(),
         binding.index,
         &binding.owner,
     )
@@ -1891,7 +2907,7 @@ fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
 fn wait_for_host_lease(request: &Dispatch, binding: &SlotBinding) -> io::Result<()> {
     let deadline = std::time::Instant::now() + HOST_GRACE;
     loop {
-        if let Some(lease) = live_lease(request.codex_home, request.source, &binding.owner)
+        if let Some(lease) = live_lease(request.codex_home, request.repository, &binding.owner)
             && lease.index == binding.index
         {
             return Ok(());
@@ -1908,7 +2924,7 @@ fn wait_for_host_lease(request: &Dispatch, binding: &SlotBinding) -> io::Result<
 
 /// Drop the lease this process recorded and leave another session's lease alone.
 fn remove_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
-    let path = lease_path(codex_home, &binding.source, binding.index)?;
+    let path = lease_path(codex_home, binding.repository(), binding.index)?;
     match read_lease(&path) {
         Some(lease) if lease.owner == binding.owner && lease.pid == std::process::id() => {
             match fs::remove_file(&path) {
@@ -1960,8 +2976,10 @@ fn live_lease(codex_home: &Path, source: &Path, owner: &str) -> Option<SessionLe
         .find(|lease| lease.owner == owner && lease_live(lease))
 }
 
-/// Is the recorded owner's host process still running?
-fn owner_live(codex_home: &Path, source: &Path, owner: &str) -> bool {
+/// Is the recorded owner's host process still running? Shared with the
+/// generic worktree commands and executor admission, which must not duplicate
+/// the lease-liveness rule.
+pub(crate) fn owner_live(codex_home: &Path, source: &Path, owner: &str) -> bool {
     live_lease(codex_home, source, owner).is_some()
 }
 
@@ -1970,6 +2988,7 @@ fn owner_live(codex_home: &Path, source: &Path, owner: &str) -> bool {
 /// existing reset-for-reuse rules or preserve it with its limitation.
 fn release(args: &[OsString]) -> io::Result<i32> {
     let mut source = None;
+    let mut repository = None;
     let mut codex_home = None;
     let mut slot = None;
     let mut disposition = None;
@@ -1985,6 +3004,7 @@ fn release(args: &[OsString]) -> io::Result<i32> {
             .ok_or_else(|| invalid("invalid native executor options"))?;
         match key {
             "--source" => source = Some(PathBuf::from(value)),
+            "--repository" => repository = Some(PathBuf::from(value)),
             "--codex-home" => codex_home = Some(PathBuf::from(value)),
             "--slot" => slot = Some(option_text(value)?),
             "--disposition" => disposition = Some(option_text(value)?),
@@ -1995,6 +3015,10 @@ fn release(args: &[OsString]) -> io::Result<i32> {
     }
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
+    let repository = repository.unwrap_or_else(|| source.clone());
+    if !source.is_absolute() || !codex_home.is_absolute() || !repository.is_absolute() {
+        return Err(invalid("executor release paths must be absolute"));
+    }
     let index: u32 = slot
         .ok_or_else(|| invalid("--slot is required"))?
         .parse()
@@ -2013,27 +3037,44 @@ fn release(args: &[OsString]) -> io::Result<i32> {
         .filter(|reason| !reason.trim().is_empty())
         .ok_or_else(|| invalid("--reason TEXT is required"))?;
     let config = load(&source)?;
-    let layout = task_worktree::pool(&source, config.max_concurrent_executors)?;
+    let layout = task_worktree::pool(&repository, worktree_pool_size(&config))?;
     layout.slot(index)?;
+    let binding = task_worktree::load_slot_record(&codex_home, &repository, index)?;
     let base = match base {
         Some(base) => base,
-        None => committed_head(&source)?,
+        None => committed_head(&repository)?,
     };
-    let live = |owner: &str| owner_live(&codex_home, &source, owner);
-    let run_note = observed_run_note(&codex_home, &source, index);
+    let live = |owner: &str| owner_live(&codex_home, &repository, owner);
+    let run_note = observed_run_note(&codex_home, &repository, index);
     // The spilled message files of this run are owned by its run records: the
     // release that cleans those records cleans these with them, and no other
     // run's messages are touched.
-    let messages = cleanup_run_messages(&codex_home, &source, index);
-    match task_worktree::release_slot(
-        &codex_home,
-        &layout,
-        index,
-        disposition,
-        &reason,
-        &base,
-        &live,
-    )? {
+    let messages = cleanup_run_messages(&codex_home, &repository, index);
+    // A durable task binding releases through the common task owner with its
+    // recorded generation handle, so a superseded release is refused; a legacy
+    // session record keeps the session release.
+    let released = match binding.as_ref().and_then(|record| record.task.as_deref()) {
+        Some(task) => task_worktree::release_task(
+            &codex_home,
+            &repository,
+            task,
+            disposition,
+            &reason,
+            &base,
+            binding.as_ref().and_then(|record| record.handle.as_deref()),
+            &live,
+        ),
+        None => task_worktree::release_slot(
+            &codex_home,
+            &layout,
+            index,
+            disposition,
+            &reason,
+            &base,
+            &live,
+        ),
+    };
+    match released? {
         LaneDisposition::Reused { base } => {
             println!(
                 "executor slot {index} released as {}: reset to {base} and free for the next dispatch",
@@ -2081,8 +3122,8 @@ fn observed_run_note(codex_home: &Path, source: &Path, index: u32) -> Option<Str
 /// The spilled message files of one released run, removed together with the run
 /// records that own them. Only the payload paths that run's own receipt records
 /// are touched, so a neighboring run's messages survive.
-fn cleanup_run_messages(codex_home: &Path, source: &Path, index: u32) -> io::Result<usize> {
-    let receipt = receipt_path(codex_home, source, index)?;
+fn cleanup_run_messages(codex_home: &Path, repository: &Path, index: u32) -> io::Result<usize> {
+    let receipt = receipt_path(codex_home, repository, index)?;
     executor_input::cleanup_recorded_messages(codex_home, &receipt)
 }
 
@@ -2120,17 +3161,21 @@ const MAX_CHANGED_FILES: usize = 40;
 
 /// The exact session a resume continues when `--session` is omitted: the
 /// identity the dispatch receipt mechanically recorded. Never a picker, never
-/// recency, never a rollout filename.
+/// recency, never a rollout filename. The caller names its verb and the
+/// dispatch command a refusal directs the caller toward, so an executor
+/// continuation and a bounded lead continuation read correctly.
 fn recorded_session(
     codex_home: &Path,
     source: &Path,
     slot: u32,
     owner: &str,
+    verb: &str,
+    spawn_hint: &str,
 ) -> io::Result<String> {
     let receipt = receipt_path(codex_home, source, slot)?;
     let bytes = fs::read(&receipt).map_err(|error| {
         invalid(&format!(
-            "executor resume without --session needs the dispatch receipt {} to name the exact recorded session: {error}; pass --session SESSION_ID explicitly, or dispatch `codex-harness executor spawn` first",
+            "{verb} without --session needs the dispatch receipt {} to name the exact recorded session: {error}; pass --session SESSION_ID explicitly, or dispatch `{spawn_hint}` first",
             receipt.display()
         ))
     })?;
@@ -2150,14 +3195,14 @@ fn recorded_session(
     }
     let Some(run) = RunObservation::from_receipt(&value) else {
         return Err(invalid(&format!(
-            "the receipt {} is a legacy record without native observation; it names no exact session, so pass --session SESSION_ID explicitly or dispatch `codex-harness executor spawn` again",
+            "the receipt {} is a legacy record without native observation; it names no exact session, so pass --session SESSION_ID explicitly or dispatch `{spawn_hint}` again",
             receipt.display()
         )));
     };
     match run.recorded_session() {
         Some(session) => Ok(task_succession::exact_session_id(session)?.to_owned()),
         None => Err(invalid(&format!(
-            "the recorded run in slot {slot} observed no native session (state={}, coverage={}, cause={}); pass --session SESSION_ID explicitly or dispatch `codex-harness executor spawn` again",
+            "the recorded run in slot {slot} observed no native session (state={}, coverage={}, cause={}); pass --session SESSION_ID explicitly or dispatch `{spawn_hint}` again",
             run.state,
             run.coverage,
             run.cause
@@ -2178,6 +3223,11 @@ struct WatchReport {
     session: Option<String>,
     checkout: Option<String>,
     base: Option<String>,
+    /// The responsibility role this run continues under, for a control-backed
+    /// receipt: the effective role and revision plus what the continued
+    /// session recorded. Absent for receipts that run the launcher directly,
+    /// which composes the role itself.
+    role: Option<String>,
     changed: Option<ChangedReport>,
     returned: Option<String>,
     returned_bytes: Option<u64>,
@@ -2206,6 +3256,18 @@ impl WatchReport {
             .as_deref()
             .and_then(|checkout| changed_report(checkout, base.as_deref()));
         let returned = run.result.as_deref().and_then(read_returned);
+        let role = if value
+            .get("control")
+            .is_some_and(|control| !control.is_null())
+        {
+            Some(match role_from_receipt(value) {
+                Ok(Some(role)) => role.summary(),
+                Ok(None) => "unrecorded (receipt written before role recording)".to_owned(),
+                Err(error) => format!("invalid ({error})"),
+            })
+        } else {
+            None
+        };
         Self {
             state: state.to_owned(),
             cause,
@@ -2214,6 +3276,7 @@ impl WatchReport {
             session: run.recorded_session().map(str::to_owned),
             checkout: checkout.map(|path| path.display().to_string()),
             base,
+            role,
             changed,
             returned: returned.as_ref().map(|(text, _, _)| text.clone()),
             returned_bytes: returned.as_ref().map(|(_, bytes, _)| *bytes),
@@ -2257,6 +3320,9 @@ impl WatchReport {
             self.owner.as_deref().unwrap_or("-"),
             self.session.as_deref().unwrap_or("-")
         ));
+        if let Some(role) = &self.role {
+            text.push_str(&format!("role: {role}\n"));
+        }
         text.push_str(&format!(
             "checkout: {} base: {}\n",
             self.checkout.as_deref().unwrap_or("unavailable"),
@@ -2343,6 +3409,7 @@ impl WatchReport {
             "session": self.session,
             "checkout": self.checkout,
             "base": self.base,
+            "role": self.role,
             "changedFiles": self.changed.as_ref().map(|changed| json!({
                 "count": changed.count(),
                 "committed": changed.committed,
@@ -2556,6 +3623,7 @@ fn parse_seconds(value: Option<&str>, fallback: u64, name: &str) -> io::Result<D
 /// same run again instead of resuming or releasing it.
 fn watch(args: &[OsString]) -> io::Result<i32> {
     let mut source = None;
+    let mut repository = None;
     let mut codex_home = None;
     let mut slot = None;
     let mut receipt = None;
@@ -2577,6 +3645,7 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
             .ok_or_else(|| invalid("invalid native executor options"))?;
         match key {
             "--source" => source = Some(PathBuf::from(value)),
+            "--repository" => repository = Some(PathBuf::from(value)),
             "--codex-home" => codex_home = Some(PathBuf::from(value)),
             "--slot" => slot = Some(option_text(value)?),
             "--receipt" => receipt = Some(PathBuf::from(value)),
@@ -2601,6 +3670,7 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
                 .transpose()?;
             let codex_home = executor_input::codex_home(codex_home)?;
             let source = executor_input::source(source, &codex_home)?;
+            let repository = repository.unwrap_or_else(|| source.clone());
             // A named slot is watched exactly as recorded, including a released
             // or legacy one; only an omitted slot is resolved from the one live
             // run.
@@ -2609,7 +3679,7 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
                 None => {
                     executor_input::resolve_run(
                         &codex_home,
-                        &source,
+                        &repository,
                         None,
                         owner.as_deref(),
                         "watch",
@@ -2617,7 +3687,7 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
                     .slot
                 }
             };
-            receipt_path(&codex_home, &source, index)?
+            receipt_path(&codex_home, &repository, index)?
         }
     };
     if !receipt.is_absolute() {
@@ -2965,6 +4035,7 @@ fn slot_base(slot: &Path, revision: &str) -> io::Result<String> {
 /// foreign or legacy worktrees that only the lead retires.
 fn pool_status(args: &[OsString]) -> io::Result<i32> {
     let mut source = None;
+    let mut repository = None;
     let mut codex_home = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2976,26 +4047,29 @@ fn pool_status(args: &[OsString]) -> io::Result<i32> {
             .ok_or_else(|| invalid("invalid native executor options"))?;
         match key {
             "--source" => source = Some(PathBuf::from(value)),
+            "--repository" => repository = Some(PathBuf::from(value)),
             "--codex-home" => codex_home = Some(PathBuf::from(value)),
             _ => return Err(invalid("invalid native executor options")),
         }
     }
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
-    let size = load(&source)?.max_concurrent_executors;
+    let repository = repository.unwrap_or_else(|| source.clone());
+    let size = worktree_pool_size(&load(&source)?);
     println!(
-        "executor worktree pool: source={} size={size} (max_concurrent_executors)",
-        source.display()
+        "executor worktree pool: source={} repository={} size={size} (worktree_pool_size)",
+        source.display(),
+        repository.display()
     );
-    match task_worktree::pool(&source, size) {
+    match task_worktree::pool(&repository, size) {
         Ok(layout) => {
             for slot in &layout.slots {
-                println!("{}", slot_report(&codex_home, &source, slot));
+                println!("{}", slot_report(&codex_home, &repository, slot));
             }
         }
         Err(error) => println!("pool layout unavailable: {error}"),
     }
-    let audit = task_worktree::audit_pool(&source, size)?;
+    let audit = task_worktree::audit_pool(&repository, size)?;
     for path in &audit.foreign {
         println!("foreign worktree (lead review): {}", path.display());
     }
@@ -3015,6 +4089,7 @@ fn pool_status(args: &[OsString]) -> io::Result<i32> {
 /// can rehearse the installed route without a model request.
 fn assignment_check(args: &[OsString]) -> io::Result<i32> {
     let mut source = None;
+    let mut repository = None;
     let mut slot = None;
     let mut assignment_path = None;
     let mut base = None;
@@ -3029,6 +4104,7 @@ fn assignment_check(args: &[OsString]) -> io::Result<i32> {
             .ok_or_else(|| invalid("invalid native executor options"))?;
         match key {
             "--source" => source = Some(PathBuf::from(value)),
+            "--repository" => repository = Some(PathBuf::from(value)),
             "--slot" => slot = Some(option_text(value)?),
             "--assignment" => assignment_path = Some(PathBuf::from(value)),
             "--base" => base = Some(option_text(value)?),
@@ -3037,21 +4113,22 @@ fn assignment_check(args: &[OsString]) -> io::Result<i32> {
         }
     }
     let source = required(source, "--source")?;
+    let repository = repository.unwrap_or_else(|| source.clone());
     let index: u32 = slot
         .ok_or_else(|| invalid("executor assignment --slot is required"))?
         .parse()
         .map_err(|_| invalid("executor assignment --slot must be a pool slot index"))?;
     let assignment_path = required(assignment_path, "--assignment")?;
     let assignment = Assignment::load(&assignment_path)?;
-    let size = load(&source)?.max_concurrent_executors;
-    let pool = task_worktree::pool(&source, size)?;
+    let size = worktree_pool_size(&load(&source)?);
+    let pool = task_worktree::pool(&repository, size)?;
     let slot = pool.slot(index)?;
     if !slot.path.is_dir() {
         return Err(invalid(&format!(
-            "slot {index} directory {} is missing; this check never creates or synchronizes a slot: dispatch `codex-harness executor spawn --source {}` to create and synchronize it (a removed slot whose registration is stale needs `git worktree prune` in {} first), then run this check again",
+            "slot {index} directory {} is missing; this check never creates or synchronizes a slot: dispatch `codex-harness executor spawn --repository {}` to create and synchronize it (a removed slot whose registration is stale needs `git worktree prune` in {} first), then run this check again",
             slot.path.display(),
-            source.display(),
-            source.display()
+            repository.display(),
+            repository.display()
         )));
     }
     let base = match base {
@@ -3085,34 +4162,48 @@ fn slot_report(codex_home: &Path, source: &Path, slot: &task_worktree::PoolSlot)
         task_worktree::SlotPresence::Absent => "absent",
         task_worktree::SlotPresence::Registered => "registered",
         task_worktree::SlotPresence::RegisteredMissing => "registered-missing",
+        task_worktree::SlotPresence::Foreign => "foreign",
     };
-    let (state, owner, base, disposition, reason): (String, String, String, String, String) =
-        match task_worktree::load_slot_record(codex_home, source, slot.index) {
-            Ok(Some(record)) => (
-                slot_state_name(record.state).to_owned(),
-                record.owner.unwrap_or_else(|| "-".into()),
-                record.base.unwrap_or_else(|| "-".into()),
-                record
-                    .disposition
-                    .map(|disposition| disposition_name(disposition).to_owned())
-                    .unwrap_or_else(|| "-".into()),
-                record.reason.unwrap_or_else(|| "-".into()),
-            ),
-            Ok(None) => (
-                "free".into(),
-                "-".into(),
-                "-".into(),
-                "-".into(),
-                "-".into(),
-            ),
-            Err(error) => (
-                "unreadable".into(),
-                "-".into(),
-                "-".into(),
-                "-".into(),
-                error.to_string(),
-            ),
-        };
+    let (state, owner, base, task, handle, disposition, reason): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = match task_worktree::load_slot_record(codex_home, source, slot.index) {
+        Ok(Some(record)) => (
+            slot_state_name(record.state).to_owned(),
+            record.owner.unwrap_or_else(|| "-".into()),
+            record.base.unwrap_or_else(|| "-".into()),
+            record.task.unwrap_or_else(|| "-".into()),
+            record.handle.unwrap_or_else(|| "-".into()),
+            record
+                .disposition
+                .map(|disposition| disposition_name(disposition).to_owned())
+                .unwrap_or_else(|| "-".into()),
+            record.reason.unwrap_or_else(|| "-".into()),
+        ),
+        Ok(None) => (
+            "free".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+        ),
+        Err(error) => (
+            "unreadable".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            error.to_string(),
+        ),
+    };
     let lease = match lease_path(codex_home, source, slot.index) {
         Ok(path) => read_lease(&path),
         Err(_) => None,
@@ -3136,7 +4227,7 @@ fn slot_report(codex_home: &Path, source: &Path, slot: &task_worktree::PoolSlot)
         })
         .unwrap_or_else(|| "run=-".into());
     format!(
-        "slot {} {} presence={presence} state={state} tree={} lease={lease_state} {run} owner={owner} base={base} disposition={disposition} reason={reason}",
+        "slot {} {} presence={presence} state={state} tree={} lease={lease_state} {run} owner={owner} base={base} task={task} handle={handle} disposition={disposition} reason={reason}",
         slot.index,
         slot.path.display(),
         tree_state(&slot.path)
@@ -3219,6 +4310,11 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
         fs::read(path).map_err(|error| invalid(&format!("executor run receipt: {error}")))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| invalid(&format!("executor run receipt JSON: {error}")))?;
+    // The dispatch entry refuses `executor run` inside a bounded lead
+    // conversation before parsing reaches this host, so a bounded lead never
+    // hosts a further conversation of any role here; it returns the decision
+    // to the lead that dispatched it instead. Hosting a lead-role receipt from
+    // a managed lead session stays an ordinary continuation.
     let launcher = value
         .get("launcher")
         .and_then(serde_json::Value::as_str)
@@ -3466,12 +4562,15 @@ const FRONTEND_ATTACH: Duration = Duration::from_secs(30);
 /// terminal surface by itself before this host ends it.
 const FRONTEND_TAIL_GRACE: Duration = Duration::from_secs(5);
 
-/// Hosts one control-backed exec run: the recorded dispatch identity is
-/// verified, one `codex app-server` child starts inside this host's Job with
-/// the prepared executor shell, the assignment is submitted through
+/// Hosts one control-backed pooled run: the recorded dispatch identity and
+/// role are verified, one `codex app-server` child starts inside this host's
+/// Job with the prepared shell, the assignment is submitted through
 /// `turn/start`, every control record is rendered on this surface while the
 /// bounded detail file and the receipt's lifecycle stay current, and the
 /// thread's own items supply the exact session identity and the final message.
+/// A receipt recorded for the lead role hosts a bounded lead conversation: the
+/// lead role, profile and settings with the single-agent suppression instead
+/// of the executor session marker.
 ///
 /// Fail-closed: a startup or binding failure is recorded as a failed state
 /// with its cause and fails this host. The receipt records no `codex exec`
@@ -3519,13 +4618,24 @@ fn run_control_receipt(
         ));
     };
     let profile = value["profile"].as_str().unwrap_or("default");
+    // The recorded role selects the hosted conversation's identity. A receipt
+    // recorded for the lead role hosts a bounded lead conversation: the lead
+    // role, profile and tools with the single-agent suppression, its own
+    // bounded-lead marker instead of the executor session marker and the lead
+    // frontend shape, with the title the dispatching side already published.
+    // An executor or legacy receipt keeps exactly the executor lifecycle.
+    let recorded_role = role_from_receipt(value)?;
+    let hosted_role = match &recorded_role {
+        Some(role) if role.role == Role::Lead.label() => Role::Lead,
+        _ => Role::Executor,
+    };
     let mut plan = ControlPlan::new(
         &launcher,
         codex_home,
         &binding.path,
-        executor_title(profile, &binding.owner),
+        role_title(hosted_role, profile, &binding.owner),
         control.identity.clone(),
-        ControlPaths::for_slot(codex_home, &binding.source, binding.index)?,
+        ControlPaths::for_slot(codex_home, binding.repository(), binding.index)?,
     );
     // The app-server has no `--profile` flag, so the routing this dispatch
     // already resolved is pinned on its thread, and the sandbox the prepared
@@ -3539,6 +4649,42 @@ fn run_control_receipt(
     {
         plan.args.push("-c".into());
         plan.args.push(config.into());
+    }
+    // The role composition recorded at dispatch travels to the app-server
+    // child exactly as it was resolved, after the profile overrides so the
+    // owned developer text and skill memberships win, and the child's own
+    // environment names the effective role and revision. A receipt written
+    // before role recording applies nothing and is reported as unrecorded
+    // rather than re-resolved at host time.
+    match recorded_role {
+        Some(role) => {
+            plan.args
+                .extend(role.args.iter().cloned().map(OsString::from));
+            plan.env.insert(
+                "HARNESS_CONTEXT_ROLE".into(),
+                Some(role.role.clone().into()),
+            );
+            plan.env.insert(
+                "HARNESS_CONTEXT_REVISION".into(),
+                Some(role.revision.clone().into()),
+            );
+            println!("role context: {}", role.summary());
+        }
+        None => println!(
+            "role context: unrecorded (this receipt was written before role recording); the app-server child starts without owned role text, and resume or restart of this slot records the current role"
+        ),
+    }
+    // An executor conversation is marked with the executor session environment
+    // and runs the single-agent override; a bounded lead conversation keeps
+    // the lead role, the configured lead profile and the ordinary tools but is
+    // a bounded decision participant: it runs the same single-agent override
+    // and carries its own bounded-lead marker, so its tools can neither
+    // dispatch further model conversations nor host another lead conversation.
+    plan.executor_session = hosted_role == Role::Executor;
+    plan.bounded_lead_session = hosted_role == Role::Lead;
+    if hosted_role == Role::Lead {
+        plan.env
+            .insert(BOUNDED_LEAD_SESSION_ENV.into(), Some("1".into()));
     }
     plan.env.insert("PATH".into(), Some(shell.path.clone()));
     if let Some(generation) = value["originatingLead"]["runGeneration"]
@@ -3598,21 +4744,26 @@ struct OwnedFrontend {
 }
 
 /// How an owned native frontend relates to the conversation it presents. An
-/// executor surface stays single-agent; a managed lead session keeps the native
-/// agent capability of the interactive CLI it hosts.
+/// executor surface stays single-agent, a bounded lead conversation is a
+/// bounded decision participant whose frontend carries the same single-agent
+/// suppression, and a managed lead session keeps the native agent capability
+/// of the interactive CLI it hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrontendRole {
     Executor,
+    BoundedLead,
     Lead,
 }
 
 impl FrontendRole {
     /// What this host reports as unfinished when the frontend cannot be
-    /// attached: an executor dispatch has not submitted its assignment, and a
-    /// lead session has not exposed a conversation.
+    /// attached: an executor dispatch has not submitted its assignment, a
+    /// bounded lead conversation has not exposed its conversation, and a
+    /// managed lead session has not exposed one either.
     fn unfinished(self) -> &'static str {
         match self {
             Self::Executor => "The assignment was not submitted",
+            Self::BoundedLead => "No bounded lead conversation was exposed",
             Self::Lead => "No lead session was exposed",
         }
     }
@@ -3780,8 +4931,10 @@ fn fail_with_frontend(
 /// token stays in the environment. Permission overrides stay on the backend;
 /// remote resume rejects them. The assignment is not an argument, so the
 /// frontend cannot submit it. Explicit exec adds `--no-alt-screen` so the
-/// native inline TUI keeps the text/scrollback contract. Both spellings pin
-/// `agents.enabled=false`; that config override is not a permission override.
+/// native inline TUI keeps the text/scrollback contract. Executor and bounded
+/// lead frontends pin `agents.enabled=false`; the managed lead's own frontend
+/// keeps the native agent capability. That config override is not a permission
+/// override.
 fn attach_owned_frontend(
     plan: &ControlPlan,
     conversation: &Conversation,
@@ -3812,8 +4965,10 @@ fn attach_owned_frontend(
     // Only the native frontend's own connection is relayed: the recorded
     // endpoint that `executor message` and `executor stop` address, and this
     // host's control connection, keep addressing the app-server child itself.
-    // A managed lead session runs no cache-guard diagnostics, so its
-    // interactive surface stays on the recorded address.
+    // An executor conversation owns the warning surface of its cache guard; a
+    // lead-role conversation - managed or bounded - records that delivery
+    // through the honest no-consumer surface instead, so its interactive
+    // surface stays on the recorded address.
     let relay = match role {
         FrontendRole::Executor => Some(
             Relay::start(
@@ -3828,7 +4983,7 @@ fn attach_owned_frontend(
                 ))
             })?,
         ),
-        FrontendRole::Lead => None,
+        FrontendRole::BoundedLead | FrontendRole::Lead => None,
     };
     let frontend_port = relay
         .as_ref()
@@ -3854,8 +5009,8 @@ fn attach_owned_frontend(
     for name in INHERITED_SESSION_ENV {
         spec.env.insert((*name).into(), None);
     }
-    if role == FrontendRole::Lead {
-        // The lead's own session must not inherit an executor marker: its
+    if matches!(role, FrontendRole::Lead | FrontendRole::BoundedLead) {
+        // A lead-role frontend must not inherit an executor marker: its
         // app-server has none, and a frontend that carried one would make the
         // lead's own nested CLI invocations look like executor sessions. An
         // executor frontend keeps the marker it was started with.
@@ -3882,7 +5037,14 @@ fn attach_owned_frontend(
 }
 
 /// Global options before `resume`. The thread id is the only positional, so
-/// the frontend cannot submit the assignment.
+/// the frontend cannot submit the assignment. Every managed frontend runs as
+/// a remote TUI whose conversation, including its tool catalogue, is served
+/// by the harness's app-server child; the `-c features.worktrees=false` pair
+/// pins this frontend process's own configuration to the managed default and
+/// never shadows the selected profile, which travels only to the app-server
+/// child as configuration overrides. A hosted conversation whose effective
+/// catalogue still re-exposed the competing tools would be a configuration
+/// conflict to report rather than a silently accepted suppression.
 fn frontend_args(
     port: u16,
     thread_id: &str,
@@ -3894,8 +5056,13 @@ fn frontend_args(
         format!("ws://127.0.0.1:{port}"),
         "--remote-auth-token-env".into(),
         FRONTEND_TOKEN_ENV.into(),
+        "-c".into(),
+        "features.worktrees=false".into(),
     ];
-    if role == FrontendRole::Executor {
+    if matches!(role, FrontendRole::Executor | FrontendRole::BoundedLead) {
+        // Every frontend but the managed lead's own keeps the native agent
+        // capability off: an executor or bounded lead conversation must not
+        // re-expose the child-spawn tools through its own configuration.
         args.push("-c".into());
         args.push("agents.enabled=false".into());
     }
@@ -4105,12 +5272,18 @@ fn host_control_conversation(
                 Some(job),
             );
         }
-        match attach_owned_frontend(
-            plan,
-            &conversation,
-            control.presentation,
-            FrontendRole::Executor,
-        ) {
+        // A bounded lead conversation is a bounded decision participant: its
+        // frontend carries the same single-agent suppression as an executor's
+        // and never the executor marker, while a managed lead session keeps
+        // the native agent capability of the interactive CLI it hosts.
+        let frontend_role = if plan.executor_session {
+            FrontendRole::Executor
+        } else if plan.bounded_lead_session {
+            FrontendRole::BoundedLead
+        } else {
+            FrontendRole::Lead
+        };
+        match attach_owned_frontend(plan, &conversation, control.presentation, frontend_role) {
             Ok(attached) => {
                 if let Err(error) = wait_for_frontend(
                     &attached,
@@ -4229,7 +5402,9 @@ fn host_control_conversation(
     };
     let (state, _streamed_message) = state;
     // The turn's own status is terminal. The final message comes from the
-    // thread's items, never from a transport acknowledgement.
+    // thread's items, never from a transport acknowledgement; the surface
+    // already held the terminal record through its tail grace, so the
+    // accepted turn's items are read directly at this boundary.
     let (final_message, cause) = match state {
         Lifecycle::Completed => match conversation.final_message() {
             Ok(FinalMessage::Present(text)) => {
@@ -5190,7 +6365,8 @@ fn inherit_lead_endpoint(
                 note = format!("; a previous record of this slot could not be retired: {error}");
             }
             println!(
-                "executor lead channel: unavailable ({cause}); `codex-harness lead message` reports this condition and its remedy instead of sending, and this dispatch continues as before{note}. Remedy: host the lead session through `codex-harness lead start`, which records a verified endpoint for its exact thread, then dispatch again"
+                "executor lead channel: unavailable ({cause}); new lead messages require a verified live endpoint and will otherwise refuse before sending. The native queue waits until the lead turn ends and is not a delivery fallback. This dispatch continues{note}. After closing the current lead frontend, resume the same thread with `codex-harness lead start --session {}`; preserve existing executor runs",
+                lead.thread_id
             );
         }
     }
@@ -5236,7 +6412,7 @@ fn dispatch_terminal_tab(
     let workspace = binding.path.as_path();
     let wrapper = std::env::current_exe()
         .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
-    let named_window = terminal_window_name(request.source, request.terminal_window)?;
+    let named_window = terminal_window_name(request.repository, request.terminal_window)?;
     // Windows Terminal cannot address the lead's window by name or id, so hold
     // that window foreground briefly: `-w 0` then resolves to it as the most
     // recently used window of the current desktop. When that is impossible
@@ -5269,7 +6445,7 @@ fn dispatch_terminal_tab(
     )?;
     task_worktree::claim_still_held(
         request.codex_home,
-        &binding.source,
+        binding.repository(),
         binding.index,
         &binding.owner,
     )
@@ -5328,6 +6504,7 @@ fn dispatch_terminal_tab(
     println!(
         "{}",
         spawn_summary(
+            request.role,
             request.profile,
             bound,
             title,
@@ -5353,14 +6530,14 @@ fn dispatch_owned_console(
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let profile = request.profile;
-    let title = executor_title(profile, &binding.owner);
+    let title = role_title(request.role, profile, &binding.owner);
     // This process hosts the session for as long as the view runs, so it is
     // the recorded liveness of the slot.
     record_lease(request.codex_home, binding)?;
     let outcome = (|| -> io::Result<i32> {
         task_worktree::claim_still_held(
             request.codex_home,
-            &binding.source,
+            binding.repository(),
             binding.index,
             &binding.owner,
         )
@@ -5382,7 +6559,15 @@ fn dispatch_owned_console(
         )?;
         println!(
             "{}",
-            spawn_summary(profile, bound, &title, receipt, "owned-console", run)
+            spawn_summary(
+                request.role,
+                profile,
+                bound,
+                &title,
+                receipt,
+                "owned-console",
+                run
+            )
         );
         // The console hosts the same tab-host wrapper as the terminal tab.
         // The native frontend owns that surface; the wrapper does not render
@@ -5428,6 +6613,7 @@ fn dispatch_owned_console(
 }
 
 fn spawn_summary(
+    role: Role,
     profile: &str,
     bound: &ProfileBinding,
     title: &str,
@@ -5454,7 +6640,8 @@ fn spawn_summary(
         ),
     };
     format!(
-        "executor dispatch accepted: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\" (native start is observed, not implied)\nreceipt: {}\nobservation: {observation}\nwatch: codex-harness executor watch --receipt {}",
+        "{} dispatch accepted: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\" (native start is observed, not implied)\nreceipt: {}\nobservation: {observation}\nwatch: codex-harness executor watch --receipt {}",
+        role.label(),
         receipt.display(),
         receipt.display()
     )
@@ -6366,6 +7553,46 @@ fn invalid(message: &str) -> io::Error {
 mod tests {
     use super::*;
 
+    /// Managed lead, bounded lead and executor frontends are remote TUI
+    /// processes whose conversation is served by the harness's app-server
+    /// child. Every role carries the managed `features.worktrees=false` default
+    /// in the frontend's own configuration before the resume subcommand, which
+    /// keeps the thread id as its only positional; the pair stays scoped to
+    /// this process, so the selected profile is never shadowed here.
+    #[test]
+    fn managed_frontends_suppress_the_native_worktree_tool_surface() {
+        let pair = ["-c", "features.worktrees=false"];
+        for role in [
+            FrontendRole::Executor,
+            FrontendRole::BoundedLead,
+            FrontendRole::Lead,
+        ] {
+            let args = frontend_args(1, "thread-1", NativePresentation::NativeInline, role);
+            assert!(
+                args.iter().any(|arg| arg == "--remote"),
+                "{role:?} frontend args must stay a remote TUI: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "--profile"),
+                "{role:?}: the selected profile travels to the app-server child and must not be shadowed by the frontend pin: {args:?}"
+            );
+            assert!(
+                args.windows(2)
+                    .any(|window| window[0] == pair[0] && window[1] == pair[1]),
+                "{role:?} frontend args lack {pair:?}: {args:?}"
+            );
+            let resume = args
+                .iter()
+                .position(|arg| arg == "resume")
+                .unwrap_or_else(|| panic!("{role:?} frontend args lack resume: {args:?}"));
+            assert_eq!(
+                resume + 2,
+                args.len(),
+                "{role:?}: the thread id stays the only positional: {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn restart_handoff_is_bounded_and_keeps_the_original_assignment_separate() {
         let progress = "test command interrupted; check its result before reuse";
@@ -6385,9 +7612,9 @@ mod tests {
     }
 
     /// Free text renders through the instruction owner: the caller's words stay
-    /// first and the installed rule follows, so `--exec` carries the lead
-    /// channel, the waiting behavior and the answer-required watch result
-    /// without the caller repeating them or teaching address discovery.
+    /// first and the small task contract follows, so `--exec` carries the
+    /// consumer and the concrete feedback address without the caller repeating
+    /// them and without restating the role-owned standing guidance.
     #[test]
     fn free_text_assignment_renders_the_executor_assignment_guidance() {
         let root = std::env::temp_dir().join(format!("executor-free-text-{}", std::process::id()));
@@ -6396,12 +7623,17 @@ mod tests {
         let request = Dispatch {
             codex_home: &root,
             source: &root,
+            repository: &root,
             pool_size: 2,
+            max_concurrency: 1,
             named_slot: None,
             owner: "exec-ds-7",
             base: None,
+            task: None,
+            handle: None,
             profile: "ds",
             prompt: PromptSource::FreeText("finish the sample outcome".into()),
+            role: Role::Executor,
             mode: SpawnMode::Exec,
             resumed_session: None,
             terminal_profile: None,
@@ -6411,10 +7643,13 @@ mod tests {
             index: 1,
             path: root.clone(),
             source: root.clone(),
+            repository: None,
             owner: "exec-ds-7".into(),
             base: "abc123".into(),
             remote: "origin".into(),
             branch: Some("main".into()),
+            task: None,
+            handle: None,
         };
         let text = resolve_prompt(&request, &binding).unwrap();
         assert!(text.starts_with("finish the sample outcome"), "{text}");
@@ -6426,21 +7661,19 @@ mod tests {
             "a streamed or typed assignment renders one brief"
         );
         assert!(
-            text.contains("by piping codex-harness lead message"),
+            text.contains("feedback: return the result and any decision you escalate to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
             "{text}"
         );
-        assert!(
-            text.contains("asks for a reply unless --notify marks a notice that needs none"),
-            "{text}"
-        );
-        assert!(
-            text.contains("An executor watch result of 3 means answer that request"),
-            "{text}"
-        );
-        assert!(
-            text.contains("durable blockers, decisions and results stay on the bd issue"),
-            "{text}"
-        );
+        // Standing exchange guidance is owned by the executor role fragment
+        // and is not restated in the rendered brief.
+        for standing in [
+            "by piping codex-harness lead message",
+            "An executor watch result of 3 means answer that request",
+            "durable blockers, decisions and results stay on the bd issue",
+            "report a compact result: done and remaining work",
+        ] {
+            assert!(!text.contains(standing), "{standing}\n{text}");
+        }
         assert!(!text.contains("--session"), "{text}");
         let _ = fs::remove_dir_all(root);
     }
@@ -6490,16 +7723,22 @@ mod tests {
             "an owner mismatch is not adopted at the deadline"
         );
 
+        // The dead-run premise is an inspectable identity, not an assumed-free
+        // pid: this very test process is live, so it opens for inspection, and
+        // the deliberately mismatched creation time is the reused-pid case the
+        // recorded identity must reject. An arbitrary pid could name another
+        // user's process and be conservatively treated as still running.
+        let live = observation::host_identity().unwrap();
         let mut dead = waiting.clone();
         dead["observation"]["host"] = json!({
-            "pid": 4242,
-            "created": 1,
-            "program": root.path().join("absent-host.exe").to_string_lossy()
+            "pid": live.pid,
+            "created": live.created + 1,
+            "program": live.program
         });
         fs::write(&receipt, serde_json::to_vec_pretty(&dead).unwrap()).unwrap();
         assert!(
             waiting_at_deadline(&receipt, None).is_none(),
-            "a dead run is not waiting"
+            "a run whose recorded host identity no longer exists is not waiting"
         );
     }
 
@@ -6634,6 +7873,110 @@ mod tests {
         );
     }
 
+    /// The bounded lead entries parse only their own bounded request: an
+    /// unknown or delegating option, a missing value, a missing owner and an
+    /// ambiguous assignment source are refused before any slot, launcher or
+    /// model request, and the usage names both entries and their own flags.
+    #[test]
+    fn lead_dispatch_parses_its_own_options_and_refuses_the_rest() {
+        let unknown =
+            lead_dispatch(&[OsString::from("--thread"), OsString::from("x")]).unwrap_err();
+        let message = unknown.to_string();
+        assert!(
+            message.contains("invalid lead dispatch option --thread"),
+            "{message}"
+        );
+        for name in [
+            "--source",
+            "--codex-home",
+            "--owner",
+            "--base",
+            "--exec",
+            "--assignment",
+        ] {
+            assert!(message.contains(name), "{message}");
+        }
+        let missing_value = lead_dispatch(&[OsString::from("--source")]).unwrap_err();
+        assert!(
+            missing_value
+                .to_string()
+                .contains("invalid lead dispatch option --source"),
+            "{missing_value}"
+        );
+        let delegated =
+            lead_dispatch(&[OsString::from("--lead"), OsString::from("t-1")]).unwrap_err();
+        assert!(
+            delegated.to_string().contains("caller-supplied lead id"),
+            "{delegated}"
+        );
+        let missing_owner = lead_dispatch(&[
+            OsString::from("--source"),
+            OsString::from(r"D:\absent"),
+            OsString::from("--codex-home"),
+            OsString::from(r"D:\absent-home"),
+            OsString::from("--exec"),
+            OsString::from("text"),
+        ])
+        .unwrap_err();
+        assert!(
+            missing_owner
+                .to_string()
+                .contains("lead dispatch --owner is required"),
+            "{missing_owner}"
+        );
+        let conflict = lead_dispatch(&[
+            OsString::from("--source"),
+            OsString::from(r"D:\absent"),
+            OsString::from("--codex-home"),
+            OsString::from(r"D:\absent-home"),
+            OsString::from("--owner"),
+            OsString::from("lead-exp-1"),
+            OsString::from("--exec"),
+            OsString::from("text"),
+            OsString::from("--assignment"),
+            OsString::from(r"D:\absent.json"),
+        ])
+        .unwrap_err();
+        assert!(
+            conflict.to_string().contains("mutually exclusive"),
+            "{conflict}"
+        );
+        assert!(lead_dispatch(&[OsString::from("--help")]).is_ok());
+        assert!(lead_resume(&[OsString::from("--help")]).is_ok());
+        let wrong_entry =
+            lead_resume(&[OsString::from("--lead"), OsString::from("t-1")]).unwrap_err();
+        assert!(
+            wrong_entry.to_string().contains("caller-supplied lead id"),
+            "{wrong_entry}"
+        );
+        let missing_slot = lead_resume(&[
+            OsString::from("--source"),
+            OsString::from(r"D:\absent"),
+            OsString::from("--codex-home"),
+            OsString::from(r"D:\absent-home"),
+            OsString::from("--owner"),
+            OsString::from("lead-exp-1"),
+            OsString::from("--exec"),
+            OsString::from("text"),
+        ])
+        .unwrap_err();
+        assert!(
+            missing_slot
+                .to_string()
+                .contains("lead resume --slot is required"),
+            "{missing_slot}"
+        );
+        let usage = LEAD_DISPATCH_USAGE;
+        assert!(usage.contains("codex-harness lead dispatch"), "{usage}");
+        assert!(usage.contains("codex-harness lead resume"), "{usage}");
+        assert!(usage.contains("--owner LABEL"), "{usage}");
+        assert!(usage.contains("--assignment FILE"), "{usage}");
+        assert!(
+            usage.contains("refused before any model request"),
+            "{usage}"
+        );
+    }
+
     #[test]
     fn an_executor_never_hosts_a_lead_session() {
         refuse_lead_hosting(None).unwrap();
@@ -6646,9 +7989,56 @@ mod tests {
         assert!(message.contains("lead message"), "{message}");
     }
 
-    /// The one asymmetry the lead's own session needs: it keeps the native
-    /// agent capability and the native settings, while an executor
-    /// conversation stays marked and single-agent.
+    /// A bounded lead conversation never hosts or dispatches another lead
+    /// conversation: its own marker refuses the lead entries before any slot,
+    /// process or model request.
+    #[test]
+    fn a_bounded_lead_conversation_never_creates_another_lead() {
+        refuse_bounded_lead_recursion(None).unwrap();
+        let error = refuse_bounded_lead_recursion(Some("1".into())).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "bounded lead conversations cannot host or dispatch another lead conversation"
+            ),
+            "{message}"
+        );
+        assert!(message.contains(BOUNDED_LEAD_SESSION_ENV), "{message}");
+        assert!(
+            message.contains("return the decision to the lead"),
+            "{message}"
+        );
+    }
+
+    /// A bounded lead conversation never starts a further model conversation
+    /// through the executor entries either: dispatch, continuation and receipt
+    /// hosting refuse before any slot, launcher or model request, and the
+    /// refusal names the channel back to the dispatching lead. Ordinary
+    /// executors and managed lead sessions carry no such marker and stay
+    /// untouched.
+    #[test]
+    fn a_bounded_lead_conversation_never_dispatches_further_conversations() {
+        refuse_bounded_lead_dispatch(None).unwrap();
+        let error = refuse_bounded_lead_dispatch(Some("1".into())).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "bounded lead conversations cannot dispatch executors or host another model conversation"
+            ),
+            "{message}"
+        );
+        assert!(message.contains(BOUNDED_LEAD_SESSION_ENV), "{message}");
+        assert!(
+            message.contains("return the decision to the lead that dispatched this conversation"),
+            "{message}"
+        );
+    }
+
+    /// The one asymmetry the lead's own session needs: a managed lead session
+    /// keeps the native agent capability and the native settings, while an
+    /// executor conversation stays marked and single-agent and a bounded lead
+    /// conversation keeps the lead identity with its own marker and the same
+    /// single-agent suppression.
     #[test]
     fn a_lead_session_is_not_an_executor_session() {
         let home = PathBuf::from(r"C:\harness-home");
@@ -6676,12 +8066,26 @@ mod tests {
             &home,
             &slot,
             lead_title("default", &slot),
-            identity,
+            identity.clone(),
             ControlPaths::for_lead_host(&home, 4242),
         );
         lead.executor_session = false;
+        let mut bounded = ControlPlan::new(
+            Path::new("codex.exe"),
+            &home,
+            &slot,
+            lead_title("default", &slot),
+            identity,
+            ControlPaths::for_lead_host(&home, 4242),
+        );
+        bounded.executor_session = false;
+        bounded.bounded_lead_session = true;
+        bounded
+            .env
+            .insert(BOUNDED_LEAD_SESSION_ENV.into(), Some("1".into()));
         let executor_spec = control::app_server_spec(&executor, 51234);
         let lead_spec = control::app_server_spec(&lead, 51235);
+        let bounded_spec = control::app_server_spec(&bounded, 51236);
         let args = |spec: &harness_core::process::CommandSpec| {
             spec.args
                 .iter()
@@ -6702,6 +8106,13 @@ mod tests {
             "{:?}",
             args(&lead_spec)
         );
+        assert!(
+            args(&bounded_spec)
+                .windows(2)
+                .any(|pair| pair == ["-c", "agents.enabled=false"]),
+            "a bounded lead conversation runs the single-agent suppression: {:?}",
+            args(&bounded_spec)
+        );
         assert_eq!(
             executor_spec
                 .env
@@ -6714,7 +8125,22 @@ mod tests {
                 .get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
             None
         );
-        for spec in [&executor_spec, &lead_spec] {
+        // The bounded lead's own marker reaches its app-server child and the
+        // executor marker does not: the child's tools refuse further model
+        // conversations without ever looking like an executor session.
+        assert_eq!(
+            bounded_spec
+                .env
+                .get(std::ffi::OsStr::new(BOUNDED_LEAD_SESSION_ENV)),
+            Some(&Some(OsString::from("1")))
+        );
+        assert_eq!(
+            bounded_spec
+                .env
+                .get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
+            None
+        );
+        for spec in [&executor_spec, &lead_spec, &bounded_spec] {
             // Neither child inherits a session identity that is not its own,
             // and both run in the checkout they serve.
             assert_eq!(
@@ -6745,6 +8171,20 @@ mod tests {
         );
         assert!(lead_frontend.iter().any(|arg| arg == "--remote"));
         assert_eq!(lead_frontend.last().unwrap(), "thread-1");
+        let bounded_frontend = frontend_args(
+            9,
+            "thread-1",
+            NativePresentation::NativeTui,
+            FrontendRole::BoundedLead,
+        );
+        assert!(
+            bounded_frontend
+                .iter()
+                .any(|arg| arg == "agents.enabled=false"),
+            "a bounded lead frontend runs the single-agent suppression: {bounded_frontend:?}"
+        );
+        assert!(bounded_frontend.iter().any(|arg| arg == "--remote"));
+        assert_eq!(bounded_frontend.last().unwrap(), "thread-1");
         assert!(
             frontend_args(
                 9,
@@ -7180,6 +8620,7 @@ mod tests {
             reasoning_effort: Some("max".into()),
         };
         let summary = spawn_summary(
+            Role::Executor,
             "ds",
             &bound,
             "CEx (ds)",
@@ -7256,6 +8697,36 @@ mod tests {
         // its prefix, which is exactly what the attach guard checks.
         let caption = format!("{first} | ready");
         assert!(caption.starts_with(&format!("{first} | ")));
+    }
+
+    /// A bounded lead conversation's console title names the lead role and its
+    /// own dispatch owner, stays bounded for long owners and stays distinct
+    /// from an executor title of the same owner and profile.
+    #[test]
+    fn bounded_lead_titles_are_role_named_bounded_and_distinct() {
+        assert_eq!(
+            lead_dispatch_title("default", "lead-exp-1"),
+            "CLead (default) - lead-exp-1"
+        );
+        assert_ne!(
+            lead_dispatch_title("default", "owner"),
+            executor_title("default", "owner")
+        );
+        assert_eq!(
+            role_title(Role::Lead, "default", "owner"),
+            lead_dispatch_title("default", "owner")
+        );
+        assert_eq!(
+            role_title(Role::Executor, "default", "owner"),
+            executor_title("default", "owner")
+        );
+        let long_a = format!("lead-{}", "a".repeat(160));
+        let long_b = format!("lead-{}", "b".repeat(160));
+        let first = lead_dispatch_title("default", &long_a);
+        assert!(first.starts_with("CLead (default) - "), "{first}");
+        assert!(first.chars().count() <= EXECUTOR_TITLE_LIMIT, "{first}");
+        assert_ne!(first, lead_dispatch_title("default", &long_b));
+        assert_eq!(first, lead_dispatch_title("default", &long_a));
     }
 
     #[test]
@@ -7362,6 +8833,7 @@ mod tests {
             schema: control::ORIGINATING_LEAD_SCHEMA,
             thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2301".into(),
             run_generation: "test-run-generation".into(),
+            home: None,
             dispatcher: control::DispatcherIdentity {
                 pid: std::process::id(),
                 creation_time: 1,
@@ -7372,20 +8844,31 @@ mod tests {
         let observed =
             RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
         let exec = root.join("spawn-1.json");
+        // The dispatch resolves the managed role before launch and records it
+        // on the route: this is the exact record the host applies later.
+        let mut route = HostRoute::Control(Box::new(ControlReceipt {
+            schema: CONTROL_SCHEMA,
+            assignment: assignment.to_owned(),
+            original_assignment: None,
+            identity: BoundIdentity::resolve(&bound),
+            presentation: NativePresentation::NativeInline,
+            port: None,
+            resume_session: None,
+            role: None,
+        }));
+        route.set_role(RoleReceipt {
+            role: "executor".into(),
+            revision: "fixture-revision".into(),
+            args: vec!["-c".into(), "developer_instructions=Executor text".into()],
+            previous: None,
+            saved: Some("fixture-revision".into()),
+        });
         save_receipt(
             &exec,
             Path::new(r"C:\home\harness\bin\codex.exe"),
             "ds",
             SpawnMode::Exec,
-            &HostRoute::Control(Box::new(ControlReceipt {
-                schema: CONTROL_SCHEMA,
-                assignment: assignment.to_owned(),
-                original_assignment: None,
-                identity: BoundIdentity::resolve(&bound),
-                presentation: NativePresentation::NativeInline,
-                port: None,
-                resume_session: None,
-            })),
+            &route,
             &bound,
             None,
             "windows-terminal-tab",
@@ -7410,6 +8893,20 @@ mod tests {
         );
         assert_eq!(value["control"]["schema"], 1, "{value}");
         assert_eq!(value["control"]["assignment"], assignment, "{value}");
+        let recorded = role_from_receipt(&value).unwrap().unwrap();
+        assert_eq!(recorded.role, "executor");
+        assert_eq!(recorded.revision, "fixture-revision");
+        assert_eq!(
+            recorded.args,
+            ["-c", "developer_instructions=Executor text"],
+            "the exact composed pairs are recorded for the host: {value}"
+        );
+        assert!(recorded.previous.is_none(), "{value}");
+        assert_eq!(
+            recorded.saved.as_deref(),
+            Some("fixture-revision"),
+            "a fresh dispatch persists the text it consumed as saved: {value}"
+        );
         assert_eq!(value["control"]["identity"]["profile"], "ds", "{value}");
         assert_eq!(value["control"]["identity"]["model"], "deepseek-flash");
         assert_eq!(value["control"]["identity"]["modelProvider"], "deepseek");
@@ -7436,6 +8933,7 @@ mod tests {
                 presentation: NativePresentation::NativeTui,
                 port: None,
                 resume_session: None,
+                role: None,
             })),
             &bound,
             None,
@@ -7450,9 +8948,429 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&tui).unwrap()).unwrap();
         assert_eq!(value["mode"], "tui");
         assert_eq!(value["control"]["presentation"], "native-tui");
+        assert!(
+            value["control"].get("role").is_none(),
+            "a receipt without a resolved role omits the field instead of inventing one: {value}"
+        );
         assert_eq!(value["args"], json!([]), "{value}");
         assert_eq!(value["observation"]["coverage"], "native");
         assert_eq!(value["control"]["assignment"], assignment);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The role record round-trips through the receipt JSON exactly as the
+    /// dispatch resolved it, and the one-line summary distinguishes the
+    /// freshly resolved source revision from the saved developer text, never
+    /// reporting text a resumed thread did not load.
+    #[test]
+    fn role_receipts_round_trip_and_summarize_effective_and_previous_revisions() {
+        let value = json!({
+            "control": {
+                "schema": 1,
+                "role": {
+                    "role": "executor",
+                    "revision": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "args": ["-c", "developer_instructions=Executor text"]
+                }
+            }
+        });
+        let role = role_from_receipt(&value).unwrap().unwrap();
+        assert_eq!(role.role, "executor");
+        assert_eq!(role.args, ["-c", "developer_instructions=Executor text"]);
+        assert!(role.previous.is_none());
+        assert!(role.saved.is_none());
+        // A receipt written before saved-revision recording, from a fresh
+        // start (`previous` none), is reliably known to keep its resolved
+        // revision: that start consumed exactly that text.
+        assert_eq!(
+            role.known_saved().as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        let summary = role.summary();
+        assert!(summary.contains("role=executor"), "{summary}");
+        assert!(summary.contains("revision=0123456789abcdef"), "{summary}");
+        assert!(summary.contains("saved=0123456789abcdef"), "{summary}");
+        assert!(summary.contains("previous=none"), "{summary}");
+
+        let resumed = json!({
+            "control": {
+                "role": {
+                    "role": "executor",
+                    "revision": "new-revision",
+                    "args": [],
+                    "previous": {"recorded": true, "revision": "old-revision"},
+                    "saved": "saved-revision"
+                }
+            }
+        });
+        let summary = role_from_receipt(&resumed).unwrap().unwrap().summary();
+        assert!(summary.contains("revision=new-revision"), "{summary}");
+        assert!(summary.contains("saved=saved-revision"), "{summary}");
+        assert!(
+            !summary.contains("saved=new-revision"),
+            "the freshly resolved revision must not be reported as the saved text: {summary}"
+        );
+        assert!(
+            summary.contains("keeps the developer text saved at its start"),
+            "the summary must not imply resumed turns loaded newer text: {summary}"
+        );
+        assert!(summary.contains("old-revision"), "{summary}");
+
+        // A receipt without a persisted saved revision and without a fresh
+        // start to trust (`previous` present) keeps explicit uncertainty
+        // instead of claiming the freshly resolved text.
+        let ambiguous = json!({
+            "control": {
+                "role": {
+                    "role": "executor",
+                    "revision": "new-revision",
+                    "args": [],
+                    "previous": {"recorded": true, "revision": "old-revision"}
+                }
+            }
+        });
+        let summary = role_from_receipt(&ambiguous).unwrap().unwrap().summary();
+        assert!(summary.contains("saved=unrecorded"), "{summary}");
+        assert!(summary.contains("not reliably recorded"), "{summary}");
+
+        // A receipt written before role recording applies nothing and reports
+        // that instead of re-resolving a role at host time.
+        assert!(
+            role_from_receipt(&json!({"control": {"schema": 1}}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(role_from_receipt(&json!({})).unwrap().is_none());
+
+        // A damaged record is refused instead of being silently ignored.
+        let error = role_from_receipt(&json!({"control": {"role": {"role": "executor"}}}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("dispatch receipt role context is invalid"),
+            "{error}"
+        );
+    }
+
+    /// A continued dispatch reads the receipt it is about to replace: the
+    /// predecessor claim for honest reporting, and, when the native thread is
+    /// resumed rather than restarted, the developer text that thread is known
+    /// to keep. Everything not reliably known stays unrecorded.
+    #[test]
+    fn continued_role_reads_the_predecessor_claim_and_the_known_saved_text() {
+        let root =
+            std::env::temp_dir().join(format!("executor-continued-role-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("spawn-1.json");
+
+        // A fresh spawn continues nothing and consumes its own resolved text.
+        let (previous, saved) =
+            continued_role(&receipt, false, false, "fresh-text", Role::Executor).unwrap();
+        assert!(previous.is_none());
+        assert_eq!(saved.as_deref(), Some("fresh-text"));
+
+        // A resume of a missing receipt records no predecessor and no saved
+        // text; a restart still consumes this dispatch's resolved text.
+        let (previous, saved) =
+            continued_role(&receipt, true, true, "resolved", Role::Executor).unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert!(saved.is_none());
+        let (previous, saved) =
+            continued_role(&receipt, true, false, "restarted-text", Role::Executor).unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert_eq!(saved.as_deref(), Some("restarted-text"));
+
+        fs::write(&receipt, json!({"schema": 1}).to_string()).unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, true, "resolved", Role::Executor).unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert!(saved.is_none(), "a legacy receipt records no saved text");
+        let (previous, saved) =
+            continued_role(&receipt, true, false, "restarted-text", Role::Executor).unwrap();
+        assert!(!previous.unwrap().recorded);
+        assert_eq!(
+            saved.as_deref(),
+            Some("restarted-text"),
+            "a restart consumes the current revision even when the replaced receipt predates role recording"
+        );
+
+        // A restart starts a fresh conversation: it consumes this dispatch's
+        // resolved text while still naming the predecessor's own record.
+        fs::write(
+            &receipt,
+            json!({"control": {"role": {"role": "executor", "revision": "kept-revision", "args": [], "saved": "kept-revision"}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (previous, saved) =
+            continued_role(&receipt, true, false, "restarted-text", Role::Executor).unwrap();
+        let previous = previous.unwrap();
+        assert!(previous.recorded);
+        assert_eq!(previous.revision.as_deref(), Some("kept-revision"));
+        assert_eq!(saved.as_deref(), Some("restarted-text"));
+
+        // A resume keeps the predecessor's persisted saved text.
+        let (previous, saved) =
+            continued_role(&receipt, true, true, "resolved-later", Role::Executor).unwrap();
+        assert!(previous.unwrap().recorded);
+        assert_eq!(saved.as_deref(), Some("kept-revision"));
+
+        // A receipt written before saved-revision recording is trusted only
+        // when it was a fresh start (no predecessor), whose resolved revision
+        // is exactly the text it consumed.
+        let old_fresh = root.join("old-fresh.json");
+        fs::write(
+            &old_fresh,
+            json!({"control": {"role": {"role": "executor", "revision": "original-revision", "args": []}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (_, saved) =
+            continued_role(&old_fresh, true, true, "resolved-later", Role::Executor).unwrap();
+        assert_eq!(saved.as_deref(), Some("original-revision"));
+
+        // A continued old-format receipt cannot distinguish a resume from a
+        // restart: its original saved text stays explicitly unknown.
+        let old_continued = root.join("old-continued.json");
+        fs::write(
+            &old_continued,
+            json!({"control": {"role": {"role": "executor", "revision": "dispatch-revision", "args": [], "previous": {"recorded": true, "revision": "even-earlier"}}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (previous, saved) =
+            continued_role(&old_continued, true, true, "resolved-later", Role::Executor).unwrap();
+        assert!(previous.unwrap().recorded);
+        assert!(
+            saved.is_none(),
+            "an ambiguous old record must not claim a saved revision"
+        );
+
+        // A continued conversation never changes responsibility role: the
+        // receipt's recorded role is what the thread actually runs under, so
+        // another role's entry point refuses before it resolves anything for
+        // its own role. The same receipt continues cleanly under its own.
+        let lead_receipt = root.join("lead-role.json");
+        fs::write(
+            &lead_receipt,
+            json!({"control": {"role": {"role": "lead", "revision": "lead-revision", "args": [], "saved": "lead-revision"}}})
+                .to_string(),
+        )
+        .unwrap();
+        let mismatch =
+            continued_role(&lead_receipt, true, true, "resolved", Role::Executor).unwrap_err();
+        let message = mismatch.to_string();
+        assert!(message.contains("role mismatch"), "{message}");
+        assert!(message.contains("records a lead conversation"), "{message}");
+        assert!(message.contains("continue it as executor"), "{message}");
+        let (previous, saved) =
+            continued_role(&lead_receipt, false, false, "fresh-text", Role::Lead).unwrap();
+        assert!(
+            previous.is_none(),
+            "a fresh lead dispatch continues nothing"
+        );
+        assert_eq!(saved.as_deref(), Some("fresh-text"));
+        let (previous, saved) =
+            continued_role(&lead_receipt, true, true, "resolved", Role::Lead).unwrap();
+        assert!(previous.unwrap().recorded);
+        assert_eq!(saved.as_deref(), Some("lead-revision"));
+        let executor_receipt = root.join("executor-role.json");
+        fs::write(
+            &executor_receipt,
+            json!({"control": {"role": {"role": "executor", "revision": "executor-revision", "args": []}}})
+                .to_string(),
+        )
+        .unwrap();
+        let mismatch =
+            continued_role(&executor_receipt, true, true, "resolved", Role::Lead).unwrap_err();
+        assert!(mismatch.to_string().contains("role mismatch"), "{mismatch}");
+        fs::write(&executor_receipt, json!({"schema": 1}).to_string()).unwrap();
+        let (previous, saved) =
+            continued_role(&executor_receipt, true, true, "resolved", Role::Lead).unwrap();
+        assert!(
+            !previous.unwrap().recorded,
+            "a legacy receipt records no role and continues as neither"
+        );
+        assert!(saved.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Start R0, resume after R1 and R2 source edits, then restart: the
+    /// persisted receipt must keep naming the original saved developer text
+    /// across repeated resumes and never report the freshly resolved revision
+    /// as consumed by a resumed thread. A restart starts a fresh conversation
+    /// and does adopt the current revision.
+    #[test]
+    fn saved_role_revision_survives_repeated_resumes_and_restart_adopts_current_text() {
+        let root = std::env::temp_dir().join(format!("executor-saved-role-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("spawn-1.json");
+        let bound = ProfileBinding {
+            profile: "ds".into(),
+            model: Some("deepseek-flash".into()),
+            model_provider: Some("deepseek".into()),
+            reasoning_effort: Some("max".into()),
+        };
+        let shell = crate::executor_shell::PreparedShell {
+            path: r"C:\Tools\PowerShell\7".into(),
+            executable: PathBuf::from(r"C:\Tools\PowerShell\7\pwsh.exe"),
+            version: "PowerShell 7.6.6".into(),
+            sandbox_mode: "danger-full-access".into(),
+        };
+        let lead = control::OriginatingLead {
+            schema: control::ORIGINATING_LEAD_SCHEMA,
+            thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2302".into(),
+            run_generation: "test-run-generation".into(),
+            home: None,
+            dispatcher: control::DispatcherIdentity {
+                pid: std::process::id(),
+                creation_time: 1,
+                program: PathBuf::from(r"C:\home\lead\codex.exe"),
+            },
+        };
+        let observed =
+            RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
+        // Each step is the dispatch accounting exactly as role_receipt
+        // applies it, persisted through the real receipt writer and read back.
+        let dispatch =
+            |continues_session: bool, resumes_saved_thread: bool, resolved: &str| -> RoleReceipt {
+                let (previous, saved) = continued_role(
+                    &receipt,
+                    continues_session,
+                    resumes_saved_thread,
+                    resolved,
+                    Role::Executor,
+                )
+                .unwrap();
+                let mut route = HostRoute::Control(Box::new(ControlReceipt {
+                    schema: CONTROL_SCHEMA,
+                    assignment: "Continue the outcome.".into(),
+                    original_assignment: None,
+                    identity: BoundIdentity::resolve(&bound),
+                    presentation: NativePresentation::NativeTui,
+                    port: None,
+                    resume_session: None,
+                    role: None,
+                }));
+                route.set_role(RoleReceipt {
+                    role: "executor".into(),
+                    revision: resolved.into(),
+                    args: vec!["-c".into(), "developer_instructions=Executor text".into()],
+                    previous,
+                    saved,
+                });
+                save_receipt(
+                    &receipt,
+                    Path::new(r"C:\home\harness\bin\codex.exe"),
+                    "ds",
+                    SpawnMode::Exec,
+                    &route,
+                    &bound,
+                    None,
+                    "windows-terminal-tab",
+                    None,
+                    None,
+                    &shell,
+                    &observed,
+                    &lead,
+                )
+                .unwrap();
+                role_from_receipt(&serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap())
+                    .unwrap()
+                    .unwrap()
+            };
+
+        let spawned = dispatch(false, false, "revision-r0");
+        assert_eq!(spawned.saved.as_deref(), Some("revision-r0"));
+        assert!(spawned.previous.is_none());
+        assert!(spawned.summary().contains("saved=revision-r0"));
+
+        let first = dispatch(true, true, "revision-r1");
+        assert_eq!(first.revision, "revision-r1");
+        assert_eq!(
+            first.saved.as_deref(),
+            Some("revision-r0"),
+            "a resume keeps the text saved at the thread's start"
+        );
+        assert_eq!(
+            first.previous.as_ref().unwrap().revision.as_deref(),
+            Some("revision-r0")
+        );
+        let summary = first.summary();
+        assert!(summary.contains("saved=revision-r0"), "{summary}");
+        assert!(!summary.contains("saved=revision-r1"), "{summary}");
+        assert!(
+            summary.contains("fresh conversation consumes revision revision-r1"),
+            "{summary}"
+        );
+
+        let second = dispatch(true, true, "revision-r2");
+        assert_eq!(
+            second.saved.as_deref(),
+            Some("revision-r0"),
+            "repeated resumes must not drop the original saved revision"
+        );
+        assert_eq!(
+            second.previous.as_ref().unwrap().revision.as_deref(),
+            Some("revision-r1"),
+            "the predecessor claim stays the immediately continued dispatch's record"
+        );
+        let summary = second.summary();
+        assert!(summary.contains("revision=revision-r2"), "{summary}");
+        assert!(summary.contains("saved=revision-r0"), "{summary}");
+        assert!(!summary.contains("saved=revision-r2"), "{summary}");
+
+        let restarted = dispatch(true, false, "revision-r3");
+        assert_eq!(
+            restarted.saved.as_deref(),
+            Some("revision-r3"),
+            "a restart starts a fresh conversation that consumes the current revision"
+        );
+        assert_eq!(
+            restarted.previous.as_ref().unwrap().revision.as_deref(),
+            Some("revision-r2")
+        );
+
+        let resumed_after_restart = dispatch(true, true, "revision-r4");
+        assert_eq!(resumed_after_restart.saved.as_deref(), Some("revision-r3"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A watched control-backed receipt reports the role it continues under:
+    /// the recorded summary, an explicit unrecorded marker for receipts
+    /// written before role recording, and nothing for receipts that run the
+    /// launcher directly, which composes the role itself.
+    #[test]
+    fn watch_reports_the_recorded_role_and_marks_legacy_receipts_unrecorded() {
+        let root = std::env::temp_dir().join(format!("executor-watch-role-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("spawn-1.json");
+        let run = RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
+        let recorded = json!({
+            "control": {"role": {"role": "executor", "revision": "watch-revision", "args": []}}
+        });
+        let report = WatchReport::build(&receipt, &recorded, &run, STATE_ACCEPTED, None);
+        let text = report.text();
+        assert!(
+            text.contains(
+                "role: role=executor revision=watch-revision saved=watch-revision previous=none"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            report.json()["role"],
+            json!("role=executor revision=watch-revision saved=watch-revision previous=none")
+        );
+        let legacy = json!({"control": {"schema": 1}});
+        let report = WatchReport::build(&receipt, &legacy, &run, STATE_ACCEPTED, None);
+        let text = report.text();
+        assert!(text.contains("role: unrecorded"), "{text}");
+        let direct = json!({"mode": "exec"});
+        let report = WatchReport::build(&receipt, &direct, &run, STATE_ACCEPTED, None);
+        assert!(report.role.is_none(), "{}", report.text());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -7603,12 +9521,15 @@ mod tests {
             index: 1,
             path: PathBuf::from(r"D:\lanes\proj-wt1"),
             source: PathBuf::from(r"D:\lanes\proj"),
+            repository: None,
             owner: "exec-ds-7".into(),
             base: "abc123".into(),
             remote: "origin".into(),
             branch: Some("main".into()),
+            task: None,
+            handle: None,
         };
-        let line = slot_summary(&binding, None);
+        let line = slot_summary(Role::Executor, &binding, None);
         for expected in [
             "index=1",
             r"D:\lanes\proj-wt1",
@@ -7620,7 +9541,7 @@ mod tests {
             assert!(line.contains(expected), "{line}");
         }
         assert!(!line.contains("--workspace named slot"), "{line}");
-        let named = slot_summary(&binding, Some(2));
+        let named = slot_summary(Role::Executor, &binding, Some(2));
         assert!(
             named.contains("--workspace named slot 2; the pool bound the free slot 1"),
             "{named}"
@@ -7637,10 +9558,13 @@ mod tests {
             index: 1,
             path: source.parent().unwrap().join("proj-wt1"),
             source: source.clone(),
+            repository: None,
             owner: "exec-ds-7".into(),
             base: "abc123".into(),
             remote: "origin".into(),
             branch: Some("main".into()),
+            task: None,
+            handle: None,
         };
         assert!(
             record_lease(&home, &binding).is_err(),
@@ -7648,6 +9572,12 @@ mod tests {
         );
         write_test_slot_record(&home, &source, &binding);
         record_lease(&home, &binding).unwrap();
+        let lease = read_lease(&lease_path(&home, &source, 1).unwrap()).unwrap();
+        assert_eq!(
+            lease.program,
+            std::env::current_exe().unwrap().canonicalize().unwrap(),
+            "the lease names the canonical image the dispatch receipt records"
+        );
         assert!(
             owner_live(&home, &source, "exec-ds-7"),
             "this test process is the recorded live host"
@@ -7698,10 +9628,13 @@ mod tests {
             index: 1,
             path: source.parent().unwrap().join("proj-wt1"),
             source: source.clone(),
+            repository: None,
             owner: "exec-ds-7".into(),
             base: "abc123".into(),
             remote: "origin".into(),
             branch: Some("main".into()),
+            task: None,
+            handle: None,
         };
         // A hand-edited receipt meets the slot state reconciliation leaves
         // behind: no owner, so no ownership comparison can ever succeed.
@@ -7871,10 +9804,13 @@ mod tests {
             index: 1,
             path: slot_path.clone(),
             source: source.clone(),
+            repository: None,
             owner: "exec-ds-9".into(),
             base: "abc123".into(),
             remote: "origin".into(),
             branch: Some("main".into()),
+            task: None,
+            handle: None,
         };
         write_test_slot_record(&home, &source, &binding);
         let report = slot_report(
@@ -7985,9 +9921,16 @@ mod tests {
         let source = root.path().join("proj");
         let home = root.path().join("home");
         fs::create_dir_all(&source).unwrap();
-        let missing = recorded_session(&home, &source, 1, "exec-ds-7")
-            .unwrap_err()
-            .to_string();
+        let missing = recorded_session(
+            &home,
+            &source,
+            1,
+            "exec-ds-7",
+            "executor resume",
+            "codex-harness executor spawn",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(missing.contains("pass --session"), "{missing}");
         let receipt = receipt_path(&home, &source, 1).unwrap();
         fs::create_dir_all(receipt.parent().unwrap()).unwrap();
@@ -8002,18 +9945,28 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let legacy = recorded_session(&home, &source, 1, "exec-ds-7")
-            .unwrap_err()
-            .to_string();
+        let legacy = recorded_session(
+            &home,
+            &source,
+            1,
+            "exec-ds-7",
+            "executor resume",
+            "codex-harness executor spawn",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(legacy.contains("legacy record"), "{legacy}");
         let binding = SlotBinding {
             index: 1,
             path: source.parent().unwrap().join("proj-wt1"),
             source: source.clone(),
+            repository: None,
             owner: "exec-other".into(),
             base: "abc123".into(),
             remote: "origin".into(),
             branch: None,
+            task: None,
+            handle: None,
         };
         let mut run = RunObservation::accepted(
             PathBuf::from(r"C:\s\message-1.txt"),
@@ -8031,12 +9984,27 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let foreign = recorded_session(&home, &source, 1, "exec-ds-7")
-            .unwrap_err()
-            .to_string();
+        let foreign = recorded_session(
+            &home,
+            &source,
+            1,
+            "exec-ds-7",
+            "executor resume",
+            "codex-harness executor spawn",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(foreign.contains("belongs to owner exec-other"), "{foreign}");
         assert_eq!(
-            recorded_session(&home, &source, 1, "exec-other").unwrap(),
+            recorded_session(
+                &home,
+                &source,
+                1,
+                "exec-other",
+                "executor resume",
+                "codex-harness executor spawn"
+            )
+            .unwrap(),
             "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4"
         );
         // A resume attempt that never observed its own identity still
@@ -8058,7 +10026,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            recorded_session(&home, &source, 1, "exec-other").unwrap(),
+            recorded_session(
+                &home,
+                &source,
+                1,
+                "exec-other",
+                "executor resume",
+                "codex-harness executor spawn"
+            )
+            .unwrap(),
             "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5"
         );
         let _ = fs::remove_dir_all(root);

@@ -78,8 +78,8 @@ runs DeepSeek V4.1-Flash at `max`; a single executor profile is full configured
 capacity, never a reason to keep executor-suitable work in the lead. Routing
 wording that seems to demand another model or per-task arguments is reported as
 a discrepancy while dispatch proceeds; only a launcher-reported failure blocks
-dispatch. `max_concurrent_executors` also sizes the executor worktree pool, and
-`executor spawn` - not the lead - allocates its slots.
+dispatch. `worktree_pool_size` sizes the shared worktree pool independently of
+that executor limit, and `executor spawn` - not the lead - allocates its slots.
 
 ## Board setup
 
@@ -131,10 +131,13 @@ TUI on the same observed lifecycle, not an unobserved launcher.
 For file-specific work, prefer `--assignment FILE` - or pipe the assignment
 into `--exec -` - instead of a long `--exec` argument; its required fields are
 `objective` (include the board id), `inputs`, `outputs`, `invariants` and
-`acceptance`, and `consumer` and `escalate` are additive. The brief itself
-carries the standing
-boundaries, the executor's work cycle and the compact result expected back, so
-do not restate those in the objective. `codex-harness lead message` (piped
+`acceptance`, and `consumer` and `escalate` are additive. The brief carries
+the task contract: outcome, checkout, base, owned paths, checks, consumer,
+feedback address and additional escalation boundaries. The executor's standing
+guidance - work cycle, base verification, heavy-command lane, feedback and
+waiting rules, and compact result shape - reaches a managed session once
+through its resolved role context, so
+do not restate it in the objective. `codex-harness lead message` (piped
 content or a short `--text`) addresses the originating lead itself and holds
 the run while it waits for the answer, so an executor reports its question
 instead of ending the work; ordinary implementation errors stay with the
@@ -245,7 +248,12 @@ direction or a run that cannot progress: a brief error, a slow stream, waiting
 or silence alone is not a reason to stop. Use the kit commands before killing
 processes manually; manual killing needs a recorded cause. After a stop,
 preserve the files, slot and partial work. Ordinary interruption continues by
-resuming the exact session. A runtime-proven cache-loss stop instead needs a fresh
+resuming the exact session. Resume and restart re-resolve the responsibility
+role, record it on the new receipt and report the effective role and revision
+(`role context: ...`); the continued session's earlier turns keep the
+revision they ran under, and a receipt written before role recording reports
+`role context: unrecorded` until a fresh dispatch, resume or restart records
+the current role. A runtime-proven cache-loss stop instead needs a fresh
 conversation: inspect the preserved work and follow the receipt's exact
 `executor restart` command for the same slot/owner/predecessor, which keeps
 saved work, carries the original task and requires checking interrupted
@@ -337,7 +345,7 @@ integrated state, never over it - diff and merge checkboxes and deltas instead
 of copying files wholesale.
 
 Executor slots are pool-owned, not task-owned: the pool never grows past
-`max_concurrent_executors`, and slots are reused while conversations are not.
+`worktree_pool_size`, and slots are reused while conversations are not.
 Return a finished slot to the pool through the explicit release path, which
 records your disposition before anything is destroyed:
 

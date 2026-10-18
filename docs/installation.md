@@ -262,6 +262,13 @@ bd --version
 codex-harness check --core-only --codex-home "$env:USERPROFILE/.codex" --user-home $env:USERPROFILE
 ```
 
+The check's `orchestration.roles` lists each responsibility role resolved from
+the recorded source root: `resolved` with its owned revision, or `gap` with
+the exact missing input. A gap describes what that role's sessions would not
+receive; it fails nothing else, and a managed dispatch or resume refuses
+before any launcher or model request while those inputs are missing, keeping
+its pool slot bound and recoverable.
+
 Both Codex commands must resolve under `CODEX_HOME/harness/bin`, and the MCP
 list must show enabled `serena` and `nuphus` when code tools were requested.
 Restart Codex sessions that loaded the old MCP/configuration. Persistent User
@@ -284,6 +291,7 @@ an explicit separate step.
 | --- | --- |
 | `global/principles-of-work.md`, the full global AGENTS content | `<CODEX_HOME>/AGENTS.md` |
 | `global/harness.config.toml` | live shared defaults; native TUI writes target the local base `config.toml` |
+| `global/roles.toml` and `global/roles/*.md` | resolved by managed lead/executor sessions from the recorded source root; no deployed copy |
 | Each `.agents/skills/<name>/` and its resources | `<user profile>/.agents/skills/<name>/` |
 | `global/agents/` and its resources | `<CODEX_HOME>/agents/codex-harness/` |
 | Immutable build binaries | `<CODEX_HOME>/harness/bin` launcher, manager, inspect/observe helpers and the `codex-harness-check.exe` diagnostic alias |
@@ -434,6 +442,12 @@ reported and left intact, repository files are preserved, and connections that
 already existed before installation stay untouched.
 Committed core disconnect also prints the shared CPU coverage withdrawal in
 [Shared CPU policy](#shared-cpu-policy). Preview does not.
+
+Role activation has no deployed copy to roll back: managed sessions resolve
+`global/roles.toml` and the fragments it names from the recorded source root
+([What is connected](#what-is-connected)), so Disconnect removes the delivered
+links while both roles stay resolvable, and the `check` report keeps naming
+each role's revision or its exact missing input.
 
 A local operation lock serializes installation per user. Recover rolls back an
 unfinished activation or finishes journal cleanup after a durable commit;

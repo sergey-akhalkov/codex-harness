@@ -97,6 +97,18 @@ than detecting arbitrary content changes. Retired candidates stay outside
 provisioning. Shared installations are not deleted. Native project checks
 remain available.
 
+Managed Pascal workers disable pasls's eager `workspace/symbol` index through
+`ls_specific_settings.pascal.initializationOptions.workspaceSymbols: false`.
+Serena supplies project symbol search using its own file selection and document
+symbol requests. The extra pasls startup index ignored that selection and could
+load accumulated build copies until `initialize` failed with `Out of memory
+(-32603)`. Document symbols, bodies, semantic edits and CodeTools cross-unit
+navigation remain enabled. Pasls still collects search directories and can load
+units requested by CodeTools; this setting is not universal backend ignore
+filtering. Explicit project initialization options retain their normal override
+semantics. After updating, a fresh worker receives the setting; reconnect an
+already failed owning session once instead of repeatedly activating it.
+
 Specialized controller or CNC source formats are not a managed language set.
 Extension presence does not prove a compatible language server.
 
@@ -188,6 +200,11 @@ crash, including language servers and private browsers. Pool eviction closes the
 previous owned tree before admitting a replacement. Startup locks prevent duplicate
 broker launches; retirement drains admitted work. Unfinished activation journals
 block new shared-service work until Recover resolves the transaction.
+
+An open Serena client retains the resolved immutable manager path used for its
+broker identity. Updating the installed manager link therefore leaves that
+client able to restart its own broker; new clients use the new build generation.
+Do not remove retained immutable builds while their sessions are still open.
 
 On Windows, shared brokers start through built-in local WMI as the same verified
 user, independently of the first client's process Job. They immediately establish

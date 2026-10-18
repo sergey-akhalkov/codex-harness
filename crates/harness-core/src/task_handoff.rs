@@ -40,6 +40,7 @@ pub(crate) struct Handoff {
     successor: Value,
     successor_model: String,
     successor_title: String,
+    successor_effort: Option<String>,
     attached: bool,
     pending: Option<String>,
     sequence: u64,
@@ -59,21 +60,23 @@ impl Handoff {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
             Err(error) => return Err(error),
         };
-        let (successor_model, successor_title) = match read_json::<
-            crate::orchestration_config::SuccessorChoice,
-        >(&root.path().join("successor.json"))
-        {
-            Ok(choice) if choice.schema == 1 && !choice.model.is_empty() => {
-                (choice.model, choice.title)
-            }
-            Ok(_) => {
-                return Err(io::Error::other(
-                    "successor configuration is invalid; preserving leadership",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), String::new()),
-            Err(error) => return Err(error),
-        };
+        let (successor_model, successor_title, successor_effort) =
+            match read_json::<crate::orchestration_config::SuccessorChoice>(
+                &root.path().join("successor.json"),
+            ) {
+                Ok(choice) if choice.schema == 1 && !choice.model.is_empty() => {
+                    (choice.model, choice.title, choice.reasoning_effort)
+                }
+                Ok(_) => {
+                    return Err(io::Error::other(
+                        "successor configuration is invalid; preserving leadership",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (String::new(), String::new(), None)
+                }
+                Err(error) => return Err(error),
+            };
         Ok(Self {
             phase: Phase::Waiting,
             previous,
@@ -82,6 +85,7 @@ impl Handoff {
             successor: Value::Null,
             successor_model,
             successor_title,
+            successor_effort,
             attached: false,
             pending: None,
             sequence: 0,
@@ -293,12 +297,13 @@ impl Handoff {
                     rows.iter()
                         .find(|model| model["model"] == self.successor_model)
                 }) {
-                    self.effort = supported_effort(model);
+                    self.effort = supported_effort(model, self.successor_effort.as_deref());
                     if self.effort.is_none() {
-                        return self.block(
-                            root,
-                            json!({"reason":"successor catalog has no supported non-delegating effort"}),
+                        let reason = catalog_effort_refusal(
+                            self.successor_effort.as_deref(),
+                            &self.successor_model,
                         );
+                        return self.block(root, json!({"reason": reason}));
                     }
                     self.send(root, connection, Phase::Rename, "thread/name/set", json!({"threadId":self.previous["threadId"],"name":"Previous lead - quota unavailable"}))?;
                 } else if let Some(cursor) = result["nextCursor"].as_str() {
@@ -437,8 +442,15 @@ fn same_permissions(before: &Value, after: &Value) -> bool {
     .all(|key| before[key] == after[key])
 }
 
-fn supported_effort(model: &Value) -> Option<String> {
+fn supported_effort(model: &Value, declared: Option<&str>) -> Option<String> {
     let supported = model["supportedReasoningEfforts"].as_array()?;
+    if let Some(declared) = declared {
+        return (declared != "ultra"
+            && supported
+                .iter()
+                .any(|row| row["reasoningEffort"] == declared))
+        .then(|| declared.to_owned());
+    }
     [Some("high"), model["defaultReasoningEffort"].as_str()]
         .into_iter()
         .flatten()
@@ -449,6 +461,15 @@ fn supported_effort(model: &Value) -> Option<String> {
                     .any(|row| row["reasoningEffort"] == *effort)
         })
         .map(str::to_owned)
+}
+
+fn catalog_effort_refusal(declared: Option<&str>, model: &str) -> String {
+    match declared {
+        Some(declared) => format!(
+            "configured successor effort {declared} is unsupported by successor model {model}; correct the successor profile or the installed catalog instead of choosing a fallback"
+        ),
+        None => "successor catalog has no supported non-delegating effort".to_owned(),
+    }
 }
 
 fn visible_history(thread: &Value) -> Result<Vec<Value>, &'static str> {
@@ -526,9 +547,10 @@ mod tests {
             root.path(),
             &crate::orchestration_config::SuccessorChoice {
                 schema: 1,
-                profile: "zai".into(),
-                model: "zai/glm-5.3".into(),
-                title: "Z.AI temporary lead".into(),
+                profile: "ds".into(),
+                model: "deepseek-flash".into(),
+                title: "ds temporary lead".into(),
+                reasoning_effort: None,
             },
         )
         .unwrap();
@@ -618,7 +640,7 @@ mod tests {
                 &json!({"method":"turn/started","params":{"threadId":"lead","turn":{"id":"new"}}}),
             )
             .unwrap();
-        handoff.event(root, &mut connection, &json!({"id":request["id"],"result":{"data":[{"model":"zai/glm-5.3","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}})).unwrap();
+        handoff.event(root, &mut connection, &json!({"id":request["id"],"result":{"data":[{"model":"deepseek-flash","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}})).unwrap();
         assert!(handoff.phase == Phase::Blocked);
         assert!(handoff.pending.is_none());
         let saved: Value = read_json(&root.path().join("handoff.json")).unwrap();
@@ -718,7 +740,107 @@ mod tests {
     #[test]
     fn unsupported_effort_and_unreconciled_images_cannot_dispatch() {
         let model = json!({"defaultReasoningEffort":"ultra","supportedReasoningEfforts":[{"reasoningEffort":"ultra"}]});
-        assert!(supported_effort(&model).is_none());
+        assert!(supported_effort(&model, None).is_none());
+        assert!(supported_effort(&model, Some("ultra")).is_none());
+        let catalog = json!({"defaultReasoningEffort":"high","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"},{"reasoningEffort":"max"}]});
+        assert_eq!(
+            supported_effort(&catalog, Some("max")).as_deref(),
+            Some("max")
+        );
+        assert!(supported_effort(&catalog, Some("xhigh")).is_none());
+        assert_eq!(supported_effort(&catalog, None).as_deref(), Some("high"));
+        let defaulted = json!({"defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"max"}]});
+        assert_eq!(
+            supported_effort(&defaulted, Some("low")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(supported_effort(&defaulted, None).as_deref(), Some("low"));
         assert!(visible_history(&json!({"turns":[{"items":[{"type":"userMessage","content":[{"type":"image","url":"owned-image"}]}]}]})).is_err());
+    }
+
+    #[test]
+    fn an_explicit_unsupported_successor_effort_names_its_cause_before_dispatch() {
+        use std::net::{Ipv4Addr, TcpListener};
+        assert_eq!(
+            catalog_effort_refusal(None, "deepseek-flash"),
+            "successor catalog has no supported non-delegating effort"
+        );
+        let mismatch = catalog_effort_refusal(Some("xhigh"), "deepseek-flash");
+        assert!(mismatch.contains("xhigh"), "{mismatch}");
+        assert!(mismatch.contains("deepseek-flash"), "{mismatch}");
+        assert!(
+            mismatch.contains("correct the successor profile or the installed catalog"),
+            "{mismatch}"
+        );
+        let prepared = BrokerRoot::prepare().unwrap();
+        let root = prepared.root();
+        save(
+            &root.path().join("leader.json"),
+            &json!({"threadId":"lead","model":"gpt-6-astra","native":{"cwd":"owned"}}),
+        )
+        .unwrap();
+        crate::orchestration_config::persist_successor(
+            root.path(),
+            &crate::orchestration_config::SuccessorChoice {
+                schema: 1,
+                profile: "ds".into(),
+                model: "deepseek-flash".into(),
+                title: "ds temporary lead".into(),
+                reasoning_effort: Some("xhigh".into()),
+            },
+        )
+        .unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server =
+            std::thread::spawn(move || tungstenite::accept(listener.accept().unwrap().0).unwrap());
+        let mut connection =
+            ControlConnection::connect(port, &"a".repeat(32), Duration::from_secs(2)).unwrap();
+        let mut server = server.join().unwrap();
+        server
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut handoff = Handoff::load(root).unwrap();
+        let tasks = BTreeMap::from([(
+            "lead".into(),
+            json!({"turns":[{"id":"refused","status":"failed","items":[{"type":"userMessage","content":[{"type":"text","text":"Inspect only"}]}]}]}),
+        )]);
+        let failures = BTreeMap::from([(
+            "lead".into(),
+            json!({"failure":{"threadId":"lead","turnId":"refused","cause":"quota"}}),
+        )]);
+        let settled = BTreeSet::from(["lead".into()]);
+        handoff
+            .tick(root, &mut connection, &tasks, &failures, &settled, &settled)
+            .unwrap();
+        let request: Value =
+            serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(request["method"], "model/list");
+        handoff
+            .event(
+                root,
+                &mut connection,
+                &json!({"id":request["id"],"result":{"data":[{"model":"deepseek-flash","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"},{"reasoningEffort":"max"}]}]}}),
+            )
+            .unwrap();
+        assert!(handoff.phase == Phase::Blocked);
+        let reason = handoff.error["reason"].as_str().unwrap();
+        assert!(reason.contains("xhigh"), "{reason}");
+        assert!(reason.contains("deepseek-flash"), "{reason}");
+        assert!(
+            !reason.contains("has no supported non-delegating effort"),
+            "{reason}"
+        );
+        assert!(handoff.effort.is_none());
+        let saved: Value = read_json(&root.path().join("handoff.json")).unwrap();
+        assert_eq!(saved["transfer"]["phase"], "blocked");
+        server
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(
+            matches!(server.read(), Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
     }
 }

@@ -1,11 +1,19 @@
 #![cfg(windows)]
 
-//! One model-free proof that `lead message` reaches the owning thread of the
-//! native app-server fixture used by
-//! `native_lead_queue_and_app_server_input_on_owning_thread`.
+//! Model-free native checks around managed and ordinary lead input.
 //!
-//! The executable comes from `HARNESS_CONTROL_CODEX_EXE` at runtime. This test
-//! starts that fixture's existing app-server; it does not add a listener,
+//! `installed_queue_endpoint_reaches_its_owning_thread` is the positive
+//! control for the installed upstream `codex queue` command against its own
+//! idle thread. `installed_queue_boundary_against_a_running_ordinary_tui`
+//! documents the upstream queue boundary that made the former queue fallback
+//! invalid for operational messages. Neither is acceptance for `lead message`:
+//! that command no longer starts the queue, and without a verified live managed
+//! endpoint it refuses before any effect with the same-thread managed resume
+//! remedy. The non-ignored `executor_message` regression owns that refusal;
+//! Root owns verification against the real installed route.
+//!
+//! The executable comes from `HARNESS_CONTROL_CODEX_EXE` at runtime. These
+//! checks start that fixture's existing app-server; they do not add a listener,
 //! daemon, launcher change, or task_control.
 //!
 //! `installed_two_leads_keep_questions_waiting_and_replies_isolated` is the
@@ -24,9 +32,14 @@
 #[path = "fixtures/control_responses.rs"]
 mod control_responses;
 
+#[path = "fixtures/skill_catalog_responses.rs"]
+mod skill_catalog_responses;
+
 use harness_core::{
     broker_state::BrokerRoot,
-    process::{CommandSpec, Job, Limits, ProcessIdentity},
+    build_identity,
+    console::{ConsoleSession, ConsoleSpec},
+    process::{Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity, StopReason},
     process_service::{self, ServiceProcess},
     task_control::ControlConnection,
     task_request::RequestIdentity,
@@ -34,12 +47,25 @@ use harness_core::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    ffi::OsString,
+    fs, io,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+/// Ordinary-lead queue boundary markers: one per installed `codex queue`
+/// invocation, so a delivery can only be attributed to the invocation that
+/// carried its mark, plus the control turn that establishes the running
+/// conversation's own thread before any queue attempt.
+const ORDINARY_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-NO-ENDPOINT-8me13";
+const ENDPOINT_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-ENDPOINT-8me13";
+const MISSING_QUEUE_MARK: &str = "ORDINARY-LEAD-QUEUE-MISSING-THREAD-8me13";
+const ORDINARY_TUI_CONTROL_PROMPT: &str = "ORDINARY-LEAD-TUI-CONTROL-PROMPT-8me13";
+const ORDINARY_TUI_CONTROL_REPLY: &str = "ORDINARY-LEAD-TUI-CONTROL-REPLY-8me13";
+/// A well-formed thread id the running receiver does not own.
+const MISSING_THREAD_ID: &str = "00000000-0000-4000-8000-000000000000";
 
 const WAIT: Duration = Duration::from_secs(20);
 /// One fresh dispatch runs the executor shell preflight before its session
@@ -49,6 +75,9 @@ const DISPATCH_WAIT: Duration = Duration::from_secs(300);
 /// plus the run's own closure is bounded well below a live model call.
 const ANSWER_WAIT: Duration = Duration::from_secs(120);
 const PAYLOAD: &str = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} from the executor\nsecond line: $(throw), %PATH%, `whoami`";
+const ACTIVE_TURN_PROMPT: &str = "ACTIVE-NATIVE-LEAD-TURN-HOLD-20261017";
+const ACTIVE_TOOL_CALL: &str = "control-active-tool-1";
+const ENVELOPE_MARK: &str = "\n---payload---\n";
 /// One native lead root: how long a request from a conversation the root has
 /// not identified yet waits for the dispatch's own session record. The record
 /// is written before the assignment is submitted, so a real run never reaches
@@ -137,21 +166,55 @@ fn seed_launcher_registration(home: &Path) {
     });
 }
 
+/// The native CLI versions the retained lead-message protocol has been run
+/// against: the historical pin, plus the installed upstream that was qualified
+/// from its own local `app-server --help` (WebSocket transport flags) and its
+/// generated protocol schema (initialize, thread/start, thread/read,
+/// turn/start, turn/steer, thread/resume). A further upstream version must be
+/// qualified the same way before this check claims it.
+const QUALIFIED_UPSTREAM_VERSIONS: &[&str] = &["0.157.0", "0.163.0"];
+
+/// Requires the fixture executable to be the installation-record upstream
+/// binary at one of the qualified versions and returns the recorded version
+/// text: the fixture hosts the installed native CLI, and a different binary or
+/// an unqualified upstream version is not this check's contract.
+fn qualified_installed_upstream(exe: &Path) -> String {
+    let upstream = installed_upstream();
+    assert!(
+        same_executable(exe, &upstream),
+        "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; this check runs the installed native CLI, not another binary",
+        exe.display(),
+        upstream.display()
+    );
+    let version = version_text(exe);
+    let qualified = QUALIFIED_UPSTREAM_VERSIONS
+        .iter()
+        .any(|candidate| version.contains(&format!("codex-cli {candidate}")));
+    assert!(
+        qualified,
+        "the installation-record upstream must be a qualified Codex CLI version (one of {QUALIFIED_UPSTREAM_VERSIONS:?}): {version}"
+    );
+    version
+}
+
 fn fixture() -> Fixture {
-    let exe = codex_exe();
     let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let responses = control_responses::Responses::start(owned_root.path().into(), true);
+    fixture_with_responses(owned_root, responses)
+}
+
+fn fixture_with_responses(
+    owned_root: BrokerRoot,
+    responses: control_responses::Responses,
+) -> Fixture {
+    let exe = codex_exe();
+    qualified_installed_upstream(&exe);
     let root = owned_root.path();
     let home = root.join("home");
     let workspace = root.join("workspace");
     fs::create_dir(&home).unwrap();
     fs::create_dir(&workspace).unwrap();
     seed_launcher_registration(&home);
-    let version = version_text(&exe);
-    assert!(
-        version.contains("codex-cli 0.157.0"),
-        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.157.0 binary: {version}"
-    );
-    let responses = control_responses::Responses::start(root.into(), true);
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
     fs::write(
         home.join("config.toml"),
@@ -274,27 +337,8 @@ impl Client {
     }
 }
 
-#[test]
-#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned native app-server fixture and canned Responses; no live model"]
-fn lead_message_reaches_the_native_owning_thread() {
-    let fixture = fixture();
+fn record_native_lead(fixture: &Fixture, thread: &str, generation: &str) -> PathBuf {
     let root = fixture.root.path();
-    let mut owner = Client::connect(fixture.port, &fixture.token);
-    let started = owner.request(
-        "thread/start",
-        json!({
-            "cwd": fixture.workspace,
-            "model": "gpt-6-astra",
-            "modelProvider": "control_fixture",
-            "allowProviderModelFallback": false,
-            "approvalPolicy": "never",
-            "sandbox": "danger-full-access"
-        }),
-    );
-    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
-    let status = owner.request("thread/read", json!({"threadId": thread}));
-    assert_eq!(status["thread"]["id"], thread);
-    assert_eq!(status["thread"]["status"]["type"], "idle", "{status}");
     let user = process_service::current_user().unwrap();
     let server = ServiceProcess::inspect(fixture.server, &fixture.exe, &user)
         .unwrap()
@@ -305,7 +349,6 @@ fn lead_message_reaches_the_native_owning_thread() {
         .identity();
     let state = root.join("run-home/harness/executor-pool/native-lead");
     fs::create_dir_all(&state).unwrap();
-    let generation = "generation-native-lead";
     fs::write(
         state.join("spawn-1.json"),
         serde_json::to_vec_pretty(&json!({
@@ -356,10 +399,18 @@ fn lead_message_reaches_the_native_owning_thread() {
         .unwrap(),
     )
     .unwrap();
-    let harness = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
-    let sent = Command::new(harness)
-        .args(["lead", "message", "--text", PAYLOAD])
-        .env("CODEX_HOME", root.join("run-home"))
+    state
+}
+
+fn send_lead_message(
+    harness: &Path,
+    home: &Path,
+    generation: &str,
+    payload: &str,
+) -> std::process::Output {
+    Command::new(harness)
+        .args(["lead", "message", "--text", payload])
+        .env("CODEX_HOME", home)
         .env("HARNESS_EXECUTOR_RUN", generation)
         .env("HARNESS_EXECUTOR_SESSION", "1")
         .env_remove("HARNESS_ORIGINATING_LEAD")
@@ -367,7 +418,142 @@ fn lead_message_reaches_the_native_owning_thread() {
         .env_remove("HARNESS_LEAD_RECIPIENT")
         .stdin(Stdio::null())
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+fn record_harness_selection(root: &Path, harness: &Path, arm: &str) {
+    assert!(
+        harness.is_absolute() && harness.is_file(),
+        "the {arm} harness executable must be an explicit absolute file: {}",
+        harness.display()
+    );
+    let selected = native_path(&harness.canonicalize().unwrap());
+    let sha256 = build_identity::hash_file(&selected).unwrap();
+    fs::write(
+        root.join("harness-selection.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "arm": arm,
+            "path": selected,
+            "sha256": sha256,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+struct ActiveToolRelease(PathBuf);
+
+impl Drop for ActiveToolRelease {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"release");
+    }
+}
+
+fn active_tool_continuation(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == ACTIVE_TOOL_CALL
+                && item["output"].as_str().is_some_and(|output| {
+                    output.contains("Process exited with code 0") && output.contains("released")
+                })
+        })
+    })
+}
+
+fn delivered_envelope(value: &Value) -> Option<(Value, String)> {
+    match value {
+        Value::String(text) => text
+            .split_once(ENVELOPE_MARK)
+            .and_then(|(header, payload)| {
+                serde_json::from_str(header)
+                    .ok()
+                    .map(|header| (header, payload.to_owned()))
+            }),
+        Value::Array(items) => items.iter().find_map(delivered_envelope),
+        Value::Object(map) => map.values().find_map(delivered_envelope),
+        _ => None,
+    }
+}
+
+fn wait_for_active_continuation(root: &Path, thread: &str, turn: &str) -> Value {
+    let until = Instant::now() + WAIT;
+    loop {
+        if let Some((_, request, hit_thread, hit_turn)) =
+            provider_entries(root)
+                .into_iter()
+                .find(|(_, request, hit_thread, hit_turn)| {
+                    hit_thread == thread
+                        && hit_turn == turn
+                        && active_tool_continuation(request)
+                        && contains_payload(request, PAYLOAD)
+                })
+        {
+            assert_eq!(hit_thread, thread);
+            assert_eq!(hit_turn, turn);
+            return request;
+        }
+        assert!(
+            Instant::now() < until,
+            "the active tool did not continue on the original turn {turn}; provider evidence {:?}",
+            provider_entries(root)
+                .into_iter()
+                .map(|(name, _, thread, turn)| (name, thread, turn))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_turn_completion(owner: &mut Client, thread: &str, turn: &str) -> Value {
+    let until = Instant::now() + WAIT;
+    loop {
+        let state = owner.request(
+            "thread/read",
+            json!({"threadId": thread, "includeTurns": true}),
+        );
+        let completed = state["thread"]["turns"].as_array().is_some_and(|turns| {
+            turns
+                .iter()
+                .any(|candidate| candidate["id"] == turn && candidate["status"] == "completed")
+        });
+        if completed && state["thread"]["status"]["type"] == "idle" {
+            return state;
+        }
+        assert!(
+            Instant::now() < until,
+            "the original active turn {turn} did not complete after its tool was released: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned native app-server fixture and canned Responses; no live model"]
+fn lead_message_reaches_the_native_owning_thread() {
+    let fixture = fixture();
+    let root = fixture.root.path();
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let started = owner.request(
+        "thread/start",
+        json!({
+            "cwd": fixture.workspace,
+            "model": "gpt-6-astra",
+            "modelProvider": "control_fixture",
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access"
+        }),
+    );
+    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+    let status = owner.request("thread/read", json!({"threadId": thread}));
+    assert_eq!(status["thread"]["id"], thread);
+    assert_eq!(status["thread"]["status"]["type"], "idle", "{status}");
+    let generation = "generation-native-lead";
+    record_native_lead(&fixture, &thread, generation);
+    let harness = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    let sent = send_lead_message(&harness, &root.join("run-home"), generation, PAYLOAD);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&sent.stdout),
@@ -413,6 +599,189 @@ fn lead_message_reaches_the_native_owning_thread() {
         root.display()
     );
     drop(fixture.job);
+}
+
+fn lead_message_steers_the_active_native_owning_thread_with(harness: &Path, arm: &str) {
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let evidence = owned_root.path().to_path_buf();
+    let responses = control_responses::Responses::routed(evidence, move |request| {
+        if title_generation_request(request) {
+            return json!({"type":"message","id":"msg-active-title","role":"assistant","content":[{"type":"output_text","text":"Active native turn"}]});
+        }
+        if !contains_payload(request, ACTIVE_TURN_PROMPT) {
+            return json!({"type":"message","id":"msg-active-unexpected","role":"assistant","content":[{"type":"output_text","text":"UNEXPECTED_ACTIVE_PROVIDER_REQUEST"}]});
+        }
+        let tool_completed = request["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == ACTIVE_TOOL_CALL
+            })
+        });
+        if tool_completed {
+            return json!({"type":"message","id":"msg-active-final","role":"assistant","content":[{"type":"output_text","text":"ACTIVE_NATIVE_TURN_COMPLETE"}]});
+        }
+        let command = "[IO.File]::WriteAllText('active-tool-ready', 'ready'); for ($n = 0; $n -lt 600 -and !(Test-Path 'active-tool-release'); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path 'active-tool-release')) { throw 'active tool release deadline' }; [IO.File]::WriteAllText('active-tool-done', 'done'); 'released'";
+        let arguments = serde_json::to_string(&json!({
+            "cmd": command,
+            "shell": control_responses::owned_pwsh(),
+            "yield_time_ms": 30000
+        }))
+        .unwrap();
+        json!({"type":"function_call","call_id":ACTIVE_TOOL_CALL,"name":"exec_command","arguments":arguments})
+    });
+    let fixture = fixture_with_responses(owned_root, responses);
+    let root = fixture.root.path();
+    let workspace = fixture.workspace.clone();
+    record_harness_selection(root, harness, arm);
+    let release_marker = workspace.join("active-tool-release");
+    let _release_on_drop = ActiveToolRelease(release_marker.clone());
+
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let started = owner.request(
+        "thread/start",
+        json!({
+            "cwd": fixture.workspace,
+            "model": "gpt-6-astra",
+            "modelProvider": "control_fixture",
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access"
+        }),
+    );
+    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+    let turn_started = owner.request(
+        "turn/start",
+        json!({
+            "threadId": thread,
+            "input": [{"type": "text", "text": ACTIVE_TURN_PROMPT}]
+        }),
+    );
+    let turn = turn_started["turn"]["id"]
+        .as_str()
+        .or_else(|| turn_started["id"].as_str())
+        .unwrap_or_else(|| panic!("turn/start answered without a turn identity: {turn_started}"))
+        .to_owned();
+    assert!(
+        wait_until(WAIT.as_secs(), || workspace
+            .join("active-tool-ready")
+            .is_file()),
+        "the owned native tool did not reach its readiness marker; provider {:?}; server {}",
+        provider_entries(root)
+            .into_iter()
+            .map(|(name, _, thread, turn)| (name, thread, turn))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(root.join("server-stderr.txt")).unwrap_or_default()
+    );
+    let active_state = owner.request(
+        "thread/read",
+        json!({"threadId": thread, "includeTurns": true}),
+    );
+    let active = active_state["thread"]["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|candidate| candidate["status"] == "inProgress")
+        .and_then(|candidate| candidate["id"].as_str());
+    assert_eq!(active, Some(turn.as_str()), "{active_state}");
+
+    let generation = "generation-native-active-lead";
+    record_native_lead(&fixture, &thread, generation);
+    let sent = send_lead_message(harness, &root.join("run-home"), generation, PAYLOAD);
+    let text = output_text(&sent);
+    assert!(
+        sent.status.success(),
+        "lead message failed against the active fixture turn; {text}; evidence {}",
+        root.display()
+    );
+    assert!(
+        text.contains("lead message: delivered") || text.contains("lead message: queued"),
+        "{text}"
+    );
+    let transport_status = if text.contains("lead message: delivered") {
+        "delivered"
+    } else {
+        "queued"
+    };
+    assert!(text.contains("method: turn/steer"), "{text}");
+    assert!(text.contains(&format!("leadThreadId: {thread}")), "{text}");
+    assert!(!text.contains(&fixture.token), "{text}");
+    let id = text
+        .lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .unwrap_or_else(|| panic!("the delivery report named no message id: {text}"));
+    fs::write(root.join("lead-message-send.txt"), &text).unwrap();
+    fs::write(
+        root.join("lead-message-transport.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "transportStatus": transport_status,
+            "method": "turn/steer",
+            "threadId": thread,
+            "turnId": turn,
+            "messageId": id,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    fs::write(&release_marker, b"release").unwrap();
+    assert!(
+        wait_until(WAIT.as_secs(), || workspace
+            .join("active-tool-done")
+            .is_file()),
+        "the released native tool did not report completion; provider {:?}; server {}",
+        provider_entries(root)
+            .into_iter()
+            .map(|(name, _, thread, turn)| (name, thread, turn))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(root.join("server-stderr.txt")).unwrap_or_default()
+    );
+    let continuation = wait_for_active_continuation(root, &thread, &turn);
+    let identity = RequestIdentity::from_request(&continuation).unwrap();
+    assert_eq!(identity.thread, thread);
+    assert_eq!(identity.turn, turn, "the steer opened another turn");
+    let (header, payload) = delivered_envelope(&continuation)
+        .unwrap_or_else(|| panic!("the continuation carried no lead envelope: {continuation}"));
+    assert_eq!(payload, PAYLOAD, "the payload was not delivered unchanged");
+    assert_eq!(header["id"], id, "{header}");
+    assert_eq!(header["kind"], "reply-request", "{header}");
+    assert_eq!(header["runGeneration"], generation, "{header}");
+    assert_eq!(header["leadThreadId"], thread, "{header}");
+
+    let completed = wait_for_turn_completion(&mut owner, &thread, &turn);
+    let turns = completed["thread"]["turns"].as_array().unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "the steer created a second turn: {completed}"
+    );
+    assert_eq!(turns[0]["id"], turn, "{completed}");
+    assert_eq!(turns[0]["status"], "completed", "{completed}");
+    assert!(
+        foreign_provider_requests(root, &thread).is_empty(),
+        "a provider request reached another conversation: {:?}",
+        foreign_provider_requests(root, &thread)
+    );
+    eprintln!(
+        "active native lead: harness {arm} {}; thread {thread}; turn {turn}; transport {transport_status}; tool completed in the steered turn; evidence {}",
+        harness.display(),
+        root.display()
+    );
+    drop(fixture.job);
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; checkout-built harness; owned native app-server and canned Responses; no live model"]
+fn lead_message_steers_the_active_native_owning_thread() {
+    let harness = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    lead_message_steers_the_active_native_owning_thread_with(&harness, "source");
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE and the deployed harness; owned native app-server and canned Responses; no live model"]
+fn lead_message_steers_the_active_native_owning_thread_installed() {
+    let harness = installed_entry();
+    lead_message_steers_the_active_native_owning_thread_with(&harness, "installed");
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +939,7 @@ fn two_lead_router(state: Arc<Mutex<LeadRoute>>) -> impl Fn(&Value) -> Value + S
                 "name": "exec_command",
                 "arguments": serde_json::to_string(&json!({
                     "cmd": command,
-                    "shell": "powershell",
+                    "shell": control_responses::owned_pwsh(),
                     "yield_time_ms": 60000
                 }))
                 .unwrap()
@@ -1272,34 +1641,73 @@ fn assert_process_gone(identity: ProcessIdentity, program: &Path, user: &str, la
 }
 
 /// The surface the dispatch recorded is a real, non-minimized window of the
-/// exact process it names - not a claim inside a record.
+/// exact process it names - not a claim inside a record. The deciding rule is
+/// `harness_core::task_view`'s retained-view rule, so it also accepts a
+/// console the terminal host presents for that exact recorded process.
 fn assert_visible_surface(root: &LeadRoot) {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    };
     let receipt = root.receipt();
     let surface = &receipt["window"];
-    let window = surface["window"].as_u64().unwrap_or_else(|| {
-        panic!(
-            "{}: the dispatch recorded no visible surface: {receipt}",
-            root.role
-        )
-    });
-    let pid = surface["process"]["pid"].as_u64().unwrap_or(0) as u32;
+    let snapshot: harness_core::task_view::Snapshot = serde_json::from_value(surface.clone())
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}: the dispatch recorded no usable visible surface ({error}): {receipt}",
+                root.role
+            )
+        });
+    let host = &receipt["observation"]["host"];
+    let program = PathBuf::from(host["program"].as_str().unwrap_or_default());
+    let user = process_service::current_user().unwrap();
+    // The harness's own retained-view rule: the exact process identity plus a
+    // live, non-minimized window, whether the console owns it or the terminal
+    // host presents it. A surface that is still settling gets a bounded moment.
+    let until = Instant::now() + WAIT;
+    loop {
+        match snapshot.is_visible(&program, &user) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => panic!(
+                "{}: the recorded surface could not be checked: {error}; {surface}",
+                root.role
+            ),
+        }
+        assert!(
+            Instant::now() < until,
+            "{}: the recorded surface is not this run's own live window: {surface} {}",
+            root.role,
+            window_state(snapshot.window)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The observed state of one window handle, for the surface failure message:
+/// existence, owning process, visibility, minimize state and class. The
+/// presentation rule itself stays owned by `harness_core::task_view`.
+fn window_state(window: usize) -> Value {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    };
+    let handle = window as HWND;
+    let exists = unsafe { IsWindow(handle) } != 0;
     let mut owner = 0u32;
-    let bounds = &surface["bounds"];
-    assert!(
-        unsafe { IsWindow(window as HWND) } != 0
-            && unsafe { GetWindowThreadProcessId(window as HWND, &mut owner) } != 0
-            && owner == pid
-            && unsafe { IsWindowVisible(window as HWND) } != 0
-            && unsafe { IsIconic(window as HWND) } == 0
-            && bounds["width"].as_i64().unwrap_or(0) > 0
-            && bounds["height"].as_i64().unwrap_or(0) > 0,
-        "{}: the recorded surface is not this run's own live window: {surface}",
-        root.role
-    );
+    let mut class = [0u16; 128];
+    let copied = if exists {
+        unsafe {
+            GetWindowThreadProcessId(handle, &mut owner);
+            GetClassNameW(handle, class.as_mut_ptr(), class.len() as i32)
+        }
+    } else {
+        0
+    };
+    json!({
+        "window": window,
+        "exists": exists,
+        "ownerPid": owner,
+        "class": String::from_utf16_lossy(&class[..copied.max(0) as usize]),
+        "visible": exists && unsafe { IsWindowVisible(handle) } != 0,
+        "minimized": exists && unsafe { IsIconic(handle) } != 0,
+    })
 }
 
 /// What the real dispatch recorded for one root's fresh executor: the run
@@ -1694,17 +2102,7 @@ fn same_directory(reported: &str, expected: &Path) -> bool {
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream and the deployed kit; two native lead roots with owned canned Responses; no live model"]
 fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
     let exe = codex_exe();
-    let upstream = installed_upstream();
-    assert!(
-        same_executable(&exe, &upstream),
-        "HARNESS_CONTROL_CODEX_EXE must be the installation-record upstream executable {} so this check runs the installed native CLI, not another binary",
-        upstream.display()
-    );
-    let version = version_text(&exe);
-    assert!(
-        version.contains("codex-cli 0.157.0"),
-        "the installation-record upstream must be Codex 0.157.0: {version}"
-    );
+    let version = qualified_installed_upstream(&exe);
     let entry = installed_entry();
     eprintln!(
         "installed two-lead isolation: entry={} upstream={} ({})",
@@ -2429,5 +2827,1452 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
         id_a,
         lead_a.state.display(),
         id_b
+    );
+}
+
+/// Runs one installed native command in the passed home and workspace, bounded
+/// by its own Job; the command's own report is recorded, never accepted as
+/// delivery.
+fn run_native_command(
+    exe: &Path,
+    home: &Path,
+    workspace: &Path,
+    root: &Path,
+    args: Vec<OsString>,
+    envs: Vec<(String, String)>,
+    label: &str,
+) -> Value {
+    let mut spec = command(exe, home, workspace);
+    spec.args = args;
+    for (key, value) in envs {
+        spec.env.insert(key.into(), Some(value.into()));
+    }
+    let stdout_path = root.join(format!("{label}-stdout.txt"));
+    let stderr_path = root.join(format!("{label}-stderr.txt"));
+    spec.stdout = Some(fs::File::create(&stdout_path).unwrap());
+    spec.stderr = Some(fs::File::create(&stderr_path).unwrap());
+    let job = Job::new(Limits::default()).unwrap();
+    let child = job.spawn(&spec).unwrap();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    json!({
+        "exitCode": outcome.exit_code,
+        "exited": outcome.reason == StopReason::Exited,
+        "reason": format!("{:?}", outcome.reason),
+        "stdout": excerpt(&stdout, 1500),
+        "stderr": excerpt(&stderr, 1500),
+    })
+}
+
+/// One `codex queue` invocation: the target thread and the message are always
+/// explicit; only `Some(port)` names an owning listener and passes the
+/// capability token through the environment of the command itself.
+fn queue_arguments(thread: &str, message: &str, endpoint: Option<u16>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "queue".into(),
+        "--thread".into(),
+        thread.into(),
+        "--message".into(),
+        message.into(),
+    ];
+    if let Some(port) = endpoint {
+        args.push("--remote".into());
+        args.push(format!("ws://127.0.0.1:{port}").into());
+        args.push("--remote-auth-token-env".into());
+        args.push("HARNESS_ORDINARY_LEAD_TOKEN".into());
+    }
+    args
+}
+
+/// Sends one line to the owned console session the way a user would: the text,
+/// a short beat, then carriage return.
+fn send_line(session: &ConsoleSession, text: &str) -> io::Result<()> {
+    session.send(text)?;
+    std::thread::sleep(Duration::from_millis(250));
+    session.send("\r")
+}
+
+/// Polls a predicate for at most the given seconds.
+fn wait_until(seconds: u64, predicate: impl Fn() -> bool) -> bool {
+    let until = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < until {
+        if predicate() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    predicate()
+}
+
+/// The child path without the WindowsApps shims, exactly as the ordinary TUI
+/// fixture selects it.
+fn filtered_path() -> OsString {
+    let child_path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|entry| {
+            !entry.components().any(|part| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("WindowsApps")
+            })
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(child_path).unwrap()
+}
+
+fn dump_terminal(root: &Path, session: &ConsoleSession) {
+    let _ = fs::write(root.join("terminal.txt"), session.transcript());
+}
+
+/// Every conversation rollout line under the running session's own `sessions`
+/// root, one JSON value per line; the receiver's own events are read here and
+/// nowhere claimed on behalf of another conversation.
+fn session_lines(home: &Path) -> Vec<Value> {
+    fn walk(path: &Path, lines: &mut Vec<Value>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                walk(&child, lines);
+            } else if child
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                for line in fs::read_to_string(&child).unwrap_or_default().lines() {
+                    if let Ok(value) = serde_json::from_str::<Value>(line) {
+                        lines.push(value);
+                    }
+                }
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    walk(&home.join("sessions"), &mut lines);
+    lines
+}
+
+/// Rollout rows of the running conversation that carry one marker.
+fn session_mark_count(home: &Path, marker: &str) -> usize {
+    session_lines(home)
+        .iter()
+        .filter(|row| row.to_string().contains(marker))
+        .count()
+}
+
+/// The delivered-message identities the running conversation's own rollout
+/// records for one marker: a delivered user message is one `response_item`
+/// message row, while the completion event beside it only reports that item.
+fn session_mark_ids(home: &Path, marker: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for row in session_lines(home) {
+        if row["type"] != "response_item"
+            || row["payload"]["type"] != "message"
+            || row["payload"]["role"] != "user"
+            || !row.to_string().contains(marker)
+        {
+            continue;
+        }
+        let id = row["payload"]["id"].as_str().unwrap_or_default();
+        let id = id.strip_prefix("msg_").unwrap_or(id);
+        ids.push(id.to_owned());
+    }
+    ids
+}
+
+/// The conversation identities the running session's own rollout meta events
+/// record: another conversation's id appearing here is a clone or resume.
+fn session_meta_ids(home: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    for row in session_lines(home) {
+        if row["type"] != "session_meta" {
+            continue;
+        }
+        for key in ["id", "session_id"] {
+            if let Some(value) = row["payload"][key].as_str() {
+                ids.push(value.to_owned());
+            }
+        }
+    }
+    ids
+}
+
+/// Every provider request the owned canned provider recorded, with the
+/// conversation identity the native request carried.
+fn provider_entries(root: &Path) -> Vec<(String, Value, String, String)> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(root).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("provider-") && name.ends_with(".json")) {
+            continue;
+        }
+        let body = fs::read(entry.path()).unwrap_or_default();
+        let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        let identity = RequestIdentity::from_request(&request)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        entries.push((name, request, identity.thread, identity.turn));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+/// Provider requests containing the marker, with the conversation identity
+/// each native request carried.
+fn provider_hits(root: &Path, marker: &str) -> Vec<(String, String, String)> {
+    provider_entries(root)
+        .into_iter()
+        .filter(|(_, request, _, _)| contains_payload(request, marker))
+        .map(|(name, _, thread, turn)| (name, thread, turn))
+        .collect()
+}
+
+/// One recorded provider request body by its evidence file name.
+fn provider_request(root: &Path, file: &str) -> Value {
+    let body = fs::read(root.join(file)).unwrap_or_default();
+    serde_json::from_slice(&body).unwrap_or(Value::Null)
+}
+
+/// The title-generation request installed 0.162.1 issues beside a user turn:
+/// an auxiliary user item carrying the installed instruction, recognized
+/// exactly as the shared fixture recognizes it.
+fn title_generation_request(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part["text"].as_str().is_some_and(|text| {
+                            text.starts_with("Generate a concise, single-line task title")
+                        })
+                    })
+                })
+        })
+    })
+}
+
+/// The tool continuation of the managed control exchange: the native request
+/// that carries the completed `control-tool-1` proof command's own output.
+fn proof_continuation(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "control-tool-1"
+                && item["output"].as_str().is_some_and(|output| {
+                    output.contains("Process exited with code 0") && output.contains("\none")
+                })
+        })
+    })
+}
+
+fn provider_request_count(root: &Path) -> usize {
+    provider_entries(root).len()
+}
+
+/// Requests that reached a conversation other than the receiver's own: a
+/// clone, resume or second conversation appears here.
+fn foreign_provider_requests(root: &Path, thread: &str) -> Vec<(String, String, String)> {
+    provider_entries(root)
+        .into_iter()
+        .filter(|(_, _, hit_thread, _)| hit_thread != thread)
+        .map(|(name, _, hit_thread, turn)| (name, hit_thread, turn))
+        .collect()
+}
+
+fn hit_json(hits: &[(String, String, String)]) -> Vec<Value> {
+    hits.iter()
+        .map(|(file, thread, turn)| json!({"file": file, "thread": thread, "turn": turn}))
+        .collect()
+}
+
+fn count_files(dir: &Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_files(&path);
+            } else {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Historical upstream queue-boundary evidence, not production acceptance:
+/// the installed native queue for an already running ordinary CLI
+/// conversation. One owned ordinary native TUI hosts its own embedded runtime
+/// in its own CODEX_HOME against the canned local Responses provider, one
+/// control turn establishes that conversation's exact thread, and the
+/// installed `codex queue --thread <id> --message <text>` then addresses that
+/// running conversation without any endpoint, daemon or token. Delivery is the
+/// running conversation's own turn request carrying the mark on its exact
+/// thread, together with its own stored and rendered copy; exit status, report
+/// text and process state are recorded separately and are not delivery.
+/// Beside each turn the running TUI issues its own native title-generation
+/// request (recognized by the installed instruction, exactly as the shared
+/// fixture recognizes it) on an ephemeral thread; those auxiliaries are
+/// classified and recorded, never counted as delivery or as a second
+/// conversation. The whole observed record is written before any expectation,
+/// and the expectations themselves name both outcomes.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; starts an owned ordinary native TUI with the canned local Responses provider; no live model, no daemon, no desktop"]
+fn installed_queue_boundary_against_a_running_ordinary_tui() {
+    let exe = codex_exe();
+    let upstream = installed_upstream();
+    assert!(
+        same_executable(&exe, &upstream),
+        "HARNESS_CONTROL_CODEX_EXE {} must be the installation-record upstream executable {}; the ordinary arm runs the installed native CLI, not another binary",
+        exe.display(),
+        upstream.display()
+    );
+    let version = version_text(&exe);
+    let sha = build_identity::hash_file(&exe).unwrap();
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let root = owned_root.path().to_path_buf();
+    let home = root.join("ordinary-home");
+    let workspace = root.join("ordinary-workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    eprintln!("ordinary-lead queue boundary evidence: {}", root.display());
+    let user = process_service::current_user().unwrap();
+
+    // The receiver is a real ordinary native TUI: the installed executable
+    // hosts its own embedded runtime, and every request is answered with one
+    // model-free assistant message so the control turn completes.
+    let responses = control_responses::Responses::routed(root.clone(), |_request| {
+        json!({
+            "type": "message",
+            "id": "ordinary-control-reply",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ORDINARY_TUI_CONTROL_REPLY}]
+        })
+    });
+    let trusted = serde_json::to_string(&workspace.to_string_lossy().to_lowercase()).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+model = "gpt-6-astra"
+model_provider = "control_fixture"
+model_reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "disabled"
+cli_auth_credentials_store = "file"
+[model_providers.control_fixture]
+name = "Owned ordinary TUI fixture"
+base_url = "http://127.0.0.1:{}/v1"
+wire_api = "responses"
+env_key = "HARNESS_CONTROL_FIXTURE_KEY"
+requires_openai_auth = false
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+[windows]
+sandbox = "unelevated"
+[features]
+hooks = false
+apps = false
+multi_agent = false
+multi_agent_v2 = false
+memories = false
+goals = false
+plugins = false
+skill_search = false
+skip_host_skill_discovery = true
+[analytics]
+enabled = false
+[projects.{trusted}]
+trust_level = "trusted"
+"#,
+            responses.port
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "harness-control-ordinary-tui"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut spec = command(&exe, &home, &workspace);
+    spec.args = vec!["--no-alt-screen".into()];
+    spec.env.insert("PATH".into(), Some(filtered_path()));
+    for key in [
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let mut console = ConsoleSpec::new(spec);
+    console.limits.memory_bytes = Some(512 * 1024 * 1024);
+    console.limits.cpu_percent = Some(50.0);
+    let session = ConsoleSession::spawn(console).unwrap();
+    let identity = session.identity();
+    let ready = wait_until(60, || {
+        let text = session.transcript();
+        text.contains("gpt-6-astra") || text.contains("Codex")
+    });
+    if !ready {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned ordinary TUI did not become ready; evidence {}",
+            root.display()
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
+
+    // The control turn is the running conversation's own first model input:
+    // its request identity establishes the exact receiver thread, cross
+    // recorded with the conversation's own session meta. No slash command is
+    // typed: the first composer submission is the prompt itself. If the
+    // frontend has not yet accepted Enter, one further plain Enter commits the
+    // same text the way a user would; the submission is observed as the
+    // conversation's own recorded request, never as echoed text.
+    send_line(&session, ORDINARY_TUI_CONTROL_PROMPT).unwrap();
+    let mut submit_retries = 0;
+    let mut control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    while !control_requested && submit_retries < 2 {
+        let _ = session.send("\r");
+        submit_retries += 1;
+        control_requested = wait_until(20, || root.join("provider-1.json").is_file());
+    }
+    if !control_requested {
+        dump_terminal(&root, &session);
+        panic!(
+            "the owned provider recorded no request for the control turn, so either the running conversation issued none or the fixture rejected its request identity; evidence {}",
+            root.display()
+        );
+    }
+    let control_answered = wait_until(60, || {
+        session_mark_count(&home, ORDINARY_TUI_CONTROL_REPLY) >= 1
+            || session.transcript().contains(ORDINARY_TUI_CONTROL_REPLY)
+    });
+    // The running TUI's own title-generation request for the control turn
+    // lands beside it; settle on the owned provider so the baseline covers the
+    // whole turn instead of racing that native auxiliary request.
+    let mut baseline_requests = provider_request_count(&root);
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_secs(1));
+        let settled = provider_request_count(&root);
+        if settled == baseline_requests {
+            break;
+        }
+        baseline_requests = settled;
+    }
+    let entries = provider_entries(&root);
+    let (_, _, thread, control_turn) = entries
+        .first()
+        .unwrap_or_else(|| panic!("no recorded provider request; evidence {}", root.display()))
+        .clone();
+    let baseline_auxiliary = entries
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
+    let meta_before = session_meta_ids(&home);
+    let sessions_before = count_files(&home.join("sessions"));
+    let daemon_socket = home
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    let daemon_socket_before = daemon_socket.exists();
+    eprintln!(
+        "ordinary lead queue boundary: receiver pid {} creation {} thread {thread} controlTurn {control_turn} controlAnswered {control_answered} submitRetries {submit_retries}; evidence {}",
+        identity.pid,
+        identity.creation_time,
+        root.display()
+    );
+
+    // The queue attempt against that running conversation, with this
+    // CODEX_HOME as the only locator: no endpoint, no capability token and no
+    // daemon ahead of it; the command's own report is recorded, and the mark
+    // can only be attributed to this exact invocation.
+    let unmanaged = run_native_command(
+        &exe,
+        &home,
+        &workspace,
+        &root,
+        queue_arguments(&thread, ORDINARY_QUEUE_MARK, None),
+        Vec::new(),
+        "queue-no-endpoint",
+    );
+    let first_hit = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, ORDINARY_QUEUE_MARK).is_empty()
+    });
+    std::thread::sleep(Duration::from_secs(6));
+    let unmanaged_hits = provider_hits(&root, ORDINARY_QUEUE_MARK);
+    let delivered_without_endpoint = first_hit || !unmanaged_hits.is_empty();
+    let total_after_unmanaged = provider_request_count(&root);
+    let auxiliary_after = provider_entries(&root)
+        .iter()
+        .filter(|(_, request, _, _)| title_generation_request(request))
+        .count();
+    let added_auxiliary = auxiliary_after.saturating_sub(baseline_auxiliary);
+    let primary_hits: Vec<(String, String, String)> = unmanaged_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread == &thread)
+        .cloned()
+        .collect();
+    let auxiliary_hits: Vec<(String, String, String)> = unmanaged_hits
+        .iter()
+        .filter(|(_, hit_thread, _)| hit_thread != &thread)
+        .cloned()
+        .collect();
+    let transcript_copies = session.transcript().matches(ORDINARY_QUEUE_MARK).count();
+    let rollout_copies = session_mark_count(&home, ORDINARY_QUEUE_MARK);
+    let rollout_message_ids = session_mark_ids(&home, ORDINARY_QUEUE_MARK);
+    let sessions_after_unmanaged = count_files(&home.join("sessions"));
+    let meta_after = session_meta_ids(&home);
+    let daemon_socket_after = daemon_socket.exists();
+    let mut daemon_cleanup = Value::Null;
+    if daemon_socket_after {
+        daemon_cleanup = run_native_command(
+            &exe,
+            &home,
+            &workspace,
+            &root,
+            vec!["app-server".into(), "daemon".into(), "stop".into()],
+            Vec::new(),
+            "daemon-stop",
+        );
+    }
+
+    // A live delivery is the only case where a closed target still needs its
+    // own refusal: the same route, a well-formed thread id the receiver does
+    // not own.
+    let mut closed_target = Value::Null;
+    let mut closed_hits: Vec<(String, String, String)> = Vec::new();
+    if delivered_without_endpoint {
+        let closed = run_native_command(
+            &exe,
+            &home,
+            &workspace,
+            &root,
+            queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, None),
+            Vec::new(),
+            "queue-missing-thread",
+        );
+        std::thread::sleep(Duration::from_secs(6));
+        closed_hits = provider_hits(&root, MISSING_QUEUE_MARK);
+        closed_target = json!({
+            "command": closed,
+            "providerHits": hit_json(&closed_hits),
+            "providerRequestsTotal": provider_request_count(&root),
+            "sessionFilesDelta": count_files(&home.join("sessions")) as i64
+                - sessions_after_unmanaged as i64,
+        });
+    }
+    let total_after_all = provider_request_count(&root);
+    let foreign = foreign_provider_requests(&root, &thread);
+    let receiver_alive = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_some())
+        .unwrap_or(false);
+
+    // Restoration: the owned receiver quits through its own console and the
+    // installed executable no longer runs afterwards.
+    dump_terminal(&root, &session);
+    let _ = send_line(&session, "/quit");
+    let console_result = session.wait(
+        Deadline::after(Duration::from_secs(25)).unwrap(),
+        &Cancellation::default(),
+        Duration::from_secs(5),
+    );
+    let console_outcome = match &console_result {
+        Ok(value) => {
+            fs::write(root.join("terminal-final.txt"), &value.transcript).unwrap();
+            json!({
+                "exited": value.outcome.reason == StopReason::Exited,
+                "outcome": value.outcome,
+                "truncated": value.output_truncated,
+            })
+        }
+        Err(error) => json!({"error": error.to_string()}),
+    };
+    // Recorded before the receipt and asserted only after it, so a failure
+    // still leaves the observed liveness beside the raw provider requests.
+    let receiver_gone_after_close = ServiceProcess::inspect(identity, &exe, &user)
+        .map(|process| process.is_none())
+        .unwrap_or(false);
+
+    // The complete observed record is written before any expectation: a failed
+    // assertion still leaves the receipt beside the raw provider requests.
+    let receipt = json!({
+        "schema": 1,
+        "subject": "installed native queue against an already running ordinary embedded CLI conversation",
+        "nativeVersion": version.trim(),
+        "sha256": sha,
+        "exe": exe.to_string_lossy(),
+        "home": home.to_string_lossy(),
+        "workspace": workspace.to_string_lossy(),
+        "threadId": &thread,
+        "receiver": {
+            "pid": identity.pid,
+            "creationTime": identity.creation_time,
+            "aliveAfterAttempts": receiver_alive,
+            "goneAfterClose": receiver_gone_after_close,
+        },
+        "marks": {
+            "controlPrompt": ORDINARY_TUI_CONTROL_PROMPT,
+            "controlReply": ORDINARY_TUI_CONTROL_REPLY,
+            "queue": ORDINARY_QUEUE_MARK,
+            "closed": MISSING_QUEUE_MARK,
+        },
+        "control": {
+            "answered": control_answered,
+            "turn": control_turn,
+            "submitRetries": submit_retries,
+        },
+        "baseline": {
+            "providerRequests": baseline_requests,
+            "titleRequests": baseline_auxiliary,
+            "sessionFiles": sessions_before,
+            "sessionMetaIds": &meta_before,
+            "daemonSocket": daemon_socket_before,
+        },
+        "queueWithoutEndpoint": {
+            "command": &unmanaged,
+            "delivered": delivered_without_endpoint,
+            "providerHits": hit_json(&unmanaged_hits),
+            "primaryHits": hit_json(&primary_hits),
+            "auxiliaryTitleRequests": hit_json(&auxiliary_hits),
+            "addedTitleRequests": added_auxiliary,
+            "transcriptCopies": transcript_copies,
+            "rolloutCopies": rollout_copies,
+            "rolloutMessageIds": &rollout_message_ids,
+            "providerRequestsTotal": total_after_unmanaged,
+            "sessionFilesAfter": sessions_after_unmanaged,
+            "sessionMetaIdsAfter": &meta_after,
+            "daemonSocketAfter": daemon_socket_after,
+            "daemonCleanup": &daemon_cleanup,
+        },
+        "closedTarget": &closed_target,
+        "providerRequestsAfterAll": total_after_all,
+        "foreignProviderRequests": hit_json(&foreign),
+        "consoleOutcome": &console_outcome,
+        "deliveryEvidence": "the running conversation's own model request carrying the mark on its exact thread, with its own stored and rendered copy",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+        "limitations": "one installed version, one owned home, one receiver; the queued message is observed through the receiver's own requests and rollout",
+    });
+    fs::write(
+        root.join("ordinary-lead-queue-boundary.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // Expectations, checked after the record exists.
+    assert!(
+        baseline_requests >= 1,
+        "the control turn must be among the running conversation's own model requests before any queue attempt; evidence {}",
+        root.display()
+    );
+    assert!(
+        control_answered,
+        "the control turn must complete against the owned provider before any queue attempt; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_alive,
+        "the queue attempts must leave the running ordinary conversation alive; pid {}; evidence {}",
+        identity.pid,
+        root.display()
+    );
+    for (file, hit_thread, _) in &auxiliary_hits {
+        assert!(
+            title_generation_request(&provider_request(&root, file)),
+            "{file} carried the queued message on thread {hit_thread} without the native title-generation shape; evidence {}",
+            root.display()
+        );
+    }
+    assert!(
+        auxiliary_hits.len() <= 1,
+        "one delivered turn cannot add more than one native title-generation request: {auxiliary_hits:?}; evidence {}",
+        root.display()
+    );
+    for (file, hit_thread, _) in &foreign {
+        assert!(
+            title_generation_request(&provider_request(&root, file)),
+            "model work left the running conversation without the native title-generation shape: {file} on thread {hit_thread}; evidence {}",
+            root.display()
+        );
+    }
+    assert_eq!(
+        meta_after,
+        meta_before,
+        "the running conversation's own recorded identity changed: {meta_after:?} against {meta_before:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        sessions_after_unmanaged,
+        sessions_before,
+        "the queue attempt created conversation storage; evidence {}",
+        root.display()
+    );
+    if delivered_without_endpoint {
+        assert_eq!(
+            primary_hits.len(),
+            1,
+            "a live delivery must be exactly one turn input on the running conversation's own thread: {primary_hits:?}; evidence {}",
+            root.display()
+        );
+        assert!(
+            transcript_copies >= 1 || rollout_copies >= 1,
+            "the running conversation's own session must hold the delivered message: transcript {transcript_copies}, rollout {rollout_copies}; evidence {}",
+            root.display()
+        );
+        if rollout_copies >= 1 {
+            assert_eq!(
+                rollout_message_ids.len(),
+                1,
+                "the running conversation must store the delivered message exactly once: {rollout_message_ids:?}; evidence {}",
+                root.display()
+            );
+        }
+        assert!(
+            added_auxiliary <= 1,
+            "one delivered turn cannot add more than one native title-generation request: added {added_auxiliary}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            total_after_unmanaged,
+            baseline_requests + 1 + added_auxiliary,
+            "the queue attempt must add only the delivered turn and at most its own native title request: {unmanaged}; evidence {}",
+            root.display()
+        );
+        assert!(
+            closed_hits.is_empty(),
+            "queue with an unowned thread id started another conversation: {closed_hits:?}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            closed_target["providerRequestsTotal"].as_u64(),
+            Some(total_after_unmanaged as u64),
+            "the closed-target attempt added model work: {closed_target}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            closed_target["sessionFilesDelta"].as_i64(),
+            Some(0),
+            "the closed-target attempt created conversation storage: {closed_target}; evidence {}",
+            root.display()
+        );
+    } else {
+        assert_eq!(
+            total_after_unmanaged,
+            baseline_requests,
+            "the refused queue attempt added model work: {unmanaged}; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            transcript_copies,
+            0,
+            "the running conversation rendered a mark that was never delivered; evidence {}",
+            root.display()
+        );
+        assert_eq!(
+            rollout_copies,
+            0,
+            "the running conversation stored a mark that was never delivered; evidence {}",
+            root.display()
+        );
+    }
+    assert!(
+        !daemon_socket_after || daemon_cleanup["exited"] == Value::Bool(true),
+        "a daemon appeared for the owned home and its stop was not recorded as exited: {daemon_cleanup}; evidence {}",
+        root.display()
+    );
+    assert!(
+        receiver_gone_after_close,
+        "the ordinary-lead queue boundary probe left the running receiver TUI alive; pid {}; evidence {}",
+        identity.pid,
+        root.display()
+    );
+    assert!(
+        console_outcome["exited"] == Value::Bool(true),
+        "the owned ordinary TUI did not quit cleanly: {console_outcome}; evidence {}",
+        root.display()
+    );
+    eprintln!(
+        "ordinary-lead queue boundary: deliveredWithoutEndpoint={delivered_without_endpoint} primaryDeliveries={} auxiliaryTitleRequests={} transcriptCopies={transcript_copies} rolloutCopies={rollout_copies} foreignRequests={} receiverAlive={receiver_alive} receiverGoneAfterClose={receiver_gone_after_close}; evidence {}",
+        primary_hits.len(),
+        auxiliary_hits.len(),
+        foreign.len(),
+        root.display()
+    );
+}
+
+/// The separately labelled positive control for the same installed `codex
+/// queue`: one owned native app-server hosts one running conversation, and the
+/// queue command names that listener and its capability token explicitly. The
+/// delivered message starts exactly one turn on the running thread; that
+/// turn's own sampling rounds (the queued input, then its executed proof-tool
+/// continuation) are one delivery, not duplicates. The closed-target arm
+/// proves the same route fails closed for a thread the receiver does not own.
+/// This receiver is managed by construction; it is not the ordinary arm.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream; owned native app-server fixture and canned Responses; no live model"]
+fn installed_queue_endpoint_reaches_its_owning_thread() {
+    let fixture = fixture();
+    let root = fixture.root.path().to_path_buf();
+    let home = root.join("home");
+    let version = version_text(&fixture.exe);
+    let user = process_service::current_user().unwrap();
+    eprintln!(
+        "queue endpoint positive control evidence: {}",
+        root.display()
+    );
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let started = owner.request(
+        "thread/start",
+        json!({
+            "cwd": fixture.workspace,
+            "model": "gpt-6-astra",
+            "modelProvider": "control_fixture",
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access"
+        }),
+    );
+    let thread = started["thread"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread/start answered {started}"))
+        .to_owned();
+    // Installed 0.162.1 answers this metadata read; `includeTurns` reaches its
+    // unimplemented list_turns RPC (-32601, "list_turns is not supported yet"),
+    // so delivery is observed in the receiver's own model requests instead.
+    let baseline = owner.request("thread/read", json!({"threadId": thread}));
+    assert_eq!(baseline["thread"]["id"], thread, "{baseline}");
+    assert_eq!(baseline["thread"]["status"]["type"], "idle", "{baseline}");
+    let baseline_requests = provider_request_count(&root);
+    let sessions_before = count_files(&home.join("sessions"));
+
+    // 1. The owning endpoint and capability token: exactly one delivered turn
+    // on the exact running thread, its proof-tool continuation included, with
+    // no other model work.
+    let managed = run_native_command(
+        &fixture.exe,
+        &home,
+        &fixture.workspace,
+        &root,
+        queue_arguments(&thread, ENDPOINT_QUEUE_MARK, Some(fixture.port)),
+        vec![(
+            "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
+            fixture.token.clone(),
+        )],
+        "queue-endpoint",
+    );
+    let first_hit = wait_until(WAIT.as_secs(), || {
+        !provider_hits(&root, ENDPOINT_QUEUE_MARK).is_empty()
+    });
+    std::thread::sleep(Duration::from_secs(6));
+    let endpoint_hits = provider_hits(&root, ENDPOINT_QUEUE_MARK);
+    let total_after_managed = provider_request_count(&root);
+    let after_managed = owner.request("thread/read", json!({"threadId": thread}));
+    let same_thread = endpoint_hits
+        .iter()
+        .all(|(_, hit_thread, _)| hit_thread == &thread);
+    let sessions_after_managed = count_files(&home.join("sessions"));
+    let managed_text = format!(
+        "{}{}",
+        managed["stdout"].as_str().unwrap_or_default(),
+        managed["stderr"].as_str().unwrap_or_default()
+    );
+    let endpoint_bodies: Vec<Value> = provider_entries(&root)
+        .into_iter()
+        .filter(|(_, request, _, _)| contains_payload(request, ENDPOINT_QUEUE_MARK))
+        .map(|(_, request, _, _)| request)
+        .collect();
+    let endpoint_turns: Vec<String> = endpoint_hits.iter().map(|(_, _, turn)| turn.clone()).fold(
+        Vec::new(),
+        |mut turns, turn| {
+            if !turns.contains(&turn) {
+                turns.push(turn);
+            }
+            turns
+        },
+    );
+    let initial_rounds = endpoint_bodies
+        .iter()
+        .filter(|request| !proof_continuation(request))
+        .count();
+    let proof_rounds = endpoint_bodies
+        .iter()
+        .filter(|request| proof_continuation(request))
+        .count();
+
+    // 2. A closed target fails closed: the same endpoint, a thread this
+    // receiver does not own - no delivery, no second conversation, no model
+    // work.
+    let missing = run_native_command(
+        &fixture.exe,
+        &home,
+        &fixture.workspace,
+        &root,
+        queue_arguments(MISSING_THREAD_ID, MISSING_QUEUE_MARK, Some(fixture.port)),
+        vec![(
+            "HARNESS_ORDINARY_LEAD_TOKEN".to_owned(),
+            fixture.token.clone(),
+        )],
+        "queue-missing-thread",
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    let missing_hits = provider_hits(&root, MISSING_QUEUE_MARK);
+    let total_after_missing = provider_request_count(&root);
+    let status = owner.request("thread/read", json!({"threadId": thread}));
+    let sessions_after_missing = count_files(&home.join("sessions"));
+    let foreign = foreign_provider_requests(&root, &thread);
+
+    let receipt = json!({
+        "schema": 1,
+        "subject": "installed queue endpoint positive control for its owning thread (managed app-server receiver, not the ordinary arm)",
+        "nativeVersion": version.trim(),
+        "exe": fixture.exe.to_string_lossy(),
+        "threadId": &thread,
+        "marks": {"endpoint": ENDPOINT_QUEUE_MARK, "missing": MISSING_QUEUE_MARK},
+        "endpoint": {
+            "command": &managed,
+            "deliveredTurns": endpoint_turns.len(),
+            "rounds": endpoint_hits.len(),
+            "initialRounds": initial_rounds,
+            "proofRounds": proof_rounds,
+            "providerHits": hit_json(&endpoint_hits),
+            "receiverAfterDelivery": {
+                "id": after_managed["thread"]["id"].clone(),
+                "status": after_managed["thread"]["status"].clone(),
+            },
+            "sameThread": same_thread,
+            "providerRequestsTotal": total_after_managed,
+        },
+        "closedTarget": {
+            "command": &missing,
+            "providerHits": hit_json(&missing_hits),
+            "providerRequestsTotal": total_after_missing,
+            "sessionFilesDelta": sessions_after_missing as i64 - sessions_after_managed as i64,
+        },
+        "baselineProviderRequests": baseline_requests,
+        "sessionFilesBaseline": sessions_before,
+        "foreignProviderRequests": hit_json(&foreign),
+        "deliveryEvidence": "the receiver's own model request carrying the queued message on the exact thread",
+        "notDeliveryEvidence": "exit status, stdout/stderr text, process existence",
+    });
+    fs::write(
+        root.join("queue-endpoint-positive-control.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        baseline_requests, 0,
+        "an idle running conversation must not have called a model before any queue attempt"
+    );
+    assert!(
+        first_hit,
+        "queue with the owning endpoint did not reach the running conversation: {managed}; evidence {}",
+        root.display()
+    );
+    assert!(
+        same_thread,
+        "endpoint delivery reached another conversation: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        endpoint_turns.len(),
+        1,
+        "queue delivery must start exactly one turn on the running conversation: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        initial_rounds,
+        1,
+        "the queued message must enter the running turn exactly once: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert!(
+        proof_rounds >= 1,
+        "the delivered turn must continue through its own proof-tool round: {endpoint_hits:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        after_managed["thread"]["id"], thread,
+        "the running conversation's thread identity changed after delivery: {after_managed}"
+    );
+    assert_eq!(
+        total_after_managed,
+        baseline_requests + endpoint_hits.len(),
+        "the delivered turn's own rounds must be the only model work: {managed}"
+    );
+    assert_eq!(
+        managed["exitCode"].as_i64(),
+        Some(0),
+        "queue with the owning endpoint failed: {managed}"
+    );
+    assert!(
+        !managed_text.contains(fixture.token.as_str()),
+        "queue must not echo the capability token: {managed}"
+    );
+    assert!(
+        missing_hits.is_empty(),
+        "queue with an unowned thread id started another conversation: {missing_hits:?}; command {missing}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        total_after_missing, total_after_managed,
+        "the closed-target attempt added model work: {missing}"
+    );
+    assert_eq!(
+        status["thread"]["id"], thread,
+        "the running conversation's thread identity changed: {status}"
+    );
+    assert!(
+        foreign.is_empty(),
+        "model work left the running conversation: {foreign:?}; evidence {}",
+        root.display()
+    );
+    assert_eq!(
+        sessions_after_missing, sessions_after_managed,
+        "a closed-target queue attempt created conversation storage"
+    );
+
+    // Restoration: stop this fixture's own receiver through its own Job and
+    // confirm the installed executable no longer runs.
+    fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
+    // TerminateProcess is asynchronous: give the exact recorded identity a
+    // bounded window to disappear before it counts as still running.
+    let until = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < until
+        && ServiceProcess::inspect(fixture.server, &fixture.exe, &user)
+            .map(|process| process.is_some())
+            .unwrap_or(true)
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_process_gone(
+        fixture.server,
+        &fixture.exe,
+        &user,
+        "the queue endpoint positive control left its receiver app-server running",
+    );
+    eprintln!(
+        "queue endpoint positive control: endpointTurns={} endpointRounds={} initialRounds={initial_rounds} proofRounds={proof_rounds} closedTargetDeliveries={} foreignRequests={}; evidence {}",
+        endpoint_turns.len(),
+        endpoint_hits.len(),
+        missing_hits.len(),
+        foreign.len(),
+        root.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Managed lead start acceptance
+// ---------------------------------------------------------------------------
+
+/// One actual `codex-harness lead start` session: the checkout-built harness
+/// hosts the lead profile in this terminal through one native app-server, its
+/// attached native frontend, the canned local Responses provider and the
+/// registered unrelated stdio MCP server. The entry point is the real
+/// `lead start` command; an ordinary Normal session or a directly composed
+/// app-server does not stand in for it.
+///
+/// The session's own runtime catalogue must lose the competing native
+/// `codex_worktrees` tools while the unrelated server's tools survive, the
+/// transcript must report the resolved role revision and the bound model,
+/// provider and effort, and the published endpoint must appear only after the
+/// frontend attached to the exact thread and must retire with the session.
+///
+/// The hosted app-server route cannot observe one permitted configuration
+/// conflict - an explicit worktree leaf that re-exposes the competing tools is
+/// owned by the registered-launcher check
+/// `installed_managed_role_tui_catalogues_drop_native_worktree_tools` - so
+/// this check claims only the observed suppression and the preserved
+/// unrelated surface, never a successful managed-pool delivery.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream and the checkout-built harness; owned canned Responses and unrelated MCP fixture; no live model"]
+fn managed_lead_start_hosts_the_catalogue_without_native_worktree_tools() {
+    let exe = codex_exe();
+    let version = qualified_installed_upstream(&exe);
+    let upstream = installed_upstream();
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let evidence = tempfile::Builder::new()
+        .prefix("lead-start-native-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!(
+        "managed lead start evidence: {} (upstream {} {})",
+        evidence.display(),
+        upstream.display(),
+        version.trim()
+    );
+    let home = evidence.join("home");
+    fs::create_dir_all(home.join("harness")).unwrap();
+    // `lead start` launches `<home>/harness/bin/codex.exe`, so the recorded
+    // build is that exact directory: this checkout's real launcher beside its
+    // integrity stubs, with the record's source root pointing at this
+    // checkout. The registration names the installed upstream the launcher
+    // forwards to; nothing global is read or changed.
+    let build = home.join("harness/bin");
+    skill_catalog_responses::managed_launcher_build_in(&build, &checkout);
+    let registration_bytes = serde_json::to_vec(&harness_core::native_launcher::Registration {
+        schema: 2,
+        state: None,
+        build: Some(build.clone()),
+        task_control: false,
+        upstream: harness_core::native_launcher::Upstream {
+            executable: upstream.clone(),
+            sha256: build_identity::hash_file(&upstream).unwrap(),
+            package: None,
+        },
+    })
+    .unwrap();
+    fs::write(home.join("harness/native-launch.json"), &registration_bytes).unwrap();
+    fs::write(evidence.join("native-launch.json"), &registration_bytes).unwrap();
+    let canned = skill_catalog_responses::CannedResponses::spawn_all_tools(&evidence).unwrap();
+    let unrelated = skill_catalog_responses::unrelated_probe_mcp(&home);
+    // The session runs in this checkout, so the checkout is the trusted
+    // project; the canned provider is bound to the exact model, provider and
+    // effort this run asserts, and the unrelated server is the only other
+    // tool source.
+    skill_catalog_responses::write_probe_config(&home, &checkout, &canned, &unrelated, false);
+    skill_catalog_responses::clear_probe_receipt(&home);
+    let expected_revision =
+        harness_core::role_context::resolve(&checkout, harness_core::role_context::Role::Lead)
+            .unwrap()
+            .revision;
+
+    let entry = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    let mut spec = CommandSpec::new(&entry);
+    spec.args = vec![
+        "lead".into(),
+        "start".into(),
+        "--source".into(),
+        checkout.clone().into_os_string(),
+        "--codex-home".into(),
+        home.clone().into_os_string(),
+        "--exec".into(),
+        skill_catalog_responses::ALL_TOOLS_PROBE_PROMPT.into(),
+    ];
+    spec.current_dir = Some(checkout.clone());
+    spec.env
+        .insert("CODEX_HOME".into(), Some(home.clone().into_os_string()));
+    spec.env.insert(
+        skill_catalog_responses::API_KEY_ENV.into(),
+        Some(skill_catalog_responses::API_KEY.into()),
+    );
+    spec.env.insert("PATH".into(), Some(filtered_path()));
+    spec.env.insert(
+        "CODEX_HARNESS_CPU_ACCOUNT".into(),
+        Some(evidence.join("cpu-account").into_os_string()),
+    );
+    for key in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_CONTEXT_ROLE",
+        "HARNESS_CONTEXT_REVISION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+        "WT_SESSION",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let mut console = ConsoleSpec::new(spec);
+    console.limits.memory_bytes = Some(1024 * 1024 * 1024);
+    console.limits.cpu_percent = Some(50.0);
+    let session = ConsoleSession::spawn(console).unwrap();
+    let host = session.identity();
+
+    // The host reports the resolved lead context and the bound routing before
+    // it starts anything: these lines are this run's own source and runtime
+    // identity, and the role revision is resolved from the same checkout the
+    // registered build names.
+    let expected_context =
+        format!("lead role context: role=lead revision={expected_revision} previous=none");
+    let expected_session = format!(
+        "lead session: profile=default model=gpt-6-astra provider=canned_skill_catalog effort=low cwd={}",
+        checkout.display()
+    );
+    let started = wait_until(60, || {
+        let text = session.transcript();
+        text.contains(&expected_context) && text.contains(&expected_session)
+    });
+    if !started {
+        dump_terminal(&evidence, &session);
+        panic!(
+            "the managed lead host did not report its resolved role context and bound routing; evidence {}",
+            evidence.display()
+        );
+    }
+
+    // The registry record is published only after the native frontend attached
+    // to this exact thread, so its appearance is the attachment evidence.
+    let registry = home.join("harness/lead-endpoints");
+    let published = wait_until(90, || {
+        fs::read_dir(&registry)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+            })
+            .unwrap_or(false)
+    });
+    if !published {
+        dump_terminal(&evidence, &session);
+        panic!(
+            "the managed lead session published no endpoint; evidence {}",
+            evidence.display()
+        );
+    }
+    let mut records: Vec<PathBuf> = fs::read_dir(&registry)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "the registry must publish exactly this session's record"
+    );
+    let endpoint_path = records.pop().unwrap();
+    let endpoint: Value = serde_json::from_slice(&fs::read(&endpoint_path).unwrap()).unwrap();
+    let port = u16::try_from(endpoint["port"].as_u64().unwrap()).unwrap();
+    let token = endpoint["token"].as_str().unwrap().to_owned();
+    let thread = endpoint["threadId"].as_str().unwrap().to_owned();
+    let recorded = ProcessIdentity {
+        pid: u32::try_from(endpoint["process"]["pid"].as_u64().unwrap()).unwrap(),
+        creation_time: endpoint["process"]["creationTime"].as_u64().unwrap(),
+    };
+    let program = PathBuf::from(endpoint["process"]["program"].as_str().unwrap());
+    assert!(
+        same_executable(&program, &build.join("codex.exe")),
+        "the published endpoint must record the registered launcher this home hosts, not another program: {}",
+        program.display()
+    );
+    let user = process_service::current_user().unwrap();
+    assert!(
+        ServiceProcess::inspect(recorded, &program, &user)
+            .unwrap()
+            .is_some(),
+        "the published endpoint must record the live app-server child of this session"
+    );
+    fs::write(
+        evidence.join("endpoint.json"),
+        serde_json::to_vec_pretty(&json!({
+            "port": port,
+            "threadId": thread,
+            "process": {
+                "pid": recorded.pid,
+                "creationTime": recorded.creation_time,
+                "program": program,
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Three probe rounds: the `--exec` first prompt and two typed turns, each
+    // executing one fresh runtime-catalogue call inside this session. Every
+    // reading must show the unrelated MCP surface and none of the competing
+    // native worktree tools.
+    let mut readings: Vec<(String, Vec<String>)> = Vec::new();
+    for round in 1..=3 {
+        if round > 1 {
+            send_line(&session, skill_catalog_responses::ALL_TOOLS_PROBE_PROMPT).unwrap();
+        }
+        let seen = readings.last().map(|(call_id, _)| call_id.clone());
+        let captured = canned.wait_for(Duration::from_secs(180), |requests| {
+            skill_catalog_responses::probe_readings(requests)
+                .last()
+                .is_some_and(|(call_id, _)| Some(call_id) != seen.as_ref())
+        });
+        assert!(
+            captured,
+            "probe round {round} captured no runtime catalogue output; evidence {}",
+            evidence.display()
+        );
+        let current = skill_catalog_responses::probe_readings(&canned.requests());
+        let (call_id, names) = current
+            .last()
+            .cloned()
+            .expect("a captured reading is present");
+        assert!(
+            !readings.iter().any(|(earlier, _)| *earlier == call_id),
+            "probe round {round} re-read an earlier probe output; evidence {}",
+            evidence.display()
+        );
+        assert!(
+            !names.is_empty(),
+            "probe round {round} reported an empty runtime catalogue; evidence {}",
+            evidence.display()
+        );
+        let fragments = skill_catalog_responses::tool_catalogue::native_worktree_names(&names);
+        assert!(
+            fragments.is_empty(),
+            "the managed lead runtime catalogue kept the competing native worktree tools: {fragments:?}; evidence {}",
+            evidence.display()
+        );
+        let tools = skill_catalog_responses::tool_catalogue::unrelated_probe_surface(&names);
+        assert!(
+            !tools.is_empty(),
+            "probe round {round} must keep the registered unrelated MCP server's tools: names {names:?}; evidence {}",
+            evidence.display()
+        );
+        fs::write(
+            evidence.join(format!("all-tools-round-{round}.json")),
+            serde_json::to_vec_pretty(&json!({
+                "call_id": call_id,
+                "names": &names,
+                "unrelated": &tools,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        readings.push((call_id, names));
+    }
+
+    // The session reached the registered unrelated server as a real stdio MCP
+    // server: its own receipt records this session's full handshake, because
+    // the previous receipt was cleared before the host started.
+    let receipt = skill_catalog_responses::wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the managed lead session left no fresh unrelated MCP handshake receipt at {}",
+            skill_catalog_responses::probe_receipt_path(&home).display()
+        )
+    });
+    skill_catalog_responses::assert_probe_receipt(&receipt, "the managed lead-start session");
+    fs::write(
+        evidence.join("mcp-receipt.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    // The request that carried the first probe turn is the exact model and
+    // effort this session bound, not the fixture's defaults.
+    let probe = canned
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .body
+                .contains(skill_catalog_responses::ALL_TOOLS_PROBE_PROMPT)
+        })
+        .expect("a captured request carries the probe prompt");
+    fs::write(evidence.join("first-probe.body.json"), &probe.body).unwrap();
+    let body: Value = serde_json::from_str(&probe.body).unwrap();
+    assert_eq!(
+        body["model"],
+        "gpt-6-astra",
+        "the lead turn must run the bound model; body keys {:?}",
+        body.as_object().map(|map| map.keys().collect::<Vec<_>>())
+    );
+    assert_eq!(
+        body["reasoning"]["effort"],
+        "low",
+        "the lead turn must run the bound reasoning effort; body keys {:?}",
+        body.as_object().map(|map| map.keys().collect::<Vec<_>>())
+    );
+
+    // Ending the frontend ends the host: the exact thread and this host's
+    // working files must retire, the app-server child must be gone, and the
+    // retired port must refuse the recorded address.
+    send_line(&session, "/quit").unwrap();
+    let outcome = session
+        .wait(
+            Deadline::after(Duration::from_secs(90)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    let transcript = outcome.transcript.clone();
+    fs::write(evidence.join("terminal.txt"), &transcript).unwrap();
+    assert_eq!(outcome.outcome.reason, StopReason::Exited, "{transcript}");
+    assert_eq!(outcome.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        transcript.contains(&format!(
+            "lead session: ended thread {thread} profile default frontend-exit 0"
+        )),
+        "the host must report the exact ended thread and its frontend exit: {transcript}"
+    );
+    assert!(
+        transcript.contains("lead endpoint:") && transcript.contains("was retired"),
+        "the host must report the retired endpoint: {transcript}"
+    );
+    assert!(
+        !transcript.contains("lead session note:"),
+        "the host reported a cleanup problem: {transcript}"
+    );
+    assert!(
+        !endpoint_path.exists(),
+        "the retired session's registry record outlived it: {}",
+        endpoint_path.display()
+    );
+    let host_dir = home.join("harness/lead-endpoints/host");
+    for path in [
+        host_dir.join(format!("{}.json", host.pid)),
+        host_dir.join(format!("{}.token", host.pid)),
+    ] {
+        assert!(
+            !path.exists(),
+            "a retired lead host must leave no working address file: {}",
+            path.display()
+        );
+    }
+    if let Ok(log) = fs::read(host_dir.join(format!("{}.log", host.pid))) {
+        fs::write(evidence.join("host.log"), log).unwrap();
+    }
+    let until = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < until
+        && ServiceProcess::inspect(recorded, &program, &user)
+            .map(|process| process.is_some())
+            .unwrap_or(true)
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_process_gone(
+        recorded,
+        &program,
+        &user,
+        "the managed lead session left its app-server child running",
+    );
+    assert!(
+        ControlConnection::connect(port, &token, Duration::from_millis(500)).is_err(),
+        "the retired endpoint still accepted a connection on port {port}"
+    );
+    eprintln!(
+        "managed lead start: thread {thread} rounds {} unrelatedTools {}; evidence {}",
+        readings.len(),
+        readings
+            .last()
+            .map(|(_, names)| {
+                skill_catalog_responses::tool_catalogue::unrelated_probe_surface(names).len()
+            })
+            .unwrap_or(0),
+        evidence.display()
     );
 }

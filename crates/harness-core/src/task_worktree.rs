@@ -1,24 +1,30 @@
-//! Executor checkouts: the harness-owned worktree pool plus the `Mapping`
-//! reader retained for per-thread worktree records written by older builds.
+//! Managed task checkouts: the harness-owned worktree pool shared by every
+//! isolated task in one repository, plus the `Mapping` reader retained for
+//! per-thread worktree records written by older builds.
 //!
-//! Executor isolation is a fixed pool of ordinary Git worktrees created as
-//! sibling directories of the source checkout and named `<repo-name>-wt1` ..
-//! `<repo-name>-wtN` for the configured `max_concurrent_executors`. The
-//! dispatch command is the sole allocator: it selects a free slot, creates it
-//! only when its position does not exist yet, synchronizes it with upstream
-//! before the first model request (fetch, reset to the resolved base, remove
-//! untracked files while keeping ignored build caches) and records the slot
-//! mapping in kit-local task state. Slot claims use exclusive file creation, so
-//! a lost race surfaces as an occupied-slot refusal instead of two sessions in
-//! one tree. A startup reservation keeps that claim exclusive until a host
-//! lease exists. Reconciliation frees only a resolved-dead reservation, or a
-//! reservation-less slot whose recorded session is not live, and a slot holding
-//! unreviewed work stays awaiting review until the lead merges it or
-//! records an explicit discard.
+//! One repository has one pool, whether a caller enters through the main
+//! checkout or any linked worktree: the pool identity is the Git common
+//! directory, and the sibling layout `<repo-name>-wt1` .. `<repo-name>-wtN`
+//! belongs to the primary worktree. Capacity comes from the independent
+//! orchestration `worktree_pool_size`; positions are created lazily and never
+//! beyond the configured range. A slot can be bound to a durable task identity
+//! with a non-reusable generation handle, and that binding survives process
+//! exit, suspension and review until an explicit release resets the slot to a
+//! verified committed base while keeping ignored build caches. Preparing a
+//! free slot resolves an exact committed base: an explicit local base is
+//! resolved without fetching, while the executor default still refreshes its
+//! upstream first. Slot claims use exclusive file creation, so a lost race
+//! surfaces as an occupied-slot refusal instead of two sessions in one tree. A
+//! startup reservation keeps that claim exclusive until a host lease exists.
+//! Reconciliation frees only a resolved-dead reservation, or a
+//! reservation-less session slot whose recorded session is not live; a slot
+//! holding unreviewed work, and any slot holding a task binding, stays held
+//! until the lead merges it, records an explicit discard or releases the task.
 use crate::build_identity::hash_bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
@@ -140,10 +146,10 @@ pub fn is_git_checkout(path: &Path) -> io::Result<bool> {
     Ok(path.join(".git").exists())
 }
 
-/// Largest supported pool; matches the orchestration `max_concurrent_executors`
+/// Largest supported pool; matches the orchestration `worktree_pool_size`
 /// bound, so a configured value is always a valid pool size.
 pub const MAX_POOL_SLOTS: u32 = 32;
-const SLOT_STATE_SCHEMA: u32 = 1;
+const SLOT_STATE_SCHEMA: u32 = 2;
 const CLAIM_ATTEMPTS: u32 = 4;
 
 /// Where a pool position stands in the source checkout's worktree registry.
@@ -155,6 +161,9 @@ pub enum SlotPresence {
     Registered,
     /// Registered to this source checkout, but the directory is gone.
     RegisteredMissing,
+    /// Something exists at the position that is not a worktree of this
+    /// repository; it is reported for lead review, never adopted or replaced.
+    Foreign,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,7 +176,11 @@ pub struct PoolSlot {
 /// Deterministic sibling slot layout of one source checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pool {
+    /// Layout root that owns the sibling slots: the primary worktree.
     pub source: PathBuf,
+    /// Checkout the caller entered through; equal to `source` for the main
+    /// checkout, so legacy per-path records of this caller stay visible.
+    pub caller: PathBuf,
     pub size: u32,
     pub slots: Vec<PoolSlot>,
 }
@@ -210,31 +223,106 @@ pub fn slot_path(source: &Path, index: u32) -> io::Result<PathBuf> {
     Ok(parent.join(format!("{name}-wt{index}")))
 }
 
-/// Resolve the pool of a source checkout. A pool position occupied by anything
-/// that is not a registered worktree of this checkout - an unrelated directory
-/// or another repository's tree - is refused instead of adopted or replaced.
-pub fn pool(source: &Path, size: u32) -> io::Result<Pool> {
-    if size == 0 || size > MAX_POOL_SLOTS {
+/// One repository's pool identity: the Git common directory shared by every
+/// linked worktree, the primary worktree root that owns the sibling slot
+/// layout, and the layout name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryIdentity {
+    pub common_dir: PathBuf,
+    pub primary_root: PathBuf,
+    pub name: String,
+}
+
+/// Resolve the pool identity of a checkout or any linked worktree of it.
+/// Entering through the main checkout or a linked worktree yields the same
+/// identity, so both see one pool inventory and one slot-state directory.
+pub fn repository_identity(source: &Path) -> io::Result<RepositoryIdentity> {
+    let checkout = resolve_source(source)?;
+    if !is_git_checkout(&checkout)? {
         return Err(pool_error(&format!(
-            "pool size {size} is out of range 1..={MAX_POOL_SLOTS}; it derives from max_concurrent_executors"
+            "{} is not a Git checkout; a repository pool needs a Git worktree",
+            checkout.display()
         )));
     }
-    let source = resolve_source(source)?;
+    let common = git(&checkout, &["rev-parse", "--git-common-dir"])?;
+    let common = native_path(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        checkout.join(common)
+    };
+    let common_dir = resolve_source(&common).map_err(|_| {
+        pool_error(&format!(
+            "the Git common directory of {} cannot be resolved; the repository identity is unsupported",
+            checkout.display()
+        ))
+    })?;
+    let primary_root = primary_worktree(&checkout).unwrap_or_else(|| checkout.clone());
+    let name = primary_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| pool_error("repository name must be unicode"))?;
+    Ok(RepositoryIdentity {
+        common_dir,
+        primary_root,
+        name,
+    })
+}
+
+/// First registered worktree of the repository: the primary checkout whose
+/// parent owns the sibling slot layout.
+fn primary_worktree(checkout: &Path) -> Option<PathBuf> {
+    let listed = git(checkout, &["worktree", "list", "--porcelain"]).ok()?;
+    let first = listed
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))?;
+    resolve_source(&native_path(first)).ok()
+}
+
+/// Layout root of one repository: the primary worktree when its Git identity
+/// resolves, otherwise the supplied checkout itself so non-repository callers
+/// keep a meaningful error instead of a cross-repository guess.
+pub fn pool_root(source: &Path) -> io::Result<PathBuf> {
+    if let Ok(identity) = repository_identity(source) {
+        return Ok(identity.primary_root);
+    }
+    resolve_source(source)
+}
+
+/// Shared pool-size validation; the bound matches the orchestration schema.
+fn validate_pool_size(size: u32) -> io::Result<()> {
+    if size == 0 || size > MAX_POOL_SLOTS {
+        return Err(pool_error(&format!(
+            "pool size {size} is out of range 1..={MAX_POOL_SLOTS}; it derives from the configured worktree_pool_size"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the pool of a repository from any of its checkouts. A pool
+/// position occupied by anything that is not a registered worktree of this
+/// repository - an unrelated directory or another repository's tree - is
+/// refused instead of adopted or replaced. Positions beyond the configured
+/// size are never created, registered or reported as pool slots.
+pub fn pool(source: &Path, size: u32) -> io::Result<Pool> {
+    validate_pool_size(size)?;
+    let caller = resolve_source(source)?;
+    let identity = repository_identity(&caller)?;
+    let source = identity.primary_root;
     let registered = registered_trees(&source)?;
     let mut slots = Vec::new();
     for index in 1..=size {
         let path = slot_path(&source, index)?;
-        let presence = match registered.iter().find(|tree| same_path(&tree.path, &path)) {
-            Some(tree) if tree.prunable || !path.is_dir() => SlotPresence::RegisteredMissing,
-            Some(_) => SlotPresence::Registered,
-            None if path.exists() => {
+        let presence = match slot_presence(&path, &registered) {
+            SlotPresence::Foreign => {
                 return Err(pool_error(&format!(
                     "slot {index} {} exists but is not a registered worktree of {}; refusing to adopt or replace a foreign path",
                     path.display(),
                     source.display()
                 )));
             }
-            None => SlotPresence::Absent,
+            presence => presence,
         };
         slots.push(PoolSlot {
             index,
@@ -244,9 +332,40 @@ pub fn pool(source: &Path, size: u32) -> io::Result<Pool> {
     }
     Ok(Pool {
         source,
+        caller,
         size,
         slots,
     })
+}
+
+/// Registry position of one pool path.
+enum SlotPosition {
+    Registered,
+    RegisteredMissing,
+    /// Something exists at the position, but it is not a worktree of this
+    /// repository; it is never adopted, replaced or deleted.
+    Foreign,
+    Absent,
+}
+
+fn classify_slot(path: &Path, registered: &[RegisteredTree]) -> SlotPosition {
+    match registered.iter().find(|tree| same_path(&tree.path, path)) {
+        Some(tree) if tree.prunable || !path.is_dir() => SlotPosition::RegisteredMissing,
+        Some(_) => SlotPosition::Registered,
+        None if path.exists() => SlotPosition::Foreign,
+        None => SlotPosition::Absent,
+    }
+}
+
+/// Presence of one pool position, including the foreign collision that `pool`
+/// refuses.
+fn slot_presence(path: &Path, registered: &[RegisteredTree]) -> SlotPresence {
+    match classify_slot(path, registered) {
+        SlotPosition::Registered => SlotPresence::Registered,
+        SlotPosition::RegisteredMissing => SlotPresence::RegisteredMissing,
+        SlotPosition::Foreign => SlotPresence::Foreign,
+        SlotPosition::Absent => SlotPresence::Absent,
+    }
 }
 
 /// Create the slot at its pool position when it does not exist yet. Creation
@@ -257,6 +376,11 @@ pub fn create_slot(pool: &Pool, index: u32) -> io::Result<PathBuf> {
         SlotPresence::Registered => Ok(slot.path.clone()),
         SlotPresence::RegisteredMissing => Err(pool_error(&format!(
             "slot {index} {} is registered but missing; run `git worktree prune` in {} and retry",
+            slot.path.display(),
+            pool.source.display()
+        ))),
+        SlotPresence::Foreign => Err(pool_error(&format!(
+            "slot {index} {} exists but is not a worktree of {}; it is never replaced, move it aside or reconfigure the pool",
             slot.path.display(),
             pool.source.display()
         ))),
@@ -358,6 +482,10 @@ pub enum ReservationLiveness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlotRecord {
+    // Legacy readers require `schema` and ignore unknown fields. Renaming the
+    // required discriminator makes them refuse these records instead of
+    // treating durable tasks as expired executor sessions after rollback.
+    #[serde(rename = "ownershipSchema", alias = "schema")]
     pub schema: u32,
     pub source: PathBuf,
     pub index: u32,
@@ -365,6 +493,14 @@ pub struct SlotRecord {
     pub state: SlotState,
     /// Executor session identity that holds the slot while its session is live.
     pub owner: Option<String>,
+    /// Durable task identity that owns the slot across process lifetimes.
+    /// `None` on executor session records written before task bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Non-reusable generation handle of the task binding, so a stale handle
+    /// cannot resume a slot whose binding was released or reassigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     /// Committed base the slot was last synchronized to.
     pub base: Option<String>,
     /// Recorded release disposition (merged or explicitly discarded).
@@ -377,13 +513,32 @@ pub struct SlotRecord {
     pub startup: Option<StartupReservation>,
 }
 
-/// Private slot state root; one directory per source checkout.
+/// Private slot state root shared by every checkout of one repository. The
+/// name and key come from the primary worktree, which also owns the sibling
+/// slots, so the main checkout and its linked worktrees resolve one directory.
 pub fn pool_state_dir(codex_home: &Path, source: &Path) -> io::Result<PathBuf> {
     let source = resolve_source(source)?;
-    let name: String = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("checkout")
+    match repository_identity(&source) {
+        Ok(identity) => Ok(state_dir(
+            codex_home,
+            &identity.name,
+            &identity.primary_root,
+        )),
+        // A path that is not (yet) a usable Git checkout keeps the historical
+        // per-path directory so status commands stay total.
+        Err(_) => Ok(state_dir(codex_home, file_name_of(&source), &source)),
+    }
+}
+
+/// Directory a build without pool identity used for one checkout path. Kept as
+/// the legacy fallback so existing slot records stay owned and readable.
+fn legacy_pool_state_dir(codex_home: &Path, source: &Path) -> io::Result<PathBuf> {
+    let source = resolve_source(source)?;
+    Ok(state_dir(codex_home, file_name_of(&source), &source))
+}
+
+fn state_dir(codex_home: &Path, name: &str, key: &Path) -> PathBuf {
+    let name: String = name
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -393,14 +548,202 @@ pub fn pool_state_dir(codex_home: &Path, source: &Path) -> io::Result<PathBuf> {
             }
         })
         .collect();
-    let digest = hash_bytes(source.to_string_lossy().as_bytes());
-    Ok(codex_home
+    let digest = hash_bytes(key.to_string_lossy().as_bytes());
+    codex_home
         .join("harness/executor-pool")
-        .join(format!("{name}-{}", &digest[..12])))
+        .join(format!("{name}-{}", &digest[..12]))
 }
 
+fn file_name_of(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkout")
+}
+
+/// Record locations of one repository: the canonical directory of its pool
+/// identity, plus every legacy per-path directory a checkout of it may have
+/// written old records into. Entering through the main checkout or any linked
+/// worktree resolves the same locations, so one repository never hides a
+/// record - or a conflict - behind the caller's path.
+struct SlotStateLayout {
+    canonical: PathBuf,
+    legacy: Vec<PathBuf>,
+}
+
+impl SlotStateLayout {
+    fn candidates(&self, index: u32) -> Vec<PathBuf> {
+        let file = format!("slot-{index}.json");
+        let mut candidates = vec![self.canonical.join(&file)];
+        for legacy in &self.legacy {
+            candidates.push(legacy.join(&file));
+        }
+        candidates
+    }
+
+    /// Path that keeps an existing record in place: the canonical location
+    /// first, then the legacy directories in repository order. Reads,
+    /// exclusive claim creation and updates use this resolution, so a legacy
+    /// record is migrated by its next mutation instead of being forked.
+    fn resolved(&self, index: u32) -> PathBuf {
+        let file = format!("slot-{index}.json");
+        self.candidates(index)
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| self.canonical.join(file))
+    }
+}
+
+fn slot_state_layout(codex_home: &Path, caller: &Path) -> io::Result<SlotStateLayout> {
+    let canonical = pool_state_dir(codex_home, caller)?;
+    let mut legacy = Vec::new();
+    let source = resolve_source(caller)?;
+    // Every registered worktree of the repository may own legacy records
+    // written under its own path by a build without pool identity. Listing is
+    // best-effort: a broken primary tree must not make status unusable.
+    if let Ok(identity) = repository_identity(&source)
+        && let Ok(trees) = registered_trees(&identity.primary_root)
+    {
+        for tree in trees {
+            // A prunable tree no longer exists: its path cannot resolve to a
+            // legacy directory, and its missing position already refuses new
+            // allocation with the prune hint.
+            if tree.prunable || !tree.path.is_dir() {
+                continue;
+            }
+            push_legacy_dir(&mut legacy, codex_home, &tree.path, &canonical)?;
+        }
+    }
+    push_legacy_dir(&mut legacy, codex_home, &source, &canonical)?;
+    Ok(SlotStateLayout { canonical, legacy })
+}
+
+fn push_legacy_dir(
+    legacy: &mut Vec<PathBuf>,
+    codex_home: &Path,
+    path: &Path,
+    canonical: &Path,
+) -> io::Result<()> {
+    let dir = legacy_pool_state_dir(codex_home, path)?;
+    if dir != canonical && !legacy.contains(&dir) {
+        legacy.push(dir);
+    }
+    Ok(())
+}
+
+/// Canonical record path of a repository. Existing records may still live in
+/// a legacy directory; `SlotStateLayout::resolved` finds them.
 pub fn slot_record_path(codex_home: &Path, source: &Path, index: u32) -> io::Result<PathBuf> {
     Ok(pool_state_dir(codex_home, source)?.join(format!("slot-{index}.json")))
+}
+
+/// Conflicting records for one slot - the canonical location against a legacy
+/// directory, or two legacy pools of one repository - cannot both own the
+/// slot. The files are preserved; ownership-changing operations and new
+/// allocation are refused until the lead reconciles.
+fn layout_record_conflict(layout: &SlotStateLayout, index: u32) -> io::Result<Option<String>> {
+    let mut existing: Vec<(PathBuf, SlotRecord)> = Vec::new();
+    for path in layout.candidates(index) {
+        match read_slot_record(&path, index) {
+            Ok(record) => existing.push((path, record)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let Some((first_path, first)) = existing.first() else {
+        return Ok(None);
+    };
+    let Some((other_path, _)) = existing.iter().find(|(_, record)| record != first) else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "slot {index} has conflicting records at {} and {}; the lead reconciles the pools before new allocation",
+        first_path.display(),
+        other_path.display()
+    )))
+}
+
+/// Fail-closed guard: ownership-changing operations refuse while a slot has
+/// records in more than one location that disagree.
+fn refuse_record_conflict(layout: &SlotStateLayout, index: u32) -> io::Result<()> {
+    match layout_record_conflict(layout, index)? {
+        Some(conflict) => Err(pool_error(&conflict)),
+        None => Ok(()),
+    }
+}
+
+fn read_slot_record(path: &Path, index: u32) -> io::Result<SlotRecord> {
+    let bytes = fs::read(path)?;
+    let mut record: SlotRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        pool_error(&format!(
+            "slot record {} is unreadable ({error}); the lead resolves or removes it",
+            path.display()
+        ))
+    })?;
+    validate_slot_record(path, index, &record)?;
+    // Read legacy records without rewriting or relocating them. The next
+    // already-authorized state transition publishes the current format.
+    record.schema = SLOT_STATE_SCHEMA;
+    Ok(record)
+}
+
+/// Fail closed on record shapes this build does not own. `schema` is the
+/// ownership format version, and the task binding fields are written together
+/// and only while a task holds the slot; any other shape would let an
+/// operation misread durable ownership, so it is refused without mutation.
+fn validate_slot_record(path: &Path, index: u32, record: &SlotRecord) -> io::Result<()> {
+    if !matches!(record.schema, 1 | SLOT_STATE_SCHEMA) {
+        return Err(pool_error(&format!(
+            "slot record {} declares ownership schema {}; this build supports schema {SLOT_STATE_SCHEMA} and refuses to operate on the unsupported durable binding - the lead resolves or removes the record",
+            path.display(),
+            record.schema
+        )));
+    }
+    if record.index != index {
+        return Err(pool_error(&format!(
+            "slot record {} declares position {} instead of {index}; a mislocated durable binding is refused - the lead resolves or removes the record",
+            path.display(),
+            record.index
+        )));
+    }
+    match (record.task.as_deref(), record.handle.as_deref()) {
+        (Some(task), Some(handle)) => {
+            if task.trim().is_empty() || handle.trim().is_empty() {
+                return Err(pool_error(&format!(
+                    "slot record {} has an incomplete task binding (task {task:?}, handle {handle:?}); the lead resolves or removes the record",
+                    path.display()
+                )));
+            }
+            if matches!(record.state, SlotState::Free | SlotState::Released) {
+                return Err(pool_error(&format!(
+                    "slot record {} is {} but still records task '{task}'; a durable binding never appears in a free or released position - the lead resolves or removes the record",
+                    path.display(),
+                    state_name(record.state)
+                )));
+            }
+        }
+        (Some(task), None) => {
+            return Err(pool_error(&format!(
+                "slot record {} records task '{task}' without its generation handle; an unverifiable durable binding is refused - the lead restores the handle or removes the record",
+                path.display()
+            )));
+        }
+        (None, Some(handle)) => {
+            return Err(pool_error(&format!(
+                "slot record {} records generation handle '{handle}' without a task; an unowned binding is refused - the lead resolves or removes the record",
+                path.display()
+            )));
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+fn load_record_at(layout: &SlotStateLayout, index: u32) -> io::Result<Option<SlotRecord>> {
+    match read_slot_record(&layout.resolved(index), index) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn load_slot_record(
@@ -408,18 +751,7 @@ pub fn load_slot_record(
     source: &Path,
     index: u32,
 ) -> io::Result<Option<SlotRecord>> {
-    let path = slot_record_path(codex_home, source, index)?;
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-        pool_error(&format!(
-            "slot record {} is unreadable ({error}); the lead resolves or removes it",
-            path.display()
-        ))
-    })
+    load_record_at(&slot_state_layout(codex_home, source)?, index)
 }
 
 /// Bound for the per-slot record lock. It covers the claim mutation only,
@@ -450,6 +782,47 @@ fn lock_slot(
         Ok(lock) => Ok(lock),
         Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(pool_error(&format!(
             "slot {index} claim record stayed locked by another dispatch for {SLOT_CLAIM_LOCK_BOUND:?}; refusing to replace the pending claim"
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+/// Bound for the pool-wide admission lock. It covers the executor admission
+/// decision and the startup reservation that carries it. Checkout preparation,
+/// upstream fetches, host attachment and model conversations stay outside it.
+const POOL_ADMISSION_LOCK_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn pool_admission_lock_path(codex_home: &Path, source: &Path) -> io::Result<PathBuf> {
+    Ok(pool_state_dir(codex_home, source)?.join("admission.lock"))
+}
+
+/// Serialize the executor admission decision with the startup reservation it
+/// authorizes: while this guard is held, no other dispatch can pass the
+/// admission gate and publish a startup claim, so "the allowance is full" and
+/// "this process reserved its run" are one atomic step. Process exit releases
+/// the lock like every other pool lock.
+pub struct PoolAdmissionGuard {
+    _lock: crate::process::ExclusiveFileLock,
+}
+
+/// Take the pool-wide admission lock for one dispatch. The caller counts the
+/// active runs and records the startup reservation before dropping the guard;
+/// the guard is never held across an upstream fetch, a host attach or a model
+/// conversation.
+pub fn begin_pool_admission(codex_home: &Path, source: &Path) -> io::Result<PoolAdmissionGuard> {
+    let path = pool_admission_lock_path(codex_home, source)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let deadline = crate::process::Deadline::after(POOL_ADMISSION_LOCK_BOUND)?;
+    match crate::process::ExclusiveFileLock::acquire(
+        &path,
+        deadline,
+        &crate::process::Cancellation::default(),
+    ) {
+        Ok(lock) => Ok(PoolAdmissionGuard { _lock: lock }),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(pool_error(&format!(
+            "executor admission stayed locked by another dispatch for {POOL_ADMISSION_LOCK_BOUND:?}; refusing to decide admission concurrently"
         ))),
         Err(error) => Err(error),
     }
@@ -533,7 +906,11 @@ fn startup_liveness(reservation: &StartupReservation) -> ReservationLiveness {
     }
 }
 
-fn startup_exclusive(reservation: &StartupReservation) -> bool {
+/// Whether a startup reservation still excludes other processes: a live or
+/// unresolved reservation does, while a confirmed-dead one does not. The
+/// executor adapter reads this to count in-flight runs for active-run
+/// admission without duplicating the reservation liveness rules.
+pub fn startup_exclusive(reservation: &StartupReservation) -> bool {
     matches!(
         startup_liveness(reservation),
         ReservationLiveness::Live | ReservationLiveness::Uncertain
@@ -562,6 +939,14 @@ fn refusal(slot: &PoolSlot, reason: String) -> SlotClaim {
         path: slot.path.clone(),
         reason,
     })
+}
+
+/// The task-claim view of the shared refusal constructor.
+fn task_refusal(slot: &PoolSlot, reason: String) -> TaskSlotClaim {
+    match refusal(slot, reason) {
+        SlotClaim::Unavailable(refusal) => TaskSlotClaim::Unavailable(refusal),
+        SlotClaim::Claimed(_) => unreachable!("a refusal never produces a claim"),
+    }
 }
 
 /// Claim a pool slot for one executor session. Exclusive file creation is the
@@ -596,10 +981,12 @@ pub fn claim_slot_for(
         ));
     }
     let slot = pool.slot(index)?;
-    let record_path = slot_record_path(codex_home, &pool.source, index)?;
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
     for _ in 0..CLAIM_ATTEMPTS {
         let _lock = lock_slot(codex_home, &pool.source, index)?;
-        let previous = load_slot_record(codex_home, &pool.source, index)?;
+        refuse_record_conflict(&layout, index)?;
+        let record_path = layout.resolved(index);
+        let previous = load_record_at(&layout, index)?;
         let claim = SlotRecord {
             schema: SLOT_STATE_SCHEMA,
             source: pool.source.clone(),
@@ -607,6 +994,8 @@ pub fn claim_slot_for(
             path: slot.path.clone(),
             state: SlotState::Synchronizing,
             owner: Some(owner.to_owned()),
+            task: None,
+            handle: None,
             base: previous.as_ref().and_then(|record| record.base.clone()),
             disposition: None,
             reason: None,
@@ -615,15 +1004,24 @@ pub fn claim_slot_for(
         if create_slot_record(&record_path, &claim)? {
             return Ok(SlotClaim::Claimed(claim));
         }
-        let Some(existing) = load_slot_record(codex_home, &pool.source, index)? else {
+        let Some(existing) = load_record_at(&layout, index)? else {
             continue;
         };
-        if !same_path(&existing.source, &pool.source) {
+        if !same_repository(&existing.source, &pool.source) {
             return Err(pool_error(&format!(
                 "slot record {} belongs to another source checkout {}; the lead resolves it",
                 record_path.display(),
                 existing.source.display()
             )));
+        }
+        if let Some(task) = existing.task.as_deref() {
+            return Ok(refusal(
+                slot,
+                format!(
+                    "slot {index} is held by task '{task}' at base {}; release that task before another session or task uses the slot",
+                    existing.base.as_deref().unwrap_or("none")
+                ),
+            ));
         }
         if let Some(reserved) = existing.startup.as_ref() {
             let liveness = startup_liveness(reserved);
@@ -635,7 +1033,7 @@ pub fn claim_slot_for(
                     return Ok(SlotClaim::Claimed(existing));
                 }
                 return Ok(refusal(
-                    &slot,
+                    slot,
                     pending_startup_reason(index, existing.owner.as_deref(), liveness),
                 ));
             }
@@ -647,7 +1045,7 @@ pub fn claim_slot_for(
         }
         if let Some(live) = existing.owner.as_deref().filter(|owner| is_live(owner)) {
             return Ok(refusal(
-                &slot,
+                slot,
                 format!("slot {index} is occupied by live session {live}"),
             ));
         }
@@ -669,7 +1067,7 @@ pub fn claim_slot_for(
                         ..existing
                     },
                 )?;
-                return Ok(refusal(&slot, reason));
+                return Ok(refusal(slot, reason));
             }
         }
     }
@@ -689,7 +1087,8 @@ pub fn bind_slot(
     base: &str,
 ) -> io::Result<SlotRecord> {
     let _lock = lock_slot(codex_home, &pool.source, index)?;
-    let record = load_slot_record(codex_home, &pool.source, index)?
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    let record = load_record_at(&layout, index)?
         .ok_or_else(|| pool_error(&format!("slot {index} has no claim to bind")))?;
     if record.owner.as_deref() != Some(owner) {
         return Err(pool_error(&format!(
@@ -697,14 +1096,15 @@ pub fn bind_slot(
             record.owner.as_deref().unwrap_or("no session")
         )));
     }
-    if let Some(startup) = record.startup.as_ref() {
-        if startup_exclusive(startup) && !startup_matches_current(startup) {
-            return Err(pool_error(&pending_startup_reason(
-                index,
-                record.owner.as_deref(),
-                startup_liveness(startup),
-            )));
-        }
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Err(pool_error(&pending_startup_reason(
+            index,
+            record.owner.as_deref(),
+            startup_liveness(startup),
+        )));
     }
     let bound = SlotRecord {
         state: SlotState::Occupied,
@@ -713,7 +1113,7 @@ pub fn bind_slot(
         reason: None,
         ..record
     };
-    write_slot_record(&slot_record_path(codex_home, &pool.source, index)?, &bound)?;
+    write_slot_record(&layout.resolved(index), &bound)?;
     Ok(bound)
 }
 
@@ -739,12 +1139,14 @@ pub fn adopt_slot(
     }
     reconcile_slots(codex_home, pool, is_live)?;
     let slot = pool.slot(index)?;
-    let record = load_slot_record(codex_home, &pool.source, index)?.ok_or_else(|| {
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    let record = load_record_at(&layout, index)?.ok_or_else(|| {
         pool_error(&format!(
             "slot {index} has no recorded binding to resume; dispatch executor spawn first"
         ))
     })?;
-    if !same_path(&record.source, &pool.source) {
+    refuse_record_conflict(&layout, index)?;
+    if !same_repository(&record.source, &pool.source) {
         return Err(pool_error(&format!(
             "slot record {index} belongs to another source checkout {}; the lead resolves it",
             record.source.display()
@@ -757,13 +1159,14 @@ pub fn adopt_slot(
             pool.source.display()
         )));
     }
-    if let Some(startup) = record.startup.as_ref() {
-        if startup_exclusive(startup) && !startup_matches_current(startup) {
-            return Err(pool_error(&format!(
-                "slot {index} is reserved by in-flight startup of session {}; resume waits until that dispatch hands off or its process identity is resolved",
-                record.owner.as_deref().unwrap_or("no session")
-            )));
-        }
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Err(pool_error(&format!(
+            "slot {index} is reserved by in-flight startup of session {}; resume waits until that dispatch hands off or its process identity is resolved",
+            record.owner.as_deref().unwrap_or("no session")
+        )));
     }
     match record.owner.as_deref() {
         Some(existing) if existing == owner => (),
@@ -802,14 +1205,150 @@ pub fn adopt_slot(
         startup,
         ..record
     };
-    write_slot_record(&slot_record_path(codex_home, &pool.source, index)?, &bound)?;
+    write_slot_record(&layout.resolved(index), &bound)?;
     Ok(bound)
 }
 
-/// Explicit slot release: record the lead's merged or discarded disposition,
-/// then reset or preserve the tree under the existing reset-for-reuse rules.
-/// A live owner session is never reset beneath. A live or uncertain startup
-/// reservation owned by another process is not a release target.
+/// What a release call expects to find when it finally owns the slot lock.
+/// The binding is re-validated under the lock, so a slot reassigned between a
+/// caller's preflight and its lock is never reset by the stale caller.
+enum ReleaseExpectation<'a> {
+    /// Release by position for a legacy executor-session record: a session
+    /// release must never clear a durable task binding.
+    Session,
+    /// Release one exact task binding; the generation handle is required when
+    /// the record carries one.
+    Task {
+        task: &'a str,
+        handle: Option<&'a str>,
+    },
+}
+
+/// The durable identity one release observed before it took the slot lock.
+///
+/// A release is authorized for the binding its caller looked at, not for
+/// whatever occupies the position later: the record read under the lock must
+/// still carry this task binding, generation handle, owner and startup
+/// reservation. A handle-less caller freezes the generation it actually
+/// observed, so a reacquired generation of the same task is a different
+/// binding that the superseded caller must not reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseIdentity {
+    task: Option<String>,
+    handle: Option<String>,
+    owner: Option<String>,
+    startup: Option<StartupReservation>,
+}
+
+impl ReleaseIdentity {
+    fn from_record(record: &SlotRecord) -> Self {
+        Self {
+            task: record.task.clone(),
+            handle: record.handle.clone(),
+            owner: record.owner.clone(),
+            startup: record.startup.clone(),
+        }
+    }
+
+    /// Refuse before any effect when the locked record no longer carries the
+    /// exact binding this release observed.
+    fn validate(&self, index: u32, record: &SlotRecord) -> io::Result<()> {
+        if self.task != record.task || self.handle != record.handle {
+            return Err(pool_error(&format!(
+                "slot {index} now carries {} instead of the {} this release observed; the binding was replaced after the call started and nothing was reset",
+                binding_label(record.task.as_deref(), record.handle.as_deref()),
+                binding_label(self.task.as_deref(), self.handle.as_deref()),
+            )));
+        }
+        if self.owner != record.owner {
+            return Err(pool_error(&format!(
+                "slot {index} is now owned by session {} instead of {}; the owner changed after this release observed the binding and nothing was reset",
+                record.owner.as_deref().unwrap_or("no session"),
+                self.owner.as_deref().unwrap_or("no session"),
+            )));
+        }
+        if self.startup != record.startup {
+            return Err(pool_error(&format!(
+                "slot {index} startup reservation changed after this release observed the binding; nothing was reset"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Plain-language form of one observed binding, used only in release refusals.
+fn binding_label(task: Option<&str>, handle: Option<&str>) -> String {
+    match (task, handle) {
+        (Some(task), Some(handle)) => format!("task '{task}' generation {handle}"),
+        (Some(task), None) => format!("task '{task}' without a generation handle"),
+        (None, Some(handle)) => format!("generation {handle} without a task"),
+        (None, None) => "no task binding".to_owned(),
+    }
+}
+
+/// Refuse a release whose expected binding no longer matches the record read
+/// under the slot lock, before any effect touches the checkout.
+fn validate_release_expectation(
+    index: u32,
+    record: &SlotRecord,
+    expected: &ReleaseExpectation<'_>,
+) -> io::Result<()> {
+    match expected {
+        ReleaseExpectation::Session => {
+            if let Some(task) = record.task.as_deref() {
+                return Err(pool_error(&format!(
+                    "slot {index} is bound to task '{task}'; a session release must not clear a durable task binding - release the task instead"
+                )));
+            }
+        }
+        ReleaseExpectation::Task { task, handle } => {
+            if record.task.as_deref() != Some(*task) {
+                return Err(pool_error(&format!(
+                    "slot {index} is {} instead of the released task '{task}'; the release was superseded and nothing was reset",
+                    match record.task.as_deref() {
+                        Some(held) => format!("bound to task '{held}'"),
+                        None => "no longer bound to that task".to_owned(),
+                    }
+                )));
+            }
+            match (handle, record.handle.as_deref()) {
+                (Some(expected), Some(recorded)) if *expected == recorded => {}
+                (Some(expected), recorded) => {
+                    return Err(pool_error(&format!(
+                        "task '{task}' binding in slot {index} has generation {} instead of {expected}; the handle is stale after release or reassignment",
+                        recorded.unwrap_or("none")
+                    )));
+                }
+                // A handle-less release keeps the optional-handle API: the
+                // task text is checked here, while the generation handle the
+                // caller actually observed is frozen in the release identity
+                // and re-validated under the lock before any effect.
+                (None, _) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The durable release-in-progress record. It keeps the task binding, owner
+/// and base while the reset and its verification are pending, so process loss
+/// or a failed reset can never advertise the slot as free.
+fn release_pending_record(
+    record: &SlotRecord,
+    disposition: SlotDisposition,
+    base: &str,
+) -> SlotRecord {
+    SlotRecord {
+        state: SlotState::AwaitingReview,
+        disposition: Some(disposition),
+        reason: Some(format!(
+            "release in progress: reset to base {base} is not confirmed yet; the binding stays held"
+        )),
+        startup: None,
+        ..record.clone()
+    }
+}
+
 pub fn release_slot(
     codex_home: &Path,
     pool: &Pool,
@@ -819,27 +1358,65 @@ pub fn release_slot(
     base: &str,
     is_live: &dyn Fn(&str) -> bool,
 ) -> io::Result<LaneDisposition> {
-    let record = load_slot_record(codex_home, &pool.source, index)?.ok_or_else(|| {
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    release_slot_with(
+        codex_home,
+        &pool.source,
+        &layout,
+        index,
+        disposition,
+        reason,
+        ReleaseExpectation::Session,
+        None,
+        base,
+        is_live,
+    )
+}
+
+// Every release input is validated under the slot lock; the explicit list is
+// kept over a params struct because the call sites read as one release call.
+// `observed` is the binding the caller looked up, when it did one.
+#[allow(clippy::too_many_arguments)]
+fn release_slot_with(
+    codex_home: &Path,
+    layout_root: &Path,
+    layout: &SlotStateLayout,
+    index: u32,
+    disposition: SlotDisposition,
+    reason: &str,
+    expected: ReleaseExpectation<'_>,
+    observed: Option<ReleaseIdentity>,
+    base: &str,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<LaneDisposition> {
+    let record = load_record_at(layout, index)?.ok_or_else(|| {
         pool_error(&format!(
             "slot {index} has no recorded assignment to release"
         ))
     })?;
-    if let Some(startup) = record.startup.as_ref() {
-        if startup_exclusive(startup) && !startup_matches_current(startup) {
-            return Err(pool_error(&format!(
-                "slot {index} is reserved by in-flight startup of session {}; release waits until that dispatch hands off or its process identity is resolved",
-                record.owner.as_deref().unwrap_or("no session")
-            )));
-        }
+    refuse_record_conflict(layout, index)?;
+    validate_release_expectation(index, &record, &expected)?;
+    // Freeze the identity this release is authorized for: the binding the
+    // caller looked up when it supplied one, otherwise this preflight read.
+    let identity = observed.unwrap_or_else(|| ReleaseIdentity::from_record(&record));
+    identity.validate(index, &record)?;
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Err(pool_error(&format!(
+            "slot {index} is reserved by in-flight startup of session {}; release waits until that dispatch hands off or its process identity is resolved",
+            record.owner.as_deref().unwrap_or("no session")
+        )));
     }
     if let Some(owner) = record.owner.as_deref().filter(|owner| is_live(owner)) {
         return Err(pool_error(&format!(
             "slot {index} is still owned by live session {owner}; stop it before release"
         )));
     }
-    let slot = pool.slot(index)?;
+    let checkout = slot_path(layout_root, index)?;
     let commit = git(
-        &slot.path,
+        &checkout,
         &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
     )
     .map(|text| text.trim().to_owned())
@@ -848,53 +1425,92 @@ pub fn release_slot(
             "release base '{base}' is not a commit in slot {index}; the slot is preserved unchanged"
         ))
     })?;
-    let _lock = lock_slot(codex_home, &pool.source, index)?;
-    let record = load_slot_record(codex_home, &pool.source, index)?.ok_or_else(|| {
+    let _lock = lock_slot(codex_home, layout_root, index)?;
+    // Re-validate the complete observed identity under the lock: a slot
+    // released and reassigned after this caller's preflight must never be
+    // reset by the superseded caller.
+    let record = load_record_at(layout, index)?.ok_or_else(|| {
         pool_error(&format!(
             "slot {index} has no recorded assignment to release"
         ))
     })?;
-    if let Some(startup) = record.startup.as_ref() {
-        if startup_exclusive(startup) && !startup_matches_current(startup) {
-            return Err(pool_error(&format!(
-                "slot {index} is reserved by in-flight startup of session {}; release waits until that dispatch hands off or its process identity is resolved",
-                record.owner.as_deref().unwrap_or("no session")
-            )));
-        }
+    refuse_record_conflict(layout, index)?;
+    validate_release_expectation(index, &record, &expected)?;
+    identity.validate(index, &record)?;
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Err(pool_error(&format!(
+            "slot {index} is reserved by in-flight startup of session {}; release waits until that dispatch hands off or its process identity is resolved",
+            record.owner.as_deref().unwrap_or("no session")
+        )));
     }
-    let record_path = slot_record_path(codex_home, &pool.source, index)?;
-    let released = SlotRecord {
-        state: SlotState::Released,
-        owner: None,
-        base: Some(commit.clone()),
-        disposition: Some(disposition),
-        reason: Some(reason.to_owned()),
-        startup: None,
-        ..record
-    };
-    write_slot_record(&record_path, &released)?;
+    if let Some(owner) = record
+        .owner
+        .as_deref()
+        .filter(|owner| Some(*owner) != record.task.as_deref())
+        .filter(|owner| is_live(owner))
+    {
+        return Err(pool_error(&format!(
+            "slot {index} is still owned by live session {owner}; stop it before release"
+        )));
+    }
+    let record_path = layout.resolved(index);
+    // Phase 1 keeps the binding, owner and base durable while reset and its
+    // verification are pending, so process loss or a failed reset can never
+    // advertise the slot as free.
+    let pending = release_pending_record(&record, disposition, base);
+    write_slot_record(&record_path, &pending)?;
     let mapping = Mapping {
         schema: 1,
-        path: slot.path.clone(),
-        source: pool.source.clone(),
+        path: checkout.clone(),
+        source: layout_root.to_path_buf(),
         head: commit.clone(),
         owner_thread: None,
         archived: false,
         unavailable: false,
     };
-    match reset_for_reuse(&mapping, &pool.source, &commit)? {
-        LaneDisposition::Reused { base } => Ok(LaneDisposition::Reused { base }),
-        LaneDisposition::Preserved { limitation } => {
-            write_slot_record(
-                &record_path,
-                &SlotRecord {
-                    state: SlotState::AwaitingReview,
-                    reason: Some(limitation.clone()),
-                    startup: None,
-                    ..released
-                },
-            )?;
+    match reset_for_reuse(&mapping, layout_root, &commit) {
+        Ok(LaneDisposition::Reused { base }) => {
+            let released = SlotRecord {
+                state: SlotState::Released,
+                owner: None,
+                task: None,
+                handle: None,
+                base: Some(commit.clone()),
+                disposition: Some(disposition),
+                reason: Some(reason.to_owned()),
+                startup: None,
+                ..pending
+            };
+            write_slot_record(&record_path, &released)?;
+            Ok(LaneDisposition::Reused { base })
+        }
+        Ok(LaneDisposition::Preserved { limitation }) => {
+            let preserved = SlotRecord {
+                state: SlotState::AwaitingReview,
+                reason: Some(limitation.clone()),
+                startup: None,
+                ..pending
+            };
+            write_slot_record(&record_path, &preserved)?;
             Ok(LaneDisposition::Preserved { limitation })
+        }
+        Err(error) => {
+            // Keep the original error and its recovery inputs; the pending
+            // record already holds the slot even if this bookkeeping write
+            // fails, and the caller gets the original cause either way.
+            let failed = SlotRecord {
+                state: SlotState::AwaitingReview,
+                reason: Some(format!(
+                    "release failed before the reset could complete: {error}; the binding, base {base} and the checkout are preserved - resolve the cause and release again"
+                )),
+                startup: None,
+                ..pending
+            };
+            let _ = write_slot_record(&record_path, &failed);
+            Err(error)
         }
     }
 }
@@ -909,12 +1525,21 @@ pub fn reconcile_slots(
     pool: &Pool,
     is_live: &dyn Fn(&str) -> bool,
 ) -> io::Result<Vec<SlotRecord>> {
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
     let mut records = Vec::new();
     for slot in &pool.slots {
-        let Some(record) = load_slot_record(codex_home, &pool.source, slot.index)? else {
+        let Some(record) = load_record_at(&layout, slot.index)? else {
             records.push(free_slot_record(pool, slot));
             continue;
         };
+        // Ambiguous record locations stop reconciliation and allocation.
+        refuse_record_conflict(&layout, slot.index)?;
+        // A task binding persists without process liveness: only an explicit
+        // release frees it.
+        if record.task.is_some() {
+            records.push(record);
+            continue;
+        }
         if record.startup.as_ref().is_some_and(startup_exclusive) {
             records.push(record);
             continue;
@@ -925,10 +1550,14 @@ pub fn reconcile_slots(
             continue;
         }
         let _lock = lock_slot(codex_home, &pool.source, slot.index)?;
-        let Some(record) = load_slot_record(codex_home, &pool.source, slot.index)? else {
+        let Some(record) = load_record_at(&layout, slot.index)? else {
             records.push(free_slot_record(pool, slot));
             continue;
         };
+        if record.task.is_some() {
+            records.push(record);
+            continue;
+        }
         if record.startup.as_ref().is_some_and(startup_exclusive) {
             records.push(record);
             continue;
@@ -955,10 +1584,7 @@ pub fn reconcile_slots(
                 ..record.clone()
             },
         };
-        write_slot_record(
-            &slot_record_path(codex_home, &pool.source, slot.index)?,
-            &next,
-        )?;
+        write_slot_record(&layout.resolved(slot.index), &next)?;
         records.push(next);
     }
     Ok(records)
@@ -976,17 +1602,91 @@ fn native_path(path: &str) -> PathBuf {
     }
 }
 
-/// Fail-closed upstream synchronization of one slot: fetch the configured
-/// remote, resolve the default base or the explicit override, reset, remove
-/// untracked files keeping ignored build caches, and verify a clean HEAD. A
-/// failed fetch, an unresolvable base or unreviewed work aborts before the
-/// slot changes.
+/// Fail-closed synchronization of one slot: resolve the requested base, reset,
+/// remove untracked files keeping ignored build caches, and verify a clean
+/// HEAD. An explicit base is resolved locally and never fetched; without one
+/// the configured upstream is refreshed first, and a fetch or resolution
+/// failure aborts before the slot changes. Unreviewed work aborts the reset.
 pub fn synchronize_slot(
     codex_home: &Path,
     pool: &Pool,
     index: u32,
     base: Option<&str>,
 ) -> io::Result<SynchronizedSlot> {
+    refuse_record_conflict(&slot_state_layout(codex_home, &pool.caller)?, index)?;
+    let checkout = slot_worktree(pool, index)?;
+    let (remote, branch) = match base {
+        // An explicit local base needs no network access; the upstream pair is
+        // still reported when it can be inspected locally.
+        Some(_) => upstream(&checkout).unwrap_or_default(),
+        None => upstream(&checkout)?,
+    };
+    if base.is_none() {
+        git(&checkout, &["fetch", &remote]).map_err(|error| {
+            pool_error(&format!(
+                "upstream fetch of '{remote}' failed for slot {index}; the slot keeps its previous state: {error}"
+            ))
+        })?;
+    }
+    let commit = match base {
+        Some(base) => resolve_commit(&checkout, base).map_err(|_| {
+            pool_error(&format!(
+                "base '{base}' is not a commit in slot {index}; an explicit base is resolved locally and never fetched, so the slot keeps its previous state"
+            ))
+        })?,
+        None => {
+            let branch = branch.clone().ok_or_else(|| {
+                pool_error(&format!(
+                    "the upstream default branch for remote '{remote}' cannot be resolved; pass an explicit base"
+                ))
+            })?;
+            resolve_commit(&checkout, &format!("refs/remotes/{remote}/{branch}")).map_err(|_| {
+                pool_error(&format!(
+                    "the upstream default branch '{remote}/{branch}' cannot be resolved in slot {index}; pass an explicit base"
+                ))
+            })?
+        }
+    };
+    let previous_head = reset_slot_to(codex_home, pool, index, &commit)?;
+    Ok(SynchronizedSlot {
+        base: commit,
+        remote,
+        branch,
+        previous_head,
+    })
+}
+
+/// Resolve the executor's upstream-default base: refresh the configured
+/// upstream and name the exact commit of its default branch. A fetch or
+/// resolution failure is reported before any slot changes, so an executor
+/// adapter can pass the returned commit as an explicit local base to the task
+/// acquisition without a second network access.
+pub fn refresh_upstream_base(checkout: &Path) -> io::Result<(String, String, String)> {
+    let checkout = resolve_source(checkout)?;
+    let (remote, branch) = upstream(&checkout)?;
+    git(&checkout, &["fetch", &remote]).map_err(|error| {
+        pool_error(&format!(
+            "upstream fetch of '{remote}' failed for {}; no base is selected from stale state: {error}",
+            checkout.display()
+        ))
+    })?;
+    let branch = branch.ok_or_else(|| {
+        pool_error(&format!(
+            "the upstream default branch for remote '{remote}' cannot be resolved; name an explicit base"
+        ))
+    })?;
+    let commit = resolve_commit(&checkout, &format!("refs/remotes/{remote}/{branch}")).map_err(
+        |_| {
+            pool_error(&format!(
+                "the upstream default branch '{remote}/{branch}' cannot be resolved; name an explicit base"
+            ))
+        },
+    )?;
+    Ok((commit, remote, branch))
+}
+
+/// The checkout of one pool position, verified to be a Git worktree.
+fn slot_worktree(pool: &Pool, index: u32) -> io::Result<PathBuf> {
     let slot = pool.slot(index)?;
     if !slot.path.is_dir() {
         return Err(pool_error(&format!(
@@ -1000,43 +1700,30 @@ pub fn synchronize_slot(
             slot.path.display()
         )));
     }
-    let (remote, branch) = upstream(&slot.path)?;
-    git(&slot.path, &["fetch", &remote]).map_err(|error| {
-        pool_error(&format!(
-            "upstream fetch of '{remote}' failed for slot {index}; the slot keeps its previous state: {error}"
-        ))
-    })?;
-    let commit = match base {
-        Some(base) => resolve_commit(&slot.path, base).map_err(|_| {
-            pool_error(&format!(
-                "base '{base}' is not a commit in slot {index} after the upstream fetch; the slot keeps its previous state"
-            ))
-        })?,
-        None => {
-            let branch = branch.clone().ok_or_else(|| {
-                pool_error(&format!(
-                    "the upstream default branch for remote '{remote}' cannot be resolved; pass an explicit base"
-                ))
-            })?;
-            resolve_commit(&slot.path, &format!("refs/remotes/{remote}/{branch}")).map_err(|_| {
-                pool_error(&format!(
-                    "the upstream default branch '{remote}/{branch}' cannot be resolved in slot {index}; pass an explicit base"
-                ))
-            })?
-        }
-    };
-    // A reset destroys data only when the slot is clean or its release
-    // disposition is recorded as merged or explicitly discarded.
-    let record = load_slot_record(codex_home, &pool.source, index)?;
+    Ok(slot.path.clone())
+}
+
+/// Reset one slot to an exact committed base, keeping ignored build caches.
+/// A reset destroys data only when the slot is clean or its release
+/// disposition is recorded as merged or explicitly discarded; unreviewed work
+/// aborts before any change. The previous HEAD is returned for the receipt.
+fn reset_slot_to(
+    codex_home: &Path,
+    pool: &Pool,
+    index: u32,
+    commit: &str,
+) -> io::Result<Option<String>> {
+    let checkout = slot_worktree(pool, index)?;
+    let record = load_slot_record(codex_home, &pool.caller, index)?;
     if !record
         .as_ref()
         .is_some_and(|record| record.disposition.is_some())
     {
-        let head = git(&slot.path, &["rev-parse", "HEAD"])
+        let head = git(&checkout, &["rev-parse", "HEAD"])
             .map(|text| text.trim().to_owned())
             .unwrap_or_default();
         let recorded = record.as_ref().and_then(|record| record.base.clone());
-        let status = slot_status(&slot.path)?;
+        let status = slot_status(&checkout)?;
         if !status.trim().is_empty() {
             return Err(pool_error(&format!(
                 "slot {index} holds unreviewed changes; merge or explicitly discard them before reuse: {}",
@@ -1049,34 +1736,29 @@ pub fn synchronize_slot(
             )));
         }
     }
-    let previous_head = git(&slot.path, &["rev-parse", "HEAD"])
+    let previous_head = git(&checkout, &["rev-parse", "HEAD"])
         .ok()
         .map(|text| text.trim().to_owned());
-    git(&slot.path, &["reset", "--hard", &commit]).map_err(|error| {
+    git(&checkout, &["reset", "--hard", commit]).map_err(|error| {
         pool_error(&format!(
             "slot {index} could not reset to {commit}: {error}"
         ))
     })?;
-    git(&slot.path, &["clean", "-fd"]).map_err(|error| {
+    git(&checkout, &["clean", "-fd"]).map_err(|error| {
         pool_error(&format!(
             "slot {index} could not remove untracked files: {error}"
         ))
     })?;
-    let head = git(&slot.path, &["rev-parse", "HEAD"])
+    let head = git(&checkout, &["rev-parse", "HEAD"])
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
-    let status = slot_status(&slot.path)?;
+    let status = slot_status(&checkout)?;
     if head != commit || !status.trim().is_empty() {
         return Err(pool_error(&format!(
             "slot {index} did not reach a clean synchronized state at {commit} (HEAD {head})"
         )));
     }
-    Ok(SynchronizedSlot {
-        base: commit,
-        remote,
-        branch,
-        previous_head,
-    })
+    Ok(previous_head)
 }
 
 /// Select, synchronize and bind a pool slot for one executor session. Every
@@ -1177,21 +1859,22 @@ pub fn release_startup_reservation(
     index: u32,
     owner: &str,
 ) -> io::Result<()> {
-    let Some(record) = load_slot_record(codex_home, source, index)? else {
+    let layout = slot_state_layout(codex_home, source)?;
+    let Some(record) = load_record_at(&layout, index)? else {
         return Ok(());
     };
     if record.owner.as_deref() != Some(owner) || record.startup.is_none() {
         return Ok(());
     }
     let _lock = lock_slot(codex_home, source, index)?;
-    let Some(record) = load_slot_record(codex_home, source, index)? else {
+    let Some(record) = load_record_at(&layout, index)? else {
         return Ok(());
     };
     if record.owner.as_deref() != Some(owner) || record.startup.is_none() {
         return Ok(());
     }
     write_slot_record(
-        &slot_record_path(codex_home, source, index)?,
+        &layout.resolved(index),
         &SlotRecord {
             startup: None,
             ..record
@@ -1217,14 +1900,15 @@ pub fn claim_still_held(
             record.owner.as_deref().unwrap_or("no session")
         )));
     }
-    if let Some(startup) = record.startup.as_ref() {
-        if startup_exclusive(startup) && !startup_matches_current(startup) {
-            return Err(pool_error(&pending_startup_reason(
-                index,
-                record.owner.as_deref(),
-                startup_liveness(startup),
-            )));
-        }
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Err(pool_error(&pending_startup_reason(
+            index,
+            record.owner.as_deref(),
+            startup_liveness(startup),
+        )));
     }
     Ok(())
 }
@@ -1239,8 +1923,9 @@ pub fn hold_startup_reservation(
     owner: &str,
 ) -> io::Result<()> {
     let startup = current_startup_reservation()?;
+    let layout = slot_state_layout(codex_home, source)?;
     let _lock = lock_slot(codex_home, source, index)?;
-    let record = load_slot_record(codex_home, source, index)?
+    let record = load_record_at(&layout, index)?
         .ok_or_else(|| pool_error(&format!("slot {index} has no claim to reserve for startup")))?;
     if record.owner.as_deref() != Some(owner) {
         return Err(pool_error(&format!(
@@ -1248,22 +1933,1239 @@ pub fn hold_startup_reservation(
             record.owner.as_deref().unwrap_or("no session")
         )));
     }
-    if let Some(existing) = record.startup.as_ref() {
-        if startup_exclusive(existing) && !startup_matches(existing, &startup) {
-            return Err(pool_error(&pending_startup_reason(
-                index,
-                record.owner.as_deref(),
-                startup_liveness(existing),
-            )));
-        }
+    if let Some(existing) = record.startup.as_ref()
+        && startup_exclusive(existing)
+        && !startup_matches(existing, &startup)
+    {
+        return Err(pool_error(&pending_startup_reason(
+            index,
+            record.owner.as_deref(),
+            startup_liveness(existing),
+        )));
     }
     write_slot_record(
-        &slot_record_path(codex_home, source, index)?,
+        &layout.resolved(index),
         &SlotRecord {
             startup: Some(startup),
             ..record
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Generic task lifecycle: durable task bindings in the shared pool.
+//
+// Ordinary tasks, experiments and reviews acquire a slot through these
+// operations without starting a process. The binding records the task
+// identity, a non-reusable generation handle and the exact prepared base; it
+// persists until an explicit release, independent of any session liveness.
+// Executor dispatch keeps its own startup reservation flow and can bind task
+// identity through the same records.
+// ---------------------------------------------------------------------------
+
+/// Observable ownership state of one pool position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    /// No binding: the position may serve the next acquisition.
+    Free,
+    /// A task owns the slot; its work survives without a live process.
+    Held,
+    /// Ownership is retained with a concrete reason - unreviewed work or an
+    /// incomplete release keeps the slot out of the free pool.
+    AwaitingReview,
+}
+
+/// Durable task binding of one pool slot, as recorded by the common owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSlot {
+    pub index: u32,
+    pub path: PathBuf,
+    /// Registry position of the path; `Foreign` is reported, never adopted.
+    pub presence: SlotPresence,
+    pub state: TaskState,
+    /// Durable task identity; `None` on a free slot or a legacy session record.
+    pub task: Option<String>,
+    /// Generation handle of the binding; a stale handle cannot continue it.
+    pub handle: Option<String>,
+    /// Owner identity recorded in the slot record: the task identity for a
+    /// task binding, the executor session for legacy records.
+    pub owner: Option<String>,
+    /// Exact committed base the slot was prepared at.
+    pub base: Option<String>,
+    /// Recorded release disposition, when a release attempt was recorded.
+    pub disposition: Option<SlotDisposition>,
+    /// Why the slot is preserved, or why the last operation aborted.
+    pub reason: Option<String>,
+}
+
+impl TaskSlot {
+    fn from_record(
+        record: &SlotRecord,
+        index: u32,
+        path: PathBuf,
+        presence: SlotPresence,
+    ) -> TaskSlot {
+        TaskSlot {
+            index,
+            path,
+            presence,
+            state: task_state(record),
+            task: record.task.clone(),
+            handle: record.handle.clone(),
+            owner: record.owner.clone(),
+            base: record.base.clone(),
+            disposition: record.disposition,
+            reason: record.reason.clone(),
+        }
+    }
+
+    fn free(index: u32, path: PathBuf, presence: SlotPresence) -> TaskSlot {
+        TaskSlot {
+            index,
+            path,
+            presence,
+            state: TaskState::Free,
+            task: None,
+            handle: None,
+            owner: None,
+            base: None,
+            disposition: None,
+            reason: None,
+        }
+    }
+}
+
+fn task_state(record: &SlotRecord) -> TaskState {
+    match record.state {
+        SlotState::Free | SlotState::Released => TaskState::Free,
+        SlotState::Synchronizing | SlotState::Occupied => TaskState::Held,
+        SlotState::AwaitingReview => TaskState::AwaitingReview,
+    }
+}
+
+fn state_name(state: SlotState) -> &'static str {
+    match state {
+        SlotState::Free => "free",
+        SlotState::Synchronizing => "synchronizing",
+        SlotState::Occupied => "occupied",
+        SlotState::AwaitingReview => "awaiting review",
+        SlotState::Released => "released",
+    }
+}
+
+/// Exact committed base for a new task: an explicit request is resolved
+/// locally and never fetched, and without a request the checkout's current
+/// HEAD is the exact local base. Returns the commit and whether the base was
+/// explicitly requested.
+pub fn resolve_task_base(checkout: &Path, requested: Option<&str>) -> io::Result<(String, bool)> {
+    match requested {
+        Some(base) => resolve_commit(checkout, base)
+            .map(|commit| (commit, true))
+            .map_err(|_| {
+                pool_error(&format!(
+                    "base '{base}' is not a commit available locally in {}; an explicit base never fetches from a remote",
+                    checkout.display()
+                ))
+            }),
+        None => resolve_commit(checkout, "HEAD")
+            .map(|commit| (commit, false))
+            .map_err(|_| {
+                pool_error(&format!(
+                    "{} has no committed HEAD to use as the exact local base; name an explicit base",
+                    checkout.display()
+                ))
+            }),
+    }
+}
+
+/// Acquire or continue one durable task binding in the repository's pool.
+///
+/// Repeating acquisition for a held task returns its binding without reset or
+/// a second slot; a different explicitly requested base is refused as a
+/// conflict. Otherwise the first free position is claimed, prepared at the
+/// exact committed base and bound to the task. Preparation never fetches: an
+/// explicit base is resolved locally, and without one the primary checkout's
+/// HEAD is the exact local base.
+pub fn acquire_task(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    task: &str,
+    base: Option<&str>,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskSlot> {
+    acquire_task_with(codex_home, source, size, task, base, is_live, None)
+}
+
+/// Task acquisition that also records this process as the slot's startup
+/// reservation until the consumer publishes its host lease; the reservation
+/// is released with `release_startup_reservation` like any other.
+pub fn acquire_task_for_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    task: &str,
+    base: Option<&str>,
+    startup: &StartupReservation,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskSlot> {
+    acquire_task_with(codex_home, source, size, task, base, is_live, Some(startup))
+}
+
+fn acquire_task_with(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    task: &str,
+    base: Option<&str>,
+    is_live: &dyn Fn(&str) -> bool,
+    startup: Option<&StartupReservation>,
+) -> io::Result<TaskSlot> {
+    // The ordinary acquisition path has no shared admission guard to keep
+    // short, so walking past a recorded position still materializes it: a
+    // held binding whose checkout was pruned through keeps its directory
+    // instead of being reported as vanished, which is what lets the recorded
+    // release recover it.
+    let begin = begin_task_startup(codex_home, source, size, task, base, startup, true, is_live)?;
+    prepare_task_startup(codex_home, source, size, begin)
+}
+
+/// The outcome of beginning one executor startup: either the task already
+/// holds a binding that continues in place, or a pool position was claimed
+/// with this process's startup reservation and still has to be prepared.
+#[derive(Debug)]
+pub enum TaskStartup {
+    /// The task's durable binding already exists; the caller records its own
+    /// startup reservation with `hold_startup_reservation` and dispatches.
+    Held(TaskSlot),
+    /// A position was claimed and the startup reservation is part of the
+    /// record. `prepare_task_startup` materializes and binds it.
+    Reserved {
+        task: String,
+        slot: PoolSlot,
+        exact: String,
+        handle: String,
+    },
+}
+
+/// Begin one task startup without touching its checkout. Under the caller's
+/// pool admission guard this is the atomic step: the pool is reconciled, an
+/// existing binding is returned, or a position is claimed with this process's
+/// startup reservation. Checkout creation, reset and binding stay out of the
+/// guard, so independent startups prepare within the allowance.
+///
+/// `repair_walked_slots` materializes recorded positions walked before the
+/// claimed one, which is how the ordinary worktree commands keep a pruned
+/// held checkout recoverable. A caller whose admission guard is shared with
+/// other dispatches passes `false`: no cold checkout preparation runs under
+/// that guard, and the claimed position is still materialized by
+/// `prepare_task_startup` after the guard is released.
+// The pool startup contract is one positional parameter family; the boolean
+// only selects walk repair.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_task_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    task: &str,
+    base: Option<&str>,
+    startup: Option<&StartupReservation>,
+    repair_walked_slots: bool,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskStartup> {
+    if task.trim().is_empty() {
+        return Err(pool_error(
+            "a task acquisition requires a non-empty task identity",
+        ));
+    }
+    let pool = pool(source, size)?;
+    let (exact, explicit) = resolve_task_base(&pool.source, base)?;
+    let requested = explicit.then_some(exact.as_str());
+    reconcile_slots(codex_home, &pool, is_live)?;
+    if let Some(binding) = find_task_binding(codex_home, &pool, task, requested)? {
+        return Ok(TaskStartup::Held(binding));
+    }
+    // Capacity reduction is refused before new acquisition: positions beyond
+    // the configured size still hold owned work, so the pool is full at its
+    // reduced limit until those bindings are released or explicitly retired.
+    // A binding beyond the size continues through the lookup above instead.
+    let beyond = held_tasks_beyond(codex_home, &pool.source, size)?;
+    if !beyond.is_empty() {
+        let held = beyond
+            .iter()
+            .map(|slot| {
+                format!(
+                    "slot {} holds task {}",
+                    slot.index,
+                    slot.task.as_deref().unwrap_or("(recorded session owner)")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(pool_error(&format!(
+            "worktree_pool_size {size} is below the recorded positions still holding tasks ({held}); release or explicitly retire those bindings before acquiring another task"
+        )));
+    }
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    let mut refusals = Vec::new();
+    for slot in &pool.slots {
+        // Positions walked before the claimed one keep their existing presence
+        // handling and recovery: a missing registered position is refused with
+        // its prune remedy, and a recorded position is materialized so a held
+        // binding keeps its directory instead of being reported as vanished.
+        // The materialization only happens where the caller asked for walk
+        // repair: the worktree commands repair a pruned held checkout, while
+        // a guarded executor dispatch leaves that checkout work to the
+        // successful preparation owner so nothing cold runs under the shared
+        // admission guard.
+        match slot.presence {
+            SlotPresence::RegisteredMissing => {
+                return Err(pool_error(&format!(
+                    "slot {} {} is registered but missing; run `git worktree prune` in {} and retry",
+                    slot.index,
+                    slot.path.display(),
+                    pool.source.display()
+                )));
+            }
+            SlotPresence::Foreign => {
+                return Err(pool_error(&format!(
+                    "slot {} {} exists but is not a worktree of {}; it is never replaced, move it aside or reconfigure the pool",
+                    slot.index,
+                    slot.path.display(),
+                    pool.source.display()
+                )));
+            }
+            SlotPresence::Registered | SlotPresence::Absent => {}
+        }
+        // The first position without a record is the one this startup claims;
+        // its materialization is preparation and stays outside the caller's
+        // admission guard, so only recorded positions are created here.
+        let recorded = load_record_at(&layout, slot.index)?.is_some();
+        if recorded && repair_walked_slots {
+            create_slot(&pool, slot.index)?;
+        }
+        match claim_task_slot(codex_home, &pool, slot.index, task, is_live, startup)? {
+            TaskSlotClaim::Claimed(record) => {
+                let Some(handle) = record.handle.clone() else {
+                    let _ = abort_task_claim(
+                        codex_home,
+                        &pool,
+                        slot.index,
+                        task,
+                        "",
+                        "the claim has no generation handle".into(),
+                    );
+                    return Err(pool_error(&format!(
+                        "slot {} claim of task '{task}' has no generation handle; the lead resolves the record",
+                        slot.index
+                    )));
+                };
+                if record.state == SlotState::Occupied {
+                    if record.base.as_deref() == Some(exact.as_str()) {
+                        // A binding completed between the lookup and the claim.
+                        return Ok(TaskStartup::Held(TaskSlot::from_record(
+                            &record,
+                            slot.index,
+                            slot.path.clone(),
+                            slot.presence,
+                        )));
+                    }
+                    // A concurrent acquisition bound this task at another
+                    // base; never reset a binding that may already hold work.
+                    return Err(pool_error(&format!(
+                        "task '{task}' is bound concurrently in slot {} at base {}; retry to continue the recorded binding",
+                        slot.index,
+                        record.base.as_deref().unwrap_or("none")
+                    )));
+                }
+                return Ok(TaskStartup::Reserved {
+                    task: task.to_owned(),
+                    slot: PoolSlot {
+                        index: slot.index,
+                        path: slot.path.clone(),
+                        presence: slot.presence,
+                    },
+                    exact,
+                    handle,
+                });
+            }
+            // The same task is already acquiring or holding a position; it
+            // must never be walked on to a second slot, so the whole pool
+            // acquisition stops with the recorded reason.
+            TaskSlotClaim::InFlightSameTask(reason) => return Err(pool_error(&reason)),
+            TaskSlotClaim::Unavailable(refusal) => {
+                // A refused position is owned by its successful claimant,
+                // whose preparation materializes it outside any admission
+                // guard; this walk never brings a rival position into
+                // existence.
+                refusals.push(refusal.reason);
+            }
+        }
+    }
+    Err(pool_error(&format!(
+        "no free slot in the pool of {size} (worktree_pool_size): {}",
+        refusals.join("; ")
+    )))
+}
+
+pub fn prepare_task_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    startup: TaskStartup,
+) -> io::Result<TaskSlot> {
+    let (task, slot, exact, handle) = match startup {
+        TaskStartup::Held(slot) => return Ok(slot),
+        TaskStartup::Reserved {
+            task,
+            slot,
+            exact,
+            handle,
+        } => (task, slot, exact, handle),
+    };
+    // The pool is re-read so the receipt reports the position's current
+    // presence; positions are fixed by the configured size, so this only
+    // refreshes the registry facts.
+    let pool = pool(source, size)?;
+    // The claim already excluded rivals; materialization, reset and binding
+    // run outside the admission guard so an independent startup prepares
+    // within the allowance. A failed preparation aborts this claim so the
+    // position is not advertised as free while it still holds unverified
+    // state, and the preparation failure stays the reported cause.
+    if let Err(error) = create_slot(&pool, slot.index) {
+        let _ = abort_task_claim(
+            codex_home,
+            &pool,
+            slot.index,
+            &task,
+            &handle,
+            error.to_string(),
+        );
+        return Err(error);
+    }
+    if let Err(error) = reset_slot_to(codex_home, &pool, slot.index, &exact) {
+        let _ = abort_task_claim(
+            codex_home,
+            &pool,
+            slot.index,
+            &task,
+            &handle,
+            error.to_string(),
+        );
+        return Err(error);
+    }
+    let bound = bind_task_slot(codex_home, &pool, slot.index, &task, &handle, &exact)?;
+    Ok(TaskSlot::from_record(
+        &bound,
+        slot.index,
+        slot.path,
+        slot.presence,
+    ))
+}
+
+pub fn continue_task(
+    codex_home: &Path,
+    source: &Path,
+    task: &str,
+    handle: Option<&str>,
+) -> io::Result<TaskSlot> {
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let registered = registered_trees(&root)?;
+    let Some((index, record)) = find_record_for_task(&layout, &root, task)? else {
+        return Err(pool_error(&format!(
+            "no recorded binding for task '{task}' in {}; acquire it first",
+            root.display()
+        )));
+    };
+    if let Some(handle) = handle
+        && record.handle.as_deref() != Some(handle)
+    {
+        return Err(pool_error(&format!(
+            "task '{task}' binding in slot {index} has generation {} instead of {handle}; the handle is stale after release or reassignment",
+            record.handle.as_deref().unwrap_or("none")
+        )));
+    }
+    if record.state == SlotState::Released {
+        return Err(pool_error(&format!(
+            "task '{task}' was released from slot {index}; acquire it again instead of continuing"
+        )));
+    }
+    if let Some(reserved) = record.startup.as_ref()
+        && startup_exclusive(reserved)
+        && !startup_matches_current(reserved)
+    {
+        return Err(pool_error(&pending_startup_reason(
+            index,
+            record.owner.as_deref(),
+            startup_liveness(reserved),
+        )));
+    }
+    // The generic path cannot verify a session binding, so it fails closed on
+    // one: a former owner must not continue a task that was reassigned.
+    if let Some(owner) = record
+        .owner
+        .as_deref()
+        .filter(|owner| Some(*owner) != record.task.as_deref())
+    {
+        return Err(pool_error(&format!(
+            "task '{task}' in slot {index} is bound to session {owner}; continue it as that session or hand it to another session explicitly"
+        )));
+    }
+    let path = slot_path(&root, index)?;
+    if !path.is_dir() {
+        return Err(pool_error(&format!(
+            "slot {index} directory {} is missing; recover the worktree before continuing task '{task}'",
+            path.display()
+        )));
+    }
+    let presence = slot_presence(&path, &registered);
+    Ok(TaskSlot::from_record(&record, index, path, presence))
+}
+
+/// Validate the session binding of a held task before it is returned or
+/// rebound: a live foreign session must be resolved first, while a task-owned
+/// binding or a former owner whose session is not live may be rebound.
+fn validate_session_binding(
+    index: u32,
+    task: &str,
+    record: &SlotRecord,
+    session: &str,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<()> {
+    if let Some(owner) = record
+        .owner
+        .as_deref()
+        .filter(|owner| Some(*owner) != record.task.as_deref())
+        && owner != session
+        && is_live(owner)
+    {
+        return Err(pool_error(&format!(
+            "task '{task}' in slot {index} is held by live session {owner}; stop it before continuing as {session}"
+        )));
+    }
+    Ok(())
+}
+
+/// Continue one held task as an explicit executor session. The recorded
+/// session binding is validated before the checkout is returned: a live
+/// foreign session refuses, while a former owner whose session resolved dead
+/// is rebound to the asking session with its task, generation handle, base and
+/// work preserved. Nothing is reset here.
+pub fn continue_task_for_session(
+    codex_home: &Path,
+    source: &Path,
+    task: &str,
+    handle: Option<&str>,
+    session: &str,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskSlot> {
+    if session.trim().is_empty() {
+        return Err(pool_error(
+            "continuing a task for a session requires the executor session identity",
+        ));
+    }
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let registered = registered_trees(&root)?;
+    let Some((index, record)) = find_record_for_task(&layout, &root, task)? else {
+        return Err(pool_error(&format!(
+            "no recorded binding for task '{task}' in {}; acquire it first",
+            root.display()
+        )));
+    };
+    if let Some(handle) = handle
+        && record.handle.as_deref() != Some(handle)
+    {
+        return Err(pool_error(&format!(
+            "task '{task}' binding in slot {index} has generation {} instead of {handle}; the handle is stale after release or reassignment",
+            record.handle.as_deref().unwrap_or("none")
+        )));
+    }
+    if record.state == SlotState::Released {
+        return Err(pool_error(&format!(
+            "task '{task}' was released from slot {index}; acquire it again instead of continuing"
+        )));
+    }
+    validate_session_binding(index, task, &record, session, is_live)?;
+    let path = slot_path(&root, index)?;
+    if !path.is_dir() {
+        return Err(pool_error(&format!(
+            "slot {index} directory {} is missing; recover the worktree before continuing task '{task}'",
+            path.display()
+        )));
+    }
+    let _lock = lock_slot(codex_home, &root, index)?;
+    let Some(record) = load_record_at(&layout, index)? else {
+        return Err(pool_error(&format!(
+            "task '{task}' binding in slot {index} disappeared while continuing; retry"
+        )));
+    };
+    refuse_record_conflict(&layout, index)?;
+    if let Some(handle) = handle
+        && record.handle.as_deref() != Some(handle)
+    {
+        return Err(pool_error(&format!(
+            "task '{task}' binding in slot {index} has generation {} instead of {handle}; the handle is stale after release or reassignment",
+            record.handle.as_deref().unwrap_or("none")
+        )));
+    }
+    if record.task.as_deref() != Some(task) || record.state == SlotState::Released {
+        return Err(pool_error(&format!(
+            "task '{task}' is no longer bound to slot {index}; the binding was reassigned"
+        )));
+    }
+    if let Some(reserved) = record.startup.as_ref()
+        && startup_exclusive(reserved)
+        && !startup_matches_current(reserved)
+    {
+        return Err(pool_error(&pending_startup_reason(
+            index,
+            record.owner.as_deref(),
+            startup_liveness(reserved),
+        )));
+    }
+    validate_session_binding(index, task, &record, session, is_live)?;
+    let rebound = if record.owner.as_deref() == Some(session) {
+        record
+    } else {
+        let rebound = SlotRecord {
+            owner: Some(session.to_owned()),
+            ..record
+        };
+        write_slot_record(&layout.resolved(index), &rebound)?;
+        rebound
+    };
+    let presence = slot_presence(&path, &registered);
+    Ok(TaskSlot::from_record(&rebound, index, path, presence))
+}
+
+/// Hand a held task binding to an executor session before launch: the session
+/// becomes the recorded owner and this process holds the startup reservation
+/// through the host handoff, while the task identity, generation handle and
+/// exact base stay unchanged. The task's checkout is never released or reset
+/// by a handoff. A stale handle, a released binding, a foreign exclusive
+/// startup reservation, or a different live session currently owning the
+/// binding refuses the transfer.
+pub fn handoff_task_to_session(
+    codex_home: &Path,
+    source: &Path,
+    task: &str,
+    handle: &str,
+    session: &str,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskSlot> {
+    if session.trim().is_empty() {
+        return Err(pool_error(
+            "a task handoff requires the executor session identity",
+        ));
+    }
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let startup = current_startup_reservation()?;
+    let registered = registered_trees(&root)?;
+    for index in recorded_indexes(&layout)? {
+        let Some(record) = load_record_at(&layout, index)? else {
+            continue;
+        };
+        if record.task.as_deref() != Some(task) || !same_repository(&record.source, &root) {
+            continue;
+        }
+        refuse_record_conflict(&layout, index)?;
+        if record.handle.as_deref() != Some(handle) {
+            return Err(pool_error(&format!(
+                "task '{task}' binding in slot {index} has generation {} instead of {handle}; the handle is stale",
+                record.handle.as_deref().unwrap_or("none")
+            )));
+        }
+        if record.state == SlotState::Released {
+            return Err(pool_error(&format!(
+                "task '{task}' was released from slot {index}; acquire it again before handoff"
+            )));
+        }
+        validate_session_binding(index, task, &record, session, is_live)?;
+        let _lock = lock_slot(codex_home, &root, index)?;
+        let Some(record) = load_record_at(&layout, index)? else {
+            continue;
+        };
+        refuse_record_conflict(&layout, index)?;
+        if record.task.as_deref() != Some(task)
+            || record.handle.as_deref() != Some(handle)
+            || record.state == SlotState::Released
+        {
+            return Err(pool_error(&format!(
+                "slot {index} is no longer bound to task '{task}' generation {handle}; the binding was reassigned"
+            )));
+        }
+        // Re-validate the session binding under the lock, immediately before
+        // the effect: a live owner that appeared after the preflight must
+        // resolve before the binding moves, and a dead former owner is
+        // explicitly replaced without reset.
+        validate_session_binding(index, task, &record, session, is_live)?;
+        if let Some(reserved) = record.startup.as_ref()
+            && startup_exclusive(reserved)
+            && !startup_matches_current(reserved)
+        {
+            return Err(pool_error(&pending_startup_reason(
+                index,
+                record.owner.as_deref(),
+                startup_liveness(reserved),
+            )));
+        }
+        let handed = SlotRecord {
+            owner: Some(session.to_owned()),
+            startup: Some(startup),
+            ..record
+        };
+        write_slot_record(&layout.resolved(index), &handed)?;
+        let path = slot_path(&root, index)?;
+        let presence = slot_presence(&path, &registered);
+        return Ok(TaskSlot::from_record(&handed, index, path, presence));
+    }
+    Err(pool_error(&format!(
+        "no recorded binding for task '{task}' in {}; acquire it before handoff",
+        root.display()
+    )))
+}
+
+// Public release API kept arity-compatible with its existing callers.
+#[allow(clippy::too_many_arguments)]
+pub fn release_task(
+    codex_home: &Path,
+    source: &Path,
+    task: &str,
+    disposition: SlotDisposition,
+    reason: &str,
+    base: &str,
+    handle: Option<&str>,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<LaneDisposition> {
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let Some((index, binding)) = find_record_for_task(&layout, &root, task)? else {
+        return Err(pool_error(&format!(
+            "no recorded binding for task '{task}' in {}; nothing was released",
+            root.display()
+        )));
+    };
+    release_slot_with(
+        codex_home,
+        &root,
+        &layout,
+        index,
+        disposition,
+        reason,
+        ReleaseExpectation::Task { task, handle },
+        // Freeze the binding this call looked up, so the same task reclaimed
+        // as a new generation before the slot lock is still a different
+        // binding and this superseded release is refused.
+        Some(ReleaseIdentity::from_record(&binding)),
+        base,
+        is_live,
+    )
+}
+
+/// Pool inventory of one repository, shared by every checkout of it. The
+/// configured positions are always listed; recorded positions beyond a
+/// reduced size stay visible so status and recovery remain usable.
+pub fn task_inventory(codex_home: &Path, source: &Path, size: u32) -> io::Result<Vec<TaskSlot>> {
+    validate_pool_size(size)?;
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let registered = registered_trees(&root)?;
+    let mut indexes: Vec<u32> = (1..=size).collect();
+    for index in recorded_indexes(&layout)? {
+        if !indexes.contains(&index) {
+            indexes.push(index);
+        }
+    }
+    indexes.sort_unstable();
+    let mut slots = Vec::new();
+    for index in indexes {
+        let path = slot_path(&root, index)?;
+        let presence = slot_presence(&path, &registered);
+        let Some(record) = load_record_at(&layout, index)? else {
+            slots.push(TaskSlot::free(index, path, presence));
+            continue;
+        };
+        if !same_repository(&record.source, &root) {
+            return Err(pool_error(&format!(
+                "slot record {index} belongs to another source checkout {}; the lead resolves it",
+                record.source.display()
+            )));
+        }
+        let mut slot = TaskSlot::from_record(&record, index, path, presence);
+        if let Some(conflict) = layout_record_conflict(&layout, index)? {
+            slot.reason = Some(conflict);
+        }
+        slots.push(slot);
+    }
+    Ok(slots)
+}
+
+/// Recorded bindings beyond a proposed pool size. A capacity reduction is
+/// rejected while this returns entries; the files are never touched here, so
+/// status, release and authorized retirement remain usable.
+pub fn held_tasks_beyond(codex_home: &Path, source: &Path, size: u32) -> io::Result<Vec<TaskSlot>> {
+    Ok(task_inventory(codex_home, source, size)?
+        .into_iter()
+        .filter(|slot| slot.index > size && slot.state != TaskState::Free)
+        .collect())
+}
+
+/// Slot positions with a record, across the canonical and legacy record
+/// directories, so a reduced capacity still shows held work.
+fn recorded_indexes(layout: &SlotStateLayout) -> io::Result<Vec<u32>> {
+    let mut indexes = BTreeSet::new();
+    for dir in std::iter::once(&layout.canonical).chain(layout.legacy.iter()) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(digits) = name
+                .strip_prefix("slot-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if let Ok(index) = digits.parse::<u32>()
+                && index > 0
+                && index <= MAX_POOL_SLOTS
+            {
+                indexes.insert(index);
+            }
+        }
+    }
+    Ok(indexes.into_iter().collect())
+}
+
+/// Locate the current record of one durable task binding in a repository's
+/// pool, refusing conflicting record locations instead of choosing a winner.
+fn find_record_for_task(
+    layout: &SlotStateLayout,
+    root: &Path,
+    task: &str,
+) -> io::Result<Option<(u32, SlotRecord)>> {
+    for index in recorded_indexes(layout)? {
+        let Some(record) = load_record_at(layout, index)? else {
+            continue;
+        };
+        if record.task.as_deref() == Some(task) && same_repository(&record.source, root) {
+            refuse_record_conflict(layout, index)?;
+            return Ok(Some((index, record)));
+        }
+    }
+    Ok(None)
+}
+
+/// Find the current binding of one task, refusing a conflicting base request
+/// and an in-flight startup reservation of another process. A binding beyond
+/// a reduced capacity still continues instead of allocating a new slot.
+fn find_task_binding(
+    codex_home: &Path,
+    pool: &Pool,
+    task: &str,
+    requested: Option<&str>,
+) -> io::Result<Option<TaskSlot>> {
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    let mut indexes: Vec<u32> = pool.slots.iter().map(|slot| slot.index).collect();
+    for index in recorded_indexes(&layout)? {
+        if !indexes.contains(&index) {
+            indexes.push(index);
+        }
+    }
+    indexes.sort_unstable();
+    let mut registered: Option<Vec<RegisteredTree>> = None;
+    for index in indexes {
+        let Some(record) = load_record_at(&layout, index)? else {
+            continue;
+        };
+        if record.task.as_deref() != Some(task)
+            || record.state == SlotState::Released
+            || !same_repository(&record.source, &pool.source)
+        {
+            continue;
+        }
+        refuse_record_conflict(&layout, index)?;
+        if let Some(requested) = requested
+            && record.base.as_deref() != Some(requested)
+        {
+            return Err(pool_error(&format!(
+                "task '{task}' is held in slot {index} at base {}; the requested base {requested} conflicts with the binding - release it or continue with the recorded base",
+                record.base.as_deref().unwrap_or("none")
+            )));
+        }
+        if let Some(reserved) = record.startup.as_ref()
+            && startup_exclusive(reserved)
+            && !startup_matches_current(reserved)
+        {
+            return Err(pool_error(&pending_startup_reason(
+                index,
+                record.owner.as_deref(),
+                startup_liveness(reserved),
+            )));
+        }
+        match record.state {
+            // A completed binding continues as the same task's work.
+            SlotState::Occupied => {}
+            // An in-flight acquisition is never returned as a binding: its
+            // process may still be resetting this tree, so the caller is
+            // refused here and never walks on to allocate the same task a
+            // second position. A confirmed-dead reservation resumes through
+            // the claim path; this process's own reservation resumes itself.
+            SlotState::Synchronizing => {
+                let abandoned = record
+                    .startup
+                    .as_ref()
+                    .is_some_and(|reserved| !startup_exclusive(reserved));
+                if abandoned {
+                    continue;
+                }
+                if !record.startup.as_ref().is_some_and(startup_matches_current) {
+                    let reason = match record.startup.as_ref() {
+                        Some(reserved) => pending_startup_reason(
+                            index,
+                            record.owner.as_deref(),
+                            startup_liveness(reserved),
+                        ),
+                        None => format!(
+                            "slot {index} is already acquiring task '{task}' in another process; retry after that acquisition finishes"
+                        ),
+                    };
+                    return Err(pool_error(&reason));
+                }
+            }
+            // Preserved or unclear state without a completed binding: never
+            // continue it implicitly and never allocate a second position for
+            // the same task.
+            SlotState::Free | SlotState::AwaitingReview => {
+                return Err(pool_error(&format!(
+                    "slot {index} records task '{task}' in state {} without a completed binding; continue it or release it explicitly",
+                    state_name(record.state)
+                )));
+            }
+            SlotState::Released => unreachable!("released records are skipped above"),
+        }
+        let path = slot_path(&pool.source, index)?;
+        let presence = if let Some(slot) = pool.slots.iter().find(|slot| slot.index == index) {
+            slot.presence
+        } else {
+            if registered.is_none() {
+                registered = Some(registered_trees(&pool.source)?);
+            }
+            let trees = registered.as_deref().unwrap_or_default();
+            slot_presence(&path, trees)
+        };
+        return Ok(Some(TaskSlot::from_record(&record, index, path, presence)));
+    }
+    Ok(None)
+}
+
+/// Result of one task-position claim attempt. `InFlightSameTask` is kept
+/// distinct from an ordinary refusal because the caller must stop walking the
+/// pool: the same task already holds or is acquiring a position, and trying
+/// later positions would allocate that one owner a second slot.
+enum TaskSlotClaim {
+    Claimed(SlotRecord),
+    Unavailable(SlotRefusal),
+    InFlightSameTask(String),
+}
+
+/// Claim one pool position for a durable task binding. A task binding is never
+/// reclaimed through session liveness: the same task continues it, and only a
+/// confirmed-abandoned startup that never admitted work can be recovered by
+/// another task. Legacy session records keep their existing liveness rules.
+fn claim_task_slot(
+    codex_home: &Path,
+    pool: &Pool,
+    index: u32,
+    task: &str,
+    is_live: &dyn Fn(&str) -> bool,
+    startup: Option<&StartupReservation>,
+) -> io::Result<TaskSlotClaim> {
+    let slot = pool.slot(index)?;
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    for _ in 0..CLAIM_ATTEMPTS {
+        let _lock = lock_slot(codex_home, &pool.source, index)?;
+        refuse_record_conflict(&layout, index)?;
+        let record_path = layout.resolved(index);
+        let previous = load_record_at(&layout, index)?;
+        let claim = SlotRecord {
+            schema: SLOT_STATE_SCHEMA,
+            source: pool.source.clone(),
+            index,
+            path: slot.path.clone(),
+            state: SlotState::Synchronizing,
+            owner: Some(task.to_owned()),
+            task: Some(task.to_owned()),
+            handle: Some(new_task_handle(task)),
+            base: previous.as_ref().and_then(|record| record.base.clone()),
+            disposition: None,
+            reason: None,
+            startup: startup.cloned(),
+        };
+        if create_slot_record(&record_path, &claim)? {
+            return Ok(TaskSlotClaim::Claimed(claim));
+        }
+        let Some(existing) = load_record_at(&layout, index)? else {
+            continue;
+        };
+        if !same_repository(&existing.source, &pool.source) {
+            return Err(pool_error(&format!(
+                "slot record {} belongs to another source checkout {}; the lead resolves it",
+                record_path.display(),
+                existing.source.display()
+            )));
+        }
+        if let Some(held) = existing.task.as_deref() {
+            if held == task {
+                if let Some(reserved) = existing.startup.as_ref()
+                    && startup_exclusive(reserved)
+                    && !startup_matches_current(reserved)
+                {
+                    return Ok(TaskSlotClaim::InFlightSameTask(pending_startup_reason(
+                        index,
+                        existing.owner.as_deref(),
+                        startup_liveness(reserved),
+                    )));
+                }
+                match existing.state {
+                    // A completed binding for this task: the caller returns it
+                    // or reports the recorded base instead of resetting it.
+                    SlotState::Occupied => return Ok(TaskSlotClaim::Claimed(existing)),
+                    // A confirmed-abandoned acquisition that never bound the
+                    // slot resumes through this claim; a competing in-flight
+                    // acquisition waits instead of resetting the same tree.
+                    SlotState::Synchronizing
+                        if existing
+                            .startup
+                            .as_ref()
+                            .is_some_and(|reserved| !startup_exclusive(reserved)) =>
+                    {
+                        return Ok(TaskSlotClaim::Claimed(existing));
+                    }
+                    SlotState::Synchronizing => {
+                        return Ok(TaskSlotClaim::InFlightSameTask(format!(
+                            "slot {index} is already acquiring task '{task}' in another process; retry after that acquisition finishes"
+                        )));
+                    }
+                    // Not a live binding: fall through to re-claiming below.
+                    SlotState::Released => {}
+                    // Preserved or unclear state without a completed binding:
+                    // never silently reclaimed for a fresh acquisition, and
+                    // never a reason to place the same task in a second slot.
+                    SlotState::Free | SlotState::AwaitingReview => {
+                        return Ok(TaskSlotClaim::InFlightSameTask(format!(
+                            "slot {index} records task '{task}' in state {} without a completed binding; continue it or release it explicitly",
+                            state_name(existing.state)
+                        )));
+                    }
+                }
+            }
+            // A confirmed-abandoned startup that never admitted work can be
+            // recovered; a bound or dirty task slot is never stolen.
+            let abandoned = existing
+                .startup
+                .as_ref()
+                .is_some_and(|reserved| startup_liveness(reserved) == ReservationLiveness::Dead);
+            if abandoned && existing.state == SlotState::Synchronizing {
+                match slot_content(pool, index, existing.base.as_deref())? {
+                    SlotContent::Reusable => match fs::remove_file(&record_path) {
+                        Ok(()) => continue,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    },
+                    SlotContent::Unreviewed(reason) | SlotContent::Missing(reason) => {
+                        write_slot_record(
+                            &record_path,
+                            &SlotRecord {
+                                state: SlotState::AwaitingReview,
+                                reason: Some(reason.clone()),
+                                startup: None,
+                                ..existing
+                            },
+                        )?;
+                        return Ok(task_refusal(slot, reason));
+                    }
+                }
+            }
+            return Ok(task_refusal(
+                slot,
+                format!(
+                    "slot {index} is held by task '{held}' at base {}; release that task before another acquisition",
+                    existing.base.as_deref().unwrap_or("none")
+                ),
+            ));
+        }
+        if let Some(reserved) = existing.startup.as_ref() {
+            let liveness = startup_liveness(reserved);
+            if matches!(
+                liveness,
+                ReservationLiveness::Live | ReservationLiveness::Uncertain
+            ) {
+                return Ok(task_refusal(
+                    slot,
+                    pending_startup_reason(index, existing.owner.as_deref(), liveness),
+                ));
+            }
+        }
+        if let Some(live) = existing.owner.as_deref().filter(|owner| is_live(owner)) {
+            return Ok(task_refusal(
+                slot,
+                format!("slot {index} is occupied by live session {live}"),
+            ));
+        }
+        match slot_content(pool, index, existing.base.as_deref())? {
+            SlotContent::Reusable => match fs::remove_file(&record_path) {
+                Ok(()) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            },
+            SlotContent::Unreviewed(reason) | SlotContent::Missing(reason) => {
+                write_slot_record(
+                    &record_path,
+                    &SlotRecord {
+                        state: SlotState::AwaitingReview,
+                        owner: existing.owner.clone(),
+                        disposition: None,
+                        reason: Some(reason.clone()),
+                        startup: None,
+                        ..existing
+                    },
+                )?;
+                return Ok(task_refusal(slot, reason));
+            }
+        }
+    }
+    Err(pool_error(&format!(
+        "slot {index} claim lost a race with another harness process; retry"
+    )))
+}
+
+/// Bind a claimed position to its task at the synchronized base. The record
+/// keeps its generation handle and any startup reservation; a replaced claim
+/// is refused instead of bound over.
+fn bind_task_slot(
+    codex_home: &Path,
+    pool: &Pool,
+    index: u32,
+    task: &str,
+    handle: &str,
+    base: &str,
+) -> io::Result<SlotRecord> {
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    let _lock = lock_slot(codex_home, &pool.source, index)?;
+    let record = load_record_at(&layout, index)?
+        .ok_or_else(|| pool_error(&format!("slot {index} has no claim to bind")))?;
+    if record.task.as_deref() != Some(task) || record.handle.as_deref() != Some(handle) {
+        return Err(pool_error(&format!(
+            "slot {index} is no longer bound to task '{task}' generation {handle}; the claim was replaced"
+        )));
+    }
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Err(pool_error(&pending_startup_reason(
+            index,
+            record.owner.as_deref(),
+            startup_liveness(startup),
+        )));
+    }
+    let bound = SlotRecord {
+        state: SlotState::Occupied,
+        base: Some(base.to_owned()),
+        disposition: None,
+        reason: None,
+        ..record
+    };
+    write_slot_record(&layout.resolved(index), &bound)?;
+    Ok(bound)
+}
+
+/// Hand a slot whose task acquisition aborted back to the pool, or preserve it
+/// when it still holds unverified work. Only this task's own in-flight claim -
+/// the recorded task, generation handle and synchronizing state - is touched,
+/// so an acquisition that lost a race cannot clear a completed binding.
+fn abort_task_claim(
+    codex_home: &Path,
+    pool: &Pool,
+    index: u32,
+    task: &str,
+    handle: &str,
+    cause: String,
+) -> io::Result<()> {
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    let Some(record) = load_record_at(&layout, index)? else {
+        return Ok(());
+    };
+    if record.task.as_deref() != Some(task)
+        || record.handle.as_deref() != Some(handle)
+        || record.state != SlotState::Synchronizing
+    {
+        return Ok(());
+    }
+    if let Some(reserved) = record.startup.as_ref()
+        && startup_exclusive(reserved)
+        && !startup_matches_current(reserved)
+    {
+        return Ok(());
+    }
+    let _lock = lock_slot(codex_home, &pool.source, index)?;
+    let Some(record) = load_record_at(&layout, index)? else {
+        return Ok(());
+    };
+    if record.task.as_deref() != Some(task)
+        || record.handle.as_deref() != Some(handle)
+        || record.state != SlotState::Synchronizing
+    {
+        return Ok(());
+    }
+    if let Some(reserved) = record.startup.as_ref()
+        && startup_exclusive(reserved)
+        && !startup_matches_current(reserved)
+    {
+        return Ok(());
+    }
+    let state = match slot_content(pool, index, record.base.as_deref())? {
+        SlotContent::Reusable => SlotState::Free,
+        SlotContent::Unreviewed(_) | SlotContent::Missing(_) => SlotState::AwaitingReview,
+    };
+    let retained = state == SlotState::AwaitingReview;
+    write_slot_record(
+        &layout.resolved(index),
+        &SlotRecord {
+            state,
+            owner: if retained { record.owner.clone() } else { None },
+            task: if retained { record.task.clone() } else { None },
+            handle: if retained {
+                record.handle.clone()
+            } else {
+                None
+            },
+            disposition: None,
+            reason: Some(format!("task acquisition aborted: {cause}")),
+            startup: None,
+            ..record
+        },
+    )
+}
+
+/// Generation handle of one task binding: a fresh value per claim, so a handle
+/// from a released or reassigned slot can never resume it.
+fn new_task_handle(task: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    hash_bytes(format!("{task}:{}:{now}:{sequence}", std::process::id()).as_bytes())
 }
 
 /// Worktree inventory classification: pool slots of this checkout, foreign or
@@ -1294,11 +3196,7 @@ pub fn audit(source: &Path) -> io::Result<WorktreeAudit> {
 /// Pool inventory with the configured size: positions beyond the pool are
 /// reported separately instead of being absorbed into the pool.
 pub fn audit_pool(source: &Path, size: u32) -> io::Result<WorktreeAudit> {
-    if size == 0 || size > MAX_POOL_SLOTS {
-        return Err(pool_error(&format!(
-            "pool size {size} is out of range 1..={MAX_POOL_SLOTS}; it derives from max_concurrent_executors"
-        )));
-    }
+    validate_pool_size(size)?;
     classify_worktrees(source, Some(size))
 }
 
@@ -1314,7 +3212,10 @@ fn classify_worktrees(source: &Path, size: Option<u32>) -> io::Result<WorktreeAu
             beyond_pool: Vec::new(),
         });
     }
-    let output = git(source, &["worktree", "list", "--porcelain"])?;
+    // One inventory per repository: entering through a linked worktree
+    // reports the pool of the primary checkout, not a second nested layout.
+    let source = pool_root(source)?;
+    let output = git(&source, &["worktree", "list", "--porcelain"])?;
     let mut paths = Vec::new();
     for line in output.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
@@ -1325,10 +3226,10 @@ fn classify_worktrees(source: &Path, size: Option<u32>) -> io::Result<WorktreeAu
     let mut foreign = Vec::new();
     let mut beyond_pool = Vec::new();
     for path in &paths {
-        if same_path(path, source) {
+        if same_path(path, &source) {
             continue;
         }
-        match slot_index(source, path)? {
+        match slot_index(&source, path)? {
             Some(index) if size.is_none_or(|size| index <= size) => {
                 slots.push(PoolSlotAudit {
                     index,
@@ -1428,35 +3329,38 @@ fn abort_claim(
     owner: &str,
     cause: String,
 ) -> io::Result<()> {
-    let Some(record) = load_slot_record(codex_home, &pool.source, index)? else {
+    let layout = slot_state_layout(codex_home, &pool.caller)?;
+    let Some(record) = load_record_at(&layout, index)? else {
         return Ok(());
     };
     if record.owner.as_deref() != Some(owner) {
         return Ok(());
     }
-    if let Some(startup) = record.startup.as_ref() {
-        if startup_exclusive(startup) && !startup_matches_current(startup) {
-            return Ok(());
-        }
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Ok(());
     }
     let _lock = lock_slot(codex_home, &pool.source, index)?;
-    let Some(record) = load_slot_record(codex_home, &pool.source, index)? else {
+    let Some(record) = load_record_at(&layout, index)? else {
         return Ok(());
     };
     if record.owner.as_deref() != Some(owner) {
         return Ok(());
     }
-    if let Some(startup) = record.startup.as_ref() {
-        if startup_exclusive(startup) && !startup_matches_current(startup) {
-            return Ok(());
-        }
+    if let Some(startup) = record.startup.as_ref()
+        && startup_exclusive(startup)
+        && !startup_matches_current(startup)
+    {
+        return Ok(());
     }
     let state = match slot_content(pool, index, record.base.as_deref())? {
         SlotContent::Reusable => SlotState::Free,
         SlotContent::Unreviewed(_) | SlotContent::Missing(_) => SlotState::AwaitingReview,
     };
     write_slot_record(
-        &slot_record_path(codex_home, &pool.source, index)?,
+        &layout.resolved(index),
         &SlotRecord {
             state,
             owner: None,
@@ -1476,6 +3380,8 @@ fn free_slot_record(pool: &Pool, slot: &PoolSlot) -> SlotRecord {
         path: slot.path.clone(),
         state: SlotState::Free,
         owner: None,
+        task: None,
+        handle: None,
         base: None,
         disposition: None,
         reason: None,
@@ -2453,6 +4359,20 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// True when two recorded checkout paths belong to one repository pool: the
+/// same path, or two linked worktrees of one Git repository. Legacy records
+/// written from a linked checkout keep their old `source` path and are still
+/// this repository's records; they are normalized on their next mutation.
+fn same_repository(left: &Path, right: &Path) -> bool {
+    if same_path(left, right) {
+        return true;
+    }
+    match (repository_identity(left), repository_identity(right)) {
+        (Ok(left), Ok(right)) => left.common_dir == right.common_dir,
+        _ => false,
+    }
+}
+
 /// The Git program. Tests resolve an absolute path once because another test
 /// may temporarily replace the process `PATH`; a worktree test must not depend
 /// on the live value.
@@ -3425,6 +5345,1714 @@ mod tests {
             }
             LaneDisposition::Reused { .. } => panic!("a missing lane cannot be reused"),
         }
+    }
+
+    #[test]
+    fn linked_checkouts_share_one_pool_and_one_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let linked = root.path().join("lead");
+        git_ok(
+            &up.source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        // The linked checkout resolves the same identity and slot layout as
+        // the primary checkout, never a nested pool under its own path.
+        let layout = pool(&linked, 2).unwrap();
+        assert_eq!(layout.source, resolve_source(&up.source).unwrap());
+        assert_eq!(layout.slots[0].path, slot_path(&up.source, 1).unwrap());
+        assert_eq!(
+            pool_state_dir(&home, &up.source).unwrap(),
+            pool_state_dir(&home, &linked).unwrap()
+        );
+        assert_ne!(
+            pool_state_dir(&home, &linked).unwrap(),
+            legacy_pool_state_dir(&home, &linked).unwrap(),
+            "new state never uses the per-path legacy directory"
+        );
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &linked, 2, "task-1", Some(&base), &dead).unwrap();
+        assert_eq!(acquired.index, 1);
+        assert_eq!(acquired.path, slot_path(&up.source, 1).unwrap());
+        assert_eq!(acquired.path.parent(), up.source.parent());
+        assert!(
+            slot_record_path(&home, &up.source, 1).unwrap().is_file(),
+            "the binding lives in the canonical state directory"
+        );
+        // The primary checkout sees and continues the same binding.
+        let continued =
+            continue_task(&home, &up.source, "task-1", acquired.handle.as_deref()).unwrap();
+        assert_eq!(continued.index, 1);
+        assert_eq!(continued.path, acquired.path);
+        assert_eq!(continued.state, TaskState::Held);
+        // A second task from the primary checkout takes the next position of
+        // the same pool; both positions then refuse a third acquisition.
+        let second = acquire_task(&home, &up.source, 2, "task-2", Some(&base), &dead).unwrap();
+        assert_eq!(second.index, 2);
+        assert_eq!(second.path, slot_path(&up.source, 2).unwrap());
+        // The primary checkout, the linked checkout and both slots are
+        // registered worktrees of the one repository.
+        assert_eq!(registered_count(&up.source), 4);
+        let error = acquire_task(&home, &linked, 2, "task-3", Some(&base), &dead).unwrap_err();
+        assert!(
+            error.to_string().contains("no free slot in the pool of 2"),
+            "{error}"
+        );
+        assert!(
+            !root.path().join("lead-wt1").exists(),
+            "a caller's linked checkout path must never become a slot root"
+        );
+        let inventory = task_inventory(&home, &up.source, 2).unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[0].task.as_deref(), Some("task-1"));
+        assert_eq!(inventory[1].task.as_deref(), Some("task-2"));
+    }
+
+    #[test]
+    fn legacy_records_written_through_a_linked_checkout_import_into_the_shared_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let linked = root.path().join("lead");
+        git_ok(
+            &up.source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &linked, 2, "task-1", Some(&base), &dead).unwrap();
+        let canonical = slot_record_path(&home, &up.source, 1).unwrap();
+        assert!(canonical.is_file());
+        // Simulate the record a build without pool identity wrote through the
+        // linked checkout: keyed by that path and naming it as the source.
+        let legacy_dir = legacy_pool_state_dir(&home, &linked).unwrap();
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let mut record: SlotRecord =
+            serde_json::from_slice(&fs::read(&canonical).unwrap()).unwrap();
+        record.source = linked.clone();
+        fs::write(
+            legacy_dir.join("slot-1.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&canonical).unwrap();
+        // The primary checkout imports the record under the shared identity.
+        let continued =
+            continue_task(&home, &up.source, "task-1", acquired.handle.as_deref()).unwrap();
+        assert_eq!(continued.index, 1);
+        assert_eq!(continued.path, acquired.path);
+        assert_eq!(continued.state, TaskState::Held);
+        // The linked checkout resolves the same binding, not a second pool.
+        let linked_view =
+            continue_task(&home, &linked, "task-1", acquired.handle.as_deref()).unwrap();
+        assert_eq!(linked_view.path, acquired.path);
+        // Mutation migrates in place: the legacy file is updated where it
+        // lives and no canonical fork appears.
+        let handed = handoff_task_to_session(
+            &home,
+            &up.source,
+            "task-1",
+            acquired.handle.as_deref().unwrap(),
+            "exec-9",
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(handed.owner.as_deref(), Some("exec-9"));
+        assert!(
+            !canonical.is_file(),
+            "an imported legacy record must not be forked into the canonical location"
+        );
+        assert!(legacy_dir.join("slot-1.json").is_file());
+        let stored = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        assert_eq!(stored.owner.as_deref(), Some("exec-9"));
+        assert_eq!(stored.handle, acquired.handle);
+        assert_eq!(stored.base.as_deref(), Some(base.as_str()));
+    }
+
+    #[test]
+    fn conflicting_records_refuse_allocation_and_preserve_both_files() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let linked = root.path().join("lead");
+        git_ok(
+            &up.source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        create_slot(&pool(&up.source, 1).unwrap(), 1).unwrap();
+        let slot_one = slot_path(&up.source, 1).unwrap();
+        // Two legacy pools of one repository disagree about the same position.
+        let primary = SlotRecord {
+            schema: SLOT_STATE_SCHEMA,
+            source: up.source.clone(),
+            index: 1,
+            path: slot_one.clone(),
+            state: SlotState::Occupied,
+            owner: Some("task-1".into()),
+            task: Some("task-1".into()),
+            handle: Some("gen-primary".into()),
+            base: Some(base.clone()),
+            disposition: None,
+            reason: None,
+            startup: None,
+        };
+        let legacy = SlotRecord {
+            source: linked.clone(),
+            handle: Some("gen-linked".into()),
+            ..primary.clone()
+        };
+        let canonical = slot_record_path(&home, &up.source, 1).unwrap();
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        let primary_bytes = serde_json::to_vec_pretty(&primary).unwrap();
+        fs::write(&canonical, &primary_bytes).unwrap();
+        let legacy_dir = legacy_pool_state_dir(&home, &linked).unwrap();
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("slot-1.json");
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(&legacy_path, &legacy_bytes).unwrap();
+        // Status stays usable and names the conflict, never a free position.
+        let inventory = task_inventory(&home, &up.source, 1).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert!(
+            inventory[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("conflicting records")),
+            "{:?}",
+            inventory[0]
+        );
+        // Every ownership-changing or continuing operation fails closed.
+        for error in [
+            acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead)
+                .unwrap_err()
+                .to_string(),
+            acquire_task(&home, &up.source, 1, "task-2", Some(&base), &dead)
+                .unwrap_err()
+                .to_string(),
+            continue_task(&home, &up.source, "task-1", None)
+                .unwrap_err()
+                .to_string(),
+            handoff_task_to_session(&home, &up.source, "task-1", "gen-primary", "exec-1", &dead)
+                .unwrap_err()
+                .to_string(),
+            release_task(
+                &home,
+                &up.source,
+                "task-1",
+                SlotDisposition::Discarded,
+                "attempted reconcile",
+                &base,
+                None,
+                &dead,
+            )
+            .unwrap_err()
+            .to_string(),
+        ] {
+            assert!(error.contains("conflicting records"), "{error}");
+        }
+        // Nothing is moved, rewritten or reset while the conflict stands.
+        assert_eq!(fs::read(&canonical).unwrap(), primary_bytes);
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+        assert_eq!(rev(&slot_one), base);
+    }
+
+    #[test]
+    fn distinct_repositories_and_foreign_slot_paths_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let first_root = root.path().join("first");
+        let second_root = root.path().join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let first = upstream(&first_root);
+        let second = upstream(&second_root);
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        // Different repositories keep different identities and state.
+        let identity_a = repository_identity(&first.source).unwrap();
+        let identity_b = repository_identity(&second.source).unwrap();
+        assert_ne!(identity_a.common_dir, identity_b.common_dir);
+        assert_ne!(
+            pool_state_dir(&home, &first.source).unwrap(),
+            pool_state_dir(&home, &second.source).unwrap()
+        );
+        // A worktree of the second repository at the first repository's slot
+        // position is foreign: refused, never adopted or replaced.
+        let collision = slot_path(&first.source, 1).unwrap();
+        git_ok(
+            &second.source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                collision.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let error = pool(&first.source, 1).unwrap_err().to_string();
+        assert!(error.contains("refusing to adopt or replace"), "{error}");
+        assert!(error.contains("proj-wt1"), "{error}");
+        let error = acquire_task(
+            &home,
+            &first.source,
+            1,
+            "task-1",
+            Some(&rev(&first.source)),
+            &dead,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to adopt or replace"),
+            "{error}"
+        );
+        // The foreign tree keeps its own registration and is never touched.
+        assert!(collision.join("README.md").is_file());
+        assert_eq!(registered_count(&second.source), 2);
+        // The other repository's own pool is unaffected and usable.
+        let own = acquire_task(
+            &home,
+            &second.source,
+            2,
+            "task-2",
+            Some(&rev(&second.source)),
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(own.path, slot_path(&second.source, 1).unwrap());
+        assert!(load_slot_record(&home, &first.source, 1).unwrap().is_none());
+        assert!(
+            load_slot_record(&home, &second.source, 1)
+                .unwrap()
+                .is_some()
+        );
+        // A path that is not a Git checkout is refused, not guessed.
+        let stray = root.path().join("stray");
+        fs::create_dir_all(&stray).unwrap();
+        let error = pool(&stray, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("is not a Git checkout"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn twenty_sequential_tasks_reuse_three_slots_and_keep_ignored_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let expected: Vec<PathBuf> = (1..=3)
+            .map(|index| slot_path(&up.source, index).unwrap())
+            .collect();
+        for i in 1..=20u32 {
+            if i == 4 {
+                // All three positions are held: the fourth task is refused
+                // without creating another worktree.
+                let error =
+                    acquire_task(&home, &up.source, 3, "task-4", Some(&base), &dead).unwrap_err();
+                assert!(
+                    error.to_string().contains("no free slot in the pool of 3"),
+                    "{error}"
+                );
+                assert!(!up.source.parent().unwrap().join("proj-wt4").exists());
+            }
+            if i > 3 {
+                let done = format!("task-{}", i - 3);
+                let disposition = release_task(
+                    &home,
+                    &up.source,
+                    &done,
+                    SlotDisposition::Merged,
+                    &format!("{done} merged"),
+                    &base,
+                    None,
+                    &dead,
+                )
+                .unwrap();
+                assert!(
+                    matches!(disposition, LaneDisposition::Reused { .. }),
+                    "{done} must release cleanly"
+                );
+            }
+            let task = format!("task-{i}");
+            let acquired = acquire_task(&home, &up.source, 3, &task, Some(&base), &dead).unwrap();
+            let slot = expected[((i - 1) % 3) as usize].clone();
+            assert_eq!(
+                acquired.path, slot,
+                "{task} must reuse the expected position"
+            );
+            assert_eq!(acquired.state, TaskState::Held);
+            let cache = slot.join("cache");
+            fs::create_dir_all(&cache).unwrap();
+            fs::write(cache.join(format!("marker-{i}")), "cached build\n").unwrap();
+            assert_eq!(
+                registered_count(&up.source),
+                1 + std::cmp::min(i, 3) as usize,
+                "twenty tasks never grow the pool past its three slots"
+            );
+        }
+        for i in 18..=20u32 {
+            release_task(
+                &home,
+                &up.source,
+                &format!("task-{i}"),
+                SlotDisposition::Merged,
+                "final release",
+                &base,
+                None,
+                &dead,
+            )
+            .unwrap();
+        }
+        // Every marker written through the earlier cycles survived every
+        // reset: ignored build caches are reused, never rebuilt.
+        let mut markers = 0;
+        for (index, slot) in expected.iter().enumerate() {
+            for entry in fs::read_dir(slot.join("cache")).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                let number: u32 = name
+                    .strip_prefix("marker-")
+                    .and_then(|number| number.parse().ok())
+                    .unwrap();
+                assert_eq!(
+                    ((number - 1) % 3) as usize,
+                    index,
+                    "{name} must live in the position that served its task"
+                );
+                markers += 1;
+            }
+        }
+        assert_eq!(markers, 20, "every task's cache marker survives reuse");
+        let inventory = task_inventory(&home, &up.source, 3).unwrap();
+        assert_eq!(inventory.len(), 3);
+        assert!(inventory.iter().all(|slot| slot.state == TaskState::Free));
+        assert!(
+            inventory
+                .iter()
+                .all(|slot| slot.presence == SlotPresence::Registered)
+        );
+    }
+
+    #[test]
+    fn a_full_held_pool_refuses_further_acquisition_without_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let first = acquire_task(&home, &up.source, 2, "task-1", Some(&base), &dead).unwrap();
+        let second = acquire_task(&home, &up.source, 2, "task-2", Some(&base), &dead).unwrap();
+        fs::write(first.path.join("work-1.txt"), "held work\n").unwrap();
+        fs::write(second.path.join("work-2.txt"), "held work\n").unwrap();
+        let error = acquire_task(&home, &up.source, 2, "task-3", Some(&base), &dead).unwrap_err();
+        assert!(
+            error.to_string().contains("no free slot in the pool of 2"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("held by task"), "{error}");
+        // Nothing overflows and no held slot is released or cleaned.
+        assert!(!up.source.parent().unwrap().join("proj-wt3").exists());
+        assert_eq!(registered_count(&up.source), 3);
+        assert!(first.path.join("work-1.txt").is_file());
+        assert!(second.path.join("work-2.txt").is_file());
+        let inventory = task_inventory(&home, &up.source, 2).unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert!(inventory.iter().all(|slot| slot.state == TaskState::Held));
+        // The same tasks continue idempotently instead of being refused.
+        let again = acquire_task(&home, &up.source, 2, "task-1", Some(&base), &dead).unwrap();
+        assert_eq!(again.handle, first.handle);
+        assert_eq!(again.path, first.path);
+    }
+
+    #[test]
+    fn an_exact_offline_base_never_fetches_while_upstream_refresh_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        // The upstream is unreachable: every fetch must fail.
+        git_ok(
+            &up.source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &file_url(&root.path().join("gone.git")),
+            ],
+        );
+        let error = refresh_upstream_base(&up.source).unwrap_err().to_string();
+        assert!(error.contains("fetch"), "{error}");
+        // The explicit local base is prepared without network access.
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        assert_eq!(acquired.base.as_deref(), Some(base.as_str()));
+        assert_eq!(rev(&acquired.path), base);
+        // The executor upstream default fails visibly instead of using stale
+        // state, and the slot keeps the exact prepared base.
+        let layout = pool(&up.source, 1).unwrap();
+        let error = synchronize_slot(&home, &layout, 1, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fetch"), "{error}");
+        assert_eq!(rev(&acquired.path), base, "a failed fetch changes nothing");
+        // An explicit-base synchronization stays local too.
+        let synchronized = synchronize_slot(&home, &layout, 1, Some(&base)).unwrap();
+        assert_eq!(synchronized.base, base);
+        assert_eq!(synchronized.previous_head.as_deref(), Some(base.as_str()));
+    }
+
+    #[test]
+    fn a_conflicting_base_request_is_refused_and_preserves_the_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        let handle = acquired.handle.clone().unwrap();
+        let partial = acquired.path.join("partial.txt");
+        fs::write(&partial, "partial work\n").unwrap();
+        let head = rev(&acquired.path);
+        // A new commit becomes the source HEAD, but the binding stays at base.
+        commit(&up.source, "later.txt", "later\n");
+        let later = rev(&up.source);
+        let error = acquire_task(&home, &up.source, 1, "task-1", Some(&later), &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicts with the binding"), "{error}");
+        // Nothing moved: the binding, its work and its generation survive.
+        assert!(partial.is_file());
+        assert_eq!(rev(&acquired.path), head);
+        let stored = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        assert_eq!(stored.base.as_deref(), Some(base.as_str()));
+        assert_eq!(stored.handle.as_deref(), Some(handle.as_str()));
+        // Repeating the same acquisition continues the binding idempotently.
+        let continued = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        assert_eq!(continued.handle.as_deref(), Some(handle.as_str()));
+        assert_eq!(continued.path, acquired.path);
+        assert!(partial.is_file());
+        // Without a requested base the recorded binding is returned unchanged.
+        let silent = acquire_task(&home, &up.source, 1, "task-1", None, &dead).unwrap();
+        assert_eq!(silent.base.as_deref(), Some(base.as_str()));
+        assert_eq!(silent.handle.as_deref(), Some(handle.as_str()));
+    }
+
+    #[test]
+    fn stale_generation_handles_cannot_continue_release_or_hand_off() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        let handle = acquired.handle.clone().unwrap();
+        for error in [
+            continue_task(&home, &up.source, "task-1", Some("stale-handle"))
+                .unwrap_err()
+                .to_string(),
+            release_task(
+                &home,
+                &up.source,
+                "task-1",
+                SlotDisposition::Discarded,
+                "discarded",
+                &base,
+                Some("stale-handle"),
+                &dead,
+            )
+            .unwrap_err()
+            .to_string(),
+            handoff_task_to_session(&home, &up.source, "task-1", "stale-handle", "exec-9", &dead)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(error.contains("stale"), "{error}");
+        }
+        // The recorded binding is untouched and continues with its handle.
+        let continued = continue_task(&home, &up.source, "task-1", Some(&handle)).unwrap();
+        assert_eq!(continued.handle.as_deref(), Some(handle.as_str()));
+        assert_eq!(continued.index, 1);
+        // A repair read without a handle still finds the binding.
+        assert_eq!(
+            continue_task(&home, &up.source, "task-1", None)
+                .unwrap()
+                .index,
+            1
+        );
+        // After the explicit release the old handle is gone with the binding.
+        let disposition = release_task(
+            &home,
+            &up.source,
+            "task-1",
+            SlotDisposition::Discarded,
+            "discarded",
+            &base,
+            Some(&handle),
+            &dead,
+        )
+        .unwrap();
+        assert!(matches!(disposition, LaneDisposition::Reused { .. }));
+        let error = continue_task(&home, &up.source, "task-1", Some(&handle))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no recorded binding"), "{error}");
+        let error = handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-9", &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no recorded binding"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_release_keeps_the_task_bound_until_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        let handle = acquired.handle.clone().unwrap();
+        let pristine = fs::read_to_string(acquired.path.join("README.md")).unwrap();
+        // A held index lock makes the release reset fail, so the slot must be
+        // preserved instead of advertised as free.
+        let lock_hint = git(&acquired.path, &["rev-parse", "--git-path", "index.lock"]).unwrap();
+        let lock_hint = PathBuf::from(lock_hint.trim());
+        let lock_path = if lock_hint.is_absolute() {
+            lock_hint
+        } else {
+            acquired.path.join(lock_hint)
+        };
+        fs::write(&lock_path, "held\n").unwrap();
+        let disposition = release_task(
+            &home,
+            &up.source,
+            "task-1",
+            SlotDisposition::Merged,
+            "merged",
+            &base,
+            Some(&handle),
+            &dead,
+        )
+        .unwrap();
+        let LaneDisposition::Preserved { limitation } = disposition else {
+            panic!("a failed reset must preserve the slot");
+        };
+        assert!(!limitation.is_empty());
+        // The record keeps the task, its generation and a visible reason.
+        let stored = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        assert_eq!(stored.state, SlotState::AwaitingReview);
+        assert_eq!(stored.task.as_deref(), Some("task-1"));
+        assert_eq!(stored.handle.as_deref(), Some(handle.as_str()));
+        assert!(
+            stored
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        // The slot is not advertised as free and refuses another task.
+        let inventory = task_inventory(&home, &up.source, 1).unwrap();
+        assert_eq!(inventory[0].state, TaskState::AwaitingReview);
+        let error = acquire_task(&home, &up.source, 1, "task-2", Some(&base), &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no free slot in the pool of 1"), "{error}");
+        // The interrupted task still continues and keeps the obstruction.
+        let continued = continue_task(&home, &up.source, "task-1", Some(&handle)).unwrap();
+        assert_eq!(continued.state, TaskState::AwaitingReview);
+        assert!(lock_path.is_file());
+        // Recovery clears the obstruction; the explicit release then succeeds.
+        fs::remove_file(&lock_path).unwrap();
+        let disposition = release_task(
+            &home,
+            &up.source,
+            "task-1",
+            SlotDisposition::Merged,
+            "merged after review",
+            &base,
+            Some(&handle),
+            &dead,
+        )
+        .unwrap();
+        assert!(matches!(disposition, LaneDisposition::Reused { .. }));
+        assert_eq!(
+            task_inventory(&home, &up.source, 1).unwrap()[0].state,
+            TaskState::Free
+        );
+        assert_eq!(
+            fs::read_to_string(acquired.path.join("README.md")).unwrap(),
+            pristine
+        );
+        // A process-loss boundary at the release reset itself: after its
+        // preflight, the slot stops being a Git worktree before the reset can
+        // run. The durable record must stay held with the original error, and
+        // the checkout must survive for recovery.
+        let second = acquire_task(&home, &up.source, 1, "task-2", Some(&base), &dead).unwrap();
+        let second_handle = second.handle.clone().unwrap();
+        fs::write(second.path.join("partial-2.txt"), "unreviewed\n").unwrap();
+        let record_path = slot_record_path(&home, &up.source, 1).unwrap();
+        let mut stored = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        stored.owner = Some("exec-gone".into());
+        fs::write(&record_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+        let git_pointer = second.path.join(".git");
+        let stashed_pointer = second.path.join(".git.stashed");
+        let calls = std::cell::Cell::new(0u32);
+        let fault_after_preflight = |_: &str| {
+            let call = calls.get() + 1;
+            calls.set(call);
+            if call == 2 {
+                fs::rename(&git_pointer, &stashed_pointer).unwrap();
+            }
+            false
+        };
+        let failed = release_task(
+            &home,
+            &up.source,
+            "task-2",
+            SlotDisposition::Merged,
+            "merged",
+            &base,
+            Some(&second_handle),
+            &fault_after_preflight,
+        )
+        .unwrap_err();
+        assert!(failed.to_string().contains("rev-parse"), "{failed}");
+        let stored = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        assert_eq!(stored.task.as_deref(), Some("task-2"));
+        assert_eq!(stored.handle.as_deref(), Some(second_handle.as_str()));
+        assert!(
+            stored
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("release failed")),
+            "{:?}",
+            stored.reason
+        );
+        assert!(second.path.join("partial-2.txt").is_file());
+        assert_eq!(
+            task_inventory(&home, &up.source, 1).unwrap()[0].state,
+            TaskState::AwaitingReview
+        );
+        // A dead former owner's interrupted binding is rebound explicitly and
+        // still continues without reset.
+        let continued = continue_task_for_session(
+            &home,
+            &up.source,
+            "task-2",
+            Some(&second_handle),
+            "exec-next",
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(continued.state, TaskState::AwaitingReview);
+        assert_eq!(continued.owner.as_deref(), Some("exec-next"));
+        // Restoring the checkout lets the recovery release complete.
+        fs::rename(&stashed_pointer, &git_pointer).unwrap();
+        let disposition = release_task(
+            &home,
+            &up.source,
+            "task-2",
+            SlotDisposition::Merged,
+            "merged after recovery",
+            &base,
+            Some(&second_handle),
+            &dead,
+        )
+        .unwrap();
+        assert!(matches!(disposition, LaneDisposition::Reused { .. }));
+        assert_eq!(
+            task_inventory(&home, &up.source, 1).unwrap()[0].state,
+            TaskState::Free
+        );
+    }
+
+    #[test]
+    fn unknown_task_record_schema_is_refused_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let dead = |_: &str| false;
+        let held = acquire_task(&home, &up.source, 1, "schema-task", Some(&base), &dead).unwrap();
+        let path = slot_record_path(&home, &up.source, 1).unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["ownershipSchema"] = serde_json::json!(999);
+        let unsupported = serde_json::to_vec(&record).unwrap();
+        fs::write(&path, &unsupported).unwrap();
+
+        let result = continue_task(&home, &up.source, "schema-task", held.handle.as_deref());
+        assert!(
+            result.is_err(),
+            "unsupported ownership schema was accepted: {result:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), unsupported);
+    }
+
+    #[test]
+    fn stale_release_cannot_reset_a_task_acquired_after_its_preflight() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let dead = |_: &str| false;
+        let original = acquire_task(&home, &up.source, 1, "original", Some(&base), &dead).unwrap();
+        let marker = original.path.join("unreviewed-successor.txt");
+        let swapped = std::cell::Cell::new(false);
+        // Deterministically schedule a release and a new acquisition between
+        // the original caller's binding preflight and its slot-lock acquisition.
+        let concurrent_transition = |_: &str| {
+            if !swapped.replace(true) {
+                release_task(
+                    &home,
+                    &up.source,
+                    "original",
+                    SlotDisposition::Discarded,
+                    "reviewed original task",
+                    &base,
+                    original.handle.as_deref(),
+                    &dead,
+                )
+                .unwrap();
+                acquire_task(&home, &up.source, 1, "successor", Some(&base), &dead).unwrap();
+                fs::write(&marker, "unfinished successor work\n").unwrap();
+            }
+            false
+        };
+
+        let stale_result = release_task(
+            &home,
+            &up.source,
+            "original",
+            SlotDisposition::Merged,
+            "stale caller",
+            &base,
+            original.handle.as_deref(),
+            &concurrent_transition,
+        );
+        assert!(
+            swapped.get(),
+            "the controlled ownership transition was not exercised"
+        );
+        assert!(
+            marker.is_file(),
+            "the stale release deleted the successor's unreviewed file"
+        );
+        assert!(
+            stale_result.is_err(),
+            "stale release succeeded: {stale_result:?}"
+        );
+        let current = continue_task(&home, &up.source, "successor", None).unwrap();
+        assert_eq!(current.task.as_deref(), Some("successor"));
+    }
+
+    #[test]
+    fn handleless_release_cannot_reset_a_reacquired_generation_of_the_same_task() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let dead = |_: &str| false;
+        let original = acquire_task(&home, &up.source, 1, "same-task", Some(&base), &dead).unwrap();
+        let marker = original.path.join("unreviewed-new-generation.txt");
+        let swapped = std::cell::Cell::new(false);
+        let concurrent_transition = |_: &str| {
+            if !swapped.replace(true) {
+                release_task(
+                    &home,
+                    &up.source,
+                    "same-task",
+                    SlotDisposition::Discarded,
+                    "reviewed original generation",
+                    &base,
+                    original.handle.as_deref(),
+                    &dead,
+                )
+                .unwrap();
+                let successor =
+                    acquire_task(&home, &up.source, 1, "same-task", Some(&base), &dead).unwrap();
+                assert_ne!(successor.handle, original.handle);
+                fs::write(&marker, "unfinished new-generation work\n").unwrap();
+            }
+            false
+        };
+        let stale_result = release_task(
+            &home,
+            &up.source,
+            "same-task",
+            SlotDisposition::Merged,
+            "stale caller without an explicit handle",
+            &base,
+            None,
+            &concurrent_transition,
+        );
+        assert!(swapped.get(), "the generation transition was not exercised");
+        assert!(
+            marker.is_file(),
+            "stale release deleted the new generation's work"
+        );
+        assert!(
+            stale_result.is_err(),
+            "stale release succeeded: {stale_result:?}"
+        );
+    }
+
+    #[test]
+    fn stale_session_release_cannot_reset_a_successor_session() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let dead = |_: &str| false;
+        let original = acquire_slot(&home, &up.source, 1, "original", Some(&base), &dead).unwrap();
+        let layout = pool(&up.source, 1).unwrap();
+        let marker = original.path.join("unreviewed-successor-session.txt");
+        let swapped = std::cell::Cell::new(false);
+        let concurrent_transition = |_: &str| {
+            if !swapped.replace(true) {
+                release_slot(
+                    &home,
+                    &layout,
+                    1,
+                    SlotDisposition::Discarded,
+                    "reviewed original session",
+                    &base,
+                    &dead,
+                )
+                .unwrap();
+                acquire_slot(&home, &up.source, 1, "successor", Some(&base), &dead).unwrap();
+                fs::write(&marker, "unfinished successor session work\n").unwrap();
+            }
+            false
+        };
+        let stale_result = release_slot(
+            &home,
+            &layout,
+            1,
+            SlotDisposition::Merged,
+            "stale session release",
+            &base,
+            &concurrent_transition,
+        );
+        assert!(swapped.get(), "the session transition was not exercised");
+        assert!(
+            marker.is_file(),
+            "stale release deleted the successor session's work"
+        );
+        assert!(
+            stale_result.is_err(),
+            "stale release succeeded: {stale_result:?}"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_pool_keeps_held_slots_visible_and_never_releases_work() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let mut handles = Vec::new();
+        for i in 1..=3u32 {
+            let acquired = acquire_task(
+                &home,
+                &up.source,
+                3,
+                &format!("task-{i}"),
+                Some(&base),
+                &dead,
+            )
+            .unwrap();
+            assert_eq!(acquired.index, i);
+            handles.push(acquired.handle.clone().unwrap());
+            fs::write(acquired.path.join(format!("work-{i}.txt")), "unreviewed\n").unwrap();
+        }
+        // A reduced size does not release or hide the third held slot.
+        let beyond = held_tasks_beyond(&home, &up.source, 2).unwrap();
+        assert_eq!(beyond.len(), 1);
+        assert_eq!(beyond[0].index, 3);
+        assert_eq!(beyond[0].task.as_deref(), Some("task-3"));
+        assert_eq!(beyond[0].state, TaskState::Held);
+        let inventory = task_inventory(&home, &up.source, 2).unwrap();
+        assert_eq!(inventory.len(), 3);
+        assert_eq!(inventory[2].index, 3);
+        assert_eq!(inventory[2].state, TaskState::Held);
+        // A new task cannot take either of the two remaining positions: the
+        // capacity reduction is refused before allocation while the owned
+        // position beyond the reduced size exists.
+        let error = acquire_task(&home, &up.source, 2, "task-4", Some(&base), &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("worktree_pool_size 2"), "{error}");
+        assert!(error.contains("slot 3"), "{error}");
+        // The recorded binding beyond the reduced size still continues.
+        let continued = acquire_task(&home, &up.source, 2, "task-3", Some(&base), &dead).unwrap();
+        assert_eq!(continued.index, 3);
+        assert_eq!(continued.handle.as_deref(), Some(handles[2].as_str()));
+        assert!(continued.path.join("work-3.txt").is_file());
+        assert_eq!(registered_count(&up.source), 4);
+        // Capacity returns only through explicit releases, never automatically.
+        // Releasing the in-range tasks leaves the beyond-range binding owned,
+        // so the reduced capacity still refuses new acquisition with both low
+        // positions free.
+        for i in 1..=2u32 {
+            release_task(
+                &home,
+                &up.source,
+                &format!("task-{i}"),
+                SlotDisposition::Discarded,
+                "reviewed",
+                &base,
+                Some(&handles[(i - 1) as usize]),
+                &dead,
+            )
+            .unwrap();
+        }
+        let error = acquire_task(&home, &up.source, 2, "task-4", Some(&base), &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("worktree_pool_size 2"), "{error}");
+        assert!(error.contains("slot 3"), "{error}");
+        assert!(error.contains("task-3"), "{error}");
+        // Releasing the beyond-range binding restores acquisition inside the
+        // reduced capacity without a replacement worktree.
+        release_task(
+            &home,
+            &up.source,
+            "task-3",
+            SlotDisposition::Discarded,
+            "reviewed",
+            &base,
+            Some(&handles[2]),
+            &dead,
+        )
+        .unwrap();
+        assert!(held_tasks_beyond(&home, &up.source, 2).unwrap().is_empty());
+        let fourth = acquire_task(&home, &up.source, 2, "task-4", Some(&base), &dead).unwrap();
+        assert_eq!(fourth.index, 1);
+        assert_eq!(registered_count(&up.source), 4);
+        release_task(
+            &home,
+            &up.source,
+            "task-4",
+            SlotDisposition::Discarded,
+            "reviewed",
+            &base,
+            Some(fourth.handle.as_deref().unwrap()),
+            &dead,
+        )
+        .unwrap();
+        assert!(
+            task_inventory(&home, &up.source, 3)
+                .unwrap()
+                .iter()
+                .all(|slot| slot.state == TaskState::Free)
+        );
+    }
+
+    #[test]
+    fn an_inflight_same_task_claim_never_allocates_a_second_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let pool = pool(&up.source, 2).unwrap();
+        let slot = create_slot(&pool, 1).unwrap();
+        let path = slot_record_path(&home, &up.source, 1).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let in_flight = SlotRecord {
+            schema: SLOT_STATE_SCHEMA,
+            source: up.source.clone(),
+            index: 1,
+            path: slot,
+            state: SlotState::Synchronizing,
+            owner: Some("task-1".into()),
+            task: Some("task-1".into()),
+            handle: Some("gen-inflight".into()),
+            base: Some(base.clone()),
+            disposition: None,
+            reason: None,
+            startup: None,
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&in_flight).unwrap()).unwrap();
+        // The same task is already being acquired elsewhere: the caller gets
+        // the in-flight refusal and never walks on to a second slot.
+        let error = acquire_task(&home, &up.source, 2, "task-1", Some(&base), &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already acquiring task 'task-1'"), "{error}");
+        assert_eq!(registered_count(&up.source), 2);
+        let inventory = task_inventory(&home, &up.source, 2).unwrap();
+        assert_eq!(inventory[0].state, TaskState::Held);
+        assert_eq!(inventory[1].state, TaskState::Free);
+        // A different task is unaffected by the same-task refusal.
+        let other = acquire_task(&home, &up.source, 2, "task-2", Some(&base), &dead).unwrap();
+        assert_eq!(other.index, 2);
+        assert_eq!(registered_count(&up.source), 3);
+        // The recorded in-flight binding still continues with its handle.
+        let continued = continue_task(&home, &up.source, "task-1", Some("gen-inflight")).unwrap();
+        assert_eq!(continued.state, TaskState::Held);
+        assert_eq!(continued.index, 1);
+    }
+
+    #[test]
+    fn a_confirmed_abandoned_task_reservation_is_recovered_without_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let pool = pool(&up.source, 1).unwrap();
+        let slot = create_slot(&pool, 1).unwrap();
+        let path = slot_record_path(&home, &up.source, 1).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let abandoned = SlotRecord {
+            schema: SLOT_STATE_SCHEMA,
+            source: up.source.clone(),
+            index: 1,
+            path: slot,
+            state: SlotState::Synchronizing,
+            owner: Some("dead-task".into()),
+            task: Some("dead-task".into()),
+            handle: Some("gen-dead".into()),
+            base: Some(base.clone()),
+            disposition: None,
+            reason: None,
+            startup: Some(StartupReservation {
+                pid: u32::MAX,
+                created: 1,
+                program: std::env::current_exe().unwrap(),
+            }),
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&abandoned).unwrap()).unwrap();
+        // The reservation never admitted work (clean tree at the exact base),
+        // so a new acquisition recovers the position instead of overflowing.
+        let acquired = acquire_task(&home, &up.source, 1, "live-task", Some(&base), &dead).unwrap();
+        assert_eq!(acquired.index, 1);
+        assert_eq!(acquired.task.as_deref(), Some("live-task"));
+        assert_eq!(registered_count(&up.source), 2);
+        // The abandoned binding is gone with its generation.
+        let error = continue_task(&home, &up.source, "dead-task", Some("gen-dead"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no recorded binding"), "{error}");
+    }
+
+    #[test]
+    fn concurrent_acquisitions_of_one_task_never_allocate_a_second_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let pool = pool(&up.source, 2).unwrap();
+        create_slot(&pool, 1).unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let results: Vec<std::io::Result<TaskSlot>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let dead = |_: &str| false;
+                        barrier.wait();
+                        acquire_task(&home, &up.source, 2, "race-task", Some(&base), &dead)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let mut indexes = Vec::new();
+        for result in results {
+            match result {
+                Ok(slot) => indexes.push(slot.index),
+                Err(error) => {
+                    let message = error.to_string();
+                    // A loser observes the same-task in-flight claim, or the
+                    // winner's record between its atomic publication and an
+                    // unlocked read. Any other outcome means the acquisition
+                    // walked on and could have allocated the task twice.
+                    assert!(
+                        message.contains("already acquiring task 'race-task'")
+                            || message.contains("is unreadable"),
+                        "unexpected concurrent refusal: {message}"
+                    );
+                }
+            }
+        }
+        assert!(
+            !indexes.is_empty(),
+            "one concurrent caller must acquire the task"
+        );
+        assert!(
+            indexes.iter().all(|index| *index == 1),
+            "one task acquired more than one slot: {indexes:?}"
+        );
+        assert_eq!(registered_count(&up.source), 2);
+        let inventory = task_inventory(&home, &up.source, 2).unwrap();
+        assert_eq!(inventory[0].state, TaskState::Held);
+        assert_eq!(inventory[0].task.as_deref(), Some("race-task"));
+        assert_eq!(inventory[1].state, TaskState::Free);
+        let continued = continue_task(
+            &home,
+            &up.source,
+            "race-task",
+            inventory[0].handle.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(continued.index, 1);
+        assert_eq!(continued.path, slot_path(&up.source, 1).unwrap());
+    }
+
+    #[test]
+    fn concurrent_different_tasks_compete_for_the_last_slot_without_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let pool = pool(&up.source, 1).unwrap();
+        create_slot(&pool, 1).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let barrier = &barrier;
+        let home_ref = &home;
+        let source = &up.source;
+        let base_ref = base.as_str();
+        let results: Vec<std::io::Result<TaskSlot>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["task-a", "task-b"]
+                .into_iter()
+                .map(|task| {
+                    scope.spawn(move || {
+                        let dead = |_: &str| false;
+                        barrier.wait();
+                        acquire_task(home_ref, source, 1, task, Some(base_ref), &dead)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let winners: Vec<&std::io::Result<TaskSlot>> =
+            results.iter().filter(|result| result.is_ok()).collect();
+        assert_eq!(winners.len(), 1, "exactly one task must win the last slot");
+        let loser = results.iter().find(|result| result.is_err()).unwrap();
+        let message = loser.as_ref().unwrap_err().to_string();
+        assert!(
+            message.contains("no free slot in the pool of 1") || message.contains("is unreadable"),
+            "unexpected last-slot refusal: {message}"
+        );
+        assert_eq!(registered_count(&up.source), 2, "no overflow worktree");
+        let inventory = task_inventory(&home, &up.source, 1).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].state, TaskState::Held);
+        assert_eq!(
+            inventory[0].task.as_deref(),
+            winners[0].as_ref().unwrap().task.as_deref()
+        );
+    }
+
+    #[test]
+    fn handoff_and_continuation_refuse_a_live_former_owner_and_rebind_a_dead_one() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        let handle = acquired.handle.clone().unwrap();
+        let partial = acquired.path.join("partial.txt");
+        fs::write(&partial, "partial work\n").unwrap();
+        let head = rev(&acquired.path);
+        // Hand the held task to a live executor session.
+        let live_a = |session: &str| session == "exec-a";
+        let handed =
+            handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-a", &live_a)
+                .unwrap();
+        assert_eq!(handed.owner.as_deref(), Some("exec-a"));
+        assert_eq!(handed.handle.as_deref(), Some(handle.as_str()));
+        // A live foreign session cannot be handed over or continued around.
+        let error =
+            handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-b", &live_a)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("live session exec-a"), "{error}");
+        let error = continue_task_for_session(
+            &home,
+            &up.source,
+            "task-1",
+            Some(&handle),
+            "exec-b",
+            &live_a,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("live session exec-a"), "{error}");
+        let error = continue_task(&home, &up.source, "task-1", Some(&handle))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("session exec-a"), "{error}");
+        // The owner session itself continues its binding unchanged.
+        let same = continue_task_for_session(
+            &home,
+            &up.source,
+            "task-1",
+            Some(&handle),
+            "exec-a",
+            &live_a,
+        )
+        .unwrap();
+        assert_eq!(same.owner.as_deref(), Some("exec-a"));
+        assert_eq!(rev(&acquired.path), head);
+        assert!(partial.is_file());
+        // A former owner that is gone no longer blocks an explicit rebind: the
+        // work, generation handle and base survive without reset.
+        let rebound =
+            handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-b", &dead).unwrap();
+        assert_eq!(rebound.owner.as_deref(), Some("exec-b"));
+        assert_eq!(rebound.handle.as_deref(), Some(handle.as_str()));
+        assert_eq!(rebound.base.as_deref(), Some(base.as_str()));
+        assert_eq!(rebound.state, TaskState::Held);
+        assert_eq!(rev(&acquired.path), head);
+        assert!(partial.is_file());
+        // The newly bound session continues; the stale former owner is refused
+        // while its successor is live.
+        let live_b = |session: &str| session == "exec-b";
+        let continued = continue_task_for_session(
+            &home,
+            &up.source,
+            "task-1",
+            Some(&handle),
+            "exec-b",
+            &live_b,
+        )
+        .unwrap();
+        assert_eq!(continued.owner.as_deref(), Some("exec-b"));
+        let error = continue_task_for_session(
+            &home,
+            &up.source,
+            "task-1",
+            Some(&handle),
+            "exec-a",
+            &live_b,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("live session exec-b"), "{error}");
+        // A session release must not clear a durable task binding by position.
+        let single = pool(&up.source, 1).unwrap();
+        let error = release_slot(
+            &home,
+            &single,
+            1,
+            SlotDisposition::Discarded,
+            "session release",
+            &base,
+            &dead,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("session release must not clear a durable task binding"),
+            "{error}"
+        );
+        assert!(partial.is_file());
+        // The explicit task release ends the binding and reuses the tree.
+        let disposition = release_task(
+            &home,
+            &up.source,
+            "task-1",
+            SlotDisposition::Merged,
+            "merged",
+            &base,
+            Some(&handle),
+            &dead,
+        )
+        .unwrap();
+        assert!(matches!(disposition, LaneDisposition::Reused { .. }));
+    }
+
+    #[test]
+    fn a_released_and_reassigned_slot_refuses_the_old_session_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        let handle = acquired.handle.clone().unwrap();
+        let live = |session: &str| session == "exec-1";
+        handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-1", &live).unwrap();
+        release_startup_reservation(&home, &up.source, 1, "exec-1").unwrap();
+        release_task(
+            &home,
+            &up.source,
+            "task-1",
+            SlotDisposition::Merged,
+            "accepted",
+            &base,
+            Some(&handle),
+            &dead,
+        )
+        .unwrap();
+        acquire_task(&home, &up.source, 1, "task-2", Some(&base), &dead).unwrap();
+        // The old conversation's binding must not resume into the reassigned
+        // slot, by any of the continuation entry points.
+        for error in [
+            continue_task_for_session(&home, &up.source, "task-1", Some(&handle), "exec-1", &live)
+                .unwrap_err()
+                .to_string(),
+            handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-1", &live)
+                .unwrap_err()
+                .to_string(),
+            continue_task(&home, &up.source, "task-1", Some(&handle))
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(error.contains("no recorded binding"), "{error}");
+        }
+        // The reassigned task continues normally.
+        assert_eq!(
+            continue_task(&home, &up.source, "task-2", None)
+                .unwrap()
+                .task
+                .as_deref(),
+            Some("task-2")
+        );
+    }
+
+    /// Legacy readers (historical base `4f2ff08`) ignore added task fields and
+    /// even an increased schema number. They must fail to deserialize the
+    /// required discriminator, before applying executor-session liveness.
+    #[test]
+    fn a_legacy_reader_refuses_a_durable_task_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let dead = |_: &str| false;
+        let held = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        let path = slot_record_path(&home, &up.source, 1).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacySlotRecord {
+            schema: u32,
+            state: SlotState,
+            owner: Option<String>,
+            base: Option<String>,
+        }
+        let error = serde_json::from_slice::<LegacySlotRecord>(&bytes)
+            .err()
+            .expect("an older reader must refuse current ownership records");
+        assert!(error.to_string().contains("missing field `schema`"));
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ownershipSchema"], SLOT_STATE_SCHEMA);
+        assert!(value.get("schema").is_none());
+
+        // A number-only bump would not protect the held task: the historical
+        // decoder still accepts it and sees no durable ownership contract.
+        let mut number_only = value.clone();
+        number_only
+            .as_object_mut()
+            .unwrap()
+            .remove("ownershipSchema");
+        number_only["schema"] = serde_json::json!(SLOT_STATE_SCHEMA);
+        let legacy: LegacySlotRecord = serde_json::from_value(number_only).unwrap();
+        assert_eq!(legacy.schema, SLOT_STATE_SCHEMA);
+        assert_eq!(
+            legacy.owner.as_deref(),
+            Some("task-1"),
+            "the legacy reader sees only an owner string, never the binding"
+        );
+        assert_eq!(
+            legacy.state,
+            SlotState::Occupied,
+            "the legacy reader sees a completed session claim, not a task binding"
+        );
+        assert_eq!(value["task"].as_str(), Some("task-1"));
+        assert_eq!(
+            legacy.base.as_deref(),
+            value["base"].as_str(),
+            "the legacy reader sees the base but never the task binding"
+        );
+        assert_eq!(value["handle"].as_str(), held.handle.as_deref());
+        // This build refuses the binding once its generation handle is gone,
+        // instead of reading task ownership as an unknown session owner.
+        let mut tampered = value;
+        tampered.as_object_mut().unwrap().remove("handle");
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let error = continue_task(&home, &up.source, "task-1", held.handle.as_deref())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without its generation handle"), "{error}");
+    }
+
+    #[test]
+    fn legacy_record_upgrade_preserves_binding_and_files_until_owned_transition() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let base = rev(&up.source);
+        let dead = |_: &str| false;
+        let held = acquire_task(&home, &up.source, 1, "retained-task", Some(&base), &dead).unwrap();
+        fs::write(held.path.join("untracked.txt"), "retained input").unwrap();
+        let path = slot_record_path(&home, &up.source, 1).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("ownershipSchema");
+        legacy["schema"] = serde_json::json!(1);
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let loaded = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        assert_eq!(loaded.schema, SLOT_STATE_SCHEMA);
+        let continued =
+            continue_task(&home, &up.source, "retained-task", held.handle.as_deref()).unwrap();
+        assert_eq!(continued.path, held.path);
+        assert_eq!(continued.base, held.base);
+        assert_eq!(continued.handle, held.handle);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "reads do not rewrite state"
+        );
+
+        let handed = handoff_task_to_session(
+            &home,
+            &up.source,
+            "retained-task",
+            held.handle.as_deref().unwrap(),
+            "executor-after-update",
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(handed.path, held.path);
+        assert_eq!(handed.base, held.base);
+        assert_eq!(
+            fs::read_to_string(held.path.join("untracked.txt")).unwrap(),
+            "retained input"
+        );
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["ownershipSchema"], SLOT_STATE_SCHEMA);
+        assert!(upgraded.get("schema").is_none());
+    }
+
+    #[test]
+    fn concurrent_owner_claims_keep_one_winner_and_never_grow_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let layout = pool(&up.source, 1).unwrap();
+        create_slot(&layout, 1).unwrap();
+        let only_a = |session: &str| session == "exec-a";
+        let SlotClaim::Claimed(winner) =
+            claim_slot_for(&home, &layout, 1, "exec-a", &only_a, None).unwrap()
+        else {
+            panic!("the first owner must win the slot");
+        };
+        assert_eq!(winner.owner.as_deref(), Some("exec-a"));
+        // A concurrent second owner loses the same position.
+        match claim_slot_for(&home, &layout, 1, "exec-b", &only_a, None).unwrap() {
+            SlotClaim::Unavailable(refusal) => {
+                assert!(
+                    refusal.reason.contains("occupied by live session exec-a"),
+                    "{}",
+                    refusal.reason
+                );
+            }
+            SlotClaim::Claimed(_) => panic!("two owners must never share one slot"),
+        }
+        // The winner's own retry keeps its claim; capacity never grows.
+        assert!(matches!(
+            claim_slot_for(&home, &layout, 1, "exec-a", &only_a, None).unwrap(),
+            SlotClaim::Claimed(_)
+        ));
+        assert_eq!(registered_count(&up.source), 2);
+        // A task acquisition cannot take a session-owned slot away.
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let error = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &only_a)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("occupied by live session exec-a"), "{error}");
+        // Once that session is gone, its clean claim is reclaimed by the task.
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        assert_eq!(acquired.index, 1);
+        assert_eq!(acquired.task.as_deref(), Some("task-1"));
+        assert_eq!(
+            registered_count(&up.source),
+            2,
+            "a second claimant never adds a worktree"
+        );
+        // And the task binding refuses an executor-session claim in turn.
+        match claim_slot(&home, &layout, 1, "exec-b", &dead).unwrap() {
+            SlotClaim::Unavailable(refusal) => {
+                assert!(
+                    refusal.reason.contains("held by task 'task-1'"),
+                    "{}",
+                    refusal.reason
+                );
+            }
+            SlotClaim::Claimed(_) => panic!("a task-held slot must not be claimed by a session"),
+        }
+    }
+
+    #[test]
+    fn handoff_moves_the_binding_without_reset_and_refuses_stale_or_foreign_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let dead = |_: &str| false;
+        let base = rev(&up.source);
+        let acquired = acquire_task(&home, &up.source, 1, "task-1", Some(&base), &dead).unwrap();
+        let handle = acquired.handle.clone().unwrap();
+        let partial = acquired.path.join("partial.txt");
+        fs::write(&partial, "partial work\n").unwrap();
+        let head = rev(&acquired.path);
+        // A stale handle cannot move the binding.
+        let error = handoff_task_to_session(&home, &up.source, "task-1", "stale", "exec-9", &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stale"), "{error}");
+        assert_eq!(
+            load_slot_record(&home, &up.source, 1)
+                .unwrap()
+                .unwrap()
+                .owner
+                .as_deref(),
+            Some("task-1")
+        );
+        // A genuinely live foreign startup reservation excludes both the
+        // handoff and the release until its process identity is resolved.
+        let program = std::env::current_exe().unwrap();
+        let mut sleeper = Command::new(&program)
+            .args([
+                "--exact",
+                "--ignored",
+                "task_worktree::tests::startup_liveness_hold",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let user = crate::process_service::current_user().unwrap();
+        let identity =
+            crate::process_service::ServiceProcess::observe(sleeper.id(), &program, 0, &user)
+                .unwrap()
+                .identity();
+        let reservation = StartupReservation {
+            pid: identity.pid,
+            created: identity.creation_time,
+            program,
+        };
+        for _ in 0..100 {
+            if startup_liveness(&reservation) == ReservationLiveness::Live {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(startup_liveness(&reservation), ReservationLiveness::Live);
+        let record_path = slot_record_path(&home, &up.source, 1).unwrap();
+        let mut stored = load_slot_record(&home, &up.source, 1).unwrap().unwrap();
+        stored.startup = Some(reservation.clone());
+        fs::write(&record_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+        let error = handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-9", &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("in-flight startup"), "{error}");
+        let error = release_task(
+            &home,
+            &up.source,
+            "task-1",
+            SlotDisposition::Discarded,
+            "discarded",
+            &base,
+            Some(&handle),
+            &dead,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("in-flight startup"), "{error}");
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        for _ in 0..100 {
+            if startup_liveness(&reservation) == ReservationLiveness::Dead {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(startup_liveness(&reservation), ReservationLiveness::Dead);
+        // With the dispatching process resolved dead, the handoff proceeds and
+        // never resets, cleans or fetches the checkout.
+        let handed =
+            handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-9", &dead).unwrap();
+        assert_eq!(handed.owner.as_deref(), Some("exec-9"));
+        assert_eq!(handed.handle.as_deref(), Some(handle.as_str()));
+        assert_eq!(handed.base.as_deref(), Some(base.as_str()));
+        assert_eq!(handed.path, acquired.path);
+        assert_eq!(handed.state, TaskState::Held);
+        assert!(partial.is_file(), "handoff must not clean partial work");
+        assert_eq!(rev(&acquired.path), head);
+        release_startup_reservation(&home, &up.source, 1, "exec-9").unwrap();
+        assert!(
+            load_slot_record(&home, &up.source, 1)
+                .unwrap()
+                .unwrap()
+                .startup
+                .is_none()
+        );
+        // After the explicit release the binding - and its handle - is gone.
+        let disposition = release_task(
+            &home,
+            &up.source,
+            "task-1",
+            SlotDisposition::Merged,
+            "merged",
+            &base,
+            Some(&handle),
+            &dead,
+        )
+        .unwrap();
+        assert!(matches!(disposition, LaneDisposition::Reused { .. }));
+        let error = handoff_task_to_session(&home, &up.source, "task-1", &handle, "exec-9", &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no recorded binding"), "{error}");
+        let error = continue_task(&home, &up.source, "task-1", Some(&handle))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no recorded binding"), "{error}");
+    }
+
+    /// Sleeper process that holds a genuine in-flight startup reservation;
+    /// it runs only when spawned by name from the handoff test.
+    #[test]
+    #[ignore = "helper process for the handoff reservation test"]
+    fn startup_liveness_hold() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
     }
 
     fn rev(cwd: &Path) -> String {

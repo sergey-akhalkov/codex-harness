@@ -642,18 +642,13 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
         }
     };
     let build = plain_path(build);
+    core_install::validate_candidate_build(&source, &build)?;
     let build_identity = harness_core::build_identity::read_record(&build)
         .map(|record| record.source.sha256.chars().take(16).collect::<String>())
         .unwrap_or_default();
     let preflight = if preview {
         None
     } else {
-        let check = harness_core::build_identity::check(&build, Some(&source));
-        if !check.runtime_allowed {
-            return Err(io::Error::other(
-                "native candidate build is stale, missing or altered; explicit build required",
-            ));
-        }
         let report = serena_verification(&build.join("codex-harness.exe"), &codex_home, &source);
         if report["status"] == "failed" {
             println!(

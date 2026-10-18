@@ -219,14 +219,23 @@ pub(crate) struct DispatcherIdentity {
 }
 
 /// Immutable originating relationship captured from the dispatching process
-/// before its session environment is cleared for the host. This record is not
-/// a lead endpoint, and a caller-supplied id or copied marker is not authority.
+/// before its session environment is cleared for the host: the conversation
+/// id, the run generation, the dispatching process's identity and, when it
+/// had one, the kit home that process ran in. The home is what lets a later
+/// addressed message reach that conversation's own store; the executor's
+/// selected home is never assumed to be the same. This record is not a lead
+/// endpoint, and a caller-supplied id or copied marker is not authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct OriginatingLead {
     pub schema: u32,
     pub thread_id: String,
     pub run_generation: String,
+    /// The kit home the dispatching process itself resolves, captured with the
+    /// rest of the relationship. Absent when the launcher's home resolver
+    /// cannot establish it; never guessed from the executor's selected home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<PathBuf>,
     pub dispatcher: DispatcherIdentity,
 }
 
@@ -253,12 +262,17 @@ pub(crate) fn supplied_lead_option(key: &str) -> bool {
     )
 }
 
-/// Captures the dispatching process's own `CODEX_THREAD_ID`. The working
-/// directory is not an input: a descendant that changes directory still
-/// records this process's thread id. A copied run marker, a sibling run, a
-/// stale reference, or a caller-supplied lead id fails closed. This does not
-/// open a lead endpoint; a thread id that is merely present cannot be proved
-/// to name a live lead conversation without one.
+/// Captures the dispatching process's own `CODEX_THREAD_ID` and the kit home
+/// that process itself resolves: an explicit `CODEX_HOME`, otherwise the
+/// user's default native home, exactly as the native launcher resolves it. A
+/// later consumer must never substitute the executor's selected home for the
+/// lead's own, because dispatch accepts an explicit `--codex-home` and the
+/// two are not required to be equal. The working directory is not an input: a
+/// descendant that changes directory still records this process's thread id.
+/// A copied run marker, a sibling run, a stale reference, or a caller-supplied
+/// lead id fails closed. This does not open a lead endpoint; a thread id that
+/// is merely present cannot be proved to name a live lead conversation
+/// without one.
 pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<OriginatingLead> {
     if LEAD_OVERRIDE_ENV
         .iter()
@@ -296,6 +310,11 @@ pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<Origina
             "unverifiable originating lead: dispatching process image is unavailable: {error}; refusing before a model request"
         ))
     })?;
+    // Resolve through the launcher owner while still in the dispatcher's cwd.
+    // A relative CODEX_HOME must not be reinterpreted in the executor checkout
+    // when it later addresses the originating conversation. An unavailable
+    // home leaves the ordinary route unavailable without changing dispatch.
+    let home = harness_core::native_launcher::codex_home().ok();
     let user = harness_core::process_service::current_user().map_err(|error| {
         invalid(format!(
             "unverifiable originating lead: dispatching process account is unavailable: {error}; refusing before a model request"
@@ -317,6 +336,7 @@ pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<Origina
         schema: ORIGINATING_LEAD_SCHEMA,
         thread_id: thread_id.to_owned(),
         run_generation: run_generation()?,
+        home,
         dispatcher: DispatcherIdentity {
             pid: identity.pid,
             creation_time: identity.creation_time,
@@ -519,6 +539,14 @@ pub struct ControlPlan {
     /// capability and must not be mistaken for an executor by the launcher or
     /// by the kit's own nested-dispatch refusal.
     pub executor_session: bool,
+    /// Whether this plan serves a bounded lead conversation. A bounded lead
+    /// keeps the lead role, the configured lead profile and the ordinary
+    /// source/check tools, but the single-agent override applies exactly as it
+    /// does for an executor: the bounded participant returns decisions to the
+    /// lead that dispatched it instead of starting further model
+    /// conversations. Its own session marker, never the executor one, makes
+    /// the kit's dispatch entries refuse inside its process tree.
+    pub bounded_lead_session: bool,
     /// Bound for readiness and for every request's answer.
     pub bound: Duration,
     /// Record-read timeout of one pump step.
@@ -549,6 +577,7 @@ impl ControlPlan {
             port: None,
             env: BTreeMap::new(),
             executor_session: true,
+            bounded_lead_session: false,
             bound: DEFAULT_BOUND,
             poll: DEFAULT_POLL,
         }
@@ -558,9 +587,11 @@ impl ControlPlan {
 /// The `codex app-server` command one control session spawns: the loopback
 /// listener, the capability-token file, the caller's extra arguments, the bound
 /// slot as working directory, and - for an executor conversation - the executor
-/// session environment and the agent-tool override. A managed lead session gets
-/// neither, because the lead keeps the native agent capability. The parent's
-/// session and thread id are removed in both cases, so the child cannot attach
+/// session environment. The agent-tool override reaches executor and bounded
+/// lead conversations alike; a bounded lead conversation carries its own
+/// session marker instead of the executor one, and a managed lead session gets
+/// neither because the lead keeps the native agent capability. The parent's
+/// session and thread id are removed in every case, so the child cannot attach
 /// to a conversation it does not serve.
 pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
     let mut command = CommandSpec::new(&plan.launcher);
@@ -608,9 +639,12 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         OsString::from("--ws-token-file"),
         plan.paths.token.clone().into_os_string(),
     ];
-    if plan.executor_session {
+    if plan.executor_session || plan.bounded_lead_session {
         // A managed lead session keeps the native agent capability: neither
         // this override nor the session marker reaches its app-server child.
+        // A bounded lead conversation is a bounded decision participant, not
+        // another dispatch owner, so its native agent tools stay off while its
+        // role, profile and source/check tools stay exactly as resolved.
         args.extend(EXECUTOR_AGENT_TOOLS_OFF.map(OsString::from));
     }
     args.extend(plan.args.iter().cloned());
@@ -824,8 +858,11 @@ pub fn registered_lead(codex_home: &Path, thread_id: &str) -> RegisteredLead {
 }
 
 /// Whether the recorded endpoint process is still the process that serves it:
-/// pid, creation time and image must match the current process table. A bare
-/// pid, a missing image, an unverifiable identity or a reused pid is not
+/// pid, creation time and image must match the current process table. A record
+/// written before spawn-time image resolution may keep naming the installed
+/// launcher symlink after an install retargets it; endpoint validation accepts
+/// that only for the same exact process image in a sibling published build.
+/// A bare pid, a missing image, an unverifiable identity or a reused pid is not
 /// liveness, so a stale address can never be inherited or delivered to.
 pub fn endpoint_process_live(process: &EndpointProcess) -> bool {
     if process.pid == 0 || process.creation_time == 0 || !process.program.is_file() {
@@ -835,7 +872,7 @@ pub fn endpoint_process_live(process: &EndpointProcess) -> bool {
         return false;
     };
     matches!(
-        harness_core::process_service::ServiceProcess::inspect(
+        harness_core::process_service::ServiceProcess::inspect_endpoint(
             ProcessIdentity {
                 pid: process.pid,
                 creation_time: process.creation_time,
@@ -2264,7 +2301,7 @@ fn unresolved_reply_hold_at(receipt: &Path) -> io::Result<bool> {
     })
 }
 
-fn item_client_id(item: &Value) -> Option<&str> {
+pub(crate) fn item_client_id(item: &Value) -> Option<&str> {
     item.get("clientId")
         .or_else(|| item.get("client_id"))
         .and_then(Value::as_str)
@@ -2471,6 +2508,15 @@ fn spawn_app_server(
         _ => free_loopback_port()?,
     };
     let mut spec = app_server_spec(plan, port);
+    // Resolve the installed launcher before CreateProcess. The endpoint must
+    // name the image this child actually runs, not a link that a later install
+    // can retarget while the child keeps serving.
+    spec.program = spec.program.canonicalize().map_err(|error| {
+        invalid(format!(
+            "control launcher {} could not be resolved: {error}",
+            spec.program.display()
+        ))
+    })?;
     let log = fs::File::create(&plan.paths.log).map_err(|error| {
         invalid(format!(
             "control app-server log {}: {error}",
@@ -2517,7 +2563,7 @@ fn spawn_app_server(
         EndpointProcess {
             pid: identity.pid,
             creation_time: identity.creation_time,
-            program: plan.launcher.clone(),
+            program: spec.program.clone(),
         },
     );
     Ok((process, connection, endpoint))

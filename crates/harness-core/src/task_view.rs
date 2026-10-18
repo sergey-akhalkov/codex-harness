@@ -6,7 +6,6 @@ use std::process::{Command, ExitStatus};
 use std::{
     io,
     path::Path,
-    ptr::null_mut,
     thread,
     time::{Duration, Instant},
 };
@@ -17,18 +16,14 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::IVirtualDesktopManager;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_MENU, keybd_event};
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, POINT, RECT},
-    Graphics::{
-        Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
-        Gdi::ClientToScreen,
-    },
+    Foundation::{HWND, LPARAM, RECT},
+    Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
     System::Console::GetConsoleWindow,
     System::Threading::{AttachThreadInput, GetCurrentThreadId},
     UI::WindowsAndMessaging::{
-        EnumWindows, GW_HWNDPREV, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent,
-        GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, SPI_GETWORKAREA, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER,
-        SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, SystemParametersInfoW,
+        EnumWindows, GetClassNameW, GetForegroundWindow, GetParent, GetWindowRect, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, SPI_GETWORKAREA, SW_RESTORE,
+        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SystemParametersInfoW,
     },
 };
 
@@ -106,8 +101,7 @@ impl Watch {
 
     pub(crate) fn visible(&self) -> io::Result<bool> {
         Ok(self.process.is_running()?
-            && visible_bounds(self.window, self.process.identity().pid).is_ok()
-            && unobscured(self.window as HWND)?)
+            && visible_bounds(self.window, self.process.identity().pid).is_ok())
     }
 
     pub(crate) fn process_running(&self) -> io::Result<bool> {
@@ -463,48 +457,6 @@ fn restore_foreground(current: HWND, previous: HWND) {
     }
 }
 
-/// Conservatively require the conversation client area to be unobscured.
-/// IsWindowVisible checks a style bit, not whether another app covers the text.
-fn unobscured(window: HWND) -> io::Result<bool> {
-    if cloaked(window)? {
-        return Ok(false);
-    }
-    let mut area = RECT::default();
-    let mut origin = POINT::default();
-    if unsafe { GetClientRect(window, &mut area) } == 0
-        || unsafe { ClientToScreen(window, &mut origin) } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    area.left += origin.x;
-    area.right += origin.x;
-    area.top += origin.y;
-    area.bottom += origin.y;
-    if area.left >= area.right || area.top >= area.bottom {
-        return Ok(false);
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    let mut above = unsafe { GetWindow(window, GW_HWNDPREV) };
-    while !above.is_null() {
-        // Window destruction/reordering can invalidate a traversal. Never loop
-        // indefinitely or infer visibility from an incomplete observation.
-        if seen.len() >= 4096 || !seen.insert(above as usize) {
-            return Ok(false);
-        }
-        if unsafe { IsWindowVisible(above) } != 0 && unsafe { IsIconic(above) } == 0 {
-            let mut other = RECT::default();
-            if unsafe { GetWindowRect(above, &mut other) } == 0 {
-                return Ok(false);
-            }
-            if overlaps(&area, &other) && !cloaked(above)? {
-                return Ok(false);
-            }
-        }
-        above = unsafe { GetWindow(above, GW_HWNDPREV) };
-    }
-    Ok(true)
-}
-
 fn cloaked(window: HWND) -> io::Result<bool> {
     let mut value = 0u32;
     let result = unsafe {
@@ -523,13 +475,29 @@ fn cloaked(window: HWND) -> io::Result<bool> {
     Ok(value != 0)
 }
 
-fn overlaps(a: &RECT, b: &RECT) -> bool {
-    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
-}
-
 struct FindWindow {
     pid: u32,
     window: Option<usize>,
+}
+
+/// The visible surface presenting a launcher-owned console. Windows Terminal
+/// hosts a console created for another process behind the terminal window of
+/// that session: the console's pseudo console window is owned by the client
+/// and parented to that terminal window, the same console-to-terminal
+/// identity `console_terminal_window` uses for this process's own session. A
+/// directly owned visible window (classic console host) is its own
+/// presentation.
+fn presentation_window(window: HWND) -> HWND {
+    let parent = unsafe { GetParent(window) };
+    if !parent.is_null()
+        && terminal_window(parent)
+        && unsafe { IsWindowVisible(parent) } != 0
+        && unsafe { IsIconic(parent) } == 0
+    {
+        parent
+    } else {
+        window
+    }
 }
 
 unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
@@ -540,7 +508,7 @@ unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
         && pid == search.pid
         && unsafe { IsWindowVisible(window) } != 0
     {
-        search.window = Some(window as usize);
+        search.window = Some(presentation_window(window) as usize);
     }
     1
 }
@@ -594,8 +562,16 @@ impl View {
             window: None,
         };
         loop {
-            if !process.is_running()? || Instant::now() >= until {
-                return Err(unavailable());
+            if let Some(code) = process.exit_code()? {
+                return Err(io::Error::other(format!(
+                    "conversation launcher exited before its window became ready: exit code {code} (0x{code:08X}); suspend new model dispatch"
+                )));
+            }
+            if Instant::now() >= until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "conversation window did not become ready before the deadline; suspend new model dispatch",
+                ));
             }
             if unsafe {
                 EnumWindows(
@@ -607,27 +583,26 @@ impl View {
                 return Err(io::Error::last_os_error());
             }
             if let Some(window) = search.window {
+                // A visible owned console can be enumerated while the system
+                // is still sizing it. That empty surface is not a dispatch
+                // readiness failure: keep polling until it has real bounds,
+                // the launcher exits or the deadline is reached.
+                match visible_bounds(window, process.identity().pid) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 let view = Self {
                     _job: job,
                     process,
                     window,
                 };
                 view.snapshot()?;
-                if unsafe {
-                    SetWindowPos(
-                        window as HWND,
-                        null_mut(),
-                        bounds.x,
-                        bounds.y,
-                        bounds.width,
-                        bounds.height,
-                        SWP_NOACTIVATE,
-                    )
-                } == 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                view.snapshot()?;
+                // Observe the surface created by the terminal. Conversation
+                // visibility does not authorize rearranging desktop windows.
                 return Ok(view);
             }
             thread::sleep(Duration::from_millis(25));
@@ -636,24 +611,6 @@ impl View {
 
     pub fn identity(&self) -> ProcessIdentity {
         self.process.identity()
-    }
-
-    pub(crate) fn place(&self, bounds: Bounds) -> io::Result<()> {
-        if unsafe {
-            SetWindowPos(
-                self.window as HWND,
-                null_mut(),
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     pub fn is_running(&self) -> io::Result<bool> {
@@ -666,8 +623,10 @@ impl View {
 
     /// Recheck before dispatch. A saved HWND or a live process alone is insufficient.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
-        if !self.process.is_running()? {
-            return Err(unavailable());
+        if let Some(code) = self.process.exit_code()? {
+            return Err(io::Error::other(format!(
+                "conversation window is unavailable: launcher exited with code {code} (0x{code:08X}) before its snapshot; suspend new model dispatch"
+            )));
         }
         Ok(Snapshot {
             process: self.process.identity(),
@@ -690,22 +649,85 @@ fn loaded_title(caption: &str, expected: &str) -> bool {
         && chars.as_str().starts_with(expected)
 }
 
+/// Whether `window` is the terminal presentation of a console whose client is
+/// the exact process `expected_pid`: a top-level window owned by that process
+/// is parented to it, the same console-to-terminal identity
+/// `console_terminal_window` uses for this process's own session.
+fn console_presentation_of(window: usize, expected_pid: u32) -> bool {
+    struct Presentation {
+        pid: u32,
+        presentation: HWND,
+        hosted: bool,
+    }
+    unsafe extern "system" fn find_anchor(window: HWND, parameter: LPARAM) -> i32 {
+        let search = unsafe { &mut *(parameter as *mut Presentation) };
+        let mut pid = 0;
+        if unsafe { GetWindowThreadProcessId(window, &mut pid) } != 0
+            && pid == search.pid
+            && unsafe { GetParent(window) } == search.presentation
+        {
+            search.hosted = true;
+        }
+        1
+    }
+    let mut search = Presentation {
+        pid: expected_pid,
+        presentation: window as HWND,
+        hosted: false,
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_anchor),
+            (&mut search as *mut Presentation) as LPARAM,
+        );
+    }
+    search.hosted
+}
+
 fn visible_bounds(window: usize, expected_pid: u32) -> io::Result<Bounds> {
     let window = window as HWND;
     let mut pid = 0;
-    if unsafe { GetWindowThreadProcessId(window, &mut pid) } == 0
-        || pid != expected_pid
-        || unsafe { IsWindowVisible(window) } == 0
-        || unsafe { IsIconic(window) } != 0
-    {
-        return Err(unavailable());
+    if unsafe { GetWindowThreadProcessId(window, &mut pid) } == 0 {
+        return Err(io::Error::other(format!(
+            "conversation window identity query failed: {}; suspend new model dispatch",
+            io::Error::last_os_error()
+        )));
+    }
+    let visible = unsafe { IsWindowVisible(window) } != 0;
+    let minimized = unsafe { IsIconic(window) } != 0;
+    // The launcher owns its console, but the visible surface can belong to the
+    // terminal host presenting it; the console still counts as owned when a
+    // live window of the exact launcher process is parented to that surface.
+    let owned = pid == expected_pid
+        || (terminal_window(window) && console_presentation_of(window as usize, expected_pid));
+    if !owned || !visible || minimized {
+        return Err(io::Error::other(format!(
+            "conversation window is unavailable: owner pid={pid}, expected pid={expected_pid}, visible={visible}, minimized={minimized}; suspend new model dispatch"
+        )));
+    }
+    // A distinct attached surface remains available when another window
+    // overlaps it. Requiring unobscured pixels would force users to tile all
+    // conversations. A hidden composition surface is still unavailable.
+    if cloaked(window)? {
+        return Err(io::Error::other(
+            "conversation window is cloaked; suspend new model dispatch",
+        ));
     }
     let mut bounds = RECT::default();
     if unsafe { GetWindowRect(window, &mut bounds) } == 0 {
         return Err(io::Error::last_os_error());
     }
     if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
-        return Err(unavailable());
+        // A found, visible, owned window can still be sized by the system after
+        // it is enumerated. Startup readiness polls this state through
+        // WouldBlock; every dispatch recheck refuses it with the same message.
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "conversation window is unavailable: empty bounds ({}, {}, {}, {}); suspend new model dispatch",
+                bounds.left, bounds.top, bounds.right, bounds.bottom
+            ),
+        ));
     }
     Ok(Bounds {
         x: bounds.left,
@@ -725,7 +747,9 @@ pub fn three_windows() -> io::Result<[Bounds; 3]> {
     let width = work.right - work.left;
     let height = work.bottom - work.top;
     if width < 2 || height < 2 {
-        return Err(unavailable());
+        return Err(io::Error::other(format!(
+            "conversation window layout is unavailable: work area is {width} by {height}; suspend new model dispatch"
+        )));
     }
     let left = width / 2;
     let top = height / 2;
@@ -794,6 +818,7 @@ pub fn layout(count: usize) -> io::Result<Vec<Bounds>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr::null_mut;
     #[test]
     fn named_running_child_caption_is_ready_without_waiting_for_its_model() {
         assert!(loaded_title("Executor 1 | workspace", "Executor 1 | "));
@@ -856,60 +881,20 @@ mod tests {
 
     #[test]
     #[ignore = "creates two short-lived owned desktop windows; requires available interactive desktop"]
-    fn obscured_chat_is_not_visible_until_cover_is_removed() {
+    fn overlapping_conversations_remain_available_but_lost_surfaces_do_not() {
         let chat = owned_window(30, 30, 400, 240);
-        assert!(unobscured(chat.0).unwrap());
-        let cover = owned_window(80, 80, 150, 100);
-        assert_ne!(unsafe { IsWindowVisible(chat.0) }, 0);
-        assert!(
-            !unobscured(chat.0).unwrap(),
-            "partial coverage hides conversation content"
-        );
+        let pid = std::process::id();
+        assert!(visible_bounds(chat.0 as usize, pid).is_ok());
+        let cover = owned_window(30, 30, 400, 240);
+        assert!(visible_bounds(chat.0 as usize, pid).is_ok());
+        assert!(visible_bounds(cover.0 as usize, pid).is_ok());
+        assert!(visible_bounds(chat.0 as usize, 0).is_err());
         unsafe {
-            SetWindowPos(
-                cover.0,
-                null_mut(),
-                30,
-                30,
-                400,
-                240,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+            ShowWindow(chat.0, SW_HIDE);
         }
-        assert!(
-            !unobscured(chat.0).unwrap(),
-            "full coverage must also suspend admission"
-        );
-        unsafe {
-            SetWindowPos(
-                cover.0,
-                null_mut(),
-                430,
-                30,
-                150,
-                100,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
-        }
-        assert!(
-            unobscured(chat.0).unwrap(),
-            "touching edges do not obscure the client"
-        );
-        unsafe {
-            SetWindowPos(
-                cover.0,
-                null_mut(),
-                80,
-                80,
-                150,
-                100,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
-            ShowWindow(cover.0, SW_HIDE);
-        }
-        assert!(
-            unobscured(chat.0).unwrap(),
-            "a hidden covering window does not obscure the client"
-        );
+        assert!(visible_bounds(chat.0 as usize, pid).is_err());
+        let closed = cover.0 as usize;
+        drop(cover);
+        assert!(visible_bounds(closed, pid).is_err());
     }
 }

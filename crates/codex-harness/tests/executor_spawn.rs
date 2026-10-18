@@ -4,7 +4,8 @@
 //! subscription work stays opt-in.
 #![cfg(windows)]
 
-use harness_core::process::{SHARED_CPU_PERCENT, SharedCpuBudget};
+use harness_core::process::{ProcessIdentity, SHARED_CPU_PERCENT, SharedCpuBudget};
+use harness_core::process_service::{self, ServiceProcess};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -13,7 +14,8 @@ use std::{
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
@@ -28,6 +30,9 @@ use windows_sys::Win32::{
         },
     },
 };
+
+#[path = "fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
 
 /// Documented JOB_OBJECT_QUERY right (winnt.h); windows-sys does not export the
 /// job access rights. A query-only handle can neither assign, configure nor
@@ -162,6 +167,9 @@ impl Fixture {
 
     fn resume_command(&self) -> Command {
         let mut command = lead_command();
+        // The fixture child serves exactly the thread this resume names; its
+        // default identity is another thread and the dispatch would refuse it.
+        let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
         command.args([
             "executor",
             "resume",
@@ -174,8 +182,9 @@ impl Fixture {
             "--owner",
             "exec-ds-52",
             "--session",
-            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+            session,
         ]);
+        command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
         command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
         command
     }
@@ -322,6 +331,24 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// Installs the owned launcher double at the documented launcher path of the
+/// fixture home: the dispatch paths resolve `harness/bin/codex.exe`, the
+/// binary answers the model-free shell preflight, and its explicit child-only
+/// fixture mode serves the controlled app-server conversation. A hard link
+/// keeps the installed identity without copying where the volume allows.
+fn install_launcher(home: &Path, exe: &Path) {
+    let launcher = home.join("harness/bin/codex.exe");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    if fs::hard_link(exe, &launcher).is_err() {
+        fs::copy(exe, &launcher).unwrap_or_else(|error| {
+            panic!(
+                "the fixture home could not install the native CLI {}: {error}",
+                exe.display()
+            )
+        });
+    }
+}
+
 #[test]
 fn configured_executor_rejects_unlisted_profile() {
     let root = std::env::temp_dir().join(format!("executor-spawn-{}", std::process::id()));
@@ -425,6 +452,1092 @@ fn pooled_spawn_derives_and_synchronizes_a_slot_before_launch() {
     fixture.drop();
 }
 
+/// An explicit base resolves locally and is never fetched: the dispatch binds
+/// the exact commit even when the configured upstream is gone, the record and
+/// checkout carry that base, and an unknown revision is refused before any
+/// claim or launcher stage. The held binding then continues through resume
+/// with the remote still unreachable.
+#[test]
+fn explicit_base_binds_the_exact_local_commit_offline_and_unknown_revisions_are_refused() {
+    let fixture = Fixture::new("explicit-base", 1);
+    // A commit that exists only in the local object store: the upstream never
+    // received it, so a fetch-based resolution would fail or pick another
+    // commit; success below proves local-only resolution.
+    fs::write(fixture.source.join("local-base.txt"), "local base\n").unwrap();
+    git(&fixture.source, &["add", "local-base.txt"]);
+    git(&fixture.source, &["commit", "-qm", "local base"]);
+    let commit = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("gone.git")),
+        ],
+    );
+    let spawned = fixture.spawn(&["--owner", "exec-local", "--base", &commit]);
+    let text = output_text(&spawned);
+    assert!(!spawned.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "the dispatch must bind its slot before the launcher: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "executor slot: index=1 path={} base={commit} owner=exec-local",
+            fixture.slot(1).display()
+        )),
+        "{text}"
+    );
+    // Without --repository the target defaults to the source checkout.
+    assert!(
+        text.contains(&format!(
+            "source={} repository={}",
+            fixture.source.display(),
+            fixture.source.display()
+        )),
+        "{text}"
+    );
+    let slot = fixture.slot(1);
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    assert_eq!(fixture.record(1)["owner"], "exec-local");
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+
+    let record_path = fixture.record_path(1);
+    let before = fs::read(&record_path).unwrap();
+    let kept_on_conflict = slot.join("keep-on-conflict.txt");
+    fs::write(&kept_on_conflict, "preserved local work\n").unwrap();
+
+    // A known local commit is still invalid for this held binding. Refuse it
+    // before launch instead of resetting the slot or discarding partial work.
+    fs::write(fixture.source.join("other-base.txt"), "other base\n").unwrap();
+    git(&fixture.source, &["add", "other-base.txt"]);
+    git(&fixture.source, &["commit", "-qm", "other local base"]);
+    let other_base = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    assert_ne!(other_base, commit);
+    let conflicting = fixture.spawn(&["--owner", "exec-local", "--base", &other_base]);
+    let text = output_text(&conflicting);
+    assert!(!conflicting.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "the requested base {other_base} conflicts with the binding"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("executor presentation:"), "{text}");
+    assert_eq!(fs::read(&record_path).unwrap(), before);
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(
+        fs::read_to_string(&kept_on_conflict).unwrap(),
+        "preserved local work\n"
+    );
+
+    // An unknown revision is refused as a local-resolution failure before any
+    // claim: the held record and the registered checkout stay untouched.
+    let unknown = fixture.spawn(&[
+        "--owner",
+        "exec-other",
+        "--base",
+        "0000000000000000000000000000000000000000",
+    ]);
+    let text = output_text(&unknown);
+    assert!(!unknown.status.success(), "{text}");
+    assert!(text.contains("is not a commit available locally"), "{text}");
+    assert!(
+        text.contains("an explicit base never fetches from a remote"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("executor presentation:"),
+        "a refused base must stop before the presentation: {text}"
+    );
+    assert_eq!(
+        fs::read(&record_path).unwrap(),
+        before,
+        "the refused base mutated the held record"
+    );
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+
+    // The held binding continues exactly: resume keeps the explicit base and
+    // the partial work with the upstream still unreachable.
+    let partial = slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+    let mut command = lead_command();
+    command.args([
+        "executor",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "exec-local",
+        "--session",
+        "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+        "--exec",
+        "continue the interrupted assignment",
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("base={commit}")), "{text}");
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    fixture.drop();
+}
+
+/// A fresh dispatch needs the configured upstream: when the required fetch
+/// fails it aborts before any claim or reset, leaving the released slot, its
+/// record and its ignored cache exactly as they were; restoring the remote
+/// lets the next dispatch resolve the upstream default and reuse that slot.
+#[test]
+fn a_required_upstream_fetch_failure_leaves_the_released_slot_untouched() {
+    let fixture = Fixture::new("fetch-failure", 1);
+    assert!(!fixture.spawn(&["--owner", "exec-1"]).status.success());
+    let slot = fixture.slot(1);
+    fs::create_dir_all(slot.join("cache")).unwrap();
+    fs::write(slot.join("cache/artifact"), "warm\n").unwrap();
+    let released_head = git_output(&slot, &["rev-parse", "HEAD"]);
+    let released = fixture.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "interrupted assignment reviewed",
+    ]);
+    assert!(
+        output_text(&released).contains("released as discarded"),
+        "{}",
+        output_text(&released)
+    );
+    let record_path = fixture.record_path(1);
+    let record_before = fs::read(&record_path).unwrap();
+
+    // The dispatch requires the upstream refresh; the configured remote is
+    // gone and the upstream moved on, so only a fetch could select the base.
+    let upstream = fixture.advance_upstream("upstream.txt");
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("gone.git")),
+        ],
+    );
+    let failed = fixture.spawn(&["--owner", "exec-2"]);
+    let text = output_text(&failed);
+    assert!(!failed.status.success(), "{text}");
+    assert!(text.contains("upstream fetch of 'origin' failed"), "{text}");
+    assert!(
+        text.contains("no base is selected from stale state"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("executor presentation:")
+            && !text.contains("installed Codex launcher is missing"),
+        "the fetch failure must abort before any launcher or model stage: {text}"
+    );
+    assert_eq!(
+        fs::read(&record_path).unwrap(),
+        record_before,
+        "the failed fetch mutated the released record"
+    );
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), released_head);
+    assert!(
+        slot.join("cache/artifact").is_file(),
+        "the released slot's ignored cache is preserved"
+    );
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+
+    // Restoring the configured remote lets the next dispatch resolve the
+    // upstream default and reuse the same position.
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("remote.git")),
+        ],
+    );
+    let retried = fixture.spawn(&["--owner", "exec-2"]);
+    let text = output_text(&retried);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("base={upstream}")), "{text}");
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), upstream);
+    assert_eq!(fixture.record(1)["owner"], "exec-2");
+    assert_eq!(fixture.record(1)["base"], upstream.as_str());
+    assert!(
+        slot.join("cache/artifact").is_file(),
+        "reuse keeps the slot's ignored cache"
+    );
+    fixture.drop();
+}
+
+/// The held check above stops at the missing launcher before any model
+/// request. With the launcher installed, the same explicit locally committed
+/// base dispatches offline through the real entry point: the hosted executor
+/// consumes the rendered assignment bound to the exact slot, base, source and
+/// owner, completes the controlled conversation and leaves its committed
+/// solution in the slot. The retained continuation then resumes the exact
+/// session with the upstream still unreachable, preserving the slot's tracked
+/// and untracked partial work without fetching or resetting anything.
+#[test]
+fn an_explicit_local_base_completes_offline_and_continuation_keeps_the_slot_work() {
+    let fixture = Fixture::new("entry-native", 1);
+    fs::write(fixture.source.join("local-base.txt"), "local base\n").unwrap();
+    git(&fixture.source, &["add", "local-base.txt"]);
+    git(&fixture.source, &["commit", "-qm", "local base"]);
+    let commit = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    git(
+        &fixture.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &file_url(&fixture.root.join("gone.git")),
+        ],
+    );
+
+    // The launcher double answers the shell preflight and serves the
+    // controlled app-server child; the managed executor role resolves from
+    // the recorded synthetic kit build; and both sides report the same
+    // explicit installed route, so the served thread identity matches the
+    // binding the dispatch pins on it.
+    install_launcher(
+        &fixture.home,
+        Path::new(env!("CARGO_BIN_EXE_harness-executor-fixture")),
+    );
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.home.join("config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let kit = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &kit);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+
+    let objective = "Complete the synthetic offline entry check";
+    let assignment = fixture.root.join("entry-assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document(objective, &["README.md"], &["out/result.txt"]),
+    )
+    .unwrap();
+
+    // The exact thread the held continuation below names, so the resumed
+    // dispatch attaches to this conversation instead of starting another.
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let mut command = fixture.spawn_command();
+    command.args([
+        "--owner",
+        "exec-ds-52",
+        "--base",
+        commit.as_str(),
+        "--assignment",
+        assignment.to_str().unwrap(),
+    ]);
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    // The fixture child serves exactly the thread the held continuation names.
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env_remove("WT_SESSION");
+    let spawned = command.output().unwrap();
+    let text = output_text(&spawned);
+
+    let slot = fixture.slot(1);
+    assert_eq!(spawned.status.code(), Some(0), "{text}");
+    assert!(text.contains("host=owned-console"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "executor presentation: mode=tui presentation=native-tui model=deepseek-flash provider=deepseek effort=max cwd={}",
+            slot.display()
+        )),
+        "{text}"
+    );
+
+    // The full entry ran: the receipt carries the rendered assignment bound
+    // to this exact checkout, base, source and owner, plus the observed
+    // lifecycle of the hosted conversation and its committed work.
+    let state = pooled_state_dir(&fixture.home);
+    let receipt_path = pooled_receipt_path(&fixture.home, 1);
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    let rendered = receipt["control"]["assignment"].as_str().unwrap();
+    let expected_prefix = format!(
+        "Structured executor assignment (schema 1)\nobjective: {objective}\ncheckout: {}\nbase: {commit}\nsource: {}\nowner: exec-ds-52\n",
+        slot.display(),
+        fixture.source.display()
+    );
+    assert!(rendered.starts_with(&expected_prefix), "{rendered}");
+    assert!(rendered.contains("- README.md"), "{rendered}");
+    assert!(rendered.contains("- out/result.txt"), "{rendered}");
+    assert_eq!(receipt["slot"]["base"], commit.as_str(), "{receipt}");
+    assert_eq!(receipt["slot"]["owner"], "exec-ds-52", "{receipt}");
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(
+        fs::read_to_string(state.join("message-1.txt")).unwrap(),
+        "fixture turn completed; the committed solution is in the bound slot",
+        "the exact session's final message is the recorded result"
+    );
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(state.join("endpoint-1.json")).unwrap()).unwrap();
+    assert_eq!(endpoint["threadId"], session, "{endpoint}");
+    let detail = fs::read_to_string(state.join("stream-1.jsonl")).unwrap();
+    assert!(detail.contains("\"method\":\"thread/started\""), "{detail}");
+    assert!(detail.contains("\"method\":\"turn/completed\""), "{detail}");
+    assert_eq!(fixture.record(1)["state"], "occupied");
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+    git(
+        &slot,
+        &["merge-base", "--is-ancestor", commit.as_str(), "HEAD"],
+    );
+    assert!(
+        git_output(
+            &slot,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        )
+        .is_empty(),
+        "the completed fixture run leaves a clean slot before the interruption"
+    );
+    assert!(
+        git_output(&fixture.source, &["remote", "get-url", "origin"]).contains("gone.git"),
+        "the offline dispatch must not rewrite the configured remote"
+    );
+
+    // Interruption-shaped partial work: one tracked edit and one untracked
+    // file exist only in the slot when the lead continues the held binding.
+    fs::write(slot.join("partial-work.txt"), "partial work\n").unwrap();
+    let readme = slot.join("README.md");
+    let mut edited = fs::read_to_string(&readme).unwrap();
+    edited.push_str("carried partial edit\n");
+    fs::write(&readme, edited).unwrap();
+
+    let mut command = fixture.resume_command();
+    command.args(["--exec", "continue the interrupted assignment"]);
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env_remove("WT_SESSION");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "{text}");
+    assert!(text.contains("host=owned-console"), "{text}");
+
+    // The continuation attached to the same session with the remote still
+    // unreachable, and neither a fetch, a reset nor the controlled agent's
+    // own work disturbed the tracked and untracked partial files.
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["control"]["resumeSession"], session, "{receipt}");
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(receipt["slot"]["base"], commit.as_str(), "{receipt}");
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+    let status = git_output(
+        &slot,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    assert!(status.contains("README.md"), "{status}");
+    assert!(status.contains("partial-work.txt"), "{status}");
+    assert_eq!(fixture.record(1)["base"], commit.as_str());
+    assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
+    assert!(git_output(&fixture.source, &["remote", "get-url", "origin"]).contains("gone.git"));
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+    git(
+        &slot,
+        &["merge-base", "--is-ancestor", commit.as_str(), "HEAD"],
+    );
+    fixture.drop();
+}
+
+/// The bounded lead conversation route end to end: one fresh pooled lead
+/// dispatch resolves the configured lead profile and the lead role
+/// composition against the recorded synthetic build, its exact session
+/// continues on the same slot without resetting partial work, the app-server
+/// child itself reports the lead context instead of the executor one, and a
+/// receipt recorded for another role is refused before any launcher or model
+/// request with the previous run's evidence untouched.
+#[test]
+fn a_bounded_lead_conversation_dispatches_resumes_and_refuses_role_conversion() {
+    let fixture = Fixture::new("bounded-lead", 1);
+    install_launcher(
+        &fixture.home,
+        Path::new(env!("CARGO_BIN_EXE_harness-executor-fixture")),
+    );
+    // The configured lead profile is the base configuration itself; the
+    // executor profile keeps its ordinary ds route. Every route assertion
+    // below would change if the lead dispatch fell back to it.
+    fs::write(
+        fixture.home.join("config.toml"),
+        "model = 'lead-model'\nmodel_provider = 'lead-provider'\nmodel_reasoning_effort = 'xhigh'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let kit = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &kit);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+
+    // A lead continuation continues the configured lead profile only: an
+    // executor profile can never be selected, and the refusal precedes any
+    // slot or pool state.
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "lead-exp-1",
+        "--profile",
+        "ds",
+        "--session",
+        "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+        "--exec",
+        "text",
+    ]);
+    command.env_remove("WT_SESSION");
+    let refused = command.output().unwrap();
+    let text = output_text(&refused);
+    assert_ne!(refused.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(
+            "lead resume continues the configured lead profile: --profile is not accepted"
+        ),
+        "{text}"
+    );
+    assert!(
+        !fixture.slot(1).exists(),
+        "the profile refusal precedes any slot: {text}"
+    );
+
+    let objective = "Bound the synthetic lead conversation route";
+    let assignment = fixture.root.join("lead-assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document(objective, &["README.md"], &["out/lead-note.txt"]),
+    )
+    .unwrap();
+
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let child_record = fixture.root.join("app-server-child.json");
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "dispatch",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--owner",
+        "lead-exp-1",
+        "--assignment",
+        assignment.to_str().unwrap(),
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env("HARNESS_EXECUTOR_FIXTURE_RECORD", &child_record);
+    command.env_remove("WT_SESSION");
+    let dispatched = command.output().unwrap();
+    let text = output_text(&dispatched);
+
+    let slot = fixture.slot(1);
+    assert_eq!(dispatched.status.code(), Some(0), "{text}");
+    assert!(text.contains("host=owned-console"), "{text}");
+    assert!(text.contains("lead slot: index=1"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "lead presentation: mode=tui presentation=native-tui model=lead-model provider=lead-provider effort=xhigh cwd={}",
+            slot.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "lead dispatch accepted: profile=default model=lead-model provider=lead-provider effort=xhigh host=owned-console title=\"CLead (default) - lead-exp-1\""
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("lead role context: role=lead revision="),
+        "{text}"
+    );
+    assert!(
+        !text.contains("deepseek"),
+        "the bounded lead never falls back to an executor profile: {text}"
+    );
+
+    // The app-server child itself reports the effective role context: the
+    // lead composition, no executor session marker, and the single-agent
+    // suppression that keeps the bounded conversation from starting further
+    // model work through its own configuration.
+    let child: Value = serde_json::from_slice(&fs::read(&child_record).unwrap()).unwrap();
+    assert_eq!(child["contextRole"], "lead", "{child}");
+    assert!(
+        child["contextRevision"]
+            .as_str()
+            .is_some_and(|revision| !revision.is_empty()),
+        "{child}"
+    );
+    assert_eq!(child["boundedLeadSession"], "1", "{child}");
+    assert!(child["executorSession"].is_null(), "{child}");
+    assert_eq!(child["currentDir"], slot.display().to_string(), "{child}");
+    let argv = child["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(argv.contains(&"app-server"), "{child}");
+    assert!(
+        argv.contains(&"agents.enabled=false"),
+        "a bounded lead runs the single-agent suppression: {child}"
+    );
+
+    // The dispatch receipt carries the lead composition, the lead-rendered
+    // assignment bound to this exact slot and the observed lifecycle.
+    let state = pooled_state_dir(&fixture.home);
+    let receipt_path = pooled_receipt_path(&fixture.home, 1);
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["profile"], "default", "{receipt}");
+    assert_eq!(receipt["control"]["role"]["role"], "lead", "{receipt}");
+    let role_args = receipt["control"]["role"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        role_args.contains("Fixture lead responsibility"),
+        "{receipt}"
+    );
+    assert!(
+        !role_args.contains("Fixture executor responsibility"),
+        "{receipt}"
+    );
+    let rendered = receipt["control"]["assignment"].as_str().unwrap();
+    let base = receipt["slot"]["base"].as_str().unwrap();
+    assert!(
+        rendered.starts_with(&format!(
+            "Structured lead assignment (schema 1)\nobjective: {objective}\ncheckout: {}\nbase: {base}\nsource: {}\nowner: lead-exp-1\n",
+            slot.display(),
+            fixture.source.display()
+        )),
+        "{rendered}"
+    );
+    assert!(rendered.contains("- out/lead-note.txt"), "{rendered}");
+    assert_eq!(receipt["slot"]["owner"], "lead-exp-1", "{receipt}");
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(
+        fs::read_to_string(state.join("message-1.txt")).unwrap(),
+        "fixture turn completed; the committed solution is in the bound slot"
+    );
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(state.join("endpoint-1.json")).unwrap()).unwrap();
+    assert_eq!(endpoint["threadId"], session, "{endpoint}");
+    let detail = fs::read_to_string(state.join("stream-1.jsonl")).unwrap();
+    assert!(detail.contains("\"method\":\"thread/started\""), "{detail}");
+    assert!(detail.contains("\"method\":\"turn/completed\""), "{detail}");
+    assert_eq!(fixture.record(1)["state"], "occupied");
+    assert_eq!(fixture.record(1)["owner"], "lead-exp-1");
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+
+    // The same conversation continues on its slot: interruption-shaped
+    // partial work (one tracked edit, one untracked file) survives the
+    // resume, which addresses the exact recorded session without --session.
+    fs::write(slot.join("partial-work.txt"), "partial work\n").unwrap();
+    let readme = slot.join("README.md");
+    let mut edited = fs::read_to_string(&readme).unwrap();
+    edited.push_str("carried partial edit\n");
+    fs::write(&readme, edited).unwrap();
+
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "lead-exp-1",
+        "--exec",
+        "continue the interrupted assignment",
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env("HARNESS_EXECUTOR_FIXTURE_RECORD", &child_record);
+    command.env_remove("WT_SESSION");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(&format!(
+            "lead resume: slot=1 owner=lead-exp-1 session={session} identity=recorded dispatch receipt"
+        )),
+        "{text}"
+    );
+    let child: Value = serde_json::from_slice(&fs::read(&child_record).unwrap()).unwrap();
+    assert_eq!(child["contextRole"], "lead", "{child}");
+    assert_eq!(child["boundedLeadSession"], "1", "{child}");
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["control"]["resumeSession"], session, "{receipt}");
+    assert_eq!(
+        receipt["control"]["role"]["previous"]["recorded"], true,
+        "{receipt}"
+    );
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    assert_eq!(fixture.record(1)["owner"], "lead-exp-1");
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+    assert_eq!(
+        fs::read_to_string(slot.join("solution.txt")).unwrap(),
+        "solved\n"
+    );
+
+    // A receipt recorded for the executor role is refused when the lead entry
+    // continues it: the refusal precedes the launcher and the model, so the
+    // previous run's result and stream stay exactly as they were and the
+    // recorded role is not converted.
+    let frozen_message = fs::read_to_string(state.join("message-1.txt")).unwrap();
+    let frozen_stream = fs::read(state.join("stream-1.jsonl")).unwrap();
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    let mut tampered = receipt.clone();
+    tampered["control"]["role"]["role"] = json!("executor");
+    fs::write(&receipt_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "resume",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--slot",
+        "1",
+        "--owner",
+        "lead-exp-1",
+        "--session",
+        session,
+        "--exec",
+        "convert the conversation",
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env_remove("WT_SESSION");
+    let refused = command.output().unwrap();
+    let text = output_text(&refused);
+    assert_ne!(refused.status.code(), Some(0), "{text}");
+    assert!(text.contains("role mismatch"), "{text}");
+    assert!(text.contains("continue it as lead"), "{text}");
+    assert_eq!(
+        fs::read_to_string(state.join("message-1.txt")).unwrap(),
+        frozen_message,
+        "the refusal precedes the launcher, so the previous result is untouched"
+    );
+    assert_eq!(
+        fs::read(state.join("stream-1.jsonl")).unwrap(),
+        frozen_stream,
+        "no app-server run followed the refusal"
+    );
+    let recorded: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        recorded["control"]["role"]["role"], "executor",
+        "{recorded}"
+    );
+    fixture.drop();
+}
+
+/// One live bounded lead dispatch this check acts on while it still runs,
+/// together with the kit state its own run recorded.
+struct LiveLead {
+    process: Child,
+    /// The dispatch receipt the run's own host keeps current.
+    receipt: PathBuf,
+    /// The recorded control endpoint that addresses this run: port, thread and
+    /// the app-server child's exact process identity.
+    endpoint: Value,
+}
+
+/// Starts one bounded lead dispatch whose app-server child follows the named
+/// control mode and waits until the run is live and addressable: the receipt
+/// names this exact session and the host process, the slot's endpoint record
+/// names the app-server child, and the child itself recorded the assignment it
+/// observed. Every wait reads the run's own records, never a timing guess.
+fn dispatch_live_bounded_lead(owner: &str, session: &str, control: &str) -> (Fixture, LiveLead) {
+    let fixture = Fixture::new(&format!("bounded-lead-{control}"), 1);
+    install_launcher(
+        &fixture.home,
+        Path::new(env!("CARGO_BIN_EXE_harness-executor-fixture")),
+    );
+    fs::write(
+        fixture.home.join("config.toml"),
+        "model = 'lead-model'\nmodel_provider = 'lead-provider'\nmodel_reasoning_effort = 'xhigh'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let kit = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &kit);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+    let assignment = fixture.root.join("lead-assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document(
+            "Hold the bounded lead conversation",
+            &["README.md"],
+            &["out/lead-note.txt"],
+        ),
+    )
+    .unwrap();
+    let control_marker = fixture.root.join("control-marker.json");
+    let mut command = lead_command();
+    command.args([
+        "lead",
+        "dispatch",
+        "--source",
+        fixture.source.to_str().unwrap(),
+        "--codex-home",
+        fixture.home.to_str().unwrap(),
+        "--owner",
+        owner,
+        "--assignment",
+        assignment.to_str().unwrap(),
+    ]);
+    command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_SESSION", session);
+    command.env("HARNESS_IMPROVEMENT_FIXTURE_CONTROL", control);
+    command.env(
+        "HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER",
+        &control_marker,
+    );
+    command.env_remove("WT_SESSION");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let process = command.spawn().unwrap();
+
+    let state = wait_pooled_state_dir(&fixture.home);
+    let receipt = state.join("spawn-1.json");
+    wait_json(&receipt, "the dispatch receipt", |value| {
+        value["observation"]["session"].as_str() == Some(session)
+            && value["observation"]["host"]["pid"].as_u64().is_some()
+    });
+    let endpoint = wait_json(
+        &state.join("endpoint-1.json"),
+        "the control endpoint record",
+        |value| {
+            value["threadId"].as_str() == Some(session)
+                && value["process"]["pid"].as_u64().is_some()
+        },
+    );
+    wait_json(&control_marker, "the child's assignment marker", |value| {
+        value["session"].as_str() == Some(session)
+    });
+    (
+        fixture,
+        LiveLead {
+            process,
+            receipt,
+            endpoint,
+        },
+    )
+}
+
+/// Writes the partial work a stop or a failure must never touch: one tracked
+/// edit and one untracked file, exactly as an interrupted session leaves them.
+fn write_partial_work(slot: &Path) -> PathBuf {
+    fs::write(slot.join("partial-work.txt"), "partial work\n").unwrap();
+    let readme = slot.join("README.md");
+    let mut edited = fs::read_to_string(&readme).unwrap();
+    edited.push_str("carried partial edit\n");
+    fs::write(&readme, edited).unwrap();
+    readme
+}
+
+/// Asserts the recorded app-server child is gone within the bound, by its
+/// exact recorded identity (pid, creation time and image), never by pid alone.
+fn wait_child_gone(endpoint: &Value, label: &str) {
+    let user = process_service::current_user().unwrap();
+    let child = ProcessIdentity {
+        pid: endpoint["process"]["pid"].as_u64().unwrap() as u32,
+        creation_time: endpoint["process"]["creationTime"].as_u64().unwrap(),
+    };
+    let program = PathBuf::from(endpoint["process"]["program"].as_str().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match ServiceProcess::inspect(child, &program, &user) {
+            Ok(None) => return,
+            Ok(Some(_)) => assert!(
+                Instant::now() < deadline,
+                "{label} {child:?} is still running"
+            ),
+            Err(error) => panic!("{label} {child:?} could not be inspected: {error}"),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded wait for one recorded JSON document to satisfy the predicate; the
+/// returned document is what the check then asserts on.
+fn wait_json(path: &Path, label: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && ready(&value)
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} was not recorded at {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Bounded wait for a spawned dispatch process, so a hung host fails the check
+/// instead of blocking it forever.
+fn wait_child(child: &mut Child, label: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} did not exit within the bound"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The bounded lead's stop path through the real owner: a held bounded lead
+/// conversation is addressed by --source/--slot/--owner and its recorded
+/// session, the native interruption is accepted through the run's own control
+/// endpoint, the recorded host and app-server child are ended and verified
+/// gone by their exact recorded identities, and the receipt keeps the lead
+/// role, the exact recorded host generation and every tracked and untracked
+/// partial file without any reset, release or completion claim.
+#[test]
+fn a_held_bounded_lead_is_stopped_and_preserves_partial_work() {
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let (fixture, mut live) = dispatch_live_bounded_lead("lead-hold-1", session, "hold");
+    let before: Value = serde_json::from_slice(&fs::read(&live.receipt).unwrap()).unwrap();
+
+    let slot = pooled_slot_path(&fixture.home);
+    let readme = write_partial_work(&slot);
+
+    // The real stop owner stops the held run by its recorded identity.
+    let stop = lead_command()
+        .args([
+            "executor",
+            "stop",
+            "--source",
+            fixture.source.to_str().unwrap(),
+            "--codex-home",
+            fixture.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            "lead-hold-1",
+            "--session",
+            session,
+            "--timeout",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    let stop_text = output_text(&stop);
+    assert_eq!(stop.status.code(), Some(0), "{stop_text}");
+    assert!(stop_text.contains(": stopped in "), "{stop_text}");
+    assert!(
+        stop_text.contains("native turn/interrupt accepted through the recorded control endpoint"),
+        "the held run is interrupted through its own control endpoint: {stop_text}"
+    );
+    assert!(
+        stop_text.contains("no reset, clean, release or completion claim"),
+        "{stop_text}"
+    );
+    assert!(
+        stop_text.contains("the recorded console window") && stop_text.contains("closed"),
+        "the owned console surface of the stopped run is verified closed: {stop_text}"
+    );
+
+    // The dispatch entry returns once its stopped run's console host ended.
+    // Its exit is the route's acceptance result, never the conversation's
+    // outcome: an accepted dispatch returns 0 and the receipt below carries
+    // the stopped lifecycle.
+    let status = wait_child(&mut live.process, "the stopped bounded lead dispatch");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an accepted dispatch returns its acceptance result: {status:?}"
+    );
+
+    // The receipt records the verified stop of exactly the generation its own
+    // observation recorded, with the lead identity and binding untouched.
+    let stopped: Value = serde_json::from_slice(&fs::read(&live.receipt).unwrap()).unwrap();
+    assert_eq!(stopped["control"]["role"]["role"], "lead", "{stopped}");
+    assert_eq!(stopped["observation"]["state"], "stopped", "{stopped}");
+    assert_eq!(stopped["observation"]["exitCode"], Value::Null, "{stopped}");
+    assert_eq!(stopped["stop"]["outcome"], "stopped", "{stopped}");
+    assert_eq!(stopped["stop"]["survivors"], json!([]), "{stopped}");
+    assert_eq!(
+        stopped["stop"]["host"], before["observation"]["host"],
+        "the stop addressed the exact recorded host generation: {stopped}"
+    );
+    assert_eq!(stopped["slot"]["owner"], "lead-hold-1", "{stopped}");
+    assert_eq!(
+        fixture.record(1)["state"],
+        "occupied",
+        "a stop releases nothing"
+    );
+
+    // Tracked and untracked partial work survives the stop byte for byte.
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+
+    // No fixture process outlived the stop.
+    wait_child_gone(&live.endpoint, "the stopped run's app-server child");
+    fixture.drop();
+}
+
+/// A bounded lead whose app-server child fails: the real host records the
+/// failure outcome with its own cause, the exact session and lead role stay
+/// recorded, every partial file stays untouched, and no fixture process
+/// outlives the failed run.
+#[test]
+fn a_failed_bounded_lead_child_records_the_failure_and_preserves_partial_work() {
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
+    let (fixture, mut live) = dispatch_live_bounded_lead("lead-fail-1", session, "fail");
+
+    let slot = pooled_slot_path(&fixture.home);
+    let readme = write_partial_work(&slot);
+
+    // The failing child ends the run by itself; the real host records the
+    // failure outcome before its own process ends. The dispatch entry's exit
+    // is its acceptance result, not the conversation's outcome: the receipt
+    // below carries the failure.
+    let status = wait_child(&mut live.process, "the failed bounded lead dispatch");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an accepted dispatch returns its acceptance result: {status:?}"
+    );
+
+    let failed: Value = serde_json::from_slice(&fs::read(&live.receipt).unwrap()).unwrap();
+    assert_eq!(failed["control"]["role"]["role"], "lead", "{failed}");
+    assert_eq!(failed["observation"]["state"], "failed", "{failed}");
+    assert_eq!(failed["observation"]["exitCode"], Value::Null, "{failed}");
+    let cause = failed["observation"]["cause"].as_str().unwrap_or_default();
+    assert!(
+        cause.contains("executor observation failed"),
+        "the recorded cause names the observed failure: {failed}"
+    );
+    assert_eq!(failed["observation"]["session"], session, "{failed}");
+    assert_eq!(failed["slot"]["owner"], "lead-fail-1", "{failed}");
+    assert_eq!(
+        fixture.record(1)["state"],
+        "occupied",
+        "a failure releases nothing"
+    );
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
+
+    // The failed run left no orphaned fixture process.
+    wait_child_gone(&live.endpoint, "the failed run's app-server child");
+    fixture.drop();
+}
+
 #[test]
 fn pooled_spawn_defaults_to_the_native_tui_and_qualifies_both_spellings() {
     let fixture = Fixture::new("presentation", 1);
@@ -433,10 +1546,20 @@ fn pooled_spawn_defaults_to_the_native_tui_and_qualifies_both_spellings() {
         "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
     )
     .unwrap();
+    // One stable owner keeps the same held binding across the presentation
+    // spellings; a fresh owner would need its own pool position.
     for (extra, mode, presentation) in [
-        (&[][..], "tui", "native-tui"),
-        (&["--mode", "tui"][..], "tui", "native-tui"),
-        (&["--mode", "exec"][..], "exec", "native-inline"),
+        (&["--owner", "exec-present"][..], "tui", "native-tui"),
+        (
+            &["--owner", "exec-present", "--mode", "tui"][..],
+            "tui",
+            "native-tui",
+        ),
+        (
+            &["--owner", "exec-present", "--mode", "exec"][..],
+            "exec",
+            "native-inline",
+        ),
     ] {
         let out = fixture.spawn(extra);
         let text = output_text(&out);
@@ -543,10 +1666,7 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
     let other = fixture.spawn(&["--owner", "exec-other"]);
     let text = output_text(&other);
     assert!(text.contains("no free slot in the pool of 1"), "{text}");
-    assert!(
-        text.contains("occupied by live session exec-live"),
-        "{text}"
-    );
+    assert!(text.contains("held by task 'exec-live'"), "{text}");
     let same = fixture.spawn(&["--owner", "exec-live"]);
     assert!(
         output_text(&same).contains("is already live in slot 1"),
@@ -554,9 +1674,28 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
         output_text(&same)
     );
     assert!(host.wait().unwrap().success());
-    // The host exited: the same slot is reclaimable instead of multiplying.
+    // The host exited, but the durable task binding stays held: only an
+    // explicit reviewed release returns the position to the pool.
     let next = fixture.spawn(&["--owner", "exec-other"]);
-    assert!(!next.status.success());
+    let text = output_text(&next);
+    assert!(!next.status.success(), "{text}");
+    assert!(text.contains("held by task 'exec-live'"), "{text}");
+    assert_eq!(fixture.record(1)["owner"], "exec-live");
+    let released = fixture.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "liveness check complete",
+    ]);
+    assert!(
+        output_text(&released).contains("released as discarded"),
+        "{}",
+        output_text(&released)
+    );
+    // The released position serves the next owner without multiplying trees.
+    assert!(!fixture.spawn(&["--owner", "exec-other"]).status.success());
     assert_eq!(fixture.record(1)["owner"], "exec-other");
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
     fixture.drop();
@@ -564,70 +1703,29 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
 
 #[test]
 fn pending_startup_claim_is_not_replaced_before_the_host_lease() {
-    overlap_while_fetch_is_held("startup-other", "exec-hold", "exec-other");
-    overlap_while_fetch_is_held("startup-same", "exec-hold", "exec-hold");
+    pending_claim_refuses_a_contender("startup-other", "exec-hold", "exec-other");
+    pending_claim_refuses_a_contender("startup-same", "exec-hold", "exec-hold");
 }
 
-fn installed_git() -> PathBuf {
-    let output = Command::new("where.exe").arg("git").output().unwrap();
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .map(str::trim)
-        .find(|line| line.to_ascii_lowercase().ends_with("git.exe"))
-        .map(PathBuf::from)
-        .expect("git.exe")
-}
-
-/// Hold the first dispatch on `git fetch` after its claim. The second dispatch
-/// starts only after that gate file exists; the loop only observes the gate.
-fn overlap_while_fetch_is_held(name: &str, owner_a: &str, owner_b: &str) {
+/// A dispatch's position stays exclusive from its claim until a host lease
+/// exists. This test process takes the only position through the same core
+/// call the dispatcher uses, so the record carries the pending startup
+/// reservation a stopped mid-startup dispatch would have written; the
+/// contender then runs the real CLI against it.
+fn pending_claim_refuses_a_contender(name: &str, owner_a: &str, owner_b: &str) {
     let fixture = Fixture::new(name, 1);
-    let gate = fixture.root.join("gate");
-    fs::create_dir_all(&gate).unwrap();
-    fs::write(gate.join("hold"), b"hold\n").unwrap();
-    let stand_in = gate.join("git.cmd");
-    fs::write(
-        &stand_in,
-        r#"@echo off
-setlocal
-if /I "%~1"=="fetch" (
-  >"%HARNESS_SPAWN_GATE%\entered.txt" echo entered
-  :wait
-  if exist "%HARNESS_SPAWN_GATE%\hold" (
-    ping -n 2 127.0.0.1 >nul
-    goto wait
-  )
-)
-"%HARNESS_SPAWN_GIT%" %*
-exit /b %ERRORLEVEL%
-"#,
+    let startup = harness_core::task_worktree::current_startup_reservation()
+        .expect("this test process is the live startup reservation");
+    harness_core::task_worktree::acquire_task_for_startup(
+        &fixture.home,
+        &fixture.source,
+        1,
+        owner_a,
+        None,
+        &startup,
+        &|_| false,
     )
-    .unwrap();
-    let mut path = std::ffi::OsString::from(&gate);
-    path.push(";");
-    path.push(std::env::var_os("PATH").unwrap_or_default());
-    let mut first = fixture.spawn_command();
-    first
-        .args(["--exec", "first assignment", "--owner", owner_a])
-        .env("PATH", &path)
-        .env("HARNESS_SPAWN_GATE", &gate)
-        .env("HARNESS_SPAWN_GIT", installed_git())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut first = first.spawn().unwrap();
-    let entered = gate.join("entered.txt");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !entered.is_file() {
-        assert!(
-            first.try_wait().unwrap().is_none(),
-            "first dispatch exited before the post-claim fetch gate"
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "first dispatch did not reach the post-claim fetch gate"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    .expect("the first acquisition takes the only position");
     let during = fixture.record(1);
     assert_eq!(during["owner"], owner_a, "{during}");
     assert!(during["startup"].is_object(), "{during}");
@@ -651,9 +1749,6 @@ exit /b %ERRORLEVEL%
         "contender replaced the pending claim: {after}"
     );
     assert_eq!(after["startup"]["pid"], during["startup"]["pid"], "{after}");
-    let _ = fs::remove_file(gate.join("hold"));
-    let _ = first.kill();
-    let _ = first.wait();
     fixture.drop();
 }
 
@@ -1078,17 +2173,91 @@ fn resume_rebinds_the_interrupted_slot_without_resetting_partial_work() {
         output_text(&again)
     );
     assert!(partial.is_file());
-    // Another owner is refused with both identities named, and the tree keeps
-    // its partial work.
+    // The former owner is gone, so an explicit resume as another session
+    // rebinds the same task binding: the checkout, generation handle and
+    // partial work survive without a reset.
     let other = fixture.resume(&["--owner", "exec-ds-9"]);
     let text = output_text(&other);
-    assert!(!other.status.success(), "{text}");
     assert!(
-        text.contains("bound to session exec-ds-52 instead of exec-ds-9"),
+        text.contains("installed Codex launcher is missing"),
         "{text}"
     );
+    assert!(text.contains("owner=exec-ds-9"), "{text}");
     assert!(partial.is_file());
-    assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
+    let record = fixture.record(1);
+    assert_eq!(record["owner"], "exec-ds-9");
+    assert_eq!(record["task"], "exec-ds-52");
+    assert_eq!(
+        git_output(&slot, &["rev-parse", "HEAD"]),
+        head,
+        "rebinding must not resynchronize the slot"
+    );
+    fixture.drop();
+}
+
+/// A dispatch whose installed build cannot supply the executor role refuses
+/// before any launcher or model request, names the exact missing input, keeps
+/// the slot bound and stays recoverable by the next dispatch.
+#[test]
+fn pooled_spawn_refuses_missing_role_inputs_before_any_launcher_or_shell() {
+    let fixture = Fixture::new("role-preflight", 1);
+    // The launcher file exists, so the refusal below can only come from the
+    // role preflight, which resolves before the shell diagnostic spawns it.
+    fs::create_dir_all(fixture.home.join("harness/bin")).unwrap();
+    fs::write(
+        fixture.home.join("harness/bin/codex.exe"),
+        b"not an executable",
+    )
+    .unwrap();
+
+    // No launch registration is installed: the refusal names that exact file,
+    // and the dispatch stops inside the managed path, after the pool work and
+    // before any shell or host.
+    let refused = fixture.spawn(&["--owner", "exec-role"]);
+    let text = output_text(&refused);
+    assert!(!refused.status.success(), "{text}");
+    assert!(text.contains("executor presentation:"), "{text}");
+    assert!(text.contains("executor role context:"), "{text}");
+    assert!(
+        text.contains("no native launch registration is installed"),
+        "{text}"
+    );
+    assert!(text.contains("native-launch.json"), "{text}");
+    assert!(text.contains("slot 1 stays bound to exec-role"), "{text}");
+    assert!(
+        !text.contains("executor shell:"),
+        "the shell diagnostic must not run before the role resolves: {text}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(pooled_receipt_path(&fixture.home, 1)).unwrap()).unwrap();
+    assert!(
+        receipt["control"].is_null(),
+        "no host ran, so no control receipt was written: {receipt}"
+    );
+    let partial = fixture.slot(1).join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+
+    // The registration is installed, but the recorded build's owned executor
+    // role source is missing: the refusal names that exact source, and the
+    // interrupted slot keeps its partial work for the next dispatch.
+    let source = synthetic_role_build::kit_source(&fixture.root);
+    let build = synthetic_role_build::recorded_build(&fixture.root, &source);
+    synthetic_role_build::register(&fixture.home, &fixture.root, &build);
+    fs::remove_file(source.join("global/executor.md")).unwrap();
+    let refused = fixture.spawn(&["--owner", "exec-role"]);
+    let text = output_text(&refused);
+    assert!(!refused.status.success(), "{text}");
+    assert!(text.contains("executor role context:"), "{text}");
+    assert!(text.contains("global/executor.md"), "{text}");
+    assert!(text.contains("slot 1 stays bound to exec-role"), "{text}");
+    assert!(!text.contains("executor shell:"), "{text}");
+    assert!(
+        partial.is_file(),
+        "the interrupted slot keeps its partial work: {text}"
+    );
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+    assert_eq!(fixture.record(1)["state"], "occupied");
+    assert_eq!(fixture.record(1)["owner"], "exec-role");
     fixture.drop();
 }
 
@@ -1144,9 +2313,30 @@ fn pooled_dispatch_records_the_mapping_and_reuses_the_same_slot_after_interrupti
     assert!(!second.status.success());
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
     assert_eq!(fixture.record(1)["owner"], "exec-1");
-    // A later session reuses the same slot path as well.
+    // A different owner never bypasses the held task: until the held binding
+    // is released, the position stays with exec-1.
     let third = fixture.spawn(&["--owner", "exec-2"]);
-    assert!(!third.status.success());
+    let text = output_text(&third);
+    assert!(!third.status.success(), "{text}");
+    assert!(text.contains("held by task 'exec-1'"), "{text}");
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+    assert_eq!(fixture.record(1)["owner"], "exec-1");
+    // Only an explicit reviewed release returns the position; the next owner
+    // then reuses the same slot path.
+    let released = fixture.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "interrupted assignment reviewed",
+    ]);
+    assert!(
+        output_text(&released).contains("released as discarded"),
+        "{}",
+        output_text(&released)
+    );
+    assert!(!fixture.spawn(&["--owner", "exec-2"]).status.success());
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
     let record = fixture.record(1);
     assert_eq!(record["state"], "occupied");
@@ -1169,14 +2359,10 @@ fn exhausted_pool_aborts_with_a_concrete_cause_and_no_new_tree() {
     assert!(text.contains("no free slot in the pool of 4"), "{text}");
     for index in 1..=4 {
         assert!(
-            text.contains(&format!("slot {index} holds local or untracked changes")),
+            text.contains(&format!("slot {index} is held by task 'exec-{index}'")),
             "{text}"
         );
     }
-    assert!(
-        text.contains("merge or explicitly discard them before reuse"),
-        "{text}"
-    );
     assert!(
         !text.contains("worktree warning"),
         "the limit warning is replaced by the pool-invariant refusal: {text}"
@@ -1189,9 +2375,17 @@ fn exhausted_pool_aborts_with_a_concrete_cause_and_no_new_tree() {
         !fixture.slot(5).exists(),
         "an exhausted pool never registers another tree"
     );
-    // Preserved slots report their reason instead of being silently reused.
+    // Each held binding keeps its unreviewed work and reports its own state
+    // instead of being silently reset and reused.
+    for index in 1..=4 {
+        assert!(
+            fixture.slot(index).join("work.txt").is_file(),
+            "held work stays in slot {index}"
+        );
+    }
     let listed = fixture.pool();
-    assert!(listed.contains("state=awaiting-review"), "{listed}");
+    assert!(listed.contains("state=occupied"), "{listed}");
+    assert!(listed.contains("task=exec-1"), "{listed}");
     assert!(listed.contains("tree=dirty"), "{listed}");
     fixture.drop();
 }
@@ -1438,6 +2632,86 @@ fn executor_dispatch_is_refused_inside_an_executor_session() {
     }
 }
 
+/// The bounded lead session marker refuses every dispatch entry before
+/// parsing anything: the lead entries with the recursion refusal, and both the
+/// executor dispatch entries and the receipt-hosting entry with the dispatch
+/// refusal, so the bounded conversation cannot start or host another model
+/// conversation of any role. Without the marker the same receipt proceeds to
+/// its ordinary resolution, exactly as a managed lead session needs.
+#[test]
+fn a_bounded_lead_marker_refuses_every_dispatch_entry() {
+    let root = std::env::temp_dir().join(format!("executor-bounded-lead-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let lead_receipt = root.join("lead-receipt.json");
+    fs::write(
+        &lead_receipt,
+        serde_json::to_vec(&json!({
+            "control": {"role": {"role": "lead", "revision": "synthetic", "args": []}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let executor_receipt = root.join("executor-receipt.json");
+    fs::write(
+        &executor_receipt,
+        serde_json::to_vec(&json!({
+            "control": {"role": {"role": "executor", "revision": "synthetic", "args": []}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let inside = |args: &[&str]| {
+        let mut command = lead_command();
+        command.env("HARNESS_BOUNDED_LEAD_SESSION", "1");
+        command.args(args);
+        output_text(&command.output().unwrap())
+    };
+    for entry in [["lead", "start"], ["lead", "dispatch"], ["lead", "resume"]] {
+        let text = inside(&entry);
+        assert!(
+            text.contains(
+                "bounded lead conversations cannot host or dispatch another lead conversation"
+            ),
+            "{entry:?}: {text}"
+        );
+    }
+    // Every executor dispatch entry is refused inside a bounded lead before it
+    // parses anything: dispatch, continuation, succession and the
+    // receipt-hosting entry for receipts of either role. The bounded
+    // participant starts no further model conversation; it returns its
+    // decision to the lead that dispatched it.
+    for entry in [
+        vec!["executor", "spawn"],
+        vec!["executor", "resume"],
+        vec!["executor", "restart"],
+        vec!["executor", "succeed"],
+        vec![
+            "executor",
+            "run",
+            "--file",
+            executor_receipt.to_str().unwrap(),
+        ],
+        vec!["executor", "run", "--file", lead_receipt.to_str().unwrap()],
+    ] {
+        let text = inside(&entry);
+        assert!(
+            text.contains(
+                "bounded lead conversations cannot dispatch executors or host another model conversation"
+            ),
+            "{entry:?}: {text}"
+        );
+    }
+    // Without the marker the same lead receipt is not refused at the host
+    // entry; it proceeds to its ordinary receipt resolution, exactly as a
+    // managed lead session continuing a lead conversation needs.
+    let mut command = lead_command();
+    command.args(["executor", "run", "--file", lead_receipt.to_str().unwrap()]);
+    let text = output_text(&command.output().unwrap());
+    assert!(text.contains("launcher is missing"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn executor_host_marks_the_session_environment() {
     let root = std::env::temp_dir().join(format!("executor-run-marker-{}", std::process::id()));
@@ -1533,7 +2807,7 @@ fn two_leads_sharing_a_checkout_keep_explicit_profiles_on_the_shell_path() {
         let recorded_source = text
             .split("source=")
             .nth(1)
-            .and_then(|rest| rest.lines().next())
+            .and_then(|rest| rest.split(" repository=").next())
             .unwrap_or("")
             .trim();
         assert!(
@@ -1952,8 +3226,12 @@ fn lead_start_reports_its_options_and_refuses_unusable_ones() {
 
 #[test]
 fn missing_or_blank_lead_id_refuses_before_a_model_request() {
-    let fixture = Fixture::new("lead-missing", 1);
-    let mut missing = fixture.spawn_command();
+    // Each refusal gets its own fixture. A refused dispatch has already
+    // acquired its durable task binding, and a held binding is not reclaimed
+    // through process liveness: only an explicit release returns that
+    // position, so the second refusal is checked in a fresh pool.
+    let missing_fixture = Fixture::new("lead-missing", 1);
+    let mut missing = missing_fixture.spawn_command();
     missing.env_remove("CODEX_THREAD_ID");
     missing.args(["--exec", "assignment text"]);
     let missing = missing.output().unwrap();
@@ -1965,7 +3243,13 @@ fn missing_or_blank_lead_id_refuses_before_a_model_request() {
         !text.contains("installed Codex launcher is missing"),
         "{text}"
     );
-    let mut blank = fixture.spawn_command();
+    let held = missing_fixture.pool();
+    assert!(held.contains("task=exec-ds-"), "{held}");
+    assert!(held.contains("state=occupied"), "{held}");
+    missing_fixture.drop();
+
+    let blank_fixture = Fixture::new("lead-blank", 1);
+    let mut blank = blank_fixture.spawn_command();
     blank.env("CODEX_THREAD_ID", " \t");
     blank.args(["--exec", "assignment text"]);
     let blank = blank.output().unwrap();
@@ -1977,7 +3261,7 @@ fn missing_or_blank_lead_id_refuses_before_a_model_request() {
         !text.contains("installed Codex launcher is missing"),
         "{text}"
     );
-    fixture.drop();
+    blank_fixture.drop();
 }
 
 #[test]
@@ -2296,6 +3580,29 @@ fn pooled_state_dir(home: &Path) -> PathBuf {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.is_dir())
         .expect("pool state directory")
+}
+
+/// The pool slot directory, for a fresh dispatch whose host has not finished
+/// recording it yet: the caller waits on the run's own state, never on a
+/// timing guess.
+fn wait_pooled_state_dir(home: &Path) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(entries) = fs::read_dir(home.join("harness/executor-pool"))
+            && let Some(state) = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find(|path| path.is_dir())
+        {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pool state directory under {} was never recorded",
+            home.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn pooled_slot_path(home: &Path) -> PathBuf {

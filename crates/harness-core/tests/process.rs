@@ -892,7 +892,11 @@ mod native {
         );
         command.args.pop();
         command.program = root.join("missing.exe");
-        assert!(job.spawn(&command).is_err());
+        // The stage is reported on stderr; the returned error keeps the raw
+        // native cause for callers that record it.
+        let missing = job.spawn(&command).unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(2), "{missing}");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         assert_eq!(job.snapshot().unwrap().active_processes, 0);
         assert!(!root.join("never.json").exists());
         // A one-page job cannot admit the executable's initial committed

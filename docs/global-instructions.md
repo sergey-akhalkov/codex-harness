@@ -13,6 +13,80 @@ settings.
 Official discovery: [AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
 and [environment variables](https://learn.chatgpt.com/docs/config-file/environment-variables).
 
+## Responsibility source owners
+
+The role separation keeps one shared core and two responsibility fragments.
+The descriptor [global/roles.toml](../global/roles.toml) names the fragments and
+classifies every kit-managed skill once as shared or role-specific. These
+source owners preserve the obligations formerly mixed into the common text,
+developer guidance and repeated executor briefs:
+
+| Obligation | Source owner |
+| --- | --- |
+| Integrity, authority, evidence, project guidance, tools, recovery and publication boundaries | [Common principles](../global/principles-of-work.md) |
+| Native routing restrictions, Code Mode/RTK use, opaque-state and desktop safeguards | [Shared developer guidance](../global/harness.config.toml) |
+| Activation, decomposition, assignment snapshots and exact paths, model selection, supervision, succession, visibility, integration and acceptance | [Lead responsibility](../global/roles/lead.md) |
+| The executor's local implementation/check/correction cycle, base verification, standing return boundaries, feedback waiting and result evidence | [Executor responsibility](../global/roles/executor.md) |
+| Task objective, actual checkout/base, owned paths, invariants, acceptance, consumer, concrete feedback address and additional boundaries | [Assignment renderer](../crates/codex-harness/src/executor_assignment.rs) |
+
+The source checker resolves both roles with the runtime's shared Rust resolver
+and rejects missing/escaping sources and unclassified managed skills. The
+common file is limited to 24,576 UTF-8 bytes. Role and developer text, native
+skill metadata, invoked bodies, required references and generated briefs all
+remain part of guidance-load accounting; moving text does not establish a
+reduction or a behavioral improvement.
+
+`harness-source-check --accounting` prints one reproducible line per role for
+the fixed session load: LF-normalized UTF-8 bytes and whitespace words for the
+common core, the owned developer text, the selected role fragment and that
+role's visible catalogue metadata. `--accounting --invoked ROLE=NAME[,NAME]`
+adds the distinct named skill bodies after frontmatter plus every distinct
+local link target found in those bodies as a reference upper bound
+(`reference_scope=all_links_upper_bound`): repeated names count once, a link
+that points at another invoked body is counted under invoked bodies instead of
+again as a reference, links inside linked files are not followed, and external
+or non-file targets and unresolved targets are counted separately. The line
+does not distinguish required from optional links and claims no completeness:
+the references a real task actually consumes are not derivable from skill text
+alone. Generated briefs stay with the retained assignment-renderer measurement,
+so no surface is counted twice. Against the pinned pre-partition baseline (24,977-byte common
+core, 6,669-byte developer text, 6,185-byte 23-skill catalogue; 37,831 bytes /
+4,970 words per session) the current fixed load is 30,619 bytes / 3,997 words
+for the executor (-19.1% / -19.6%), 36,993 bytes / 4,851 words for the lead
+(-2.2% / -2.4%) and 67,612 / 8,848 for the combined two-role load (-10.6% /
+-11.0%). These are source-text sizes: the comparison excludes generated
+briefs, invoked bodies and linked reference files. The completed matched-task
+accounting includes those surfaces and confirms a reduction in required source
+load; its limits and the inconclusive operational comparison are recorded in
+[the role-context decision](project-decisions.md). Source sizes alone establish
+no semantic equivalence, quality or speed benefit.
+
+The ordinary local launcher resolves the role before startup and composes it
+with the applicable native profile, project and session context. Managed
+dispatch, resume, restart, run and succeed resolve the executor role, and the
+harness-hosted lead session resolves the lead role; the control receipt
+records the role and its owned revision and reports both on resume or restart,
+so older turns are never claimed to have loaded newer text. A receipt written
+before role recording reports `role context: unrecorded` until a fresh
+dispatch, resume or restart records the current role. The renderer no longer
+restates the standing responsibility guidance - it reaches a managed session
+once through its role context - while the brief keeps the task-specific
+outcome, checkout, base, owned paths, checks, consumer, feedback address and
+extra boundaries. Maintenance commands and remote attachments retain their
+existing path. Installed common/role context and effective catalogues have been
+verified outside the kit, followed by real executor work, returned corrections
+and accepted integration through the delivered components. Recovery distinguishes
+saved guidance from the current source revision; the supported boundary is in
+[agent delegation](agent-delegation.md). Source and fixture checks alone do not
+establish effective consumption.
+
+The launcher keeps configuration overrides in the native root argument scope,
+before the subcommand, with explicit values in encounter order and composed
+role context last. Codex CLI 0.162.1 replaces the root configuration vector
+when overrides appear after a subcommand; appending role settings there can
+drop unrelated defaults such as permissions. The launcher argument checks and
+the isolated installation's native startup check cover this boundary.
+
 ## Update and scope
 
 Edit the canonical file in the repository. A new session reads the current text

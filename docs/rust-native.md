@@ -558,6 +558,153 @@ CPU or call a model. What incomplete activation and the disconnect notice mean
 is in [installation](installation.md#shared-cpu-policy). The decision is in
 [project decisions](project-decisions.md#shared-agent-cpu-budget).
 
+## Shared worktree pool commands
+
+`codex-harness worktree acquire|continue|list|release` operates one
+repository's shared harness worktree pool for ordinary tasks without starting
+a conversation, through the same durable task owner executor dispatch uses.
+`--source` names the kit/configuration checkout whose
+`global/orchestration.toml` supplies the pool capacity (default: the installed
+kit source recorded under `--codex-home`); `--repository` names the
+independent target repository (default: `--source`), which needs only to be a
+Git checkout - a consuming repository carries no kit configuration.
+
+```powershell
+codex-harness worktree acquire --task ID [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY] [--base REV]
+codex-harness worktree continue --task ID [--handle HANDLE] [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY]
+codex-harness worktree list [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY]
+codex-harness worktree release --task ID --disposition merged|discarded --reason TEXT [--handle HANDLE] [--base REV] [--repository REPO] [--source CHECKOUT] [--codex-home DIRECTORY]
+```
+
+Acquire resolves the exact committed base locally and never fetches: the
+target's HEAD by default, or the explicit `--base` commit; an unknown base
+fails closed with that rule named. It prints the pool line and the slot
+receipt (`slot`, `path`, `presence`, `state`, `base`, `task`, `handle`,
+`owner`, `disposition`, `reason`). The handle is the recorded generation a
+release must present after any reassignment. Repeating acquire for a held
+task returns the same binding; a different requested base refuses as a
+conflict, and capacity is `worktree_pool_size`, falling back to
+`max_concurrent_executors` when the configuration omits it; install and update
+materialize that former effective capacity as the explicit setting before
+publication, and `worktree_limit` is compatibility-only. Continue returns
+the held binding; a stale handle, a released binding or a live foreign
+session refuses with its cause. List reports every configured position plus
+registered-missing and foreign directories for lead review. Release records
+`merged` or `discarded` with its reason, resets the position to the committed
+base for reuse while retaining ignored caches, and preserves a position that
+cannot reset safely with exit 2.
+
+Executor dispatch consumes the same pool: `executor spawn` accepts
+`--repository REPO` (default `--source`) and `--task ID --handle HANDLE` to
+hand a held ordinary task to the session without a reset or a second tree.
+Dispatch is admitted against `max_concurrent_executors`, separately from the
+pool: an active run holds concurrency while its host lease is live or its
+startup claim still excludes other dispatches, a held or suspended task keeps
+only its pool position, and a refusal names the active runs without allocating
+anything. `executor resume`, `restart`, `watch`, `message`, `stop`,
+`assignment`, `pool` and `release` accept the same `--repository` selector. `executor pool` lines
+add `repository=`, `task=` and `handle=` beside the session fields.
+
+### Bounded lead conversations
+
+`codex-harness lead dispatch --source CHECKOUT --codex-home DIRECTORY --owner LABEL
+--assignment FILE` starts a separate visible decision participant using the configured
+`lead_profile` and lead role. It uses the shared pool, receipt and control lifecycle.
+Native agent tools and further harness model dispatch are disabled inside this
+conversation; the originating lead owns executor assignments and integration.
+`lead resume` accepts the same source, home and owner plus `--slot N` and optional
+`--session THREAD_ID`, retaining the exact conversation and partial work. Observe,
+message and stop it through the corresponding `executor` commands and recorded slot.
+Dispatch exit zero means the request was accepted; the receipt records completion,
+failure or interruption. Model-free fixtures cover dispatch, resume, role mismatch,
+stopping and child failure; measured workflow composition and real-agent equivalence
+require their own acceptance before this route can supply comparison evidence.
+
+### Native worktree tool suppression
+
+The native TUI hosts a dynamic `codex_worktrees` tool server into sessions
+while its `worktrees` feature is enabled, which competes with the common pool
+as a second allocator. The kit's shared configuration turns the native feature
+off (`features.worktrees = false`), a session start forwards that leaf as
+`-c features.worktrees=false`, and managed lead and executor frontends carry
+the same pair before their `resume` subcommand. Those controller frontends
+(`lead start` / `executor host`) run as remote TUIs attached to the harness's
+app-server child, which serves the conversation; the pair pins the frontend
+process's own configuration to the managed default, while the selected
+profile and the user configuration reach the app-server child unchanged. A
+model-free probe of the installed app-server route (the same binary and
+`features.worktrees` override forms the hosted route uses) registered no
+worktree-named tool in its runtime catalogue under the feature default,
+`false` or `true`, so the exercised hosted boundary did not re-expose the
+competing tools. The actual `lead start` route is exercised directly by its
+own model-free fixture
+(`lead_message_native::managed_lead_start_hosts_the_catalogue_without_native_worktree_tools`):
+three fresh probe rounds run inside that served session reported 46 tools
+with none worktree-named while all 38 unrelated probe tools remained, so the
+backend catalogue that answers the conversation's model requests is covered.
+The remote frontend's separate UI catalogue is not read by these probes. A
+hosted conversation whose effective catalogue still re-exposed the tools
+would be an explicit-override or host-injected configuration conflict to
+report, not a successful suppression; the
+precedence and conflict reporting below belongs to the registered launcher
+route, where re-exposure is observable.
+
+The switch is proven against the effective runtime tool catalogue, not a
+configuration value, a feature readback or the static first request: the
+installed CLI defers dynamically hosted tool servers out of the first request
+schemas, so the opt-in installed check reads the session's own runtime
+catalogue. It drives the installed native CLI TUI against the canned local
+Responses fixture, has the session run code-mode `exec` calls that report the
+keys of its runtime `tools` object plus its `ALL_TOOLS` metadata, and repeats
+that up to three bounded settle rounds because tool availability can change
+between calls. An unsuppressed control run must expose a worktree-named tool
+in its runtime catalogue, and the managed-leaf run
+(`-c features.worktrees=false`) must expose none of it in the runtime
+catalogue or the session's first request surface, so a control that observes
+nothing leaves the requirement open instead of passing vacuously. Request
+bodies and terminal transcripts stay in the kept evidence directory it prints.
+
+```powershell
+cargo test --locked -p codex-harness --test skill_catalog_refresh installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf --jobs 1 -- --ignored --exact --nocapture --test-threads=1
+```
+
+The same installed check covers the launcher's forwarding route end to end:
+`installed_managed_role_tui_catalogues_drop_native_worktree_tools` records a
+build whose `codex.exe` is this checkout's real launcher and whose registered
+upstream is the installed CLI, then runs fresh role-marked managed sessions -
+lead, executor, a no-leaf profile and an explicit-true profile - against the
+canned Responses fixture. This is the launcher's forwarding route, whose
+locally hosted TUI is the surface this check reads; the controller-hosted
+frontends attach to a separate app-server conversation that this probe does
+not read. The unsuppressed control must expose a worktree-named tool;
+the managed lead and executor sessions and a managed session whose selected
+profile carries no `features.worktrees` choice must expose none, because
+selecting a profile is not a worktree choice; and an explicit winning profile
+`true` must keep the tools and print the conflict report, so the decision is
+observed at the runtime catalogue instead of inferred from argv.
+
+```powershell
+cargo test --locked -p codex-harness --test skill_catalog_refresh installed_managed_role_tui_catalogues_drop_native_worktree_tools --jobs 1 -- --ignored --exact --nocapture --test-threads=1
+```
+
+The `native_launcher` tests pin the launch side:
+`managed_session_starts_forward_the_worktree_tool_suppression_leaf` requires
+the forwarded leaf for TUI and non-TUI starts, while
+`native_worktree_choice_precedence_reports_only_unsuppressed_sessions`
+exercises the installed native precedence: repeated `-c` leaves keep the last
+value, `--enable` and `--disable` re-encode as the feature leaf and win over
+`-c` regardless of encounter order, a disable wins over an enable, and only
+an explicit winning `false` establishes the suppression. Any other winning
+choice - a higher-precedence user or project replacement, an explicit profile
+leaf, a command-line `true`/`--enable`, or a value that is not a boolean and
+that the native session refuses - is reported on stderr as a configuration
+conflict instead of being fought or claimed silently. The report names the
+winning source and effective value, states the suppression decision, and is
+never a claim about an observed tool catalogue. A conversation that started
+before the change keeps the tools it registered; the suppression applies to
+fresh sessions, so an existing conversation needs an explicit restart rather
+than an in-place update.
+
 ## Structured executor assignments
 
 `codex-harness executor spawn`, `resume` and `restart` accept `--assignment FILE` or
@@ -685,6 +832,21 @@ request keeps the run, its session, slot and worktree live (`executor watch`
 exit 3) without a resume. Selection rules live in
 [agent delegation](agent-delegation.md#steering-and-stopping-executors).
 
+Transmission requires a verified live managed endpoint: `turn/steer` on the
+lead's active turn, or `turn/start` on its idle recorded thread. When the
+dispatch recorded no per-spawn endpoint, the command reads only the managed
+registry record for that exact thread under the originating lead home recorded
+at dispatch, as published by `lead start --session THREAD` after resuming the
+same thread. The installed native queue is not used: its queue operation
+dispatches only when the target turn is idle, so it cannot deliver an
+operational message during the lead's current turn. With no live verified
+endpoint the command refuses before composing an envelope, writing a spill,
+recording an attempt or creating a reply hold, and names the same-thread
+managed resume remedy. A malformed, mismatched or stale recorded endpoint
+fails closed. Legacy queued or indeterminate attempts are reconciled read-only
+from the lead's own stored items on a repeat; they are never transmitted again,
+and native queue entries are left in place.
+
 ```powershell
 cargo test --locked -p codex-harness --test executor_observation --jobs 1 -- --test-threads=1
 cargo test --locked -p codex-harness --test executor_spawn --jobs 1 -- --test-threads=1
@@ -789,9 +951,16 @@ creates a bounded observation; `list`, `ledger` and `candidates` inspect it.
 `ledger` also reports the item's pacing observations, applicable pacing
 decisions and benefit-gate default from the same native bd comments.
 `triage --decisions FILE` applies caller-selected grouping/kinds, counts distinct
-reporter/episode votes, excludes diagnostic votes and enforces the configured
+reporter/episode votes, excludes diagnostic and derived-evidence votes and enforces the configured
 batch limit. Every command identifies its limits; an explicit `--source KIT`
 overrides the installed kit's configuration.
+
+Use `record --kind derived-evidence` for an analysis of another report. Keep
+`--episode` equal to the source episode and identify the analyst in `--reporter`;
+retain the bounded evidence reference in the observation. Triage preserves this
+provenance with `counted=false reason=derived-evidence`, including when analysis
+arrives before the original report or is merged and retried. It grants no
+implementation authority and does not satisfy a promotion's vote threshold.
 
 `promote` records an explicit backlog, OpenSpec or sanitized kit-backlog route.
 The OpenSpec route validates an existing change created through the project's
@@ -1146,11 +1315,13 @@ transport evidence, not a native provider integration receipt.
 
 `task_admission` connects request correlation to the observed native session and
 active turn, then checks the exact conversation's registered process identity and
-visible window before forwarding. A parent's window cannot cover a child;
-interrupted turns wait and stopped tasks reject dispatch. Focused checks verify
-that missing child visibility produces no upstream connection. Only ordinary
-turn requests currently have this admission path; other request kinds are
-rejected pending explicit visibility support.
+visible window before forwarding. A conversation stays available while another
+window covers it, because on-screen tiling is not required; a hidden, minimized,
+cloaked or closed surface waits while its view is unavailable, interrupted turns
+wait, and stopped tasks reject dispatch. Focused checks verify that missing child
+visibility produces no upstream connection. Only ordinary turn requests
+currently have this admission path; other request kinds are rejected pending
+explicit visibility support.
 
 The release ordinary-entry and quota-handoff checks passed with CLI 0.154.0
 through this gate and `task_forward` into an owned synthetic upstream. They
@@ -1168,19 +1339,21 @@ successor configuration. Focused ingress checks verify rejection without any
 upstream connection and joined shutdown during an incomplete HTTP read. The
 integrated ordinary release entry check passed with native tool execution,
 visible final result, saved local route configuration and process cleanup.
-An earlier handoff observation exposed a gap: window-presence checks reported
-conversations obscured by another application as visible.
-`task_view::Watch` now also checks the client rectangle against windows above it
-and rejects cloaked conversations. An owned Windows-window test passed for
-partial/full coverage, moving the cover away and hiding it; all windows were
-destroyed by their test owner. The bounded traversal treats changing or unknown
-composition state conservatively. It uses window rectangles, so transparent or
-irregular overlays can also suspend admission. This follows the documented
-[IsWindowVisible limitation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible)
-and [window ordering contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow).
-The integrated ordinary, quota-handoff and minimize/restore release checks passed
-with this change and CLI 0.154.0. The handoff windows were observed simultaneously;
-all three checks showed the final result and verified process cleanup.
+An earlier handoff observation showed why window composition is not the
+availability signal: `IsWindowVisible` reports a style bit and stays true while
+another application covers the conversation. Availability is decided per
+conversation from its own surface: the exact registered process must be running
+and its window visible, not minimized, not cloaked and not empty. Overlap with
+another conversation, including a parent's, leaves the surface available because
+on-screen tiling is not required; a hidden, minimized, cloaked or closed surface
+suspends dispatch. An ignored owned Windows-window regression covers overlapping
+surfaces plus hidden and closed ones; all windows are destroyed by their test
+owner. This follows the documented
+[IsWindowVisible limitation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible),
+which does not report occlusion. The integrated ordinary, quota-handoff and
+minimize/restore release checks passed with the earlier coverage check on CLI
+0.154.0; the handoff windows were observed simultaneously, and all three checks
+showed the final result and verified process cleanup.
 On CLI 0.155.1, `ordinary_launcher_opens_helper_before_its_first_request`
 passed through the release entry point: lead, executor and helper panes were
 established before the helper's first model request (helper title `Helper 1`,
@@ -1543,6 +1716,15 @@ regressions run in the standard workspace gate, and the adopted-package check
 `cargo test --locked -p codex-harness --test serena_stdio grown_location_record_still_completes_handshake_after_deliveries -- --ignored --exact --test-threads=1`
 (explicit `HARNESS_CODE_TOOLS_REGISTRY`) must complete MCP initialize and
 tools/list before a release is called delivered.
+
+The `open_session_restarts_its_broker_after_installed_manager_link_changes`
+test additionally requires `HARNESS_TEST_NEXT_MANAGER` to name a distinct,
+already built native manager. It starts through an owned installation link,
+changes that link, restarts the broker and checks both old and new conversations.
+The automatic Serena workflow prepares a release manager for this input while
+the test uses the development manager as its first generation. A local run can
+reuse a different immutable installed build. The separate Pascal startup test
+requires an adopted `pasls`; the Rust/Python CI runner explicitly excludes it.
 
 The local xAI compatibility transport is a managed generation with owned
 endpoint identity. The launcher prepares a private generation root; the shim

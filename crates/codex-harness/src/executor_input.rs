@@ -377,6 +377,33 @@ pub(crate) fn source(explicit: Option<PathBuf>, home: &Path) -> io::Result<PathB
     }
 }
 
+/// The extra `--repository` address a continuation command needs when the
+/// configuration source and the target repository differ; legacy operation
+/// prints nothing.
+pub(crate) fn repository_flag(source: &Path, repository: &Path) -> String {
+    if same_directory(source, repository) {
+        String::new()
+    } else {
+        format!(" --repository {}", repository.display())
+    }
+}
+
+/// True when both paths name the same directory: canonicalization resolves the
+/// different spellings of one path, and comparison is case-insensitive because
+/// that is the Windows path rule. Paths that cannot be canonicalized are
+/// compared by their trimmed text.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy()),
+        _ => a
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/'])),
+    }
+}
+
 /// The source checkout of the installation recorded under one home. The current
 /// metadata keeps its owners inside `settings`; the legacy import schema kept
 /// `sourceRoot` at the top level. Only those two documented locations are read.

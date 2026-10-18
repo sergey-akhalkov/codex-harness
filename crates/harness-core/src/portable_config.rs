@@ -37,14 +37,40 @@ pub fn overrides(
     codex_home: &Path,
     working_directory: &Path,
 ) -> io::Result<Vec<OsString>> {
+    Ok(overrides_with_shadowed(shared_file, codex_home, working_directory)?.0)
+}
+
+/// A shared default a higher-precedence configuration layer replaced, with the
+/// effective value that won. Callers that must report losing an invariant read
+/// these instead of re-deriving precedence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowedDefault {
+    /// Dotted path of the shared leaf, for example `features.worktrees`.
+    pub path: String,
+    /// Highest-precedence layer that replaced the shared value.
+    pub source: PreferenceSource,
+    /// The effective value that replaced the shared default.
+    pub value: toml::Value,
+}
+
+/// [`overrides`] plus the shared defaults that higher-precedence configuration
+/// replaced. The forwarded leaves are identical; a caller uses this form when
+/// silently losing a shared default could hide a broken invariant.
+pub fn overrides_with_shadowed(
+    shared_file: &Path,
+    codex_home: &Path,
+    working_directory: &Path,
+) -> io::Result<(Vec<OsString>, Vec<ShadowedDefault>)> {
     let shared = read(shared_file)?;
     let local = read_user(codex_home)?;
     let project = trusted_project_config(&local, working_directory)?;
     let mut result = Vec::new();
+    let mut shadowed = Vec::new();
     for (key, value) in &shared {
         if key != "projects" {
             leaves(
                 &mut result,
+                &mut shadowed,
                 &mut vec![key.as_str()],
                 value,
                 &local,
@@ -53,7 +79,145 @@ pub fn overrides(
             )?;
         }
     }
+    Ok((result, shadowed))
+}
+
+/// The effective `features.worktrees` value the applicable native layers
+/// select, with the winning layer's own label. The shared portable file is
+/// not consulted: callers treat `None` as "no higher-precedence choice". An
+/// explicit profile layers over the base user configuration and a trusted
+/// project file over both, the same order role retention applies.
+pub fn worktree_feature_choice(
+    codex_home: &Path,
+    working_directory: &Path,
+    profile: Option<(&str, &toml::Table)>,
+) -> io::Result<Option<(String, toml::Value)>> {
+    let user = read_user(codex_home)?;
+    let mut trust = user.clone();
+    if let Some((_, table)) = profile {
+        merge_tables(&mut trust, table);
+    }
+    let project = trusted_project_config(&trust, working_directory)?;
+    let selected = |layer: Option<&toml::Table>| -> Option<toml::Value> {
+        layer?
+            .get("features")?
+            .as_table()?
+            .get("worktrees")
+            .cloned()
+    };
+    if let Some(value) = selected(project.as_ref()) {
+        return Ok(Some(("trusted-project".into(), value)));
+    }
+    if let Some((name, table)) = profile
+        && let Some(value) = selected(Some(table))
+    {
+        return Ok(Some((format!("explicit profile '{name}'"), value)));
+    }
+    Ok(selected(Some(&user)).map(|value| ("user".to_owned(), value)))
+}
+
+/// Retain context settings for responsibility-role composition. Callers pass
+/// their already-resolved native profile and explicit session overrides; this
+/// function never chooses a profile, model, provider or effort.
+///
+/// Developer text follows user < profile < trusted project < explicit session.
+/// Skill entries are retained across those layers: native 0.162.1 prompt
+/// discovery honors user disables even when config/read reports the project's
+/// replacement array. Passing only that effective array would re-enable skills.
+pub fn retained_role_config(
+    codex_home: &Path,
+    working_directory: &Path,
+    profile: Option<&toml::Table>,
+    session: &toml::Table,
+) -> io::Result<toml::Table> {
+    let user = read_user(codex_home)?;
+    let mut trust = user.clone();
+    if let Some(profile) = profile {
+        merge_tables(&mut trust, profile);
+    }
+    merge_tables(&mut trust, session);
+    let project = trusted_project_config(&trust, working_directory)?;
+    let mut retained = toml::Table::new();
+    let mut skills = Vec::new();
+    for layer in std::iter::once(&user)
+        .chain(profile)
+        .chain(project.as_ref())
+        .chain(std::iter::once(session))
+    {
+        if let Some(value) = layer.get("developer_instructions") {
+            if !value.is_str() {
+                return Err(io::Error::other("developer_instructions must be text"));
+            }
+            retained.insert("developer_instructions".into(), value.clone());
+        }
+        if let Some(value) = layer.get("skills") {
+            let table = value
+                .as_table()
+                .ok_or_else(|| io::Error::other("skills must be a table"))?;
+            if let Some(value) = table.get("config") {
+                let entries = value
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("skills.config must be an array"))?;
+                for entry in entries {
+                    if !skills.contains(entry) {
+                        skills.push(entry.clone());
+                    }
+                }
+            }
+        }
+    }
+    retained.insert(
+        "skills".into(),
+        toml::Value::Table(toml::Table::from_iter([("config".into(), skills.into())])),
+    );
+    Ok(retained)
+}
+
+/// Interpret native `-c` leaves in encounter order for context composition.
+/// Values follow Codex's TOML-or-literal contract; dotted keys are literal
+/// components, not TOML key expressions. No configuration is written.
+pub fn context_overrides(values: &[String]) -> io::Result<toml::Table> {
+    let mut result = toml::Table::new();
+    for raw in values {
+        let (key, encoded) = raw
+            .split_once('=')
+            .filter(|(key, _)| !key.trim().is_empty())
+            .ok_or_else(|| io::Error::other("native context override requires key=value"))?;
+        let encoded = encoded.trim();
+        let value = toml::from_str::<toml::Table>(&format!("value = {encoded}"))
+            .ok()
+            .and_then(|mut table| table.remove("value"))
+            .unwrap_or_else(|| toml::Value::String(encoded.trim_matches(['\"', '\'']).to_owned()));
+        let mut components = key.trim().split('.').peekable();
+        let mut table = &mut result;
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                table.insert(component.to_owned(), value);
+                break;
+            }
+            let entry = table
+                .entry(component.to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if !entry.is_table() {
+                *entry = toml::Value::Table(toml::Table::new());
+            }
+            table = entry.as_table_mut().expect("table just established");
+        }
+    }
     Ok(result)
+}
+
+fn merge_tables(target: &mut toml::Table, source: &toml::Table) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(toml::Value::Table(target)), toml::Value::Table(source)) => {
+                merge_tables(target, source);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 /// Resolve the model and reasoning effort a plain session start in
@@ -194,6 +358,7 @@ fn parse(text: &str) -> io::Result<toml::Table> {
 
 fn leaves<'a>(
     output: &mut Vec<OsString>,
+    shadowed: &mut Vec<ShadowedDefault>,
     keys: &mut Vec<&'a str>,
     value: &'a toml::Value,
     local: &toml::Table,
@@ -214,7 +379,7 @@ fn leaves<'a>(
     if let toml::Value::Table(table) = value {
         for (key, child) in table {
             keys.push(key);
-            leaves(output, keys, child, local, project, home)?;
+            leaves(output, shadowed, keys, child, local, project, home)?;
             keys.pop();
         }
         return Ok(());
@@ -232,6 +397,16 @@ fn leaves<'a>(
             project_selected = project_selected.and_then(|v| v.get(*key));
         }
         if selected.is_some() || project_selected.is_some() {
+            let (source, value) = match (project_selected, selected) {
+                (Some(value), _) => (PreferenceSource::Project, value.clone()),
+                (None, Some(value)) => (PreferenceSource::User, value.clone()),
+                (None, None) => unreachable!("a replacing layer owns the effective value"),
+            };
+            shadowed.push(ShadowedDefault {
+                path: keys.join("."),
+                source,
+                value,
+            });
             return Ok(());
         }
     }
@@ -261,6 +436,85 @@ fn leaves<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_context_overrides_keep_order_tables_and_literal_values() {
+        let overrides = context_overrides(&[
+            "developer_instructions = first".into(),
+            "skills = { config = [{ path = '/owned/SKILL.md', enabled = false }], marker = 'retained' }".into(),
+            "developer_instructions = 'last = value'".into(),
+            "skills.config = [{ path = '/other/SKILL.md', enabled = false }]".into(),
+        ]).unwrap();
+        assert_eq!(
+            overrides["developer_instructions"].as_str(),
+            Some("last = value")
+        );
+        assert_eq!(overrides["skills"]["marker"].as_str(), Some("retained"));
+        assert_eq!(
+            overrides["skills"]["config"][0]["path"].as_str(),
+            Some("/other/SKILL.md")
+        );
+        assert!(context_overrides(&["missing equals".into()]).is_err());
+    }
+
+    #[test]
+    fn retained_role_layers_keep_native_precedence_and_all_explicit_disables() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        let project_key = toml::Value::String(path_key(&project));
+        let user_text = format!(
+            "developer_instructions = 'user'\nmodel = 'untouched'\n[projects.{project_key}]\ntrust_level = 'trusted'\n[[skills.config]]\npath = '/user/SKILL.md'\nenabled = false\n"
+        );
+        let project_text = "developer_instructions = 'project'\n[[skills.config]]\npath = '/project/SKILL.md'\nenabled = false\n";
+        fs::write(home.join("config.toml"), &user_text).unwrap();
+        fs::write(project.join(".codex/config.toml"), project_text).unwrap();
+        let profile = parse("developer_instructions = 'profile'").unwrap();
+        let explicit = parse("developer_instructions = 'explicit'").unwrap();
+        let retained =
+            retained_role_config(&home, &project, Some(&profile), &toml::Table::new()).unwrap();
+        assert_eq!(retained["developer_instructions"].as_str(), Some("project"));
+        assert_eq!(retained["skills"]["config"].as_array().unwrap().len(), 2);
+        assert!(!retained.contains_key("model"));
+        let retained = retained_role_config(&home, &project, Some(&profile), &explicit).unwrap();
+        assert_eq!(
+            retained["developer_instructions"].as_str(),
+            Some("explicit")
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            user_text
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(".codex/config.toml")).unwrap(),
+            project_text
+        );
+    }
+
+    #[test]
+    fn retained_role_configuration_ignores_untrusted_project_and_rejects_bad_arrays() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        fs::write(home.join("config.toml"), "developer_instructions = 'user'").unwrap();
+        fs::write(
+            project.join(".codex/config.toml"),
+            "developer_instructions = 'untrusted'",
+        )
+        .unwrap();
+        let profile = parse("developer_instructions = 'profile'").unwrap();
+        let retained =
+            retained_role_config(&home, &project, Some(&profile), &toml::Table::new()).unwrap();
+        assert_eq!(retained["developer_instructions"].as_str(), Some("profile"));
+        let invalid = parse("skills.config = 'invalid'").unwrap();
+        assert!(retained_role_config(&home, &project, None, &invalid).is_err());
+    }
+
     #[test]
     fn live_policy_local_preferences_and_leaf_arguments() {
         let root = tempfile::tempdir().unwrap();

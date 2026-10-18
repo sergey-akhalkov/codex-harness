@@ -2,21 +2,29 @@
 //! Uses an owned CODEX_HOME, a distinct canned local Responses provider, and
 //! ConPTY + Windows Jobs. Never redefines reserved provider openai.
 #![cfg(windows)]
+#[path = "fixtures/control_responses.rs"]
+mod control_responses;
 #[path = "fixtures/native_sampling.rs"]
 mod native_sampling;
 #[path = "fixtures/skill_catalog_responses.rs"]
 mod skill_catalog_responses;
+#[path = "fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
+use skill_catalog_responses::tool_catalogue;
 
 use harness_core::{
     build_identity,
     console::{ConsoleSession, ConsoleSpec},
+    native_launcher::{Registration, Upstream},
     process::{Cancellation, CommandSpec, Deadline, StopReason},
 };
 use serde_json::{Value, json};
 use skill_catalog_responses::{
-    API_KEY, API_KEY_ENV, CALL_ID, CHILD_CALL_ID, CHILD_PROMPT, COMPACT_PROMPT, CannedResponses,
-    EARLY_SKILL, NEXT_TURN_PROMPT, PROVIDER_ID, RESUME_PROMPT, RETIRE_PROMPT, RequestKind,
-    SUMMARY_TEXT, UNRELATED_PROMPT, USER_PROMPT,
+    ALL_TOOLS_PROBE_PROMPT, API_KEY, API_KEY_ENV, CALL_ID, CHILD_CALL_ID, CHILD_PROMPT,
+    COMPACT_PROMPT, CannedResponses, EARLY_SKILL, ManagedInstall, NEXT_TURN_PROMPT, PROVIDER_ID,
+    RESUME_PROMPT, RETIRE_PROMPT, RequestKind, SUMMARY_TEXT, UNRELATED_PROMPT, USER_PROMPT,
+    assert_probe_receipt, clear_probe_receipt, probe_readings, probe_receipt_path,
+    record_managed_install, unrelated_probe_mcp, wait_for_probe_receipt, write_probe_config,
 };
 use std::{
     fs, io,
@@ -24,12 +32,28 @@ use std::{
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tool_catalogue::{tool_surface, worktree_fragments, worktree_names};
 
 const EXPECTED_SHA: &str = "e4c11374bd9de8ad5c3b7617fd4654bb7839901edb0863f9930666863c7a021b";
 const EXPECTED_LEN: u64 = 307_150_128;
 const PINNED_SOURCE: &str = "installed-cli-0.155.0";
 const LATE_SKILL: &str = "skill_catalog_late_refresh_probe";
 const LATE_MARKER: &str = "SKILL_CATALOG_LATE_REFRESH_MARKER_7f3c2a91";
+/// Explicit native resume probe markers: the executor role text before and
+/// after the kit source change, and the project skills the resume must
+/// reconcile. Kept distinct from every other probe's names.
+const RESUME_ROLE_ALPHA: &str = "RESUME_ROLE_TEXT_ALPHA_9d21";
+const RESUME_ROLE_BRAVO: &str = "RESUME_ROLE_TEXT_BRAVO_5fe8";
+const RESUME_EARLY_SKILL: &str = "resume_probe_early";
+const RESUME_LATE_SKILL: &str = "resume_probe_late";
+const RESUME_UNRELATED_SKILL: &str = "resume_probe_unrelated";
+
+/// Explicit native catalogue probe names for the repository scope, the
+/// explicit shared-skill disablement and the env-pinned canary farm. Kept
+/// distinct from every other probe's names.
+const CATALOGUE_PROJECT_SKILL: &str = "project_probe";
+const CATALOGUE_USER_UNRELATED_SKILL: &str = "user_unrelated";
+const CATALOGUE_EXPLICITLY_DISABLED_SKILL: &str = "cargo-fast";
 
 fn write_json(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
@@ -125,6 +149,61 @@ fn write_skill_described(dir: &Path, name: &str, description: &str, marker: &str
     .unwrap();
 }
 
+/// The synthetic managed home both role probes run with: the `ds` profile
+/// mirrors the ds/deepseek-flash/deepseek/max binding with only its transport
+/// pointed at the canned local Responses server, and the base configuration
+/// trusts the owned workspace. `extra` appends probe-specific configuration.
+fn write_role_probe_home(home: &Path, case: &Path, canned: &CannedResponses, extra: &str) {
+    fs::write(
+        home.join("ds.config.toml"),
+        format!(
+            "model = \"deepseek-flash\"\nmodel_provider = \"deepseek\"\nmodel_reasoning_effort = \"max\"\n\n[features]\ncode_mode = false\n\n[model_providers.deepseek]\nname = \"Canned role probe Responses\"\nbase_url = \"{}\"\nenv_key = \"{API_KEY_ENV}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n",
+            canned.base_url()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[windows]\nsandbox = \"unelevated\"\n\n[features]\nhooks = false\napps = false\nmemories = false\ngoals = false\nplugins = false\nskill_search = true\n\n[projects.{}]\ntrust_level = \"trusted\"\n{extra}",
+            json_escape(case)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("auth.json"),
+        serde_json::to_vec_pretty(&json!({"auth_mode": "apikey", "OPENAI_API_KEY": API_KEY}))
+            .unwrap(),
+    )
+    .unwrap();
+}
+
+/// The `-c` composition the managed host applies for one role: the profile
+/// overrides first, then the role launch composition from the recorded build.
+fn role_args(
+    home: &Path,
+    case: &Path,
+    role: harness_core::role_context::Role,
+) -> (String, Vec<std::ffi::OsString>) {
+    let profile = harness_core::orchestration_config::profile_config(home, "ds").unwrap();
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    for config in harness_core::orchestration_config::profile_config_overrides(home, "ds").unwrap()
+    {
+        args.push("-c".into());
+        args.push(config.into());
+    }
+    let launch = harness_core::native_launcher::role_launch(
+        home,
+        case,
+        Some(&profile),
+        &toml::Table::new(),
+        role,
+    )
+    .unwrap();
+    args.extend(launch.args.iter().map(std::ffi::OsString::from));
+    (launch.revision, args)
+}
+
 fn git_identity(root: &Path) {
     let status = Command::new(std::env::var_os("HARNESS_GIT").unwrap_or_else(|| "git.exe".into()))
         .args(["init", "-q"])
@@ -133,6 +212,53 @@ fn git_identity(root: &Path) {
         .unwrap();
     assert!(status.success(), "owned workspace git init failed");
     fs::write(root.join("README.md"), "skill catalog refresh workspace\n").unwrap();
+}
+
+fn git_command(dir: &Path) -> Command {
+    let mut command =
+        Command::new(std::env::var_os("HARNESS_GIT").unwrap_or_else(|| "git.exe".into()));
+    command.current_dir(dir);
+    command
+}
+
+/// One linked worktree of the real kit repository, created for one explicit
+/// native probe and removed best-effort on drop. The registration lives in
+/// the shared repository, so cleanup runs even when the probe panics.
+struct LinkedKitWorktree {
+    repo: PathBuf,
+    path: PathBuf,
+}
+
+impl LinkedKitWorktree {
+    fn add(repo: &Path, path: &Path) -> Self {
+        let output = git_command(repo)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "linked worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self {
+            repo: repo.to_path_buf(),
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for LinkedKitWorktree {
+    fn drop(&mut self) {
+        let _ = git_command(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .status();
+        let _ = git_command(&self.repo).args(["worktree", "prune"]).status();
+        if self.path.exists() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 fn contains_marker(body: &str, marker: &str) -> bool {
@@ -2449,6 +2575,400 @@ fn catalogue_without_native_discovery_is_explicit_and_never_scans() {
     );
 }
 
+/// An explicitly requested role resolves before the native read: a home whose
+/// installed build cannot supply the role refuses with the exact missing
+/// input instead of reporting a set the managed session would not see.
+#[test]
+fn catalogue_role_refuses_missing_role_inputs_before_the_native_read() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-refusal-")
+        .tempdir()
+        .unwrap();
+    let case = root.path().join("case");
+    let home = root.path().join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .args(["--role", "lead"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a role the installed build cannot supply refuses the command"
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("role context for --role lead"), "{text}");
+    assert!(
+        text.contains("no native launch registration is installed"),
+        "{text}"
+    );
+}
+
+/// The role the catalogue composes onto the native read reaches the discovery
+/// child exactly as a managed session's host renders it: the owned developer
+/// text and the skill memberships travel as `-c` pairs on the app-server
+/// invocation. The discovery double fails its first request on purpose, so
+/// the private evidence root with the exact request survives for reading.
+#[test]
+fn catalogue_role_composes_developer_text_and_memberships_onto_the_native_read() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-composition-")
+        .tempdir()
+        .unwrap();
+    let case = root.path().join("case");
+    let home = root.path().join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let source = synthetic_role_build::kit_source(root.path());
+    let build = synthetic_role_build::recorded_build(root.path(), &source);
+    synthetic_role_build::register(&home, root.path(), &build);
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .arg("--upstream")
+        .arg(&upstream)
+        .args(["--role", "executor"])
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "discovery")
+        .env("HARNESS_DISCOVERY_FIXTURE", "init-error")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let evidence = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("native skill discovery failed; private evidence: "))
+        .expect("the refused discovery names its private evidence root")
+        .trim()
+        .to_owned();
+    let request: Value =
+        serde_json::from_slice(&fs::read(Path::new(&evidence).join("request.json")).unwrap())
+            .unwrap();
+    let arguments: Vec<&str> = request["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(arguments[0], "app-server", "{arguments:?}");
+    assert_eq!(arguments[1], "--stdio", "{arguments:?}");
+    let developer = arguments
+        .iter()
+        .find(|argument| argument.starts_with("developer_instructions="))
+        .expect("the executor developer text travels as an override");
+    assert!(
+        developer.contains("Fixture executor responsibility"),
+        "{developer}"
+    );
+    let memberships = arguments
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the role's skill memberships travel as an override");
+    assert!(memberships.contains("coordinate"), "{memberships}");
+    assert!(memberships.contains("SKILL.md"), "{memberships}");
+    assert!(memberships.contains("enabled = false"), "{memberships}");
+    assert!(
+        !memberships.contains("shared"),
+        "an allowed shared skill stays enabled: {memberships}"
+    );
+}
+
+/// The selected profile travels with the composed role context: the profile
+/// installed as `selected` disables the shared kit skill, so the composed
+/// `skills.config` the native read receives keeps it disabled even though the
+/// executor role allows it, while `other` leaves it enabled and profile
+/// routing values never compose. The reported role context names role,
+/// profile and revision without changing with the profile, and nothing on
+/// disk changes. Fixture-only composition evidence through the real catalogue
+/// entry point: the discovery double records the exact composed context; the
+/// installed native CLI's consumption of it is covered by the explicit native
+/// probe that follows.
+#[test]
+fn catalogue_role_profile_keeps_the_selected_profiles_context_and_disablement() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-profile-")
+        .tempdir()
+        .unwrap();
+    let case = root.path().join("case");
+    let home = root.path().join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let source = synthetic_role_build::kit_source(root.path());
+    let build = synthetic_role_build::recorded_build(root.path(), &source);
+    synthetic_role_build::register(&home, root.path(), &build);
+    let shared = source.join("skills/shared/SKILL.md");
+    let shared_canonical = shared.canonicalize().unwrap();
+    let coordinate = source
+        .join("skills/coordinate/SKILL.md")
+        .canonicalize()
+        .unwrap();
+    fs::write(
+        home.join("selected.config.toml"),
+        format!(
+            "model = \"fixture-selected-routing\"\ndeveloper_instructions = \"Selected profile guidance\"\n\n[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(shared.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("other.config.toml"),
+        "model = \"fixture-other-routing\"\n",
+    )
+    .unwrap();
+    let before: Vec<(PathBuf, Vec<u8>)> = [
+        home.join("selected.config.toml"),
+        home.join("other.config.toml"),
+        source.join("global/roles.toml"),
+        shared.clone(),
+    ]
+    .into_iter()
+    .map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    })
+    .collect();
+    let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+    let catalogue = |profile: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command
+            .args(["skills", "catalogue", "--case"])
+            .arg(&case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", "executor"])
+            .env("HARNESS_LAUNCH_FIXTURE_MODE", "discovery")
+            .env("HARNESS_DISCOVERY_FIXTURE", "init-error");
+        if let Some(profile) = profile {
+            command.args(["--profile", profile]);
+        }
+        command.output().unwrap()
+    };
+    let revision = |stdout: &str| {
+        stdout
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("role_context=role=executor;profile=")
+                    .and_then(|rest| rest.split_once(";revision="))
+                    .map(|(_, revision)| revision.to_owned())
+            })
+            .expect("the catalogue reports the composed role context")
+    };
+
+    let (selected_args, selected_out) = refused_catalogue_context(&catalogue(Some("selected")));
+    assert!(
+        selected_out.starts_with("role_context=role=executor;profile=selected;revision="),
+        "{selected_out}"
+    );
+    assert!(
+        !selected_args.iter().any(|argument| {
+            argument.starts_with("model=")
+                || argument.starts_with("model_provider=")
+                || argument.starts_with("model_reasoning_effort=")
+        }),
+        "profile routing values never compose onto the catalogue: {selected_args:?}"
+    );
+    let selected_developer = selected_args
+        .iter()
+        .find(|argument| argument.starts_with("developer_instructions="))
+        .expect("the executor developer text travels as an override");
+    assert!(
+        selected_developer.contains("Fixture executor responsibility"),
+        "{selected_developer}"
+    );
+    assert!(
+        selected_developer.contains("Selected profile guidance"),
+        "{selected_developer}"
+    );
+    let selected_config = selected_args
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the skill context travels as an override");
+    assert!(
+        composed_disablement(selected_config, &shared_canonical),
+        "the selected profile's disablement reaches the composed context: {selected_config}"
+    );
+    assert!(
+        composed_disablement(selected_config, &coordinate),
+        "the executor memberships stay composed: {selected_config}"
+    );
+
+    let (other_args, other_out) = refused_catalogue_context(&catalogue(Some("other")));
+    assert!(
+        other_out.starts_with("role_context=role=executor;profile=other;revision="),
+        "{other_out}"
+    );
+    let other_config = other_args
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the skill context travels as an override");
+    assert!(
+        !composed_disablement(other_config, &shared_canonical),
+        "another profile leaves the shared skill enabled: {other_config}"
+    );
+    assert!(
+        composed_disablement(other_config, &coordinate),
+        "the executor memberships stay composed: {other_config}"
+    );
+
+    let (plain_args, plain_out) = refused_catalogue_context(&catalogue(None));
+    assert!(
+        plain_out.starts_with("role_context=role=executor;profile=none;revision="),
+        "{plain_out}"
+    );
+    let plain_config = plain_args
+        .iter()
+        .find(|argument| argument.starts_with("skills.config="))
+        .expect("the skill context travels as an override");
+    assert!(
+        !composed_disablement(plain_config, &shared_canonical),
+        "without a selected profile no profile layer composes: {plain_config}"
+    );
+
+    let selected_revision = revision(&selected_out);
+    assert_eq!(
+        selected_revision,
+        revision(&other_out),
+        "{selected_out}{other_out}"
+    );
+    assert_eq!(
+        selected_revision,
+        revision(&plain_out),
+        "{selected_out}{plain_out}"
+    );
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .args(["--role", "executor", "--profile", "absent"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing.stdout),
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(
+        text.contains("role context for --role executor --profile absent")
+            && text.contains("is not installed"),
+        "a profile that is not installed refuses instead of composing nothing: {text}"
+    );
+
+    let without_role = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .args(["--profile", "selected"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        without_role.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&without_role.stderr)
+    );
+    let without_role_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&without_role.stdout),
+        String::from_utf8_lossy(&without_role.stderr)
+    );
+    assert!(
+        without_role_text.contains("pass --role lead|executor"),
+        "profile context without a role refuses instead of guessing one: {without_role_text}"
+    );
+
+    for (path, bytes) in &before {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            bytes,
+            "{} changed",
+            path.display()
+        );
+    }
+}
+
+/// The composed `-c` argument pairs and stdout of one refused fixture
+/// discovery, read from the private evidence root the command names on stderr.
+fn refused_catalogue_context(output: &std::process::Output) -> (Vec<String>, String) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let evidence = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("native skill discovery failed; private evidence: "))
+        .expect("the refused discovery names its private evidence root")
+        .trim()
+        .to_owned();
+    let request: Value =
+        serde_json::from_slice(&fs::read(Path::new(&evidence).join("request.json")).unwrap())
+            .unwrap();
+    let arguments = request["arguments"]
+        .as_array()
+        .expect("the recorded request carries its arguments")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("recorded arguments are text")
+                .to_owned()
+        })
+        .collect();
+    (
+        arguments,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+/// Whether one composed `skills.config` argument disables `path`.
+fn composed_disablement(config: &str, path: &Path) -> bool {
+    let composed: toml::Value =
+        toml::from_str(config).expect("the composed skills.config parses as TOML");
+    composed
+        .get("skills")
+        .and_then(|skills| skills.get("config"))
+        .and_then(toml::Value::as_array)
+        .expect("the composed context carries a skills.config array")
+        .iter()
+        .any(|entry| {
+            entry
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .and_then(|value| Path::new(value).canonicalize().ok())
+                .is_some_and(|value| value == path)
+                && entry.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+        })
+}
+
 #[test]
 #[ignore = "explicit installed native CLI app-server skills/list; no model"]
 fn catalogue_reports_the_native_effective_set_with_kit_identity() {
@@ -2568,6 +3088,1469 @@ fn catalogue_reports_the_native_effective_set_with_kit_identity() {
     );
 }
 
+/// Explicit native probe: the installed CLI consumes the composed profile
+/// layer, so the project skill a selected profile disables is not reported
+/// enabled in that profile's catalogue while another profile reports it
+/// enabled, and the composed role context names the selected profile
+/// model-free. The installed native CLI and its launcher registration are
+/// required; no model call is made.
+#[test]
+#[ignore = "explicit installed native CLI app-server skills/list; no model"]
+fn catalogue_role_profile_native_read_consumes_the_selected_profiles_disablement() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-profile-native-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!(
+        "skill catalogue role profile native evidence: {}",
+        root.display()
+    );
+    let case = root.join("case");
+    let home = root.join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let source = synthetic_role_build::kit_source(&root);
+    let build = synthetic_role_build::recorded_build(&root, &source);
+    synthetic_role_build::register(&home, &root, &build);
+    let skill = case.join(".agents/skills/profile_probe/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(
+        &skill,
+        "---\nname: profile_probe\ndescription: fixture\n---\nFixture profile probe",
+    )
+    .unwrap();
+    fs::write(
+        home.join("selected.config.toml"),
+        format!(
+            "[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(skill.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(home.join("other.config.toml"), "# no profile layers\n").unwrap();
+    let upstream = registered_upstream(&live_codex_home());
+    let catalogue = |profile: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .args(["skills", "catalogue", "--case"])
+            .arg(&case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", "executor", "--profile", profile])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let selected = catalogue("selected");
+    fs::write(root.join("catalogue-selected.txt"), selected.as_bytes()).unwrap();
+    assert!(
+        selected.contains("role_context=role=executor;profile=selected;revision="),
+        "{selected}"
+    );
+    assert!(
+        !selected.contains("name=profile_probe;scope=repo;enabled=true;"),
+        "the selected profile disables the probe skill: {selected}"
+    );
+    let other = catalogue("other");
+    fs::write(root.join("catalogue-other.txt"), other.as_bytes()).unwrap();
+    assert!(
+        other.contains("role_context=role=executor;profile=other;revision="),
+        "{other}"
+    );
+    assert!(
+        other.contains("name=profile_probe;scope=repo;enabled=true;"),
+        "another profile keeps the probe skill enabled: {other}"
+    );
+}
+
+/// Explicit native probe: two simultaneously running managed role catalogues
+/// in one synthetic installation, after one sequential catalogue warms the
+/// shared home: on installed 0.162.1 two simultaneous first initializations
+/// of one fresh home race and one exits with `failed to initialize state
+/// runtime`, while a deployed home is already initialized. The recorded
+/// build source is this checkout and the case lives in its integration-test
+/// target tmp area, so the native repository scope lists this checkout's
+/// classified `.agents/skills` at the canonical paths the role resolution
+/// uses: the lead-only kit skills must stay disabled for the executor
+/// catalogue while they stay enabled for the lead, every shared kit skill
+/// outside the explicit disablement stays enabled, one explicitly disabled
+/// shared skill stays disabled for both roles, and the unclassified project
+/// skill stays enabled for both. The installed native CLI resolves its user
+/// farm from the real OS profile and ignores the USERPROFILE/HOME pins
+/// (observed on 0.162.1), so the env-pinned farm is a canary that must stay
+/// undiscovered and untouched; deployment-world user-scope disablement
+/// remains a global-deployment gate. Neither role may rewrite the synthetic
+/// configuration or the session-local home. The installed native CLI
+/// performs the catalogue read; no model call is made.
+#[test]
+#[ignore = "explicit installed native CLI skills/list over the workspace kit source; no model"]
+fn catalogue_role_sessions_keep_independent_user_contexts() {
+    // The installed native CLI refuses helper aliases and the sqlite state
+    // runtime under the system temporary directory, so the fixture root
+    // lives in the integration-test target tmp area instead of TEMP.
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-role-sessions-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .keep();
+    println!("skill catalogue role sessions evidence: {}", root.display());
+    let case = root.join("case");
+    let home = root.join("codex");
+    let user = root.join("user");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&user).unwrap();
+    // The recorded build source is the workspace kit checkout itself, so the
+    // recorded role classification resolves the same canonical skill paths
+    // the native repository scope reports for the case below.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let explicitly_disabled = source
+        .join(".agents/skills")
+        .join(CATALOGUE_EXPLICITLY_DISABLED_SKILL)
+        .join("SKILL.md");
+    assert!(
+        explicitly_disabled.is_file(),
+        "the workspace kit must classify the probe skill: {}",
+        explicitly_disabled.display()
+    );
+    let build = synthetic_role_build::recorded_build(&root, &source);
+    synthetic_role_build::register(&home, &root, &build);
+
+    let project = case.join(format!(".agents/skills/{CATALOGUE_PROJECT_SKILL}"));
+    write_skill(&project, CATALOGUE_PROJECT_SKILL, "PROJECT_MARKER");
+
+    // Env-pinned canary farm: 0.162.1 resolves the user farm from the real OS
+    // profile, so this skill must stay undiscovered and the tree untouched.
+    let farm = user.join(".agents/skills");
+    fs::create_dir_all(&farm).unwrap();
+    write_skill(
+        &farm.join(CATALOGUE_USER_UNRELATED_SKILL),
+        CATALOGUE_USER_UNRELATED_SKILL,
+        "USER_UNRELATED_MARKER",
+    );
+
+    // One shared kit skill is explicitly disabled for this session through
+    // the selected profile layer; both role catalogues must preserve that
+    // disablement for the canonical path the role resolution classifies.
+    fs::write(
+        home.join("ds.config.toml"),
+        format!(
+            "[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(explicitly_disabled.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(home.join("config.toml"), "approval_policy = \"never\"\n").unwrap();
+
+    let upstream = registered_upstream(&live_codex_home());
+    let config_before = (
+        fs::read(home.join("config.toml")).unwrap(),
+        fs::read(home.join("ds.config.toml")).unwrap(),
+    );
+    let user_before = tree_paths(&user);
+
+    let catalogue = |role: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command
+            .args(["skills", "catalogue", "--case"])
+            .arg(&case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", role, "--profile", "ds", "--limit", "1048576"]);
+        command.env("USERPROFILE", &user);
+        command.env("HOME", &user);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command
+    };
+    // The installed native CLI initializes its per-home sqlite state lazily:
+    // two app-server processes opening one fresh home at the same instant race
+    // and one exits with `failed to initialize state runtime` (observed on
+    // 0.162.1). A deployed home is already initialized, so one sequential
+    // catalogue warms the shared home through the same entry point and the
+    // two simultaneous role reads then start against the deployed shape.
+    let warm = catalogue("lead").output().unwrap();
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    fs::write(root.join("catalogue-warm.txt"), &warm.stdout).unwrap();
+    let lead = catalogue("lead").spawn().unwrap();
+    let executor = catalogue("executor").spawn().unwrap();
+    let lead = lead.wait_with_output().unwrap();
+    let executor = executor.wait_with_output().unwrap();
+    assert!(
+        lead.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lead.stderr)
+    );
+    assert!(
+        executor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executor.stderr)
+    );
+    let lead_text = String::from_utf8_lossy(&lead.stdout).into_owned();
+    let executor_text = String::from_utf8_lossy(&executor.stdout).into_owned();
+    fs::write(root.join("catalogue-lead.txt"), lead_text.as_bytes()).unwrap();
+    fs::write(
+        root.join("catalogue-executor.txt"),
+        executor_text.as_bytes(),
+    )
+    .unwrap();
+
+    // Expectations come from the kit descriptor itself: shared skills belong
+    // to both roles, the lead-only skills must stay disabled for the
+    // executor, and the explicitly disabled shared skill stays disabled for
+    // both roles without re-enabling anything.
+    let descriptor: toml::Value =
+        toml::from_str(&fs::read_to_string(source.join("global/roles.toml")).unwrap()).unwrap();
+    let names = |value: &toml::Value| -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let shared = names(&descriptor["shared_skills"]);
+    let lead_only = names(&descriptor["roles"]["lead"]["skills"]);
+    let executor_only = names(&descriptor["roles"]["executor"]["skills"]);
+    let entry = |text: &str, name: &str, scope: &str| -> Option<bool> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("name={name};scope={scope};")))
+            .map(|line| line.starts_with(&format!("name={name};scope={scope};enabled=true;")))
+    };
+    let repo_disabled = |text: &str| -> usize {
+        text.lines()
+            .filter(|line| line.contains(";scope=repo;") && line.contains(";enabled=false;"))
+            .count()
+    };
+    for (role, text) in [
+        ("lead", lead_text.as_str()),
+        ("executor", executor_text.as_str()),
+    ] {
+        assert!(
+            text.contains(&format!("role_context=role={role};profile=ds;revision=")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("omitted="),
+            "--limit 1048576 must deliver every effective entry for {role}: {text}"
+        );
+        assert!(
+            entry(text, CATALOGUE_PROJECT_SKILL, "repo") == Some(true),
+            "the unclassified project skill stays enabled for {role}: {text}"
+        );
+        assert!(
+            entry(text, CATALOGUE_EXPLICITLY_DISABLED_SKILL, "repo") == Some(false),
+            "the explicit disablement is preserved for {role}: {text}"
+        );
+        assert!(
+            !text.contains(CATALOGUE_USER_UNRELATED_SKILL),
+            "the env-pinned farm stays undiscovered for {role}: {text}"
+        );
+        for name in &shared {
+            if name.as_str() == CATALOGUE_EXPLICITLY_DISABLED_SKILL {
+                continue;
+            }
+            assert!(
+                entry(text, name, "repo") == Some(true),
+                "the shared kit skill {name} stays enabled for {role}: {text}"
+            );
+        }
+    }
+    for name in &lead_only {
+        assert!(
+            entry(lead_text.as_str(), name, "repo") == Some(true),
+            "the lead catalogue keeps {name}: {lead_text}"
+        );
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(false),
+            "the lead-owned {name} stays disabled for the executor: {executor_text}"
+        );
+    }
+    for name in &executor_only {
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(true),
+            "the executor catalogue keeps {name}: {executor_text}"
+        );
+    }
+    assert_eq!(
+        repo_disabled(&lead_text),
+        1,
+        "only the explicit disablement is disabled for the lead: {lead_text}"
+    );
+    assert_eq!(
+        repo_disabled(&executor_text),
+        lead_only.len() + 1,
+        "only the explicit and lead-owned disablements are disabled for the executor: {executor_text}"
+    );
+
+    let config_after = (
+        fs::read(home.join("config.toml")).unwrap(),
+        fs::read(home.join("ds.config.toml")).unwrap(),
+    );
+    assert_eq!(
+        config_before, config_after,
+        "the role catalogues must not rewrite the synthetic configuration"
+    );
+    assert_eq!(
+        user_before,
+        tree_paths(&user),
+        "the role catalogues must not write the session-local user home"
+    );
+}
+/// Sorted relative paths of one directory tree; link entries are listed but
+/// not followed, so a session-local home can be compared before and after an
+/// external catalogue read.
+fn tree_paths(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, path: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let child = entry.path();
+            out.push(
+                child
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            if entry.file_type().unwrap().is_dir() {
+                walk(root, &child, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// The installed native TUI hosts a dynamic `codex_worktrees` tool server
+/// into ordinary sessions while the native `worktrees` feature is on. The
+/// static first model request can defer dynamic tool servers, so the effective
+/// catalogue is read from the running session itself: one code-mode `exec`
+/// call per bounded settle round reports the session's own `ALL_TOOLS`. The
+/// managed selection (the shared configuration leaf, forwarded as
+/// `-c features.worktrees=false`) must leave no worktree-named
+/// tool in that runtime catalogue and no `codex_worktrees` marker in the
+/// session's first-request surface. The unsuppressed control run proves the
+/// probe observes the runtime surface while the feature is on: a control that
+/// exposes nothing leaves this check with no observation and the task open
+/// rather than passing vacuously. Both probe homes also register the
+/// first-party fixture as a real unrelated MCP server, and both sessions
+/// must keep its discovered tools with its own recorded handshake: the
+/// suppression drops the competing worktree surface, not unrelated servers.
+/// Driven over the installed native CLI TUI against the canned local
+/// Responses server; no billed model call and no shared configuration write.
+#[test]
+#[ignore = "explicit installed native CLI ordinary TUI + canned local Responses; no live model"]
+fn installed_ordinary_tui_catalogue_drops_native_worktree_tools_under_the_managed_leaf() {
+    let upstream = registered_upstream(&live_codex_home());
+    assert!(upstream.is_absolute() && upstream.is_file());
+    let version = Command::new(&upstream).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    // The installed native CLI is exactly the observed 0.162.1 or 0.163.0 in
+    // its normal `codex-cli <version>` form; any other version stays refused.
+    assert!(
+        version == "codex-cli 0.162.1" || version == "codex-cli 0.163.0",
+        "unexpected native CLI: {version}"
+    );
+
+    let evidence = tempfile::Builder::new()
+        .prefix("native-worktree-catalogue-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("native worktree catalogue evidence: {}", evidence.display());
+
+    let control = installed_tui_all_tools(&upstream, &evidence, "control", &[], 3);
+    let control_fragments = worktree_names(&control.names);
+    assert!(
+        !control.names.is_empty() && !control_fragments.is_empty(),
+        "the unsuppressed control runtime catalogue exposed no codex_worktrees tool, so this check observed nothing and the task stays open: names {:?}; evidence {}",
+        control.names,
+        evidence.display()
+    );
+    // The same control home carries the registered unrelated MCP server, so
+    // a managed session that kept it proves preservation rather than an
+    // absent MCP surface.
+    assert_unrelated_mcp_preserved(&control, "the unsuppressed control session");
+
+    let suppressed = installed_tui_all_tools(
+        &upstream,
+        &evidence,
+        "managed-leaf",
+        &["-c", "features.worktrees=false"],
+        3,
+    );
+    assert!(
+        !suppressed.names.is_empty(),
+        "the managed-leaf run captured no runtime catalogue; evidence {}",
+        evidence.display()
+    );
+    let suppressed_fragments = worktree_names(&suppressed.names);
+    let surface_fragments = worktree_fragments(&suppressed.surface);
+    assert!(
+        suppressed_fragments.is_empty() && surface_fragments.is_empty(),
+        "features.worktrees=false left the competing worktree surface in the session: runtime {suppressed_fragments:?}, request surface {surface_fragments:?}; evidence {}",
+        evidence.display()
+    );
+    assert_unrelated_mcp_preserved(&suppressed, "the managed-leaf session");
+    write_json(
+        &evidence.join("acceptance.json"),
+        &json!({
+            "control_fragments": control_fragments,
+            "control_names": control.names,
+            "control_unrelated": tool_catalogue::unrelated_probe_names(&control.names),
+            "suppressed_fragments": suppressed_fragments,
+            "suppressed_names": suppressed.names,
+            "suppressed_unrelated": tool_catalogue::unrelated_probe_names(&suppressed.names),
+            "suppressed_surface_fragments": surface_fragments,
+        }),
+    );
+    println!(
+        "codex_worktrees control fragments {control_fragments:?}; suppressed fragments {suppressed_fragments:?}"
+    );
+}
+
+/// Explicit native probe: fresh managed sessions through the launcher's
+/// registered build, carrying the lead or executor role marker, must consume
+/// the worktree-tool suppression at the runtime tool catalogue, not merely
+/// construct argv. This is the launcher's forwarding route, whose locally
+/// hosted TUI is the surface this probe reads; the controller-hosted
+/// frontends (`lead start` / `executor host`) attach to a separate
+/// app-server conversation, so this check makes no claim about that route
+/// (the installed app-server tool-registration boundary is probed
+/// separately). The real launcher
+/// binary under a recorded build whose source root is this checkout forwards
+/// single sessions to the installed native CLI against the canned local
+/// Responses server. The unsuppressed direct control exposes the competing
+/// tools, both managed roles stay free of them, a selected profile that
+/// carries no features.worktrees choice still receives the suppression
+/// default, and an explicit winning profile true is honored with a truthful
+/// conflict report at the real entry point. Every session in this probe also
+/// carries the registered first-party fixture as a real unrelated MCP server
+/// and must keep its discovered tools with the server's own recorded
+/// handshake, so no route may pass by dropping unrelated servers. No global
+/// deployment and no billed model call.
+#[test]
+#[ignore = "explicit installed native CLI TUI through the real launcher + canned local Responses; no live model"]
+fn installed_managed_role_tui_catalogues_drop_native_worktree_tools() {
+    let upstream = registered_upstream(&live_codex_home());
+    assert!(upstream.is_absolute() && upstream.is_file());
+    let version = Command::new(&upstream).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    // The installed native CLI is exactly the observed 0.162.1 or 0.163.0 in
+    // its normal `codex-cli <version>` form; any other version stays refused.
+    assert!(
+        version == "codex-cli 0.162.1" || version == "codex-cli 0.163.0",
+        "unexpected native CLI: {version}"
+    );
+
+    let evidence = tempfile::Builder::new()
+        .prefix("native-managed-worktree-catalogue-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!(
+        "native managed worktree catalogue evidence: {}",
+        evidence.display()
+    );
+
+    // Positive control on the direct installed CLI: without any suppression
+    // the runtime catalogue exposes the competing tools, so a suppressed
+    // route that observed nothing cannot pass vacuously.
+    let control = installed_tui_all_tools(&upstream, &evidence, "control", &[], 3);
+    let control_fragments = worktree_names(&control.names);
+    assert!(
+        !control.names.is_empty() && !control_fragments.is_empty(),
+        "the unsuppressed control runtime catalogue exposed no codex_worktrees tool, so this check observed nothing and the task stays open: names {:?}; evidence {}",
+        control.names,
+        evidence.display()
+    );
+    assert_unrelated_mcp_preserved(&control, "the unsuppressed control session");
+
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let install = record_managed_install(&evidence, &upstream, &source);
+
+    let assert_suppressed = |route: &str, catalogue: &RuntimeCatalogue| {
+        assert!(
+            !catalogue.names.is_empty(),
+            "the managed {route} run captured no runtime catalogue; evidence {}",
+            evidence.display()
+        );
+        let fragments = worktree_names(&catalogue.names);
+        assert!(
+            fragments.is_empty(),
+            "the managed {route} runtime catalogue kept the competing worktree tools: {fragments:?}; evidence {}",
+            evidence.display()
+        );
+        assert!(
+            !catalogue.transcript.contains("features.worktrees"),
+            "the managed {route} session reported a worktree conflict it does not have; evidence {}",
+            evidence.display()
+        );
+        assert_unrelated_mcp_preserved(catalogue, &format!("the managed {route} session"));
+    };
+
+    let lead = managed_tui_all_tools(&install, &evidence, "managed-lead", &[], false, &[], 3);
+    assert_suppressed("lead", &lead);
+
+    let executor =
+        managed_tui_all_tools(&install, &evidence, "managed-executor", &[], true, &[], 3);
+    assert_suppressed("executor", &executor);
+
+    // Selecting a profile is not a worktree choice: a managed session whose
+    // selected profile carries no features.worktrees leaf still receives the
+    // suppression default.
+    let profiled = managed_tui_all_tools(
+        &install,
+        &evidence,
+        "managed-profile",
+        &["--profile", "no-leaf"],
+        false,
+        &[("no-leaf.config.toml", "model_reasoning_effort = \"low\"\n")],
+        3,
+    );
+    assert_suppressed("profile", &profiled);
+
+    // Only an actual winning choice is honored and reported: a profile that
+    // sets features.worktrees=true keeps the competing tools and the launcher
+    // reports the configuration conflict instead of claiming suppression.
+    let explicit = managed_tui_all_tools(
+        &install,
+        &evidence,
+        "managed-profile-true",
+        &["--profile", "explicit-leaf"],
+        false,
+        &[(
+            "explicit-leaf.config.toml",
+            "[features]\nworktrees = true\n",
+        )],
+        3,
+    );
+    assert!(
+        !explicit.names.is_empty(),
+        "the explicit true profile run captured no runtime catalogue; evidence {}",
+        evidence.display()
+    );
+    let explicit_fragments = worktree_names(&explicit.names);
+    assert!(
+        !explicit_fragments.is_empty(),
+        "an explicit winning profile true kept no competing tools, so the suppression decision and this probe disagree: names {:?}; evidence {}",
+        explicit.names,
+        evidence.display()
+    );
+    assert!(
+        explicit.transcript.contains("features.worktrees=true")
+            && explicit
+                .transcript
+                .contains("compete with the shared worktree pool"),
+        "the re-exposed native tools must be reported at the real entry point; evidence {}",
+        evidence.display()
+    );
+    assert_unrelated_mcp_preserved(&explicit, "the explicit-true profile session");
+
+    write_json(
+        &evidence.join("acceptance.json"),
+        &json!({
+            "control_fragments": control_fragments,
+            "control_names": control.names,
+            "control_unrelated": tool_catalogue::unrelated_probe_names(&control.names),
+            "lead_fragments": worktree_names(&lead.names),
+            "lead_names": lead.names,
+            "lead_unrelated": tool_catalogue::unrelated_probe_names(&lead.names),
+            "executor_fragments": worktree_names(&executor.names),
+            "executor_names": executor.names,
+            "executor_unrelated": tool_catalogue::unrelated_probe_names(&executor.names),
+            "profile_fragments": worktree_names(&profiled.names),
+            "profile_names": profiled.names,
+            "profile_unrelated": tool_catalogue::unrelated_probe_names(&profiled.names),
+            "explicit_fragments": explicit_fragments,
+            "explicit_names": explicit.names,
+            "explicit_unrelated": tool_catalogue::unrelated_probe_names(&explicit.names),
+        }),
+    );
+    println!(
+        "managed worktree catalogue: control {} tools; lead {}; executor {}; profile-no-leaf {}; profile-true {}",
+        control.names.len(),
+        lead.names.len(),
+        executor.names.len(),
+        profiled.names.len(),
+        explicit.names.len()
+    );
+}
+
+/// Explicit native probe: a managed executor catalogue must stay free of
+/// lead-only kit skills across every validated copy of the same kit
+/// repository. The recorded build source is this checkout while the case is
+/// a fresh linked worktree of the same repository, so the native repository
+/// scope discovers the lead-only skill at the case checkout and the real
+/// user farm discovers the main checkout copy; both must report
+/// enabled=false for the executor while shared skills stay enabled in both
+/// scopes and the same catalogue for the lead keeps the lead-only skill
+/// enabled, proving the filter is role selection and not a blanket path or
+/// name disable. An unrelated case carrying a same-name project skill stays
+/// enabled. The explicit disablement recorded at the canonical source path
+/// must also reach the case and user copies. The installed native CLI
+/// performs every catalogue read; no model call is made.
+#[test]
+#[ignore = "explicit installed native CLI skills/list over a linked worktree of the kit source; no model"]
+fn catalogue_role_executor_disables_lead_skills_across_linked_worktree_copies() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-linked-worktree-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .keep();
+    println!(
+        "skill catalogue linked worktree evidence: {}",
+        root.display()
+    );
+    let home = root.join("codex");
+    fs::create_dir_all(&home).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let linked = root.join("linked");
+    let linked_worktree = LinkedKitWorktree::add(&source, &linked);
+    let build = synthetic_role_build::recorded_build(&root, &source);
+    synthetic_role_build::register(&home, &root, &build);
+
+    // Expectations come from the kit descriptor itself: shared skills belong
+    // to both roles and the lead-only skills must stay absent for the
+    // executor.
+    let descriptor: toml::Value =
+        toml::from_str(&fs::read_to_string(source.join("global/roles.toml")).unwrap()).unwrap();
+    let names = |value: &toml::Value| -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let shared = names(&descriptor["shared_skills"]);
+    let lead_only = names(&descriptor["roles"]["lead"]["skills"]);
+    let explicitly_disabled = source
+        .join(".agents/skills")
+        .join(CATALOGUE_EXPLICITLY_DISABLED_SKILL)
+        .join("SKILL.md");
+    assert!(
+        explicitly_disabled.is_file(),
+        "the workspace kit must classify the probe skill: {}",
+        explicitly_disabled.display()
+    );
+    fs::write(
+        home.join("ds.config.toml"),
+        format!(
+            "[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(explicitly_disabled.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(home.join("config.toml"), "approval_policy = \"never\"\n").unwrap();
+
+    let upstream = registered_upstream(&live_codex_home());
+    let catalogue = |role: &str, case: &Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command
+            .args(["skills", "catalogue", "--case"])
+            .arg(case)
+            .arg("--codex-home")
+            .arg(&home)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--role", role, "--profile", "ds", "--limit", "1048576"]);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command.output().unwrap()
+    };
+    let executor = catalogue("executor", &linked);
+    assert!(
+        executor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executor.stderr)
+    );
+    let executor_text = String::from_utf8_lossy(&executor.stdout).into_owned();
+    fs::write(
+        root.join("catalogue-executor-linked.txt"),
+        executor_text.as_bytes(),
+    )
+    .unwrap();
+    let lead = catalogue("lead", &linked);
+    assert!(
+        lead.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lead.stderr)
+    );
+    let lead_text = String::from_utf8_lossy(&lead.stdout).into_owned();
+    fs::write(root.join("catalogue-lead-linked.txt"), lead_text.as_bytes()).unwrap();
+
+    let entry = |text: &str, name: &str, scope: &str| -> Option<bool> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("name={name};scope={scope};")))
+            .map(|line| line.starts_with(&format!("name={name};scope={scope};enabled=true;")))
+    };
+    for (role, text) in [
+        ("executor", executor_text.as_str()),
+        ("lead", lead_text.as_str()),
+    ] {
+        assert!(
+            text.contains(&format!("role_context=role={role};profile=ds;revision=")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("omitted="),
+            "--limit 1048576 must deliver every effective entry for {role}: {text}"
+        );
+    }
+    for name in &lead_only {
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(false),
+            "the case checkout copy of lead-only {name} must be disabled: {executor_text}"
+        );
+        assert!(
+            entry(executor_text.as_str(), name, "user") == Some(false),
+            "the user-farm copy of lead-only {name} must be disabled: {executor_text}"
+        );
+        assert!(
+            !executor_text.lines().any(|line| {
+                line.starts_with(&format!("name={name};")) && line.contains(";enabled=true;")
+            }),
+            "no discovered copy of {name} may stay enabled for the executor: {executor_text}"
+        );
+        assert!(
+            entry(lead_text.as_str(), name, "repo") == Some(true),
+            "the lead keeps {name}: {lead_text}"
+        );
+    }
+    for name in &shared {
+        if name == CATALOGUE_EXPLICITLY_DISABLED_SKILL {
+            continue;
+        }
+        assert!(
+            entry(executor_text.as_str(), name, "repo") == Some(true),
+            "the shared skill {name} stays available in the case checkout: {executor_text}"
+        );
+        assert!(
+            entry(executor_text.as_str(), name, "user") == Some(true),
+            "the shared skill {name} stays available in the user farm: {executor_text}"
+        );
+    }
+    for (role, text) in [
+        ("executor", executor_text.as_str()),
+        ("lead", lead_text.as_str()),
+    ] {
+        assert!(
+            entry(text, CATALOGUE_EXPLICITLY_DISABLED_SKILL, "repo") == Some(false),
+            "the explicit disablement reaches the case checkout for {role}: {text}"
+        );
+        assert!(
+            entry(text, CATALOGUE_EXPLICITLY_DISABLED_SKILL, "user") == Some(false),
+            "the explicit disablement reaches the user farm for {role}: {text}"
+        );
+    }
+
+    // An unrelated case carrying a same-name project skill must stay enabled:
+    // no foreign path may be disabled by name or similarity.
+    let foreign_case = root.join("foreign");
+    fs::create_dir_all(&foreign_case).unwrap();
+    write_skill(
+        &foreign_case.join(".agents/skills").join(&lead_only[0]),
+        &lead_only[0],
+        "FOREIGN_SAME_NAME_MARKER",
+    );
+    let foreign = catalogue("executor", &foreign_case);
+    assert!(
+        foreign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&foreign.stderr)
+    );
+    let foreign_text = String::from_utf8_lossy(&foreign.stdout).into_owned();
+    fs::write(
+        root.join("catalogue-executor-foreign.txt"),
+        foreign_text.as_bytes(),
+    )
+    .unwrap();
+    // Discovery from inside the kit checkout surfaces both the canonical kit
+    // copy and the case copy at repo scope; only the case copy stays enabled,
+    // and the canonical kit copy stays disabled for the executor.
+    let foreign_path = foreign_case.to_string_lossy().into_owned();
+    let kit_path = source
+        .join(".agents/skills")
+        .join(&lead_only[0])
+        .to_string_lossy()
+        .into_owned();
+    let path_entry = |text: &str, name: &str, path: &str, enabled: bool| {
+        text.lines().any(|line| {
+            line.starts_with(&format!("name={name};"))
+                && line.contains(&format!(";enabled={enabled};"))
+                && line.contains(path)
+        })
+    };
+    assert!(
+        path_entry(foreign_text.as_str(), &lead_only[0], &foreign_path, true),
+        "an unrelated same-name project skill stays enabled: {foreign_text}"
+    );
+    assert!(
+        path_entry(foreign_text.as_str(), &lead_only[0], &kit_path, false),
+        "the canonical kit copy stays disabled for the executor: {foreign_text}"
+    );
+    drop(linked_worktree);
+}
+
+/// Explicit native probe of what the installed native CLI (0.162.1 or
+/// 0.163.0) actually consumes for a managed resume. Fresh starts consume the
+/// composed role text and the live
+/// skill selection. A resumed thread keeps the developer text saved at its
+/// start and retains the skill entries saved then, while skills added later
+/// are picked up from the live surface; neither `config.developer_instructions`
+/// nor `developerInstructions`
+/// on `thread/resume` changes the consumed developer text: the configuration
+/// variants produce byte-identical requests. The current revision's text
+/// reaches turns only through a fresh conversation, which the restart
+/// contrast captures. The installed native CLI is driven over stdio with the
+/// same `-c` composition the managed host applies: profile `ds` mirrors the
+/// ds/deepseek-flash/deepseek/max binding with only its transport pointed at
+/// the canned local Responses server, and the role `-c` pairs come from the
+/// same `role_launch` composer the managed host uses. Captured model request
+/// bodies prove what each fresh and resumed turn actually consumed. No
+/// billed model call and no shared configuration write.
+#[test]
+#[ignore = "explicit installed native CLI app-server over stdio + canned local Responses; no live model"]
+fn native_managed_resume_keeps_saved_role_text_and_refreshes_the_live_catalogue() {
+    let upstream = registered_upstream(&live_codex_home());
+    assert!(upstream.is_absolute() && upstream.is_file());
+    let version = Command::new(&upstream).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    // The installed native CLI is exactly the observed 0.162.1 or 0.163.0 in
+    // its normal `codex-cli <version>` form; any other version stays refused.
+    assert!(
+        version == "codex-cli 0.162.1" || version == "codex-cli 0.163.0",
+        "unexpected native CLI: {version}"
+    );
+
+    let evidence = tempfile::Builder::new()
+        .prefix("native-resume-role-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("native resume role evidence: {}", evidence.display());
+    let case = evidence.join("case");
+    let home = evidence.join("codex");
+    fs::create_dir_all(&case).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    git_identity(&case);
+    let source = synthetic_role_build::kit_source(&evidence);
+    fs::write(
+        source.join("global/executor.md"),
+        format!("Fixture executor responsibility\n\n{RESUME_ROLE_ALPHA}\n"),
+    )
+    .unwrap();
+    let build = synthetic_role_build::recorded_build(&evidence, &source);
+    synthetic_role_build::register(&home, &evidence, &build);
+    let skills = case.join(".agents/skills");
+    write_skill(
+        &skills.join(RESUME_EARLY_SKILL),
+        RESUME_EARLY_SKILL,
+        "RESUME_EARLY_MARKER",
+    );
+    write_skill(
+        &skills.join(RESUME_UNRELATED_SKILL),
+        RESUME_UNRELATED_SKILL,
+        "RESUME_UNRELATED_MARKER",
+    );
+
+    let canned = CannedResponses::spawn(&evidence).unwrap();
+    let unrelated = unrelated_probe_mcp(&home);
+    write_role_probe_home(&home, &case, &canned, &unrelated);
+
+    let (lead_revision, lead_args) =
+        role_args(&home, &case, harness_core::role_context::Role::Lead);
+    clear_probe_receipt(&home);
+    let lead_body = {
+        let mut lead = RoleAppServer::spawn(&upstream, &home, &case, &lead_args, false, None);
+        lead.initialize();
+        let thread = lead.thread_start(&case);
+        let body = turn_and_capture(&mut lead, &thread, &canned, 1);
+        lead.shutdown();
+        body
+    };
+    let lead_receipt = wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the lead route must leave a fresh unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&home).display()
+        )
+    });
+    assert_probe_receipt(&lead_receipt, "the lead route");
+
+    let (start_revision, mut start_args) =
+        role_args(&home, &case, harness_core::role_context::Role::Executor);
+    start_args.push("-c".into());
+    start_args.push("agents.enabled=false".into());
+    let mut threads = Vec::new();
+    let mut start_bodies = Vec::new();
+    clear_probe_receipt(&home);
+    {
+        let mut executor = RoleAppServer::spawn(&upstream, &home, &case, &start_args, true, None);
+        executor.initialize();
+        for expected in 2..=4 {
+            let thread = executor.thread_start(&case);
+            let body = turn_and_capture(&mut executor, &thread, &canned, expected);
+            threads.push(thread);
+            start_bodies.push(body);
+        }
+        executor.shutdown();
+    }
+    let start_receipt = wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the executor start routes must leave a fresh unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&home).display()
+        )
+    });
+    assert_probe_receipt(&start_receipt, "the executor start routes");
+
+    fs::write(
+        source.join("global/executor.md"),
+        format!("Fixture executor responsibility\n\n{RESUME_ROLE_BRAVO}\n"),
+    )
+    .unwrap();
+    let build = synthetic_role_build::recorded_build(&evidence, &source);
+    synthetic_role_build::register(&home, &evidence, &build);
+    let bravo_text =
+        harness_core::role_context::resolve(&source, harness_core::role_context::Role::Executor)
+            .unwrap()
+            .developer_instructions;
+    assert!(bravo_text.contains(RESUME_ROLE_BRAVO));
+    fs::remove_dir_all(skills.join(RESUME_EARLY_SKILL)).unwrap();
+    write_skill(
+        &skills.join(RESUME_LATE_SKILL),
+        RESUME_LATE_SKILL,
+        "RESUME_LATE_MARKER",
+    );
+
+    let (resume_revision, mut resume_args) =
+        role_args(&home, &case, harness_core::role_context::Role::Executor);
+    assert_ne!(
+        resume_revision, start_revision,
+        "changing the owned role text must change the resolved revision"
+    );
+    resume_args.push("-c".into());
+    resume_args.push("agents.enabled=false".into());
+    let variants = [
+        ("threadId", json!({"threadId": threads[0]})),
+        (
+            "config",
+            json!({"threadId": threads[1], "config": {"developer_instructions": bravo_text}}),
+        ),
+        (
+            "developerInstructions",
+            json!({"threadId": threads[2], "developerInstructions": bravo_text}),
+        ),
+    ];
+    let mut resume_answers = Vec::new();
+    let mut resume_bodies = Vec::new();
+    clear_probe_receipt(&home);
+    let restart_body = {
+        let mut executor = RoleAppServer::spawn(&upstream, &home, &case, &resume_args, true, None);
+        executor.initialize();
+        for (index, (variant, params)) in variants.iter().enumerate() {
+            let answer = executor.call("thread/resume", params.clone());
+            resume_answers.push(json!({
+                "variant": variant,
+                "cwd": answer["thread"]["cwd"].clone(),
+                "instructionSources": answer
+                    .get("instructionSources")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }));
+            let body = turn_and_capture(&mut executor, &threads[index], &canned, 5 + index);
+            resume_bodies.push(body);
+        }
+        // A fresh conversation on the same live session consumes the current
+        // revision: the restart carries the bravo text and the live skill
+        // selection, while the resumed threads above keep the text and the
+        // early entry saved at their start.
+        let restart_thread = executor.thread_start(&case);
+        let restart_body = turn_and_capture(&mut executor, &restart_thread, &canned, 8);
+        executor.shutdown();
+        restart_body
+    };
+    let resume_receipt = wait_for_probe_receipt(&home).unwrap_or_else(|| {
+        panic!(
+            "the resume and restart routes must leave a fresh unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&home).display()
+        )
+    });
+    assert_probe_receipt(&resume_receipt, "the resume and restart routes");
+
+    for (name, body) in start_bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| (format!("executor-start-{index}.body.json"), body))
+        .chain(std::iter::once(("lead.body.json".to_owned(), &lead_body)))
+        .chain(std::iter::once((
+            "restart-contrast.body.json".to_owned(),
+            &restart_body,
+        )))
+        .chain(
+            resume_bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| (format!("resume-{index}.body.json"), body)),
+        )
+    {
+        fs::write(evidence.join(name), body.as_bytes()).unwrap();
+    }
+
+    let report = json!({
+        "evidence": evidence,
+        "upstream": {
+            "path": upstream,
+            "version": version,
+            "sha256": build_identity::hash_file(&upstream).unwrap(),
+            "bytes": fs::metadata(&upstream).unwrap().len(),
+        },
+        "binding": {
+            "profile": "ds",
+            "model": "deepseek-flash",
+            "provider": "deepseek",
+            "reasoning_effort": "max",
+        },
+        "revisions": {
+            "lead": lead_revision,
+            "executor_start": start_revision,
+            "executor_resume": resume_revision,
+        },
+        "lead": described(&lead_body),
+        "executor_start": start_bodies.iter().map(|body| described(body)).collect::<Vec<_>>(),
+        "executor_resume": resume_bodies.iter().map(|body| described(body)).collect::<Vec<_>>(),
+        "restart": described(&restart_body),
+        "resume_answers": resume_answers,
+        "receipts": {
+            "lead": lead_receipt["calls"].clone(),
+            "executor_start": start_receipt["calls"].clone(),
+            "executor_resume": resume_receipt["calls"].clone(),
+        },
+    });
+    write_json(&evidence.join("report.json"), &report);
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    assert_eq!(report["lead"]["lead_text"], true);
+    assert_eq!(report["lead"]["executor_text"], false);
+    assert_eq!(report["lead"]["multi_agent"], true);
+    for (index, start) in report["executor_start"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(start["alpha"], true, "start body {index}");
+        assert_eq!(start["executor_text"], true, "start body {index}");
+        assert_eq!(start["early"], true, "start body {index}");
+        assert_eq!(start["late"], false, "start body {index}");
+        assert_eq!(start["unrelated"], true, "start body {index}");
+        assert_eq!(
+            start["spawn_agent"], false,
+            "an executor session must not advertise agent spawning: {start}"
+        );
+        assert_eq!(
+            start["multi_agent"], false,
+            "an executor session must not advertise the orchestration tool: {start}"
+        );
+    }
+    for (index, resume) in report["executor_resume"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            resume["alpha"], true,
+            "resumed turn {index} must keep the developer text saved at its start: {resume}"
+        );
+        assert_eq!(
+            resume["bravo"], false,
+            "a resumed thread must not load the newer role text retroactively: {resume}"
+        );
+        assert_eq!(
+            resume["early"], true,
+            "the entry saved at the start stays in the saved selection: {resume}"
+        );
+        assert_eq!(
+            resume["late"], true,
+            "the live catalogue supplies skills added after the start: {resume}"
+        );
+        assert_eq!(resume["unrelated"], true, "resumed turn {index}: {resume}");
+        assert_eq!(
+            resume["spawn_agent"], false,
+            "an executor session must not advertise agent spawning: {resume}"
+        );
+        assert_eq!(
+            resume["multi_agent"], false,
+            "an executor session must not advertise the orchestration tool: {resume}"
+        );
+    }
+    let resumed = report["executor_resume"].as_array().unwrap();
+    assert_eq!(
+        resumed[0], resumed[1],
+        "config.developer_instructions must not change the consumed text"
+    );
+    assert_eq!(
+        resumed[1], resumed[2],
+        "developerInstructions must not change the consumed text"
+    );
+    for entry in report["resume_answers"].as_array().unwrap() {
+        assert_eq!(
+            entry["cwd"].as_str().map(str::to_lowercase),
+            case.to_str().map(str::to_lowercase),
+            "thread/resume keeps the session workspace: {entry}"
+        );
+        assert!(
+            entry["instructionSources"].is_array(),
+            "thread/resume reports instruction sources as a list: {entry}"
+        );
+    }
+    assert_eq!(
+        report["restart"]["bravo"], true,
+        "a fresh conversation consumes the current role text"
+    );
+    assert_eq!(
+        report["restart"]["alpha"], false,
+        "a fresh conversation drops the predecessor role text"
+    );
+    assert_eq!(report["restart"]["executor_text"], true);
+    assert_eq!(
+        report["restart"]["early"], false,
+        "a fresh conversation drops the removed skill entry"
+    );
+    assert_eq!(report["restart"]["late"], true);
+    assert_eq!(report["restart"]["unrelated"], true);
+    assert_eq!(report["restart"]["spawn_agent"], false);
+    assert_eq!(report["restart"]["multi_agent"], false);
+
+    // The live catalogue of every captured turn - fresh starts, the three
+    // resumed threads and the restart contrast - stays free of the competing
+    // native worktree surface, while every turn keeps the registered
+    // unrelated MCP server's model-visible surface. The managed app-server
+    // route advertises that server as the single `mcp__unrelated_probe`
+    // namespace entry (the TUI catalogue route reports its expanded
+    // `mcp__unrelated_probe__*` tools), and the fresh per-session receipts
+    // asserted above record each session's real handshake with it:
+    // suppression must drop only the competing surface, at the resume and
+    // restart boundaries too.
+    let assert_boundary = |label: String, entry: &Value| {
+        assert!(
+            entry["worktree_tools"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{label} must stay free of the competing native worktree tools: {entry}"
+        );
+        assert!(
+            entry["unrelated_tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{label} must keep the registered unrelated MCP server's tools: {entry}"
+        );
+    };
+    assert_boundary("the lead start".to_owned(), &report["lead"]);
+    for (index, start) in report["executor_start"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_boundary(format!("executor start {index}"), start);
+    }
+    for (index, resume) in report["executor_resume"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_boundary(format!("executor resume {index}"), resume);
+    }
+    assert_boundary("the restart contrast".to_owned(), &report["restart"]);
+}
+
+/// One native app-server child driven over stdio JSON-RPC, the same protocol
+/// the managed control connection speaks over its WebSocket. Stdout is
+/// drained on a reader thread; only matching request answers are consumed.
+struct RoleAppServer {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    transcript: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    diagnostics: std::sync::Arc<std::sync::Mutex<String>>,
+    next_id: u64,
+}
+
+impl RoleAppServer {
+    fn spawn(
+        exe: &Path,
+        home: &Path,
+        case: &Path,
+        args: &[std::ffi::OsString],
+        executor: bool,
+        user_home: Option<&Path>,
+    ) -> Self {
+        let mut command = Command::new(exe);
+        command.arg("app-server");
+        command.args(args);
+        command.current_dir(case);
+        command.env("CODEX_HOME", home);
+        if let Some(user_home) = user_home {
+            // Native skill discovery resolves the user farm from the OS home,
+            // not CODEX_HOME; the probe pins it to a session-local directory.
+            command.env("USERPROFILE", user_home);
+            command.env("HOME", user_home);
+        }
+        command.env(API_KEY_ENV, API_KEY);
+        command.env("PATH", filtered_path());
+        command.env_remove("OPENAI_API_KEY");
+        command.env_remove("CODEX_API_KEY");
+        // The managed host strips a leaked parent identity before the
+        // app-server starts; the probe must not attach to this session.
+        command.env_remove("CODEX_SESSION_ID");
+        command.env_remove("CODEX_THREAD_ID");
+        command.env_remove("HARNESS_EXECUTOR_RUN");
+        if executor {
+            command.env("HARNESS_EXECUTOR_SESSION", "1");
+        } else {
+            command.env_remove("HARNESS_EXECUTOR_SESSION");
+        }
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (sender, lines) = std::sync::mpsc::channel();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let transcript = std::sync::Arc::clone(&transcript);
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    transcript.lock().unwrap().push(line.clone());
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let diagnostics = std::sync::Arc::clone(&diagnostics);
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = stderr.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buffer[..read]));
+                }
+            });
+        }
+        Self {
+            child,
+            stdin,
+            lines,
+            transcript,
+            diagnostics,
+            next_id: 0,
+        }
+    }
+
+    fn write(&mut self, value: &Value) {
+        use std::io::Write;
+        let stdin = self.stdin.as_mut().expect("app-server stdin is open");
+        writeln!(stdin, "{value}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.write(&json!({"id": id, "method": method, "params": params}));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self.lines.recv_timeout(remaining).unwrap_or_else(|_| {
+                panic!(
+                    "{method} was not answered; stderr:\n{}\nstdout tail:\n{}",
+                    self.diagnostics.lock().unwrap(),
+                    self.tail()
+                )
+            });
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                if let Some(error) = value.get("error") {
+                    panic!("{method} was rejected: {error}");
+                }
+                return value.get("result").cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
+
+    fn initialize(&mut self) {
+        self.call(
+            "initialize",
+            json!({
+                "clientInfo": {"name": "harness-role-resume-probe", "version": "1"},
+                "capabilities": {"experimentalApi": true},
+            }),
+        );
+        self.write(&json!({"method": "initialized"}));
+    }
+
+    fn thread_start(&mut self, case: &Path) -> String {
+        let started = self.call(
+            "thread/start",
+            json!({
+                "cwd": case,
+                "allowProviderModelFallback": false,
+                "model": "deepseek-flash",
+                "modelProvider": "deepseek",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "config": {"model_reasoning_effort": "max"},
+            }),
+        );
+        started["thread"]["id"]
+            .as_str()
+            .expect("thread/start answers with a thread identity")
+            .to_owned()
+    }
+
+    fn turn(&mut self, thread: &str) {
+        self.call(
+            "turn/start",
+            json!({
+                "threadId": thread,
+                "input": [{"type": "text", "text": RESUME_PROMPT}],
+            }),
+        );
+    }
+
+    fn tail(&self) -> String {
+        let transcript = self.transcript.lock().unwrap();
+        let start = transcript.len().saturating_sub(12);
+        transcript[start..].join("\n")
+    }
+
+    fn shutdown(mut self) {
+        self.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if self.child.try_wait().unwrap().is_some() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// Submits one turn on `thread` and returns the raw body of the model request
+/// it produced. `expected` is the one-based count of canned Resume requests,
+/// so captures are attributed to turns by their exact order.
+fn turn_and_capture(
+    server: &mut RoleAppServer,
+    thread: &str,
+    canned: &CannedResponses,
+    expected: usize,
+) -> String {
+    server.turn(thread);
+    let captured = canned.wait_for(Duration::from_secs(120), |requests| {
+        requests
+            .iter()
+            .filter(|request| request.kind == RequestKind::Resume)
+            .count()
+            >= expected
+    });
+    assert!(
+        captured,
+        "turn {expected} produced no captured model request"
+    );
+    canned
+        .requests()
+        .into_iter()
+        .filter(|request| request.kind == RequestKind::Resume)
+        .nth(expected - 1)
+        .expect("captured model request")
+        .body
+}
+
+/// The observable consumption markers of one captured model request.
+fn described(body: &str) -> Value {
+    let tools: Vec<String> = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value["tools"].as_array().map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        tool["name"]
+                            .as_str()
+                            .or_else(|| tool["function"]["name"].as_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    json!({
+        "alpha": body.contains(RESUME_ROLE_ALPHA),
+        "bravo": body.contains(RESUME_ROLE_BRAVO),
+        "lead_text": body.contains("Fixture lead responsibility"),
+        "executor_text": body.contains("Fixture executor responsibility"),
+        "early": body.contains(RESUME_EARLY_SKILL),
+        "late": body.contains(RESUME_LATE_SKILL),
+        "unrelated": body.contains(RESUME_UNRELATED_SKILL),
+        "shared": body.contains("- shared:"),
+        "coordinate": body.contains("- coordinate:"),
+        "project_probe": body.contains(&format!("- {CATALOGUE_PROJECT_SKILL}:")),
+        "user_unrelated": body.contains(&format!("- {CATALOGUE_USER_UNRELATED_SKILL}:")),
+        "spawn_agent": tools.iter().any(|name| name.contains("spawn")),
+        "multi_agent": tools.iter().any(|name| name.contains("multi_agent")),
+        "worktree_tools": tool_catalogue::native_worktree_names(&tools),
+        "unrelated_tools": tool_catalogue::unrelated_probe_surface(&tools),
+        "tools": tools,
+    })
+}
+
 fn live_codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -2620,71 +4603,23 @@ fn pinned_exe() -> PathBuf {
     exe
 }
 
-fn write_probe_config(
-    home: &Path,
-    workspace: &Path,
-    canned: &CannedResponses,
-    extra: &str,
-    compact_prompt: bool,
-) {
-    let trusted = json_escape(workspace);
-    let compact = if compact_prompt {
-        format!("compact_prompt = \"{COMPACT_PROMPT}\"\n")
-    } else {
-        String::new()
-    };
-    fs::write(
-        home.join("config.toml"),
-        format!(
-            r#"model = "gpt-6-astra"
-model_provider = "{PROVIDER_ID}"
-model_reasoning_effort = "low"
-approval_policy = "never"
-sandbox_mode = "danger-full-access"
-web_search = "disabled"
-model_auto_compact_token_limit = 1000000
-model_context_window = 20000
-{compact}[model_providers.{PROVIDER_ID}]
-name = "Canned skill catalog Responses"
-base_url = "{}"
-env_key = "{API_KEY_ENV}"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = false
-request_max_retries = 0
-stream_max_retries = 0
-[windows]
-sandbox = "unelevated"
-[features]
-hooks = false
-apps = false
-multi_agent = false
-memories = false
-goals = false
-plugins = true
-skill_search = true
-[projects.{trusted}]
-trust_level = "trusted"
-{extra}
-"#,
-            canned.base_url()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        home.join("auth.json"),
-        serde_json::to_vec_pretty(&json!({
-            "auth_mode": "apikey",
-            "OPENAI_API_KEY": API_KEY
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+fn spawn_probe_tui(exe: &Path, home: &Path, workspace: &Path) -> ConsoleSession {
+    spawn_probe_tui_args(exe, home, workspace, &[])
 }
 
-fn spawn_probe_tui(exe: &Path, home: &Path, workspace: &Path) -> ConsoleSession {
+fn spawn_probe_tui_args(
+    exe: &Path,
+    home: &Path,
+    workspace: &Path,
+    extra: &[&str],
+) -> ConsoleSession {
     let mut command = CommandSpec::new(exe);
     command.args = vec!["--no-alt-screen".into()];
+    command.args.extend(
+        extra
+            .iter()
+            .map(|argument| std::ffi::OsString::from(*argument)),
+    );
     command.current_dir = Some(workspace.to_path_buf());
     command.env.insert(
         "CODEX_HOME".into(),
@@ -2700,9 +4635,260 @@ fn spawn_probe_tui(exe: &Path, home: &Path, workspace: &Path) -> ConsoleSession 
     ConsoleSession::spawn(spec).unwrap()
 }
 
+/// One runtime catalogue reading from a fresh installed-CLI TUI session: the
+/// nested-tool names the session itself reported through a code-mode `exec`
+/// call, plus the session's static first-request surface and console
+/// transcript for evidence.
+struct RuntimeCatalogue {
+    /// The probe root this reading belongs to: the workspace and every
+    /// evidence file of the reading live beneath it.
+    root: PathBuf,
+    /// The probe home the reading ran with: the registered unrelated MCP
+    /// server and its handshake receipt live beneath it.
+    home: PathBuf,
+    names: Vec<String>,
+    surface: (Vec<String>, String),
+    transcript: String,
+}
+
+/// Runs one fresh installed-CLI TUI session against the canned local Responses
+/// server and returns the session's settled runtime nested-tool catalogue.
+/// The static first request can defer dynamic tool servers, so the probe has
+/// the session run code-mode `exec` calls that report its own runtime tool
+/// names; `rounds` bounds the settle turns, because tool availability can
+/// change between calls. A caller that observes worktree-named tools stops
+/// early; every other caller keeps probing to the round bound, so an early
+/// empty reading is never the final word for the suppressed comparison.
+fn installed_tui_all_tools(
+    exe: &Path,
+    evidence: &Path,
+    label: &str,
+    extra: &[&str],
+    rounds: usize,
+) -> RuntimeCatalogue {
+    let root = evidence.join(label);
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    git_identity(&workspace);
+    let canned = CannedResponses::spawn_all_tools(&root).unwrap();
+    let unrelated = unrelated_probe_mcp(&home);
+    write_probe_config(&home, &workspace, &canned, &unrelated, false);
+    let session = spawn_probe_tui_args(exe, &home, &workspace, extra);
+    tui_all_tools_probe(&root, &home, &canned, session, label, rounds)
+}
+
+/// The shared runtime-catalogue probe body: the session must already run
+/// against the canned all-tools Responses server. Each of the bounded settle
+/// rounds asks the session to report its own runtime tool names; the probe
+/// stops early only when a worktree-named tool appeared, so a suppressed
+/// comparison never accepts an early empty reading as its final word.
+fn tui_all_tools_probe(
+    root: &Path,
+    home: &Path,
+    canned: &CannedResponses,
+    session: ConsoleSession,
+    label: &str,
+    rounds: usize,
+) -> RuntimeCatalogue {
+    ready_named(&session, root, home, &format!("RuntimeTools{label}"));
+    let mut names = Vec::new();
+    for round in 1..=rounds {
+        let before = probe_readings(&canned.requests());
+        send_line(&session, ALL_TOOLS_PROBE_PROMPT).unwrap();
+        let captured = canned.wait_for(Duration::from_secs(60), |requests| {
+            probe_readings(requests).len() > before.len()
+        });
+        assert!(
+            captured,
+            "probe round {round} ({label}) captured no runtime catalogue output; evidence {}",
+            root.display()
+        );
+        let readings = probe_readings(&canned.requests());
+        let (call_id, observed) = readings.last().expect("a captured reading is present");
+        assert!(
+            !before.iter().any(|(earlier, _)| earlier == call_id),
+            "probe round {round} ({label}) re-read an earlier probe output; evidence {}",
+            root.display()
+        );
+        names = observed.clone();
+        write_json(
+            &root.join(format!("all-tools-round-{round}.json")),
+            &json!({"call_id": call_id, "names": &names}),
+        );
+        if !worktree_names(&names).is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    send_line(&session, "/quit").unwrap();
+    let transcript = session
+        .wait(
+            Deadline::after(Duration::from_secs(25)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .map(|outcome| outcome.transcript)
+        .unwrap_or_default();
+    let first = canned
+        .requests()
+        .into_iter()
+        .find(|request| request.kind == RequestKind::FirstSampling);
+    if let Some(request) = &first {
+        fs::write(root.join("first-sampling.body.json"), &request.body).unwrap();
+    }
+    let surface = first
+        .map(|request| tool_surface(&request.body))
+        .unwrap_or_default();
+    write_json(
+        &root.join("surface.json"),
+        &json!({"names": &surface.0, "definitions": &surface.1}),
+    );
+    RuntimeCatalogue {
+        root: root.to_path_buf(),
+        home: home.to_path_buf(),
+        names,
+        surface,
+        transcript,
+    }
+}
+
+/// Asserts one probe session really reached the registered unrelated MCP
+/// server and kept its tools: the runtime catalogue carries the server's
+/// model-visible namespace and the server's own receipt records its
+/// initialize/tools-list handshake. A suppressed comparison that silently
+/// dropped unrelated servers fails here instead of passing as "no tools".
+fn assert_unrelated_mcp_preserved(catalogue: &RuntimeCatalogue, label: &str) {
+    let tools = tool_catalogue::unrelated_probe_names(&catalogue.names);
+    assert!(
+        !tools.is_empty(),
+        "{label} must preserve the registered unrelated MCP server's tools: names {:?}; evidence {}",
+        catalogue.names,
+        catalogue.root.display()
+    );
+    let receipt = wait_for_probe_receipt(&catalogue.home).unwrap_or_else(|| {
+        panic!(
+            "{label} must leave a complete unrelated MCP handshake receipt at {}",
+            probe_receipt_path(&catalogue.home).display()
+        )
+    });
+    assert_probe_receipt(&receipt, label);
+}
+
+/// Spawns one managed launcher session under the recorded build: the same
+/// console harness and canned local Responses server as the ordinary probe,
+/// with the CPU account pinned to a session-local directory so the shared
+/// machine allowance is untouched, and the executor marker set only for the
+/// executor route. A parent executor environment must not leak into the lead
+/// run, so the marker is removed explicitly for every other route.
+fn spawn_probe_tui_managed(
+    launcher: &Path,
+    home: &Path,
+    workspace: &Path,
+    extra: &[&str],
+    executor: bool,
+    cpu_account: &Path,
+) -> ConsoleSession {
+    let mut command = CommandSpec::new(launcher);
+    command.args = vec!["--no-alt-screen".into()];
+    command.args.extend(
+        extra
+            .iter()
+            .map(|argument| std::ffi::OsString::from(*argument)),
+    );
+    command.current_dir = Some(workspace.to_path_buf());
+    command.env.insert(
+        "CODEX_HOME".into(),
+        Some(home.to_path_buf().into_os_string()),
+    );
+    command.env.insert(API_KEY_ENV.into(), Some(API_KEY.into()));
+    command.env.insert("PATH".into(), Some(filtered_path()));
+    command.env.insert("OPENAI_API_KEY".into(), None);
+    command.env.insert("CODEX_API_KEY".into(), None);
+    // The probe host is itself a Codex session, so the parent's identity and
+    // harness context must not leak into the fresh managed session; a real
+    // managed launch starts from a terminal without this state.
+    command.env.insert("CODEX_SESSION_ID".into(), None);
+    command.env.insert("CODEX_THREAD_ID".into(), None);
+    command.env.insert("HARNESS_EXECUTOR_RUN".into(), None);
+    command.env.insert("HARNESS_CONTEXT_ROLE".into(), None);
+    command.env.insert("HARNESS_CONTEXT_REVISION".into(), None);
+    command.env.insert(
+        "CODEX_HARNESS_CPU_ACCOUNT".into(),
+        Some(cpu_account.to_path_buf().into_os_string()),
+    );
+    if executor {
+        command
+            .env
+            .insert("HARNESS_EXECUTOR_SESSION".into(), Some("1".into()));
+    } else {
+        command.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
+    }
+    let mut spec = ConsoleSpec::new(command);
+    spec.limits.memory_bytes = Some(512 * 1024 * 1024);
+    spec.limits.cpu_percent = Some(50.0);
+    ConsoleSession::spawn(spec).unwrap()
+}
+
+/// Runs one fresh managed launcher session against the canned local Responses
+/// server: the run's own home registers the recorded build with the real
+/// installed upstream, `home_files` supplies extra home layers such as named
+/// profile files, and the session's settled runtime nested-tool catalogue is
+/// returned.
+fn managed_tui_all_tools(
+    install: &ManagedInstall,
+    evidence: &Path,
+    label: &str,
+    extra: &[&str],
+    executor: bool,
+    home_files: &[(&str, &str)],
+    rounds: usize,
+) -> RuntimeCatalogue {
+    let root = evidence.join(label);
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(home.join("harness")).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    git_identity(&workspace);
+    write_json(
+        &home.join("harness/native-launch.json"),
+        &serde_json::to_value(Registration {
+            schema: 2,
+            state: None,
+            build: Some(install.build.clone()),
+            task_control: false,
+            upstream: Upstream {
+                executable: install.upstream.clone(),
+                sha256: build_identity::hash_file(&install.upstream).unwrap(),
+                package: None,
+            },
+        })
+        .unwrap(),
+    );
+    let canned = CannedResponses::spawn_all_tools(&root).unwrap();
+    let unrelated = unrelated_probe_mcp(&home);
+    write_probe_config(&home, &workspace, &canned, &unrelated, false);
+    for (name, body) in home_files {
+        fs::write(home.join(name), body).unwrap();
+    }
+    let session = spawn_probe_tui_managed(
+        &install.launcher,
+        &home,
+        &workspace,
+        extra,
+        executor,
+        &install.cpu_account,
+    );
+    tui_all_tools_probe(&root, &home, &canned, session, label, rounds)
+}
+
 fn ready_named(session: &ConsoleSession, evidence: &Path, home: &Path, name: &str) {
     let ready = wait_for(session, evidence, 60, || {
-        session.transcript().contains("gpt-6-astra")
+        session
+            .transcript()
+            .to_ascii_lowercase()
+            .contains("gpt-6-astra")
     });
     assert!(
         ready,
