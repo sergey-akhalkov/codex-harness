@@ -143,6 +143,25 @@ fn native_accepted_closure_retains_both_stages_delivery_and_usage_without_replay
     assert_eq!(record.executor.usage.attempts, 1);
     assert_eq!(record.lead.usage.attempts, 1);
     assert!(record.executor.usage.tokens > 0 && record.lead.usage.tokens > 0);
+    let chain = read_json(&workspace.state.join("chain.json"));
+    assert_eq!(
+        chain["acceptedWork"],
+        serde_json::to_value(&record.binding).unwrap()
+    );
+    for role in ["executor-self-reflection", "lead-self-reflection"] {
+        let turns = fixture_requests(&workspace, role, "turn/start");
+        assert_eq!(turns.len(), 1);
+        let prompt = turns[0]["params"]["input"][0]["text"].as_str().unwrap();
+        let references = prompt
+            .split_once("<<<ACCEPTED WORK\n")
+            .unwrap()
+            .1
+            .split_once("\nACCEPTED WORK>>>")
+            .unwrap()
+            .0;
+        let references: Value = serde_json::from_str(references).unwrap();
+        assert_eq!(references, serde_json::to_value(&record.binding).unwrap());
+    }
     let calls = request_counts(&workspace);
     let replay = run_accepted(&workspace, &request, "complete");
     assert_eq!(replay.outcome.exit_code, 0, "{}", replay.transcript);

@@ -23,7 +23,7 @@ pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
         invalid("the requested acceptance is not a retained eligible local closure")
     })?;
     validate_request(&request, &record)?;
-    let (chain, _lease) = prepare_chain(request)?;
+    let (chain, _lease) = prepare_chain_with_acceptance(request, Some(record.binding.clone()))?;
     check_binding(&controller, &chain)?;
     preflight_lead(&chain)?;
     let executor = run_recorded_stage(&controller, &chain, Stage::Executor, || {
