@@ -393,9 +393,15 @@ fn execute(path: &Path, board: Option<&Path>) -> io::Result<i32> {
 pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
     let (chain, _lease) = prepare_chain(request)?;
     preflight_lead(&chain)?;
-    let executor_state = run_executor(&chain)?;
+    let executor_state = {
+        let _admission = admit_stage(&chain, Role::ExecutorSelfReflection)?;
+        run_executor(&chain)?
+    };
     preflight_lead(&chain)?;
-    let lead_state = run_lead(&chain, &executor_state)?;
+    let lead_state = {
+        let _admission = admit_stage(&chain, Role::LeadSelfReflection)?;
+        run_lead(&chain, &executor_state)?
+    };
     let delivery = deliver_synthesis(&chain, &executor_state, &lead_state)?;
     print_result(&chain, &executor_state, &lead_state, &delivery)
 }
@@ -453,6 +459,39 @@ pub(crate) fn prepare_chain(
 /// live and readable.
 pub(crate) fn preflight_lead(chain: &ChainState) -> io::Result<()> {
     preflight_lead_return(chain)
+}
+
+/// Reserve the existing shared run allowance only when a new model stage
+/// can start. Retained outcomes and uncertain-attempt reconciliation need no
+/// new model reservation. The caller holds this guard through stage retention.
+fn admit_stage(
+    chain: &ChainState,
+    role: Role,
+) -> io::Result<Option<crate::executor_cli::reflection_admission::Admission>> {
+    let (declaration, state_path) = match role {
+        Role::ExecutorSelfReflection => (
+            &chain.executor_stage,
+            chain.state_dir.join("executor-stage.json"),
+        ),
+        Role::LeadSelfReflection => (&chain.lead_stage, chain.state_dir.join("lead-stage.json")),
+        _ => return Err(invalid("only reflection roles can claim stage admission")),
+    };
+    if state_path.is_file() {
+        let state: StageState = read_json(&state_path, MAX_REQUEST_BYTES)?;
+        if state.status != StageStatus::NotStarted {
+            return Ok(None);
+        }
+    }
+    let config = orchestration_config::load(&chain.source)?;
+    crate::executor_cli::reflection_admission::acquire(
+        &chain.codex_home,
+        &declaration.checkout,
+        &config,
+        &chain.state_dir,
+        role,
+        &chain.task,
+    )
+    .map(Some)
 }
 
 /// Runs (or reuses) the executor stage exactly once for this chain.

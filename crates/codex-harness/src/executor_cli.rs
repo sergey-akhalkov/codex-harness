@@ -46,6 +46,7 @@ pub(crate) mod executor_message;
 mod executor_stop;
 #[path = "executor_observation.rs"]
 mod observation;
+pub(crate) mod reflection_admission;
 // The native warning relay: the frontend-facing socket the host may append a
 // degraded diagnostic to. It is not a second backend address, and `executor
 // message` and `executor stop` never resolve a run through it.
@@ -3424,18 +3425,14 @@ fn held_binding<'a>(
     })
 }
 
-/// Slot indexes and owners of the repository's active executor runs: a run is
-/// active while its host lease is live or its dispatch still holds an
-/// exclusive startup claim. A held, suspended or cleanly exited task keeps
-/// pool capacity but not concurrency, and an ordinary task's held position
-/// never consumes it. `replacing` names the slot this dispatch reactivates,
-/// which does not count against itself.
+/// Active ordinary hosts/startup claims and admitted reflection stages share
+/// one repository concurrency allowance. Held worktrees alone do not consume it.
 fn active_executor_runs(
     codex_home: &Path,
     repository: &Path,
     pool_size: u32,
     replacing: Option<u32>,
-) -> io::Result<Vec<(u32, String)>> {
+) -> io::Result<Vec<String>> {
     let mut active = Vec::new();
     for index in 1..=pool_size.min(task_worktree::MAX_POOL_SLOTS) {
         if Some(index) == replacing {
@@ -3445,7 +3442,7 @@ fn active_executor_runs(
         if let Some(lease) = lease
             && lease_live(&lease)
         {
-            active.push((index, lease.owner));
+            active.push(format!("slot {index} is running '{}'", lease.owner));
             continue;
         }
         let Some(record) = task_worktree::load_slot_record(codex_home, repository, index)? else {
@@ -3459,41 +3456,46 @@ fn active_executor_runs(
             .as_ref()
             .is_some_and(task_worktree::startup_exclusive)
         {
-            active.push((index, owner));
+            active.push(format!("slot {index} is running '{owner}'"));
         }
     }
+    active.extend(reflection_admission::active(codex_home, repository)?);
     Ok(active)
 }
 
-/// Executor admission is separate from pool capacity: `max_concurrent_executors`
-/// bounds active runs, so one lead (or a successor with the same configuration)
-/// cannot multiply the allowance by dispatching along free pool slots. A
-/// bounded lead conversation counts as one active run like any other dispatch.
+/// Ordinary and bounded-lead dispatch use the same counter as reflection.
+/// Callers hold the repository admission lock through reservation publication.
 fn admit_executor_run(request: &Dispatch, replacing: Option<u32>) -> io::Result<()> {
-    let active = active_executor_runs(
+    admit_active_run(
         request.codex_home,
         request.repository,
         request.pool_size,
+        request.max_concurrency,
         replacing,
-    )?;
-    let limit = request.max_concurrency.max(1);
+        request.role,
+    )
+}
+
+fn admit_active_run(
+    home: &Path,
+    repository: &Path,
+    pool_size: u32,
+    max_concurrency: u32,
+    replacing: Option<u32>,
+    role: Role,
+) -> io::Result<()> {
+    let active = active_executor_runs(home, repository, pool_size, replacing)?;
+    let limit = max_concurrency.max(1);
     if active.len() as u32 >= limit {
-        let runs = active
-            .iter()
-            .map(|(index, owner)| format!("slot {index} is running '{owner}'"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        // A bounded lead conversation consumes the same active-run allowance
-        // as an executor run; the refusal names the shared limit truthfully
-        // for both roles.
-        let subject = match request.role {
+        let subject = match role {
             Role::Executor => "executor concurrency",
             Role::Lead => "run concurrency",
             Role::ExecutorSelfReflection | Role::LeadSelfReflection => "reflection concurrency",
         };
         return Err(invalid(&format!(
-            "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {runs}; a free pool slot does not grant another active run - stop or wait for a run",
-            active.len()
+            "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {}; a free pool slot does not grant another active run - stop or wait for a run",
+            active.len(),
+            active.join("; "),
         )));
     }
     Ok(())
@@ -3705,15 +3707,15 @@ fn lease_live(lease: &SessionLease) -> bool {
     }
 }
 
-/// The live lease of one owner, if a host process holds it: the pool core asks
-/// liveness per owner, so every lease in the kit-local state directory counts.
+/// A live worktree owner's host lease. Reflection stage admission has no
+/// worktree position and must not be adopted as an ordinary owner binding.
 fn live_lease(codex_home: &Path, source: &Path, owner: &str) -> Option<SessionLease> {
     let dir = task_worktree::pool_state_dir(codex_home, source).ok()?;
     let entries = fs::read_dir(&dir).ok()?;
     entries
         .flatten()
         .filter_map(|entry| read_lease(&entry.path()))
-        .find(|lease| lease.owner == owner && lease_live(lease))
+        .find(|lease| lease.index != 0 && lease.owner == owner && lease_live(lease))
 }
 
 /// Is the recorded owner's host process still running? Shared with the

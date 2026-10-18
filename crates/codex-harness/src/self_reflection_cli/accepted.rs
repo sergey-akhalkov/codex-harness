@@ -112,9 +112,7 @@ fn run_recorded_stage(
         Stage::Lead => (&record.lead, chain.state_dir.join("lead-stage.json")),
     };
     match recorded.state {
-        RecordedStageState::Pending => {
-            controller.begin_stage(&chain.acceptance, stage)?;
-        }
+        RecordedStageState::Pending => {}
         RecordedStageState::InFlight | RecordedStageState::Retained => {
             if !state_path.is_file() {
                 return Err(invalid(format!(
@@ -143,6 +141,14 @@ fn run_recorded_stage(
                 stage.as_str()
             )));
         }
+    }
+    let role = match stage {
+        Stage::Executor => Role::ExecutorSelfReflection,
+        Stage::Lead => Role::LeadSelfReflection,
+    };
+    let _admission = admit_stage(chain, role)?;
+    if recorded.state == RecordedStageState::Pending {
+        controller.begin_stage(&chain.acceptance, stage)?;
     }
     let state = match run() {
         Ok(state) => state,

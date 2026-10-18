@@ -189,3 +189,76 @@ fn foreign_acceptance_refuses_before_fork_and_unknown_usage_blocks_the_lead() {
     assert_eq!(request_counts(&workspace), calls);
     assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
 }
+
+#[test]
+fn occupied_shared_capacity_keeps_the_closure_pending_then_freed_capacity_runs_it() {
+    let workspace = Workspace::new("accepted-capacity", LeadMode::Delivered);
+    let (controller, request, acceptance) = accepted(&workspace);
+    let before = controller.record(&acceptance).unwrap().unwrap();
+    let config = harness_core::orchestration_config::load(&kit_root()).unwrap();
+    let pool_size = harness_core::orchestration_config::worktree_pool_size(&config);
+    assert!(pool_size >= config.max_concurrent_executors);
+    let program = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity = harness_core::process_service::ServiceProcess::observe(
+        std::process::id(),
+        &program,
+        0,
+        &user,
+    )
+    .unwrap()
+    .identity();
+    let pool =
+        harness_core::task_worktree::pool_state_dir(&workspace.home, &workspace.checkout).unwrap();
+    fs::create_dir_all(&pool).unwrap();
+    // Model-free native lease fixture: the test process actually owns every
+    // recorded live PID/creation identity. No worktree position is allocated.
+    let leases: Vec<_> = (1..=config.max_concurrent_executors)
+        .map(|index| {
+            let path = pool.join(format!("lease-{index}.json"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&json!({
+                    "schema": 1, "owner": format!("ordinary-fixture-{index}"),
+                    "index": index, "path": workspace.checkout,
+                    "pid": identity.pid, "created": identity.creation_time, "program": program,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            path
+        })
+        .collect();
+    let blocked = run_accepted(&workspace, &request, "complete");
+    assert_refused(&blocked, "reflection concurrency is full");
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), before);
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert!(!workspace.state.join("executor-stage.json").exists());
+    for path in leases {
+        fs::remove_file(path).unwrap();
+    }
+    let completed = run_accepted(&workspace, &request, "complete");
+    assert_eq!(completed.outcome.exit_code, 0, "{}", completed.transcript);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap().delivery,
+        DeliveryState::Consumed
+    );
+    for index in 1..=pool_size {
+        assert!(
+            harness_core::task_worktree::load_slot_record(
+                &workspace.home,
+                &workspace.checkout,
+                index
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    assert!(!fs::read_dir(pool).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("reflection-lease-") && name.ends_with(".json"))
+    }));
+}
