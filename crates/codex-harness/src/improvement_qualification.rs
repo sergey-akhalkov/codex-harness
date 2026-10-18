@@ -524,6 +524,15 @@ fn ensure_review_packet(
     fs::create_dir_all(&root)?;
     fs::create_dir_all(&source)?;
     accounting::git(&source, &["init", "-q", "--initial-branch=main"]).map_err(invalid)?;
+    // The shared continuation owner reads the bound checkout's configured
+    // upstream before it resumes an exact reviewer session. The packet is
+    // deliberately independent, so its only origin is the packet itself: a
+    // same-reviewer correction can bind and reaffirm the frozen checkout
+    // without fetching sibling history or another solution.
+    let packet_origin = source
+        .to_str()
+        .ok_or_else(|| invalid("the semantic review packet path is not valid UTF-8"))?;
+    accounting::git(&source, &["remote", "add", "origin", packet_origin]).map_err(invalid)?;
 
     let task_bytes = fs::read(&inputs.task_prompt.path)?;
     let criteria_bytes = fs::read(&declaration.criteria.path)?;

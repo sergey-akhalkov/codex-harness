@@ -1106,33 +1106,103 @@ and drives the sequential measured pair (baseline before candidate, one
 measured conversation at a time); without them the run stops at
 `candidate-ready`.
 
-The in-development `baseline_qualification` input prepares one ordinary
-control workflow separately from the two-arm comparison. It freezes the task
-instructions as `task_prompt: {path, sha256}` and takes exactly one runtime
+The `baseline_qualification` input prepares one ordinary control workflow
+separately from the two-arm comparison. It freezes the task instructions as
+`task_prompt: {path, sha256}` and takes exactly one implementation runtime
 route: the existing local `client`, or `native_config: {path, sha256}` with
 explicit lead and executor profiles. Native configuration is copied only into
 a fresh owned home before installation; explicitly named `private_inputs`
 use the runtime owner's existing validation and identity records. A changed
 task, configuration or participant binding refuses further dispatch.
 
-The currently checked increment opens a visible lead frame, dispatches its
-structured assignment, and continues the same lead for review. A `CORRECT`
-decision resumes the same executor within the declared correction allowance,
-then returns to that lead for another review. Each turn's exact native
-generation and result are retained before dependent work; `resume` does not
-repeat settled turns. Only clean committed changes within the frozen scope
-reach review. The independent task oracle then checks that revision in a fresh
-owned copy; `ACCEPT` cannot override a failed check. A pre-existing output report
-or changes to the oracle copy refuse further effects and preserve those files.
-An interrupted check with no retained outcome remains unknown instead of being
-automatically repeated; recovery requires the original check evidence.
+The optional `semantic_review` declaration adds one independent read-only
+reviewer after the ordinary lead `ACCEPT` and the retained final executor
+result. It names its own frozen native runtime and profile; the configuration
+must declare `sandbox_mode = "read-only"` and `approval_policy = "never"`,
+and the selected profile must resolve an explicit model and reasoning effort.
+It also takes an absolute frozen `criteria: {path, sha256}` file, up to 32
+declared relative `sources` reproduced at the submitted revision, and a
+finite `max_corrections` of 0 or 1. Omitting the declaration preserves the
+program-only route and its serialized digest. The reviewer is installed into
+its own fresh home; the implementation runtime stays writable and shared user
+configuration is never changed. The frozen packet contains the actual task
+prompt, the submitted result, the declared sources, bounded participant/action
+evidence and a manifest with the exact revisions, hashes and physical line
+counts. Expected answers, sibling outcomes and arm identity are withheld, and
+packet content is data rather than authority. A minimal synthetic declaration
+(paths and digests are placeholders):
 
-The retained row counts each native participant session once, including its
-review and correction turns. Missing or conflicting native usage prevents a
-complete row instead of becoming zero cost. Repeating `resume` reuses the
-retained row and check. This is an ordinary control observation: independent
-semantic-review calibration, the full comparison costs and frozen decision
-policy still require qualification before self-reflection model use or adoption.
+```json
+{
+  "schema": 1,
+  "runtime": {
+    "state": "D:/qualification/state",
+    "build": "D:/qualification/state/builds/reviewer",
+    "label": "reviewer-runtime",
+    "upstream": "D:/qualification/bin/codex.exe",
+    "native_config": {"path": "D:/qualification/reviewer.toml", "sha256": "<sha256>"},
+    "private_inputs": []
+  },
+  "profile": "ds",
+  "criteria": {"path": "D:/qualification/criteria.txt", "sha256": "<sha256>"},
+  "sources": ["solution.txt"],
+  "max_corrections": 1
+}
+```
+
+The reviewer returns only `{"run_id": ..., "findings": [...],
+"unresolved_issues": [...]}`. Each finding names a declared path and a
+physical newline line; its `evidence` must contain a declared `path:line` (or
+`path:first-last`) location. A paraphrased or omission-based observation is
+valid without quoting the line. `findings` demonstrate material task
+failures and imply rejection; `unresolved_issues` are obstacles to judging
+and leave the judgment unknown. The parent validates the document identity,
+schema, run id, locations, evidence binding, packet hashes and native
+completion; it derives no acceptance from reviewer prose. One malformed-output
+defect may use the declared same-reviewer correction, which retains both
+attempts and costs and gives no expected-verdict hint.
+
+The workflow opens a visible lead frame, dispatches its structured assignment,
+and continues the same lead for review. A `CORRECT` decision resumes the same
+executor within the declared correction allowance, then returns to that lead
+for another review. Each turn's exact native generation and result are
+retained before dependent work; `resume` does not repeat settled turns. Only
+clean committed changes within the frozen scope reach review. The independent
+task oracle then checks that revision in a fresh owned copy, and the reviewer
+judges the frozen task, submitted result, declared sources and bounded action
+evidence. Final acceptance is the conjunction of lead approval, the passing
+independent program check and a successful semantic judgment. A substantive
+semantic rejection records a complete row with `accepted=false`; `unknown` or
+an unresolved malformed output writes no row and refuses completion. A
+pre-existing output report or changes to the oracle copy refuse further
+effects and preserve those files. An interrupted check with no retained
+outcome remains unknown instead of being automatically repeated; recovery
+requires the original check evidence.
+
+The retained row counts each exact native participant session once, including
+lead, executor, review, correction and reviewer turns. Reviewer usage is
+discovered in the reviewer's own installed home and included in the same
+usage totals, so a declared reviewer is never free. Missing or conflicting
+native usage prevents a complete row instead of becoming zero cost. Repeating
+`resume` reuses the retained row, checks and settled reviewer judgment. A
+native completion or restart settles the same reviewer conversation and does
+not dispatch a duplicate turn.
+
+The ordinary operator entry point is:
+
+```powershell
+codex-harness improve start --run D:/qualification/run --spec D:/qualification/spec.json --supervision once
+codex-harness improve resume --run D:/qualification/run
+```
+
+`start` prepares the run and dispatches the lead frame; each `resume` settles
+the retained terminal turn and dispatches the next declared participant. The
+completed run retains `baseline-qualification/row.json` under the run
+directory, and later `resume` calls reuse that row. This is an ordinary control
+observation only: it records one baseline workflow and refuses candidate
+reflection calls, comparison verdicts or adoption. Broader real-task quality
+still requires the calibrated reviewer inputs and frozen task supplied by the
+consumer.
 
 `select` activates an already prepared baseline or candidate runtime through
 the shared build-selection owner, records the identity it actually consumed

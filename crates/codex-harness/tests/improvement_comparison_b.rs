@@ -212,20 +212,46 @@ fn one_real_control_backed_pair_settles_through_native_observation() {
 
 #[test]
 fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles() {
-    baseline_workflow_case(true, false);
+    baseline_workflow_case(true, None);
 }
 
 #[test]
 fn baseline_qualification_requires_the_independent_oracle_despite_lead_acceptance() {
-    baseline_workflow_case(false, false);
+    baseline_workflow_case(false, None);
 }
 
 #[test]
 fn baseline_qualification_consumes_an_independent_semantic_reviewer() {
-    baseline_workflow_case(true, true);
+    baseline_workflow_case(true, Some(SemanticReviewCase::Accept));
 }
 
-fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: bool) {
+#[test]
+fn baseline_qualification_rejects_a_substantive_semantic_finding() {
+    baseline_workflow_case(true, Some(SemanticReviewCase::Reject));
+}
+
+#[test]
+fn baseline_qualification_corrects_one_malformed_reviewer_result() {
+    baseline_workflow_case(true, Some(SemanticReviewCase::MalformedThenAccept));
+}
+
+#[test]
+fn baseline_qualification_refuses_an_unknown_semantic_judgment() {
+    baseline_workflow_case(true, Some(SemanticReviewCase::Unknown));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticReviewCase {
+    Accept,
+    Reject,
+    MalformedThenAccept,
+    Unknown,
+}
+
+fn baseline_workflow_case(
+    independent_acceptance_passes: bool,
+    review_case: Option<SemanticReviewCase>,
+) {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("qualification-native-frame");
     let launcher = std::path::PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
@@ -245,7 +271,8 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
     fs::write(&config, "model = 'gpt-6-astra'\nmodel_provider = 'openai'\nmodel_reasoning_effort = 'xhigh'\n[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n").unwrap();
     let prompt = fixture.spec.with_file_name("qualification-task.txt");
     fs::write(&prompt, "Read the frozen add-workload OpenSpec task and frame its implementation inside solution.txt and sleep_ms. Preserve its independent acceptance.").unwrap();
-    let reviewer = if semantic_review {
+    let review_run_id = format!("{}-semantic-review", spec["run"].as_str().unwrap());
+    let reviewer = review_case.map(|case| {
         let config = fixture
             .spec
             .with_file_name("qualification-review-config.toml");
@@ -262,17 +289,27 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
             "The submitted result must implement the frozen task and preserve its declared acceptance.\n",
         )
         .unwrap();
-        Some((
-            config,
-            criteria,
-            format!(
-                "{{\"run_id\":\"{}-semantic-review\",\"findings\":[],\"unresolved_issues\":[]}}",
-                spec["run"].as_str().unwrap()
+        let accepted = format!(
+            "{{\"run_id\":\"{review_run_id}\",\"findings\":[],\"unresolved_issues\":[]}}"
+        );
+        // The rejection finding binds a declared physical location in its
+        // evidence but paraphrases the content instead of quoting the line.
+        let initial = match case {
+            SemanticReviewCase::Accept => accepted.clone(),
+            SemanticReviewCase::Reject => format!(
+                "{{\"run_id\":\"{review_run_id}\",\"findings\":[{{\"path\":\"solution.txt\",\"line\":1,\"description\":\"the submitted content does not demonstrate the frozen workload result\",\"evidence\":\"solution.txt:1 is the only submitted content and shows no implemented result\"}}],\"unresolved_issues\":[]}}"
             ),
-        ))
-    } else {
-        None
-    };
+            SemanticReviewCase::MalformedThenAccept => format!(
+                "{{\"run_id\":\"{review_run_id}\",\"findings\":[{{\"path\":\"solution.txt\",\"line\":1,\"description\":\"the submitted content does not demonstrate the frozen workload result\"}}],\"unresolved_issues\":[]}}"
+            ),
+            SemanticReviewCase::Unknown => format!(
+                "{{\"run_id\":\"{review_run_id}\",\"findings\":[],\"unresolved_issues\":[\"the frozen task criterion cannot be judged from the supplied packet\"]}}"
+            ),
+        };
+        let corrected =
+            (case == SemanticReviewCase::MalformedThenAccept).then(|| accepted.clone());
+        (config, criteria, initial, corrected)
+    });
     spec["local_runner"] = Value::Null;
     spec["qualification"] = Value::Null;
     spec["baseline_qualification"] = json!({
@@ -289,7 +326,7 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         "workflow": {"schema":1,"lead_profile":"default","executor_profile":"ds","max_corrections":1,"capacity":2},
         "report": fixture.spec.with_file_name("qualification-result.txt")
     });
-    if let Some((config, criteria, _)) = &reviewer {
+    if let Some((config, criteria, _, _)) = &reviewer {
         spec["baseline_qualification"]["semantic_review"] = json!({
             "schema": 1,
             "runtime": {
@@ -380,11 +417,7 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
     assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
     fs::write(&receipt, original).unwrap();
 
-    let resume_turn = |role: &str, result: &str| {
-        let suffix = format!(
-            "attempt-{}",
-            fixture.cursor()["attempts"].as_array().unwrap().len() + 1
-        );
+    let resume_turn_with_suffix = |role: &str, result: &str, suffix: &str| {
         let output = fixture.improve_with_env(
             &["resume", "--run", fixture.run.to_str().unwrap()],
             &[
@@ -402,7 +435,7 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
                         "12345678-1234-4234-8234-123456789002"
                     },
                 ),
-                ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", suffix.as_str()),
+                ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", suffix),
                 (
                     "HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_TEXT",
                     if role == "correction" {
@@ -419,6 +452,13 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         );
         assert!(output.status.success(), "{}", text(&output));
         output
+    };
+    let resume_turn = |role: &str, result: &str| {
+        let suffix = format!(
+            "attempt-{}",
+            fixture.cursor()["attempts"].as_array().unwrap().len() + 1
+        );
+        resume_turn_with_suffix(role, result, &suffix)
     };
     let wait_last = || {
         let cursor = fixture.cursor();
@@ -483,8 +523,8 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         executor_session
     );
     wait_last();
-    if let Some((_, _, review_result)) = &reviewer {
-        resume_turn("lead-acceptance", review_result);
+    if let Some((_, _, initial_result, corrected_result)) = &reviewer {
+        resume_turn("lead-acceptance", initial_result);
         let cursor = fixture.cursor();
         assert_eq!(cursor["attempts"].as_array().unwrap().len(), 6, "{cursor}");
         let review_attempt = &cursor["attempts"][5];
@@ -493,8 +533,89 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         assert_eq!(review_attempt["model"], "deepseek-flash", "{cursor}");
         assert_eq!(review_attempt["state"], "started", "{cursor}");
         wait_last();
+        if let Some(corrected) = corrected_result {
+            let suffix = format!(
+                "attempt-{}",
+                fixture.cursor()["attempts"].as_array().unwrap().len() + 1
+            );
+            resume_turn_with_suffix("lead-acceptance", corrected, &suffix);
+            let cursor = fixture.cursor();
+            assert_eq!(cursor["attempts"].as_array().unwrap().len(), 7, "{cursor}");
+            let corrected_attempt = &cursor["attempts"][6];
+            assert_eq!(corrected_attempt["role"], "semantic-review", "{cursor}");
+            assert_eq!(corrected_attempt["state"], "started", "{cursor}");
+            wait_last();
+        }
     }
-    let expected_attempts = if semantic_review { 6 } else { 5 };
+    if review_case == Some(SemanticReviewCase::Unknown) {
+        let (_, _, unknown_result, _) = reviewer.as_ref().unwrap();
+        let refused = fixture.resume();
+        assert!(!refused.status.success(), "{}", text(&refused));
+        assert!(
+            text(&refused).contains("unresolved issues"),
+            "{}",
+            text(&refused)
+        );
+        let cursor = fixture.cursor();
+        assert_eq!(cursor["attempts"].as_array().unwrap().len(), 6, "{cursor}");
+        let review_attempt = &cursor["attempts"][5];
+        assert_eq!(review_attempt["state"], "completed", "{cursor}");
+        assert_eq!(
+            review_attempt["binding"]["session"], "12345678-1234-4234-8234-123456789003",
+            "{cursor}"
+        );
+        let retained =
+            std::path::PathBuf::from(review_attempt["retained"]["result"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(&retained).unwrap(),
+            unknown_result.as_str()
+        );
+        let qualification = &cursor["baseline_qualification"];
+        assert!(qualification["accepted"].is_null(), "{cursor}");
+        assert!(qualification["row"].is_null(), "{cursor}");
+        assert!(qualification["oracle"].is_null(), "{cursor}");
+        assert_eq!(
+            qualification["semantic_review"]["judgment_kind"], "unknown",
+            "{cursor}"
+        );
+        assert_eq!(qualification["semantic_review"]["findings"], 0, "{cursor}");
+        assert_eq!(
+            qualification["semantic_review"]["unresolved_issues"], 1,
+            "{cursor}"
+        );
+        let repeated = fixture.resume();
+        assert!(!repeated.status.success(), "{}", text(&repeated));
+        assert!(
+            text(&repeated).contains("unresolved issues"),
+            "{}",
+            text(&repeated)
+        );
+        let repeated_cursor = fixture.cursor();
+        assert_eq!(
+            repeated_cursor["attempts"].as_array().unwrap().len(),
+            6,
+            "{repeated_cursor}"
+        );
+        let repeated_attempt = &repeated_cursor["attempts"][5];
+        let repeated_retained =
+            std::path::PathBuf::from(repeated_attempt["retained"]["result"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(&repeated_retained).unwrap(),
+            unknown_result.as_str()
+        );
+        println!(
+            "semantic-review evidence: case=Unknown run_id={review_run_id} attempts=1 session=12345678-1234-4234-8234-123456789003 retained={} judgment=unknown accepted=null row=none",
+            retained.display()
+        );
+        let stopped = fixture.stop();
+        assert!(stopped.status.success(), "{}", text(&stopped));
+        return;
+    }
+    let expected_attempts = match review_case {
+        None => 5,
+        Some(SemanticReviewCase::MalformedThenAccept) => 7,
+        Some(_) => 6,
+    };
     let oracle_workspace = std::path::PathBuf::from(
         fixture.cursor()["baseline_qualification"]["task_workspace"]
             .as_str()
@@ -519,8 +640,10 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         changed_cursor["attempts"].as_array().unwrap().len(),
         expected_attempts
     );
-    if let Some((_, _, review_result)) = &reviewer {
-        let review_attempt = &changed_cursor["attempts"][5];
+    if let Some((_, _, initial_result, corrected_result)) = &reviewer {
+        let final_index = if corrected_result.is_some() { 6 } else { 5 };
+        let final_result = corrected_result.as_ref().unwrap_or(initial_result);
+        let review_attempt = &changed_cursor["attempts"][final_index];
         assert_eq!(review_attempt["state"], "completed", "{changed_cursor}");
         assert_eq!(
             review_attempt["binding"]["session"], "12345678-1234-4234-8234-123456789003",
@@ -528,14 +651,31 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         );
         let retained =
             std::path::PathBuf::from(review_attempt["retained"]["result"].as_str().unwrap());
+        assert_eq!(fs::read_to_string(retained).unwrap(), final_result.as_str());
+        let expected_kind = if review_case == Some(SemanticReviewCase::Reject) {
+            "reject"
+        } else {
+            "accept"
+        };
         assert_eq!(
-            fs::read_to_string(retained).unwrap(),
-            review_result.as_str()
-        );
-        assert_eq!(
-            changed_cursor["baseline_qualification"]["semantic_review"]["judgment_kind"], "accept",
+            changed_cursor["baseline_qualification"]["semantic_review"]["judgment_kind"],
+            expected_kind,
             "{changed_cursor}"
         );
+        if corrected_result.is_some() {
+            let first_attempt = &changed_cursor["attempts"][5];
+            assert_eq!(first_attempt["state"], "completed", "{changed_cursor}");
+            assert_eq!(
+                first_attempt["binding"]["session"], "12345678-1234-4234-8234-123456789003",
+                "{changed_cursor}"
+            );
+            let first_retained =
+                std::path::PathBuf::from(first_attempt["retained"]["result"].as_str().unwrap());
+            assert_eq!(
+                fs::read_to_string(first_retained).unwrap(),
+                initial_result.as_str()
+            );
+        }
     }
     fs::remove_file(&preserved).unwrap();
     let settled = fixture.resume();
@@ -547,18 +687,24 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
     assert_eq!(workflow["lead_accepted"], true);
     assert_eq!(workflow["corrections"].as_array().unwrap().len(), 1);
     assert_eq!(cursor["phase"], "baseline-qualification-recorded");
+    let review_rejects = review_case == Some(SemanticReviewCase::Reject);
+    let expected_accepted = independent_acceptance_passes && !review_rejects;
     assert_eq!(
         cursor["baseline_qualification"]["accepted"],
-        independent_acceptance_passes
+        expected_accepted
     );
     assert_ne!(lead_session, executor_session);
     let row_path =
         std::path::PathBuf::from(cursor["baseline_qualification"]["row"].as_str().unwrap());
     let row_bytes = fs::read(&row_path).unwrap();
     let row: Value = serde_json::from_slice(&row_bytes).unwrap();
-    let expected_native_runs = if semantic_review { 3 } else { 2 };
-    let expected_total_tokens = if semantic_review { 720 } else { 600 };
-    let expected_responses = if semantic_review { 6 } else { 5 };
+    let expected_native_runs = if review_case.is_some() { 3 } else { 2 };
+    let expected_responses = match review_case {
+        None => 5,
+        Some(SemanticReviewCase::MalformedThenAccept) => 7,
+        Some(_) => 6,
+    };
+    let expected_total_tokens = expected_responses * 120;
     assert_eq!(
         row["native_runs"].as_array().unwrap().len(),
         expected_native_runs
@@ -572,20 +718,25 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         row["checks"][0]["passed"], independent_acceptance_passes,
         "{row}"
     );
-    assert_eq!(row["accepted"], independent_acceptance_passes, "{row}");
-    if semantic_review {
+    assert_eq!(row["accepted"], expected_accepted, "{row}");
+    if review_case.is_some() {
         let semantic = row["checks"]
             .as_array()
             .unwrap()
             .iter()
             .find(|check| check["id"] == "independent-semantic-review")
             .expect("the row retains the independent semantic judgment");
-        assert_eq!(semantic["passed"], true, "{row}");
-        assert_eq!(semantic["findings"], 0, "{row}");
+        assert_eq!(semantic["executed"], true, "{row}");
+        assert_eq!(semantic["passed"], !review_rejects, "{row}");
+        assert_eq!(
+            semantic["findings"],
+            if review_rejects { 1 } else { 0 },
+            "{row}"
+        );
         assert_eq!(semantic["unresolved_issues"], 0, "{row}");
         assert_eq!(
             cursor["baseline_qualification"]["semantic_review"]["judgment_kind"],
-            "accept"
+            if review_rejects { "reject" } else { "accept" }
         );
     }
     let oracle_path =
@@ -603,8 +754,36 @@ fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: 
         fixture.cursor()["attempts"].as_array().unwrap().len(),
         expected_attempts
     );
-    assert_eq!(fs::read(row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
     assert_eq!(fs::read(oracle_path).unwrap(), oracle_bytes);
+    if let Some(case) = review_case {
+        let reviewer_attempts: Vec<&Value> = cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|attempt| attempt["role"] == "semantic-review")
+            .collect();
+        println!(
+            "semantic-review evidence: case={case:?} run_id={review_run_id} attempts={} sessions={} retained={} native_runs={} responses={} tokens={} judgment={} accepted={} row={}",
+            reviewer_attempts.len(),
+            reviewer_attempts
+                .iter()
+                .map(|attempt| attempt["binding"]["session"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(","),
+            reviewer_attempts
+                .iter()
+                .map(|attempt| attempt["retained"]["result"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(","),
+            expected_native_runs,
+            expected_responses,
+            expected_total_tokens,
+            if review_rejects { "reject" } else { "accept" },
+            expected_accepted,
+            row_path.display()
+        );
+    }
     let stopped = fixture.stop();
     assert!(stopped.status.success(), "{}", text(&stopped));
 }
