@@ -1134,6 +1134,14 @@ completed participant turn's bounded visible stream before a pool slot can be
 reused and keeps one explicit coverage record per turn. Missing, truncated,
 malformed or unavailable action coverage makes the packet incomplete and
 refuses reviewer dispatch or acceptance; it is never evidence of no effects.
+Every retained action is bound to its participant attempt, exact session and
+completed native turn. A nonempty action turn that disagrees with the stream's
+terminal turn is a coverage gap, not a retargeted action; only an item that
+truly omits a turn id inherits the exact completed turn. Command, file,
+web-search and MCP actions keep their bounded visible outcome, including MCP
+result content and an error or `result.isError` indication. A completed status
+alone is not a success verdict, and a visible tool-call shape whose outcome
+this stage cannot retain is an explicit gap rather than a bare type.
 A minimal synthetic declaration
 (paths and digests are placeholders):
 

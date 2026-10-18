@@ -21,6 +21,7 @@ pub(super) const MAX_ACTION_COMMAND_BYTES: usize = 2048;
 pub(super) const MAX_ACTION_TARGET_BYTES: usize = 512;
 pub(super) const MAX_ACTION_ARGUMENTS_BYTES: usize = 2048;
 pub(super) const MAX_ACTION_OUTPUT_BYTES: usize = 1024;
+pub(super) const MAX_ACTION_ERROR_BYTES: usize = 1024;
 const MAX_TEXT_BYTES: usize = 4096;
 pub(super) const MAX_RUN_ID_BYTES: usize = 200;
 pub(super) const MAX_PATH_BYTES: usize = 240;
@@ -131,6 +132,10 @@ pub(super) struct ReviewAction {
     pub exit_code: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Visible native error text or an explicit MCP `result.isError` marker.
+    /// A completed status alone is not treated as success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// A bounded field was shortened; the action identity and outcome remain
     /// intact and the truncation is explicit to the reviewer.
     #[serde(default)]
@@ -145,6 +150,11 @@ pub(super) struct ReviewActionCoverage {
     pub role: String,
     pub session: String,
     pub state: String,
+    /// The exact native turn the retained stream completed. Every action of a
+    /// complete coverage record must carry this identity; a foreign turn is a
+    /// gap, never a silent fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
     /// Digest of the retained raw bytes copied before the mutable pool slot
     /// could be reused; absent when no bytes were retained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -444,6 +454,13 @@ pub(super) fn validate_action_evidence(actions: &ReviewActions) -> io::Result<()
             &coverage.state,
             MAX_PATH_BYTES,
         )?;
+        if let Some(turn) = coverage.turn.as_deref() {
+            bounded_text(
+                &format!("action_coverage[{index}].turn"),
+                turn,
+                MAX_RUN_ID_BYTES,
+            )?;
+        }
         if coverage.attempt != participant.attempt
             || coverage.role != participant.role
             || coverage.session != participant.session
@@ -452,6 +469,11 @@ pub(super) fn validate_action_evidence(actions: &ReviewActions) -> io::Result<()
             return Err(invalid(format!(
                 "action_coverage[{index}] does not bind the exact participant turn {} role {} session {}",
                 participant.attempt, participant.role, participant.session
+            )));
+        }
+        if coverage.complete && coverage.turn.is_none() {
+            return Err(invalid(format!(
+                "action_coverage[{index}] is marked complete without the exact completed native turn identity"
             )));
         }
         if coverage.complete {
@@ -551,7 +573,21 @@ pub(super) fn validate_action_evidence(actions: &ReviewActions) -> io::Result<()
                 "action_evidence[{index}] does not bind the exact participant session and role of its coverage record"
             )));
         }
+        if coverage.complete {
+            let turn = coverage.turn.as_deref().ok_or_else(|| {
+                invalid(format!(
+                    "action_evidence[{index}] has a complete coverage record without an exact native turn identity"
+                ))
+            })?;
+            if action.turn.as_deref() != Some(turn) {
+                return Err(invalid(format!(
+                    "action_evidence[{index}] turn {:?} does not match the exact completed turn {turn:?} for attempt {}",
+                    action.turn, action.attempt
+                )));
+            }
+        }
         for (name, value, max) in [
+            ("turn", action.turn.as_deref(), MAX_RUN_ID_BYTES),
             ("tool", action.tool.as_deref(), MAX_PATH_BYTES),
             (
                 "command",
@@ -565,6 +601,7 @@ pub(super) fn validate_action_evidence(actions: &ReviewActions) -> io::Result<()
                 MAX_ACTION_ARGUMENTS_BYTES,
             ),
             ("output", action.output.as_deref(), MAX_ACTION_OUTPUT_BYTES),
+            ("error", action.error.as_deref(), MAX_ACTION_ERROR_BYTES),
         ] {
             if let Some(value) = value {
                 bounded_text(&format!("action_evidence[{index}].{name}"), value, max)?;
@@ -755,6 +792,82 @@ mod tests {
             br#"{"run_id":"wrong","findings":[],"unresolved_issues":[]}"#.as_slice(),
         ] {
             assert!(validate(output, "r", &files).is_err());
+        }
+    }
+
+    fn actions_with_turn(coverage_turn: Option<&str>, action_turn: Option<&str>) -> ReviewActions {
+        ReviewActions {
+            schema: 1,
+            run_id: "run-1".to_owned(),
+            task: "task".to_owned(),
+            submitted_revision: "a".repeat(40),
+            base_revision: "b".repeat(40),
+            writable_scope: vec!["solution.txt".to_owned()],
+            changed_paths: vec!["solution.txt".to_owned()],
+            worktree_clean: true,
+            report_sha256: "c".repeat(64),
+            participants: vec![ReviewParticipant {
+                attempt: "executor-1".to_owned(),
+                role: "executor".to_owned(),
+                session: "session-1".to_owned(),
+                profile: "ds".to_owned(),
+                state: "completed".to_owned(),
+            }],
+            action_evidence: vec![ReviewAction {
+                attempt: "executor-1".to_owned(),
+                role: "executor".to_owned(),
+                session: "session-1".to_owned(),
+                turn: action_turn.map(str::to_owned),
+                item: "cmd-1".to_owned(),
+                phase: "completed".to_owned(),
+                kind: "tool".to_owned(),
+                tool: Some("command".to_owned()),
+                command: Some("git status --short".to_owned()),
+                target: None,
+                arguments: None,
+                status: Some("completed".to_owned()),
+                exit_code: Some(0),
+                output: Some("clean".to_owned()),
+                error: None,
+                text_truncated: false,
+            }],
+            action_coverage: vec![ReviewActionCoverage {
+                attempt: "executor-1".to_owned(),
+                role: "executor".to_owned(),
+                session: "session-1".to_owned(),
+                state: "completed".to_owned(),
+                turn: coverage_turn.map(str::to_owned),
+                source_sha256: Some("d".repeat(64)),
+                source_bytes: 128,
+                retained_bytes: 128,
+                action_records: 1,
+                omitted_records: 0,
+                malformed_records: 0,
+                partial_records: 0,
+                terminal_events: 1,
+                truncated: false,
+                complete: true,
+                note: None,
+            }],
+            action_evidence_complete: true,
+        }
+    }
+
+    #[test]
+    fn complete_action_evidence_requires_the_exact_native_turn() {
+        assert!(
+            validate_action_evidence(&actions_with_turn(Some("turn-a"), Some("turn-a"))).is_ok()
+        );
+        for (coverage_turn, action_turn) in [
+            (Some("turn-a"), Some("turn-b")),
+            (Some("turn-a"), None),
+            (None, Some("turn-a")),
+            (None, None),
+        ] {
+            assert!(
+                validate_action_evidence(&actions_with_turn(coverage_turn, action_turn)).is_err(),
+                "coverage turn {coverage_turn:?} action turn {action_turn:?} must not be complete"
+            );
         }
     }
 }

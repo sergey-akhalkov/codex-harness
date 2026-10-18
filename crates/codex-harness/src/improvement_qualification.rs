@@ -562,6 +562,8 @@ struct ParsedActionStream {
     actions: Vec<assessment::ReviewAction>,
     parsed_actions: u64,
     omitted_actions: u64,
+    unsupported_actions: u64,
+    unsupported_shapes: Vec<String>,
     malformed_records: u64,
     partial_records: u64,
     terminal_events: u64,
@@ -831,6 +833,7 @@ fn completed_turn_identity(value: &Value) -> Option<String> {
         return value
             .pointer("/params/turn/id")
             .and_then(Value::as_str)
+            .filter(|turn| !turn.is_empty())
             .map(str::to_owned);
     }
     if value.get("type").and_then(Value::as_str) == Some("turn.completed") {
@@ -838,18 +841,39 @@ fn completed_turn_identity(value: &Value) -> Option<String> {
             .get("turn_id")
             .and_then(Value::as_str)
             .or_else(|| value.pointer("/turn/id").and_then(Value::as_str))
+            .filter(|turn| !turn.is_empty())
             .map(str::to_owned);
     }
     None
 }
 
+/// A tool-shaped item whose arguments/result are visible but whose native
+/// semantics this stage does not know. It is retained for diagnosis and marks
+/// the coverage incomplete; a bare type is never complete effect evidence.
+fn tool_like_item_type(normalized: &str) -> bool {
+    normalized.contains("call") || normalized.ends_with("tool")
+}
+
+/// The bounded visible text of an MCP error: its native message when present,
+/// otherwise the whole visible error value.
+fn mcp_error_text(value: &Value) -> String {
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| action_value_text(value))
+}
+
 /// Extract one bounded visible action from the control or bare exec item
-/// shape. Messages, reasoning and compaction items are never included.
+/// shape. Messages, reasoning and compaction items are never included. A
+/// nonempty event turn is preserved for attribution; only an item that omits
+/// turn identity falls back to the exact completed turn of its stream.
 fn action_from_event(
     value: &Value,
     record: &RetainedActionStream,
     line_number: usize,
-) -> Option<assessment::ReviewAction> {
+) -> Option<(assessment::ReviewAction, Option<String>)> {
     let (phase, item, event_turn) =
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             let phase = match method {
@@ -864,7 +888,8 @@ fn action_from_event(
                 .and_then(Value::as_str)
                 .or_else(|| value.pointer("/params/turn/id").and_then(Value::as_str))
                 .or_else(|| item.get("turnId").and_then(Value::as_str))
-                .or_else(|| item.get("turn_id").and_then(Value::as_str));
+                .or_else(|| item.get("turn_id").and_then(Value::as_str))
+                .filter(|turn| !turn.is_empty());
             (phase, item, turn)
         } else {
             let kind = value.get("type").and_then(Value::as_str)?;
@@ -880,7 +905,8 @@ fn action_from_event(
                 .and_then(Value::as_str)
                 .or_else(|| value.get("turnId").and_then(Value::as_str))
                 .or_else(|| item.get("turn_id").and_then(Value::as_str))
-                .or_else(|| item.get("turnId").and_then(Value::as_str));
+                .or_else(|| item.get("turnId").and_then(Value::as_str))
+                .filter(|turn| !turn.is_empty());
             (phase, item, turn)
         };
     let item_type = item
@@ -889,7 +915,9 @@ fn action_from_event(
         .unwrap_or("unknown");
     let normalized = item_type.to_ascii_lowercase();
     if normalized == "agentmessage"
+        || normalized == "agent_message"
         || normalized == "usermessage"
+        || normalized == "user_message"
         || normalized.contains("reasoning")
         || normalized.contains("compaction")
         || normalized.contains("compacted")
@@ -904,11 +932,13 @@ fn action_from_event(
         .unwrap_or_else(|| format!("unnamed-line-{}", line_number + 1));
     let item_id = bounded_action_text(&raw_item, assessment::MAX_RUN_ID_BYTES, &mut truncated);
     let mut kind = "item";
+    let mut unsupported_shape = None;
     let tool;
     let mut command = None;
     let mut target = None;
     let mut arguments = None;
     let mut output = None;
+    let mut error = None;
     match normalized.as_str() {
         "commandexecution" | "command_execution" => {
             kind = "tool";
@@ -951,6 +981,14 @@ fn action_from_event(
             {
                 arguments = Some(value.to_string());
             }
+            if let Some(value) = item.get("result").filter(|value| !value.is_null()) {
+                output = Some(value.to_string());
+            }
+            if let Some(value) = item.get("error").filter(|value| !value.is_null()) {
+                error = Some(mcp_error_text(value));
+            } else if item.pointer("/result/isError").and_then(Value::as_bool) == Some(true) {
+                error = Some("result.isError=true".to_owned());
+            }
         }
         "websearch" | "web_search" => {
             kind = "tool";
@@ -964,6 +1002,19 @@ fn action_from_event(
         }
         _ => {
             tool = Some(item_type.to_owned());
+            if tool_like_item_type(&normalized) {
+                kind = "tool";
+                if let Some(value) = item.get("arguments").filter(|value| !value.is_null()) {
+                    arguments = Some(value.to_string());
+                }
+                if let Some(value) = item.get("result").filter(|value| !value.is_null()) {
+                    output = Some(value.to_string());
+                }
+                if let Some(value) = item.get("error").filter(|value| !value.is_null()) {
+                    error = Some(mcp_error_text(value));
+                }
+                unsupported_shape = Some(item_type.to_owned());
+            }
         }
     }
     let status = item
@@ -976,45 +1027,51 @@ fn action_from_event(
         .and_then(Value::as_i64);
     let turn = event_turn
         .map(|turn| bounded_action_text(turn, assessment::MAX_RUN_ID_BYTES, &mut truncated));
-    Some(assessment::ReviewAction {
-        attempt: record.attempt.clone(),
-        role: record.role.clone(),
-        session: record.session.clone(),
-        turn,
-        item: item_id,
-        phase: phase.to_owned(),
-        kind: kind.to_owned(),
-        tool: tool
-            .map(|tool| bounded_action_text(&tool, assessment::MAX_PATH_BYTES, &mut truncated)),
-        command: command.map(|command| {
-            bounded_action_text(
-                &command,
-                assessment::MAX_ACTION_COMMAND_BYTES,
-                &mut truncated,
-            )
-        }),
-        target: target.map(|target| {
-            bounded_action_text(&target, assessment::MAX_ACTION_TARGET_BYTES, &mut truncated)
-        }),
-        arguments: arguments.map(|arguments| {
-            bounded_action_text(
-                &arguments,
-                assessment::MAX_ACTION_ARGUMENTS_BYTES,
-                &mut truncated,
-            )
-        }),
-        status,
-        exit_code,
-        output: output.map(|output| {
-            bounded_action_text(&output, assessment::MAX_ACTION_OUTPUT_BYTES, &mut truncated)
-        }),
-        text_truncated: truncated,
-    })
+    Some((
+        assessment::ReviewAction {
+            attempt: record.attempt.clone(),
+            role: record.role.clone(),
+            session: record.session.clone(),
+            turn,
+            item: item_id,
+            phase: phase.to_owned(),
+            kind: kind.to_owned(),
+            tool: tool
+                .map(|tool| bounded_action_text(&tool, assessment::MAX_PATH_BYTES, &mut truncated)),
+            command: command.map(|command| {
+                bounded_action_text(
+                    &command,
+                    assessment::MAX_ACTION_COMMAND_BYTES,
+                    &mut truncated,
+                )
+            }),
+            target: target.map(|target| {
+                bounded_action_text(&target, assessment::MAX_ACTION_TARGET_BYTES, &mut truncated)
+            }),
+            arguments: arguments.map(|arguments| {
+                bounded_action_text(
+                    &arguments,
+                    assessment::MAX_ACTION_ARGUMENTS_BYTES,
+                    &mut truncated,
+                )
+            }),
+            status,
+            exit_code,
+            output: output.map(|output| {
+                bounded_action_text(&output, assessment::MAX_ACTION_OUTPUT_BYTES, &mut truncated)
+            }),
+            error: error.map(|error| {
+                bounded_action_text(&error, assessment::MAX_ACTION_ERROR_BYTES, &mut truncated)
+            }),
+            text_truncated: truncated,
+        },
+        unsupported_shape,
+    ))
 }
 
 fn parse_action_stream(record: &RetainedActionStream, bytes: &[u8]) -> ParsedActionStream {
     let mut parsed = ParsedActionStream {
-        turn: record.observed_turn.clone(),
+        turn: record.observed_turn.clone().filter(|turn| !turn.is_empty()),
         ..ParsedActionStream::default()
     };
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -1057,10 +1114,18 @@ fn parse_action_stream(record: &RetainedActionStream, bytes: &[u8]) -> ParsedAct
             }
             parsed.turn = Some(turn);
         }
-        if let Some(mut action) = action_from_event(&value, record, index) {
+        if let Some((action, unsupported_shape)) = action_from_event(&value, record, index) {
             parsed.parsed_actions += 1;
-            if action.turn.is_none() {
-                action.turn = parsed.turn.clone();
+            if let Some(shape) = unsupported_shape {
+                parsed.unsupported_actions += 1;
+                let mut shape_truncated = false;
+                let shape =
+                    bounded_action_text(&shape, assessment::MAX_PATH_BYTES, &mut shape_truncated);
+                if parsed.unsupported_shapes.len() < 8
+                    && !parsed.unsupported_shapes.iter().any(|seen| seen == &shape)
+                {
+                    parsed.unsupported_shapes.push(shape);
+                }
             }
             if parsed.actions.len() < assessment::MAX_ACTION_RECORDS_PER_TURN {
                 parsed.actions.push(action);
@@ -1069,10 +1134,15 @@ fn parse_action_stream(record: &RetainedActionStream, bytes: &[u8]) -> ParsedAct
             }
         }
     }
-    if let Some(turn) = &parsed.turn {
+    // A known completed turn is the only supported fallback for an item that
+    // omits its own turn id. Any nonempty action turn that disagrees with it
+    // is a conflict: it is never silently retargeted to this attempt.
+    if let Some(turn) = parsed.turn.clone() {
         for action in &mut parsed.actions {
-            if action.turn.is_none() {
-                action.turn = Some(turn.clone());
+            match action.turn.as_deref() {
+                Some(action_turn) if action_turn != turn.as_str() => parsed.turn_conflict = true,
+                None => action.turn = Some(turn.clone()),
+                Some(_) => {}
             }
         }
     }
@@ -1147,6 +1217,17 @@ fn action_coverage_gap(
     if parsed.turn.is_none() {
         return Some("the retained action stream names no exact native turn identity".to_owned());
     }
+    if parsed.unsupported_actions != 0 {
+        let shapes = if parsed.unsupported_shapes.is_empty() {
+            "unnamed".to_owned()
+        } else {
+            parsed.unsupported_shapes.join(", ")
+        };
+        return Some(format!(
+            "{} visible tool event(s) use a shape whose bounded outcome this qualification stage cannot retain ({shapes}); the action view is incomplete",
+            parsed.unsupported_actions
+        ));
+    }
     None
 }
 
@@ -1204,6 +1285,7 @@ fn review_action_evidence(
             role: participant.role.clone(),
             session: participant.session.clone(),
             state: participant.state.clone(),
+            turn: None,
             source_sha256: None,
             source_bytes: 0,
             retained_bytes: 0,
@@ -1289,6 +1371,7 @@ fn review_action_evidence(
             continue;
         }
         let parsed = parse_action_stream(&record, &bytes);
+        entry.turn = parsed.turn.clone();
         entry.malformed_records = parsed.malformed_records;
         entry.partial_records = parsed.partial_records;
         entry.terminal_events = parsed.terminal_events;
@@ -3138,4 +3221,196 @@ fn prepare(
     prepare_semantic_review(run, inputs, state, &runtime)?;
     prepare_oracle_workspace(run, inputs, state, &runtime)?;
     Ok(runtime)
+}
+
+#[cfg(test)]
+mod action_evidence_tests {
+    use super::*;
+
+    fn retained_stream(turn: Option<&str>, stream: &str) -> RetainedActionStream {
+        RetainedActionStream {
+            schema: ACTION_EVIDENCE_SCHEMA,
+            attempt: "executor-1".to_owned(),
+            role: "executor".to_owned(),
+            session: "session-1".to_owned(),
+            source: None,
+            captured: true,
+            source_bytes: stream.len() as u64,
+            retained_bytes: stream.len() as u64,
+            source_sha256: Some("0".repeat(64)),
+            truncated: false,
+            observed_events: Some(stream.trim_end_matches('\n').lines().count() as u64),
+            observed_malformed: Some(0),
+            observed_rounds: Some(1),
+            observed_turn: turn.map(str::to_owned),
+            note: None,
+        }
+    }
+
+    fn parse(record: &RetainedActionStream, stream: &str) -> ParsedActionStream {
+        parse_action_stream(record, stream.as_bytes())
+    }
+
+    #[test]
+    fn foreign_action_turn_is_a_gap_and_omitted_turn_uses_the_completed_turn() {
+        let owned = concat!(
+            r#"{"method":"item/completed","params":{"turnId":"turn-owned","item":{"id":"cmd-owned","type":"commandExecution","command":"git status --short","status":"completed","exitCode":0,"aggregatedOutput":" M solution.txt\n"}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-owned","status":"completed"}}}"#,
+            "\n",
+        );
+        let owned_record = retained_stream(Some("turn-owned"), owned);
+        let complete = parse(&owned_record, owned);
+        assert_eq!(complete.actions[0].turn.as_deref(), Some("turn-owned"));
+        assert!(action_coverage_gap(&owned_record, &complete).is_none());
+
+        let omitted = concat!(
+            r#"{"method":"item/completed","params":{"item":{"id":"cmd-omitted","type":"commandExecution","command":"git status --short","status":"completed","exitCode":0}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-owned","status":"completed"}}}"#,
+            "\n",
+        );
+        let omitted_record = retained_stream(None, omitted);
+        let inherited = parse(&omitted_record, omitted);
+        assert_eq!(
+            inherited.actions[0].turn.as_deref(),
+            Some("turn-owned"),
+            "an item that truly omits a turn id uses the exact completed turn"
+        );
+        assert!(action_coverage_gap(&omitted_record, &inherited).is_none());
+
+        let foreign = concat!(
+            r#"{"method":"item/completed","params":{"turnId":"turn-foreign","item":{"id":"cmd-foreign","type":"commandExecution","command":"git status --short","status":"completed","exitCode":0}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-owned","status":"completed"}}}"#,
+            "\n",
+        );
+        let foreign_record = retained_stream(Some("turn-owned"), foreign);
+        let conflict = parse(&foreign_record, foreign);
+        assert!(conflict.turn_conflict);
+        assert_eq!(
+            conflict.actions[0].turn.as_deref(),
+            Some("turn-foreign"),
+            "the foreign turn is preserved, not retargeted"
+        );
+        let gap = action_coverage_gap(&foreign_record, &conflict).unwrap();
+        assert!(gap.contains("disagree on the exact turn identity"), "{gap}");
+    }
+
+    #[test]
+    fn mcp_outcomes_retain_result_and_error_but_completed_status_is_not_a_verdict() {
+        let success = concat!(
+            r#"{"method":"item/completed","params":{"turnId":"turn-mcp","item":{"id":"mcp-ok","type":"mcpToolCall","server":"serena","tool":"read_file","status":"completed","arguments":{"path":"solution.txt"},"result":{"content":[{"type":"text","text":"read ok"}],"isError":false}}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-mcp","status":"completed"}}}"#,
+            "\n",
+        );
+        let success_record = retained_stream(Some("turn-mcp"), success);
+        let success = parse(&success_record, success);
+        let action = &success.actions[0];
+        assert_eq!(action.tool.as_deref(), Some("serena.read_file"));
+        assert!(
+            action
+                .arguments
+                .as_deref()
+                .unwrap_or_default()
+                .contains("solution.txt")
+        );
+        assert!(
+            action
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("read ok")
+        );
+        assert!(action.error.is_none());
+        assert!(action_coverage_gap(&success_record, &success).is_none());
+
+        let failed = concat!(
+            r#"{"method":"item/completed","params":{"turnId":"turn-mcp","item":{"id":"mcp-error","type":"mcpToolCall","server":"board","tool":"move","status":"completed","arguments":{"id":"card-1"},"result":{"content":[],"isError":true},"error":{"message":"permission denied"}}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-mcp","status":"completed"}}}"#,
+            "\n",
+        );
+        let failed_record = retained_stream(Some("turn-mcp"), failed);
+        let failed = parse(&failed_record, failed);
+        let action = &failed.actions[0];
+        assert_eq!(action.status.as_deref(), Some("completed"));
+        assert!(
+            action
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("isError")
+        );
+        assert!(
+            action
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("permission denied")
+        );
+        assert!(action_coverage_gap(&failed_record, &failed).is_none());
+
+        let marker = concat!(
+            r#"{"method":"item/completed","params":{"turnId":"turn-mcp","item":{"id":"mcp-marker","type":"mcpToolCall","server":"board","tool":"move","status":"completed","result":{"content":[],"isError":true}}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-mcp","status":"completed"}}}"#,
+            "\n",
+        );
+        let marker_record = retained_stream(Some("turn-mcp"), marker);
+        let marker = parse(&marker_record, marker);
+        assert_eq!(
+            marker.actions[0].error.as_deref(),
+            Some("result.isError=true")
+        );
+        assert!(action_coverage_gap(&marker_record, &marker).is_none());
+    }
+
+    #[test]
+    fn unsupported_tool_shapes_gap_while_messages_and_non_tools_are_filtered() {
+        let unsupported = concat!(
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"collab-1","type":"collabToolCall","status":"completed","arguments":{"receiver":"child"},"result":{"content":[]}}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-a","status":"completed"}}}"#,
+            "\n",
+        );
+        let unsupported_record = retained_stream(Some("turn-a"), unsupported);
+        let unsupported = parse(&unsupported_record, unsupported);
+        let action = &unsupported.actions[0];
+        assert_eq!(action.kind, "tool");
+        assert_eq!(action.tool.as_deref(), Some("collabToolCall"));
+        let gap = action_coverage_gap(&unsupported_record, &unsupported).unwrap();
+        assert!(gap.contains("cannot retain"), "{gap}");
+        assert!(gap.contains("collabToolCall"), "{gap}");
+
+        let benign = concat!(
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"plan-1","type":"todoList","status":"completed","items":[{"text":"work"}]}}}"#,
+            "\n",
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"msg-1","type":"agent_message","text":"private message"}}}"#,
+            "\n",
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"msg-2","type":"user_message","text":"private input"}}}"#,
+            "\n",
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"msg-3","type":"agentMessage","text":"private message"}}}"#,
+            "\n",
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"msg-4","type":"userMessage","text":"private input"}}}"#,
+            "\n",
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"reason-1","type":"reasoning","text":"opaque"}}}"#,
+            "\n",
+            r#"{"method":"item/completed","params":{"turnId":"turn-a","item":{"id":"compact-1","type":"compaction","text":"opaque"}}}"#,
+            "\n",
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-a","status":"completed"}}}"#,
+            "\n",
+        );
+        let benign_record = retained_stream(None, benign);
+        let benign = parse(&benign_record, benign);
+        assert_eq!(
+            benign.actions.len(),
+            1,
+            "only the non-message todo item is retained"
+        );
+        assert_eq!(benign.actions[0].tool.as_deref(), Some("todoList"));
+        assert_eq!(benign.actions[0].kind, "item");
+        assert!(action_coverage_gap(&benign_record, &benign).is_none());
+    }
 }

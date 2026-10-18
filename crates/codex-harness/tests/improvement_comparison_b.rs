@@ -711,6 +711,12 @@ fn baseline_workflow_case_with(
             assert_eq!(coverage["role"], participant["role"], "{actions}");
             assert_eq!(coverage["session"], participant["session"], "{actions}");
             assert_eq!(coverage["complete"], true, "{actions}");
+            assert!(
+                coverage["turn"]
+                    .as_str()
+                    .is_some_and(|turn| !turn.is_empty()),
+                "every complete coverage record names its exact completed turn: {actions}"
+            );
             assert_eq!(coverage["malformed_records"], 0, "{actions}");
             assert_eq!(coverage["partial_records"], 0, "{actions}");
             assert_eq!(coverage["omitted_records"], 0, "{actions}");
@@ -766,6 +772,15 @@ fn baseline_workflow_case_with(
                 .unwrap_or_default()
                 .contains("solution.txt"),
             "{actions}"
+        );
+        let executor_coverage = coverage
+            .iter()
+            .find(|entry| entry["attempt"] == "executor-1")
+            .expect("the executor turn keeps its coverage record");
+        assert_eq!(
+            executor_coverage["turn"].as_str(),
+            Some(executor_turn.as_str()),
+            "the coverage record and every executor action share the exact completed turn: {actions}"
         );
         println!(
             "semantic action evidence: run_id={} complete={} participants={} coverage={} action={}",
