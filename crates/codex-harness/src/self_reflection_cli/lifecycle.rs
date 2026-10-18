@@ -5,8 +5,8 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ActivationRequest, DeliveryState as RecordedDeliveryState, JournalPolicy, LifecycleStatus,
-    ReflectionController, ReflectionRecord, StageState as RecordedStageState,
+    ActivationRequest, BindingStatus, DeliveryState as RecordedDeliveryState, JournalPolicy,
+    LifecycleStatus, ReflectionController, ReflectionRecord, StageState as RecordedStageState,
 };
 
 const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\nRun enable/process/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
@@ -310,18 +310,33 @@ fn request(
 }
 
 fn process(options: &Options, controller: &ReflectionController, quiet: bool) -> io::Result<i32> {
+    let idle = || {
+        if quiet {
+            Ok(0)
+        } else {
+            status(controller, &options.home)
+        }
+    };
     let Some(state) = controller.stored_state()? else {
-        return status(controller, &options.home);
+        return idle();
     };
     if state.lifecycle != LifecycleStatus::Active {
-        return status(controller, &options.home);
+        return idle();
     }
     let lead = options.lead()?;
     let checked = controller.check_active_binding(&lead, None)?;
     if !checked.is_active() {
+        if matches!(
+            checked.status,
+            BindingStatus::Inactive | BindingStatus::Stopped
+        ) {
+            return idle();
+        }
         return Err(invalid(checked.detail));
     }
-    let polled = controller.poll()?;
+    let Some(polled) = controller.poll_if_active()? else {
+        return idle();
+    };
     if let Some(recovery) = polled.recovery {
         return Err(invalid(format!(
             "the board needs reconciliation: {}",

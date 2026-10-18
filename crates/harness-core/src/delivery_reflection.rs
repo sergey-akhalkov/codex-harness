@@ -901,6 +901,12 @@ pub struct PollReceipt {
     pub refusals: Vec<EventRefusal>,
 }
 
+enum PollOutcome {
+    Inactive,
+    Stopped,
+    Receipt(Box<PollReceipt>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StopReceipt {
     pub binding_id: String,
@@ -1428,16 +1434,35 @@ impl ReflectionController {
     /// Reads new committed closures without launching a model. Any recovery
     /// condition stops consumption at the retained checkpoint.
     pub fn poll(&self) -> io::Result<PollReceipt> {
+        match self.poll_outcome()? {
+            PollOutcome::Receipt(receipt) => Ok(*receipt),
+            PollOutcome::Inactive => Err(conflict(
+                "delivery reflection is inactive; activate it before polling",
+            )),
+            PollOutcome::Stopped => Err(conflict(
+                "delivery reflection is stopped; activate it before polling",
+            )),
+        }
+    }
+
+    /// Polls while the lifecycle is retained and active. A normal stop observed
+    /// before any stage dispatch is a typed no-op, not a failed consumer.
+    pub fn poll_if_active(&self) -> io::Result<Option<PollReceipt>> {
+        match self.poll_outcome()? {
+            PollOutcome::Receipt(receipt) => Ok(Some(*receipt)),
+            PollOutcome::Inactive | PollOutcome::Stopped => Ok(None),
+        }
+    }
+
+    fn poll_outcome(&self) -> io::Result<PollOutcome> {
         let current = self.current_source()?;
         let path = self.state_path(&current);
         let _lock = self.lock(&path)?;
-        let mut state = self.read_state_at(&path)?.ok_or_else(|| {
-            conflict("delivery reflection is inactive; activate it before polling")
-        })?;
+        let Some(mut state) = self.read_state_at(&path)? else {
+            return Ok(PollOutcome::Inactive);
+        };
         if state.lifecycle != LifecycleStatus::Active {
-            return Err(conflict(
-                "delivery reflection is stopped; activate it before polling",
-            ));
+            return Ok(PollOutcome::Stopped);
         }
         if state.recovery.is_none() && !state.source.same_scope(&current) {
             let kind = if normalize(&state.source.project_id) == normalize(&current.project_id)
@@ -1475,7 +1500,7 @@ impl ReflectionController {
         }
         if let Some(recovery) = &state.recovery {
             self.write_state_at(&path, &state)?;
-            return Ok(poll_receipt(
+            return Ok(PollOutcome::Receipt(Box::new(poll_receipt(
                 &state,
                 0,
                 0,
@@ -1483,7 +1508,7 @@ impl ReflectionController {
                 0,
                 Vec::new(),
                 Some(recovery.clone()),
-            ));
+            ))));
         }
         let page = match self.tail(state.checkpoint, state.limits.max_events_per_poll) {
             Ok(page) => page,
@@ -1501,7 +1526,7 @@ impl ReflectionController {
                     None,
                 )?;
                 self.write_state_at(&path, &state)?;
-                return Ok(poll_receipt(
+                return Ok(PollOutcome::Receipt(Box::new(poll_receipt(
                     &state,
                     0,
                     0,
@@ -1509,7 +1534,7 @@ impl ReflectionController {
                     0,
                     Vec::new(),
                     Some(state.recovery.clone().expect("recovery was set")),
-                ));
+                ))));
             }
         };
         if let Some((floor, head)) = page.truncated {
@@ -1526,7 +1551,7 @@ impl ReflectionController {
                 Some(head),
             )?;
             self.write_state_at(&path, &state)?;
-            return Ok(poll_receipt(
+            return Ok(PollOutcome::Receipt(Box::new(poll_receipt(
                 &state,
                 0,
                 0,
@@ -1534,7 +1559,7 @@ impl ReflectionController {
                 0,
                 Vec::new(),
                 Some(state.recovery.clone().expect("recovery was set")),
-            ));
+            ))));
         }
         let events_seen = page.events.len() as u64;
         let mut accepted = 0u64;
@@ -1646,7 +1671,7 @@ impl ReflectionController {
         let jobs = pending_jobs_from_state(&state);
         let recovery = state.recovery.clone();
         self.write_state_at(&path, &state)?;
-        Ok(poll_receipt(
+        Ok(PollOutcome::Receipt(Box::new(poll_receipt(
             &state,
             accepted,
             ignored,
@@ -1654,7 +1679,7 @@ impl ReflectionController {
             events_seen,
             jobs,
             recovery,
-        ))
+        ))))
     }
 
     fn pause_for_recovery(
