@@ -599,44 +599,26 @@ fn bounded_triage_counts_once_and_excludes_diagnostics() {
     board.drop();
 }
 
-/// Two friction episodes from one synthetic executor session stay distinct
-/// feedback identities. The board stores the reporter label, not a process
-/// handle; the test process supplies the exact pid/creation identity that must
-/// stay live across recording, triage and replay.
-#[cfg(windows)]
+/// Two friction episodes from one synthetic reporter stay distinct feedback
+/// identities through recording, triage and replay. This exercises board
+/// bookkeeping only; real managed-session continuity is evidenced separately
+/// through board feedback, not by the Rust test process.
 #[test]
-fn same_executor_two_episodes_keep_distinct_identity_and_live_session() {
-    use harness_core::process_service::{ServiceProcess, current_user};
-
-    let board = Board::new("same-executor-episodes");
-    let program = std::env::current_exe().unwrap().canonicalize().unwrap();
-    let user = current_user().unwrap();
-    let session = ServiceProcess::observe(std::process::id(), &program, 0, &user).unwrap();
-    let identity = session.identity();
-    assert!(session.is_running().unwrap());
-    let reporter = format!("executor-{}-{}", identity.pid, identity.creation_time);
+fn same_reporter_episodes_keep_identity_through_triage_and_replay() {
+    let board = Board::new("same-reporter-episodes");
+    let reporter = "executor-a";
 
     let first = board.record(
         "executor dispatch waited after tool output",
-        &reporter,
+        reporter,
         "dispatch-wait-1",
         "executor",
     );
-    assert!(
-        ServiceProcess::inspect(identity, &program, &user)
-            .unwrap()
-            .is_some_and(|process| process.is_running().unwrap())
-    );
     let second = board.record(
         "the same dispatch wait recurred on a second assignment",
-        &reporter,
+        reporter,
         "dispatch-wait-2",
         "executor",
-    );
-    assert!(
-        ServiceProcess::inspect(identity, &program, &user)
-            .unwrap()
-            .is_some_and(|process| process.is_running().unwrap())
     );
     assert_ne!(first, second);
 
@@ -762,12 +744,6 @@ fn same_executor_two_episodes_keep_distinct_identity_and_live_session() {
         "{ledger}"
     );
 
-    // Recording, triage and replay never replace or stop the original session.
-    assert!(
-        ServiceProcess::inspect(identity, &program, &user)
-            .unwrap()
-            .is_some_and(|process| process.is_running().unwrap())
-    );
     board.drop();
 }
 
