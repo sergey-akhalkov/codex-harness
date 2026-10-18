@@ -1846,7 +1846,7 @@ fn ensure_review_packet(
         sources.push(identity);
     }
 
-    let participants = workflow_review_participants(run)?;
+    let participants = workflow_review_participants(run, state)?;
     let (action_evidence, action_coverage, action_evidence_complete) =
         review_action_evidence(run, &participants)?;
     let actions = assessment::ReviewActions {
@@ -2239,7 +2239,50 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(&temp, path)
 }
 
-fn workflow_review_participants(run: &Run) -> io::Result<Vec<assessment::ReviewParticipant>> {
+fn verified_unsubmitted_lead_frame(
+    attempt: &Attempt,
+    state: &BaselineQualificationState,
+    consumer: &str,
+) -> io::Result<bool> {
+    if attempt.role != AttemptRole::LeadFrame || attempt.state != AttemptState::Failed {
+        return Ok(false);
+    }
+    // Only a superseded initial framing turn may be excluded. The active frame
+    // and the bounded format correction remain required participants whenever
+    // they did not complete.
+    if state.workflow.lead_frame.as_deref() == Some(attempt.id.as_str())
+        || state.workflow.lead_frame_correction.as_deref() == Some(attempt.id.as_str())
+    {
+        return Ok(false);
+    }
+    let Some(evidence) = attempt
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.pre_submission)
+    else {
+        return Ok(false);
+    };
+    let Some(retained) = attempt.retained.as_ref() else {
+        return Err(invalid(format!(
+            "the failed lead frame {} records pre-submission evidence ({}) but its retained terminal evidence is missing; {consumer}",
+            attempt.id,
+            evidence.reason()
+        )));
+    };
+    retained.verify().map_err(|fault| {
+        invalid(format!(
+            "the failed lead frame {} records pre-submission evidence ({}) but its retained terminal evidence does not verify ({fault:?}); {consumer}",
+            attempt.id,
+            evidence.reason()
+        ))
+    })?;
+    Ok(true)
+}
+
+fn workflow_review_participants(
+    run: &Run,
+    state: &BaselineQualificationState,
+) -> io::Result<Vec<assessment::ReviewParticipant>> {
     let mut participants = Vec::new();
     for attempt in &run.cursor.attempts {
         if !matches!(
@@ -2253,6 +2296,13 @@ fn workflow_review_participants(run: &Run) -> io::Result<Vec<assessment::ReviewP
             continue;
         }
         if attempt.state != AttemptState::Completed {
+            if verified_unsubmitted_lead_frame(
+                attempt,
+                state,
+                "the semantic review packet cannot bind incomplete participants",
+            )? {
+                continue;
+            }
             return Err(invalid(
                 "a lead or executor turn is unresolved; the semantic review packet cannot bind incomplete participants",
             ));
@@ -2317,7 +2367,7 @@ fn verify_review_packet(
             "the semantic review action evidence does not bind the committed submission, scope and report",
         ));
     }
-    if actions.participants != workflow_review_participants(run)? {
+    if actions.participants != workflow_review_participants(run, state)? {
         return Err(invalid(
             "the semantic review action evidence does not match the exact retained lead and executor turns",
         ));
@@ -2634,12 +2684,19 @@ fn finalize(
         ) {
             continue;
         }
-        let identity = participant(turn)?;
         if turn.state != AttemptState::Completed {
+            if verified_unsubmitted_lead_frame(
+                turn,
+                state,
+                "no complete workflow cost can be recorded",
+            )? {
+                continue;
+            }
             return Err(invalid(
                 "a participant turn is unresolved; no complete workflow cost can be recorded",
             ));
         }
+        let identity = participant(turn)?;
         retained_result(turn)?;
         participants.entry(identity.session).or_default().push(turn);
     }
