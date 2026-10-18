@@ -2040,19 +2040,35 @@ mod native {
 
     #[test]
     fn heavy_aggregate_admits_two_caller_sessions_without_weakening_containment() {
-        let root = root("heavy-aggregate-sessions");
+        exercise_two_caller_sessions(true);
+    }
+
+    fn exercise_two_caller_sessions(permit_caller_breakaway: bool) {
+        let scenario = if permit_caller_breakaway {
+            "breakaway"
+        } else {
+            "inherited"
+        };
+        let root = root(&format!("heavy-aggregate-{scenario}-sessions"));
         let account = canonical_account(&root, "account");
         let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
         let aggregate = HeavyAggregate::acquire(&account, AGGREGATE_LIMIT).unwrap();
-        // Each named Job models a dispatching caller branch that permits its
-        // heavy payload to leave that branch. The payload must still join the
-        // shared CPU, aggregate and lifecycle jobs.
-        let session_one_name = format!("Harness.Process.Session.{}.one", std::process::id());
-        let session_two_name = format!("Harness.Process.Session.{}.two", std::process::id());
+        // Each named Job models a dispatching caller branch. Breakaway-enabled
+        // sessions let payloads leave that branch; inherited sessions do not.
+        let session_one_name = format!(
+            "Harness.Process.Session.{}.{scenario}.one",
+            std::process::id()
+        );
+        let session_two_name = format!(
+            "Harness.Process.Session.{}.{scenario}.two",
+            std::process::id()
+        );
         let session_one = Job::new_named(Limits::default(), &session_one_name).unwrap();
-        allow_breakaway(&session_one_name);
         let session_two = Job::new_named(Limits::default(), &session_two_name).unwrap();
-        allow_breakaway(&session_two_name);
+        if permit_caller_breakaway {
+            allow_breakaway(&session_one_name);
+            allow_breakaway(&session_two_name);
+        }
         let release = root.join("release");
         let ready_one = root.join("one.ready.json");
         let final_one = root.join("one.final.json");
@@ -2093,59 +2109,97 @@ mod native {
         std::fs::write(&release, b"release").unwrap();
         let outcome_one = run(session_one, &worker_one);
         let outcome_two = run(session_two, &worker_two);
-        for (label, outcome) in [("first", &outcome_one), ("second", &outcome_two)] {
-            assert_eq!(
-                (outcome.reason, outcome.exit_code, outcome.process_exit_code),
-                (StopReason::Exited, 0, 0),
-                "{label} worker did not complete normally"
-            );
-        }
         let stderr_one = std::fs::read_to_string(&stderr_one).unwrap_or_default();
         let stderr_two = std::fs::read_to_string(&stderr_two).unwrap_or_default();
         let detail = format!(
-            "first={}\nsecond={}\nfirst outcome={outcome_one:?}\nsecond outcome={outcome_two:?}\nfirst stderr={stderr_one}\nsecond stderr={stderr_two}",
+            "scenario={scenario}\nfirst={}\nsecond={}\nfirst outcome={outcome_one:?}\nsecond outcome={outcome_two:?}\nfirst stderr={stderr_one}\nsecond stderr={stderr_two}",
             first.1, second.1
         );
         assert!(
             first.0,
             "the first session did not start its payload: {detail}"
         );
-        assert!(
-            second.0,
-            "the second sibling session could not start the same aggregate: {detail}"
-        );
-        for (label, ready) in [("first", &first.1), ("second", &second.1)] {
+        for field in ["cpu", "aggregate", "lifecycle"] {
             assert_eq!(
-                ready["cpu"], true,
-                "{label} left the shared CPU job: {detail}"
-            );
-            assert_eq!(
-                ready["aggregate"], true,
-                "{label} left the aggregate: {detail}"
-            );
-            assert_eq!(
-                ready["lifecycle"], true,
-                "{label} left its lifecycle job: {detail}"
-            );
-            assert_eq!(
-                ready["session"], false,
-                "{label} stayed in the caller branch: {detail}"
-            );
-            assert_eq!(
-                ready["caller_session"], true,
-                "{label} caller branch was not observed: {detail}"
+                first.1[field], true,
+                "first left its required {field} job: {detail}"
             );
         }
-        let final_one = wait_for_json(&final_one);
-        let final_two = wait_for_json(&final_two);
-        for (label, final_value) in [("first", final_one), ("second", final_two)] {
-            assert_eq!(
-                final_value["cancelled"], true,
-                "{label} lifecycle did not cancel its payload: {detail}"
+        if permit_caller_breakaway {
+            assert!(
+                second.0,
+                "the second sibling session could not start the same aggregate: {detail}"
+            );
+            for (label, outcome) in [("first", &outcome_one), ("second", &outcome_two)] {
+                assert_eq!(
+                    (outcome.reason, outcome.exit_code, outcome.process_exit_code),
+                    (StopReason::Exited, 0, 0),
+                    "{label} worker did not complete normally: {detail}"
+                );
+            }
+            for (label, ready) in [("first", &first.1), ("second", &second.1)] {
+                assert_eq!(
+                    ready["session"], false,
+                    "{label} stayed in the caller branch: {detail}"
+                );
+                assert_eq!(
+                    ready["caller_session"], true,
+                    "{label} caller branch was not observed: {detail}"
+                );
+            }
+            for (label, final_value) in [
+                ("first", wait_for_json(&final_one)),
+                ("second", wait_for_json(&final_two)),
+            ] {
+                assert_eq!(
+                    final_value["cancelled"], true,
+                    "{label} lifecycle did not cancel its payload: {detail}"
+                );
+                assert_eq!(
+                    final_value["remaining"], 0,
+                    "{label} left a lifecycle member: {detail}"
+                );
+            }
+        } else {
+            assert!(
+                !second.0,
+                "the non-breakaway second session unexpectedly started: {detail}"
+            );
+            assert_eq!(second.1["stage"], "error", "{detail}");
+            let second_error = second.1["error"].as_str().unwrap_or_default();
+            assert!(
+                second_error.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK")
+                    && second_error.contains("another caller branch"),
+                "the failure did not name the caller-Job capability boundary: {detail}"
             );
             assert_eq!(
-                final_value["remaining"], 0,
-                "{label} left a lifecycle member: {detail}"
+                (
+                    outcome_one.reason,
+                    outcome_one.exit_code,
+                    outcome_one.process_exit_code
+                ),
+                (StopReason::Exited, 0, 0),
+                "the first worker did not complete normally: {detail}"
+            );
+            assert_eq!(
+                (
+                    outcome_two.reason,
+                    outcome_two.exit_code,
+                    outcome_two.process_exit_code
+                ),
+                (StopReason::Exited, 17, 17),
+                "the rejected second worker did not fail closed: {detail}"
+            );
+            assert_eq!(first.1["session"], true, "{detail}");
+            assert_eq!(first.1["caller_session"], true, "{detail}");
+            let final_one = wait_for_json(&final_one);
+            assert_eq!(
+                final_one["cancelled"], true,
+                "first lifecycle did not cancel after the rejected sibling: {detail}"
+            );
+            assert_eq!(
+                final_one["remaining"], 0,
+                "first lifecycle left a member after the rejected sibling: {detail}"
             );
         }
         assert_eq!(
@@ -2156,12 +2210,18 @@ mod native {
         record(
             &root.join("verified.json"),
             json!({
+                "scenario": scenario,
                 "sessions": [session_one_name, session_two_name],
                 "first": first.1,
                 "second": second.1,
                 "cancelled": true,
             }),
         );
+    }
+
+    #[test]
+    fn heavy_aggregate_fails_closed_for_two_nonbreakaway_caller_branches() {
+        exercise_two_caller_sessions(false);
     }
 
     #[test]

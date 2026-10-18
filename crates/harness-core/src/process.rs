@@ -1936,7 +1936,18 @@ mod windows {
                 lifecycle.handle.as_raw_handle(),
             ];
             let list = if cpu.is_some() { &jobs[..] } else { &jobs[1..] };
-            spawn_suspended_in(list, command, None, caller_allows_breakaway()?)
+            let breakaway = caller_allows_breakaway()?;
+            spawn_suspended_in(list, command, None, breakaway).map_err(|error| {
+                if !breakaway && error.kind() == io::ErrorKind::PermissionDenied {
+                    return io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; the caller is not in a Job that permits JOB_OBJECT_LIMIT_BREAKAWAY_OK. If the shared aggregate is already nested below another caller branch, Windows rejects this join; run the caller from a Job that permits breakaway or serialize this heavy-command account"
+                        ),
+                    );
+                }
+                error
+            })
         }
     }
 }
