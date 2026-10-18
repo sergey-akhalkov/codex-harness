@@ -365,6 +365,17 @@ checkpoint, pending work, recovery state and the controller's verified process
 liveness and log location. Disable prevents new stages and preserves retained
 results and journal configuration, including other consumers' use.
 
+Recovery is explicit and model-free. After inspecting the reported gap,
+`recover --resolution resume-retained --project CHECKOUT` continues from a
+recorded retained journal floor. For a reconciled source or unjournaled gap,
+use `recover --resolution rebaseline-current --evidence TEXT --project CHECKOUT`;
+the existing owner verifies retained task identities and records the explanation
+before moving to the current head. Neither command retries an unknown model
+outcome. Both require the lifecycle's own live managed lead. After disabling,
+`restore-journal --project CHECKOUT` removes only a setting this lifecycle
+enabled; a preexisting enabled journal remains untouched. Retained results and
+checkpoints survive restoration.
+
 Only an eligible accepted ordinary task can start the two visible reflection
 forks. Their exact task, run, source turns, result references, role revisions,
 profiles and return address come from the existing owners. The normal lead

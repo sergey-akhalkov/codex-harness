@@ -8,13 +8,19 @@ use harness_core::delivery_reflection::{
     ActivationRequest, JournalPolicy, LifecycleStatus, ReflectionController, ReflectionRecord,
 };
 
-const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\nRun enable/process from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance. Status is model-free. Disable preserves results and stops new stages.";
+const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\nRun enable/process/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
+
+enum RecoveryAction {
+    ResumeRetained,
+    RebaselineCurrent(String),
+}
 
 struct Options {
     command: String,
     project: PathBuf,
     source: PathBuf,
     home: PathBuf,
+    recovery: Option<RecoveryAction>,
 }
 
 impl Options {
@@ -25,7 +31,7 @@ impl Options {
             .unwrap_or_default();
         if !matches!(
             command,
-            "enable" | "status" | "disable" | "process" | "_serve"
+            "enable" | "status" | "disable" | "process" | "recover" | "restore-journal" | "_serve"
         ) {
             return Err(invalid(USAGE));
         }
@@ -33,8 +39,10 @@ impl Options {
         let (pairs, remainder) = args[1..].as_chunks::<2>();
         for pair in pairs {
             let name = pair[0].to_str().unwrap_or_default();
-            if !matches!(name, "--project" | "--source" | "--codex-home")
-                || values.insert(name, PathBuf::from(&pair[1])).is_some()
+            if !matches!(
+                name,
+                "--project" | "--source" | "--codex-home" | "--resolution" | "--evidence"
+            ) || values.insert(name, pair[1].clone()).is_some()
             {
                 return Err(invalid(format!(
                     "unknown or repeated option {name}; {USAGE}"
@@ -44,14 +52,49 @@ impl Options {
         if !remainder.is_empty() {
             return Err(invalid(format!("an option has no value; {USAGE}")));
         }
+        let resolution = values.remove("--resolution");
+        let evidence = values.remove("--evidence");
+        let recovery = if command == "recover" {
+            match resolution.as_deref().and_then(|value| value.to_str()) {
+                Some("resume-retained") if evidence.is_none() => {
+                    Some(RecoveryAction::ResumeRetained)
+                }
+                Some("rebaseline-current") => {
+                    let evidence = evidence.and_then(|value| value.into_string().ok())
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| invalid("rebaseline-current requires nonempty UTF-8 --evidence describing the reconciled event gap"))?;
+                    if evidence.len() > harness_core::delivery_reflection::MAX_TEXT_BYTES {
+                        return Err(invalid(
+                            "recovery evidence exceeds the existing board evidence limit",
+                        ));
+                    }
+                    Some(RecoveryAction::RebaselineCurrent(evidence))
+                }
+                _ => {
+                    return Err(invalid(
+                        "recover requires --resolution resume-retained (without --evidence) or rebaseline-current --evidence TEXT",
+                    ));
+                }
+            }
+        } else {
+            if resolution.is_some() || evidence.is_some() {
+                return Err(invalid(
+                    "--resolution and --evidence are only valid with recover",
+                ));
+            }
+            None
+        };
         let project = values
             .remove("--project")
+            .map(PathBuf::from)
             .unwrap_or(std::env::current_dir()?);
         let home = values
             .remove("--codex-home")
+            .map(PathBuf::from)
             .map_or_else(harness_core::native_launcher::codex_home, Ok)?;
         let source = values
             .remove("--source")
+            .map(PathBuf::from)
             .or_else(|| crate::feedback_cli::installed_kit_source_in(&home))
             .unwrap_or_else(|| project.clone());
         Ok(Self {
@@ -59,6 +102,7 @@ impl Options {
             project: canonical_dir(&project, "consumer project")?,
             source: canonical_dir(&source, "kit source")?,
             home: canonical_dir(&home, "CODEX_HOME")?,
+            recovery,
         })
     }
 
@@ -136,6 +180,34 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             Ok(0)
         }
         "process" => process(&options, &controller, false),
+        "restore-journal" => {
+            let receipt = controller.restore_owned_journal()?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(0)
+        }
+        "recover" => {
+            let lead = options.lead()?;
+            let state = controller.stored_state()?.ok_or_else(|| {
+                invalid("reflection is inactive; there is no recovery to resolve")
+            })?;
+            if state.lifecycle != LifecycleStatus::Active || state.binding.lead_session != lead {
+                return Err(invalid(
+                    "recovery requires the active lifecycle's own managed lead; retained work was not changed",
+                ));
+            }
+            let receipt = match options
+                .recovery
+                .as_ref()
+                .expect("validated recovery action")
+            {
+                RecoveryAction::ResumeRetained => controller.resume_from_floor()?,
+                RecoveryAction::RebaselineCurrent(evidence) => {
+                    controller.rebaseline_current(evidence)?
+                }
+            };
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(0)
+        }
         _ => unreachable!(),
     }
 }
@@ -296,6 +368,7 @@ fn serve(options: &Options) -> io::Result<i32> {
         }
         for board in boards {
             let options = Options {
+                recovery: None,
                 command: "process".to_owned(),
                 project: canonical_dir(&board.project, "consumer project")?,
                 source: options.source.clone(),

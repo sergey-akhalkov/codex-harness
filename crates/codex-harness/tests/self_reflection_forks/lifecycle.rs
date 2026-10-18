@@ -22,6 +22,15 @@ fn install_fixture(workspace: &Workspace) {
 }
 
 fn command(workspace: &Workspace, action: &str, lead: Option<&str>) -> std::process::Output {
+    command_with(workspace, action, lead, &[])
+}
+
+fn command_with(
+    workspace: &Workspace,
+    action: &str,
+    lead: Option<&str>,
+    extra: &[&str],
+) -> std::process::Output {
     let mut command = Command::new(manager());
     command
         .args(["delivery-improvement", action, "--project"])
@@ -30,6 +39,7 @@ fn command(workspace: &Workspace, action: &str, lead: Option<&str>) -> std::proc
         .arg(kit_root())
         .arg("--codex-home")
         .arg(&workspace.home)
+        .args(extra)
         .env("CODEX_HOME", &workspace.home)
         .env_remove("HARNESS_REFLECTION_SESSION")
         .env_remove("HARNESS_EXECUTOR_SESSION")
@@ -141,6 +151,132 @@ fn foreign_lead_is_refused_and_disabled_processing_keeps_pending_work() {
     assert_eq!(
         controller.record(&acceptance).unwrap().unwrap(),
         before.records[&acceptance]
+    );
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+}
+
+#[test]
+fn native_journal_recovery_is_explicit_and_preserves_retained_work() {
+    use harness_core::delivery_reflection::{ActivationRequest, JournalPolicy};
+
+    let workspace = Workspace::new("lifecycle-recovery", LeadMode::Delivered);
+    let (controller, _, _) = accepted::accepted(&workspace);
+    install_fixture(&workspace);
+    let board = |args: &[&str]| {
+        let output = Command::new("bd.exe")
+            .args(args)
+            .current_dir(&workspace.checkout)
+            .env("BD_NON_INTERACTIVE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let initial = controller.stored_state().unwrap().unwrap();
+    board(&["config", "set", "events-journal", "false"]);
+    board(&[
+        "create",
+        "Unjournaled synthetic board write",
+        "--type",
+        "task",
+    ]);
+    assert!(controller.poll().unwrap().recovery.is_some());
+    let recovering = controller.stored_state().unwrap().unwrap();
+    let resolution = [
+        "--resolution",
+        "rebaseline-current",
+        "--evidence",
+        "Owned board inspected; unjournaled write was unrelated; retained task bindings reconcile.",
+    ];
+    let foreign = command_with(&workspace, "recover", Some("foreign-lead"), &resolution);
+    assert!(!foreign.status.success());
+    let missing_evidence = command_with(
+        &workspace,
+        "recover",
+        Some(LEAD_THREAD),
+        &["--resolution", "rebaseline-current"],
+    );
+    assert!(!missing_evidence.status.success());
+    let stray_option = command_with(
+        &workspace,
+        "disable",
+        None,
+        &["--resolution", "resume-retained"],
+    );
+    assert!(!stray_option.status.success());
+    assert_eq!(controller.stored_state().unwrap().unwrap(), recovering);
+    board(&["config", "set", "events-journal", "true"]);
+    let recovered = success(command_with(
+        &workspace,
+        "recover",
+        Some(LEAD_THREAD),
+        &resolution,
+    ));
+    assert!(recovered["revision"].as_u64().unwrap() > initial.binding.revision);
+    let retained = controller.stored_state().unwrap().unwrap();
+    assert!(retained.recovery.is_none());
+    assert_eq!(retained.records, initial.records);
+    assert_eq!(
+        retained.last_recovery_evidence.as_deref(),
+        Some(resolution[3])
+    );
+    board(&["config", "set", "events-journal-retain-days", "0"]);
+    board(&["config", "set", "events-journal-retain-rows", "0"]);
+    board(&["config", "set", "events-journal-auto-prune", "false"]);
+    let floor = retained.checkpoint + 2;
+    for title in ["Gap first write", "Gap second write", "Gap retained write"] {
+        board(&["create", title, "--type", "task"]);
+    }
+    board(&["events", "prune", "--before", &floor.to_string(), "--json"]);
+    let gap = controller.poll().unwrap();
+    assert_eq!(gap.recovery.as_ref().unwrap().floor, Some(floor));
+    let resumed = success(command_with(
+        &workspace,
+        "recover",
+        Some(LEAD_THREAD),
+        &["--resolution", "resume-retained"],
+    ));
+    assert_eq!(resumed["checkpoint"], floor - 1);
+    assert!(controller.poll().unwrap().recovery.is_none());
+    assert_eq!(
+        controller.stored_state().unwrap().unwrap().records,
+        initial.records
+    );
+    assert!(
+        !command(&workspace, "restore-journal", None)
+            .status
+            .success()
+    );
+    success(command(&workspace, "disable", None));
+    let restored = success(command(&workspace, "restore-journal", None));
+    assert_eq!(
+        restored["journal_restored"], false,
+        "preexisting journal must remain enabled"
+    );
+
+    // Reuse the stopped native board to exercise controller-owned restoration.
+    // Activation preserves records while taking ownership only of the missing setting.
+    board(&["config", "unset", "events-journal"]);
+    controller
+        .activate(&ActivationRequest {
+            lead_session: LEAD_THREAD.to_owned(),
+            run: None,
+            boundary: None,
+            journal: JournalPolicy::EnableIfMissing,
+            limits: None,
+        })
+        .unwrap();
+    success(command(&workspace, "disable", None));
+    let restored = success(command(&workspace, "restore-journal", None));
+    assert_eq!(restored["journal_restored"], true);
+    let repeated = success(command(&workspace, "restore-journal", None));
+    assert_eq!(repeated["journal_restored"], false);
+    assert_eq!(
+        controller.stored_state().unwrap().unwrap().records,
+        initial.records
     );
     assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
 }
