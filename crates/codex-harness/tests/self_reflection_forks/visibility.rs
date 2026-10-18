@@ -1,5 +1,12 @@
 use super::*;
 use harness_core::delivery_reflection::{DeliveryState, StageState as RecordedStageState};
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 
 fn terminate_pid(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -9,6 +16,62 @@ fn terminate_pid(pid: u32) {
         assert!(!handle.is_null(), "OpenProcess({pid})");
         assert_ne!(TerminateProcess(handle, 1), 0, "TerminateProcess({pid})");
         assert_ne!(CloseHandle(handle), 0, "CloseHandle({pid})");
+    }
+}
+
+fn process_image(pid: u32) -> Option<PathBuf> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 32 * 1024];
+    let mut length = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    (ok != 0 && length != 0)
+        .then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize])))
+}
+
+fn reflection_frontends(parent: u32) -> Vec<u32> {
+    let expected = frontend_double();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot as isize == -1 {
+        return Vec::new();
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut present = unsafe { Process32FirstW(snapshot, &mut entry) };
+    let mut found = Vec::new();
+    while present != 0 {
+        if entry.th32ParentProcessID == parent
+            && process_image(entry.th32ProcessID).is_some_and(|image| image == expected)
+        {
+            found.push(entry.th32ProcessID);
+        }
+        present = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    found
+}
+
+fn wait_for_reflection_frontend(parent: u32, previous: Option<u32>) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(pid) = reflection_frontends(parent)
+            .into_iter()
+            .find(|pid| Some(*pid) != previous)
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the ordinary process did not attach another reflection frontend within 20s"
+        );
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -111,13 +174,30 @@ fn assert_exact_reflection_frontend_in(workspace: &Workspace, state_dir: &Path) 
         .position(|arg| *arg == "resume")
         .unwrap_or_else(|| panic!("frontend did not resume a thread: {argv}"));
     assert_eq!(args.get(resume + 1), Some(&EXECUTOR_FORK), "{argv}");
-    let token =
-        fs::read_to_string(state_dir.join("executor-self-reflection-reconcile/endpoint.token"))
-            .unwrap();
+    let mut tokens = Vec::new();
+    for entry in fs::read_dir(state_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let retained = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-native") || name.ends_with("-reconcile"));
+        let token = path.join("endpoint.token");
+        if retained && token.is_file() {
+            tokens.push((token.clone(), fs::read_to_string(token).unwrap()));
+        }
+    }
     assert!(
-        !argv.contains(token.trim()),
-        "frontend argv leaked its token"
+        !tokens.is_empty(),
+        "no reflection endpoint token was retained under {}",
+        state_dir.display()
     );
+    for (path, token) in tokens {
+        assert!(
+            !argv.contains(token.trim()),
+            "frontend argv leaked the token retained at {}",
+            path.display()
+        );
+    }
 
     let title = fs::read_to_string(workspace.home.join("frontend-title.txt")).unwrap();
     assert!(title.starts_with("ERefl ds/deepseek/"), "{title}");
@@ -447,9 +527,10 @@ fn native_accepted_visibility_loss_recovers_exact_submitted_turn_without_second_
 }
 
 /// The ordinary delivery-improvement process derives its request and state
-/// paths from the retained board acceptance. Losing its owning manager after a
-/// submitted native turn must recover that exact turn without a caller-authored
-/// request, a second fork/turn, or a repeated lead delivery.
+/// paths from the retained board acceptance. Losing only its owned reflection
+/// frontend after a submitted native turn must restore visibility in the same
+/// manager and recover that exact turn without a caller-authored request, a
+/// second fork/turn, or a repeated lead delivery.
 #[test]
 fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_request() {
     let workspace = Workspace::new("normal-process-visibility-recovery", LeadMode::Delivered);
@@ -496,30 +577,28 @@ fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_re
     assert_eq!(in_flight.executor.state, RecordedStageState::InFlight);
     let (rollout_path, rollout_bytes) = executor_rollout(&workspace.home);
 
-    terminate_pid(pid);
-    let lost = wait_session(session);
-    assert_ne!(lost.outcome.exit_code, 0, "{}", lost.transcript);
+    let frontend = wait_for_reflection_frontend(pid, None);
+    terminate_pid(frontend);
+    let restored_frontend = wait_for_reflection_frontend(pid, Some(frontend));
+    assert_ne!(restored_frontend, frontend);
     assert_eq!(read_json(&state_dir.join("executor-stage.json")), submitted);
     assert_eq!(
         controller.record(&acceptance).unwrap().unwrap(),
         in_flight,
-        "the owning process loss changed the accepted ledger"
+        "frontend-only loss changed the accepted ledger"
     );
     assert!(
         !workspace.request.exists(),
         "ordinary process must derive the retained request instead of writing one"
     );
 
-    let _ = fs::remove_file(workspace.home.join("frontend-argv.txt"));
-    let _ = fs::remove_file(workspace.home.join("frontend-release"));
-    workspace.lead_state.lock().unwrap().source_turn_active = true;
-    let mut recovering_spec =
-        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
-    recovering_spec.env.insert(
-        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
-        Some(EXECUTOR_RESULT.into()),
-    );
-    let recovering = ConsoleSession::spawn(ConsoleSpec::new(recovering_spec)).unwrap();
+    fs::write(
+        workspace
+            .fixture_dir
+            .join("release-executor-self-reflection.marker"),
+        "release",
+    )
+    .unwrap();
     wait_until(
         || {
             fs::read(state_dir.join("executor-stage.json"))
@@ -528,11 +607,10 @@ fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_re
                 .is_some_and(|stage| stage["status"] == "completed")
         },
         Duration::from_secs(20),
-        "the ordinary process did not recover the submitted executor stage",
+        "the ordinary process did not reconcile the exact retained executor turn",
     );
     assert_exact_reflection_frontend_in(&workspace, &state_dir);
-    workspace.lead_state.lock().unwrap().source_turn_active = false;
-    let recovered = wait_session(recovering);
+    let recovered = wait_session(session);
     assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
 
     let executor = read_json(&state_dir.join("executor-stage.json"));
@@ -563,11 +641,13 @@ fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_re
         "recovery started a new thread"
     );
     let resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
-    assert_eq!(resumes.len(), 1, "{resumes:?}");
-    assert_eq!(
-        resumes[0]["params"]["threadId"], EXECUTOR_FORK,
-        "{resumes:?}"
+    assert!(
+        resumes.len() <= 1,
+        "recovery resumed more than once: {resumes:?}"
     );
+    for resume in resumes {
+        assert_eq!(resume["params"]["threadId"], EXECUTOR_FORK, "{resume}");
+    }
     assert_eq!(
         executor_rollout(&workspace.home),
         (rollout_path, rollout_bytes),

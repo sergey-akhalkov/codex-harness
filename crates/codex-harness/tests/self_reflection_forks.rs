@@ -1418,15 +1418,23 @@ fn interrupted_unknown_and_visibility_loss_outcomes_are_not_replayed() {
     );
     assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
     let executor = stage(&visibility, "executor-stage");
-    assert_eq!(executor["status"], "visibility-lost", "{executor}");
+    assert_eq!(executor["status"], "turn-submitted", "{executor}");
+    assert_eq!(executor["fork"]["forkThread"], EXECUTOR_FORK, "{executor}");
+    assert_eq!(executor["turnId"], EXECUTOR_FORK_TURN, "{executor}");
     assert!(
         executor["error"].as_str().is_some_and(|error| {
-            error.contains("reflection surface closed while the turn was in flight")
+            error.contains("could not be restored")
+                && error.contains("No new turn was started")
+                && error.contains("remains recoverable")
         }),
         "{executor}"
     );
     let before = request_counts(&visibility);
-    assert_eq!(before.1, 1, "{before:?}");
+    assert_eq!(before, (1, 1, 0, 0), "{before:?}");
+    assert!(
+        fixture_requests(&visibility, "executor-self-reflection", "thread/start").is_empty(),
+        "visibility loss started another thread"
+    );
     let replay = run_chain(
         &visibility,
         &request,
@@ -1435,7 +1443,26 @@ fn interrupted_unknown_and_visibility_loss_outcomes_are_not_replayed() {
         EXECUTOR_RESULT,
         LEAD_RESULT,
     );
-    assert_refused(&replay, "already ended as visibility-lost");
+    assert_ne!(replay.outcome.exit_code, 0, "{}", replay.transcript);
+    let retained = stage(&visibility, "executor-stage");
+    assert_eq!(retained["status"], "turn-submitted", "{retained}");
+    assert_eq!(retained["fork"]["forkThread"], EXECUTOR_FORK, "{retained}");
+    assert_eq!(retained["turnId"], EXECUTOR_FORK_TURN, "{retained}");
+    assert_eq!(retained["usage"], executor["usage"], "{retained}");
+    assert_eq!(retained["work"], executor["work"], "{retained}");
+    assert_eq!(
+        retained["sourceContextBytes"], executor["sourceContextBytes"],
+        "{retained}"
+    );
+    assert!(
+        retained["error"].as_str().is_some_and(|error| {
+            error.contains("native visibility restoration")
+                && error.contains(EXECUTOR_FORK)
+                && error.contains(EXECUTOR_FORK_TURN)
+                && error.contains("remains recoverable")
+        }),
+        "{retained}"
+    );
     assert_eq!(request_counts(&visibility), before);
 }
 

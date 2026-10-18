@@ -2115,13 +2115,13 @@ fn run_stage(
         persist(state_path, &state)?;
         return Ok(state);
     }
-    let frontend = match attach_owned_frontend(
+    let mut frontend = match attach_owned_frontend(
         &plan,
         &conversation,
         NativePresentation::NativeTui,
         FrontendRole::Reflection,
     ) {
-        Ok(frontend) => frontend,
+        Ok(frontend) => Some(frontend),
         Err(error) => {
             state.status = StageStatus::Failed;
             state.error = Some(error.to_string());
@@ -2130,21 +2130,28 @@ fn run_stage(
             return Err(error);
         }
     };
-    let visible = wait_for_frontend(&frontend, &mut conversation, true, &plan.title);
+    let current = frontend
+        .as_ref()
+        .expect("the reflection frontend was attached immediately above");
+    let visible = wait_for_frontend(current, &mut conversation, true, &plan.title);
     if let Err(error) = visible {
         state.status = StageStatus::VisibilityLost;
         state.error = Some(error.to_string());
         state.updated_ms = now_ms();
         persist(state_path, &state)?;
-        let _ = frontend.close();
+        if let Some(frontend) = frontend.take() {
+            let _ = frontend.close();
+        }
         return Err(error);
     }
-    if !frontend.is_running().unwrap_or(false) {
+    if !current.is_running().unwrap_or(false) {
         state.status = StageStatus::VisibilityLost;
         state.error = Some("the reflection surface closed before model work started".to_owned());
         state.updated_ms = now_ms();
         persist(state_path, &state)?;
-        let _ = frontend.close();
+        if let Some(frontend) = frontend.take() {
+            let _ = frontend.close();
+        }
         return Err(invalid(
             "the reflection surface closed before model work started; no turn was submitted",
         ));
@@ -2162,7 +2169,9 @@ fn run_stage(
                 state.stage
             ));
             let retained = finish(state_path, state);
-            let _ = frontend.close();
+            if let Some(frontend) = frontend.take() {
+                let _ = frontend.close();
+            }
             return match retained {
                 Ok(_) => Err(error),
                 Err(retention) => Err(invalid(format!("{error}; {retention}"))),
@@ -2173,88 +2182,123 @@ fn run_stage(
     state.status = StageStatus::TurnSubmitted;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
-    let outcome = match drive_turn(
-        &mut conversation,
-        &frontend,
-        chain,
-        stage,
-        chain.bound_seconds,
-        admission,
-    ) {
-        Ok(Lifecycle::Completed) => retain_completed(
+    let mut restored_visibility = false;
+    let outcome = loop {
+        let current = frontend
+            .as_ref()
+            .expect("the reflection frontend is present until this drive loop breaks");
+        let driven = drive_turn(
+            &mut conversation,
+            current,
             chain,
             stage,
-            &mut conversation,
-            state,
-            &fork_thread,
-            state_path,
-            Some(admission),
-        ),
-        Ok(Lifecycle::Failed) => {
-            state.status = StageStatus::Failed;
-            state.error = conversation
-                .failure()
-                .map(str::to_owned)
-                .or_else(|| Some("the native turn ended failed".to_owned()));
-            finish(state_path, state)
-        }
-        Ok(Lifecycle::Interrupted) => {
-            state.status = StageStatus::Interrupted;
-            state.error = Some("the native turn ended interrupted".to_owned());
-            finish(state_path, state)
-        }
-        Ok(Lifecycle::Defect) => {
-            state.status = StageStatus::Unknown;
-            state.error = conversation
-                .defect()
-                .map(str::to_owned)
-                .or_else(|| Some("the native conversation reported a protocol defect".to_owned()));
-            finish(state_path, state)
-        }
-        Ok(other) => {
-            state.status = StageStatus::Unknown;
-            state.error = Some(format!(
-                "the native turn ended in non-terminal state {}; its outcome is unknown",
-                status_name_stage(other)
-            ));
-            finish(state_path, state)
-        }
-        Err(DriveFailure::LostVisibility) => {
-            state.status = StageStatus::VisibilityLost;
-            state.error = Some(
-                "the reflection surface closed while the turn was in flight; new model work stopped and the turn's outcome remains unknown"
-                    .to_owned(),
-            );
-            finish(state_path, state)
-        }
-        Err(DriveFailure::Timeout(bound)) => {
-            state.status = StageStatus::Unknown;
-            state.error = Some(format!(
-                "no terminal native state was established within {bound:?}; the turn may still be running and is not replayed"
-            ));
-            finish(state_path, state)
-        }
-        Err(DriveFailure::Error(error)) => {
-            state.status = StageStatus::Unknown;
-            state.error = Some(format!(
-                "observing the native turn failed, so its outcome is unknown: {error}"
-            ));
-            finish(state_path, state)
-        }
-        Err(DriveFailure::BudgetPaused(pause)) => {
-            state.status = StageStatus::BudgetPaused;
-            state.error = Some(pause.summary());
-            state.budget_pause = Some(pause);
-            if let Some(turn) = state.turn_id.clone() {
-                let usage = retain_usage(&chain.codex_home, &fork_thread, &turn);
-                apply_usage(&mut state, usage);
+            chain.bound_seconds,
+            admission,
+        );
+        match driven {
+            Ok(Lifecycle::Completed) => {
+                break retain_completed(
+                    chain,
+                    stage,
+                    &mut conversation,
+                    state,
+                    &fork_thread,
+                    state_path,
+                    Some(admission),
+                );
             }
-            state.updated_ms = now_ms();
-            persist(state_path, &state)?;
-            Ok(state)
+            Ok(Lifecycle::Failed) => {
+                state.status = StageStatus::Failed;
+                state.error = conversation
+                    .failure()
+                    .map(str::to_owned)
+                    .or_else(|| Some("the native turn ended failed".to_owned()));
+                break finish(state_path, state);
+            }
+            Ok(Lifecycle::Interrupted) => {
+                state.status = StageStatus::Interrupted;
+                state.error = Some("the native turn ended interrupted".to_owned());
+                break finish(state_path, state);
+            }
+            Ok(Lifecycle::Defect) => {
+                state.status = StageStatus::Unknown;
+                state.error = conversation.defect().map(str::to_owned).or_else(|| {
+                    Some("the native conversation reported a protocol defect".to_owned())
+                });
+                break finish(state_path, state);
+            }
+            Ok(other) => {
+                state.status = StageStatus::Unknown;
+                state.error = Some(format!(
+                    "the native turn ended in non-terminal state {}; its outcome is unknown",
+                    status_name_stage(other)
+                ));
+                break finish(state_path, state);
+            }
+            Err(DriveFailure::LostVisibility) if !restored_visibility => {
+                let lost = frontend
+                    .take()
+                    .expect("the lost reflection frontend was attached");
+                match restore_reflection_frontend(&plan, &mut conversation, lost) {
+                    Ok(restored) => {
+                        frontend = Some(restored);
+                        restored_visibility = true;
+                        println!(
+                            "{}: restored the owned reflection surface for retained fork {} turn {}; no new turn was submitted",
+                            state.stage, fork_thread, turn.turn_id
+                        );
+                    }
+                    Err(error) => {
+                        state.status = StageStatus::TurnSubmitted;
+                        state.error = Some(format!(
+                            "the reflection surface closed while retained turn {} was in flight and could not be restored: {error}. No new turn was started; the submitted turn remains recoverable at {}; rerun `codex-harness delivery-improvement process` to resume the exact retained turn",
+                            turn.turn_id,
+                            state_path.display()
+                        ));
+                        break finish(state_path, state);
+                    }
+                }
+            }
+            Err(DriveFailure::LostVisibility) => {
+                state.status = StageStatus::TurnSubmitted;
+                state.error = Some(format!(
+                    "the restored reflection surface closed while retained turn {} was still in flight. No new turn was started; the submitted turn remains recoverable at {}; rerun `codex-harness delivery-improvement process` to resume the exact retained turn",
+                    turn.turn_id,
+                    state_path.display()
+                ));
+                break finish(state_path, state);
+            }
+            Err(DriveFailure::Timeout(bound)) => {
+                state.status = StageStatus::Unknown;
+                state.error = Some(format!(
+                    "no terminal native state was established within {bound:?}; the turn may still be running and is not replayed"
+                ));
+                break finish(state_path, state);
+            }
+            Err(DriveFailure::Error(error)) => {
+                state.status = StageStatus::Unknown;
+                state.error = Some(format!(
+                    "observing the native turn failed, so its outcome is unknown: {error}"
+                ));
+                break finish(state_path, state);
+            }
+            Err(DriveFailure::BudgetPaused(pause)) => {
+                state.status = StageStatus::BudgetPaused;
+                state.error = Some(pause.summary());
+                state.budget_pause = Some(pause);
+                if let Some(turn) = state.turn_id.clone() {
+                    let usage = retain_usage(&chain.codex_home, &fork_thread, &turn);
+                    apply_usage(&mut state, usage);
+                }
+                state.updated_ms = now_ms();
+                persist(state_path, &state)?;
+                break Ok(state);
+            }
         }
     };
-    let _ = frontend.close();
+    if let Some(frontend) = frontend {
+        let _ = frontend.close();
+    }
     outcome
 }
 
@@ -2475,6 +2519,48 @@ fn close_recovery_frontend(
         (Err(error), Err(cleanup)) => Err(invalid(format!(
             "{error}; additionally, the owned reflection frontend cleanup failed: {cleanup}; no dependent stage was started"
         ))),
+    }
+}
+
+/// Replaces only the closed native surface of an existing reflection
+/// conversation. The app-server, fork and submitted turn stay exactly as they
+/// were; this function cannot submit model work.
+fn restore_reflection_frontend(
+    plan: &ControlPlan,
+    conversation: &mut Conversation,
+    lost: crate::executor_cli::OwnedFrontend,
+) -> io::Result<crate::executor_cli::OwnedFrontend> {
+    lost.close().map_err(|error| {
+        invalid(format!(
+            "the closed reflection surface could not be retired: {error}"
+        ))
+    })?;
+    let frontend = attach_owned_frontend(
+        plan,
+        conversation,
+        NativePresentation::NativeTui,
+        FrontendRole::Reflection,
+    )?;
+    if let Err(error) = wait_for_frontend(&frontend, conversation, true, &plan.title) {
+        let _ = frontend.close();
+        return Err(invalid(format!(
+            "the replacement reflection surface did not attach: {error}"
+        )));
+    }
+    match frontend.is_running() {
+        Ok(true) => Ok(frontend),
+        Ok(false) => {
+            let _ = frontend.close();
+            Err(invalid(
+                "the replacement reflection surface closed before its attachment could be verified",
+            ))
+        }
+        Err(error) => {
+            let _ = frontend.close();
+            Err(invalid(format!(
+                "the replacement reflection surface could not be verified: {error}"
+            )))
+        }
     }
 }
 

@@ -209,6 +209,17 @@ fn run_recorded_stage(
     let state = match run(start.as_ref()) {
         Ok(state) => state,
         Err(error) => {
+            let submitted = fs::read(&state_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<StageState>(&bytes).ok())
+                .is_some_and(|native| native.status == StageStatus::TurnSubmitted);
+            if submitted {
+                // The native turn identity is retained. Keep the accepted
+                // ledger in flight so the ordinary process can restore the
+                // surface and reconcile that exact turn instead of refusing
+                // the record as a generic unknown attempt.
+                return Err(error);
+            }
             if recorded.state != RecordedStageState::Retained {
                 let usage = submitted_stage_usage(&state_path);
                 let (work, work_reconciled) = submitted_stage_work(&state_path);
