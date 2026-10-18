@@ -1454,6 +1454,7 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
             revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             name: "workload-b".to_owned(),
             writable_scope: vec!["crates/one".to_owned()],
+            read_only: false,
         },
         runtimes: RuntimeInputs {
             state: state.clone(),

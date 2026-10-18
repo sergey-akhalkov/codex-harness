@@ -370,6 +370,10 @@ pub struct TaskInputs {
     pub name: String,
     /// The workload's own writable scope, relative to the frozen task copy.
     pub writable_scope: Vec<String>,
+    /// Explicit analysis-only work; its source scope must remain empty.
+    /// This does not change the ordinary agent's runtime or tool authority.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 impl TaskInputs {
@@ -384,7 +388,13 @@ impl TaskInputs {
             ));
         }
         token("task name", &self.name, MAX_TOKEN)?;
-        if self.writable_scope.is_empty() || self.writable_scope.len() > MAX_SCOPE_ENTRIES {
+        if self.read_only {
+            if !self.writable_scope.is_empty() {
+                return Err(invalid(
+                    "a read_only task must have an empty writable_scope",
+                ));
+            }
+        } else if self.writable_scope.is_empty() || self.writable_scope.len() > MAX_SCOPE_ENTRIES {
             return Err(invalid(
                 "the task writable_scope must name 1-32 relative paths inside the frozen copy",
             ));
@@ -393,6 +403,48 @@ impl TaskInputs {
             relative_scope_entry(entry)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod task_input_tests {
+    use super::TaskInputs;
+    use serde_json::json;
+
+    #[test]
+    fn analysis_only_scope_is_explicit_and_cannot_authorize_writes() {
+        let source = tempfile::tempdir().unwrap();
+        let input = json!({
+            "source": source.path(),
+            "revision": "1234567",
+            "name": "retained-evidence-diagnosis",
+            "writable_scope": [],
+        });
+        let mut task: TaskInputs = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&task).unwrap(), input);
+        assert!(
+            !task.read_only,
+            "legacy tasks keep implementation semantics"
+        );
+        assert!(
+            task.validate().is_err(),
+            "an omitted scope must not grant analysis-only authority"
+        );
+        task.writable_scope.push("solution.txt".to_owned());
+        assert!(task.validate().is_ok());
+
+        let mut analysis = input;
+        analysis["read_only"] = json!(true);
+        let mut task: TaskInputs = serde_json::from_value(analysis).unwrap();
+        assert!(
+            task.validate().is_ok(),
+            "a read-only task needs no fictitious output file"
+        );
+        task.writable_scope.push("solution.txt".to_owned());
+        assert!(
+            task.validate().is_err(),
+            "read-only and write authority must not coexist"
+        );
     }
 }
 
