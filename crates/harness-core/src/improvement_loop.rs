@@ -812,6 +812,184 @@ impl QualificationRuntimeInputs {
     }
 }
 
+pub const SEMANTIC_REVIEW_SCHEMA: u32 = 1;
+/// Largest declared source set one semantic reviewer may inspect.
+pub const MAX_REVIEW_SOURCES: usize = 32;
+
+/// The optional independent semantic acceptance reviewer of one ordinary
+/// baseline qualification. It is a separate fresh native runtime installed
+/// into its own read-only home; it never shares the implementation runtime,
+/// its writable sandbox or its mutable user configuration.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticReviewInputs {
+    pub schema: u32,
+    /// The reviewer's own frozen native runtime declaration.
+    pub runtime: QualificationRuntimeInputs,
+    /// The installed native profile the reviewer conversation runs under.
+    pub profile: String,
+    /// Frozen acceptance criteria bytes the reviewer judges against.
+    pub criteria: crate::improvement_runtime::FileIdentity,
+    /// Declared source files at the submitted revision whose exact bytes and
+    /// physical lines the reviewer may cite. Paths are relative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    /// Finite same-reviewer allowance for one malformed-output correction.
+    #[serde(default)]
+    pub max_corrections: u32,
+}
+
+impl SemanticReviewInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != SEMANTIC_REVIEW_SCHEMA {
+            return Err(invalid(format!(
+                "semantic review inputs declare schema {}; this controller reads schema {SEMANTIC_REVIEW_SCHEMA}",
+                self.schema
+            )));
+        }
+        self.runtime.validate()?;
+        let config = self.runtime.native_config.as_ref().ok_or_else(|| {
+            invalid(
+                "semantic review requires its own frozen native configuration and a fresh installed home; a shared local client route is not accepted",
+            )
+        })?;
+        if self.runtime.client.is_some() {
+            return Err(invalid(
+                "semantic review installs its own read-only native runtime instead of reusing a declared local client",
+            ));
+        }
+        token("semantic reviewer profile", &self.profile, MAX_TOKEN)?;
+        review_native_config(config, &self.profile, &self.runtime.private_inputs)?;
+        if !self.criteria.path.is_absolute()
+            || !self.criteria.path.is_file()
+            || fs::metadata(&self.criteria.path)?.len() > MAX_RUN_SPEC_BYTES
+            || crate::build_identity::hash_file(&self.criteria.path)? != self.criteria.sha256
+        {
+            return Err(invalid(
+                "the semantic review criteria are missing, oversized or changed; supply their exact frozen bytes",
+            ));
+        }
+        if fs::read_to_string(&self.criteria.path)?.trim().is_empty() {
+            return Err(invalid("the semantic review criteria must not be empty"));
+        }
+        if self.sources.len() > MAX_REVIEW_SOURCES {
+            return Err(invalid(format!(
+                "the semantic reviewer may declare at most {MAX_REVIEW_SOURCES} source files"
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &self.sources {
+            relative_scope_entry(source)?;
+            if !seen.insert(source.trim().replace('\\', "/")) {
+                return Err(invalid(format!(
+                    "the semantic reviewer source {source} is declared more than once"
+                )));
+            }
+        }
+        if self.max_corrections > 1 {
+            return Err(invalid(
+                "the semantic reviewer allows at most one declared same-reviewer correction",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn review_native_config(
+    config: &crate::improvement_runtime::FileIdentity,
+    profile: &str,
+    private_inputs: &[crate::improvement_runtime::PrivateInput],
+) -> io::Result<()> {
+    let text = fs::read_to_string(&config.path)?;
+    let table: toml::Table = toml::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|_| invalid("the semantic reviewer native configuration is not valid TOML"))?;
+    for field in ["sandbox_mode", "approval_policy"] {
+        let declared = table
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if declared.is_empty() {
+            return Err(invalid(format!(
+                "the semantic reviewer native configuration must explicitly declare {field}"
+            )));
+        }
+    }
+    if table.get("sandbox_mode").and_then(toml::Value::as_str) != Some("read-only") {
+        return Err(invalid(
+            "the semantic reviewer runtime must declare sandbox_mode = \"read-only\"; the ordinary implementation runtime stays writable",
+        ));
+    }
+    if table.get("approval_policy").and_then(toml::Value::as_str) != Some("never") {
+        return Err(invalid(
+            "the read-only semantic reviewer must declare approval_policy = \"never\"; it cannot wait for an interactive approval",
+        ));
+    }
+    let profile_table = if profile == "default" {
+        None
+    } else {
+        let named = format!("{profile}.config.toml");
+        let profile_table = if let Some(input) = private_inputs
+            .iter()
+            .find(|input| input.destination == named)
+        {
+            let text = fs::read_to_string(&input.source)?;
+            toml::from_str(text.trim_start_matches('\u{feff}'))
+                .map_err(|_| invalid("the semantic reviewer profile file is not valid TOML"))?
+        } else {
+            table
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .and_then(|profiles| profiles.get(profile))
+                .and_then(toml::Value::as_table)
+                .cloned()
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "the semantic reviewer profile '{profile}' is not installed in the frozen native configuration"
+                    ))
+                })?
+        };
+        for (field, expected) in [("sandbox_mode", "read-only"), ("approval_policy", "never")] {
+            if let Some(value) = profile_table.get(field) {
+                if value.as_str() != Some(expected) {
+                    return Err(invalid(format!(
+                        "the semantic reviewer profile '{profile}' may not override {field} away from {expected}"
+                    )));
+                }
+            }
+        }
+        Some(profile_table)
+    };
+    let (model, effort) = if let Some(table) = profile_table.as_ref() {
+        (
+            toml_config_string(table, "model"),
+            toml_config_string(table, "model_reasoning_effort"),
+        )
+    } else {
+        (
+            toml_config_string(&table, "model"),
+            toml_config_string(&table, "model_reasoning_effort"),
+        )
+    };
+    for (name, value) in [("model", model), ("model_reasoning_effort", effort)] {
+        if value.is_none() {
+            return Err(invalid(format!(
+                "the semantic reviewer profile '{profile}' must resolve an explicit {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn toml_config_string(table: &toml::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// The explicit one-arm baseline qualification declaration. It freezes the
 /// task snapshot, the single prepared runtime, the independent acceptance, the
 /// participant profiles and the finite correction allowance before any effect.
@@ -832,6 +1010,10 @@ pub struct BaselineQualificationInputs {
     /// completed native result. It must stay outside the submitted product
     /// checkout; the independent oracle reads it through its literal path.
     pub report: PathBuf,
+    /// Optional independent semantic acceptance reviewer. Omitted preserves
+    /// the legacy program-only route without changing its serialized digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_review: Option<SemanticReviewInputs>,
 }
 
 impl BaselineQualificationInputs {
@@ -880,6 +1062,9 @@ impl BaselineQualificationInputs {
             return Err(invalid(
                 "the qualification report must stay outside the frozen task source; the submitted product checkout cannot own its own acceptance input",
             ));
+        }
+        if let Some(review) = &self.semantic_review {
+            review.validate()?;
         }
         Ok(())
     }
@@ -1425,6 +1610,9 @@ pub enum AttemptRole {
     Correction,
     /// The same-lead exact acceptance decision after review.
     LeadAcceptance,
+    /// The independent read-only semantic acceptance reviewer after the lead
+    /// accepted. It applies no treatment and is not a measured arm.
+    SemanticReview,
 }
 
 impl AttemptRole {
@@ -1440,6 +1628,7 @@ impl AttemptRole {
             Self::LeadReview => "lead-review",
             Self::Correction => "correction",
             Self::LeadAcceptance => "lead-acceptance",
+            Self::SemanticReview => "semantic-review",
         }
     }
 
@@ -1455,6 +1644,7 @@ impl AttemptRole {
             Self::LeadReview => "lreview",
             Self::Correction => "corr",
             Self::LeadAcceptance => "laccept",
+            Self::SemanticReview => "sreview",
         }
     }
 
@@ -2431,6 +2621,57 @@ impl ComparisonState {
 
 pub const BASELINE_QUALIFICATION_STATE_SCHEMA: u32 = 1;
 
+/// The retained preparation, exact turns and judgment of the optional
+/// independent semantic reviewer. A judgment copy is retained after the
+/// reviewer result passes structural, location and evidence validation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticReviewState {
+    /// The reviewer runtime receipt installed into its own fresh home.
+    #[serde(default)]
+    pub runtime: Option<PathBuf>,
+    #[serde(default)]
+    pub home: Option<PathBuf>,
+    /// The minimal owned Git source frozen for this review.
+    #[serde(default)]
+    pub source: Option<PathBuf>,
+    /// The exact committed submission revision the reviewer judged.
+    #[serde(default)]
+    pub submission_revision: Option<String>,
+    /// The single commit of the frozen review packet.
+    #[serde(default)]
+    pub review_revision: Option<String>,
+    /// The retained review manifest and its exact digest.
+    #[serde(default)]
+    pub manifest: Option<PathBuf>,
+    #[serde(default)]
+    pub manifest_sha256: Option<String>,
+    /// The installed reviewer binding resolved before the first turn.
+    #[serde(default)]
+    pub binding: Option<QualificationBindingIdentity>,
+    /// The exact reviewer conversation, once its first turn was accepted.
+    #[serde(default)]
+    pub participant: Option<WorkflowParticipant>,
+    #[serde(default)]
+    pub initial_attempt: Option<String>,
+    #[serde(default)]
+    pub correction_attempt: Option<String>,
+    #[serde(default)]
+    pub correction_used: bool,
+    /// The retained judgment copy and its exact evidence identity.
+    #[serde(default)]
+    pub judgment: Option<PathBuf>,
+    #[serde(default)]
+    pub judgment_sha256: Option<String>,
+    /// `accept`, `reject` or `unknown`; absent until a judgment is settled.
+    #[serde(default)]
+    pub judgment_kind: Option<String>,
+    #[serde(default)]
+    pub findings: Option<u64>,
+    #[serde(default)]
+    pub unresolved_issues: Option<u64>,
+}
+
 /// One participant binding resolved from the installed configuration before
 /// the first turn and never re-resolved from a fallback. The accepted native
 /// dispatch must reproduce all of these values.
@@ -2527,6 +2768,10 @@ pub struct BaselineQualificationState {
     /// Why this qualification produced no usable result.
     #[serde(default)]
     pub condition: Option<String>,
+    /// The optional independent semantic reviewer and its retained judgment.
+    /// Omitted cursors retain the legacy program-only route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_review: Option<SemanticReviewState>,
     #[serde(default)]
     pub prepared_ms: Option<u64>,
 }

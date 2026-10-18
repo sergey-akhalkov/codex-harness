@@ -212,15 +212,20 @@ fn one_real_control_backed_pair_settles_through_native_observation() {
 
 #[test]
 fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles() {
-    baseline_workflow_case(true);
+    baseline_workflow_case(true, false);
 }
 
 #[test]
 fn baseline_qualification_requires_the_independent_oracle_despite_lead_acceptance() {
-    baseline_workflow_case(false);
+    baseline_workflow_case(false, false);
 }
 
-fn baseline_workflow_case(independent_acceptance_passes: bool) {
+#[test]
+fn baseline_qualification_consumes_an_independent_semantic_reviewer() {
+    baseline_workflow_case(true, true);
+}
+
+fn baseline_workflow_case(independent_acceptance_passes: bool, semantic_review: bool) {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("qualification-native-frame");
     let launcher = std::path::PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
@@ -240,6 +245,34 @@ fn baseline_workflow_case(independent_acceptance_passes: bool) {
     fs::write(&config, "model = 'gpt-6-astra'\nmodel_provider = 'openai'\nmodel_reasoning_effort = 'xhigh'\n[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n").unwrap();
     let prompt = fixture.spec.with_file_name("qualification-task.txt");
     fs::write(&prompt, "Read the frozen add-workload OpenSpec task and frame its implementation inside solution.txt and sleep_ms. Preserve its independent acceptance.").unwrap();
+    let reviewer = if semantic_review {
+        let config = fixture
+            .spec
+            .with_file_name("qualification-review-config.toml");
+        fs::write(
+            &config,
+            "sandbox_mode = 'read-only'\napproval_policy = 'never'\nmodel = 'gpt-6-astra'\nmodel_provider = 'openai'\nmodel_reasoning_effort = 'xhigh'\n[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+        )
+        .unwrap();
+        let criteria = fixture
+            .spec
+            .with_file_name("qualification-review-criteria.txt");
+        fs::write(
+            &criteria,
+            "The submitted result must implement the frozen task and preserve its declared acceptance.\n",
+        )
+        .unwrap();
+        Some((
+            config,
+            criteria,
+            format!(
+                "{{\"run_id\":\"{}-semantic-review\",\"findings\":[],\"unresolved_issues\":[]}}",
+                spec["run"].as_str().unwrap()
+            ),
+        ))
+    } else {
+        None
+    };
     spec["local_runner"] = Value::Null;
     spec["qualification"] = Value::Null;
     spec["baseline_qualification"] = json!({
@@ -256,6 +289,29 @@ fn baseline_workflow_case(independent_acceptance_passes: bool) {
         "workflow": {"schema":1,"lead_profile":"default","executor_profile":"ds","max_corrections":1,"capacity":2},
         "report": fixture.spec.with_file_name("qualification-result.txt")
     });
+    if let Some((config, criteria, _)) = &reviewer {
+        spec["baseline_qualification"]["semantic_review"] = json!({
+            "schema": 1,
+            "runtime": {
+                "state": fixture.state,
+                "build": fixture.state.join("builds/h-build"),
+                "label": "accepted-semantic-review-runtime",
+                "upstream": fixture.upstream,
+                "native_config": {
+                    "path": config,
+                    "sha256": build_identity::hash_file(config).unwrap()
+                },
+                "private_inputs": []
+            },
+            "profile": "ds",
+            "criteria": {
+                "path": criteria,
+                "sha256": build_identity::hash_file(criteria).unwrap()
+            },
+            "sources": ["solution.txt"],
+            "max_corrections": 1
+        });
+    }
     fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
     let assignment = json!({
         "schema":1, "objective":"Implement the frozen workload in the bound checkout.",
@@ -340,6 +396,8 @@ fn baseline_workflow_case(independent_acceptance_passes: bool) {
                     "HARNESS_IMPROVEMENT_FIXTURE_SESSION",
                     if role == "lead-review" {
                         "12345678-1234-4234-8234-123456789001"
+                    } else if role == "lead-acceptance" {
+                        "12345678-1234-4234-8234-123456789003"
                     } else {
                         "12345678-1234-4234-8234-123456789002"
                     },
@@ -425,6 +483,18 @@ fn baseline_workflow_case(independent_acceptance_passes: bool) {
         executor_session
     );
     wait_last();
+    if let Some((_, _, review_result)) = &reviewer {
+        resume_turn("lead-acceptance", review_result);
+        let cursor = fixture.cursor();
+        assert_eq!(cursor["attempts"].as_array().unwrap().len(), 6, "{cursor}");
+        let review_attempt = &cursor["attempts"][5];
+        assert_eq!(review_attempt["role"], "semantic-review", "{cursor}");
+        assert_eq!(review_attempt["profile"], "ds", "{cursor}");
+        assert_eq!(review_attempt["model"], "deepseek-flash", "{cursor}");
+        assert_eq!(review_attempt["state"], "started", "{cursor}");
+        wait_last();
+    }
+    let expected_attempts = if semantic_review { 6 } else { 5 };
     let oracle_workspace = std::path::PathBuf::from(
         fixture.cursor()["baseline_qualification"]["task_workspace"]
             .as_str()
@@ -443,8 +513,30 @@ fn baseline_workflow_case(independent_acceptance_passes: bool) {
         fs::read_to_string(&preserved).unwrap(),
         "preserve before acceptance"
     );
-    assert!(fixture.cursor()["baseline_qualification"]["oracle"].is_null());
-    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 5);
+    let changed_cursor = fixture.cursor();
+    assert!(changed_cursor["baseline_qualification"]["oracle"].is_null());
+    assert_eq!(
+        changed_cursor["attempts"].as_array().unwrap().len(),
+        expected_attempts
+    );
+    if let Some((_, _, review_result)) = &reviewer {
+        let review_attempt = &changed_cursor["attempts"][5];
+        assert_eq!(review_attempt["state"], "completed", "{changed_cursor}");
+        assert_eq!(
+            review_attempt["binding"]["session"], "12345678-1234-4234-8234-123456789003",
+            "{changed_cursor}"
+        );
+        let retained =
+            std::path::PathBuf::from(review_attempt["retained"]["result"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(retained).unwrap(),
+            review_result.as_str()
+        );
+        assert_eq!(
+            changed_cursor["baseline_qualification"]["semantic_review"]["judgment_kind"], "accept",
+            "{changed_cursor}"
+        );
+    }
     fs::remove_file(&preserved).unwrap();
     let settled = fixture.resume();
     assert!(settled.status.success(), "{}", text(&settled));
@@ -464,17 +556,38 @@ fn baseline_workflow_case(independent_acceptance_passes: bool) {
         std::path::PathBuf::from(cursor["baseline_qualification"]["row"].as_str().unwrap());
     let row_bytes = fs::read(&row_path).unwrap();
     let row: Value = serde_json::from_slice(&row_bytes).unwrap();
-    assert_eq!(row["native_runs"].as_array().unwrap().len(), 2);
+    let expected_native_runs = if semantic_review { 3 } else { 2 };
+    let expected_total_tokens = if semantic_review { 720 } else { 600 };
+    let expected_responses = if semantic_review { 6 } else { 5 };
     assert_eq!(
-        row["usage"]["total_tokens"], 600,
-        "each of the five distinct responses is charged once: {row}"
+        row["native_runs"].as_array().unwrap().len(),
+        expected_native_runs
     );
-    assert_eq!(row["usage"]["response_count"], 5, "{row}");
+    assert_eq!(
+        row["usage"]["total_tokens"], expected_total_tokens,
+        "each distinct participant response is charged once: {row}"
+    );
+    assert_eq!(row["usage"]["response_count"], expected_responses, "{row}");
     assert_eq!(
         row["checks"][0]["passed"], independent_acceptance_passes,
         "{row}"
     );
     assert_eq!(row["accepted"], independent_acceptance_passes, "{row}");
+    if semantic_review {
+        let semantic = row["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "independent-semantic-review")
+            .expect("the row retains the independent semantic judgment");
+        assert_eq!(semantic["passed"], true, "{row}");
+        assert_eq!(semantic["findings"], 0, "{row}");
+        assert_eq!(semantic["unresolved_issues"], 0, "{row}");
+        assert_eq!(
+            cursor["baseline_qualification"]["semantic_review"]["judgment_kind"],
+            "accept"
+        );
+    }
     let oracle_path =
         std::path::PathBuf::from(cursor["baseline_qualification"]["oracle"].as_str().unwrap());
     let oracle_bytes = fs::read(&oracle_path).unwrap();
@@ -486,7 +599,10 @@ fn baseline_workflow_case(independent_acceptance_passes: bool) {
     );
     let repeated = fixture.resume();
     assert!(repeated.status.success(), "{}", text(&repeated));
-    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        expected_attempts
+    );
     assert_eq!(fs::read(row_path).unwrap(), row_bytes);
     assert_eq!(fs::read(oracle_path).unwrap(), oracle_bytes);
     let stopped = fixture.stop();
