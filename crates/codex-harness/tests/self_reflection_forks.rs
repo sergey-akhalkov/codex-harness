@@ -1674,3 +1674,6 @@ fn missing_new_turn_usage_stays_unknown_and_copied_source_is_not_charged() {
     let delivery = read_json(&workspace.state.join("lead-delivery.json"));
     assert_eq!(delivery["state"], "delivered", "{delivery}");
 }
+
+#[path = "self_reflection_forks/budget.rs"]
+mod budget;

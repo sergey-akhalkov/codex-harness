@@ -1988,6 +1988,18 @@ impl ReflectionController {
         stage: Stage,
         error: impl Into<String>,
     ) -> io::Result<StageReceipt> {
+        self.mark_stage_unknown_with_usage(acceptance_id, stage, error, UsageDelta::default())
+    }
+
+    /// Marks one stage unknown while retaining the work its submitted turn
+    /// consumed. Usage stays unreconciled, so dependent stages remain closed.
+    pub fn mark_stage_unknown_with_usage(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        error: impl Into<String>,
+        usage: UsageDelta,
+    ) -> io::Result<StageReceipt> {
         let error = bounded_text("stage uncertainty", &error.into(), MAX_TEXT_BYTES)?;
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;
@@ -2005,6 +2017,7 @@ impl ReflectionController {
                     slot.state
                 )));
             }
+            add_usage(slot, usage);
             slot.state = StageState::Unknown;
             slot.usage.last_error = Some(error);
             slot.usage_reconciled = false;

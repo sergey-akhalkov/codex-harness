@@ -3,7 +3,7 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ReflectionController, ReflectionRecord, Stage, StageState as RecordedStageState,
+    ReflectionController, ReflectionRecord, Stage, StageState as RecordedStageState, UsageDelta,
 };
 
 pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
@@ -153,13 +153,18 @@ fn run_recorded_stage(
     let state = match run() {
         Ok(state) => state,
         Err(error) => {
-            if recorded.state != RecordedStageState::Retained
-                && let Err(retention) =
-                    controller.mark_stage_unknown(&chain.acceptance, stage, error.to_string())
-            {
-                return Err(invalid(format!(
-                    "{error}; retaining stage uncertainty: {retention}"
-                )));
+            if recorded.state != RecordedStageState::Retained {
+                let usage = submitted_stage_usage(&state_path);
+                if let Err(retention) = controller.mark_stage_unknown_with_usage(
+                    &chain.acceptance,
+                    stage,
+                    error.to_string(),
+                    usage,
+                ) {
+                    return Err(invalid(format!(
+                        "{error}; retaining stage uncertainty: {retention}"
+                    )));
+                }
             }
             return Err(error);
         }
@@ -195,4 +200,20 @@ fn run_recorded_stage(
     }
     controller.retain_stage(&chain.acceptance, stage, outcome, usage)?;
     Ok(state)
+}
+
+/// Accounts for a turn submitted before the stage ended without a reconciled
+/// completion. Token fields stay exactly as the native state recorded them; an
+/// unknown total is not replaced with an estimate.
+fn submitted_stage_usage(state_path: &Path) -> UsageDelta {
+    let Ok(bytes) = fs::read(state_path) else {
+        return UsageDelta::default();
+    };
+    let Ok(state) = serde_json::from_slice::<StageState>(&bytes) else {
+        return UsageDelta::default();
+    };
+    UsageDelta {
+        turns: u64::from(state.turn_id.is_some()),
+        tokens: stage_usage_delta(&state).tokens,
+    }
 }
