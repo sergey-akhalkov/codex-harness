@@ -704,6 +704,15 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
             args.push(OsString::from("-c"));
             args.push(OsString::from(format!("{feature}=false")));
         }
+        // Goal RPCs are process-wide administrative controls, while inherited
+        // goal continuation is a fork-local setting. A source home may disable
+        // goals, but this app-server must still read, clear and verify the
+        // source and fork goals. This override follows every caller argument
+        // so the process remains able to administer goal state; `fork_params`
+        // keeps the feature off in the fork's own config, so the fork still
+        // has no inherited goal or autonomous continuation.
+        args.push(OsString::from("-c"));
+        args.push(OsString::from("features.goals=true"));
         args.push(OsString::from("-c"));
         args.push(OsString::from("web_search=\"disabled\""));
         // The native tool transport is required for permitted reads. Tool
@@ -1982,6 +1991,22 @@ impl Conversation {
         Ok(thread.clone())
     }
 
+    /// Parses the native `thread/goal/get` answer without guessing. A null goal is
+    /// the documented absence; an object is the exact stored goal. Any other shape,
+    /// including a missing field, is a malformed answer and stays an error.
+    fn parse_thread_goal(answer: &Value) -> io::Result<Value> {
+        match answer.get("goal") {
+            Some(goal @ (Value::Null | Value::Object(_))) => Ok(goal.clone()),
+            Some(other) => Err(invalid(format!(
+                "thread/goal/get answered with a non-goal value {}; refusing to guess goal state",
+                excerpt(&other.to_string(), 200)
+            ))),
+            None => Err(invalid(
+                "thread/goal/get answered without a goal field; refusing to guess goal state",
+            )),
+        }
+    }
+
     /// Reads one exact thread goal through the native goal owner. A null answer
     /// means the thread has no goal; a missing or malformed answer is refused
     /// rather than treated as an absent goal.
@@ -1993,16 +2018,7 @@ impl Conversation {
             ));
         }
         let answer = self.call("thread/goal/get", json!({"threadId": thread_id}))?;
-        match answer.get("goal") {
-            Some(goal @ (Value::Null | Value::Object(_))) => Ok(goal.clone()),
-            Some(other) => Err(invalid(format!(
-                "thread/goal/get answered with a non-goal value {}; refusing to guess goal state",
-                excerpt(&other.to_string(), 200)
-            ))),
-            None => Err(invalid(
-                "thread/goal/get answered without a goal field; refusing to guess goal state",
-            )),
-        }
+        Self::parse_thread_goal(&answer)
     }
 
     /// Clears one thread goal as an automatic lifecycle mutation and verifies
@@ -3615,6 +3631,100 @@ mod tests {
                 table[name].get("enabled").and_then(Value::as_bool),
                 Some(false),
                 "{value}"
+            );
+        }
+    }
+
+    fn reflection_plan(args: Vec<OsString>) -> ControlPlan {
+        let root = home("reflection-args");
+        let paths = ControlPaths {
+            endpoint: root.join("endpoint.json"),
+            token: root.join("token"),
+            log: root.join("log"),
+        };
+        let mut plan = ControlPlan::new(
+            PathBuf::from("codex.exe"),
+            root.clone(),
+            root,
+            "reflection check",
+            BoundIdentity {
+                profile: "ds".to_owned(),
+                model: Some("deepseek-flash".to_owned()),
+                model_provider: Some("deepseek".to_owned()),
+                reasoning_effort: Some("max".to_owned()),
+            },
+            paths,
+        );
+        plan.executor_session = false;
+        plan.reflection_session = true;
+        plan.args = args;
+        plan
+    }
+
+    #[test]
+    fn reflection_app_server_administers_goals_while_its_fork_keeps_them_disabled() {
+        let plan = reflection_plan(vec![
+            OsString::from("-c"),
+            OsString::from("features.goals=false"),
+        ]);
+        let args: Vec<String> = app_server_args(&plan, 4242)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let caller_value = args
+            .iter()
+            .position(|arg| arg == "features.goals=false")
+            .expect("the caller's conflicting override stays in the command");
+        let process_value = args
+            .iter()
+            .position(|arg| arg == "features.goals=true")
+            .expect("a reflection app-server must be able to read and clear goals");
+        assert_eq!(args[process_value - 1], "-c", "{args:?}");
+        assert!(
+            caller_value < process_value,
+            "the controller's goal RPC capability must win over a caller override: {args:?}"
+        );
+        for feature in REFLECTION_FEATURE_SWITCHES
+            .iter()
+            .filter(|feature| **feature != "features.goals")
+        {
+            assert!(
+                args.iter().any(|arg| arg == &format!("{feature}=false")),
+                "{feature} was not disabled at process scope: {args:?}"
+            );
+        }
+        let fork = fork_params(&plan, "source", "turn", &[], &[]).unwrap();
+        assert_eq!(fork["deferGoalContinuation"], true, "{fork}");
+        assert_eq!(fork["config"]["features.goals"], false, "{fork}");
+    }
+
+    #[test]
+    fn thread_goal_answers_are_only_null_or_an_object() {
+        assert_eq!(
+            Conversation::parse_thread_goal(&json!({"goal": null})).unwrap(),
+            Value::Null
+        );
+        let answer = json!({
+            "goal": {
+                "threadId": "thread-goal",
+                "objective": "preserve the exact fixture objective",
+                "status": "paused"
+            }
+        });
+        assert_eq!(
+            Conversation::parse_thread_goal(&answer).unwrap(),
+            answer["goal"]
+        );
+        for malformed in [
+            json!({}),
+            json!({"goal": "paused"}),
+            json!({"goal": []}),
+            json!({"goal": 7}),
+        ] {
+            let error = Conversation::parse_thread_goal(&malformed).unwrap_err();
+            assert!(
+                error.to_string().contains("refusing to guess goal state"),
+                "{malformed}: {error}"
             );
         }
     }

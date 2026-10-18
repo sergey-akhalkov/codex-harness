@@ -13,6 +13,8 @@ mod accepted;
 mod context;
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
+#[path = "self_reflection_forks/goals.rs"]
+mod goals;
 #[path = "self_reflection_forks/installed.rs"]
 mod installed;
 #[path = "self_reflection_forks/lead_recovery.rs"]
