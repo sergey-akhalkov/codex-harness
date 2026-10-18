@@ -27,8 +27,8 @@ use crate::executor_cli::{
 };
 use harness_core::{
     delivery_reflection::{
-        AcceptanceBinding, BudgetLimit, BudgetPause, Finding, ReflectionLimits, StageAdmission,
-        StageOutcome, StageUsage, StageWork, UsageDelta, UsageTotals,
+        AcceptanceBinding, BudgetLimit, BudgetPause, Finding, ReflectionLimits, Stage,
+        StageAdmission, StageOutcome, StageUsage, StageWork, UsageDelta, UsageTotals,
     },
     orchestration_config::{self, ProfileBinding},
     process::{Job, Limits},
@@ -591,6 +591,7 @@ pub(crate) fn run_executor(
     let path = chain.state_dir.join("executor-stage.json");
     run_stage(
         chain,
+        Stage::Executor,
         &chain.executor_stage,
         &chain.executor_source,
         &prepared,
@@ -617,6 +618,7 @@ pub(crate) fn run_lead(
     let path = chain.state_dir.join("lead-stage.json");
     run_stage(
         chain,
+        Stage::Lead,
         &chain.lead_stage,
         &chain.lead_source,
         &prepared,
@@ -1968,6 +1970,7 @@ fn bound_result(result: &str) -> io::Result<()> {
 
 fn run_stage(
     chain: &ChainState,
+    stage: Stage,
     declaration: &StageDeclaration,
     source: &Boundary,
     prepared: &PreparedStage,
@@ -2001,7 +2004,15 @@ fn run_stage(
         return Ok(state);
     }
     if state.status == StageStatus::TurnSubmitted {
-        return reconcile_submitted(chain, declaration, prepared, state_path, state, admission);
+        return reconcile_submitted(
+            chain,
+            stage,
+            declaration,
+            prepared,
+            state_path,
+            state,
+            admission,
+        );
     }
     if state.status != StageStatus::NotStarted {
         return Err(invalid(format!(
@@ -2083,6 +2094,8 @@ fn run_stage(
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
     if let Some(pause) = work_budget_pause(
+        chain,
+        stage,
         admission,
         state.work,
         vec![
@@ -2160,9 +2173,17 @@ fn run_stage(
     state.status = StageStatus::TurnSubmitted;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
-    let outcome = match drive_turn(&mut conversation, &frontend, chain.bound_seconds, admission) {
+    let outcome = match drive_turn(
+        &mut conversation,
+        &frontend,
+        chain,
+        stage,
+        chain.bound_seconds,
+        admission,
+    ) {
         Ok(Lifecycle::Completed) => retain_completed(
             chain,
+            stage,
             &mut conversation,
             state,
             &fork_thread,
@@ -2283,6 +2304,7 @@ fn validate_stage(
 
 fn reconcile_submitted(
     chain: &ChainState,
+    stage: Stage,
     declaration: &StageDeclaration,
     prepared: &PreparedStage,
     state_path: &Path,
@@ -2405,6 +2427,7 @@ fn reconcile_submitted(
                     frontend,
                     retain_completed(
                         chain,
+                        stage,
                         &mut conversation,
                         state,
                         &fork_thread,
@@ -2458,6 +2481,8 @@ fn close_recovery_frontend(
 fn drive_turn(
     conversation: &mut Conversation,
     frontend: &crate::executor_cli::OwnedFrontend,
+    chain: &ChainState,
+    stage: Stage,
     bound_seconds: u64,
     admission: &StageAdmission,
 ) -> Result<Lifecycle, DriveFailure> {
@@ -2481,6 +2506,8 @@ fn drive_turn(
             }
         }
         if let Some(pause) = work_budget_pause(
+            chain,
+            stage,
             admission,
             StageWork {
                 investigations: investigations.len() as u64,
@@ -2549,6 +2576,8 @@ fn completed_investigation(event: &control::ControlEvent, unnamed: &mut u64) -> 
 }
 
 fn work_budget_pause(
+    chain: &ChainState,
+    stage: Stage,
     admission: &StageAdmission,
     work: StageWork,
     mut evidence: Vec<String>,
@@ -2572,7 +2601,7 @@ fn work_budget_pause(
         admission.stage_context_bytes_limit,
         admission.record_context_bytes_limit
     ));
-    let (limit, observed, allowed, missing_fact, continuation_choice) = if record_investigations
+    let (limit, observed, allowed, missing_fact) = if record_investigations
         > admission.record_investigations_limit
     {
         (
@@ -2580,7 +2609,6 @@ fn work_budget_pause(
             record_investigations,
             admission.record_investigations_limit,
             "The accepted task exceeded its cumulative investigation allowance before the remaining source or accepted-work question could be established.",
-            "Raise max_investigations_per_record above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
         )
     } else if stage_investigations > admission.stage_investigations_limit {
         (
@@ -2588,7 +2616,6 @@ fn work_budget_pause(
             stage_investigations,
             admission.stage_investigations_limit,
             "The reflection stage exceeded its investigation allowance before the remaining source or accepted-work question could be established.",
-            "Raise max_investigations_per_stage (and the record allowance if needed) above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
         )
     } else if record_context > admission.record_context_bytes_limit {
         (
@@ -2596,7 +2623,6 @@ fn work_budget_pause(
             record_context,
             admission.record_context_bytes_limit,
             "The accepted task exceeded its cumulative recorded instruction/context allowance before the supplied source context could be verified as complete.",
-            "Raise max_context_bytes_per_record above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
         )
     } else if stage_context > admission.stage_context_bytes_limit {
         (
@@ -2604,19 +2630,194 @@ fn work_budget_pause(
             stage_context,
             admission.stage_context_bytes_limit,
             "The stage exceeded its recorded instruction/context allowance before the supplied source context could be verified as complete.",
-            "Raise max_context_bytes_per_stage (and the record allowance if needed) above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
         )
     } else {
         return None;
     };
+    let continuation_choice =
+        pause_continuation(chain, stage, limit, observed, allowed, admission, work);
     Some(BudgetPause {
         limit,
         observed,
         allowed,
         missing_fact: missing_fact.to_owned(),
-        continuation_choice: continuation_choice.to_owned(),
+        continuation_choice,
         evidence,
     })
+}
+
+/// Names an executable ordinary continuation for the installed CLI. The
+/// manual chain path has no accepted record to continue, so it keeps an
+/// interface-neutral instruction instead of advertising a command that cannot
+/// resolve its acceptance.
+fn pause_continuation(
+    chain: &ChainState,
+    stage: Stage,
+    limit: BudgetLimit,
+    observed: u64,
+    allowed: u64,
+    admission: &StageAdmission,
+    work: StageWork,
+) -> String {
+    if chain.accepted_work.is_none() {
+        return format!(
+            "raise {} above the observed value through the owning continuation and reconcile any unreconciled usage or observed work; otherwise leave this stage retained as inconclusive without another analysis",
+            limit.as_str()
+        );
+    }
+    accepted_continuation(
+        &chain.executor_stage.checkout,
+        &chain.source,
+        &chain.codex_home,
+        &chain.acceptance,
+        stage,
+        limit,
+        observed,
+        allowed,
+        admission,
+        work,
+    )
+}
+
+/// The exact installed continuation command for a retained accepted pause.
+/// Reconciliation flags are added by the caller only after measured additions
+/// exist; the command never asks the operator to invoke Rust methods.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accepted_continuation(
+    project: &Path,
+    source: &Path,
+    codex_home: &Path,
+    acceptance: &str,
+    stage: Stage,
+    limit: BudgetLimit,
+    observed: u64,
+    allowed: u64,
+    admission: &StageAdmission,
+    work: StageWork,
+) -> String {
+    let stage_investigations = admission
+        .stage_investigations_used
+        .saturating_add(work.investigations);
+    let record_investigations = admission
+        .record_investigations_used
+        .saturating_add(work.investigations);
+    let stage_context = admission
+        .stage_context_bytes_used
+        .saturating_add(work.context_bytes);
+    let record_context = admission
+        .record_context_bytes_used
+        .saturating_add(work.context_bytes);
+    let mut raises = vec![(limit, observed.max(allowed).saturating_add(1))];
+    let mut require = |flag: BudgetLimit, used: u64, configured: u64| {
+        if used >= configured {
+            raises.push((flag, used.saturating_add(1)));
+        }
+    };
+    match limit {
+        BudgetLimit::RecordInvestigations => require(
+            BudgetLimit::StageInvestigations,
+            stage_investigations,
+            admission.stage_investigations_limit,
+        ),
+        BudgetLimit::StageInvestigations => require(
+            BudgetLimit::RecordInvestigations,
+            record_investigations,
+            admission.record_investigations_limit,
+        ),
+        BudgetLimit::RecordContextBytes => require(
+            BudgetLimit::StageContextBytes,
+            stage_context,
+            admission.stage_context_bytes_limit,
+        ),
+        BudgetLimit::StageContextBytes => require(
+            BudgetLimit::RecordContextBytes,
+            record_context,
+            admission.record_context_bytes_limit,
+        ),
+        BudgetLimit::StageAttempts
+        | BudgetLimit::StageTurns
+        | BudgetLimit::StageTokens
+        | BudgetLimit::RecordTokens => {}
+    }
+    raise_record_floor(
+        &mut raises,
+        BudgetLimit::StageInvestigations,
+        BudgetLimit::RecordInvestigations,
+        admission.record_investigations_limit,
+    );
+    raise_record_floor(
+        &mut raises,
+        BudgetLimit::StageContextBytes,
+        BudgetLimit::RecordContextBytes,
+        admission.record_context_bytes_limit,
+    );
+    raise_record_floor(
+        &mut raises,
+        BudgetLimit::StageTokens,
+        BudgetLimit::RecordTokens,
+        admission.record_tokens_limit,
+    );
+    raises.sort_by_key(|(flag, _)| limit_flag(*flag));
+    let mut command = format!(
+        "codex-harness delivery-improvement continue --project {} --source {} --codex-home {} --acceptance {} --stage {}",
+        quote_path(project),
+        quote_path(source),
+        quote_path(codex_home),
+        quote_text(acceptance),
+        stage_arg(stage),
+    );
+    for (flag, value) in raises {
+        command.push_str(&format!(" --{} {value}", limit_flag(flag)));
+    }
+    command
+}
+
+fn raise_record_floor(
+    raises: &mut Vec<(BudgetLimit, u64)>,
+    stage_limit: BudgetLimit,
+    record_limit: BudgetLimit,
+    configured: u64,
+) {
+    let Some((_, stage_value)) = raises.iter().find(|(flag, _)| *flag == stage_limit) else {
+        return;
+    };
+    let stage_value = *stage_value;
+    if stage_value <= configured {
+        return;
+    }
+    if let Some((_, record_value)) = raises.iter_mut().find(|(flag, _)| *flag == record_limit) {
+        *record_value = (*record_value).max(stage_value);
+    } else {
+        raises.push((record_limit, stage_value));
+    }
+}
+
+pub(crate) fn stage_arg(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Executor => "executor",
+        Stage::Lead => "lead",
+    }
+}
+
+pub(crate) fn limit_flag(limit: BudgetLimit) -> &'static str {
+    match limit {
+        BudgetLimit::StageAttempts => "max-attempts-per-stage",
+        BudgetLimit::StageTurns => "max-turns-per-stage",
+        BudgetLimit::StageTokens => "max-tokens-per-stage",
+        BudgetLimit::RecordTokens => "max-tokens-per-record",
+        BudgetLimit::StageInvestigations => "max-investigations-per-stage",
+        BudgetLimit::RecordInvestigations => "max-investigations-per-record",
+        BudgetLimit::StageContextBytes => "max-context-bytes-per-stage",
+        BudgetLimit::RecordContextBytes => "max-context-bytes-per-record",
+    }
+}
+
+pub(crate) fn quote_path(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
+pub(crate) fn quote_text(text: &str) -> String {
+    format!("\"{text}\"")
 }
 
 /// Refuses a new fork when the admission snapshot already has no remaining
@@ -2672,6 +2873,7 @@ fn ensure_admission_available(admission: &StageAdmission) -> io::Result<()> {
 
 fn retain_completed(
     chain: &ChainState,
+    stage: Stage,
     conversation: &mut Conversation,
     mut state: StageState,
     fork_thread: &str,
@@ -2720,9 +2922,9 @@ fn retain_completed(
         "copied source turns retained as evidence, not newly charged: {}",
         state.copied_source_turns.len()
     ));
-    if let Some(pause) =
-        admission.and_then(|admission| work_budget_pause(admission, stage_work(&state), evidence))
-    {
+    if let Some(pause) = admission.and_then(|admission| {
+        work_budget_pause(chain, stage, admission, stage_work(&state), evidence)
+    }) {
         state.status = StageStatus::BudgetPaused;
         state.error = Some(pause.summary());
         state.budget_pause = Some(pause);

@@ -5,15 +5,48 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ActivationRequest, BindingStatus, DeliveryState as RecordedDeliveryState, JournalPolicy,
-    LifecycleStatus, ReflectionController, ReflectionRecord, StageState as RecordedStageState,
+    ActivationRequest, BindingStatus, BudgetLimit, BudgetPause,
+    DeliveryState as RecordedDeliveryState, JournalPolicy, LifecycleStatus, ReflectionController,
+    ReflectionLimits, ReflectionRecord, Stage, StageRecord, StageState as RecordedStageState,
+    StageWork, UsageDelta,
 };
 
-const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\nRun enable/process/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
+const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement continue --acceptance ACCEPTANCE --stage executor|lead --project DIRECTORY [--source KIT] [--codex-home DIRECTORY] [--max-attempts-per-stage N] [--max-turns-per-stage N] [--max-tokens-per-stage N] [--max-tokens-per-record N] [--max-investigations-per-stage N] [--max-investigations-per-record N] [--max-context-bytes-per-stage N] [--max-context-bytes-per-record N] [--reconcile-usage-turns N --reconcile-usage-tokens N] [--reconcile-investigations N --reconcile-context-bytes N]\nRun enable/process/continue/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance; continue resumes only the exact retained budget-paused stage named by status, with every supplied allowance strictly above its current value and the paused allowance above its observed value. Reconciliation values are measured additions, never estimates, and each pair must be supplied together; unchanged input starts no model work. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
+
+const LIMIT_OPTIONS: [(&str, BudgetLimit); 8] = [
+    ("--max-attempts-per-stage", BudgetLimit::StageAttempts),
+    ("--max-turns-per-stage", BudgetLimit::StageTurns),
+    ("--max-tokens-per-stage", BudgetLimit::StageTokens),
+    ("--max-tokens-per-record", BudgetLimit::RecordTokens),
+    (
+        "--max-investigations-per-stage",
+        BudgetLimit::StageInvestigations,
+    ),
+    (
+        "--max-investigations-per-record",
+        BudgetLimit::RecordInvestigations,
+    ),
+    (
+        "--max-context-bytes-per-stage",
+        BudgetLimit::StageContextBytes,
+    ),
+    (
+        "--max-context-bytes-per-record",
+        BudgetLimit::RecordContextBytes,
+    ),
+];
 
 enum RecoveryAction {
     ResumeRetained,
     RebaselineCurrent(String),
+}
+
+struct Continuation {
+    acceptance: String,
+    stage: Stage,
+    limits: Vec<(BudgetLimit, u64)>,
+    usage: Option<UsageDelta>,
+    work: Option<StageWork>,
 }
 
 struct Options {
@@ -22,6 +55,127 @@ struct Options {
     source: PathBuf,
     home: PathBuf,
     recovery: Option<RecoveryAction>,
+    continuation: Option<Continuation>,
+}
+
+fn allowed_option(command: &str, name: &str) -> bool {
+    match command {
+        "continue" => {
+            matches!(
+                name,
+                "--project"
+                    | "--source"
+                    | "--codex-home"
+                    | "--acceptance"
+                    | "--stage"
+                    | "--reconcile-usage-turns"
+                    | "--reconcile-usage-tokens"
+                    | "--reconcile-investigations"
+                    | "--reconcile-context-bytes"
+            ) || LIMIT_OPTIONS.iter().any(|(flag, _)| *flag == name)
+        }
+        "recover" => matches!(
+            name,
+            "--project" | "--source" | "--codex-home" | "--resolution" | "--evidence"
+        ),
+        _ => matches!(name, "--project" | "--source" | "--codex-home"),
+    }
+}
+
+fn continuation_options(values: &mut BTreeMap<&str, OsString>) -> io::Result<Continuation> {
+    let acceptance = take_option_text(
+        values,
+        "--acceptance",
+        "continue requires --acceptance ACCEPTANCE naming the exact retained pause",
+    )?;
+    if acceptance.len() > harness_core::delivery_reflection::MAX_TEXT_BYTES {
+        return Err(invalid("--acceptance exceeds the retained text bound"));
+    }
+    let stage = match take_option_text(
+        values,
+        "--stage",
+        "continue requires --stage executor or --stage lead naming the exact paused stage",
+    )?
+    .as_str()
+    {
+        "executor" => Stage::Executor,
+        "lead" => Stage::Lead,
+        other => {
+            return Err(invalid(format!(
+                "--stage must be executor or lead, not '{other}'; {USAGE}"
+            )));
+        }
+    };
+    let mut limits = Vec::new();
+    for (flag, limit) in LIMIT_OPTIONS {
+        if let Some(value) = take_option_number(values, flag)? {
+            limits.push((limit, value));
+        }
+    }
+    let usage_turns = take_option_number(values, "--reconcile-usage-turns")?;
+    let usage_tokens = take_option_number(values, "--reconcile-usage-tokens")?;
+    let usage = match (usage_turns, usage_tokens) {
+        (None, None) => None,
+        (Some(turns), Some(tokens)) => Some(UsageDelta { turns, tokens }),
+        _ => {
+            return Err(invalid(
+                "--reconcile-usage-turns and --reconcile-usage-tokens must be supplied together as measured additions from the retained native turn; one-sided reconciliation is refused",
+            ));
+        }
+    };
+    let investigations = take_option_number(values, "--reconcile-investigations")?;
+    let context_bytes = take_option_number(values, "--reconcile-context-bytes")?;
+    let work = match (investigations, context_bytes) {
+        (None, None) => None,
+        (Some(investigations), Some(context_bytes)) => Some(StageWork {
+            investigations,
+            context_bytes,
+        }),
+        _ => {
+            return Err(invalid(
+                "--reconcile-investigations and --reconcile-context-bytes must be supplied together as measured additions from the retained native stage; one-sided reconciliation is refused",
+            ));
+        }
+    };
+    Ok(Continuation {
+        acceptance,
+        stage,
+        limits,
+        usage,
+        work,
+    })
+}
+
+fn take_option_text(
+    values: &mut BTreeMap<&str, OsString>,
+    name: &str,
+    missing: &str,
+) -> io::Result<String> {
+    let raw = values.remove(name).ok_or_else(|| invalid(missing))?;
+    let text = raw
+        .into_string()
+        .map_err(|_| invalid(format!("{name} requires UTF-8 text")))?;
+    if text.trim().is_empty() {
+        return Err(invalid(missing));
+    }
+    Ok(text)
+}
+
+fn take_option_number(
+    values: &mut BTreeMap<&str, OsString>,
+    name: &str,
+) -> io::Result<Option<u64>> {
+    let Some(raw) = values.remove(name) else {
+        return Ok(None);
+    };
+    let text = raw
+        .to_str()
+        .ok_or_else(|| invalid(format!("{name} requires a UTF-8 non-negative integer")))?;
+    text.parse::<u64>().map(Some).map_err(|_| {
+        invalid(format!(
+            "{name} requires a non-negative integer, not '{text}'"
+        ))
+    })
 }
 
 impl Options {
@@ -32,7 +186,14 @@ impl Options {
             .unwrap_or_default();
         if !matches!(
             command,
-            "enable" | "status" | "disable" | "process" | "recover" | "restore-journal" | "_serve"
+            "enable"
+                | "status"
+                | "disable"
+                | "process"
+                | "recover"
+                | "restore-journal"
+                | "continue"
+                | "_serve"
         ) {
             return Err(invalid(USAGE));
         }
@@ -40,11 +201,7 @@ impl Options {
         let (pairs, remainder) = args[1..].as_chunks::<2>();
         for pair in pairs {
             let name = pair[0].to_str().unwrap_or_default();
-            if !matches!(
-                name,
-                "--project" | "--source" | "--codex-home" | "--resolution" | "--evidence"
-            ) || values.insert(name, pair[1].clone()).is_some()
-            {
+            if !allowed_option(command, name) || values.insert(name, pair[1].clone()).is_some() {
                 return Err(invalid(format!(
                     "unknown or repeated option {name}; {USAGE}"
                 )));
@@ -53,6 +210,11 @@ impl Options {
         if !remainder.is_empty() {
             return Err(invalid(format!("an option has no value; {USAGE}")));
         }
+        let continuation = if command == "continue" {
+            Some(continuation_options(&mut values)?)
+        } else {
+            None
+        };
         let resolution = values.remove("--resolution");
         let evidence = values.remove("--evidence");
         let recovery = if command == "recover" {
@@ -78,11 +240,6 @@ impl Options {
                 }
             }
         } else {
-            if resolution.is_some() || evidence.is_some() {
-                return Err(invalid(
-                    "--resolution and --evidence are only valid with recover",
-                ));
-            }
             None
         };
         let project = values
@@ -104,6 +261,7 @@ impl Options {
             source: canonical_dir(&source, "kit source")?,
             home: canonical_dir(&home, "CODEX_HOME")?,
             recovery,
+            continuation,
         })
     }
 
@@ -181,6 +339,10 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             Ok(0)
         }
         "process" => process(&options, &controller, false),
+        "continue" => {
+            let lead = options.lead()?;
+            continuation(&options, &controller, &lead)
+        }
         "restore-journal" => {
             let receipt = controller.restore_owned_journal()?;
             println!("{}", serde_json::to_string(&receipt)?);
@@ -213,11 +375,20 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
+const MAX_STATUS_RECORDS: usize = 64;
+
 fn status(controller: &ReflectionController, home: &Path) -> io::Result<i32> {
     let Some(state) = controller.stored_state()? else {
         println!("{}", json!({"lifecycle": "inactive", "pending": 0}));
         return Ok(0);
     };
+    let records: Vec<Value> = state
+        .records
+        .values()
+        .take(MAX_STATUS_RECORDS)
+        .map(record_status)
+        .collect();
+    let omitted = state.records.len().saturating_sub(records.len());
     println!(
         "{}",
         json!({
@@ -225,6 +396,7 @@ fn status(controller: &ReflectionController, home: &Path) -> io::Result<i32> {
             "binding": state.binding,
             "checkpoint": state.checkpoint,
             "journal": state.journal,
+            "limits": state.limits,
             "retained": state.records.len(),
             "pending": controller.pending_jobs()?.len(),
             "unfinished": state.records.values().filter(|record| record.delivery != RecordedDeliveryState::Consumed).count(),
@@ -233,9 +405,58 @@ fn status(controller: &ReflectionController, home: &Path) -> io::Result<i32> {
             "lastPoll": state.last_poll,
             "stateFile": controller.state_file()?,
             "host": host::status(home, &state.binding.lead_session)?,
+            "records": records,
+            "recordsOmitted": omitted,
         })
     );
     Ok(0)
+}
+
+/// Model-free visibility for the exact retained pause. `continuation` is the
+/// same installed command the native pause recorded; reconciliation flags are
+/// named separately because their values are measured additions the operator
+/// must supply, never estimates or assumed zero.
+fn record_status(record: &ReflectionRecord) -> Value {
+    let slot = |stage: Stage, value: &StageRecord| {
+        let mut missing = Vec::new();
+        if !value.usage_reconciled {
+            missing.push("--reconcile-usage-turns N --reconcile-usage-tokens N");
+        }
+        if !value.work_reconciled {
+            missing.push("--reconcile-investigations N --reconcile-context-bytes N");
+        }
+        let next_action = value.pause.as_ref().map(|_| {
+            if missing.is_empty() {
+                format!(
+                    "run the continuation for --stage {} to resume only this retained pause; otherwise leave the stage retained as inconclusive without another analysis",
+                    stage_arg(stage)
+                )
+            } else {
+                format!(
+                    "measure the retained native turn/stage and supply {} together with the continuation for --stage {}; never assume zero; otherwise leave the stage retained as inconclusive",
+                    missing.join(" and "),
+                    stage_arg(stage)
+                )
+            }
+        });
+        json!({
+            "state": value.state,
+            "usage": value.usage,
+            "usageReconciled": value.usage_reconciled,
+            "workReconciled": value.work_reconciled,
+            "pause": value.pause,
+            "missingReconciliation": missing,
+            "continuation": value.pause.as_ref().map(|pause| pause.continuation_choice.clone()),
+            "nextAction": next_action,
+        })
+    };
+    json!({
+        "acceptance": record.acceptance_id,
+        "executor": slot(Stage::Executor, &record.executor),
+        "lead": slot(Stage::Lead, &record.lead),
+        "delivery": record.delivery,
+        "deliveryReceipt": record.delivery_receipt,
+    })
 }
 
 fn declarations(
@@ -393,6 +614,280 @@ fn retained_delivery(record: &ReflectionRecord) -> bool {
         && record.delivery != RecordedDeliveryState::Consumed
 }
 
+fn stage_slot(record: &ReflectionRecord, stage: Stage) -> &StageRecord {
+    match stage {
+        Stage::Executor => &record.executor,
+        Stage::Lead => &record.lead,
+    }
+}
+
+/// Resumes the exact retained budget pause through the installed interface.
+/// Every refusal happens before a state write or model turn: the lead binding,
+/// board recovery, exact acceptance/stage, reconciliation inventory, raised
+/// allowances and projected admission are all checked first.
+fn continuation(
+    options: &Options,
+    controller: &ReflectionController,
+    lead: &str,
+) -> io::Result<i32> {
+    let continuation = options.continuation.as_ref().ok_or_else(|| {
+        invalid("continue requires --acceptance and --stage; nothing was changed")
+    })?;
+    let acceptance = continuation.acceptance.as_str();
+    let stage = continuation.stage;
+    let stage_name = stage_arg(stage);
+    let state = controller.stored_state()?.ok_or_else(|| {
+        invalid(
+            "delivery reflection is inactive; retained pauses require the active lifecycle and its managed lead; nothing was changed",
+        )
+    })?;
+    if state.lifecycle != LifecycleStatus::Active {
+        return Err(invalid(
+            "delivery reflection is stopped; retained results are preserved, but continuing a paused stage requires the active lifecycle; nothing was changed",
+        ));
+    }
+    let checked = controller.check_active_binding(lead, Some(acceptance))?;
+    if !checked.is_active() {
+        return Err(invalid(format!(
+            "the retained pause cannot be continued: {}; nothing was changed",
+            checked.detail
+        )));
+    }
+    if checked.matched_acceptance_id.as_deref() != Some(acceptance) {
+        return Err(invalid(format!(
+            "acceptance '{acceptance}' is not the current accepted work for this binding (matched {:?}); status names the exact retained pause; nothing was changed",
+            checked.matched_acceptance_id
+        )));
+    }
+    let polled = controller.poll()?;
+    if let Some(recovery) = polled.recovery {
+        return Err(invalid(format!(
+            "the board needs reconciliation before any continuation: {}; resolve it with `codex-harness delivery-improvement recover`; no model work was started",
+            recovery.detail
+        )));
+    }
+    let state = controller.stored_state()?.ok_or_else(|| {
+        invalid("the reflection lifecycle disappeared during continuation; nothing was changed")
+    })?;
+    if let Some((other, other_stage)) = state.records.iter().find_map(|(id, record)| {
+        [Stage::Executor, Stage::Lead]
+            .into_iter()
+            .find_map(|stage| {
+                matches!(
+                    stage_slot(record, stage).state,
+                    RecordedStageState::InFlight | RecordedStageState::Unknown
+                )
+                .then(|| (id.clone(), stage_arg(stage)))
+            })
+    }) {
+        return Err(invalid(format!(
+            "acceptance '{other}' has a {other_stage} stage in flight or unknown; reconcile that stage before changing limits or continuing '{acceptance}'; nothing was changed"
+        )));
+    }
+    let record = controller.record(acceptance)?.ok_or_else(|| {
+        invalid(format!(
+            "acceptance '{acceptance}' is not retained by this lifecycle; run delivery-improvement status; nothing was changed"
+        ))
+    })?;
+    if record.delivery == RecordedDeliveryState::Consumed {
+        return Err(invalid(format!(
+            "acceptance '{acceptance}' delivery is already consumed; no stage may run again; nothing was changed"
+        )));
+    }
+    let slot = stage_slot(&record, stage);
+    if slot.state != RecordedStageState::Blocked {
+        return Err(invalid(format!(
+            "{stage_name} reflection for '{acceptance}' is {:?}, not a retained budget pause; continue only the exact paused stage named by status; nothing was changed",
+            slot.state
+        )));
+    }
+    let pause = slot.pause.as_ref().ok_or_else(|| {
+        invalid(format!(
+            "{stage_name} reflection for '{acceptance}' is blocked without a retained budget pause; reconcile its cause through status and recovery; nothing was changed"
+        ))
+    })?;
+    validate_reconciliation(continuation, stage_name, slot)?;
+    let limits = raised_limits(continuation, &state.limits, pause, stage_name)?;
+    validate_projected_admission(&record, slot, &limits, continuation)?;
+    // Stage routing and the exact accepted boundaries are validated before any
+    // retained state changes. The continuation then executes only this
+    // acceptance through the same accepted-stage controller as `process`.
+    let request = request(options, controller, &record)?;
+
+    if let Some(usage) = continuation.usage {
+        controller.record_unknown_usage(acceptance, stage, usage)?;
+    }
+    if let Some(work) = continuation.work {
+        controller.record_observed_work(acceptance, stage, work)?;
+    }
+    if !continuation.limits.is_empty() {
+        controller.configure_limits(&limits)?;
+    }
+    controller.retry_stage(acceptance, stage)?;
+    accepted::execute(request, &options.project)
+}
+
+fn validate_reconciliation(
+    continuation: &Continuation,
+    stage_name: &str,
+    slot: &StageRecord,
+) -> io::Result<()> {
+    match (continuation.usage.is_some(), slot.usage_reconciled) {
+        (true, true) => {
+            return Err(invalid(format!(
+                "{stage_name} reflection usage is already reconciled; omit --reconcile-usage-turns/--reconcile-usage-tokens rather than charging again; nothing was changed"
+            )));
+        }
+        (false, false) => {
+            return Err(invalid(format!(
+                "{stage_name} reflection usage is unreconciled; continue requires measured additions with --reconcile-usage-turns N --reconcile-usage-tokens N; never assume zero; nothing was changed"
+            )));
+        }
+        _ => {}
+    }
+    match (continuation.work.is_some(), slot.work_reconciled) {
+        (true, true) => Err(invalid(format!(
+            "{stage_name} reflection observed work is already reconciled; omit --reconcile-investigations/--reconcile-context-bytes rather than charging again; nothing was changed"
+        ))),
+        (false, false) => Err(invalid(format!(
+            "{stage_name} reflection observed work is unreconciled; continue requires measured additions with --reconcile-investigations N --reconcile-context-bytes N; never assume zero; nothing was changed"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn raised_limits(
+    continuation: &Continuation,
+    current: &ReflectionLimits,
+    pause: &BudgetPause,
+    stage_name: &str,
+) -> io::Result<ReflectionLimits> {
+    let mut limits = current.clone();
+    for (limit, value) in &continuation.limits {
+        let configured = limit.configured(current);
+        if *value <= configured {
+            return Err(invalid(format!(
+                "--{} must be strictly above the current {} ({configured}); unchanged allowances cannot continue a paused stage; nothing was changed",
+                limit_flag(*limit),
+                limit.as_str()
+            )));
+        }
+        match limit {
+            BudgetLimit::StageAttempts => {
+                limits.max_attempts_per_stage = u32::try_from(*value).map_err(|_| {
+                    invalid(format!(
+                        "--{} must be at most {}",
+                        limit_flag(*limit),
+                        u32::MAX
+                    ))
+                })?;
+            }
+            BudgetLimit::StageTurns => limits.max_turns_per_stage = *value,
+            BudgetLimit::StageTokens => limits.max_tokens_per_stage = *value,
+            BudgetLimit::RecordTokens => limits.max_tokens_per_record = *value,
+            BudgetLimit::StageInvestigations => limits.max_investigations_per_stage = *value,
+            BudgetLimit::RecordInvestigations => limits.max_investigations_per_record = *value,
+            BudgetLimit::StageContextBytes => limits.max_context_bytes_per_stage = *value,
+            BudgetLimit::RecordContextBytes => limits.max_context_bytes_per_record = *value,
+        }
+    }
+    limits.validate().map_err(|error| {
+        invalid(format!(
+            "the requested allowances are not usable: {error}; nothing was changed"
+        ))
+    })?;
+    if pause.limit.configured(&limits) <= pause.observed {
+        return Err(invalid(format!(
+            "{stage_name} reflection remains paused at {} observed {}; continue requires --{} above {}; nothing was changed",
+            pause.limit.as_str(),
+            pause.observed,
+            limit_flag(pause.limit),
+            pause.observed
+        )));
+    }
+    Ok(limits)
+}
+
+/// Mirrors the cumulative admission `begin_stage` applies, including the
+/// measured reconciliation additions, so a continuation that cannot admit the
+/// next attempt is refused before limits or usage are written.
+fn validate_projected_admission(
+    record: &ReflectionRecord,
+    slot: &StageRecord,
+    limits: &ReflectionLimits,
+    continuation: &Continuation,
+) -> io::Result<()> {
+    let usage = continuation.usage.unwrap_or_default();
+    let work = continuation.work.unwrap_or_default();
+    let turns = slot.usage.turns.saturating_add(usage.turns);
+    let tokens = slot.usage.tokens.saturating_add(usage.tokens);
+    let investigations = slot
+        .usage
+        .investigations
+        .saturating_add(work.investigations);
+    let context_bytes = slot.usage.context_bytes.saturating_add(work.context_bytes);
+    let totals = record.usage_totals();
+    let record_tokens = totals.tokens.saturating_add(usage.tokens);
+    let record_investigations = totals.investigations.saturating_add(work.investigations);
+    let record_context_bytes = totals.context_bytes.saturating_add(work.context_bytes);
+    let stage_name = stage_arg(continuation.stage);
+    let refusal = |flag: &str, observed: u64, scope: &str| {
+        invalid(format!(
+            "continuing {stage_name} reflection would admit no new attempt: {scope} observed {observed} leaves no allowance; set --{flag} above {observed} (at least {}) and keep the record floor at or above the stage value; nothing was changed",
+            observed.saturating_add(1)
+        ))
+    };
+    if u64::from(slot.usage.attempts) >= u64::from(limits.max_attempts_per_stage) {
+        return Err(refusal(
+            "max-attempts-per-stage",
+            u64::from(slot.usage.attempts),
+            "stage attempts",
+        ));
+    }
+    if turns >= limits.max_turns_per_stage {
+        return Err(refusal("max-turns-per-stage", turns, "stage turns"));
+    }
+    if tokens >= limits.max_tokens_per_stage {
+        return Err(refusal("max-tokens-per-stage", tokens, "stage tokens"));
+    }
+    if record_tokens >= limits.max_tokens_per_record {
+        return Err(refusal(
+            "max-tokens-per-record",
+            record_tokens,
+            "record tokens",
+        ));
+    }
+    if investigations >= limits.max_investigations_per_stage {
+        return Err(refusal(
+            "max-investigations-per-stage",
+            investigations,
+            "stage investigations",
+        ));
+    }
+    if record_investigations >= limits.max_investigations_per_record {
+        return Err(refusal(
+            "max-investigations-per-record",
+            record_investigations,
+            "record investigations",
+        ));
+    }
+    if context_bytes >= limits.max_context_bytes_per_stage {
+        return Err(refusal(
+            "max-context-bytes-per-stage",
+            context_bytes,
+            "stage supplied-context bytes",
+        ));
+    }
+    if record_context_bytes >= limits.max_context_bytes_per_record {
+        return Err(refusal(
+            "max-context-bytes-per-record",
+            record_context_bytes,
+            "record supplied-context bytes",
+        ));
+    }
+    Ok(())
+}
+
 fn serve(options: &Options) -> io::Result<i32> {
     let lead = options.lead()?;
     if std::env::var("HARNESS_REFLECTION_HOST").as_deref() != Ok(lead.as_str()) {
@@ -421,6 +916,7 @@ fn serve(options: &Options) -> io::Result<i32> {
         for board in boards {
             let options = Options {
                 recovery: None,
+                continuation: None,
                 command: "process".to_owned(),
                 project: canonical_dir(&board.project, "consumer project")?,
                 source: options.source.clone(),

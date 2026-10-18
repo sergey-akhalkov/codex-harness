@@ -577,7 +577,8 @@ impl BudgetLimit {
         }
     }
 
-    fn configured(self, limits: &ReflectionLimits) -> u64 {
+    /// The value this allowance has in one configured limit set.
+    pub fn configured(self, limits: &ReflectionLimits) -> u64 {
         match self {
             Self::StageAttempts => u64::from(limits.max_attempts_per_stage),
             Self::StageTurns => limits.max_turns_per_stage,
@@ -2063,7 +2064,7 @@ impl ReflectionController {
         };
         if let Some(pause) = &slot.pause {
             return Err(conflict(&format!(
-                "{} reflection remains paused; configure the named allowance above the observed value, reconcile usage, and call retry_stage before another attempt: {}",
+                "{} reflection remains paused; configure the named allowance above the observed value and reconcile any unreconciled usage or observed work through the owning continuation before another attempt: {}",
                 stage.as_str(),
                 pause.summary()
             )));
@@ -2578,12 +2579,12 @@ impl ReflectionController {
             }
             if slot.state == StageState::Unknown && !slot.usage_reconciled {
                 return Err(conflict(
-                    "the unknown stage outcome must have its usage reconciled with record_unknown_usage before retry",
+                    "the unknown stage outcome must have its measured or explicitly unknown usage reconciled before retry",
                 ));
             }
             if slot.state == StageState::Unknown && !slot.work_reconciled {
                 return Err(conflict(
-                    "the unknown stage's observed investigation/context work must be reconciled with record_observed_work before retry",
+                    "the unknown stage's observed investigation/context work must be reconciled before retry",
                 ));
             }
             if slot.state == StageState::Blocked {
@@ -2595,12 +2596,12 @@ impl ReflectionController {
                 })?;
                 if !slot.usage_reconciled {
                     return Err(conflict(
-                        "the paused stage's new-turn usage must be reconciled with record_unknown_usage before retry",
+                        "the paused stage's new-turn usage must be reconciled with the measured or explicitly unknown value before retry",
                     ));
                 }
                 if !slot.work_reconciled {
                     return Err(conflict(
-                        "the paused stage's observed investigation/context work must be reconciled with record_observed_work before retry",
+                        "the paused stage's observed investigation/context work must be reconciled before retry",
                     ));
                 }
                 let configured = pause.limit.configured(&limits);

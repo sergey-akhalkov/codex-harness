@@ -14,6 +14,7 @@ use harness_core::{
         acceptance_metadata,
     },
 };
+use std::ffi::OsString;
 
 const BUDGET_ACTOR: &str = "reflection-fixture-lead";
 
@@ -123,6 +124,101 @@ fn run_budget_chain_with_investigations(
         spec.env.insert(name.into(), Some(value.into()));
     }
     wait_session(ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap())
+}
+
+fn install_fixture(workspace: &Workspace) {
+    let bin = workspace.home.join("harness/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::copy(fixture(), bin.join("codex.exe")).unwrap();
+    fs::copy(
+        workspace.home.join(format!("{PROFILE}.config.toml")),
+        workspace.home.join("config.toml"),
+    )
+    .unwrap();
+    let registry = workspace.home.join("harness/lead-endpoints");
+    fs::create_dir_all(&registry).unwrap();
+    fs::copy(
+        &workspace.endpoint,
+        registry.join(format!("{LEAD_THREAD}.json")),
+    )
+    .unwrap();
+}
+
+/// Drives the installed `delivery-improvement` interface, not the low-level
+/// request runner, so continuation is proven exactly as an operator reaches it.
+fn delivery_cli(
+    workspace: &Workspace,
+    action: &str,
+    extra: &[&str],
+    executor_investigations: u64,
+    executor_fork: &str,
+    executor_turn: &str,
+) -> ConsoleOutcome {
+    let mut spec = CommandSpec::new(manager());
+    spec.args = vec![
+        "delivery-improvement".into(),
+        action.into(),
+        "--project".into(),
+        workspace.checkout.as_os_str().to_owned(),
+        "--source".into(),
+        kit_root().into_os_string(),
+        "--codex-home".into(),
+        workspace.home.as_os_str().to_owned(),
+    ];
+    spec.args
+        .extend(extra.iter().map(|value| OsString::from(*value)));
+    spec.current_dir = Some(workspace.checkout.clone());
+    apply_fixture_env(
+        workspace,
+        &mut spec,
+        LEAD_THREAD,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    spec.env
+        .insert("HARNESS_REFLECTION_HOST".into(), Some(LEAD_THREAD.into()));
+    spec.env
+        .insert("CODEX_THREAD_ID".into(), Some(LEAD_THREAD.into()));
+    spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_INVESTIGATIONS".into(),
+        Some(executor_investigations.to_string().into()),
+    );
+    spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_LEAD_INVESTIGATIONS".into(),
+        Some("0".into()),
+    );
+    spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_FORK_THREAD".into(),
+        Some(executor_fork.into()),
+    );
+    spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_FORK_TURN".into(),
+        Some(executor_turn.into()),
+    );
+    wait_session(ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap())
+}
+
+fn status_json(workspace: &Workspace) -> Value {
+    let output = Command::new(manager())
+        .args(["delivery-improvement", "status", "--project"])
+        .arg(&workspace.checkout)
+        .arg("--source")
+        .arg(kit_root())
+        .arg("--codex-home")
+        .arg(&workspace.home)
+        .env("CODEX_HOME", &workspace.home)
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 #[test]
@@ -419,7 +515,19 @@ fn investigation_overrun_pauses_the_stage_and_retry_retains_prior_work() {
     assert_eq!(pause.observed, 2);
     assert_eq!(pause.allowed, 1);
     assert!(pause.missing_fact.contains("investigation allowance"));
-    assert!(pause.continuation_choice.contains("retry_stage"));
+    assert!(
+        pause
+            .continuation_choice
+            .contains("delivery-improvement continue"),
+        "{}",
+        pause.continuation_choice
+    );
+    assert!(
+        pause.continuation_choice.contains("--stage executor"),
+        "{}",
+        pause.continuation_choice
+    );
+    assert!(!pause.continuation_choice.contains("retry_stage"));
     assert!(!pause.evidence.is_empty());
     assert_eq!(record.lead.state, StageState::Pending);
     assert_eq!(record.lead.usage.attempts, 0);
@@ -554,6 +662,202 @@ fn investigation_overrun_pauses_the_stage_and_retry_retains_prior_work() {
 }
 
 #[test]
+fn installed_continuation_resumes_the_exact_pause_without_resetting_costs() {
+    let workspace = Workspace::new("budget-cli-continuation", LeadMode::Delivered);
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 2,
+        max_turns_per_stage: 2,
+        max_tokens_per_stage: 240,
+        max_tokens_per_record: 480,
+        max_investigations_per_stage: 1,
+        max_investigations_per_record: 2,
+        ..ReflectionLimits::default()
+    };
+    let (controller, request, acceptance) = accepted_with_limits(&workspace, limits);
+    install_fixture(&workspace);
+    assert_eq!(&request["acceptance"], &json!(acceptance));
+
+    let paused = delivery_cli(
+        &workspace,
+        "process",
+        &[],
+        2,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&paused, "stage_investigations observed 2 exceeds allowed 1");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Blocked);
+    assert_eq!(
+        record.executor.pause.as_ref().unwrap().limit,
+        BudgetLimit::StageInvestigations
+    );
+    assert!(record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+
+    // Status is model-free and names the exact installed continuation,
+    // including the raised allowance flags computed from the retained pause.
+    let status = status_json(&workspace);
+    let entry = status["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["acceptance"] == json!(acceptance))
+        .unwrap();
+    assert_eq!(entry["executor"]["state"], json!("blocked"), "{entry}");
+    assert_eq!(entry["executor"]["usageReconciled"], json!(true), "{entry}");
+    assert_eq!(entry["executor"]["workReconciled"], json!(true), "{entry}");
+    assert_eq!(
+        entry["executor"]["missingReconciliation"],
+        json!([]),
+        "{entry}"
+    );
+    let continuation = entry["executor"]["continuation"].as_str().unwrap();
+    assert!(
+        continuation.contains("delivery-improvement continue")
+            && continuation.contains("--stage executor")
+            && continuation.contains("--max-investigations-per-stage")
+            && continuation.contains("--max-investigations-per-record"),
+        "{continuation}"
+    );
+    assert!(
+        entry["executor"]["nextAction"]
+            .as_str()
+            .is_some_and(|action| action.contains("--stage executor")),
+        "{entry}"
+    );
+
+    // Unchanged allowances cannot resume the pause: no model request and no
+    // state change.
+    let unchanged = delivery_cli(
+        &workspace,
+        "continue",
+        &["--acceptance", &acceptance, "--stage", "executor"],
+        2,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&unchanged, "--max-investigations-per-stage");
+    assert!(
+        unchanged.transcript.contains("nothing was changed"),
+        "{}",
+        unchanged.transcript
+    );
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+
+    // A continuation for any other stage is refused before effects.
+    let wrong_stage = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "lead",
+            "--max-investigations-per-stage",
+            "4",
+            "--max-investigations-per-record",
+            "8",
+        ],
+        2,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&wrong_stage, "not a retained budget pause");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+
+    // Reconciliation is never assumed: a one-sided pair is refused at parse
+    // time, and an already-reconciled stage refuses a second charge.
+    let one_sided = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "executor",
+            "--reconcile-usage-turns",
+            "0",
+        ],
+        2,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&one_sided, "--reconcile-usage-tokens");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    let doubled = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "executor",
+            "--reconcile-usage-turns",
+            "0",
+            "--reconcile-usage-tokens",
+            "0",
+        ],
+        2,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&doubled, "already reconciled");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+
+    // The exact paused stage continues with its retained usage and the raised
+    // cumulative allowances; the second native attempt and the lead follow.
+    let continued = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "executor",
+            "--max-investigations-per-stage",
+            "4",
+            "--max-investigations-per-record",
+            "8",
+        ],
+        2,
+        "fixture-executor-reflection-fork-2",
+        "fixture-executor-reflection-turn-2",
+    );
+    assert_eq!(continued.outcome.exit_code, 0, "{}", continued.transcript);
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
+
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+    let archived = read_json(&state_dir.join("executor-stage-attempt-1.json"));
+    assert_eq!(archived["status"], json!("budget-paused"), "{archived}");
+    assert_eq!(archived["work"]["investigations"], json!(2), "{archived}");
+
+    let final_record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(final_record.executor.state, StageState::Retained);
+    assert_eq!(final_record.executor.usage.attempts, 2);
+    assert_eq!(final_record.executor.usage.turns, 2);
+    assert_eq!(final_record.executor.usage.tokens, 240);
+    assert_eq!(final_record.executor.usage.investigations, 4);
+    assert!(final_record.executor.pause.is_none());
+    assert_eq!(final_record.lead.state, StageState::Retained);
+    assert_eq!(final_record.lead.usage.tokens, 240);
+    assert_eq!(final_record.delivery, DeliveryState::Consumed);
+    assert_eq!(final_record.usage_totals().tokens, 480);
+    assert_eq!(final_record.usage_totals().investigations, 4);
+    let raised = controller.stored_state().unwrap().unwrap().limits;
+    assert_eq!(raised.max_investigations_per_stage, 4);
+    assert_eq!(raised.max_investigations_per_record, 8);
+}
+
+#[test]
 fn fork_context_overrun_pauses_before_the_turn_and_restart_sends_no_request() {
     let workspace = Workspace::new("budget-context-overrun", LeadMode::Delivered);
     let limits = ReflectionLimits {
@@ -595,7 +899,7 @@ fn fork_context_overrun_pauses_before_the_turn_and_restart_sends_no_request() {
     assert!(
         pause
             .continuation_choice
-            .contains("max_context_bytes_per_stage")
+            .contains("--max-context-bytes-per-stage")
     );
     assert_eq!(record.lead.state, StageState::Pending);
     assert_eq!(record.delivery, DeliveryState::Pending);
@@ -685,7 +989,7 @@ fn record_investigation_overrun_pauses_the_lead_and_rerun_sends_no_request() {
     assert!(
         pause
             .continuation_choice
-            .contains("max_investigations_per_record")
+            .contains("--max-investigations-per-record")
     );
     assert!(!pause.evidence.is_empty());
     assert_eq!(record.delivery, DeliveryState::Pending);
