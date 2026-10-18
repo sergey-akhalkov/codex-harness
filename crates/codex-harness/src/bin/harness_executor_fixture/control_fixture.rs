@@ -226,7 +226,7 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
         env::var("HARNESS_IMPROVEMENT_FIXTURE_SESSION").unwrap_or_else(|_| DEFAULT_SESSION.into());
     let synthetic = synthetic_turn()?;
     let turn = synthetic.clone().unwrap_or_else(FixtureTurn::legacy);
-    let route = installed_route()?;
+    let route = installed_route(args)?;
     let rollout_model =
         env::var("HARNESS_IMPROVEMENT_FIXTURE_MODEL").unwrap_or_else(|_| route.model.clone());
     let rollout_effort =
@@ -1377,14 +1377,34 @@ struct InstalledRoute {
     effort: String,
 }
 
-fn installed_route() -> io::Result<InstalledRoute> {
+fn installed_route(args: &[std::ffi::OsString]) -> io::Result<InstalledRoute> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("the fixture app-server requires CODEX_HOME"))?;
     let bytes = fs::read(home.join("config.toml"))?;
-    let document: toml::Table =
+    let mut document: toml::Table =
         toml::from_str(std::str::from_utf8(&bytes).map_err(io::Error::other)?)
             .map_err(io::Error::other)?;
+    // Native app-server receives the selected profile through explicit -c
+    // overrides. Honor the actual command, rather than answering every role
+    // with the base home's model.
+    for pair in args
+        .windows(2)
+        .filter(|pair| pair[0] == "-c" || pair[0] == "--config")
+    {
+        let argument = pair[1].to_string_lossy();
+        let Some((key, _)) = argument.split_once('=') else {
+            continue;
+        };
+        if !matches!(
+            key.trim(),
+            "model" | "model_provider" | "model_reasoning_effort"
+        ) {
+            continue;
+        }
+        let value: toml::Table = toml::from_str(&argument).map_err(io::Error::other)?;
+        document.extend(value);
+    }
     let text = |key: &str| {
         document
             .get(key)

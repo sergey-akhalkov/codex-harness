@@ -1908,35 +1908,68 @@ pub(super) fn attempt_receipt(fixture: &Fixture, attempt_id: &str) -> PathBuf {
     )
 }
 
-/// Bounded wait until the host's own observation record of one attempt reached
-/// a terminal state **and** recorded the terminal exit status. A completed
-/// state is written when the control driver sees the turn's terminal event,
-/// before the host finalizes the final message and exit code; returning early
-/// would let a caller restore that pre-finalization record over the host's own
-/// completed write. Only the finalized record is a settled attempt.
+/// Wait for the host's finalized result. A completed turn still needs its
+/// terminal exit status, so a caller cannot overwrite the host's later write.
+/// Startup failure can lack an exit code; it is final only when the exact
+/// recorded host has exited.
 pub(super) fn wait_for_terminal_receipt(receipt: &Path) -> Value {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut last = None;
     loop {
         if let Ok(bytes) = fs::read(receipt)
             && let Ok(record) = serde_json::from_slice::<Value>(&bytes)
-            && let Some(state) = record["observation"]["state"].as_str()
-            && match state {
-                "completed" | "failed" | "defect" => {
+        {
+            let state = record["observation"]["state"].as_str().unwrap_or_default();
+            let finalized = match state {
+                "completed" => record["observation"]["exitCode"].as_i64().is_some(),
+                "failed" | "defect" => {
                     record["observation"]["exitCode"].as_i64().is_some()
+                        || failed_host_has_exited(&record)
                 }
                 "interrupted" | "stopped" => true,
                 _ => false,
+            };
+            if finalized {
+                return record;
             }
-        {
-            return record;
+            last = Some(record["observation"].clone());
         }
         assert!(
             std::time::Instant::now() < until,
-            "the control-backed run produced no terminal observation record at {}",
+            "no finalized native observation at {}; last observation: {last:?}",
             receipt.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+fn failed_host_has_exited(record: &Value) -> bool {
+    use harness_core::{
+        process::ProcessIdentity,
+        process_service::{self, ServiceProcess},
+    };
+    let host = &record["observation"]["host"];
+    let (Some(pid), Some(created), Some(program)) = (
+        host["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()),
+        host["created"].as_u64(),
+        host["program"].as_str(),
+    ) else {
+        return false;
+    };
+    let Ok(user) = process_service::current_user() else {
+        return false;
+    };
+    matches!(
+        ServiceProcess::inspect(
+            ProcessIdentity {
+                pid,
+                creation_time: created
+            },
+            Path::new(program),
+            &user
+        ),
+        Ok(None)
+    )
 }
 
 pub(super) fn load_json(path: &Path) -> Value {

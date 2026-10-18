@@ -294,8 +294,38 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
     assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
     fs::write(&receipt, original).unwrap();
 
-    let resumed = fixture.resume();
-    assert!(resumed.status.success(), "{}", text(&resumed));
+    let resume_turn = |role: &str, result: &str| {
+        let output = fixture.improve_with_env(
+            &["resume", "--run", fixture.run.to_str().unwrap()],
+            &[
+                CONTROL_CHILD_MODE,
+                ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
+                ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", role),
+                ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", result),
+                (
+                    "HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_TEXT",
+                    if role == "correction" {
+                        "corrected"
+                    } else {
+                        "solved"
+                    },
+                ),
+            ],
+        );
+        assert!(output.status.success(), "{}", text(&output));
+        output
+    };
+    let wait_last = || {
+        let cursor = fixture.cursor();
+        let attempt = cursor["attempts"].as_array().unwrap().last().unwrap();
+        let receipt = std::path::PathBuf::from(attempt["receipt"].as_str().unwrap());
+        let terminal = wait_for_terminal_receipt(&receipt);
+        assert_eq!(terminal["observation"]["state"], "completed", "{terminal}");
+    };
+    resume_turn(
+        "executor",
+        "Implemented the task and committed the scoped solution.",
+    );
     let cursor = fixture.cursor();
     let qualification = &cursor["baseline_qualification"];
     assert_eq!(qualification["lead_binding"]["model"], "gpt-6-astra");
@@ -315,9 +345,60 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
             .unwrap(),
     );
     assert_eq!(fs::read_to_string(retained).unwrap(), assignment);
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(cursor["attempts"][1]["profile"], "ds");
+    assert_eq!(cursor["attempts"][1]["model"], "deepseek-flash");
+    wait_last();
+    resume_turn(
+        "lead-review",
+        "CORRECT: Address the one concrete scoped correction and rerun the check.",
+    );
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 3);
+    wait_last();
+    let lead_session =
+        fixture.cursor()["baseline_qualification"]["workflow"]["lead"]["session"].clone();
+    resume_turn(
+        "correction",
+        "Applied the concrete correction and verified the task.",
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 4);
+    assert_eq!(cursor["attempts"][2]["binding"]["session"], lead_session);
+    let executor_session =
+        cursor["baseline_qualification"]["workflow"]["executor"]["session"].clone();
+    wait_last();
+    resume_turn(
+        "lead-review",
+        "ACCEPT: The scoped result and applicable checks satisfy the original task.",
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        cursor["attempts"][3]["binding"]["session"],
+        executor_session
+    );
+    wait_last();
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][4]["binding"]["session"], lead_session);
+    let workflow = &cursor["baseline_qualification"]["workflow"];
+    assert_eq!(workflow["completed"], true);
+    assert_eq!(workflow["lead_accepted"], true);
+    assert_eq!(workflow["corrections"].as_array().unwrap().len(), 1);
+    assert!(
+        cursor["baseline_qualification"]["accepted"].is_null(),
+        "lead acceptance alone is not independent qualification"
+    );
+    let report =
+        std::path::PathBuf::from(cursor["baseline_qualification"]["report"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(report).unwrap(),
+        "Applied the concrete correction and verified the task."
+    );
     let repeated = fixture.resume();
     assert!(repeated.status.success(), "{}", text(&repeated));
-    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 5);
     let stopped = fixture.stop();
     assert!(stopped.status.success(), "{}", text(&stopped));
 }

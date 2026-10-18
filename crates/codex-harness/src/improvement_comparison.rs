@@ -2566,11 +2566,11 @@ fn record_workload_implementation(
     .map_err(|error| error.to_string())
 }
 
-/// The verified committed solution of one measured arm.
-struct Solution {
-    revision: String,
-    changed_paths: Vec<String>,
-    checkout: PathBuf,
+/// The verified committed solution of one ordinary or measured task.
+pub(super) struct Solution {
+    pub(super) revision: String,
+    pub(super) changed_paths: Vec<String>,
+    pub(super) checkout: PathBuf,
 }
 
 fn validate_solution(
@@ -2579,6 +2579,25 @@ fn validate_solution(
     bindings: &ExperimentBindings,
     comparison: &ComparisonInputs,
     arm: ComparisonArm,
+) -> Result<Solution, String> {
+    let binding = bindings
+        .arm(arm_to_experiment(arm))
+        .map_err(|error| error.to_string())?;
+    validate_committed_solution(
+        attempt,
+        &run.store.comparison_arm_dir(arm).join("checkout"),
+        &binding.workload.revision,
+        &comparison.task.writable_scope,
+        Some(&comparison.specification.change),
+    )
+}
+
+pub(super) fn validate_committed_solution(
+    attempt: &Attempt,
+    repository: &Path,
+    base: &str,
+    scope: &[String],
+    planning_change: Option<&str>,
 ) -> Result<Solution, String> {
     let checkout = attempt
         .checkout
@@ -2590,37 +2609,22 @@ fn validate_solution(
             checkout.display()
         ));
     }
-    let binding = bindings
-        .arm(arm_to_experiment(arm))
-        .map_err(|error| error.to_string())?;
-    let revision = git(&checkout, &["rev-parse", "HEAD"])
-        .map_err(|error| format!("the solution revision is unavailable: {error}"))?
-        .trim()
-        .to_owned();
-    let arm_checkout = run.store.comparison_arm_dir(arm).join("checkout");
+    let revision = git(&checkout, &["rev-parse", "HEAD"])?.trim().to_owned();
     if !git_ok(
-        &arm_checkout,
+        repository,
         &["cat-file", "-e", &format!("{revision}^{{commit}}")],
+    ) || !git_ok(
+        repository,
+        &["merge-base", "--is-ancestor", base, &revision],
     ) {
         return Err(format!(
-            "the solution revision {revision} is not an object of the {} arm's own repository",
-            arm.as_str()
-        ));
-    }
-    let base = binding.workload.revision.clone();
-    if !git_ok(
-        &arm_checkout,
-        &["merge-base", "--is-ancestor", &base, &revision],
-    ) {
-        return Err(format!(
-            "the solution revision {revision} is not a descendant of the frozen task revision"
+            "the solution revision {revision} is not a descendant in the bound task repository"
         ));
     }
     let status = git(
         &checkout,
         &["status", "--porcelain", "--untracked-files=normal"],
-    )
-    .map_err(|error| format!("the solution checkout status is unavailable: {error}"))?;
+    )?;
     let dirty: Vec<&str> = status
         .lines()
         .map(str::trim)
@@ -2636,19 +2640,26 @@ fn validate_solution(
     let changed = git(
         &checkout,
         &["diff", "--name-only", &format!("{base}..{revision}")],
-    )
-    .map_err(|error| format!("the changed-path list is unavailable: {error}"))?;
+    )?;
     let changed: Vec<String> = changed
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect();
-    changed_paths_within_scope(
-        &changed,
-        &comparison.task.writable_scope,
-        &comparison.specification.change,
-    )?;
+    if let Some(change) = planning_change {
+        changed_paths_within_scope(&changed, scope, change)?;
+    } else {
+        for path in &changed {
+            if !scope.iter().any(|allowed| {
+                path == allowed || path.starts_with(&format!("{}/", allowed.trim_end_matches('/')))
+            }) {
+                return Err(format!(
+                    "the committed path {path} is outside the frozen task writable scope"
+                ));
+            }
+        }
+    }
     Ok(Solution {
         revision,
         changed_paths: changed,

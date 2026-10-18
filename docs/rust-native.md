@@ -1101,11 +1101,15 @@ a fresh owned home before installation; explicitly named `private_inputs`
 use the runtime owner's existing validation and identity records. A changed
 task, configuration or participant binding refuses further dispatch.
 
-The currently checked increment opens a visible lead frame and retains its
-structured assignment through the native completion receipt. `resume`
-reconciles that exact generation and does not repeat the frame. Executor work,
-lead review and independent acceptance remain pending; this preparation is
-not a qualified comparison and does not activate self-reflection candidates.
+The currently checked increment opens a visible lead frame, dispatches its
+structured assignment, and continues the same lead for review. A `CORRECT`
+decision resumes the same executor within the declared correction allowance,
+then returns to that lead for another review. Each turn's exact native
+generation and result are retained before dependent work; `resume` does not
+repeat settled turns. Only clean committed changes within the frozen scope
+reach review. Independent acceptance and complete cost accounting remain
+pending; a lead's `ACCEPT` alone is not qualification and does not activate
+self-reflection candidates.
 
 `select` activates an already prepared baseline or candidate runtime through
 the shared build-selection owner, records the identity it actually consumed

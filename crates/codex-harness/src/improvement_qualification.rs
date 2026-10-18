@@ -85,13 +85,10 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
                 session,
                 profile: attempt.profile,
             });
-            run.cursor.baseline_qualification = Some(state);
+            run.cursor.baseline_qualification = Some(state.clone());
             run.store.save_cursor(&run.cursor)?;
         }
-        return Ok(vec![format!(
-            "qualification lead frame retained at {}; executor, review and independent acceptance are still pending",
-            result.display()
-        )]);
+        return advance_work(run, &inputs, &mut state, &runtime);
     }
     let home = runtime.home.clone();
     let facts = DispatchFacts {
@@ -180,6 +177,393 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
             }
             run.cursor.condition = Some(format!(
                 "lead framing dispatch failed: {error}; retained attempt is not replayed"
+            ));
+            run.store.save_cursor(&run.cursor)?;
+            Err(error)
+        }
+    }
+}
+
+fn retained_result(attempt: &Attempt) -> io::Result<PathBuf> {
+    if let Some(reason) = &attempt.reuse_refused {
+        return Err(invalid(format!(
+            "{} cannot be consumed: {reason}",
+            attempt.id
+        )));
+    }
+    let retained = attempt
+        .retained
+        .as_ref()
+        .ok_or_else(|| invalid("completed turn has no retained evidence"))?;
+    let path = retained
+        .result
+        .as_ref()
+        .ok_or_else(|| invalid("completed turn has no retained result"))?;
+    if retained.result_sha256.as_deref() != Some(build_identity::hash_file(path)?.as_str()) {
+        return Err(invalid(format!(
+            "the retained result of {} changed; no next turn was dispatched",
+            attempt.id
+        )));
+    }
+    Ok(path.clone())
+}
+
+fn participant(attempt: &Attempt) -> io::Result<WorkflowParticipant> {
+    let binding = attempt
+        .binding
+        .as_ref()
+        .ok_or_else(|| invalid("completed turn has no native binding"))?;
+    Ok(WorkflowParticipant {
+        slot: binding.slot,
+        owner: binding.owner.clone(),
+        session: binding
+            .session
+            .clone()
+            .ok_or_else(|| invalid("completed turn has no exact native session"))?,
+        profile: attempt.profile.clone(),
+    })
+}
+
+fn persist(run: &mut Run, state: &BaselineQualificationState) -> io::Result<()> {
+    run.cursor.baseline_qualification = Some(state.clone());
+    run.store.save_cursor(&run.cursor)
+}
+
+fn pending(attempt: &Attempt) -> Vec<String> {
+    vec![format!(
+        "qualification {} is {:?}; resume observes its exact native outcome without replay",
+        attempt.id, attempt.state
+    )]
+}
+
+fn advance_work(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    runtime: &ArmRuntime,
+) -> io::Result<Vec<String>> {
+    if state.workflow.executor_attempt.is_none() {
+        let frame = run
+            .cursor
+            .attempt(state.workflow.lead_frame.as_deref().unwrap())
+            .ok_or_else(|| invalid("recorded frame is missing"))?;
+        let assignment = retained_result(frame)?;
+        return dispatch_turn(
+            run,
+            inputs,
+            state,
+            runtime,
+            AttemptRole::Executor,
+            "executor-1".to_owned(),
+            assignment,
+        );
+    }
+    let executor_id = state.workflow.executor_attempt.as_deref().unwrap();
+    let executor = run
+        .cursor
+        .attempt(executor_id)
+        .cloned()
+        .ok_or_else(|| invalid("recorded executor attempt is missing"))?;
+    if executor.state != AttemptState::Completed {
+        return Ok(pending(&executor));
+    }
+    if state.workflow.executor.is_none() {
+        retain_solution(run, inputs, state, &executor)?;
+        state.workflow.executor = Some(participant(&executor)?);
+        persist(run, state)?;
+    }
+    if state.workflow.completed {
+        return Ok(vec![format!(
+            "qualification lead decision retained (accepted={}); independent oracle and accounting remain pending",
+            state.workflow.lead_accepted.unwrap_or(false)
+        )]);
+    }
+    if let Some(review_id) = state.workflow.review.clone() {
+        let review = run
+            .cursor
+            .attempt(&review_id)
+            .cloned()
+            .ok_or_else(|| invalid("recorded review is missing"))?;
+        if review.state != AttemptState::Completed {
+            return Ok(pending(&review));
+        }
+        if state.workflow.review_token.is_none() {
+            let result = retained_result(&review)?;
+            let decision = harness_core::improvement_loop::parse_review_decision(
+                &fs::read_to_string(result)?,
+            )?;
+            state.workflow.record_review(&review_id, decision)?;
+            persist(run, state)?;
+        }
+    }
+    use harness_core::improvement_loop::QualificationStep;
+    match state.workflow.next_step(&inputs.workflow)? {
+        QualificationStep::Review => {
+            let report = state
+                .report
+                .as_ref()
+                .ok_or_else(|| invalid("executor report is not retained"))?;
+            let checkout = state
+                .task_workspace
+                .as_ref()
+                .ok_or_else(|| invalid("executor checkout is missing"))?;
+            let prompt = format!(
+                "Review the completed ordinary task from your original framing. The exact executor checkout is {}; its committed revision is {}. Read the actual changes, checks and the retained executor report at {}. Preserve the original task acceptance. Do not implement or delegate. Start your result with ACCEPT, CORRECT or REJECT. ACCEPT needs a supported acceptance decision, CORRECT needs concrete bounded corrections for this same executor, and REJECT explains the remaining blocker. Do not add experiment policy.\n\nOriginal task:\n{}",
+                checkout.display(),
+                state.source_revision.as_deref().unwrap_or("unrecorded"),
+                report.display(),
+                fs::read_to_string(&inputs.task_prompt.path)?
+            );
+            let id = format!("lead-review-{}", state.workflow.corrections.len() + 1);
+            let path = run.store.assignments_dir().join(format!("{id}.txt"));
+            fs::write(&path, prompt)?;
+            dispatch_turn(
+                run,
+                inputs,
+                state,
+                runtime,
+                AttemptRole::LeadReview,
+                id,
+                path,
+            )
+        }
+        QualificationStep::Correct => {
+            let id = format!("correction-{}", state.workflow.corrections.len() + 1);
+            if let Some(correction) = run.cursor.attempt(&id).cloned() {
+                if correction.state != AttemptState::Completed {
+                    return Ok(pending(&correction));
+                }
+                retain_solution(run, inputs, state, &correction)?;
+                state.workflow.record_correction(&id, &inputs.workflow)?;
+                persist(run, state)?;
+                return advance_work(run, inputs, state, runtime);
+            }
+            let review = run
+                .cursor
+                .attempt(state.workflow.review.as_deref().unwrap())
+                .ok_or_else(|| invalid("correction has no retained lead review"))?;
+            let result = retained_result(review)?;
+            let prompt = format!(
+                "Continue your ordinary task in the same checkout. Read the retained lead review at {} and address its concrete corrections; preserve all original acceptance. Run the applicable checks, commit the scoped product and report changes, actual checks and unresolved issues. Do not delegate.\n\nLead review:\n{}",
+                result.display(),
+                fs::read_to_string(&result)?
+            );
+            let path = run.store.assignments_dir().join(format!("{id}.txt"));
+            fs::write(&path, prompt)?;
+            dispatch_turn(
+                run,
+                inputs,
+                state,
+                runtime,
+                AttemptRole::Correction,
+                id,
+                path,
+            )
+        }
+        QualificationStep::Finalize
+        | QualificationStep::Rejected
+        | QualificationStep::Exhausted => {
+            state
+                .workflow
+                .record_completion(state.workflow.lead_accepted == Some(true));
+            if state.workflow.next_step(&inputs.workflow)? == QualificationStep::Rejected {
+                state.condition = Some("the lead rejected the task or its declared correction allowance was exhausted; preserve all turns, no replay".to_owned());
+            }
+            persist(run, state)?;
+            Ok(vec!["qualification workflow settled; independent acceptance and complete accounting remain pending".to_owned()])
+        }
+        other => Err(invalid(format!(
+            "unexpected qualification step after framing/execution: {other:?}"
+        ))),
+    }
+}
+
+fn retain_solution(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    attempt: &Attempt,
+) -> io::Result<()> {
+    let result = retained_result(attempt)?;
+    let solution = super::improvement_comparison::validate_committed_solution(
+        attempt,
+        state
+            .checkout
+            .as_deref()
+            .ok_or_else(|| invalid("dispatch checkout is missing"))?,
+        state
+            .task_base
+            .as_deref()
+            .ok_or_else(|| invalid("frozen task base is missing"))?,
+        &inputs.task.writable_scope,
+        None,
+    )
+    .map_err(invalid)?;
+    fs::copy(&result, &inputs.report)?;
+    state.source_revision = Some(solution.revision);
+    state.task_workspace = Some(solution.checkout);
+    state.report_sha256 = Some(build_identity::hash_file(&inputs.report)?);
+    state.report_bytes = Some(fs::metadata(&inputs.report)?.len());
+    state.report = Some(inputs.report.clone());
+    state.report_source = Some(result);
+    persist(run, state)
+}
+
+fn dispatch_turn(
+    run: &mut Run,
+    _inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    runtime: &ArmRuntime,
+    role: AttemptRole,
+    id: String,
+    input: PathBuf,
+) -> io::Result<Vec<String>> {
+    let facts = DispatchFacts {
+        runner_declared: run.spec.runner.is_some(),
+        launcher: Some(runtime.home.join("harness/bin/codex.exe")),
+        ..DispatchFacts::default()
+    };
+    if let DispatchGate::Blocked { reason } = dispatch_gate(&run.cursor, role, &facts) {
+        run.cursor.condition = Some(reason.clone());
+        run.store.save_cursor(&run.cursor)?;
+        return Ok(vec![reason]);
+    }
+    let selected = if role == AttemptRole::LeadReview {
+        state.lead_binding.as_ref()
+    } else {
+        state.executor_binding.as_ref()
+    }
+    .ok_or_else(|| invalid("prepared participant binding is missing"))?
+    .clone();
+    let prior = match role {
+        AttemptRole::LeadReview => state.workflow.lead.clone(),
+        AttemptRole::Correction => state.workflow.executor.clone(),
+        _ => None,
+    };
+    let owner = prior
+        .as_ref()
+        .map(|p| p.owner.clone())
+        .unwrap_or_else(|| dispatch_owner(&run.spec.run, role, 1));
+    run.cursor.push_attempt(Attempt {
+        id: id.clone(),
+        role,
+        binding: None,
+        retained: None,
+        owner: owner.clone(),
+        title: format!(
+            "{} ({}) - {owner}",
+            if role == AttemptRole::LeadReview {
+                "CLead"
+            } else {
+                "CEx"
+            },
+            selected.profile
+        ),
+        profile: selected.profile.clone(),
+        model: selected.model.clone(),
+        model_provider: selected.model_provider.clone(),
+        reasoning_effort: selected.reasoning_effort.clone(),
+        checkout: None,
+        assignment: Some(input.clone()),
+        receipt: None,
+        result: None,
+        detail: None,
+        state: AttemptState::Requested,
+        reason: None,
+        reuse_refused: None,
+        started_ms: now_ms(),
+        updated_ms: now_ms(),
+    })?;
+    match role {
+        AttemptRole::Executor => state.workflow.executor_attempt = Some(id.clone()),
+        AttemptRole::LeadReview => state.workflow.review = Some(id.clone()),
+        _ => {}
+    }
+    run.cursor.effect(
+        EffectKind::DispatchPrepared,
+        format!("attempt={id} role={} owner={owner}", role.as_str()),
+    );
+    persist(run, state)?;
+    let source = state
+        .checkout
+        .clone()
+        .ok_or_else(|| invalid("dispatch checkout is missing"))?;
+    let accepted: io::Result<VisibleAccepted> = match role {
+        AttemptRole::Executor => dispatch_visible_conversation(&VisibleConversation {
+            codex_home: runtime.home.clone(),
+            source,
+            owner,
+            profile: selected.profile.clone(),
+            base: state.task_base.clone(),
+            assignment: input,
+        }),
+        AttemptRole::LeadReview => {
+            let p = prior.ok_or_else(|| invalid("review has no exact lead participant"))?;
+            continue_visible_lead_conversation(&VisibleLeadContinuation {
+                codex_home: runtime.home.clone(),
+                source,
+                slot: p.slot,
+                owner: p.owner,
+                session: p.session,
+                prompt: fs::read_to_string(input)?,
+            })
+            .map(|a| VisibleAccepted {
+                owner: a.owner,
+                title: format!("CLead ({}) - {}", selected.profile, owner),
+                slot: a.slot,
+                model: selected.model.clone(),
+                model_provider: selected.model_provider.clone(),
+                reasoning_effort: selected.reasoning_effort.clone(),
+                checkout: a.checkout,
+                receipt: a.receipt,
+                result: a.result,
+                detail: a.detail,
+            })
+        }
+        AttemptRole::Correction => {
+            let p = prior.ok_or_else(|| invalid("correction has no exact executor participant"))?;
+            continue_visible_executor_conversation(&VisibleExecutorContinuation {
+                codex_home: runtime.home.clone(),
+                source,
+                slot: p.slot,
+                owner: p.owner,
+                session: p.session,
+                profile: p.profile,
+                prompt: fs::read_to_string(input)?,
+            })
+            .map(|a| VisibleAccepted {
+                owner: a.owner,
+                title: format!("CEx ({}) - {}", selected.profile, owner),
+                slot: a.slot,
+                model: selected.model.clone(),
+                model_provider: selected.model_provider.clone(),
+                reasoning_effort: selected.reasoning_effort.clone(),
+                checkout: a.checkout,
+                receipt: a.receipt,
+                result: a.result,
+                detail: a.detail,
+            })
+        }
+        _ => Err(invalid("unsupported qualification participant turn")),
+    };
+    match accepted {
+        Ok(accepted) => {
+            record_accepted(&mut run.cursor, &id, &accepted);
+            run.cursor.condition = None;
+            run.store.save_cursor(&run.cursor)?;
+            Ok(vec![format!(
+                "qualification {id} accepted through {}",
+                accepted.title
+            )])
+        }
+        Err(error) => {
+            if let Some(attempt) = run.cursor.attempts.iter_mut().find(|a| a.id == id) {
+                attempt.state = AttemptState::Failed;
+                attempt.reason = Some(error.to_string());
+                attempt.updated_ms = now_ms();
+            }
+            run.cursor.condition = Some(format!(
+                "{id} dispatch failed: {error}; the retained attempt is not replayed"
             ));
             run.store.save_cursor(&run.cursor)?;
             Err(error)
