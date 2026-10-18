@@ -133,6 +133,7 @@ struct StageResult {
 /// continuation/refusal to the existing stage body in this process.
 pub(super) fn run_stage_in_surface(
     chain: &ChainState,
+    stage: Stage,
     declaration: &StageDeclaration,
     source: &Boundary,
     prepared: &PreparedStage,
@@ -154,6 +155,7 @@ pub(super) fn run_stage_in_surface(
     if !fresh || admission.is_none() {
         return run_stage(
             chain,
+            stage,
             declaration,
             source,
             prepared,
@@ -416,13 +418,15 @@ pub(super) fn execute_stage_runner(request_path: &Path) -> io::Result<i32> {
             request.coordinator.pid
         )));
     }
-    let (role, declaration, source) = match request.role.as_str() {
+    let (stage, role, declaration, source) = match request.role.as_str() {
         EXECUTOR_STAGE => (
+            Stage::Executor,
             Role::ExecutorSelfReflection,
             &request.chain.executor_stage,
             &request.chain.executor_source,
         ),
         LEAD_STAGE => (
+            Stage::Lead,
             Role::LeadSelfReflection,
             &request.chain.lead_stage,
             &request.chain.lead_source,
@@ -487,6 +491,7 @@ pub(super) fn execute_stage_runner(request_path: &Path) -> io::Result<i32> {
     let admission = request.admission.as_ref().map(StageAdmission::from);
     let outcome = run_stage(
         &request.chain,
+        stage,
         declaration,
         source,
         &prepared,
