@@ -378,6 +378,44 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                     if turn.role.is_some() {
                         let _ = record_workflow_turn(&session, &turn, message_ms);
                     }
+                    if turn.role == Some("executor") {
+                        // One known visible tool action for the synthetic
+                        // executor turn. It carries a stable id, the exact
+                        // command, status, exit code and bounded output so a
+                        // reviewer packet can bind the real retained action
+                        // rather than a lifecycle label.
+                        server.push(json!({
+                            "method": "item/started",
+                            "params": {
+                                "threadId": session.clone(),
+                                "turnId": turn.id,
+                                "startedAtMs": message_ms,
+                                "item": {
+                                    "id": "fixture-command-executor-1",
+                                    "type": "commandExecution",
+                                    "command": "git status --short",
+                                    "status": "inProgress",
+                                },
+                            },
+                        }));
+                        server.push(json!({
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": session.clone(),
+                                "turnId": turn.id,
+                                "startedAtMs": message_ms,
+                                "completedAtMs": message_ms,
+                                "item": {
+                                    "id": "fixture-command-executor-1",
+                                    "type": "commandExecution",
+                                    "command": "git status --short",
+                                    "status": "completed",
+                                    "exitCode": 0,
+                                    "aggregatedOutput": " M solution.txt\n",
+                                },
+                            },
+                        }));
+                    }
                     server.push(json!({
                         "method": "item/started",
                         "params": {

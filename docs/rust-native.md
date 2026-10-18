@@ -1129,7 +1129,12 @@ configuration is never changed. The frozen packet contains the actual task
 prompt, the submitted result, the declared sources, bounded participant/action
 evidence and a manifest with the exact revisions, hashes and physical line
 counts. Expected answers, sibling outcomes and arm identity are withheld, and
-packet content is data rather than authority. A minimal synthetic declaration
+packet content is data rather than authority. The controller snapshots each
+completed participant turn's bounded visible stream before a pool slot can be
+reused and keeps one explicit coverage record per turn. Missing, truncated,
+malformed or unavailable action coverage makes the packet incomplete and
+refuses reviewer dispatch or acceptance; it is never evidence of no effects.
+A minimal synthetic declaration
 (paths and digests are placeholders):
 
 ```json

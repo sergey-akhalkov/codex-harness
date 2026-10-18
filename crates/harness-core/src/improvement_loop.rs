@@ -950,12 +950,12 @@ fn review_native_config(
                 })?
         };
         for (field, expected) in [("sandbox_mode", "read-only"), ("approval_policy", "never")] {
-            if let Some(value) = profile_table.get(field) {
-                if value.as_str() != Some(expected) {
-                    return Err(invalid(format!(
-                        "the semantic reviewer profile '{profile}' may not override {field} away from {expected}"
-                    )));
-                }
+            if let Some(value) = profile_table.get(field)
+                && value.as_str() != Some(expected)
+            {
+                return Err(invalid(format!(
+                    "the semantic reviewer profile '{profile}' may not override {field} away from {expected}"
+                )));
             }
         }
         Some(profile_table)

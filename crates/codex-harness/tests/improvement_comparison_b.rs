@@ -240,6 +240,15 @@ fn baseline_qualification_refuses_an_unknown_semantic_judgment() {
     baseline_workflow_case(true, Some(SemanticReviewCase::Unknown));
 }
 
+#[test]
+fn baseline_qualification_refuses_incomplete_action_coverage() {
+    baseline_workflow_case_with(
+        true,
+        Some(SemanticReviewCase::Accept),
+        ActionCapture::ExecutorDetailRemoved,
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SemanticReviewCase {
     Accept,
@@ -248,9 +257,27 @@ enum SemanticReviewCase {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionCapture {
+    Complete,
+    ExecutorDetailRemoved,
+}
+
 fn baseline_workflow_case(
     independent_acceptance_passes: bool,
     review_case: Option<SemanticReviewCase>,
+) {
+    baseline_workflow_case_with(
+        independent_acceptance_passes,
+        review_case,
+        ActionCapture::Complete,
+    );
+}
+
+fn baseline_workflow_case_with(
+    independent_acceptance_passes: bool,
+    review_case: Option<SemanticReviewCase>,
+    action_capture: ActionCapture,
 ) {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("qualification-native-frame");
@@ -494,6 +521,43 @@ fn baseline_workflow_case(
     assert_eq!(cursor["attempts"][1]["profile"], "ds");
     assert_eq!(cursor["attempts"][1]["model"], "deepseek-flash");
     wait_last();
+    let executor_receipt =
+        std::path::PathBuf::from(cursor["attempts"][1]["receipt"].as_str().unwrap());
+    let executor_terminal = wait_for_terminal_receipt(&executor_receipt);
+    let executor_turn = executor_terminal["observation"]["turn"]
+        .as_str()
+        .expect("the completed executor turn records its exact native turn")
+        .to_owned();
+    if action_capture == ActionCapture::ExecutorDetailRemoved {
+        let detail = std::path::PathBuf::from(
+            cursor["attempts"][1]["detail"]
+                .as_str()
+                .expect("the executor records its bounded action stream locator"),
+        );
+        assert!(detail.is_file(), "{}", detail.display());
+        // The host may still be finishing its own bounded detail writes when
+        // the receipt turns terminal; remove the exact source with a bounded
+        // retry instead of racing a sharing violation.
+        let mut removed = false;
+        for _ in 0..100 {
+            match fs::remove_file(&detail) {
+                Ok(()) => {
+                    removed = true;
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+                    ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(error) => panic!("cannot remove {}: {error}", detail.display()),
+            }
+        }
+        assert!(removed, "cannot remove {}", detail.display());
+    }
     resume_turn(
         "lead-review",
         "CORRECT: Address the one concrete scoped correction and rerun the check.",
@@ -524,6 +588,103 @@ fn baseline_workflow_case(
     );
     wait_last();
     if let Some((_, _, initial_result, corrected_result)) = &reviewer {
+        if action_capture == ActionCapture::ExecutorDetailRemoved {
+            let suffix = format!(
+                "attempt-{}",
+                fixture.cursor()["attempts"].as_array().unwrap().len() + 1
+            );
+            let refused = fixture.improve_with_env(
+                &["resume", "--run", fixture.run.to_str().unwrap()],
+                &[
+                    CONTROL_CHILD_MODE,
+                    ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
+                    ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", "lead-acceptance"),
+                    ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", initial_result),
+                    (
+                        "HARNESS_IMPROVEMENT_FIXTURE_SESSION",
+                        "12345678-1234-4234-8234-123456789003",
+                    ),
+                    ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", &suffix),
+                    (
+                        "HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_TEXT",
+                        "needs-correction",
+                    ),
+                ],
+            );
+            assert!(!refused.status.success(), "{}", text(&refused));
+            assert!(
+                text(&refused).contains("action coverage is incomplete"),
+                "{}",
+                text(&refused)
+            );
+            let refused_cursor = fixture.cursor();
+            assert_eq!(
+                refused_cursor["attempts"].as_array().unwrap().len(),
+                5,
+                "no reviewer turn is dispatched from incomplete action evidence: {refused_cursor}"
+            );
+            assert!(
+                !refused_cursor["attempts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|attempt| attempt["role"] == "semantic-review"),
+                "{refused_cursor}"
+            );
+            let qualification = &refused_cursor["baseline_qualification"];
+            assert!(qualification["accepted"].is_null(), "{refused_cursor}");
+            assert!(qualification["row"].is_null(), "{refused_cursor}");
+            assert!(qualification["oracle"].is_null(), "{refused_cursor}");
+            assert!(
+                qualification["condition"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("action view is missing or incomplete"),
+                "{refused_cursor}"
+            );
+            let actions_path = fixture
+                .run
+                .join("baseline-qualification/reviewer/source/actions.json");
+            let actions: Value = serde_json::from_slice(&fs::read(&actions_path).unwrap()).unwrap();
+            assert_eq!(actions["action_evidence_complete"], false, "{actions}");
+            let executor_coverage = actions["action_coverage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["attempt"] == "executor-1")
+                .expect("the unavailable executor action view keeps one explicit coverage record");
+            assert_eq!(executor_coverage["complete"], false, "{actions}");
+            assert!(
+                executor_coverage["note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unavailable"),
+                "{actions}"
+            );
+            assert!(
+                !actions["action_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["attempt"] == "executor-1"),
+                "an unavailable action stream is recorded as a gap, not as an empty no-effect view: {actions}"
+            );
+            let repeated = fixture.resume();
+            assert!(!repeated.status.success(), "{}", text(&repeated));
+            assert!(
+                text(&repeated).contains("action coverage is incomplete"),
+                "{}",
+                text(&repeated)
+            );
+            assert_eq!(
+                fixture.cursor()["attempts"].as_array().unwrap().len(),
+                5,
+                "the settled refusal is not replayed into a reviewer dispatch"
+            );
+            let stopped = fixture.stop();
+            assert!(stopped.status.success(), "{}", text(&stopped));
+            return;
+        }
         resume_turn("lead-acceptance", initial_result);
         let cursor = fixture.cursor();
         assert_eq!(cursor["attempts"].as_array().unwrap().len(), 6, "{cursor}");
@@ -533,6 +694,96 @@ fn baseline_workflow_case(
         assert_eq!(review_attempt["model"], "deepseek-flash", "{cursor}");
         assert_eq!(review_attempt["state"], "started", "{cursor}");
         wait_last();
+        let actions_path = fixture
+            .run
+            .join("baseline-qualification/reviewer/source/actions.json");
+        let actions: Value = serde_json::from_slice(&fs::read(&actions_path).unwrap()).unwrap();
+        assert_eq!(actions["action_evidence_complete"], true, "{actions}");
+        let participants = actions["participants"].as_array().unwrap();
+        let coverage = actions["action_coverage"].as_array().unwrap();
+        assert_eq!(
+            coverage.len(),
+            participants.len(),
+            "every required participant turn keeps one explicit coverage record: {actions}"
+        );
+        for (participant, coverage) in participants.iter().zip(coverage) {
+            assert_eq!(coverage["attempt"], participant["attempt"], "{actions}");
+            assert_eq!(coverage["role"], participant["role"], "{actions}");
+            assert_eq!(coverage["session"], participant["session"], "{actions}");
+            assert_eq!(coverage["complete"], true, "{actions}");
+            assert_eq!(coverage["malformed_records"], 0, "{actions}");
+            assert_eq!(coverage["partial_records"], 0, "{actions}");
+            assert_eq!(coverage["omitted_records"], 0, "{actions}");
+            assert_eq!(coverage["truncated"], false, "{actions}");
+            assert_eq!(
+                coverage["source_bytes"], coverage["retained_bytes"],
+                "{actions}"
+            );
+            assert!(
+                coverage["terminal_events"].as_u64().unwrap() >= 1,
+                "{actions}"
+            );
+            assert_eq!(
+                coverage["action_records"].as_u64().unwrap(),
+                actions["action_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|action| action["attempt"] == participant["attempt"])
+                    .count() as u64,
+                "{actions}"
+            );
+        }
+        let executor_action = actions["action_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| {
+                action["item"] == "fixture-command-executor-1" && action["phase"] == "completed"
+            })
+            .unwrap_or_else(|| {
+                panic!("the retained executor command event reaches the packet: {actions}")
+            });
+        assert_eq!(executor_action["attempt"], "executor-1", "{actions}");
+        assert_eq!(executor_action["role"], "executor", "{actions}");
+        assert_eq!(executor_action["session"], executor_session, "{actions}");
+        assert_eq!(
+            executor_action["turn"].as_str(),
+            Some(executor_turn.as_str()),
+            "{actions}"
+        );
+        assert_eq!(executor_action["kind"], "tool", "{actions}");
+        assert_eq!(executor_action["tool"], "command", "{actions}");
+        assert_eq!(
+            executor_action["command"], "git status --short",
+            "{actions}"
+        );
+        assert_eq!(executor_action["status"], "completed", "{actions}");
+        assert_eq!(executor_action["exit_code"], 0, "{actions}");
+        assert!(
+            executor_action["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("solution.txt"),
+            "{actions}"
+        );
+        println!(
+            "semantic action evidence: run_id={} complete={} participants={} coverage={} action={}",
+            actions["run_id"].as_str().unwrap_or("?"),
+            actions["action_evidence_complete"],
+            participants.len(),
+            coverage
+                .iter()
+                .map(|entry| format!(
+                    "{}/{}:complete={}",
+                    entry["attempt"].as_str().unwrap_or("?"),
+                    entry["action_records"],
+                    entry["complete"]
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            executor_action
+        );
         if let Some(corrected) = corrected_result {
             let suffix = format!(
                 "attempt-{}",
