@@ -23,6 +23,9 @@ const ACTION_EVIDENCE_DIR: &str = "baseline-qualification/action-evidence";
 const MAX_ACTION_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ACTION_LINE_BYTES: usize = 1024 * 1024;
 const FRAMING_CORRECTION_ID: &str = "lead-frame-correction-1";
+const SEMANTIC_REVIEW_INITIAL_ID: &str = "semantic-review-1";
+const SEMANTIC_REVIEW_CORRECTION_ID: &str = "semantic-review-2";
+const SEMANTIC_REVIEW_RECOVERY_ID: &str = "semantic-review-1-recovery-1";
 
 pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
     let inputs = run
@@ -2354,8 +2357,11 @@ fn advance_semantic_review(
         .as_deref()
         .or(review.initial_attempt.as_deref());
     let Some(terminal) = terminal else {
-        let id = "semantic-review-1".to_owned();
-        let path = run.store.assignments_dir().join("semantic-review-1.json");
+        let id = SEMANTIC_REVIEW_INITIAL_ID.to_owned();
+        let path = run
+            .store
+            .assignments_dir()
+            .join(format!("{SEMANTIC_REVIEW_INITIAL_ID}.json"));
         fs::create_dir_all(run.store.assignments_dir())?;
         let assignment = semantic_review_assignment(&packet)?;
         fs::write(&path, serde_json::to_vec_pretty(&assignment)?)?;
@@ -2383,14 +2389,38 @@ fn advance_semantic_review(
         if attempt.state.is_in_flight() {
             return Ok(pending(&attempt));
         }
+        if terminal == SEMANTIC_REVIEW_INITIAL_ID
+            && review.initial_attempt.as_deref() == Some(SEMANTIC_REVIEW_INITIAL_ID)
+            && review.correction_attempt.is_none()
+            && !review.correction_used
+            && run.cursor.attempt(SEMANTIC_REVIEW_RECOVERY_ID).is_none()
+            && let Some(verified) = verified_unsubmitted_reviewer_attempt(
+                &attempt,
+                "no replacement reviewer can be dispatched",
+            )?
+        {
+            return recover_semantic_review(
+                run, inputs, state, runtime, &packet, &review, &attempt, verified,
+            );
+        }
         state.condition = Some(format!(
-            "the semantic review attempt {terminal} ended as {:?}; preserve its receipt and result and remedy the declared reviewer runtime before a new review",
-            attempt.state
+            "the semantic review attempt {terminal} ended as {:?}; {}",
+            attempt.state,
+            if terminal == SEMANTIC_REVIEW_RECOVERY_ID {
+                "the one permitted startup recovery was already used; preserve every receipt, result and cost and do not launch another reviewer"
+            } else {
+                "only a retained, identity-verified native failure before any model submission permits one separately bound replacement; preserve the receipt and remedy the declared reviewer runtime"
+            }
         ));
         persist(run, state)?;
         return Err(invalid(format!(
-            "the semantic review attempt {terminal} is {:?}; it is not replayed and no complete row can be recorded",
-            attempt.state
+            "the semantic review attempt {terminal} is {:?}; {}",
+            attempt.state,
+            if terminal == SEMANTIC_REVIEW_RECOVERY_ID {
+                "the permitted recovery was already dispatched, so it is not replaced again"
+            } else {
+                "it has no exact verified pre-submission startup evidence, so it is not replayed"
+            }
         )));
     }
     let participant = participant(&attempt)?;
@@ -2433,8 +2463,11 @@ fn advance_semantic_review(
                 && declaration.max_corrections == 1
                 && !review.correction_used
             {
-                let id = "semantic-review-2".to_owned();
-                let path = run.store.assignments_dir().join("semantic-review-2.txt");
+                let id = SEMANTIC_REVIEW_CORRECTION_ID.to_owned();
+                let path = run
+                    .store
+                    .assignments_dir()
+                    .join(format!("{SEMANTIC_REVIEW_CORRECTION_ID}.txt"));
                 fs::create_dir_all(run.store.assignments_dir())?;
                 fs::write(&path, semantic_correction_prompt(&packet, &error))?;
                 review.correction_used = true;
@@ -2605,6 +2638,390 @@ fn verified_unsubmitted_lead_frame(
         ))
     })?;
     Ok(true)
+}
+
+struct VerifiedReviewerSlotBinding {
+    index: u32,
+    task: String,
+    handle: String,
+    base: Option<String>,
+}
+
+struct VerifiedUnsubmittedReviewerAttempt {
+    evidence: PreSubmissionEvidence,
+    ended_ms: u64,
+    slot: VerifiedReviewerSlotBinding,
+}
+
+/// The exact superseded semantic-review startup failure that may be replaced
+/// once. Unlike a generic failed attempt, this requires the retained receipt
+/// itself to verify, to belong to the frozen dispatch generation, and to
+/// record a terminal native failure with no model submission and no effect.
+fn verified_unsubmitted_reviewer_attempt(
+    attempt: &Attempt,
+    consumer: &str,
+) -> io::Result<Option<VerifiedUnsubmittedReviewerAttempt>> {
+    if attempt.role != AttemptRole::SemanticReview
+        || attempt.state != AttemptState::Failed
+        || attempt.id != SEMANTIC_REVIEW_INITIAL_ID
+    {
+        return Ok(None);
+    }
+    let Some(binding) = attempt.binding.as_ref() else {
+        return Ok(None);
+    };
+    let Some(evidence) = binding.pre_submission else {
+        return Ok(None);
+    };
+    let Some(retained) = attempt.retained.as_ref() else {
+        return Err(invalid(format!(
+            "the failed semantic review {} records pre-submission evidence ({}) but its retained terminal evidence is missing; {consumer}",
+            attempt.id,
+            evidence.reason()
+        )));
+    };
+    retained.verify().map_err(|fault| {
+        invalid(format!(
+            "the failed semantic review {} records pre-submission evidence ({}) but its retained terminal evidence does not verify ({fault:?}); {consumer}",
+            attempt.id,
+            evidence.reason()
+        ))
+    })?;
+    let view = receipt_view(&retained.receipt).map_err(|error| {
+        invalid(format!(
+            "the failed semantic review {} retained an unreadable terminal receipt: {error}; {consumer}",
+            attempt.id
+        ))
+    })?;
+    if !matches!(&view.state, ConversationState::Failed(_)) {
+        return Err(invalid(format!(
+            "the failed semantic review {} retained a non-failed terminal state; {consumer}",
+            attempt.id
+        )));
+    }
+    if view.pre_submission != Some(evidence) {
+        return Err(invalid(format!(
+            "the failed semantic review {} retained pre-submission evidence that does not match its frozen binding; {consumer}",
+            attempt.id
+        )));
+    }
+    let observed = ObservedIdentity {
+        slot: view.identity.slot,
+        owner: view.identity.owner.clone(),
+        generation: view.identity.generation.clone(),
+        session: view.identity.session.clone(),
+        host: view
+            .identity
+            .host
+            .clone()
+            .map(|(pid, created, program)| HostBinding {
+                pid,
+                created,
+                program,
+            }),
+    };
+    match verify_dispatch_identity(binding, &observed) {
+        IdentityCheck::Verified => {}
+        IdentityCheck::Mismatch(reason) | IdentityCheck::Missing(reason) => {
+            return Err(invalid(format!(
+                "the failed semantic review {} retained a receipt that does not belong to the frozen dispatch: {reason}; {consumer}",
+                attempt.id
+            )));
+        }
+    }
+    let value: Value = read_json(&retained.receipt, MAX_RUN_SPEC_BYTES).map_err(|error| {
+        invalid(format!(
+            "the failed semantic review {} retained an unreadable terminal receipt: {error}; {consumer}",
+            attempt.id
+        ))
+    })?;
+    let observation = value
+        .get("observation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the failed semantic review {} retained a receipt without an observation; {consumer}",
+                attempt.id
+            ))
+        })?;
+    let zero = |key: &str| observation.get(key).and_then(Value::as_u64) == Some(0);
+    let no_turn = observation.get("turn").is_none_or(|value| value.is_null());
+    let no_exit = observation
+        .get("exitCode")
+        .is_none_or(|value| value.is_null());
+    if observation.get("coverage").and_then(Value::as_str) != Some("native")
+        || observation.get("state").and_then(Value::as_str) != Some("failed")
+        || !no_turn
+        || !no_exit
+        || !zero("events")
+        || !zero("messages")
+        || !zero("toolCalls")
+        || !zero("rounds")
+    {
+        return Err(invalid(format!(
+            "the failed semantic review {} does not retain an explicit terminal native startup failure with zero events, messages, tool calls and rounds and no turn or exit code; {consumer}",
+            attempt.id
+        )));
+    }
+    let submission = observation.get("submission").and_then(Value::as_str);
+    match evidence {
+        PreSubmissionEvidence::NativeMarker if submission != Some("not-attempted") => {
+            return Err(invalid(format!(
+                "the failed semantic review {} records a native pre-submission marker without the exact not-attempted submission fact; {consumer}",
+                attempt.id
+            )));
+        }
+        PreSubmissionEvidence::LegacyFrontendAttachment if submission.is_some() => {
+            return Err(invalid(format!(
+                "the failed semantic review {} carries a submission marker beside legacy frontend-attachment evidence; {consumer}",
+                attempt.id
+            )));
+        }
+        _ => {}
+    }
+    let ended_ms = observation
+        .get("updatedMs")
+        .and_then(Value::as_u64)
+        .filter(|ended| *ended > 0 && *ended >= attempt.started_ms)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the failed semantic review {} retained no credible terminal time for its startup interval; {consumer}",
+                attempt.id
+            ))
+        })?;
+    // The verified receipt also freezes the durable slot generation the
+    // failed dispatch held. Recovery continues that exact task, so any later
+    // reassignment must refuse before the owner is reused.
+    let slot = value
+        .get("slot")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the failed semantic review {} retained no durable slot binding; {consumer}",
+                attempt.id
+            ))
+        })?;
+    let slot_index = slot
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .filter(|index| Some(*index) == view.identity.slot)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the failed semantic review {} retained a slot binding without its exact dispatch index; {consumer}",
+                attempt.id
+            ))
+        })?;
+    let slot_task = slot
+        .get("task")
+        .and_then(Value::as_str)
+        .filter(|task| !task.is_empty())
+        .ok_or_else(|| {
+            invalid(format!(
+                "the failed semantic review {} retained no durable task identity for its slot; {consumer}",
+                attempt.id
+            ))
+        })?;
+    let slot_handle = slot
+        .get("handle")
+        .and_then(Value::as_str)
+        .filter(|handle| !handle.is_empty())
+        .ok_or_else(|| {
+            invalid(format!(
+                "the failed semantic review {} retained no durable generation handle for its slot; {consumer}",
+                attempt.id
+            ))
+        })?;
+    let slot_base = slot.get("base").and_then(Value::as_str).map(str::to_owned);
+    Ok(Some(VerifiedUnsubmittedReviewerAttempt {
+        evidence,
+        ended_ms,
+        slot: VerifiedReviewerSlotBinding {
+            index: slot_index,
+            task: slot_task.to_owned(),
+            handle: slot_handle.to_owned(),
+            base: slot_base,
+        },
+    }))
+}
+
+/// Prepares the one reviewer replacement only after the original assignment,
+/// declared participant identity and durable slot generation have been
+/// rechecked against the frozen packet. The replacement reuses the verified
+/// failed owner, so the pool continues the held task without a reset or a
+/// second checkout; `dispatch_turn` records the replacement intent and attempt
+/// before opening the native surface.
+fn recover_semantic_review(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    runtime: &ArmRuntime,
+    packet: &FrozenReviewPacket,
+    review: &SemanticReviewState,
+    failed: &Attempt,
+    verified: VerifiedUnsubmittedReviewerAttempt,
+) -> io::Result<Vec<String>> {
+    if review.participant.is_some() {
+        return Err(invalid(
+            "the failed semantic review already recorded a participant; a startup replacement cannot retarget that conversation",
+        ));
+    }
+    if review.correction_attempt.is_some()
+        || review.correction_used
+        || run.cursor.attempt(SEMANTIC_REVIEW_CORRECTION_ID).is_some()
+        || run.cursor.attempt(SEMANTIC_REVIEW_RECOVERY_ID).is_some()
+    {
+        return Err(invalid(
+            "the semantic review already reached its output-correction or startup-recovery branch; preserve that exact turn and dispatch nothing",
+        ));
+    }
+    let binding = review
+        .binding
+        .as_ref()
+        .ok_or_else(|| invalid("the declared semantic reviewer binding is missing"))?;
+    if failed.profile != binding.profile
+        || failed.model != binding.model
+        || failed.model_provider != binding.model_provider
+        || failed.reasoning_effort != binding.reasoning_effort
+    {
+        return Err(invalid(
+            "the failed semantic review attempt no longer matches the frozen profile/model/provider/effort; preserve it instead of selecting a fallback",
+        ));
+    }
+    let dispatch = failed
+        .binding
+        .as_ref()
+        .ok_or_else(|| {
+            invalid(
+                "the failed semantic review attempt has no frozen dispatch binding; preserve it instead of retargeting the recovery",
+            )
+        })?;
+    if failed.receipt.as_ref() != Some(&dispatch.receipt) {
+        return Err(invalid(
+            "the failed semantic review attempt no longer points at its accepted native receipt; preserve it instead of retargeting the recovery",
+        ));
+    }
+    if dispatch.pre_submission != Some(verified.evidence) {
+        return Err(invalid(
+            "the failed semantic review attempt no longer records the verified pre-submission fact; preserve it instead of retargeting the recovery",
+        ));
+    }
+    let assignment_path = run
+        .store
+        .assignments_dir()
+        .join(format!("{SEMANTIC_REVIEW_INITIAL_ID}.json"));
+    if failed.assignment.as_ref() != Some(&assignment_path) {
+        return Err(invalid(
+            "the failed semantic review attempt no longer points at its frozen assignment; preserve it instead of retargeting the replacement",
+        ));
+    }
+    let expected_assignment = serde_json::to_value(semantic_review_assignment(packet)?)?;
+    let retained_assignment: Value =
+        read_json(&assignment_path, MAX_RUN_SPEC_BYTES).map_err(|error| {
+            invalid(format!(
+                "the frozen semantic review assignment at {} cannot be read: {error}; no replacement reviewer was dispatched",
+                assignment_path.display()
+            ))
+        })?;
+    if retained_assignment != expected_assignment {
+        return Err(invalid(
+            "the frozen semantic review assignment changed; preserve the original packet and dispatch no replacement reviewer",
+        ));
+    }
+    if review.review_revision.as_deref().is_none_or(str::is_empty) {
+        return Err(invalid(
+            "the frozen semantic review revision is missing; no replacement reviewer was dispatched",
+        ));
+    }
+    // The replacement reuses the failed reviewer owner so the pool continues
+    // its held durable task in place. That is only the same binding while the
+    // slot still records the frozen task, its generation handle and the exact
+    // review base; a reassigned record must refuse instead of lending this
+    // evidence to a different generation.
+    let home = review.home.as_deref().ok_or_else(|| {
+        invalid("the semantic reviewer home is missing; no replacement reviewer was dispatched")
+    })?;
+    let source = review.source.as_deref().ok_or_else(|| {
+        invalid(
+            "the frozen semantic review source is missing; no replacement reviewer was dispatched",
+        )
+    })?;
+    // A live session still owns the exact slot, so no replacement intent is
+    // recorded yet: the same owner is continued only after that process ends.
+    if crate::executor_cli::owner_live(home, source, &failed.owner) {
+        return Err(invalid(format!(
+            "the failed semantic review owner {} is already live in slot {}; stop that session before the startup replacement, and the retained evidence is preserved",
+            failed.owner, verified.slot.index
+        )));
+    }
+    let record = task_worktree::load_slot_record(home, source, verified.slot.index)?.ok_or_else(
+        || {
+            invalid(format!(
+                "the failed semantic review slot {} no longer records its durable binding; preserve the evidence and dispatch no replacement",
+                verified.slot.index
+            ))
+        },
+    )?;
+    if record.index != verified.slot.index
+        || record.task.as_deref() != Some(verified.slot.task.as_str())
+        || record.handle.as_deref() != Some(verified.slot.handle.as_str())
+        || record.base != verified.slot.base
+        || matches!(
+            record.state,
+            task_worktree::SlotState::Free | task_worktree::SlotState::Released
+        )
+    {
+        return Err(invalid(format!(
+            "the failed semantic review slot {} was reassigned or its generation changed since the verified pre-submission failure; preserve the evidence and dispatch no replacement",
+            verified.slot.index
+        )));
+    }
+    let note = format!(
+        "semantic review {} failed before submission ({}); its generation, receipt, result and wall-clock interval are retained, and one replacement is prepared against the unchanged frozen assignment by reusing the verified owner and slot with a fresh conversation",
+        failed.id,
+        verified.evidence.reason()
+    );
+    let mut notes = dispatch_turn(
+        run,
+        inputs,
+        state,
+        runtime,
+        AttemptRole::SemanticReview,
+        SEMANTIC_REVIEW_RECOVERY_ID.to_owned(),
+        assignment_path,
+    )?;
+    notes.insert(0, note);
+    Ok(notes)
+}
+
+fn semantic_review_recovery_intervention(
+    state: &BaselineQualificationState,
+    attempt: &Attempt,
+    verified: &VerifiedUnsubmittedReviewerAttempt,
+) -> io::Result<Value> {
+    let retained = attempt
+        .retained
+        .as_ref()
+        .ok_or_else(|| invalid("the superseded semantic review has no retained evidence"))?;
+    let replacement = state
+        .semantic_review
+        .as_ref()
+        .and_then(|review| review.initial_attempt.clone())
+        .filter(|id| id != &attempt.id)
+        .ok_or_else(|| invalid("the semantic review replacement identity is missing"))?;
+    Ok(json!({
+        "attempt_id": attempt.id,
+        "role": attempt.role.as_str(),
+        "kind": "verified-pre-submission-reviewer-recovery",
+        "state": attempt.state.as_str(),
+        "pre_submission": verified.evidence,
+        "reason": attempt.reason,
+        "replacement_attempt": replacement,
+        "evidence": retained.receipt,
+        "evidence_sha256": retained.receipt_sha256,
+        "started_at": attempt.started_ms as f64 / 1000.0,
+        "ended_at": verified.ended_ms as f64 / 1000.0,
+    }))
 }
 
 fn workflow_review_participants(
@@ -3000,6 +3417,7 @@ fn finalize(
     // The optional reviewer runs in its own installed home, so its rollout is
     // discovered there rather than in the implementation runtime.
     let mut participants: BTreeMap<String, Vec<&Attempt>> = BTreeMap::new();
+    let mut interventions = Vec::new();
     for turn in &run.cursor.attempts {
         if !matches!(
             turn.role,
@@ -3018,6 +3436,21 @@ fn finalize(
                 state,
                 "no complete workflow cost can be recorded",
             )? {
+                continue;
+            }
+            if state
+                .semantic_review
+                .as_ref()
+                .and_then(|review| review.initial_attempt.as_deref())
+                == Some(SEMANTIC_REVIEW_RECOVERY_ID)
+                && let Some(verified) = verified_unsubmitted_reviewer_attempt(
+                    turn,
+                    "no complete workflow cost can be recorded",
+                )?
+            {
+                interventions.push(semantic_review_recovery_intervention(
+                    state, turn, &verified,
+                )?);
                 continue;
             }
             return Err(invalid(
@@ -3191,7 +3624,7 @@ fn finalize(
         "discovery_verified":true, "observed_model_metadata_verified":true,
         "native_runs":native_runs, "usage":usage,
         "checks":checks,
-        "children":[], "interventions":[], "retry_of":null,
+        "children":[], "interventions":interventions, "retry_of":null,
         "workflow":state.workflow,
         "matched":{
             "task_source_revision":inputs.task.revision, "task_base":state.task_base,
@@ -3424,10 +3857,41 @@ fn dispatch_turn(
             .and_then(|review| review.participant.clone()),
         _ => None,
     };
-    let owner = prior
-        .as_ref()
-        .map(|p| p.owner.clone())
-        .unwrap_or_else(|| dispatch_owner(&run.spec.run, role, 1));
+    let owner = match prior.as_ref() {
+        Some(prior) => prior.owner.clone(),
+        None if role == AttemptRole::SemanticReview && id == SEMANTIC_REVIEW_RECOVERY_ID => {
+            let failed = run
+                .cursor
+                .attempt(SEMANTIC_REVIEW_INITIAL_ID)
+                .filter(|attempt| {
+                    attempt.role == AttemptRole::SemanticReview
+                        && attempt.state == AttemptState::Failed
+                        && attempt.binding.as_ref().is_some_and(|binding| {
+                            binding.pre_submission.is_some() && binding.owner == attempt.owner
+                        })
+                })
+                .ok_or_else(|| {
+                    invalid(
+                        "the verified failed semantic reviewer attempt is missing or changed; its owner and slot cannot be reused for the replacement",
+                    )
+                })?;
+            failed.owner.clone()
+        }
+        None => {
+            let ordinal = if role == AttemptRole::SemanticReview {
+                let count = run
+                    .cursor
+                    .attempts
+                    .iter()
+                    .filter(|attempt| attempt.role == AttemptRole::SemanticReview)
+                    .count();
+                u32::try_from(count.saturating_add(1)).unwrap_or(u32::MAX)
+            } else {
+                1
+            };
+            dispatch_owner(&run.spec.run, role, ordinal)
+        }
+    };
     let title_role = match role {
         AttemptRole::LeadFrame | AttemptRole::LeadReview => "CLead",
         AttemptRole::SemanticReview => "CReview",
@@ -3455,6 +3919,13 @@ fn dispatch_turn(
         started_ms: now_ms(),
         updated_ms: now_ms(),
     })?;
+    if role == AttemptRole::SemanticReview && id != SEMANTIC_REVIEW_CORRECTION_ID {
+        state
+            .semantic_review
+            .as_mut()
+            .ok_or_else(|| invalid("the retained semantic review state is missing"))?
+            .initial_attempt = Some(id.clone());
+    }
     match role {
         AttemptRole::LeadFrame => {
             state.workflow.lead_frame_correction = Some(id.clone());
