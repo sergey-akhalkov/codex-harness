@@ -177,6 +177,13 @@ shared defaults are read separately by the launcher. The native RTK acceptance
 suite (`cargo test -p codex-harness --test rtk_adapter`) and the native console
 fixtures check the accepted behavior with a new connection.
 
+Complete that review before a managed dispatch: its bounded frontend startup
+can expire while Codex waits for the trust decision. With Codex 0.163.0, a
+long isolated `CODEX_HOME` can also make the ordinary CLI exit before review
+with `path must be shorter than SUN_LEN`. Add `--no-daemon` to that original
+CLI invocation, as its diagnostic directs, and repeat the native review.
+This changes the server startup route; it does not grant hook trust.
+
 ```powershell
 & <build>\codex-harness.exe install    --token-workflow-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>   # after core installation
 & <build>\codex-harness.exe check      --token-workflow-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
