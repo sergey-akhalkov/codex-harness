@@ -2287,10 +2287,21 @@ pub fn verify_consumption_with_trust(
         let destination = runtime.home.join(&private.destination);
         let sha256 = hash_file("a copied private runner input", &destination, FILE_LIMIT)?;
         if sha256 != private.sha256 {
-            return Err(invalid(format!(
-                "the private runner input {} changed since preparation",
-                private.destination
-            )));
+            let metadata = fs::metadata(&destination)?;
+            if metadata.len() > FILE_LIMIT {
+                return Err(invalid(
+                    "a copied private runner input exceeds its size bound",
+                ));
+            }
+            let bytes = fs::read(&destination)?;
+            if bytes.len() as u64 > FILE_LIMIT
+                || !private_input_matches_with_native_trust(&bytes, &private.sha256, runtime)
+            {
+                return Err(invalid(format!(
+                    "the private runner input {} changed since preparation",
+                    private.destination
+                )));
+            }
         }
     }
 
@@ -2400,26 +2411,29 @@ fn strip_appended_trust(bytes: &[u8], trusted_workspaces: &[PathBuf]) -> Option<
     Some(candidates)
 }
 
-/// Removes exactly the local hook approval the native client appends after
-/// the user accepts this arm's own unchanged token-hook definition. The trust
-/// key comes from the retained `hooks.json` link and the digest from the
-/// retained definition, so a foreign path, another event or handler, a changed
-/// definition or any additional field keeps its bytes and still fails the
-/// frozen configuration comparison.
-fn strip_native_hook_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<u8>> {
+struct NativeHookTrust {
+    subtable: String,
+    profile_record: String,
+}
+
+/// Builds the only native hook-trust records accepted for this arm. The key
+/// comes from the retained `hooks.json` link and the digest from the retained
+/// definition, so a foreign path, another event or handler, a changed
+/// definition or any additional field cannot reuse an earlier approval.
+fn native_hook_trust(runtime: &ArmRuntime) -> Option<NativeHookTrust> {
     let Some(component) = runtime
         .components
         .iter()
         .find(|component| component.name == "token-workflow")
     else {
-        return Some(bytes.to_vec());
+        return None;
     };
     let Some(link) = component
         .links
         .iter()
         .find(|link| link.name == "hooks.json")
     else {
-        return Some(bytes.to_vec());
+        return None;
     };
     let definition_path = checked_link(&link.destination, &link.source, false).ok()?;
     let metadata = fs::metadata(&definition_path).ok()?;
@@ -2433,16 +2447,69 @@ fn strip_native_hook_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<u8>
     if destination.contains('\'') || destination.contains('\n') || destination.contains('\r') {
         return None;
     }
-    let block =
+    let subtable =
         format!("\n[hooks.state.'{destination}:pre_tool_use:0:0']\ntrusted_hash = \"{digest}\"\n");
+    let profile_record = format!("\n[hooks.state]\n{subtable}");
+    Some(NativeHookTrust {
+        subtable,
+        profile_record,
+    })
+}
+
+/// Removes exactly the local hook approval the native client appends to the
+/// arm configuration after the user accepts this arm's own unchanged
+/// token-hook definition.
+fn strip_native_hook_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<u8>> {
+    let Some(trust) = native_hook_trust(runtime) else {
+        return Some(bytes.to_vec());
+    };
     // The exact native record is required: a changed digest, key or extra
     // field does not match and remains part of the frozen comparison.
     let text = std::str::from_utf8(bytes).ok()?;
-    match text.matches(&block).count() {
+    match text.matches(&trust.subtable).count() {
         0 => Some(bytes.to_vec()),
-        1 => Some(text.replacen(&block, "", 1).into_bytes()),
+        1 => Some(text.replacen(&trust.subtable, "", 1).into_bytes()),
         _ => None,
     }
+}
+
+/// Removes exactly the native profile-file consent record, including the
+/// native `[hooks.state]` parent header. Unlike the arm configuration path,
+/// a private profile must actually carry the record; an absent or duplicate
+/// approval is refused.
+fn strip_native_profile_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<u8>> {
+    let trust = native_hook_trust(runtime)?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    text.strip_suffix(&trust.profile_record)
+        .map(|stripped| stripped.as_bytes().to_vec())
+}
+
+/// Accepts a private runner input only at its frozen digest, or after removing
+/// the one exact native hook approval and reconstructing the prepared CRLF
+/// bytes. The native serializer rewrites line endings to LF; no other byte
+/// change is admitted.
+fn private_input_matches_with_native_trust(
+    bytes: &[u8],
+    expected_sha256: &str,
+    runtime: &ArmRuntime,
+) -> bool {
+    if build_identity::hash_bytes(bytes) == expected_sha256 {
+        return true;
+    }
+    let Some(stripped) = strip_native_profile_trust(bytes, runtime) else {
+        return false;
+    };
+    if build_identity::hash_bytes(&stripped) == expected_sha256 {
+        return true;
+    }
+    if stripped.contains(&b'\r') {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&stripped) else {
+        return false;
+    };
+    let crlf = text.replace('\n', "\r\n");
+    build_identity::hash_bytes(crlf.as_bytes()) == expected_sha256
 }
 
 /// Mirrors the native client's hook trust identity for a `hooks.json`

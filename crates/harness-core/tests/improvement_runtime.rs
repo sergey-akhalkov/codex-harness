@@ -1064,6 +1064,13 @@ fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
         "model_context_window = 65536\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\n",
     )
     .unwrap();
+    let private_profile = root.join("private/ds.config.toml");
+    fs::create_dir_all(private_profile.parent().unwrap()).unwrap();
+    fs::write(
+        &private_profile,
+        b"sandbox_mode = \"read-only\"\r\nmodel = \"fixture-glyph-1\"\r\nmodel_reasoning_effort = \"high\"\r\napproval_policy = \"never\"\r\n\r\n[features]\r\ncode_mode = false\r\n",
+    )
+    .unwrap();
     let request = ArmRequest {
         variant: prepare_variant(&state, Arm::Baseline, "H", &build).unwrap(),
         home: home.clone(),
@@ -1072,11 +1079,21 @@ fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
         upstream: fixtures.upstream.clone(),
         timeout: Duration::from_secs(60),
         client: Some(local_client(&catalogue, Some(&overlay))),
-        private_inputs: Vec::new(),
+        private_inputs: vec![PrivateInput {
+            source: private_profile,
+            destination: "ds.config.toml".into(),
+        }],
         protected: Vec::new(),
     };
     let mut runtime = install_arm(&request).unwrap();
     verify_consumption(&runtime).unwrap();
+    let private_profile = runtime.home.join("ds.config.toml");
+    let prepared_private = fs::read(&private_profile).unwrap();
+    assert_eq!(
+        runtime.private[0].sha256,
+        build_identity::hash_bytes(&prepared_private),
+        "the frozen private profile identity is unchanged"
+    );
     let config = runtime.configuration.as_ref().unwrap().path.clone();
     let installed = fs::read(&config).unwrap();
     let installed_text = std::str::from_utf8(&installed).unwrap();
@@ -1134,6 +1151,102 @@ fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
         "\n[projects.'{}']\ntrust_level = \"trusted\"\n",
         workspace.to_string_lossy().to_ascii_lowercase()
     );
+
+    // The native client rewrites this private profile to LF and appends one
+    // exact local approval for the retained hook definition. The frozen
+    // private-input digest still describes the prepared CRLF bytes.
+    let prepared_private_text = std::str::from_utf8(&prepared_private).unwrap();
+    let profile_native = format!(
+        "{}\n[hooks.state]\n\n[hooks.state.'{key}']\ntrusted_hash = \"{known_digest}\"\n",
+        prepared_private_text.replace("\r\n", "\n")
+    );
+    let profile_record =
+        format!("\n[hooks.state]\n\n[hooks.state.'{key}']\ntrusted_hash = \"{known_digest}\"\n");
+    fs::write(&private_profile, &profile_native).unwrap();
+    verify_consumption(&runtime).unwrap();
+    verify_consumption(&runtime).unwrap();
+    assert_eq!(
+        runtime.private[0].sha256,
+        build_identity::hash_bytes(&prepared_private),
+        "native consent does not replace the frozen private profile identity"
+    );
+
+    let mut profile_counterexamples: Vec<(&str, String)> = Vec::new();
+    profile_counterexamples.push((
+        "a wrong private hook digest",
+        profile_native.replace(
+            known_digest,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    ));
+    profile_counterexamples.push((
+        "a foreign private hook path",
+        profile_native.replace(
+            &key,
+            &format!(
+                "{}:pre_tool_use:0:0",
+                root.join("foreign-hooks.json").display()
+            ),
+        ),
+    ));
+    profile_counterexamples.push((
+        "a different private handler index",
+        profile_native.replace(":pre_tool_use:0:0", ":pre_tool_use:0:1"),
+    ));
+    profile_counterexamples.push((
+        "an extra private trust field",
+        profile_native.replace(
+            &format!("trusted_hash = \"{known_digest}\""),
+            &format!("trusted_hash = \"{known_digest}\"\nenabled = true"),
+        ),
+    ));
+    profile_counterexamples.push((
+        "a duplicate private trust record",
+        format!("{profile_native}{profile_record}"),
+    ));
+    profile_counterexamples.push((
+        "a missing private trust parent header",
+        format!(
+            "{}\n[hooks.state.'{key}']\ntrusted_hash = \"{known_digest}\"\n",
+            prepared_private_text.replace("\r\n", "\n")
+        ),
+    ));
+    profile_counterexamples.push((
+        "private model drift",
+        profile_native.replace("fixture-glyph-1", "fixture-glyph-2"),
+    ));
+    profile_counterexamples.push((
+        "private authority drift",
+        profile_native.replace(
+            "approval_policy = \"never\"",
+            "approval_policy = \"on-request\"",
+        ),
+    ));
+    profile_counterexamples.push((
+        "a partial private line-ending rewrite",
+        profile_native.replace(
+            "sandbox_mode = \"read-only\"\n",
+            "sandbox_mode = \"read-only\"\r\n",
+        ),
+    ));
+    profile_counterexamples.push((
+        "an unowned private setting",
+        format!("{profile_native}\n[fixture-extra]\nvalue = 1\n"),
+    ));
+    for (name, text) in profile_counterexamples {
+        assert_ne!(
+            text, profile_native,
+            "{name} did not change the private bytes"
+        );
+        fs::write(&private_profile, text).unwrap();
+        let error = verify_consumption(&runtime).unwrap_err().to_string();
+        assert!(
+            error.contains("private runner input ds.config.toml changed since preparation"),
+            "{name}: {error}"
+        );
+    }
+    fs::write(&private_profile, &profile_native).unwrap();
+    verify_consumption(&runtime).unwrap();
 
     // The native approval alone is accepted without inventing workspace
     // authority; the dispatch's own workspace entry then needs its recorded
