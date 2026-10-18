@@ -1,15 +1,17 @@
 //! Bounded cumulative reflection cost through the accepted-stage controller.
 //!
 //! These checks use the real accepted closure, native fork runner and fixture
-//! app-server. They prove that declared allowances survive the second stage and
-//! a repeated resume, and that unknown usage never unlocks dependent work.
+//! app-server. They prove that declared token, turn, investigation and
+//! supplied-context allowances survive the second stage and a repeated resume,
+//! and that unknown usage never unlocks dependent work.
 
 use super::*;
 use harness_core::{
     board_cli,
     delivery_reflection::{
-        AcceptanceBinding, ActivationRequest, DeliveryState, Finding, JournalPolicy, Purpose,
-        ReflectionController, ReflectionLimits, StageState, acceptance_metadata,
+        AcceptanceBinding, ActivationRequest, BudgetLimit, DeliveryState, Finding, JournalPolicy,
+        Purpose, ReflectionController, ReflectionLimits, Stage, StageState, UsageDelta,
+        acceptance_metadata,
     },
 };
 
@@ -81,6 +83,46 @@ fn run_budget_chain(
         lead_result,
         Some(&workspace.checkout),
     ))
+}
+
+fn run_budget_chain_with_investigations(
+    workspace: &Workspace,
+    request: &Value,
+    executor_investigations: u64,
+    lead_investigations: u64,
+    executor_fork: &str,
+    executor_turn: &str,
+) -> ConsoleOutcome {
+    let mut spec = chain_spec(
+        workspace,
+        request,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+        Some(&workspace.checkout),
+    );
+    for (name, value) in [
+        (
+            "HARNESS_REFLECTION_FIXTURE_EXECUTOR_INVESTIGATIONS",
+            executor_investigations.to_string(),
+        ),
+        (
+            "HARNESS_REFLECTION_FIXTURE_LEAD_INVESTIGATIONS",
+            lead_investigations.to_string(),
+        ),
+        (
+            "HARNESS_REFLECTION_FIXTURE_EXECUTOR_FORK_THREAD",
+            executor_fork.to_owned(),
+        ),
+        (
+            "HARNESS_REFLECTION_FIXTURE_EXECUTOR_FORK_TURN",
+            executor_turn.to_owned(),
+        ),
+    ] {
+        spec.env.insert(name.into(), Some(value.into()));
+    }
+    wait_session(ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap())
 }
 
 #[test]
@@ -329,4 +371,424 @@ fn failed_executor_stage_stays_unknown_and_resume_starts_no_model_work() {
     assert_refused(&repeated, "requires explicit recovery");
     assert_eq!(request_counts(&workspace), calls);
     assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+}
+
+#[test]
+fn investigation_overrun_pauses_the_stage_and_retry_retains_prior_work() {
+    let workspace = Workspace::new("budget-investigation-overrun", LeadMode::Delivered);
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 2,
+        max_turns_per_stage: 2,
+        max_tokens_per_stage: 240,
+        max_tokens_per_record: 480,
+        max_investigations_per_stage: 1,
+        max_investigations_per_record: 2,
+        ..ReflectionLimits::default()
+    };
+    let (controller, request, acceptance) = accepted_with_limits(&workspace, limits);
+    let paused = run_budget_chain_with_investigations(
+        &workspace,
+        &request,
+        2,
+        0,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&paused, "stage_investigations observed 2 exceeds allowed 1");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Blocked);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 2);
+    assert!(record.executor.usage.context_bytes > 0, "{record:?}");
+    assert!(record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+    assert!(
+        record
+            .executor
+            .usage
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stage_investigations"))
+    );
+    let pause = record.executor.pause.as_ref().unwrap();
+    assert_eq!(pause.limit, BudgetLimit::StageInvestigations);
+    assert_eq!(pause.observed, 2);
+    assert_eq!(pause.allowed, 1);
+    assert!(pause.missing_fact.contains("investigation allowance"));
+    assert!(pause.continuation_choice.contains("retry_stage"));
+    assert!(!pause.evidence.is_empty());
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.lead.usage.attempts, 0);
+    assert_eq!(record.delivery, DeliveryState::Pending);
+
+    let native = stage(&workspace, "executor-stage");
+    assert_eq!(native["status"], json!("budget-paused"), "{native}");
+    assert!(
+        native["contextBasis"].as_str().is_some_and(|basis| {
+            basis.contains("not provider tokens") && basis.contains("not proof")
+        }),
+        "{native}"
+    );
+    assert_eq!(native["usageKnown"], json!(true), "{native}");
+    assert_eq!(native["usage"]["total_tokens"], json!(120), "{native}");
+    assert_eq!(native["work"]["investigations"], json!(2), "{native}");
+    assert!(
+        native["work"]["context_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "{native}"
+    );
+    assert!(
+        native["sourceContextBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "{native}"
+    );
+    assert_eq!(
+        native["budgetPause"]["limit"],
+        json!("stage_investigations"),
+        "{native}"
+    );
+
+    let calls = request_counts(&workspace);
+    let repeated = run_budget_chain_with_investigations(
+        &workspace,
+        &request,
+        2,
+        0,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&repeated, "requires explicit recovery");
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+
+    let retry = controller
+        .retry_stage(&acceptance, Stage::Executor)
+        .unwrap_err();
+    assert!(
+        retry
+            .to_string()
+            .contains("stage_investigations observed 2"),
+        "{retry}"
+    );
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+
+    let raised = ReflectionLimits {
+        max_attempts_per_stage: 2,
+        max_turns_per_stage: 2,
+        max_tokens_per_stage: 240,
+        max_tokens_per_record: 480,
+        max_investigations_per_stage: 4,
+        max_investigations_per_record: 8,
+        ..ReflectionLimits::default()
+    };
+    controller
+        .activate(&ActivationRequest {
+            lead_session: LEAD_THREAD.to_owned(),
+            run: None,
+            boundary: None,
+            journal: JournalPolicy::RequireExisting,
+            limits: Some(raised),
+        })
+        .unwrap();
+    let receipt = controller
+        .retry_stage(&acceptance, Stage::Executor)
+        .unwrap();
+    assert_eq!(receipt.state, StageState::Pending);
+    assert_eq!(receipt.usage.attempts, 1);
+    assert_eq!(receipt.usage.tokens, 120);
+    assert_eq!(receipt.usage.investigations, 2);
+    assert_eq!(receipt.usage.last_error, None);
+
+    let completed = run_budget_chain_with_investigations(
+        &workspace,
+        &request,
+        2,
+        0,
+        "fixture-executor-reflection-fork-2",
+        "fixture-executor-reflection-turn-2",
+    );
+    assert_eq!(completed.outcome.exit_code, 0, "{}", completed.transcript);
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
+
+    let archived = read_json(&workspace.state.join("executor-stage-attempt-1.json"));
+    assert_eq!(archived["status"], json!("budget-paused"), "{archived}");
+    assert_eq!(archived["work"]["investigations"], json!(2), "{archived}");
+    let executor = stage(&workspace, "executor-stage");
+    assert_eq!(
+        executor["turnId"],
+        json!("fixture-executor-reflection-turn-2"),
+        "{executor}"
+    );
+    assert_eq!(
+        executor["copiedSourceTurns"],
+        json!([EXECUTOR_SOURCE_TURN]),
+        "{executor}"
+    );
+    assert!(
+        executor["contextBasis"]
+            .as_str()
+            .is_some_and(|basis| basis.contains("serialized fork thread record")),
+        "{executor}"
+    );
+
+    let final_record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(final_record.executor.state, StageState::Retained);
+    assert_eq!(final_record.executor.usage.attempts, 2);
+    assert_eq!(final_record.executor.usage.turns, 2);
+    assert_eq!(final_record.executor.usage.tokens, 240);
+    assert_eq!(final_record.executor.usage.investigations, 4);
+    assert!(final_record.executor.pause.is_none());
+    assert_eq!(final_record.executor.usage.last_error, None);
+    assert_eq!(final_record.lead.state, StageState::Retained);
+    assert_eq!(final_record.lead.usage.tokens, 240);
+    assert_eq!(final_record.delivery, DeliveryState::Consumed);
+    assert_eq!(final_record.usage_totals().tokens, 480);
+    assert_eq!(final_record.usage_totals().investigations, 4);
+}
+
+#[test]
+fn fork_context_overrun_pauses_before_the_turn_and_restart_sends_no_request() {
+    let workspace = Workspace::new("budget-context-overrun", LeadMode::Delivered);
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 1,
+        max_turns_per_stage: 1,
+        max_context_bytes_per_stage: 1,
+        max_context_bytes_per_record: 1_000_000,
+        ..ReflectionLimits::default()
+    };
+    let (controller, request, acceptance) = accepted_with_limits(&workspace, limits);
+    let paused = run_budget_chain(
+        &workspace,
+        &request,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_refused(&paused, "stage_context_bytes observed");
+    assert_eq!(request_counts(&workspace), (1, 0, 0, 0));
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Blocked);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(
+        record.executor.usage.turns, 0,
+        "no turn was submitted before the context pause"
+    );
+    assert_eq!(record.executor.usage.tokens, 0);
+    assert_eq!(record.executor.usage.investigations, 0);
+    assert!(record.executor.usage.context_bytes > 0, "{record:?}");
+    assert!(record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+    let pause = record.executor.pause.as_ref().unwrap();
+    assert_eq!(pause.limit, BudgetLimit::StageContextBytes);
+    assert_eq!(pause.observed, record.executor.usage.context_bytes);
+    assert_eq!(pause.allowed, 1);
+    assert!(pause.missing_fact.contains("supplied source context"));
+    assert!(
+        pause
+            .continuation_choice
+            .contains("max_context_bytes_per_stage")
+    );
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.delivery, DeliveryState::Pending);
+
+    let native = stage(&workspace, "executor-stage");
+    assert_eq!(native["status"], json!("budget-paused"), "{native}");
+    assert_eq!(native["turnId"], Value::Null, "{native}");
+    assert_eq!(native["usageKnown"], json!(true), "{native}");
+    assert_eq!(native["usage"]["total_tokens"], json!(0), "{native}");
+    assert_eq!(native["work"]["investigations"], json!(0), "{native}");
+    assert!(
+        native["sourceContextBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "{native}"
+    );
+    assert_eq!(
+        native["budgetPause"]["limit"],
+        json!("stage_context_bytes"),
+        "{native}"
+    );
+
+    let calls = request_counts(&workspace);
+    let repeated = run_budget_chain(
+        &workspace,
+        &request,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_refused(&repeated, "requires explicit recovery");
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+}
+
+#[test]
+fn record_investigation_overrun_pauses_the_lead_and_rerun_sends_no_request() {
+    let workspace = Workspace::new("budget-record-investigations", LeadMode::Delivered);
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 1,
+        max_turns_per_stage: 1,
+        max_tokens_per_stage: 240,
+        max_tokens_per_record: 480,
+        max_investigations_per_stage: 2,
+        max_investigations_per_record: 2,
+        ..ReflectionLimits::default()
+    };
+    let (controller, request, acceptance) = accepted_with_limits(&workspace, limits);
+    let paused = run_budget_chain_with_investigations(
+        &workspace,
+        &request,
+        1,
+        2,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(
+        &paused,
+        "record_investigations observed 3 exceeds allowed 2",
+    );
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Retained);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 1);
+    assert!(record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+    assert_eq!(record.lead.state, StageState::Blocked);
+    assert_eq!(record.lead.usage.attempts, 1);
+    assert_eq!(record.lead.usage.turns, 1);
+    assert_eq!(record.lead.usage.tokens, 240);
+    assert_eq!(record.lead.usage.investigations, 2);
+    assert!(record.lead.usage.context_bytes > 0, "{record:?}");
+    assert!(record.lead.usage_reconciled);
+    assert!(record.lead.work_reconciled);
+    let pause = record.lead.pause.as_ref().unwrap();
+    assert_eq!(pause.limit, BudgetLimit::RecordInvestigations);
+    assert_eq!(pause.observed, 3);
+    assert_eq!(pause.allowed, 2);
+    assert!(
+        pause
+            .missing_fact
+            .contains("cumulative investigation allowance")
+    );
+    assert!(
+        pause
+            .continuation_choice
+            .contains("max_investigations_per_record")
+    );
+    assert!(!pause.evidence.is_empty());
+    assert_eq!(record.delivery, DeliveryState::Pending);
+
+    let native = stage(&workspace, "lead-stage");
+    assert_eq!(native["status"], json!("budget-paused"), "{native}");
+    assert_eq!(native["usageKnown"], json!(true), "{native}");
+    assert_eq!(native["usage"]["total_tokens"], json!(240), "{native}");
+    assert_eq!(native["work"]["investigations"], json!(2), "{native}");
+    assert!(
+        native["sourceContextBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "{native}"
+    );
+    assert!(
+        native["contextBasis"]
+            .as_str()
+            .is_some_and(|basis| basis.contains("serialized fork thread record")),
+        "{native}"
+    );
+    assert!(
+        native["budgetPause"]["evidence"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "{native}"
+    );
+
+    let calls = request_counts(&workspace);
+    let repeated = run_budget_chain_with_investigations(
+        &workspace,
+        &request,
+        1,
+        2,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&repeated, "requires explicit recovery");
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+}
+
+#[test]
+fn turn_exhaustion_blocks_a_second_attempt_after_reconciliation() {
+    let workspace = Workspace::new("budget-turn-exhaustion", LeadMode::Delivered);
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 2,
+        max_turns_per_stage: 1,
+        ..ReflectionLimits::default()
+    };
+    let (controller, request, acceptance) = accepted_with_limits(&workspace, limits);
+    let failed = run_budget_chain(
+        &workspace,
+        &request,
+        "failed",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_refused(&failed, "ended as failed");
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Unknown);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert!(!record.executor.usage_reconciled);
+    assert!(
+        record.executor.work_reconciled,
+        "the fork context was measured before the failed turn"
+    );
+    assert!(record.executor.usage.context_bytes > 0, "{record:?}");
+    let calls = request_counts(&workspace);
+    assert_eq!(calls, (1, 1, 0, 0));
+
+    controller
+        .record_unknown_usage(
+            &acceptance,
+            Stage::Executor,
+            UsageDelta {
+                turns: 0,
+                tokens: 0,
+            },
+        )
+        .unwrap();
+    let reconciled = controller.record(&acceptance).unwrap().unwrap();
+    assert!(reconciled.executor.usage_reconciled);
+    assert!(reconciled.executor.work_reconciled);
+    assert_eq!(reconciled.executor.usage.last_error, None);
+    assert_eq!(reconciled.executor.usage.turns, 1);
+
+    let receipt = controller
+        .retry_stage(&acceptance, Stage::Executor)
+        .unwrap();
+    assert_eq!(receipt.state, StageState::Pending);
+    let error = controller
+        .begin_stage(&acceptance, Stage::Executor)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("reached its 1 turn allowance"),
+        "{error}"
+    );
+    assert_eq!(request_counts(&workspace), calls);
+    let after = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(after.executor.state, StageState::Pending);
+    assert_eq!(after.executor.usage.attempts, 1);
+    assert_eq!(after.executor.usage.turns, 1);
 }

@@ -428,6 +428,7 @@ struct ReflectionState {
     lead_source_turn: String,
     fork_thread: String,
     fork_turn: String,
+    investigations: u64,
     outcome: String,
     result: String,
     model: String,
@@ -807,6 +808,15 @@ fn reflection_state() -> ReflectionState {
             ),
         )
     };
+    let investigations = if stage == "executor-self-reflection" {
+        reflection_env("HARNESS_REFLECTION_FIXTURE_EXECUTOR_INVESTIGATIONS", "0")
+            .parse()
+            .unwrap_or(0)
+    } else {
+        reflection_env("HARNESS_REFLECTION_FIXTURE_LEAD_INVESTIGATIONS", "0")
+            .parse()
+            .unwrap_or(0)
+    };
     let default_outcome = reflection_env("HARNESS_REFLECTION_FIXTURE_OUTCOME", "complete");
     let outcome = if stage == "executor-self-reflection" {
         reflection_env(
@@ -837,6 +847,7 @@ fn reflection_state() -> ReflectionState {
         lead_source_turn,
         fork_thread,
         fork_turn,
+        investigations,
         outcome,
         result,
         model: reflection_env(
@@ -1073,6 +1084,29 @@ fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: 
                     "turn": {"id": state.fork_turn, "status": "inProgress"},
                 },
             }));
+            for index in 0..state.investigations {
+                let item = json!({
+                    "id": format!("{}-investigation-{index}", state.fork_turn),
+                    "type": "commandExecution",
+                    "command": "synthetic read-only investigation",
+                });
+                notifier.push(json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": state.fork_thread,
+                        "turnId": state.fork_turn,
+                        "item": item.clone(),
+                    },
+                }));
+                notifier.push(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": state.fork_thread,
+                        "turnId": state.fork_turn,
+                        "item": item,
+                    },
+                }));
+            }
             match state.outcome.as_str() {
                 "complete" | "missing-usage" | "source-later-work" => {
                     notifier.push(json!({
@@ -1165,7 +1199,7 @@ fn write_reflection_rollout(state: &ReflectionState) -> io::Result<()> {
     if state.outcome == "missing-usage" {
         new_usage.as_object_mut().unwrap().remove("total_tokens");
     }
-    let lines = [
+    let mut lines = vec![
         json!({"type": "session_meta", "payload": {"id": state.fork_thread}}),
         json!({
             "type": "token_usage_record",
@@ -1188,13 +1222,44 @@ fn write_reflection_rollout(state: &ReflectionState) -> io::Result<()> {
             },
         }),
     ];
+    for index in 0..state.investigations {
+        lines.push(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": state.fork_turn,
+                "item": {
+                    "type": "commandExecution",
+                    "id": format!("{}-investigation-{index}", state.fork_turn),
+                    "command": "synthetic read-only investigation",
+                },
+            },
+        }));
+    }
     let text = lines
         .iter()
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
+    let safe = |value: &str| {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
     fs::write(
-        sessions.join(format!("{}.jsonl", state.stage)),
+        sessions.join(format!(
+            "{}-{}-{}.jsonl",
+            safe(&state.stage),
+            safe(&state.fork_thread),
+            safe(&state.fork_turn)
+        )),
         format!("{text}\n"),
     )
 }

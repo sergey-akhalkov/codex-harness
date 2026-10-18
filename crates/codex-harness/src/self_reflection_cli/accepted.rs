@@ -3,7 +3,8 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ReflectionController, ReflectionRecord, Stage, StageState as RecordedStageState, UsageDelta,
+    ReflectionController, ReflectionRecord, Stage, StageStart, StageState as RecordedStageState,
+    UsageDelta,
 };
 
 pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
@@ -26,14 +27,14 @@ pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
     let (chain, _lease) = prepare_chain_with_acceptance(request, Some(record.binding.clone()))?;
     check_binding(&controller, &chain)?;
     preflight_lead(&chain)?;
-    let executor = run_recorded_stage(&controller, &chain, Stage::Executor, || {
-        run_executor(&chain)
+    let executor = run_recorded_stage(&controller, &chain, Stage::Executor, |start| {
+        run_executor(&chain, start.map(|start| &start.admission))
     })?;
     check_binding(&controller, &chain)?;
     preflight_lead(&chain)?;
     wait_for_lead_turn(&chain)?;
-    let lead = run_recorded_stage(&controller, &chain, Stage::Lead, || {
-        run_lead(&chain, &executor)
+    let lead = run_recorded_stage(&controller, &chain, Stage::Lead, |start| {
+        run_lead(&chain, &executor, start.map(|start| &start.admission))
     })?;
     check_binding(&controller, &chain)?;
     let delivery = match deliver_synthesis(&chain, &executor, &lead) {
@@ -99,7 +100,7 @@ fn run_recorded_stage(
     controller: &ReflectionController,
     chain: &ChainState,
     stage: Stage,
-    run: impl FnOnce() -> io::Result<StageState>,
+    run: impl FnOnce(Option<&StageStart>) -> io::Result<StageState>,
 ) -> io::Result<StageState> {
     let record = controller
         .record(&chain.acceptance)?
@@ -134,6 +135,11 @@ fn run_recorded_stage(
                     "retained reflection usage remains unknown; reconcile its native cost before continuing",
                 ));
             }
+            if recorded.state == RecordedStageState::Retained && !recorded.work_reconciled {
+                return Err(invalid(
+                    "retained reflection observed work remains unknown; reconcile its investigation/context work before continuing",
+                ));
+            }
         }
         other => {
             return Err(invalid(format!(
@@ -146,20 +152,73 @@ fn run_recorded_stage(
         Stage::Executor => Role::ExecutorSelfReflection,
         Stage::Lead => Role::LeadSelfReflection,
     };
-    let _admission = admit_stage(chain, role)?;
-    if recorded.state == RecordedStageState::Pending {
-        controller.begin_stage(&chain.acceptance, stage)?;
+    let starts_new_attempt = recorded.state == RecordedStageState::Pending;
+    let _admission = admit_stage(chain, role, starts_new_attempt)?;
+    if starts_new_attempt && state_path.is_file() {
+        let prior: StageState = read_json(&state_path, MAX_REQUEST_BYTES)?;
+        if prior.status != StageStatus::NotStarted {
+            let stem = state_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("stage");
+            let attempt = format!("{stem}-attempt-{}", recorded.usage.attempts);
+            let archive_stem = if state_path
+                .with_file_name(format!("{attempt}.json"))
+                .exists()
+            {
+                format!("{attempt}-{}", now_ms())
+            } else {
+                attempt
+            };
+            let archive = state_path.with_file_name(format!("{archive_stem}.json"));
+            fs::rename(&state_path, &archive).map_err(|error| {
+                invalid(format!(
+                    "the prior {} native attempt could not be preserved at {} before retry: {error}",
+                    stage.as_str(),
+                    archive.display()
+                ))
+            })?;
+            let stage_role = match stage {
+                Stage::Executor => chain.executor_stage.role.as_str(),
+                Stage::Lead => chain.lead_stage.role.as_str(),
+            };
+            for kind in ["native", "reconcile"] {
+                let source = state_path
+                    .parent()
+                    .ok_or_else(|| invalid("the stage state path has no directory"))?
+                    .join(format!("{stage_role}-{kind}"));
+                if !source.is_dir() {
+                    continue;
+                }
+                let archive = source.with_file_name(format!("{archive_stem}-{kind}"));
+                fs::rename(&source, &archive).map_err(|error| {
+                    invalid(format!(
+                        "the prior {} {kind} attempt could not be preserved at {} before retry: {error}",
+                        stage.as_str(),
+                        archive.display()
+                    ))
+                })?;
+            }
+        }
     }
-    let state = match run() {
+    let start = if starts_new_attempt {
+        Some(controller.begin_stage(&chain.acceptance, stage)?)
+    } else {
+        None
+    };
+    let state = match run(start.as_ref()) {
         Ok(state) => state,
         Err(error) => {
             if recorded.state != RecordedStageState::Retained {
                 let usage = submitted_stage_usage(&state_path);
-                if let Err(retention) = controller.mark_stage_unknown_with_usage(
+                let (work, work_reconciled) = submitted_stage_work(&state_path);
+                if let Err(retention) = controller.mark_stage_unknown_with_work_and_usage(
                     &chain.acceptance,
                     stage,
                     error.to_string(),
                     usage,
+                    work,
+                    work_reconciled,
                 ) {
                     return Err(invalid(format!(
                         "{error}; retaining stage uncertainty: {retention}"
@@ -169,6 +228,34 @@ fn run_recorded_stage(
             return Err(error);
         }
     };
+    if let Some(pause) = stage_budget_pause(&state).cloned() {
+        let usage = stage_usage_delta(&state);
+        let work = stage_work(&state);
+        let usage_reconciled = stage_usage_known(&state);
+        let work_reconciled = stage_work_known(&state);
+        let usage_unknown_reason = (!usage_reconciled)
+            .then(|| stage_unknown_reason(&state))
+            .flatten();
+        let work_unknown_reason = (!work_reconciled)
+            .then_some(state.work_unknown_reason.as_deref())
+            .flatten();
+        controller.pause_stage(
+            &chain.acceptance,
+            stage,
+            pause.clone(),
+            usage,
+            work,
+            usage_reconciled,
+            work_reconciled,
+            usage_unknown_reason,
+            work_unknown_reason,
+        )?;
+        return Err(invalid(format!(
+            "{} evidence is retained at {}; no dependent work was admitted",
+            pause.summary(),
+            state_path.display()
+        )));
+    }
     let outcome = stage_outcome(&state);
     if recorded.state == RecordedStageState::Retained {
         let retained = recorded
@@ -189,16 +276,54 @@ fn run_recorded_stage(
         return Ok(state);
     }
     let usage = stage_usage_delta(&state);
+    let work = stage_work(&state);
+    let mut details = Vec::new();
     if !stage_usage_known(&state) {
-        let detail =
-            stage_unknown_reason(&state).unwrap_or("the native new-turn usage is unavailable");
-        controller.retain_stage_unreconciled(&chain.acceptance, stage, outcome, usage, detail)?;
+        details.push(
+            stage_unknown_reason(&state)
+                .unwrap_or("the native new-turn usage is unavailable")
+                .to_owned(),
+        );
+    }
+    if !stage_work_known(&state) {
+        details.push(
+            state
+                .work_unknown_reason
+                .as_deref()
+                .unwrap_or("the native investigation/context work is unavailable")
+                .to_owned(),
+        );
+    }
+    let detail = details.join("; ");
+    if !detail.is_empty() {
+        if stage_usage_known(&state) {
+            controller.retain_stage_with_work_reconciliation(
+                &chain.acceptance,
+                stage,
+                outcome,
+                usage,
+                true,
+                work,
+                false,
+                detail.clone(),
+            )?;
+        } else {
+            controller.retain_stage_unreconciled_with_work(
+                &chain.acceptance,
+                stage,
+                outcome,
+                usage,
+                work,
+                stage_work_known(&state),
+                detail.clone(),
+            )?;
+        }
         return Err(invalid(format!(
             "{} result retained, but usage remains unknown: {detail}",
             stage.as_str()
         )));
     }
-    controller.retain_stage(&chain.acceptance, stage, outcome, usage)?;
+    controller.retain_stage_with_work(&chain.acceptance, stage, outcome, usage, work)?;
     Ok(state)
 }
 
@@ -216,4 +341,14 @@ fn submitted_stage_usage(state_path: &Path) -> UsageDelta {
         turns: u64::from(state.turn_id.is_some()),
         tokens: stage_usage_delta(&state).tokens,
     }
+}
+
+fn submitted_stage_work(state_path: &Path) -> (StageWork, bool) {
+    let Ok(bytes) = fs::read(state_path) else {
+        return (StageWork::default(), false);
+    };
+    let Ok(state) = serde_json::from_slice::<StageState>(&bytes) else {
+        return (StageWork::default(), false);
+    };
+    (state.work, state.work_known)
 }

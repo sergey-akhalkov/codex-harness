@@ -26,7 +26,10 @@ use crate::executor_cli::{
     wait_for_frontend,
 };
 use harness_core::{
-    delivery_reflection::{AcceptanceBinding, Finding, StageOutcome, UsageDelta},
+    delivery_reflection::{
+        AcceptanceBinding, BudgetLimit, BudgetPause, Finding, ReflectionLimits, StageAdmission,
+        StageOutcome, StageUsage, StageWork, UsageDelta, UsageTotals,
+    },
     orchestration_config::{self, ProfileBinding},
     process::{Job, Limits},
     role_context::{self, ResolvedRole, Role},
@@ -68,6 +71,8 @@ const LEAD_PREFLIGHT_BOUND: Duration = Duration::from_secs(20);
 /// Bound for waiting on the exact accepting lead turn before the lead fork.
 /// The turn identity is retained when this expires; nothing is replayed.
 const LEAD_TURN_WAIT: Duration = Duration::from_secs(120);
+const CONTEXT_WORK_BASIS: &str = "rollout-recorded base and developer instruction bytes; inherited source transcript bytes are not exposed by the native usage contract";
+const FORK_CONTEXT_BASIS: &str = "serialized fork thread record returned by the app-server plus the prompt UTF-8 bytes; this is supplied-context bytes, not provider tokens and not proof that every source byte remained in model context";
 
 const EXECUTOR_STAGE: &str = "executor-self-reflection";
 const LEAD_STAGE: &str = "lead-self-reflection";
@@ -174,6 +179,7 @@ pub(crate) enum StageStatus {
     Failed,
     Interrupted,
     VisibilityLost,
+    BudgetPaused,
     Unknown,
 }
 
@@ -228,6 +234,18 @@ pub(crate) struct StageState {
     #[serde(default)]
     rollout: Option<PathBuf>,
     #[serde(default)]
+    work: StageWork,
+    #[serde(default)]
+    work_known: bool,
+    #[serde(default)]
+    work_unknown_reason: Option<String>,
+    #[serde(default)]
+    context_basis: Option<String>,
+    #[serde(default)]
+    source_context_bytes: u64,
+    #[serde(default)]
+    budget_pause: Option<BudgetPause>,
+    #[serde(default)]
     error: Option<String>,
     #[serde(default)]
     updated_ms: u64,
@@ -267,6 +285,12 @@ impl StageState {
             cumulative_thread: None,
             coverage: None,
             rollout: None,
+            work: StageWork::default(),
+            work_known: false,
+            work_unknown_reason: None,
+            context_basis: None,
+            source_context_bytes: 0,
+            budget_pause: None,
             error: None,
             updated_ms: now_ms(),
         }
@@ -306,6 +330,7 @@ enum DriveFailure {
     LostVisibility,
     Timeout(Duration),
     Error(io::Error),
+    BudgetPaused(BudgetPause),
 }
 
 enum RetainedResult {
@@ -398,15 +423,63 @@ fn execute(path: &Path, board: Option<&Path>) -> io::Result<i32> {
 pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
     let (chain, _lease) = prepare_chain(request)?;
     preflight_lead(&chain)?;
+    let limits = ReflectionLimits::default();
+    let executor_admission =
+        StageAdmission::new(&limits, &StageUsage::default(), &UsageTotals::default());
     let executor_state = {
-        let _admission = admit_stage(&chain, Role::ExecutorSelfReflection)?;
-        run_executor(&chain)?
+        let _admission = admit_stage(&chain, Role::ExecutorSelfReflection, true)?;
+        run_executor(&chain, Some(&executor_admission))?
     };
+    if let Some(pause) = stage_budget_pause(&executor_state) {
+        return Err(invalid(format!(
+            "executor reflection paused; the lead and delivery were not started: {}",
+            pause.summary()
+        )));
+    }
+    if !stage_is_completed(&executor_state) {
+        return Err(invalid(
+            "executor reflection did not complete; the lead and delivery were not started",
+        ));
+    }
+    if !stage_usage_known(&executor_state) || !stage_work_known(&executor_state) {
+        return Err(invalid(
+            "executor reflection cost or observed work remains unknown; the lead and delivery were not started",
+        ));
+    }
+    let executor_usage_delta = stage_usage_delta(&executor_state);
+    let executor_work = stage_work(&executor_state);
+    let executor_usage = StageUsage {
+        attempts: 1,
+        turns: executor_usage_delta.turns,
+        tokens: executor_usage_delta.tokens,
+        investigations: executor_work.investigations,
+        context_bytes: executor_work.context_bytes,
+        last_error: None,
+    };
+    let record_totals = UsageTotals {
+        attempts: executor_usage.attempts,
+        turns: executor_usage.turns,
+        tokens: executor_usage.tokens,
+        investigations: executor_usage.investigations,
+        context_bytes: executor_usage.context_bytes,
+    };
+    let lead_admission = StageAdmission::new(&limits, &StageUsage::default(), &record_totals);
     preflight_lead(&chain)?;
     let lead_state = {
-        let _admission = admit_stage(&chain, Role::LeadSelfReflection)?;
-        run_lead(&chain, &executor_state)?
+        let _admission = admit_stage(&chain, Role::LeadSelfReflection, true)?;
+        run_lead(&chain, &executor_state, Some(&lead_admission))?
     };
+    if let Some(pause) = stage_budget_pause(&lead_state) {
+        return Err(invalid(format!(
+            "lead reflection paused; delivery was not started: {}",
+            pause.summary()
+        )));
+    }
+    if !stage_is_completed(&lead_state) {
+        return Err(invalid(
+            "lead reflection did not complete; delivery was not started",
+        ));
+    }
     let delivery = deliver_synthesis(&chain, &executor_state, &lead_state)?;
     print_result(&chain, &executor_state, &lead_state, &delivery)
 }
@@ -487,21 +560,16 @@ pub(crate) fn preflight_lead(chain: &ChainState) -> io::Result<()> {
 fn admit_stage(
     chain: &ChainState,
     role: Role,
+    needed: bool,
 ) -> io::Result<Option<crate::executor_cli::reflection_admission::Admission>> {
-    let (declaration, state_path) = match role {
-        Role::ExecutorSelfReflection => (
-            &chain.executor_stage,
-            chain.state_dir.join("executor-stage.json"),
-        ),
-        Role::LeadSelfReflection => (&chain.lead_stage, chain.state_dir.join("lead-stage.json")),
+    if !needed {
+        return Ok(None);
+    }
+    let declaration = match role {
+        Role::ExecutorSelfReflection => &chain.executor_stage,
+        Role::LeadSelfReflection => &chain.lead_stage,
         _ => return Err(invalid("only reflection roles can claim stage admission")),
     };
-    if state_path.is_file() {
-        let state: StageState = read_json(&state_path, MAX_REQUEST_BYTES)?;
-        if state.status != StageStatus::NotStarted {
-            return Ok(None);
-        }
-    }
     let config = orchestration_config::load(&chain.source)?;
     crate::executor_cli::reflection_admission::acquire(
         &chain.codex_home,
@@ -515,7 +583,10 @@ fn admit_stage(
 }
 
 /// Runs (or reuses) the executor stage exactly once for this chain.
-pub(crate) fn run_executor(chain: &ChainState) -> io::Result<StageState> {
+pub(crate) fn run_executor(
+    chain: &ChainState,
+    admission: Option<&StageAdmission>,
+) -> io::Result<StageState> {
     let prepared = prepare_stage(chain, &chain.executor_stage, Role::ExecutorSelfReflection)?;
     let path = chain.state_dir.join("executor-stage.json");
     run_stage(
@@ -525,6 +596,7 @@ pub(crate) fn run_executor(chain: &ChainState) -> io::Result<StageState> {
         &prepared,
         &path,
         executor_prompt(chain)?,
+        admission,
     )
 }
 
@@ -536,7 +608,11 @@ pub(crate) fn wait_for_lead_turn(chain: &ChainState) -> io::Result<()> {
 }
 
 /// Runs (or reuses) the lead stage over the retained executor outcome.
-pub(crate) fn run_lead(chain: &ChainState, executor: &StageState) -> io::Result<StageState> {
+pub(crate) fn run_lead(
+    chain: &ChainState,
+    executor: &StageState,
+    admission: Option<&StageAdmission>,
+) -> io::Result<StageState> {
     let prepared = prepare_stage(chain, &chain.lead_stage, Role::LeadSelfReflection)?;
     let path = chain.state_dir.join("lead-stage.json");
     run_stage(
@@ -546,6 +622,7 @@ pub(crate) fn run_lead(chain: &ChainState, executor: &StageState) -> io::Result<
         &prepared,
         &path,
         lead_prompt(chain, executor)?,
+        admission,
     )
 }
 
@@ -619,9 +696,21 @@ pub(crate) fn stage_usage_delta(state: &StageState) -> UsageDelta {
         0
     };
     UsageDelta {
-        turns: u64::from(state.status == StageStatus::Completed),
+        turns: u64::from(state.turn_id.is_some()),
         tokens,
     }
+}
+
+pub(crate) fn stage_work(state: &StageState) -> StageWork {
+    state.work
+}
+
+pub(crate) fn stage_work_known(state: &StageState) -> bool {
+    state.work_known
+}
+
+pub(crate) fn stage_budget_pause(state: &StageState) -> Option<&BudgetPause> {
+    state.budget_pause.as_ref()
 }
 
 /// The durable core outcome of one completed stage. The retained result is
@@ -1884,6 +1973,7 @@ fn run_stage(
     prepared: &PreparedStage,
     state_path: &Path,
     prompt: String,
+    admission: Option<&StageAdmission>,
 ) -> io::Result<StageState> {
     let mut state = if state_path.exists() {
         let retained: StageState = read_json(state_path, MAX_REQUEST_BYTES)?;
@@ -1911,7 +2001,7 @@ fn run_stage(
         return Ok(state);
     }
     if state.status == StageStatus::TurnSubmitted {
-        return reconcile_submitted(chain, declaration, prepared, state_path, state);
+        return reconcile_submitted(chain, declaration, prepared, state_path, state, admission);
     }
     if state.status != StageStatus::NotStarted {
         return Err(invalid(format!(
@@ -1922,6 +2012,12 @@ fn run_stage(
             state_path.display()
         )));
     }
+    let admission = admission.ok_or_else(|| {
+        invalid(
+            "the stage has no fresh admission state; refusing to start native model work without its remaining allowances",
+        )
+    })?;
+    ensure_admission_available(admission)?;
     state.status = StageStatus::Forking;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
@@ -1963,6 +2059,49 @@ fn run_stage(
             .as_ref()
             .is_some_and(|fork| fork.source_preserved)
     );
+    let fork_record = match conversation.read_thread_record(&fork_thread) {
+        Ok(record) => record,
+        Err(error) => {
+            state.status = StageStatus::Failed;
+            state.error = Some(format!(
+                "the forked source context could not be measured, so no turn was admitted: {error}"
+            ));
+            state.updated_ms = now_ms();
+            persist(state_path, &state)?;
+            return Err(error);
+        }
+    };
+    let source_context_bytes =
+        record_bytes(&fork_record)?.saturating_add(u64::try_from(prompt.len()).unwrap_or(u64::MAX));
+    state.source_context_bytes = source_context_bytes;
+    state.work = StageWork {
+        investigations: 0,
+        context_bytes: source_context_bytes,
+    };
+    state.work_known = true;
+    state.context_basis = Some(FORK_CONTEXT_BASIS.to_owned());
+    state.updated_ms = now_ms();
+    persist(state_path, &state)?;
+    if let Some(pause) = work_budget_pause(
+        admission,
+        state.work,
+        vec![
+            format!(
+                "app-server fork record plus prompt measured {source_context_bytes} supplied-context bytes before the reflection turn"
+            ),
+            FORK_CONTEXT_BASIS.to_owned(),
+        ],
+    ) {
+        state.status = StageStatus::BudgetPaused;
+        state.error = Some(pause.summary());
+        state.usage = zero_usage();
+        state.usage_known = true;
+        state.usage_unknown_reason = None;
+        state.budget_pause = Some(pause);
+        state.updated_ms = now_ms();
+        persist(state_path, &state)?;
+        return Ok(state);
+    }
     let frontend = match attach_owned_frontend(
         &plan,
         &conversation,
@@ -2021,10 +2160,15 @@ fn run_stage(
     state.status = StageStatus::TurnSubmitted;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
-    let outcome = match drive_turn(&mut conversation, &frontend, chain.bound_seconds) {
-        Ok(Lifecycle::Completed) => {
-            retain_completed(chain, &mut conversation, state, &fork_thread, state_path)
-        }
+    let outcome = match drive_turn(&mut conversation, &frontend, chain.bound_seconds, admission) {
+        Ok(Lifecycle::Completed) => retain_completed(
+            chain,
+            &mut conversation,
+            state,
+            &fork_thread,
+            state_path,
+            Some(admission),
+        ),
         Ok(Lifecycle::Failed) => {
             state.status = StageStatus::Failed;
             state.error = conversation
@@ -2075,6 +2219,18 @@ fn run_stage(
                 "observing the native turn failed, so its outcome is unknown: {error}"
             ));
             finish(state_path, state)
+        }
+        Err(DriveFailure::BudgetPaused(pause)) => {
+            state.status = StageStatus::BudgetPaused;
+            state.error = Some(pause.summary());
+            state.budget_pause = Some(pause);
+            if let Some(turn) = state.turn_id.clone() {
+                let usage = retain_usage(&chain.codex_home, &fork_thread, &turn);
+                apply_usage(&mut state, usage);
+            }
+            state.updated_ms = now_ms();
+            persist(state_path, &state)?;
+            Ok(state)
         }
     };
     let _ = frontend.close();
@@ -2131,6 +2287,7 @@ fn reconcile_submitted(
     prepared: &PreparedStage,
     state_path: &Path,
     mut state: StageState,
+    admission: Option<&StageAdmission>,
 ) -> io::Result<StageState> {
     let fork = state
         .fork
@@ -2159,7 +2316,14 @@ fn reconcile_submitted(
             .unwrap_or_default();
         match status {
             "completed" => {
-                return retain_completed(chain, &mut conversation, state, &fork_thread, state_path);
+                return retain_completed(
+                    chain,
+                    &mut conversation,
+                    state,
+                    &fork_thread,
+                    state_path,
+                    admission,
+                );
             }
             "failed" | "interrupted" => {
                 state.status = if status == "failed" {
@@ -2189,17 +2353,52 @@ fn drive_turn(
     conversation: &mut Conversation,
     frontend: &crate::executor_cli::OwnedFrontend,
     bound_seconds: u64,
+    admission: &StageAdmission,
 ) -> Result<Lifecycle, DriveFailure> {
     let bound = Duration::from_secs(bound_seconds);
     let until = Instant::now() + bound;
+    let mut investigations = BTreeSet::new();
+    let mut unnamed_investigations = 0u64;
     loop {
         match frontend.is_running() {
             Ok(true) => {}
             Ok(false) => return Err(DriveFailure::LostVisibility),
             Err(error) => return Err(DriveFailure::Error(error)),
         }
-        if let Err(error) = conversation.pump() {
-            return Err(DriveFailure::Error(error));
+        let events = match conversation.pump() {
+            Ok(events) => events,
+            Err(error) => return Err(DriveFailure::Error(error)),
+        };
+        for event in events {
+            if let Some(id) = completed_investigation(&event, &mut unnamed_investigations) {
+                investigations.insert(id);
+            }
+        }
+        if let Some(pause) = work_budget_pause(
+            admission,
+            StageWork {
+                investigations: investigations.len() as u64,
+                context_bytes: 0,
+            },
+            vec![format!(
+                "completed native investigation items observed before turn completion: {}",
+                investigations.len()
+            )],
+        ) {
+            let mut pause = pause;
+            match conversation.interrupt_active() {
+                Ok(true) => pause
+                    .evidence
+                    .push("the reflection conversation acknowledged turn interruption".to_owned()),
+                Ok(false) => pause.evidence.push(
+                    "the native thread reported no active turn; the completed lifecycle is reconciled before pause retention"
+                        .to_owned(),
+                ),
+                Err(error) => pause.evidence.push(format!(
+                    "the reflection turn interruption could not be verified: {error}"
+                )),
+            }
+            return Err(DriveFailure::BudgetPaused(pause));
         }
         if let Some(state) = conversation.lifecycle()
             && (state.is_terminal() || state == Lifecycle::Defect)
@@ -2213,12 +2412,165 @@ fn drive_turn(
     }
 }
 
+fn completed_investigation(event: &control::ControlEvent, unnamed: &mut u64) -> Option<String> {
+    if event.method.as_deref() != Some("item/completed") {
+        return None;
+    }
+    let item = &event.raw["params"]["item"];
+    let kind = item["type"].as_str()?;
+    if !matches!(
+        kind,
+        "commandExecution"
+            | "command_execution"
+            | "CommandExecution"
+            | "mcpToolCall"
+            | "mcp_tool_call"
+            | "McpToolCall"
+            | "webSearch"
+            | "web_search"
+            | "WebSearch"
+            | "fileChange"
+            | "file_change"
+            | "FileChange"
+    ) {
+        return None;
+    }
+    if let Some(id) = item["id"].as_str() {
+        return Some(id.to_owned());
+    }
+    *unnamed = unnamed.saturating_add(1);
+    Some(format!("unnamed-investigation-{unnamed}"))
+}
+
+fn work_budget_pause(
+    admission: &StageAdmission,
+    work: StageWork,
+    mut evidence: Vec<String>,
+) -> Option<BudgetPause> {
+    let stage_investigations = admission
+        .stage_investigations_used
+        .saturating_add(work.investigations);
+    let record_investigations = admission
+        .record_investigations_used
+        .saturating_add(work.investigations);
+    let stage_context = admission
+        .stage_context_bytes_used
+        .saturating_add(work.context_bytes);
+    let record_context = admission
+        .record_context_bytes_used
+        .saturating_add(work.context_bytes);
+    evidence.push(format!(
+        "stage investigations {stage_investigations}/{}; record investigations {record_investigations}/{}; stage instruction bytes {stage_context}/{}; record instruction bytes {record_context}/{}",
+        admission.stage_investigations_limit,
+        admission.record_investigations_limit,
+        admission.stage_context_bytes_limit,
+        admission.record_context_bytes_limit
+    ));
+    let (limit, observed, allowed, missing_fact, continuation_choice) = if record_investigations
+        > admission.record_investigations_limit
+    {
+        (
+            BudgetLimit::RecordInvestigations,
+            record_investigations,
+            admission.record_investigations_limit,
+            "The accepted task exceeded its cumulative investigation allowance before the remaining source or accepted-work question could be established.",
+            "Raise max_investigations_per_record above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
+        )
+    } else if stage_investigations > admission.stage_investigations_limit {
+        (
+            BudgetLimit::StageInvestigations,
+            stage_investigations,
+            admission.stage_investigations_limit,
+            "The reflection stage exceeded its investigation allowance before the remaining source or accepted-work question could be established.",
+            "Raise max_investigations_per_stage (and the record allowance if needed) above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
+        )
+    } else if record_context > admission.record_context_bytes_limit {
+        (
+            BudgetLimit::RecordContextBytes,
+            record_context,
+            admission.record_context_bytes_limit,
+            "The accepted task exceeded its cumulative recorded instruction/context allowance before the supplied source context could be verified as complete.",
+            "Raise max_context_bytes_per_record above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
+        )
+    } else if stage_context > admission.stage_context_bytes_limit {
+        (
+            BudgetLimit::StageContextBytes,
+            stage_context,
+            admission.stage_context_bytes_limit,
+            "The stage exceeded its recorded instruction/context allowance before the supplied source context could be verified as complete.",
+            "Raise max_context_bytes_per_stage (and the record allowance if needed) above the observed value, reconcile unknown new-turn usage if prompted, and call retry_stage; or retain an explicit inconclusive outcome without another analysis.",
+        )
+    } else {
+        return None;
+    };
+    Some(BudgetPause {
+        limit,
+        observed,
+        allowed,
+        missing_fact: missing_fact.to_owned(),
+        continuation_choice: continuation_choice.to_owned(),
+        evidence,
+    })
+}
+
+/// Refuses a new fork when the admission snapshot already has no remaining
+/// allowance. The accepted-stage controller normally enforces this before
+/// writing an attempt; the manual chain path uses the same native signal.
+fn ensure_admission_available(admission: &StageAdmission) -> io::Result<()> {
+    let checks = [
+        (
+            "stage turn",
+            admission.stage_turns_used,
+            admission.stage_turns_limit,
+        ),
+        (
+            "stage token",
+            admission.stage_tokens_used,
+            admission.stage_tokens_limit,
+        ),
+        (
+            "accepted-record token",
+            admission.record_tokens_used,
+            admission.record_tokens_limit,
+        ),
+        (
+            "stage investigation",
+            admission.stage_investigations_used,
+            admission.stage_investigations_limit,
+        ),
+        (
+            "accepted-record investigation",
+            admission.record_investigations_used,
+            admission.record_investigations_limit,
+        ),
+        (
+            "stage supplied-context",
+            admission.stage_context_bytes_used,
+            admission.stage_context_bytes_limit,
+        ),
+        (
+            "accepted-record supplied-context",
+            admission.record_context_bytes_used,
+            admission.record_context_bytes_limit,
+        ),
+    ];
+    for (name, used, limit) in checks {
+        if used >= limit {
+            return Err(invalid(format!(
+                "{name} allowance is exhausted ({used}/{limit}); no fork or turn was requested"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn retain_completed(
     chain: &ChainState,
     conversation: &mut Conversation,
     mut state: StageState,
     fork_thread: &str,
     state_path: &Path,
+    admission: Option<&StageAdmission>,
 ) -> io::Result<StageState> {
     let turn = state
         .turn_id
@@ -2249,20 +2601,35 @@ fn retain_completed(
         }
     }
     let usage = retain_usage(&chain.codex_home, fork_thread, &turn);
-    state.usage = usage.usage;
-    state.usage_known = usage.known;
-    state.usage_unknown_reason = usage.unknown_reason;
-    state.matched_response_ids = usage.matched_response_ids;
-    state.copied_source_turns = usage.copied_source_turns;
-    state.cumulative_thread = usage.cumulative_thread;
-    state.coverage = usage.coverage;
-    state.rollout = usage.rollout;
+    apply_usage(&mut state, usage);
+    let mut evidence = vec![format!(
+        "exact new-turn rollout: {}",
+        state
+            .rollout
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not found".to_owned())
+    )];
+    evidence.push(format!(
+        "copied source turns retained as evidence, not newly charged: {}",
+        state.copied_source_turns.len()
+    ));
+    if let Some(pause) =
+        admission.and_then(|admission| work_budget_pause(admission, stage_work(&state), evidence))
+    {
+        state.status = StageStatus::BudgetPaused;
+        state.error = Some(pause.summary());
+        state.budget_pause = Some(pause);
+        state.updated_ms = now_ms();
+        persist(state_path, &state)?;
+        return Ok(state);
+    }
     state.status = StageStatus::Completed;
     state.error = None;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
     println!(
-        "{}: completed turn {} result={} usage={} copiedSourceTurns={} cumulativeRetained={}",
+        "{}: completed turn {} result={} usage={} investigations={} contextBytes={} copiedSourceTurns={} cumulativeRetained={}",
         state.stage,
         turn,
         state.result_state.as_deref().unwrap_or("unknown"),
@@ -2271,10 +2638,54 @@ fn retain_completed(
         } else {
             "unknown"
         },
+        state.work.investigations,
+        state.work.context_bytes,
         state.copied_source_turns.len(),
         state.cumulative_thread.is_some()
     );
     Ok(state)
+}
+
+fn apply_usage(state: &mut StageState, usage: UsageRetention) {
+    let source_context_bytes = state.source_context_bytes;
+    state.usage = usage.usage;
+    state.usage_known = usage.known;
+    state.usage_unknown_reason = usage.unknown_reason;
+    state.matched_response_ids = usage.matched_response_ids;
+    state.copied_source_turns = usage.copied_source_turns;
+    state.cumulative_thread = usage.cumulative_thread;
+    state.coverage = usage.coverage;
+    state.rollout = usage.rollout;
+    state.work = StageWork {
+        investigations: usage.work.investigations,
+        context_bytes: usage
+            .work
+            .context_bytes
+            .saturating_add(source_context_bytes),
+    };
+    state.work_known = usage.work_known;
+    state.work_unknown_reason = usage.work_unknown_reason;
+    state.context_basis = if source_context_bytes == 0 {
+        usage.context_basis
+    } else {
+        Some(match usage.context_basis {
+            Some(rollout) => format!("{FORK_CONTEXT_BASIS}; {rollout}"),
+            None => FORK_CONTEXT_BASIS.to_owned(),
+        })
+    };
+}
+
+fn record_bytes(record: &Value) -> io::Result<u64> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| invalid(format!("the fork record could not be measured: {error}")))?;
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+}
+
+fn zero_usage() -> Usage {
+    TOKEN_FIELDS
+        .iter()
+        .map(|field| ((*field).to_owned(), Some(0)))
+        .collect()
 }
 
 fn assistant_text(thread: &Value, turn_id: &str) -> RetainedResult {
@@ -2308,6 +2719,10 @@ struct UsageRetention {
     cumulative_thread: Option<Usage>,
     coverage: Option<Coverage>,
     rollout: Option<PathBuf>,
+    work: StageWork,
+    work_known: bool,
+    work_unknown_reason: Option<String>,
+    context_basis: Option<String>,
 }
 
 /// Retains only the exact new turn's recorded response deltas. A copied source
@@ -2316,12 +2731,16 @@ fn retain_usage(home: &Path, fork_thread: &str, turn: &str) -> UsageRetention {
     let unknown = |reason: String| UsageRetention {
         known: false,
         usage: rollout_reader::unknown_usage(),
-        unknown_reason: Some(reason),
+        unknown_reason: Some(reason.clone()),
         matched_response_ids: Vec::new(),
         copied_source_turns: Vec::new(),
         cumulative_thread: None,
         coverage: None,
         rollout: None,
+        work: StageWork::default(),
+        work_known: false,
+        work_unknown_reason: Some(reason),
+        context_basis: None,
     };
     let path = match wait_for_rollout(home, fork_thread, turn) {
         Ok(Some(path)) => path,
@@ -2352,6 +2771,8 @@ fn retain_usage(home: &Path, fork_thread: &str, turn: &str) -> UsageRetention {
         .filter(|id| id != turn)
         .collect();
     if matched.is_empty() {
+        let (work, work_known, work_unknown_reason, context_basis) =
+            work_from_summary(&summary, turn);
         return UsageRetention {
             known: false,
             usage: rollout_reader::unknown_usage(),
@@ -2366,6 +2787,10 @@ fn retain_usage(home: &Path, fork_thread: &str, turn: &str) -> UsageRetention {
                 .map(|snapshot| snapshot.usage.clone()),
             coverage: Some(summary.coverage),
             rollout: Some(path),
+            work,
+            work_known,
+            work_unknown_reason,
+            context_basis,
         };
     }
     let mut usage = BTreeMap::new();
@@ -2396,6 +2821,7 @@ fn retain_usage(home: &Path, fork_thread: &str, turn: &str) -> UsageRetention {
                 .last()
                 .map(|snapshot| snapshot.usage.clone())
         });
+    let (work, work_known, work_unknown_reason, context_basis) = work_from_summary(&summary, turn);
     UsageRetention {
         known: unknown_fields.is_empty(),
         usage,
@@ -2413,7 +2839,59 @@ fn retain_usage(home: &Path, fork_thread: &str, turn: &str) -> UsageRetention {
         cumulative_thread,
         coverage: Some(summary.coverage),
         rollout: Some(path),
+        work,
+        work_known,
+        work_unknown_reason,
+        context_basis,
     }
+}
+
+/// Extracts recorded per-turn investigations and recorded instruction bytes.
+/// The native rollout does not expose complete inherited source-context bytes,
+/// so this signal is bounded and explicitly labelled rather than estimated.
+fn work_from_summary(
+    summary: &rollout_reader::SessionSummary,
+    turn: &str,
+) -> (StageWork, bool, Option<String>, Option<String>) {
+    let investigations = summary
+        .lifecycles
+        .iter()
+        .filter(|item| item.turn_id.as_deref() == Some(turn))
+        .filter(|item| matches!(item.kind.as_str(), "command" | "tool"))
+        .map(|item| item.id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    let context_bytes = summary
+        .instructions
+        .base_bytes
+        .saturating_add(summary.instructions.developer_bytes);
+    let structural_unknown = summary.coverage.corrupt_lines > 0
+        || summary.coverage.oversized_lines > 0
+        || [
+            "invalid_event",
+            "invalid_event_type",
+            "invalid_payload",
+            "unreadable_input",
+            "corrupt_jsonl",
+            "oversized_jsonl_record",
+        ]
+        .iter()
+        .any(|code| summary.warnings.contains(*code));
+    let reason = structural_unknown.then(|| {
+        format!(
+            "the native rollout did not completely expose investigation/context records: warnings={:?}, corruptLines={}, oversizedLines={}",
+            summary.warnings, summary.coverage.corrupt_lines, summary.coverage.oversized_lines
+        )
+    });
+    (
+        StageWork {
+            investigations,
+            context_bytes,
+        },
+        !structural_unknown,
+        reason,
+        Some(CONTEXT_WORK_BASIS.to_owned()),
+    )
 }
 
 fn wait_for_rollout(home: &Path, thread: &str, turn: &str) -> io::Result<Option<PathBuf>> {
@@ -2751,6 +3229,7 @@ fn status_name(status: StageStatus) -> &'static str {
         StageStatus::Failed => "failed",
         StageStatus::Interrupted => "interrupted",
         StageStatus::VisibilityLost => "visibility-lost",
+        StageStatus::BudgetPaused => "budget-paused",
         StageStatus::Unknown => "unknown",
     }
 }

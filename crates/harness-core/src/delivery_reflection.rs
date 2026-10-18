@@ -366,6 +366,21 @@ fn default_max_tokens_per_stage() -> u64 {
 fn default_max_tokens_per_record() -> u64 {
     200_000
 }
+fn default_max_investigations_per_stage() -> u64 {
+    64
+}
+fn default_max_investigations_per_record() -> u64 {
+    128
+}
+fn default_max_context_bytes_per_stage() -> u64 {
+    1024 * 1024
+}
+fn default_max_context_bytes_per_record() -> u64 {
+    2 * 1024 * 1024
+}
+fn default_reconciled() -> bool {
+    true
+}
 fn default_max_events_per_poll() -> u32 {
     500
 }
@@ -378,6 +393,10 @@ pub struct ReflectionLimits {
     pub max_turns_per_stage: u64,
     pub max_tokens_per_stage: u64,
     pub max_tokens_per_record: u64,
+    pub max_investigations_per_stage: u64,
+    pub max_investigations_per_record: u64,
+    pub max_context_bytes_per_stage: u64,
+    pub max_context_bytes_per_record: u64,
     pub max_events_per_poll: u32,
 }
 
@@ -389,6 +408,10 @@ impl Default for ReflectionLimits {
             max_turns_per_stage: default_max_turns_per_stage(),
             max_tokens_per_stage: default_max_tokens_per_stage(),
             max_tokens_per_record: default_max_tokens_per_record(),
+            max_investigations_per_stage: default_max_investigations_per_stage(),
+            max_investigations_per_record: default_max_investigations_per_record(),
+            max_context_bytes_per_stage: default_max_context_bytes_per_stage(),
+            max_context_bytes_per_record: default_max_context_bytes_per_record(),
             max_events_per_poll: default_max_events_per_poll(),
         }
     }
@@ -421,6 +444,32 @@ impl ReflectionLimits {
         {
             return Err(invalid(
                 "reflection max_tokens_per_record must cover one stage and be at most 20000000",
+            ));
+        }
+        if self.max_investigations_per_stage == 0 || self.max_investigations_per_stage > 10_000 {
+            return Err(invalid(
+                "reflection max_investigations_per_stage must be between 1 and 10000",
+            ));
+        }
+        if self.max_investigations_per_record < self.max_investigations_per_stage
+            || self.max_investigations_per_record > 20_000
+        {
+            return Err(invalid(
+                "reflection max_investigations_per_record must cover one stage and be at most 20000",
+            ));
+        }
+        if self.max_context_bytes_per_stage == 0
+            || self.max_context_bytes_per_stage > 64 * 1024 * 1024
+        {
+            return Err(invalid(
+                "reflection max_context_bytes_per_stage must be between 1 and 67108864",
+            ));
+        }
+        if self.max_context_bytes_per_record < self.max_context_bytes_per_stage
+            || self.max_context_bytes_per_record > 128 * 1024 * 1024
+        {
+            return Err(invalid(
+                "reflection max_context_bytes_per_record must cover one stage and be at most 134217728",
             ));
         }
         if self.max_events_per_poll == 0 || self.max_events_per_poll > 5_000 {
@@ -470,6 +519,8 @@ pub struct StageUsage {
     pub attempts: u32,
     pub turns: u64,
     pub tokens: u64,
+    pub investigations: u64,
+    pub context_bytes: u64,
     pub last_error: Option<String>,
 }
 
@@ -480,12 +531,120 @@ pub struct UsageDelta {
     pub tokens: u64,
 }
 
+/// Work observed by native stage signals that is not a token counter. It is
+/// recorded beside token usage and is never replaced by an estimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StageWork {
+    pub investigations: u64,
+    pub context_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UsageTotals {
     pub attempts: u32,
     pub turns: u64,
     pub tokens: u64,
+    pub investigations: u64,
+    pub context_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetLimit {
+    StageAttempts,
+    StageTurns,
+    StageTokens,
+    RecordTokens,
+    StageInvestigations,
+    RecordInvestigations,
+    StageContextBytes,
+    RecordContextBytes,
+}
+
+impl BudgetLimit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StageAttempts => "stage_attempts",
+            Self::StageTurns => "stage_turns",
+            Self::StageTokens => "stage_tokens",
+            Self::RecordTokens => "record_tokens",
+            Self::StageInvestigations => "stage_investigations",
+            Self::RecordInvestigations => "record_investigations",
+            Self::StageContextBytes => "stage_context_bytes",
+            Self::RecordContextBytes => "record_context_bytes",
+        }
+    }
+
+    fn configured(self, limits: &ReflectionLimits) -> u64 {
+        match self {
+            Self::StageAttempts => u64::from(limits.max_attempts_per_stage),
+            Self::StageTurns => limits.max_turns_per_stage,
+            Self::StageTokens => limits.max_tokens_per_stage,
+            Self::RecordTokens => limits.max_tokens_per_record,
+            Self::StageInvestigations => limits.max_investigations_per_stage,
+            Self::RecordInvestigations => limits.max_investigations_per_record,
+            Self::StageContextBytes => limits.max_context_bytes_per_stage,
+            Self::RecordContextBytes => limits.max_context_bytes_per_record,
+        }
+    }
+}
+
+/// A work stoppage caused by a configured allowance. The record remains
+/// inspectable and the prior usage stays charged; retrying requires the named
+/// allowance to be raised above the observed value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BudgetPause {
+    pub limit: BudgetLimit,
+    pub observed: u64,
+    pub allowed: u64,
+    pub missing_fact: String,
+    pub continuation_choice: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+impl BudgetPause {
+    fn validate(&self) -> io::Result<()> {
+        if self.allowed == 0 || self.observed <= self.allowed {
+            return Err(invalid(
+                "a reflection budget pause must record an observed value above a nonzero allowance",
+            ));
+        }
+        bounded_text(
+            "budget pause missing fact",
+            &self.missing_fact,
+            MAX_TEXT_BYTES,
+        )?;
+        bounded_text(
+            "budget pause continuation",
+            &self.continuation_choice,
+            MAX_TEXT_BYTES,
+        )?;
+        if self.evidence.len() > MAX_COVERAGE_ITEMS {
+            return Err(invalid(&format!(
+                "budget pause has {} evidence items; the limit is {MAX_COVERAGE_ITEMS}",
+                self.evidence.len()
+            )));
+        }
+        for item in &self.evidence {
+            bounded_text("budget pause evidence", item, MAX_TEXT_BYTES)?;
+        }
+        Ok(())
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "budget pause: {} observed {} exceeds allowed {}; missing fact: {}; continuation: {}",
+            self.limit.as_str(),
+            self.observed,
+            self.allowed,
+            self.missing_fact,
+            self.continuation_choice
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +675,13 @@ pub struct StageRecord {
     pub usage: StageUsage,
     pub outcome: Option<StageOutcome>,
     pub usage_reconciled: bool,
+    /// Investigation and supplied-context work is reconciled separately from
+    /// token usage. Older records without this field predate split work
+    /// reconciliation and remain recoverable as reconciled.
+    #[serde(default = "default_reconciled")]
+    pub work_reconciled: bool,
+    #[serde(default)]
+    pub pause: Option<BudgetPause>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,9 +713,31 @@ pub struct ReflectionRecord {
 impl ReflectionRecord {
     pub fn usage_totals(&self) -> UsageTotals {
         UsageTotals {
-            attempts: self.executor.usage.attempts + self.lead.usage.attempts,
-            turns: self.executor.usage.turns + self.lead.usage.turns,
-            tokens: self.executor.usage.tokens + self.lead.usage.tokens,
+            attempts: self
+                .executor
+                .usage
+                .attempts
+                .saturating_add(self.lead.usage.attempts),
+            turns: self
+                .executor
+                .usage
+                .turns
+                .saturating_add(self.lead.usage.turns),
+            tokens: self
+                .executor
+                .usage
+                .tokens
+                .saturating_add(self.lead.usage.tokens),
+            investigations: self
+                .executor
+                .usage
+                .investigations
+                .saturating_add(self.lead.usage.investigations),
+            context_bytes: self
+                .executor
+                .usage
+                .context_bytes
+                .saturating_add(self.lead.usage.context_bytes),
         }
     }
 }
@@ -733,7 +921,50 @@ pub struct StageStart {
     pub executor_turn: Option<String>,
     pub lead_turn: Option<String>,
     pub usage: StageUsage,
+    pub admission: StageAdmission,
     pub remaining_tokens: u64,
+}
+
+/// The cumulative allowance state visible before a new native stage attempt.
+/// Native enforcement uses both the stage and accepted-record counters so a
+/// tool or context overrun cannot wait for a later admission check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StageAdmission {
+    pub stage_turns_used: u64,
+    pub stage_turns_limit: u64,
+    pub stage_tokens_used: u64,
+    pub stage_tokens_limit: u64,
+    pub stage_investigations_used: u64,
+    pub stage_investigations_limit: u64,
+    pub stage_context_bytes_used: u64,
+    pub stage_context_bytes_limit: u64,
+    pub record_investigations_used: u64,
+    pub record_investigations_limit: u64,
+    pub record_context_bytes_used: u64,
+    pub record_context_bytes_limit: u64,
+    pub record_tokens_used: u64,
+    pub record_tokens_limit: u64,
+}
+
+impl StageAdmission {
+    pub fn new(limits: &ReflectionLimits, stage: &StageUsage, record: &UsageTotals) -> Self {
+        Self {
+            stage_turns_used: stage.turns,
+            stage_turns_limit: limits.max_turns_per_stage,
+            stage_tokens_used: stage.tokens,
+            stage_tokens_limit: limits.max_tokens_per_stage,
+            stage_investigations_used: stage.investigations,
+            stage_investigations_limit: limits.max_investigations_per_stage,
+            stage_context_bytes_used: stage.context_bytes,
+            stage_context_bytes_limit: limits.max_context_bytes_per_stage,
+            record_investigations_used: record.investigations,
+            record_investigations_limit: limits.max_investigations_per_record,
+            record_context_bytes_used: record.context_bytes,
+            record_context_bytes_limit: limits.max_context_bytes_per_record,
+            record_tokens_used: record.tokens,
+            record_tokens_limit: limits.max_tokens_per_record,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1765,7 +1996,8 @@ impl ReflectionController {
             .records
             .get_mut(acceptance_id)
             .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
-        let record_tokens = record.usage_totals().tokens;
+        let record_totals = record.usage_totals();
+        let record_tokens = record_totals.tokens;
         let remaining_tokens = limits.max_tokens_per_record.saturating_sub(record_tokens);
         let slot = match stage {
             Stage::Executor => {
@@ -1788,6 +2020,11 @@ impl ReflectionController {
                         "lead reflection is ineligible until the executor stage's new-turn usage is reconciled; record the measured or explicitly unknown cost first",
                     ));
                 }
+                if !record.executor.work_reconciled {
+                    return Err(conflict(
+                        "lead reflection is ineligible until the executor stage's observed investigation/context work is reconciled; record the measured work first",
+                    ));
+                }
                 if record.lead.state != StageState::Pending
                     || record.delivery == DeliveryState::Consumed
                 {
@@ -1799,6 +2036,13 @@ impl ReflectionController {
                 &mut record.lead
             }
         };
+        if let Some(pause) = &slot.pause {
+            return Err(conflict(&format!(
+                "{} reflection remains paused; configure the named allowance above the observed value, reconcile usage, and call retry_stage before another attempt: {}",
+                stage.as_str(),
+                pause.summary()
+            )));
+        }
         if slot.usage.attempts >= limits.max_attempts_per_stage {
             return Err(conflict(&format!(
                 "{} reflection exceeded its {} attempt allowance",
@@ -1826,9 +2070,37 @@ impl ReflectionController {
                 limits.max_tokens_per_record
             )));
         }
+        if slot.usage.investigations >= limits.max_investigations_per_stage {
+            return Err(conflict(&format!(
+                "{} reflection reached its {} investigation allowance",
+                stage.as_str(),
+                limits.max_investigations_per_stage
+            )));
+        }
+        if record_totals.investigations >= limits.max_investigations_per_record {
+            return Err(conflict(&format!(
+                "accepted task reached its {} investigation allowance across both stages",
+                limits.max_investigations_per_record
+            )));
+        }
+        if slot.usage.context_bytes >= limits.max_context_bytes_per_stage {
+            return Err(conflict(&format!(
+                "{} reflection reached its {} supplied-context byte allowance",
+                stage.as_str(),
+                limits.max_context_bytes_per_stage
+            )));
+        }
+        if record_totals.context_bytes >= limits.max_context_bytes_per_record {
+            return Err(conflict(&format!(
+                "accepted task reached its {} supplied-context byte allowance across both stages",
+                limits.max_context_bytes_per_record
+            )));
+        }
+        let admission = StageAdmission::new(&limits, &slot.usage, &record_totals);
         slot.usage.attempts = slot.usage.attempts.saturating_add(1);
         slot.state = StageState::InFlight;
         slot.usage_reconciled = false;
+        slot.work_reconciled = false;
         let source_sessions = match stage {
             Stage::Executor => record.binding.executor_sessions.clone(),
             Stage::Lead => vec![state.binding.lead_session.clone()],
@@ -1843,6 +2115,7 @@ impl ReflectionController {
             executor_turn: record.binding.executor_turn.clone(),
             lead_turn: record.binding.lead_turn.clone(),
             usage: slot.usage.clone(),
+            admission,
             remaining_tokens,
         };
         self.write_state_at(&path, &state)?;
@@ -1853,10 +2126,57 @@ impl ReflectionController {
         &self,
         acceptance_id: &str,
         stage: Stage,
-        mut outcome: StageOutcome,
+        outcome: StageOutcome,
         usage: UsageDelta,
     ) -> io::Result<StageReceipt> {
+        self.retain_stage_with_work(acceptance_id, stage, outcome, usage, StageWork::default())
+    }
+
+    /// Retains a completed stage together with its observed investigation and
+    /// supplied-context work. Prior attempts remain charged.
+    pub fn retain_stage_with_work(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        outcome: StageOutcome,
+        usage: UsageDelta,
+        work: StageWork,
+    ) -> io::Result<StageReceipt> {
+        self.retain_stage_with_work_reconciliation(
+            acceptance_id,
+            stage,
+            outcome,
+            usage,
+            true,
+            work,
+            true,
+            "",
+        )
+    }
+
+    /// Retains a completed stage with explicit token and observed-work
+    /// reconciliation state. A result may be retained while one dimension is
+    /// still unknown, but dependent stages remain closed until both are
+    /// recorded without estimates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain_stage_with_work_reconciliation(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        mut outcome: StageOutcome,
+        usage: UsageDelta,
+        usage_reconciled: bool,
+        work: StageWork,
+        work_reconciled: bool,
+        detail: impl Into<String>,
+    ) -> io::Result<StageReceipt> {
         normalize_outcome(&mut outcome)?;
+        let detail = detail.into();
+        let detail = if detail.trim().is_empty() {
+            None
+        } else {
+            Some(bounded_text("usage uncertainty", &detail, MAX_TEXT_BYTES)?)
+        };
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;
         let mut state = self.active_state(&path)?;
@@ -1873,11 +2193,13 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            add_usage(slot, usage);
+            add_usage(slot, usage, work);
             slot.state = StageState::Retained;
-            slot.usage.last_error = None;
-            slot.usage_reconciled = true;
+            slot.usage.last_error = detail;
+            slot.usage_reconciled = usage_reconciled;
+            slot.work_reconciled = work_reconciled;
             slot.outcome = Some(outcome);
+            slot.pause = None;
             if stage == Stage::Lead {
                 record.delivery = DeliveryState::Pending;
             }
@@ -1901,46 +2223,42 @@ impl ReflectionController {
         &self,
         acceptance_id: &str,
         stage: Stage,
-        mut outcome: StageOutcome,
+        outcome: StageOutcome,
         usage: UsageDelta,
         detail: impl Into<String>,
     ) -> io::Result<StageReceipt> {
-        normalize_outcome(&mut outcome)?;
-        let detail = bounded_text("usage uncertainty", &detail.into(), MAX_TEXT_BYTES)?;
-        let path = self.state_path(&self.current_source()?);
-        let _lock = self.lock(&path)?;
-        let mut state = self.active_state(&path)?;
-        let (record_tokens, next_stage_eligible) = {
-            let record = state
-                .records
-                .get_mut(acceptance_id)
-                .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
-            let slot = stage_slot(record, stage);
-            if slot.state != StageState::InFlight {
-                return Err(conflict(&format!(
-                    "{} reflection is {:?}, not in flight",
-                    stage.as_str(),
-                    slot.state
-                )));
-            }
-            add_usage(slot, usage);
-            slot.state = StageState::Retained;
-            slot.usage.last_error = Some(detail);
-            slot.usage_reconciled = false;
-            slot.outcome = Some(outcome);
-            if stage == Stage::Lead {
-                record.delivery = DeliveryState::Pending;
-            }
-            let record_tokens = record.usage_totals().tokens;
-            let next = lead_stage_eligible(record);
-            (record_tokens, next)
-        };
-        let receipt = {
-            let record = &state.records[acceptance_id];
-            stage_receipt(record, stage, next_stage_eligible, record_tokens)
-        };
-        self.write_state_at(&path, &state)?;
-        Ok(receipt)
+        self.retain_stage_unreconciled_with_work(
+            acceptance_id,
+            stage,
+            outcome,
+            usage,
+            StageWork::default(),
+            true,
+            detail,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain_stage_unreconciled_with_work(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        outcome: StageOutcome,
+        usage: UsageDelta,
+        work: StageWork,
+        work_reconciled: bool,
+        detail: impl Into<String>,
+    ) -> io::Result<StageReceipt> {
+        self.retain_stage_with_work_reconciliation(
+            acceptance_id,
+            stage,
+            outcome,
+            usage,
+            false,
+            work,
+            work_reconciled,
+            detail,
+        )
     }
 
     pub fn fail_stage(
@@ -1967,11 +2285,79 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            add_usage(slot, usage);
+            add_usage(slot, usage, StageWork::default());
             slot.state = StageState::Blocked;
             slot.usage.last_error = Some(error);
             slot.usage_reconciled = true;
+            slot.work_reconciled = true;
             slot.outcome = None;
+            slot.pause = None;
+            record.usage_totals().tokens
+        };
+        let receipt = {
+            let record = &state.records[acceptance_id];
+            stage_receipt(record, stage, false, record_tokens)
+        };
+        self.write_state_at(&path, &state)?;
+        Ok(receipt)
+    }
+
+    /// Stops one in-flight stage on a configured allowance. The observed work
+    /// and any exact token delta remain charged. If token usage is not known,
+    /// the pause stays unreconciled and blocks all dependent admission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pause_stage(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        pause: BudgetPause,
+        usage: UsageDelta,
+        work: StageWork,
+        usage_reconciled: bool,
+        work_reconciled: bool,
+        usage_unknown_reason: Option<&str>,
+        work_unknown_reason: Option<&str>,
+    ) -> io::Result<StageReceipt> {
+        pause.validate()?;
+        let mut detail = pause.summary();
+        if !usage_reconciled {
+            let reason =
+                usage_unknown_reason.unwrap_or("the exact new-turn token usage is unavailable");
+            detail.push_str(&format!(
+                "; token usage remains unreconciled and blocks dependent work: {reason}"
+            ));
+        }
+        if !work_reconciled {
+            let reason = work_unknown_reason
+                .unwrap_or("the observed investigation and supplied-context work is unavailable");
+            detail.push_str(&format!(
+                "; observed work remains unreconciled and blocks dependent work: {reason}"
+            ));
+        }
+        let detail = bounded_text("budget pause detail", &detail, MAX_TEXT_BYTES)?;
+        let path = self.state_path(&self.current_source()?);
+        let _lock = self.lock(&path)?;
+        let mut state = self.active_state(&path)?;
+        let record_tokens = {
+            let record = state
+                .records
+                .get_mut(acceptance_id)
+                .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
+            let slot = stage_slot(record, stage);
+            if slot.state != StageState::InFlight {
+                return Err(conflict(&format!(
+                    "{} reflection is {:?}, not in flight",
+                    stage.as_str(),
+                    slot.state
+                )));
+            }
+            add_usage(slot, usage, work);
+            slot.state = StageState::Blocked;
+            slot.usage.last_error = Some(detail);
+            slot.usage_reconciled = usage_reconciled;
+            slot.work_reconciled = work_reconciled;
+            slot.outcome = None;
+            slot.pause = Some(pause);
             record.usage_totals().tokens
         };
         let receipt = {
@@ -2000,6 +2386,28 @@ impl ReflectionController {
         error: impl Into<String>,
         usage: UsageDelta,
     ) -> io::Result<StageReceipt> {
+        self.mark_stage_unknown_with_work_and_usage(
+            acceptance_id,
+            stage,
+            error,
+            usage,
+            StageWork::default(),
+            true,
+        )
+    }
+
+    /// Marks one stage unknown with both its submitted token delta and any
+    /// measured investigation/context work. Token usage remains
+    /// unreconciled; work is reconciled only when the caller measured it.
+    pub fn mark_stage_unknown_with_work_and_usage(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        error: impl Into<String>,
+        usage: UsageDelta,
+        work: StageWork,
+        work_reconciled: bool,
+    ) -> io::Result<StageReceipt> {
         let error = bounded_text("stage uncertainty", &error.into(), MAX_TEXT_BYTES)?;
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;
@@ -2017,10 +2425,11 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            add_usage(slot, usage);
+            add_usage(slot, usage, work);
             slot.state = StageState::Unknown;
             slot.usage.last_error = Some(error);
             slot.usage_reconciled = false;
+            slot.work_reconciled = work_reconciled;
             record.usage_totals().tokens
         };
         let receipt = {
@@ -2047,7 +2456,10 @@ impl ReflectionController {
                 .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
             let slot = stage_slot(record, stage);
             let reconcilable = slot.state == StageState::Unknown
-                || (slot.state == StageState::Retained && !slot.usage_reconciled);
+                || (slot.state == StageState::Retained && !slot.usage_reconciled)
+                || (slot.state == StageState::Blocked
+                    && slot.pause.is_some()
+                    && !slot.usage_reconciled);
             if !reconcilable {
                 return Err(conflict(&format!(
                     "{} reflection is {:?} with usage reconciled {}, not unknown or retained-unreconciled",
@@ -2056,8 +2468,58 @@ impl ReflectionController {
                     slot.usage_reconciled
                 )));
             }
-            add_usage(slot, usage);
+            add_usage(slot, usage, StageWork::default());
             slot.usage_reconciled = true;
+            if slot.work_reconciled {
+                slot.usage.last_error = None;
+            }
+            let record_tokens = record.usage_totals().tokens;
+            let next = stage == Stage::Executor && lead_stage_eligible(record);
+            (record_tokens, next)
+        };
+        let receipt = {
+            let record = &state.records[acceptance_id];
+            stage_receipt(record, stage, next_stage_eligible, record_tokens)
+        };
+        self.write_state_at(&path, &state)?;
+        Ok(receipt)
+    }
+
+    /// Records measured investigation and supplied-context work for a stage
+    /// whose work signal was incomplete. Pass only observed values, never an
+    /// estimate. Token reconciliation remains a separate requirement.
+    pub fn record_observed_work(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        work: StageWork,
+    ) -> io::Result<StageReceipt> {
+        let path = self.state_path(&self.current_source()?);
+        let _lock = self.lock(&path)?;
+        let mut state = self.active_state(&path)?;
+        let (record_tokens, next_stage_eligible) = {
+            let record = state
+                .records
+                .get_mut(acceptance_id)
+                .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
+            let slot = stage_slot(record, stage);
+            let reconcilable = !slot.work_reconciled
+                && (slot.state == StageState::Unknown
+                    || slot.state == StageState::Retained
+                    || (slot.state == StageState::Blocked && slot.pause.is_some()));
+            if !reconcilable {
+                return Err(conflict(&format!(
+                    "{} reflection is {:?} with observed work already reconciled {}; no additional work was charged",
+                    stage.as_str(),
+                    slot.state,
+                    slot.work_reconciled
+                )));
+            }
+            add_usage(slot, UsageDelta::default(), work);
+            slot.work_reconciled = true;
+            if slot.usage_reconciled {
+                slot.usage.last_error = None;
+            }
             let record_tokens = record.usage_totals().tokens;
             let next = stage == Stage::Executor && lead_stage_eligible(record);
             (record_tokens, next)
@@ -2074,7 +2536,8 @@ impl ReflectionController {
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;
         let mut state = self.active_state(&path)?;
-        let max_attempts = state.limits.max_attempts_per_stage;
+        let limits = state.limits.clone();
+        let max_attempts = limits.max_attempts_per_stage;
         let record_tokens = {
             let record = state
                 .records
@@ -2093,6 +2556,38 @@ impl ReflectionController {
                     "the unknown stage outcome must have its usage reconciled with record_unknown_usage before retry",
                 ));
             }
+            if slot.state == StageState::Unknown && !slot.work_reconciled {
+                return Err(conflict(
+                    "the unknown stage's observed investigation/context work must be reconciled with record_observed_work before retry",
+                ));
+            }
+            if slot.state == StageState::Blocked {
+                let pause = slot.pause.as_ref().ok_or_else(|| {
+                    conflict(&format!(
+                        "{} reflection is blocked without a retained budget pause; reconcile its cause before retry",
+                        stage.as_str()
+                    ))
+                })?;
+                if !slot.usage_reconciled {
+                    return Err(conflict(
+                        "the paused stage's new-turn usage must be reconciled with record_unknown_usage before retry",
+                    ));
+                }
+                if !slot.work_reconciled {
+                    return Err(conflict(
+                        "the paused stage's observed investigation/context work must be reconciled with record_observed_work before retry",
+                    ));
+                }
+                let configured = pause.limit.configured(&limits);
+                if configured <= pause.observed {
+                    return Err(conflict(&format!(
+                        "{} reflection remains paused at {} observed {}; configure that allowance above the observed value before retry",
+                        stage.as_str(),
+                        pause.limit.as_str(),
+                        pause.observed
+                    )));
+                }
+            }
             if slot.usage.attempts >= max_attempts {
                 return Err(conflict(&format!(
                     "{} reflection reached its {max_attempts} attempt allowance",
@@ -2101,6 +2596,8 @@ impl ReflectionController {
             }
             slot.state = StageState::Pending;
             slot.outcome = None;
+            slot.pause = None;
+            slot.usage.last_error = None;
             record.usage_totals().tokens
         };
         let receipt = {
@@ -2646,9 +3143,14 @@ fn stage_slot(record: &mut ReflectionRecord, stage: Stage) -> &mut StageRecord {
     }
 }
 
-fn add_usage(slot: &mut StageRecord, usage: UsageDelta) {
+fn add_usage(slot: &mut StageRecord, usage: UsageDelta, work: StageWork) {
     slot.usage.turns = slot.usage.turns.saturating_add(usage.turns);
     slot.usage.tokens = slot.usage.tokens.saturating_add(usage.tokens);
+    slot.usage.investigations = slot
+        .usage
+        .investigations
+        .saturating_add(work.investigations);
+    slot.usage.context_bytes = slot.usage.context_bytes.saturating_add(work.context_bytes);
 }
 
 fn normalize_outcome(outcome: &mut StageOutcome) -> io::Result<()> {
@@ -2680,6 +3182,7 @@ fn normalize_outcome(outcome: &mut StageOutcome) -> io::Result<()> {
 fn lead_stage_eligible(record: &ReflectionRecord) -> bool {
     record.executor.state == StageState::Retained
         && record.executor.usage_reconciled
+        && record.executor.work_reconciled
         && record.lead.state == StageState::Pending
         && record.delivery != DeliveryState::Consumed
 }
