@@ -2119,12 +2119,6 @@ mod native {
             first.0,
             "the first session did not start its payload: {detail}"
         );
-        for field in ["cpu", "aggregate", "lifecycle"] {
-            assert_eq!(
-                first.1[field], true,
-                "first left its required {field} job: {detail}"
-            );
-        }
         if permit_caller_breakaway {
             assert!(
                 second.0,
@@ -2138,6 +2132,12 @@ mod native {
                 );
             }
             for (label, ready) in [("first", &first.1), ("second", &second.1)] {
+                for field in ["cpu", "aggregate", "lifecycle"] {
+                    assert_eq!(
+                        ready[field], true,
+                        "{label} left its required {field} job: {detail}"
+                    );
+                }
                 assert_eq!(
                     ready["session"], false,
                     "{label} stayed in the caller branch: {detail}"
@@ -2190,6 +2190,12 @@ mod native {
                 (StopReason::Exited, 17, 17),
                 "the rejected second worker did not fail closed: {detail}"
             );
+            for field in ["cpu", "aggregate", "lifecycle"] {
+                assert_eq!(
+                    first.1[field], true,
+                    "first left its required {field} job: {detail}"
+                );
+            }
             assert_eq!(first.1["session"], true, "{detail}");
             assert_eq!(first.1["caller_session"], true, "{detail}");
             let final_one = wait_for_json(&final_one);
