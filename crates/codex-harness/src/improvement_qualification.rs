@@ -9,7 +9,7 @@ use super::*;
 use harness_core::improvement_experiment::{ArmBinding, prepare_home, prepare_variant};
 use harness_core::improvement_loop::{
     BaselineQualificationInputs, BaselineQualificationState, QualificationBindingIdentity,
-    WorkflowParticipant,
+    SemanticReviewState, WorkflowParticipant,
 };
 use harness_core::improvement_runtime::{self, ArmRequest, ArmRuntime};
 use harness_core::task_worktree::{self, FrozenCopy};
@@ -1712,6 +1712,28 @@ struct FrozenReviewPacket {
     action_gap: Option<String>,
 }
 
+struct ReviewPacketPlan {
+    files: Vec<(assessment::ReviewFileIdentity, Vec<u8>)>,
+    action_gap: Option<String>,
+}
+
+fn review_packet_is_bound(review: &SemanticReviewState) -> bool {
+    review.source.is_some()
+        || review.manifest.is_some()
+        || review.manifest_sha256.is_some()
+        || review.submission_revision.is_some()
+        || review.review_revision.is_some()
+        || review.participant.is_some()
+        || review.initial_attempt.is_some()
+        || review.correction_attempt.is_some()
+        || review.correction_used
+        || review.judgment.is_some()
+        || review.judgment_sha256.is_some()
+        || review.judgment_kind.is_some()
+        || review.findings.is_some()
+        || review.unresolved_issues.is_some()
+}
+
 /// Freeze the reviewer's exact visible inputs after the final executor result
 /// and lead acceptance. The packet is one committed minimal repository: the
 /// frozen task and criteria, the submitted result, bounded action evidence,
@@ -1728,7 +1750,6 @@ fn ensure_review_packet(
     let root = run.store.root().join("baseline-qualification/reviewer");
     let source = root.join("source");
     let manifest = source.join("manifest.json");
-    let run_id = format!("{}-semantic-review", run.spec.run);
     let report_sha256 = build_identity::hash_file(report)?;
     let mut review = state.semantic_review.take().unwrap_or_default();
     if let Some(recorded) = &review.source
@@ -1738,17 +1759,29 @@ fn ensure_review_packet(
             "the retained semantic review packet source changed; preserve it instead of repointing the reviewer",
         ));
     }
-    if !source.exists()
-        && (review.source.is_some()
-            || review.initial_attempt.is_some()
-            || review.manifest.is_some())
-    {
+    let source_metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(invalid(format!(
+                "the retained semantic review packet source {} could not be inspected: {error}",
+                source.display()
+            )));
+        }
+    };
+    if source_metadata.is_none() && review_packet_is_bound(&review) {
         return Err(invalid(format!(
             "the retained semantic review packet at {} is missing; preserve the run and recover its exact committed packet before another reviewer turn",
             source.display()
         )));
     }
-    if source.exists() {
+    let action_gap = if let Some(metadata) = source_metadata {
+        if !metadata.file_type().is_dir() {
+            return Err(invalid(format!(
+                "the retained semantic review packet source {} is not an ordinary directory",
+                source.display()
+            )));
+        }
         if let Some(recorded) = &review.manifest
             && recorded != &manifest
         {
@@ -1756,149 +1789,80 @@ fn ensure_review_packet(
                 "the retained semantic review manifest changed; preserve it instead of repointing the reviewer",
             ));
         }
-        let (value, files) = assessment::load_packet(&source, &manifest)?;
-        verify_review_packet(
+        let manifest_metadata = match fs::symlink_metadata(&manifest) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(invalid(format!(
+                    "the retained semantic review manifest {} could not be inspected: {error}",
+                    manifest.display()
+                )));
+            }
+        };
+        if manifest_metadata.is_some() {
+            let (value, files) = assessment::load_packet(&source, &manifest)?;
+            verify_review_packet(
+                run,
+                inputs,
+                state,
+                declaration,
+                solution,
+                report_sha256.as_str(),
+                &source,
+                &manifest,
+                review.manifest_sha256.as_deref(),
+                &value,
+                &files,
+            )?;
+            let manifest_sha256 = build_identity::hash_file(&manifest)?;
+            let actions = review_actions_from(&files)?;
+            let action_gap = action_gap(&actions);
+            review.source = Some(source.clone());
+            review.manifest = Some(manifest.clone());
+            review.manifest_sha256 = Some(manifest_sha256.clone());
+            review.submission_revision = Some(value.submission_revision.clone());
+            review.review_revision = Some(revision_of(&source)?);
+            state.semantic_review = Some(review);
+            persist(run, state)?;
+            return Ok(FrozenReviewPacket {
+                run_id: value.run_id,
+                files,
+                action_gap,
+            });
+        }
+        ensure_review_preparation_recoverable(run, &review, &source)?;
+        let plan = plan_review_packet(
             run,
             inputs,
             state,
             declaration,
             solution,
+            report,
             report_sha256.as_str(),
-            &source,
-            &manifest,
-            review.manifest_sha256.as_deref(),
-            &value,
-            &files,
         )?;
-        let manifest_sha256 = build_identity::hash_file(&manifest)?;
-        let actions = review_actions_from(&files)?;
-        let action_gap = action_gap(&actions);
-        review.source = Some(source.clone());
-        review.manifest = Some(manifest.clone());
-        review.manifest_sha256 = Some(manifest_sha256.clone());
-        review.submission_revision = Some(value.submission_revision.clone());
-        review.review_revision = Some(revision_of(&source)?);
-        state.semantic_review = Some(review);
-        persist(run, state)?;
-        return Ok(FrozenReviewPacket {
-            run_id: value.run_id,
-            files,
-            action_gap,
-        });
-    }
-    if root.exists() && !root.is_dir() {
-        return Err(invalid(
-            "the semantic review preparation root is not a directory",
-        ));
-    }
-    fs::create_dir_all(&root)?;
-    fs::create_dir_all(&source)?;
-    accounting::git(&source, &["init", "-q", "--initial-branch=main"]).map_err(invalid)?;
-    // The shared continuation owner reads the bound checkout's configured
-    // upstream before it resumes an exact reviewer session. The packet is
-    // deliberately independent, so its only origin is the packet itself: a
-    // same-reviewer correction can bind and reaffirm the frozen checkout
-    // without fetching sibling history or another solution.
-    let packet_origin = source
-        .to_str()
-        .ok_or_else(|| invalid("the semantic review packet path is not valid UTF-8"))?;
-    accounting::git(&source, &["remote", "add", "origin", packet_origin]).map_err(invalid)?;
-
-    let task_bytes = fs::read(&inputs.task_prompt.path)?;
-    let criteria_bytes = fs::read(&declaration.criteria.path)?;
-    let submission_bytes = fs::read(report)?;
-    if build_identity::hash_bytes(&submission_bytes) != report_sha256 {
-        return Err(invalid(
-            "the submitted result changed while freezing the semantic review packet",
-        ));
-    }
-    let task = assessment::ReviewFileIdentity::of("task.txt", &task_bytes)?;
-    let criteria = assessment::ReviewFileIdentity::of("criteria.txt", &criteria_bytes)?;
-    let submission = assessment::ReviewFileIdentity::of("submission.txt", &submission_bytes)?;
-    write_packet_file(&source, &task, &task_bytes)?;
-    write_packet_file(&source, &criteria, &criteria_bytes)?;
-    write_packet_file(&source, &submission, &submission_bytes)?;
-
-    let mut sources = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for declared in &declaration.sources {
-        let path = declared.trim().replace('\\', "/");
-        if matches!(
-            path.as_str(),
-            "task.txt" | "criteria.txt" | "submission.txt" | "actions.json" | "manifest.json"
-        ) || path.starts_with("global/")
-        {
-            return Err(invalid(format!(
-                "the semantic reviewer source {path} collides with a reserved packet path"
-            )));
+        complete_review_packet(&source, &plan)?;
+        plan.action_gap
+    } else {
+        if root.exists() && !root.is_dir() {
+            return Err(invalid(
+                "the semantic review preparation root is not a directory",
+            ));
         }
-        if !seen.insert(path.clone()) {
-            return Err(invalid(format!(
-                "the semantic reviewer source {path} is declared more than once"
-            )));
-        }
-        let bytes = git_bytes(
-            &solution.checkout,
-            &["show", &format!("{}:{path}", solution.revision)],
+        let plan = plan_review_packet(
+            run,
+            inputs,
+            state,
+            declaration,
+            solution,
+            report,
+            report_sha256.as_str(),
         )?;
-        let identity = assessment::ReviewFileIdentity::of(&path, &bytes)?;
-        write_packet_file(&source, &identity, &bytes)?;
-        sources.push(identity);
-    }
-
-    let participants = workflow_review_participants(run, state)?;
-    let (action_evidence, action_coverage, action_evidence_complete) =
-        review_action_evidence(run, &participants)?;
-    let actions = assessment::ReviewActions {
-        schema: 1,
-        run_id: run_id.clone(),
-        task: inputs.task.name.clone(),
-        submitted_revision: solution.revision.clone(),
-        base_revision: state.task_base.clone().ok_or_else(|| {
-            invalid("the frozen task base is missing from semantic review evidence")
-        })?,
-        writable_scope: inputs.task.writable_scope.clone(),
-        changed_paths: solution.changed_paths.clone(),
-        worktree_clean: true,
-        report_sha256: report_sha256.clone(),
-        participants,
-        action_evidence,
-        action_coverage,
-        action_evidence_complete,
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&source)?;
+        accounting::git(&source, &["init", "-q", "--initial-branch=main"]).map_err(invalid)?;
+        complete_review_packet(&source, &plan)?;
+        plan.action_gap
     };
-    assessment::validate_action_evidence(&actions)?;
-    let action_gap = action_gap(&actions);
-    let actions_bytes = serde_json::to_vec_pretty(&actions)?;
-    let actions_identity = assessment::ReviewFileIdentity::of("actions.json", &actions_bytes)?;
-    write_packet_file(&source, &actions_identity, &actions_bytes)?;
-    let manifest_value = assessment::ReviewManifest {
-        schema: assessment::REVIEW_SCHEMA,
-        run_id,
-        submission_revision: solution.revision.clone(),
-        base_revision: state.task_base.clone().unwrap(),
-        task,
-        criteria,
-        submission,
-        actions: actions_identity,
-        sources,
-    };
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest_value)?;
-    fs::write(&manifest, &manifest_bytes)?;
-    accounting::git(&source, &["add", "-A"]).map_err(invalid)?;
-    accounting::git(
-        &source,
-        &[
-            "-c",
-            "user.name=codex-harness",
-            "-c",
-            "user.email=codex-harness@localhost",
-            "commit",
-            "-q",
-            "-m",
-            "freeze independent semantic review packet",
-        ],
-    )
-    .map_err(invalid)?;
     let review_revision = revision_of(&source)?;
     let configuration = format!(
         "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [{}]\nmax_concurrent_executors = 1\nworktree_pool_size = 1\n",
@@ -1943,6 +1907,370 @@ fn ensure_review_packet(
         files,
         action_gap,
     })
+}
+
+fn plan_review_packet(
+    run: &Run,
+    inputs: &BaselineQualificationInputs,
+    state: &BaselineQualificationState,
+    declaration: &harness_core::improvement_loop::SemanticReviewInputs,
+    solution: &super::improvement_comparison::Solution,
+    report: &Path,
+    report_sha256: &str,
+) -> io::Result<ReviewPacketPlan> {
+    let run_id = format!("{}-semantic-review", run.spec.run);
+    let task_bytes = fs::read(&inputs.task_prompt.path)?;
+    let criteria_bytes = fs::read(&declaration.criteria.path)?;
+    let submission_bytes = fs::read(report)?;
+    if build_identity::hash_bytes(&submission_bytes) != report_sha256 {
+        return Err(invalid(
+            "the submitted result changed while freezing the semantic review packet",
+        ));
+    }
+    let task = assessment::ReviewFileIdentity::of("task.txt", &task_bytes)?;
+    let criteria = assessment::ReviewFileIdentity::of("criteria.txt", &criteria_bytes)?;
+    let submission = assessment::ReviewFileIdentity::of("submission.txt", &submission_bytes)?;
+    let mut files = vec![
+        (task.clone(), task_bytes),
+        (criteria.clone(), criteria_bytes),
+        (submission.clone(), submission_bytes),
+    ];
+
+    let mut sources = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for declared in &declaration.sources {
+        let path = declared.trim().replace('\\', "/");
+        if matches!(
+            path.as_str(),
+            "task.txt" | "criteria.txt" | "submission.txt" | "actions.json" | "manifest.json"
+        ) || path.starts_with("global/")
+        {
+            return Err(invalid(format!(
+                "the semantic reviewer source {path} collides with a reserved packet path"
+            )));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(invalid(format!(
+                "the semantic reviewer source {path} is declared more than once"
+            )));
+        }
+        let bytes = git_bytes(
+            &solution.checkout,
+            &["show", &format!("{}:{path}", solution.revision)],
+        )?;
+        let identity = assessment::ReviewFileIdentity::of(&path, &bytes)?;
+        files.push((identity.clone(), bytes));
+        sources.push(identity);
+    }
+
+    let participants = workflow_review_participants(run, state)?;
+    let (action_evidence, action_coverage, action_evidence_complete) =
+        review_action_evidence(run, &participants)?;
+    let base_revision = state
+        .task_base
+        .clone()
+        .ok_or_else(|| invalid("the frozen task base is missing from semantic review evidence"))?;
+    let actions = assessment::ReviewActions {
+        schema: 1,
+        run_id: run_id.clone(),
+        task: inputs.task.name.clone(),
+        submitted_revision: solution.revision.clone(),
+        base_revision: base_revision.clone(),
+        writable_scope: inputs.task.writable_scope.clone(),
+        changed_paths: solution.changed_paths.clone(),
+        worktree_clean: true,
+        report_sha256: report_sha256.to_owned(),
+        participants,
+        action_evidence,
+        action_coverage,
+        action_evidence_complete,
+    };
+    assessment::validate_action_evidence(&actions)?;
+    let action_gap = action_gap(&actions);
+    let actions_bytes = serde_json::to_vec_pretty(&actions)?;
+    let actions_identity = assessment::ReviewFileIdentity::of("actions.json", &actions_bytes)?;
+    files.push((actions_identity.clone(), actions_bytes));
+
+    let manifest_value = assessment::ReviewManifest {
+        schema: assessment::REVIEW_SCHEMA,
+        run_id,
+        submission_revision: solution.revision.clone(),
+        base_revision,
+        task,
+        criteria,
+        submission,
+        actions: actions_identity,
+        sources,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_value)?;
+    let manifest_identity = assessment::ReviewFileIdentity::of("manifest.json", &manifest_bytes)?;
+    files.push((manifest_identity, manifest_bytes));
+    Ok(ReviewPacketPlan { files, action_gap })
+}
+
+fn ensure_review_preparation_recoverable(
+    run: &Run,
+    review: &SemanticReviewState,
+    source: &Path,
+) -> io::Result<()> {
+    use super::improvement_comparison as accounting;
+    if review_packet_is_bound(review) {
+        return Err(invalid(
+            "the retained semantic review is already bound or dispatched; preserve its exact packet and reviewer evidence instead of recreating it",
+        ));
+    }
+    if run
+        .cursor
+        .attempts
+        .iter()
+        .any(|attempt| attempt.role == AttemptRole::SemanticReview)
+    {
+        return Err(invalid(
+            "the retained semantic review has a dispatched attempt; preserve its exact receipt instead of recreating the packet",
+        ));
+    }
+    let git_metadata = fs::symlink_metadata(source.join(".git")).map_err(|error| {
+        invalid(format!(
+            "the retained semantic review preparation has no readable Git directory: {error}"
+        ))
+    })?;
+    if !git_metadata.file_type().is_dir() {
+        return Err(invalid(
+            "the retained semantic review preparation Git metadata is not an ordinary directory",
+        ));
+    }
+    if review_head(source)?.is_some() {
+        return Err(invalid(
+            "the retained semantic review preparation has a commit without a manifest; preserve it instead of recreating the packet",
+        ));
+    }
+    let branch = accounting::git(source, &["symbolic-ref", "--short", "HEAD"]).map_err(invalid)?;
+    if branch.trim() != "main" {
+        return Err(invalid(format!(
+            "the retained semantic review preparation is on branch {:?} instead of main; preserve it and refuse to recreate the packet",
+            branch.trim()
+        )));
+    }
+    let index = accounting::git(source, &["ls-files"]).map_err(invalid)?;
+    if !index.trim().is_empty() {
+        return Err(invalid(
+            "the retained semantic review preparation has staged paths without a manifest; preserve it and refuse to recreate the packet",
+        ));
+    }
+    let refs =
+        accounting::git(source, &["for-each-ref", "--format=%(refname)"]).map_err(invalid)?;
+    if !refs.trim().is_empty() {
+        return Err(invalid(
+            "the retained semantic review preparation has Git refs without a manifest; preserve it and refuse to recreate the packet",
+        ));
+    }
+    Ok(())
+}
+
+fn review_head(source: &Path) -> io::Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(source)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|error| {
+            invalid(format!(
+                "git rev-parse --verify --quiet HEAD could not start: {error}"
+            ))
+        })?;
+    if output.status.success() {
+        let revision = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !matches!(revision.len(), 40 | 64) {
+            return Err(invalid(
+                "the retained semantic review preparation recorded an inexact commit revision",
+            ));
+        }
+        return Ok(Some(revision));
+    }
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    Err(invalid(format!(
+        "git rev-parse --verify --quiet HEAD failed: {}",
+        detail.trim().chars().take(512).collect::<String>()
+    )))
+}
+
+fn ensure_review_packet_origin(source: &Path) -> io::Result<()> {
+    use super::improvement_comparison as accounting;
+    let expected = source
+        .to_str()
+        .ok_or_else(|| invalid("the semantic review packet path is not valid UTF-8"))?;
+    let remotes = accounting::git(source, &["remote"]).map_err(invalid)?;
+    let mut names: Vec<&str> = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        // The shared continuation owner reads the bound checkout's configured
+        // upstream before it resumes an exact reviewer session. The packet is
+        // deliberately independent, so its only origin is the packet itself: a
+        // same-reviewer correction can bind and reaffirm the frozen checkout
+        // without fetching sibling history or another solution.
+        accounting::git(source, &["remote", "add", "origin", expected]).map_err(invalid)?;
+        return Ok(());
+    }
+    if names != ["origin"] {
+        return Err(invalid(format!(
+            "the retained semantic review preparation has remotes {:?} instead of only origin; preserve it and refuse to recreate the packet",
+            names
+        )));
+    }
+    let actual = accounting::git(source, &["remote", "get-url", "origin"]).map_err(invalid)?;
+    if actual.trim() != expected {
+        return Err(invalid(format!(
+            "the retained semantic review preparation origin {:?} differs from the packet checkout {:?}; preserve it and refuse to retarget the reviewer",
+            actual.trim(),
+            expected
+        )));
+    }
+    Ok(())
+}
+
+fn verify_review_packet_preparation(
+    source: &Path,
+    expected_files: &[(assessment::ReviewFileIdentity, Vec<u8>)],
+) -> io::Result<Vec<String>> {
+    let expected: std::collections::BTreeMap<&str, &[u8]> = expected_files
+        .iter()
+        .map(|(identity, bytes)| (identity.path.as_str(), bytes.as_slice()))
+        .collect();
+    if expected.len() != expected_files.len() {
+        return Err(invalid(
+            "the semantic review preparation plan names the same path more than once",
+        ));
+    }
+    let mut actual = std::collections::BTreeMap::new();
+    collect_review_preparation_files(source, source, &expected, &mut actual)?;
+    for (path, file) in &actual {
+        let Some(expected_bytes) = expected.get(path.as_str()) else {
+            return Err(invalid(format!(
+                "the retained semantic review preparation contains unexpected path {path}; preserve it and refuse to recreate the packet"
+            )));
+        };
+        let bytes = fs::read(file)?;
+        if bytes != *expected_bytes {
+            return Err(invalid(format!(
+                "the retained semantic review preparation input {path} differs from the current frozen packet bytes; preserve it and refuse to recreate the packet"
+            )));
+        }
+    }
+    Ok(expected_files
+        .iter()
+        .filter(|(identity, _)| !actual.contains_key(&identity.path))
+        .map(|(identity, _)| identity.path.clone())
+        .collect())
+}
+
+fn collect_review_preparation_files(
+    source: &Path,
+    directory: &Path,
+    expected: &std::collections::BTreeMap<&str, &[u8]>,
+    files: &mut std::collections::BTreeMap<String, std::path::PathBuf>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative_path = path.strip_prefix(source).map_err(|error| {
+            invalid(format!(
+                "the semantic review preparation path is invalid: {error}"
+            ))
+        })?;
+        let mut components = Vec::new();
+        for component in relative_path.components() {
+            match component {
+                std::path::Component::Normal(name) => {
+                    components.push(name.to_string_lossy().into_owned());
+                }
+                _ => {
+                    return Err(invalid(
+                        "the semantic review preparation contains a non-relative path component",
+                    ));
+                }
+            }
+        }
+        let relative = components.join("/");
+        if relative == ".git" {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid(format!(
+                "the retained semantic review preparation contains symlink {relative}; preserve it and refuse to recreate the packet"
+            )));
+        }
+        if metadata.is_dir() {
+            let prefix = format!("{relative}/");
+            if !expected
+                .keys()
+                .any(|expected| expected.starts_with(&prefix))
+            {
+                return Err(invalid(format!(
+                    "the retained semantic review preparation contains unexpected directory {relative}; preserve it and refuse to recreate the packet"
+                )));
+            }
+            collect_review_preparation_files(source, &path, expected, files)?;
+        } else if metadata.is_file() {
+            files.insert(relative, path);
+        } else {
+            return Err(invalid(format!(
+                "the retained semantic review preparation path {relative} is not an ordinary file or directory"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn complete_review_packet(source: &Path, plan: &ReviewPacketPlan) -> io::Result<()> {
+    use super::improvement_comparison as accounting;
+    let missing = verify_review_packet_preparation(source, &plan.files)?;
+    ensure_review_packet_origin(source)?;
+    for (identity, bytes) in &plan.files {
+        if missing
+            .iter()
+            .any(|missing_path| missing_path == &identity.path)
+        {
+            write_packet_file(source, identity, bytes)?;
+        }
+    }
+    let still_missing = verify_review_packet_preparation(source, &plan.files)?;
+    if !still_missing.is_empty() {
+        return Err(invalid(format!(
+            "the semantic review preparation did not complete its expected inputs: {}",
+            still_missing.join(", ")
+        )));
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(
+        plan.files
+            .iter()
+            .map(|(identity, _)| identity.path.as_str()),
+    );
+    accounting::git(source, &add).map_err(invalid)?;
+    accounting::git(
+        source,
+        &[
+            "-c",
+            "user.name=codex-harness",
+            "-c",
+            "user.email=codex-harness@localhost",
+            "commit",
+            "-q",
+            "-m",
+            "freeze independent semantic review packet",
+        ],
+    )
+    .map_err(invalid)?;
+    Ok(())
 }
 
 fn advance_semantic_review(
