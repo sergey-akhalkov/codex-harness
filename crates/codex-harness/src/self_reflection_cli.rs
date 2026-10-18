@@ -50,6 +50,7 @@ use std::{
 mod accepted;
 pub(crate) mod host;
 pub(crate) mod lifecycle;
+mod surface;
 /// Set on every reflection app-server and frontend. `main` refuses every
 /// `codex-harness` command in a process tree carrying it, so a reflection fork
 /// cannot dispatch work, edit board state or start another conversation.
@@ -348,6 +349,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
     let mut request_path: Option<PathBuf> = None;
     let mut board: Option<PathBuf> = None;
+    let mut stage_runner: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].to_string_lossy().as_ref() {
@@ -366,6 +368,13 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                     board = Some(PathBuf::from(value));
                 }
             }
+            "--stage-runner" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| invalid("--stage-runner requires a path"))?;
+                stage_runner = Some(PathBuf::from(value));
+            }
             other => {
                 return Err(invalid(format!(
                     "unknown argument {other:?}; run `codex-harness self-reflection --help`"
@@ -373,6 +382,14 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             }
         }
         index += 1;
+    }
+    if let Some(path) = stage_runner {
+        if request_path.is_some() || board.is_some() {
+            return Err(invalid(
+                "--stage-runner is an internal single-stage mode and cannot be combined with --request or --accepted-board",
+            ));
+        }
+        return surface::execute_stage_runner(&path);
     }
     let request_path = request_path.ok_or_else(|| {
         invalid(
@@ -589,7 +606,7 @@ pub(crate) fn run_executor(
 ) -> io::Result<StageState> {
     let prepared = prepare_stage(chain, &chain.executor_stage, Role::ExecutorSelfReflection)?;
     let path = chain.state_dir.join("executor-stage.json");
-    run_stage(
+    surface::run_stage_in_surface(
         chain,
         Stage::Executor,
         &chain.executor_stage,
@@ -616,7 +633,7 @@ pub(crate) fn run_lead(
 ) -> io::Result<StageState> {
     let prepared = prepare_stage(chain, &chain.lead_stage, Role::LeadSelfReflection)?;
     let path = chain.state_dir.join("lead-stage.json");
-    run_stage(
+    surface::run_stage_in_surface(
         chain,
         Stage::Lead,
         &chain.lead_stage,

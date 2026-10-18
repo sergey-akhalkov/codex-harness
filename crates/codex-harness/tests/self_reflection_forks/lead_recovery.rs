@@ -40,8 +40,11 @@ const EXECUTOR_SOURCE_PROMPT: &str =
 const EXECUTOR_SOURCE_REPLY: &str = "LEAD-RECOVERY-EXECUTOR-SOURCE-REPLY";
 const EXECUTOR_RESULT_TEXT: &str = "LEAD-RECOVERY-EXECUTOR-RESULT";
 const LEAD_RESULT_TEXT: &str = "LEAD-RECOVERY-LEAD-RESULT";
+const EXECUTOR_PROMPT_MARKER: &str = "Bounded read-only executor self-reflection";
+const LEAD_PROMPT_MARKER: &str = "Bounded read-only lead self-reflection";
 const TITLE_PROMPT: &str = "Generate a concise, single-line task title";
 const WAIT: Duration = Duration::from_secs(120);
+const COMPLETE_WAIT: Duration = Duration::from_secs(300);
 const EXIT_WAIT: Duration = Duration::from_secs(120);
 
 /// True for the native title-generation request, which carries its own
@@ -1003,18 +1006,57 @@ fn native_executor_source(home: &Path, build: &Path, evidence: &Path) -> (String
     )
 }
 
-/// Counts provider requests that carry a reflection stage prompt. The host's
-/// refusal must happen before any model work, so this stays zero.
-fn reflection_requests(evidence: &Path) -> usize {
+/// Counts provider requests that carry one exact role marker. The two stage
+/// prompts use distinct bounded lines, so the lead request's embedded executor
+/// result cannot be mistaken for a second executor request.
+fn reflection_request_count(evidence: &Path, marker: &str) -> usize {
     let mut found = 0;
     if let Ok(entries) = fs::read_dir(evidence.join("provider")) {
         for entry in entries.flatten() {
             if let Ok(body) = fs::read_to_string(entry.path())
-                && (body.contains("executor self-reflection")
-                    || body.contains("lead self-reflection"))
+                && body.contains(marker)
             {
                 found += 1;
             }
+        }
+    }
+    found
+}
+
+/// Counts the lead conversation's own user-message items carrying one exact
+/// client message id. A replayed delivery would add a second item.
+fn delivered_user_message_items(
+    port: u16,
+    token: &str,
+    thread: &str,
+    client_message_id: &str,
+) -> usize {
+    let mut connection = NativeClient::connect(port, token);
+    let mut cursor: Option<String> = None;
+    let mut found = 0;
+    for _ in 0..16 {
+        let mut params = json!({
+            "threadId": thread,
+            "itemsView": "full",
+            "sortDirection": "asc",
+            "limit": 100,
+        });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = connection.request("thread/turns/list", params);
+        for turn in page["data"].as_array().cloned().unwrap_or_default() {
+            for item in turn["items"].as_array().cloned().unwrap_or_default() {
+                if item["type"] == "userMessage"
+                    && item["clientId"].as_str() == Some(client_message_id)
+                {
+                    found += 1;
+                }
+            }
+        }
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
         }
     }
     found
@@ -1047,14 +1089,19 @@ fn host_status(home: &Path, lead: &str) -> Option<(PathBuf, Value, String)> {
     None
 }
 
-/// Establishes where the real managed host's model-free consumer stops when a
-/// real accepted closure is bound to its live thread and completed turn. The
-/// host is left running until its outcome is captured, then ended normally.
+/// The managed lead host's existing model-free `_serve` consumer runs the two
+/// pending reflection stages in their own visibly titled foreground surfaces,
+/// retains the real executor and lead results, and delivers the synthesis
+/// exactly once. The isolated source home enables the upstream goal RPC so the
+/// production fork preflight can read the source goal; the fork request itself
+/// still carries the production fork-local feature/goal suppression. The
+/// goals-disabled source-home correction is a separate owner's work and is not
+/// relaxed here.
 #[test]
 #[ignore = "requires the installed native upstream and the checkout-built launcher; owned canned Responses; no live model"]
-fn native_lead_host_attempts_the_pending_executor_stage() {
+fn native_managed_host_runs_reflections_in_distinct_surfaces_and_delivers_once() {
     let evidence = tempfile::Builder::new()
-        .prefix("lead-recovery-pending-")
+        .prefix("lead-recovery-managed-host-")
         .tempdir()
         .unwrap()
         .keep();
@@ -1069,29 +1116,34 @@ fn native_lead_host_attempts_the_pending_executor_stage() {
     write_registration(&home, &build, &upstream);
     let responses = control_responses::Responses::routed(evidence.join("provider"), |request| {
         if title_generation_request(request) {
-            return message("Lead recovery fixture");
+            return message("Managed host fixture");
         }
         let prompt = request["input"].to_string();
+        // The lead prompt embeds the retained executor result, so role
+        // routing keys on each stage's own bounded prompt line.
+        if prompt.contains(LEAD_PROMPT_MARKER) {
+            if !prompt.contains(EXECUTOR_RESULT_TEXT) {
+                return message("LEAD-RECOVERY-MISSING-EXECUTOR-RESULT");
+            }
+            return message(LEAD_RESULT_TEXT);
+        }
+        if prompt.contains(EXECUTOR_PROMPT_MARKER) {
+            return message(EXECUTOR_RESULT_TEXT);
+        }
         if prompt.contains("LEAD-RECOVERY-OWNED-EXECUTOR-SOURCE") {
             return message(EXECUTOR_SOURCE_REPLY);
         }
-        if prompt.contains("executor self-reflection") {
-            return message(EXECUTOR_RESULT_TEXT);
-        }
-        if prompt.contains("lead self-reflection") {
-            return message(LEAD_RESULT_TEXT);
-        }
         message(FIRST_REPLY)
     });
-    // The reflection runner queries the source goal through `thread/goal/get`
-    // before it forks. Enable that upstream feature in this isolated home so
-    // the pending-stage probe reaches the controller's actual frontend
-    // boundary; no model request is admitted by this feature.
+    // The managed host's fork preflight reads the source goal through
+    // `thread/goal/get`; this isolated home enables that upstream RPC. The
+    // fork's own request still carries `features.goals = false` from the
+    // production feature switches.
     write_config(&home, &checkout, responses.port, true);
     let entry = manager();
     let registry = home.join("harness/lead-endpoints");
     fs::create_dir_all(&registry).unwrap();
-    println!("pending reflection evidence: {}", evidence.display());
+    println!("managed reflection evidence: {}", evidence.display());
 
     // The accepted source is a real, independent headless executor turn in
     // this same native home, not a relabelled lead conversation.
@@ -1109,9 +1161,9 @@ fn native_lead_host_attempts_the_pending_executor_stage() {
     let thread = endpoint["threadId"].as_str().unwrap().to_owned();
     let port = u16::try_from(endpoint["port"].as_u64().unwrap()).unwrap();
     let token = endpoint["token"].as_str().unwrap().to_owned();
-    let (old_identity, old_program) = endpoint_process(&endpoint);
-    assert!(process_is_live(old_identity, &old_program));
-    let saved_endpoint = fs::read(&endpoint_path).unwrap();
+    let (host_identity, host_program) = endpoint_process(&endpoint);
+    assert!(process_is_live(host_identity, &host_program));
+    assert_eq!(endpoint_records(&registry).len(), 1);
     let first_turn = completed_turn(port, &token, &thread);
     let board = evidence.join("board");
     let (state_path, task, acceptance) = accepted_board(
@@ -1122,59 +1174,96 @@ fn native_lead_host_attempts_the_pending_executor_stage() {
         &thread,
         &first_turn,
     );
+    let binding_deadline = Instant::now() + WAIT;
+    let accepted_binding = loop {
+        if let Some(record) = fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ReflectionState>(&bytes).ok())
+            .and_then(|state| state.records.get(&acceptance).cloned())
+        {
+            break record.binding;
+        }
+        assert!(
+            Instant::now() < binding_deadline,
+            "the accepted record's binding disappeared after the board closure"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     eprintln!(
         "accepted board: task {task} acceptance {acceptance} executor {executor_thread}/{executor_turn} lead {thread}/{first_turn}"
     );
 
-    let deadline = Instant::now() + WAIT;
+    // Wait for both reflections and the single delivery while keeping the
+    // model-free host log as failure evidence.
+    let deadline = Instant::now() + COMPLETE_WAIT;
     let mut observed_status = Value::Null;
     let mut observed_log = String::new();
-    let mut observed = RecordedStageState::Pending;
-    loop {
-        if let Ok(bytes) = fs::read(&state_path)
-            && let Ok(state) = serde_json::from_slice::<ReflectionState>(&bytes)
-            && let Some(record) = state.records.get(&acceptance)
-        {
-            observed = record.executor.state;
-        }
+    let record = loop {
+        let state = fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ReflectionState>(&bytes).ok())
+            .and_then(|state| state.records.get(&acceptance).cloned());
         if let Some((_, status, log)) = host_status(&home, &thread) {
+            if status["state"] == "failed" {
+                panic!("the managed host failed before delivery: {status}\nlog:\n{log}");
+            }
             observed_status = status;
             observed_log = log;
         }
-        if matches!(
-            observed,
-            RecordedStageState::Retained
-                | RecordedStageState::Blocked
-                | RecordedStageState::Unknown
-        ) || observed_status["state"] == "failed"
-            || observed_log.contains("no live terminal surface")
-        {
-            break;
+        let complete = state.as_ref().is_some_and(|record| {
+            record.executor.state == RecordedStageState::Retained
+                && record.lead.state == RecordedStageState::Retained
+                && record.delivery == RecordedDeliveryState::Consumed
+        });
+        if complete {
+            break state.expect("the completed acceptance retains its record");
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "the managed host did not attempt the pending executor stage; status={observed_status}\nlog:\n{observed_log}"
-            );
-        }
+        assert!(
+            Instant::now() < deadline,
+            "the managed host did not complete both reflections and delivery; record={state:?} status={observed_status}\nlog:\n{observed_log}"
+        );
         std::thread::sleep(Duration::from_millis(250));
-    }
-    eprintln!(
-        "host status: {observed_status}\nexecutor state: {observed:?}\nhost log:\n{observed_log}"
-    );
-    let state: ReflectionState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    let record = state.records.get(&acceptance).unwrap();
+    };
+    eprintln!("managed host status: {observed_status}\nhost log:\n{observed_log}");
+
     assert_eq!(
         record.executor.state,
-        RecordedStageState::Unknown,
+        RecordedStageState::Retained,
         "{record:?}"
     );
     assert_eq!(record.executor.usage.attempts, 1, "{record:?}");
-    assert!(record.executor.outcome.is_none(), "{record:?}");
-    assert_eq!(record.lead.state, RecordedStageState::Pending, "{record:?}");
+    assert_eq!(
+        record
+            .executor
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.summary.as_str()),
+        Some(EXECUTOR_RESULT_TEXT),
+        "{record:?}"
+    );
+    assert_eq!(
+        record.lead.state,
+        RecordedStageState::Retained,
+        "{record:?}"
+    );
+    assert_eq!(record.lead.usage.attempts, 1, "{record:?}");
+    assert_eq!(
+        record
+            .lead
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.summary.as_str()),
+        Some(LEAD_RESULT_TEXT),
+        "{record:?}"
+    );
     assert_eq!(
         record.delivery,
-        RecordedDeliveryState::Pending,
+        RecordedDeliveryState::Consumed,
         "{record:?}"
+    );
+    assert_eq!(
+        record.binding, accepted_binding,
+        "the accepted task/acceptance binding changed during reflection"
     );
     assert_eq!(
         record.binding.executor_session.as_deref(),
@@ -1191,157 +1280,263 @@ fn native_lead_host_attempts_the_pending_executor_stage() {
     );
     assert_eq!(record.binding.task, task);
     assert_eq!(record.acceptance_id, acceptance);
+
+    // One native provider request per role proves the lead consumed the
+    // retained executor result instead of starting another executor stage.
     assert_eq!(
-        reflection_requests(&evidence),
-        0,
-        "the terminal-surface refusal must happen before any reflection model request"
+        reflection_request_count(&evidence, EXECUTOR_PROMPT_MARKER),
+        1,
+        "the executor reflection must run exactly once"
+    );
+    assert_eq!(
+        reflection_request_count(&evidence, LEAD_PROMPT_MARKER),
+        1,
+        "the lead reflection must run exactly once"
+    );
+
+    let chain_dir = state_path.with_extension("").join(&acceptance);
+    let executor_stage = chain_dir.join("executor-stage.json");
+    let lead_stage = chain_dir.join("lead-stage.json");
+    let delivery_path = chain_dir.join("lead-delivery.json");
+    let executor_surface_path = executor_stage.with_extension("surface.json");
+    let lead_surface_path = lead_stage.with_extension("surface.json");
+    for path in [
+        &executor_stage,
+        &lead_stage,
+        &delivery_path,
+        &executor_surface_path,
+        &lead_surface_path,
+    ] {
+        assert!(
+            path.is_file(),
+            "the managed host retained no {}",
+            path.display()
+        );
+    }
+    for path in [
+        chain_dir.join("executor-self-reflection-surface-request.json"),
+        chain_dir.join("executor-self-reflection-surface-result.json"),
+        chain_dir.join("lead-self-reflection-surface-request.json"),
+        chain_dir.join("lead-self-reflection-surface-result.json"),
+    ] {
+        assert!(
+            !path.exists(),
+            "the transient surface artifact {} was not cleaned",
+            path.display()
+        );
+    }
+    let names: Vec<String> = fs::read_dir(&chain_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains("-attempt-")),
+        "a reflection stage was archived as a retry: {names:?}"
+    );
+
+    let executor_native: Value =
+        serde_json::from_slice(&fs::read(&executor_stage).unwrap()).unwrap();
+    let lead_native: Value = serde_json::from_slice(&fs::read(&lead_stage).unwrap()).unwrap();
+    assert_eq!(executor_native["status"], "completed", "{executor_native}");
+    assert_eq!(
+        executor_native["result"], EXECUTOR_RESULT_TEXT,
+        "{executor_native}"
+    );
+    assert_eq!(executor_native["stage"], "executor-self-reflection");
+    assert_eq!(executor_native["task"], task);
+    assert_eq!(executor_native["run"], "replacement-run");
+    assert_eq!(executor_native["acceptance"], acceptance);
+    assert_eq!(executor_native["sourceThread"], executor_thread);
+    assert_eq!(executor_native["sourceLastTurn"], executor_turn);
+    assert_eq!(executor_native["usageKnown"], true, "{executor_native}");
+    assert_eq!(lead_native["status"], "completed", "{lead_native}");
+    assert_eq!(lead_native["result"], LEAD_RESULT_TEXT, "{lead_native}");
+    assert_eq!(lead_native["stage"], "lead-self-reflection");
+    assert_eq!(lead_native["sourceThread"], thread);
+    assert_eq!(lead_native["sourceLastTurn"], first_turn);
+    assert_eq!(lead_native["usageKnown"], true, "{lead_native}");
+    for native in [&executor_native, &lead_native] {
+        assert_eq!(native["fork"]["sourcePreserved"], true, "{native}");
+        assert!(
+            native["fork"]["forkThread"]
+                .as_str()
+                .is_some_and(|fork| !fork.is_empty()),
+            "{native}"
+        );
+    }
+
+    // Both stages ran in distinct visibly titled consoles, not in the
+    // consumer's redirected pipe, and each console belonged to the exact live
+    // model-free controller.
+    let executor_surface: Value =
+        serde_json::from_slice(&fs::read(&executor_surface_path).unwrap()).unwrap();
+    let lead_surface: Value =
+        serde_json::from_slice(&fs::read(&lead_surface_path).unwrap()).unwrap();
+    let (_, status, _) = host_status(&home, &thread).expect("the managed host status");
+    assert_eq!(status["state"], "running", "{status}");
+    let controller_pid = status["process"]["pid"].as_u64().unwrap();
+    let controller_created = status["process"]["creationTime"].as_u64().unwrap();
+    let controller_program = PathBuf::from(status["process"]["program"].as_str().unwrap());
+    assert!(
+        process_is_live(
+            ProcessIdentity {
+                pid: u32::try_from(controller_pid).unwrap(),
+                creation_time: controller_created,
+            },
+            &controller_program
+        ),
+        "the model-free controller is not live: {status}"
+    );
+    for (role, surface, prefix) in [
+        ("executor-self-reflection", &executor_surface, "ERefl "),
+        ("lead-self-reflection", &lead_surface, "LRefl "),
+    ] {
+        assert_eq!(surface["schema"], 1, "{surface}");
+        assert_eq!(surface["role"], role, "{surface}");
+        assert_eq!(surface["consoleAttached"], true, "{surface}");
+        assert_eq!(
+            surface["captionBefore"], surface["nativeTitle"],
+            "{surface}"
+        );
+        assert!(
+            surface["nativeTitle"]
+                .as_str()
+                .is_some_and(|title| title.starts_with(prefix)),
+            "{surface}"
+        );
+        assert_eq!(surface["coordinator"]["pid"], controller_pid, "{surface}");
+        assert_eq!(
+            surface["coordinator"]["creation_time"], controller_created,
+            "{surface}"
+        );
+        assert!(
+            same_program(
+                Path::new(surface["coordinatorProgram"].as_str().unwrap()),
+                &controller_program
+            ),
+            "{surface}"
+        );
+        assert!(
+            same_program(
+                Path::new(surface["program"].as_str().unwrap()),
+                &controller_program
+            ),
+            "the foreground trampoline must be the exact controller binary: {surface}"
+        );
+    }
+    let executor_pid = executor_surface["identity"]["pid"].as_u64().unwrap();
+    let lead_pid = lead_surface["identity"]["pid"].as_u64().unwrap();
+    assert_ne!(
+        executor_pid, lead_pid,
+        "both stages must retain their own foreground process"
+    );
+    assert_ne!(
+        executor_surface["nativeTitle"], lead_surface["nativeTitle"],
+        "the two native surfaces must carry distinct role titles"
+    );
+    for (what, surface) in [("executor", &executor_surface), ("lead", &lead_surface)] {
+        let identity = ProcessIdentity {
+            pid: u32::try_from(surface["identity"]["pid"].as_u64().unwrap()).unwrap(),
+            creation_time: surface["identity"]["creation_time"].as_u64().unwrap(),
+        };
+        let program = PathBuf::from(surface["program"].as_str().unwrap());
+        wait_process_gone(
+            identity,
+            &program,
+            &format!("the {what} foreground surface"),
+        );
+    }
+    assert_eq!(
+        observed_log.matches("foreground surface pid").count(),
+        2,
+        "the model-free host did not launch exactly two foreground surfaces:\n{observed_log}"
+    );
+    assert!(
+        observed_log.contains("executor-self-reflection: foreground surface pid")
+            && observed_log.contains("lead-self-reflection: foreground surface pid"),
+        "the host log names the wrong stages:\n{observed_log}"
+    );
+    assert!(
+        !observed_log.contains("no live terminal surface"),
+        "the managed host still refuses its stage:\n{observed_log}"
+    );
+
+    // One delivered synthesis: the exact client message id appears once in
+    // the lead's own conversation, and the host does not replay it.
+    let delivery: Value = serde_json::from_slice(&fs::read(&delivery_path).unwrap()).unwrap();
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    let client_message_id = delivery["clientMessageId"].as_str().unwrap().to_owned();
+    assert!(!client_message_id.is_empty());
+    assert!(
+        delivery["turn"]
+            .as_str()
+            .is_some_and(|turn| !turn.is_empty()),
+        "{delivery}"
+    );
+    assert!(
+        delivery["item"]
+            .as_str()
+            .is_some_and(|item| !item.is_empty()),
+        "{delivery}"
+    );
+    assert_eq!(delivery["by"], "clientId", "{delivery}");
+    assert_eq!(
+        record.delivery_receipt.as_deref(),
+        Some(client_message_id.as_str()),
+        "{record:?}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            delivered_user_message_items(port, &token, &thread, &client_message_id) == 1
+        }),
+        "the lead conversation did not show exactly one delivered synthesis input"
+    );
+
+    // A full extra host poll must not start a second stage or delivery.
+    std::thread::sleep(Duration::from_secs(6));
+    let after: ReflectionState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let after_record = after.records.get(&acceptance).unwrap();
+    assert_eq!(after_record.executor.usage.attempts, 1, "{after_record:?}");
+    assert_eq!(after_record.lead.usage.attempts, 1, "{after_record:?}");
+    assert_eq!(
+        after_record.delivery,
+        RecordedDeliveryState::Consumed,
+        "{after_record:?}"
+    );
+    assert_eq!(
+        reflection_request_count(&evidence, EXECUTOR_PROMPT_MARKER),
+        1
+    );
+    assert_eq!(reflection_request_count(&evidence, LEAD_PROMPT_MARKER), 1);
+    assert_eq!(
+        delivered_user_message_items(port, &token, &thread, &client_message_id),
+        1,
+        "the retained lead delivery was replayed"
     );
     let issue = board_cli::show_issue(Path::new("bd.exe"), &board, &task).unwrap();
     assert_eq!(issue["status"], "closed", "{issue}");
     assert_eq!(issue["close_reason"], ACCEPTED_CLOSE_REASON, "{issue}");
-    assert!(
-        observed_log.contains("no live terminal surface")
-            && observed_log.contains("run it in its own terminal instead of a redirected pipe"),
-        "the managed host consumer did not retain the terminal-surface refusal at attach_owned_frontend; executor={observed:?} status={observed_status}\nlog:\n{observed_log}"
-    );
 
-    // The supported successor takes the same thread after the old controller
-    // has retired. The retained executor is Unknown, so the new consumer must
-    // stay idle without starting a second stage or delivery and leave the
-    // accepted task intact.
-    let old_controller = host_status(&home, &thread)
-        .map(|(_, status, _)| status["process"].clone())
-        .expect("the old host recorded its model-free controller");
-    let old_outcome = quit_session(host, &entry);
+    let outcome = quit_session(host, &entry);
     assert_eq!(
-        old_outcome.outcome.reason,
+        outcome.outcome.reason,
         StopReason::Exited,
         "{}",
-        old_outcome.transcript
+        outcome.transcript
     );
-    assert_eq!(
-        old_outcome.outcome.exit_code, 0,
-        "{}",
-        old_outcome.transcript
-    );
+    assert_eq!(outcome.outcome.exit_code, 0, "{}", outcome.transcript);
     assert!(
         !endpoint_path.exists(),
         "the ended host must retire its endpoint record"
     );
-    wait_process_gone(old_identity, &old_program, "the old app-server");
-    fs::write(&endpoint_path, &saved_endpoint).unwrap();
-    let log_path = host_status(&home, &thread)
-        .map(|(path, _, _)| path.with_extension("log"))
-        .expect("the old host retained a status log");
-    let before_successor = fs::read(&log_path).unwrap_or_default().len();
-
-    let successor = spawn_lead(&entry, &home, &checkout, Some(&thread), None, &evidence);
-    let (successor_path, successor_endpoint) =
-        wait_for_replacement_endpoint(&registry, old_identity.pid, WAIT);
-    assert_eq!(
-        successor_path, endpoint_path,
-        "the successor must publish the one registry key of this thread"
-    );
-    assert_eq!(
-        successor_endpoint["threadId"].as_str(),
-        Some(thread.as_str()),
-        "the successor must resume the exact same thread"
-    );
-    let (successor_identity, successor_program) = endpoint_process(&successor_endpoint);
-    assert_ne!(successor_identity.pid, old_identity.pid);
-    assert!(same_program(&successor_program, &build.join("codex.exe")));
-    assert!(process_is_live(successor_identity, &successor_program));
-    assert_eq!(endpoint_records(&registry).len(), 1);
-
-    let deadline = Instant::now() + WAIT;
-    let successor_status = loop {
-        if let Some((_, status, _)) = host_status(&home, &thread)
-            && status["state"] == "running"
-            && status["process"]["pid"] != old_controller["pid"]
-        {
-            let identity = ProcessIdentity {
-                pid: u32::try_from(status["process"]["pid"].as_u64().unwrap()).unwrap(),
-                creation_time: status["process"]["creationTime"].as_u64().unwrap(),
-            };
-            let program = PathBuf::from(status["process"]["program"].as_str().unwrap());
-            assert!(
-                process_is_live(identity, &program),
-                "the successor model-free controller is not live: {status}"
-            );
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the successor did not start its own model-free controller; log growth: {}",
-            fs::read(&log_path)
-                .unwrap_or_default()
-                .len()
-                .saturating_sub(before_successor)
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    };
-    // A full host poll must not replay the retained Uncertain stage.
-    std::thread::sleep(Duration::from_secs(5));
-    if let Some((_, status, log)) = host_status(&home, &thread) {
-        assert_eq!(
-            status["process"]["pid"], successor_status["process"]["pid"],
-            "the successor controller changed while the retained stage was idle: {status}"
-        );
-        assert_eq!(
-            log.len(),
-            before_successor,
-            "the successor replayed or advanced the retained Uncertain stage; log:\n{}",
-            log.get(before_successor..).unwrap_or_default()
-        );
-    } else {
-        panic!("the successor model-free controller status disappeared");
-    }
-    let state: ReflectionState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    let record = state.records.get(&acceptance).unwrap();
-    assert_eq!(
-        record.executor.state,
-        RecordedStageState::Unknown,
-        "{record:?}"
-    );
-    assert_eq!(record.executor.usage.attempts, 1, "{record:?}");
-    assert_eq!(record.lead.state, RecordedStageState::Pending, "{record:?}");
-    assert_eq!(
-        record.delivery,
-        RecordedDeliveryState::Pending,
-        "{record:?}"
-    );
-    assert_eq!(
-        reflection_requests(&evidence),
-        0,
-        "succession must not rerun the retained executor stage"
-    );
-    let issue = board_cli::show_issue(Path::new("bd.exe"), &board, &task).unwrap();
-    assert_eq!(issue["status"], "closed", "{issue}");
-    assert_eq!(issue["close_reason"], ACCEPTED_CLOSE_REASON, "{issue}");
-
-    let successor_outcome = quit_session(successor, &entry);
-    assert_eq!(
-        successor_outcome.outcome.reason,
-        StopReason::Exited,
-        "{}",
-        successor_outcome.transcript
-    );
-    assert_eq!(
-        successor_outcome.outcome.exit_code, 0,
-        "{}",
-        successor_outcome.transcript
-    );
-    assert!(!endpoint_path.exists());
-    wait_process_gone(
-        successor_identity,
-        &successor_program,
-        "the successor app-server",
-    );
+    wait_process_gone(host_identity, &host_program, "the managed host app-server");
     assert!(endpoint_records(&registry).is_empty());
     eprintln!(
-        "pending reflection probe: task {task} acceptance {acceptance}; old pid {} successor pid {}; evidence {}",
-        old_identity.pid,
-        successor_identity.pid,
+        "managed reflection probe: task {task} acceptance {acceptance}; host pid {}; executor surface pid {}; lead surface pid {}; evidence {}",
+        host_identity.pid,
+        executor_pid,
+        lead_pid,
         evidence.display()
     );
 }
