@@ -15,6 +15,8 @@ use std::{
     process::{Command, Output},
 };
 
+#[path = "delivery_reflection/native_branch.rs"]
+mod native_branch;
 #[path = "delivery_reflection/native_import.rs"]
 mod native_import;
 const LEAD: &str = "lead-fixture";
@@ -66,6 +68,10 @@ struct Board {
 
 impl Board {
     fn new(root: &Path) -> Self {
+        Self::new_with_init(root, &[])
+    }
+
+    fn new_with_init(root: &Path, init_options: &[&str]) -> Self {
         let project = root.join("project");
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&project).unwrap();
@@ -86,6 +92,7 @@ impl Board {
                 "--prefix",
                 "bdct",
             ])
+            .args(init_options)
             .current_dir(&project)
             .env("BD_NON_INTERACTIVE", "1")
             .env("BEADS_ACTOR", APPROVER)

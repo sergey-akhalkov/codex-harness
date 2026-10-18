@@ -394,6 +394,19 @@ reconciliation rather than repeated model calls. The independent skill drafts
 remain outside discovery in `.agents/skill-candidates` until evaluation allows
 publication. No comparison benefit is established by the model-free checks.
 
+The native branch-recovery check additionally needs an existing Dolt binary;
+set `HARNESS_DOLT_EXE` to its absolute path before running:
+
+```powershell
+codex-harness heavy -- cargo test -p harness-core --test integration --locked --jobs 1 delivery_reflection::native_branch::native_branch_change_pauses_and_restoration_preserves_pending_acceptance -- --ignored --exact --nocapture --test-threads=1
+```
+
+This opt-in check creates its own temporary board and loopback server, changes
+the actual native database branch, checks the recovery pause and retained
+acceptance, then restores the branch and verifies no duplicate trigger. The
+server is stopped on completion or test failure. It requires no model calls
+and does not inspect or alter an existing project board.
+
 ## Heavy-command budget
 
 `codex-harness heavy -- PROGRAM ARGS` runs one batch command and its descendants
