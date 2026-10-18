@@ -16,6 +16,7 @@ use harness_core::{
 const ACTOR: &str = "reflection-fixture-lead";
 const RUN: &str = "accepted-context-run";
 const PREDECESSOR_SOURCE: &str = "fixture-predecessor-executor-source";
+const MISMATCHED_SOURCE: &str = "fixture-other-recorded-source";
 
 struct AcceptedContextFixture {
     workspace: Workspace,
@@ -198,6 +199,21 @@ fn reuse_checkout(fixture: &AcceptedContextFixture) -> String {
 }
 
 fn write_source_rollout(workspace: &Workspace, thread: &str, compacted: bool) -> PathBuf {
+    let mut lines = vec![source_session_meta(thread), visible_source_message()];
+    if compacted {
+        lines.push(json!({
+            "type": "compacted",
+            "payload": {"summary": "synthetic opaque replacement"}
+        }));
+    }
+    write_source_rollout_lines(workspace, thread, &lines)
+}
+
+fn write_source_rollout_lines(
+    workspace: &Workspace,
+    file_thread: &str,
+    lines: &[Value],
+) -> PathBuf {
     let directory = workspace
         .home
         .join("sessions")
@@ -205,17 +221,7 @@ fn write_source_rollout(workspace: &Workspace, thread: &str, compacted: bool) ->
         .join("10")
         .join("18");
     fs::create_dir_all(&directory).unwrap();
-    let path = directory.join(format!("rollout-2026-10-18T00-00-00-{thread}.jsonl"));
-    let mut lines = vec![json!({
-        "type": "session_meta",
-        "payload": {"id": thread, "session_id": thread}
-    })];
-    if compacted {
-        lines.push(json!({
-            "type": "compacted",
-            "payload": {"summary": "synthetic opaque replacement"}
-        }));
-    }
+    let path = directory.join(format!("rollout-2026-10-18T00-00-00-{file_thread}.jsonl"));
     let mut contents = String::new();
     for line in lines {
         contents.push_str(&line.to_string());
@@ -223,6 +229,56 @@ fn write_source_rollout(workspace: &Workspace, thread: &str, compacted: bool) ->
     }
     fs::write(&path, contents).unwrap();
     path
+}
+
+fn source_session_meta(thread: &str) -> Value {
+    json!({
+        "type": "session_meta",
+        "payload": {"id": thread, "session_id": thread}
+    })
+}
+
+fn visible_source_message() -> Value {
+    json!({
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "response_id": "fixture-visible-source-response",
+            "content": [{"type": "output_text", "text": "synthetic visible source input"}]
+        }
+    })
+}
+
+fn write_forked_source_rollout(workspace: &Workspace, thread: &str) -> PathBuf {
+    let lines = [
+        json!({
+            "type": "session_meta",
+            "payload": {
+                "id": thread,
+                "session_id": thread,
+                "forked_from_id": "fixture-parent-source"
+            }
+        }),
+        visible_source_message(),
+    ];
+    write_source_rollout_lines(workspace, thread, &lines)
+}
+
+fn write_mismatched_source_rollout(workspace: &Workspace, requested: &str) -> PathBuf {
+    let lines = [
+        json!({
+            "type": "session_meta",
+            "payload": {
+                "id": MISMATCHED_SOURCE,
+                "session_id": MISMATCHED_SOURCE,
+                "forked_from_id": "fixture-parent-source"
+            }
+        }),
+        source_session_meta(requested),
+        visible_source_message(),
+    ];
+    write_source_rollout_lines(workspace, requested, &lines)
 }
 
 fn source_gaps(evidence: &Value) -> Vec<String> {
@@ -397,7 +453,9 @@ fn accepted_reused_checkout_keeps_exact_retained_evidence_in_both_stages() {
             "{evidence}"
         );
         assert!(
-            prompt.contains("sourceContext.gaps identify missing or compacted coverage"),
+            prompt.contains(
+                "sourceContext.gaps identify missing, mismatched, ambiguous or compacted coverage"
+            ),
             "{prompt}"
         );
     }
@@ -463,7 +521,9 @@ fn accepted_source_missing_stays_explicit_in_both_stages() {
             "{evidence}"
         );
         assert!(
-            prompt.contains("sourceContext.gaps identify missing or compacted coverage"),
+            prompt.contains(
+                "sourceContext.gaps identify missing, mismatched, ambiguous or compacted coverage"
+            ),
             "{prompt}"
         );
         assert!(
@@ -506,10 +566,10 @@ fn accepted_source_compaction_stays_explicit_in_both_stages() {
         assert!(
             source_gaps(&evidence)
                 .iter()
-                .any(|gap| gap.contains("compacted history")),
+                .any(|gap| gap.contains("compacted window(s)")),
             "{evidence}"
         );
-        assert!(prompt.contains("compacted history"), "{prompt}");
+        assert!(prompt.contains("compacted window(s)"), "{prompt}");
         assert!(
             prompt.contains("Opaque reasoning, pre-compaction content"),
             "{prompt}"
@@ -517,6 +577,95 @@ fn accepted_source_compaction_stays_explicit_in_both_stages() {
         assert!(
             !prompt.contains("synthetic opaque replacement"),
             "opaque source content must not be decoded: {prompt}"
+        );
+    }
+}
+
+#[test]
+fn accepted_source_fork_marker_is_ambiguous_not_compaction_in_both_stages() {
+    let fixture = accepted_context_fixture("accepted-context-fork-marker");
+    write_forked_source_rollout(&fixture.workspace, EXECUTOR_SOURCE);
+    write_source_rollout(&fixture.workspace, LEAD_THREAD, false);
+
+    let completed = run_context_chain(&fixture);
+    assert_eq!(completed.outcome.exit_code, 0, "{}", completed.transcript);
+    for (prompt, evidence) in both_stage_prompt_evidence(&fixture.workspace) {
+        assert_eq!(evidence["status"], "verified", "{evidence}");
+        assert_eq!(
+            evidence["sourceContext"]["status"], "available",
+            "{evidence}"
+        );
+        let executor = &evidence["sourceContext"]["executor"];
+        assert_eq!(executor["thread"], EXECUTOR_SOURCE, "{evidence}");
+        assert_eq!(executor["recordedThread"], EXECUTOR_SOURCE, "{evidence}");
+        assert_eq!(executor["identityMatches"], true, "{evidence}");
+        assert_eq!(executor["status"], "available", "{evidence}");
+        assert_eq!(executor["historyMarkerObserved"], true, "{evidence}");
+        assert_eq!(executor["compactionObserved"], false, "{evidence}");
+        assert_eq!(executor["compactedWindows"], 0, "{evidence}");
+        assert!(
+            executor["coverage"]["recognizedEvents"].as_u64().unwrap() > 0,
+            "visible source content must be recognized: {evidence}"
+        );
+        let gaps = source_gaps(&evidence);
+        assert!(
+            gaps.iter().any(|gap| {
+                gap.contains("fork marker is ambiguous")
+                    && gap.contains("does not establish compaction")
+                    && gap.contains("unavailable visible content")
+            }),
+            "{evidence}"
+        );
+        assert!(
+            !gaps.iter().any(|gap| gap.contains("compacted window(s)")),
+            "{evidence}"
+        );
+        assert!(prompt.contains("fork marker is ambiguous"), "{prompt}");
+        assert!(
+            !prompt.contains("records 1 compacted window(s)"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("pre-compaction content is not decoded"),
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
+fn accepted_source_recorded_identity_mismatch_stays_explicit_in_both_stages() {
+    let fixture = accepted_context_fixture("accepted-context-source-mismatched");
+    write_mismatched_source_rollout(&fixture.workspace, EXECUTOR_SOURCE);
+    write_source_rollout(&fixture.workspace, LEAD_THREAD, false);
+
+    let completed = run_context_chain(&fixture);
+    assert_eq!(completed.outcome.exit_code, 0, "{}", completed.transcript);
+    for (prompt, evidence) in both_stage_prompt_evidence(&fixture.workspace) {
+        assert_eq!(evidence["status"], "verified", "{evidence}");
+        assert_eq!(
+            evidence["sourceContext"]["status"], "mismatched",
+            "{evidence}"
+        );
+        let executor = &evidence["sourceContext"]["executor"];
+        assert_eq!(executor["thread"], EXECUTOR_SOURCE, "{evidence}");
+        assert_eq!(executor["recordedThread"], MISMATCHED_SOURCE, "{evidence}");
+        assert_eq!(executor["identityMatches"], false, "{evidence}");
+        assert_eq!(executor["status"], "mismatched", "{evidence}");
+        assert_eq!(executor["compactionObserved"], false, "{evidence}");
+        let gaps = source_gaps(&evidence);
+        assert!(
+            gaps.iter().any(|gap| {
+                gap.contains(&format!(
+                    "records thread identity {MISMATCHED_SOURCE} instead of requested executor source '{EXECUTOR_SOURCE}'"
+                )) && gap.contains("not attributed")
+            }),
+            "{evidence}"
+        );
+        assert!(prompt.contains("records thread identity"), "{prompt}");
+        assert!(prompt.contains(MISMATCHED_SOURCE), "{prompt}");
+        assert!(
+            prompt.contains("its coverage is not attributed"),
+            "{prompt}"
         );
     }
 }

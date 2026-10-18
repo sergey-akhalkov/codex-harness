@@ -1136,10 +1136,10 @@ fn stage_plan(
 const ACCEPTED_DESCRIPTION_BYTES: usize = 2048;
 const ACCEPTED_COMMENT_BYTES: usize = 768;
 const ACCEPTED_COMMENT_LIMIT: usize = 6;
-const SOURCE_INTEGRITY_WARNINGS: [&str; 11] = [
+const AMBIGUOUS_HISTORY_WARNING: &str = "forked_or_compacted_history";
+const SOURCE_INTEGRITY_WARNINGS: [&str; 10] = [
     "conflicting_thread_ids",
     "corrupt_jsonl",
-    "forked_or_compacted_history",
     "interrupted_turn",
     "invalid_event",
     "invalid_event_type",
@@ -1220,8 +1220,12 @@ fn source_context_entry(
         "turn": turn,
         "otherSessions": other_sessions,
         "rollout": Value::Null,
+        "recordedThread": Value::Null,
+        "identityMatches": false,
         "status": "missing",
+        "compactedWindows": 0,
         "compactionObserved": false,
+        "historyMarkerObserved": false,
         "warnings": [],
         "sourceIntegrityWarnings": [],
         "coverage": Value::Null,
@@ -1236,7 +1240,19 @@ fn source_context_entry(
                 .filter(|warning| SOURCE_INTEGRITY_WARNINGS.contains(&warning.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            let compaction_observed = summary.warnings.contains("forked_or_compacted_history");
+            let recorded_thread = summary
+                .row
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let identity_matches = recorded_thread.as_deref() == Some(thread);
+            let compacted_windows = summary
+                .row
+                .get("compacted_windows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let compaction_observed = compacted_windows > 0;
+            let history_marker_observed = summary.warnings.contains(AMBIGUOUS_HISTORY_WARNING);
             let mut status = if compaction_observed {
                 "compacted"
             } else {
@@ -1248,11 +1264,19 @@ fn source_context_entry(
                     "the source rollout {} for {role} session '{thread}' could not be read; source history is unavailable and is not reconstructed",
                     path.display()
                 ));
-            } else if summary.coverage.corrupt_lines > 0
+            } else if !identity_matches {
+                status = "mismatched";
+                gaps.push(format!(
+                    "the located source rollout {} records thread identity {} instead of requested {role} source '{thread}'; its coverage is not attributed and is not reconstructed",
+                    path.display(),
+                    recorded_thread.as_deref().unwrap_or("unresolved")
+                ));
+            }
+            if summary.coverage.corrupt_lines > 0
                 || summary.coverage.oversized_lines > 0
                 || summary.coverage.unrecognized_events > 0
             {
-                if status != "compacted" {
+                if !matches!(status, "compacted" | "unreadable" | "mismatched") {
                     status = "partial";
                 }
                 gaps.push(format!(
@@ -1265,13 +1289,17 @@ fn source_context_entry(
             }
             if compaction_observed {
                 gaps.push(format!(
-                    "the source rollout {} for {role} session '{thread}' records forked or compacted history; pre-compaction content may be absent and is not decoded or reconstructed",
+                    "the source rollout {} for {role} session '{thread}' records {compacted_windows} compacted window(s); pre-compaction content is not decoded or reconstructed",
+                    path.display()
+                ));
+            } else if history_marker_observed {
+                gaps.push(format!(
+                    "the source rollout {} for {role} session '{thread}' reports {AMBIGUOUS_HISTORY_WARNING} without a compacted-window event; the fork marker is ambiguous and does not establish compaction or unavailable visible content",
                     path.display()
                 ));
             }
             if !source_integrity_warnings.is_empty()
-                && status != "compacted"
-                && status != "unreadable"
+                && !matches!(status, "compacted" | "unreadable" | "mismatched")
             {
                 status = "partial";
                 gaps.push(format!(
@@ -1286,8 +1314,12 @@ fn source_context_entry(
                 "turn": turn,
                 "otherSessions": other_sessions,
                 "rollout": path.display().to_string(),
+                "recordedThread": recorded_thread,
+                "identityMatches": identity_matches,
                 "status": status,
+                "compactedWindows": compacted_windows,
                 "compactionObserved": compaction_observed,
+                "historyMarkerObserved": history_marker_observed,
                 "warnings": warnings,
                 "sourceIntegrityWarnings": source_integrity_warnings,
                 "coverage": {
@@ -1405,6 +1437,8 @@ fn accepted_source_context(chain: &ChainState, binding: &AcceptanceBinding) -> V
         "missing"
     } else if statuses.contains(&"unreadable") {
         "unreadable"
+    } else if statuses.contains(&"mismatched") {
+        "mismatched"
     } else if statuses.contains(&"compacted") {
         "compacted"
     } else if statuses.contains(&"partial") {
@@ -1414,11 +1448,11 @@ fn accepted_source_context(chain: &ChainState, binding: &AcceptanceBinding) -> V
     };
     json!({
         "status": status,
-        "statusMeaning": "bounded source rollout coverage; missing or compacted history does not invalidate the retained accepted result, but it must remain explicit",
+        "statusMeaning": "bounded source rollout coverage; identity mismatch, corrupt or unavailable evidence and observed compaction stay explicit; a fork marker alone does not establish compaction",
         "executor": executor,
         "lead": lead,
         "gaps": gaps,
-        "reconstruction": "Opaque reasoning, pre-compaction content and unavailable source history are not decoded or reconstructed.",
+        "reconstruction": "Opaque reasoning, pre-compaction content and unavailable source history are not decoded or reconstructed. A fork-only history marker is not treated as compaction evidence.",
     })
 }
 
@@ -1793,7 +1827,7 @@ fn push_accepted_gaps(
 
 fn executor_prompt(chain: &ChainState) -> io::Result<String> {
     Ok(format!(
-        "Bounded read-only executor self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\n{accepted_boundary}\n{accepted_context}\nThis fork preserves the accepted executor conversation as far as the native source provides it; sourceContext.gaps identify missing or compacted coverage. The stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. Source coverage gaps are limits on available evidence, not findings about the accepted work. Do not decode opaque reasoning, reconstruct pre-compaction history, or use the current checkout as a substitute. Analyze the assignment and the executor's visible work under the executor self-reflection role, separating observed facts from hypotheses. Do not continue the source task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
+        "Bounded read-only executor self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\n{accepted_boundary}\n{accepted_context}\nThe native fork is the primary visible source context and preserves the accepted executor conversation as far as the native source provides it; sourceContext.gaps identify missing, mismatched, ambiguous or compacted coverage. The stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. Source coverage gaps are limits on available evidence, not findings about the accepted work. Do not decode opaque reasoning, treat a fork marker as proof of compaction, reconstruct pre-compaction history, or use the current checkout as a substitute. Analyze the assignment and the executor's visible work under the executor self-reflection role, separating observed facts from hypotheses. Do not continue the source task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
         task = chain.task,
         run = chain.run,
         acceptance = chain.acceptance,
@@ -1819,7 +1853,7 @@ fn lead_prompt(chain: &ChainState, executor: &StageState) -> io::Result<String> 
         .unwrap_or("unrecorded");
     let turn = executor.turn_id.as_deref().unwrap_or("unrecorded");
     Ok(format!(
-        "Bounded read-only lead self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\n{accepted_boundary}\n{accepted_context}\nRetained executor reflection (stage {EXECUTOR_STAGE}, fork {fork}, turn {turn}):\n<<<EXECUTOR REFLECTION\n{result}\nEXECUTOR REFLECTION>>>\n\nThe stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. The lead fork preserves the accepted lead conversation as far as the native source provides it; sourceContext.gaps identify missing or compacted coverage. Source coverage gaps are limits on available evidence, not findings about the accepted work. Do not decode opaque reasoning, reconstruct pre-compaction history, or use the current checkout as a substitute. Analyze the lead's visible conduct under the lead self-reflection role and synthesize both perspectives. Preserve supported disagreement and keep missing evidence explicitly unknown. Do not repeat or accept the task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
+        "Bounded read-only lead self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\n{accepted_boundary}\n{accepted_context}\nRetained executor reflection (stage {EXECUTOR_STAGE}, fork {fork}, turn {turn}):\n<<<EXECUTOR REFLECTION\n{result}\nEXECUTOR REFLECTION>>>\n\nThe stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. The native fork is the primary visible source context and preserves the accepted lead conversation as far as the native source provides it; sourceContext.gaps identify missing, mismatched, ambiguous or compacted coverage. Source coverage gaps are limits on available evidence, not findings about the accepted work. Do not decode opaque reasoning, treat a fork marker as proof of compaction, reconstruct pre-compaction history, or use the current checkout as a substitute. Analyze the lead's visible conduct under the lead self-reflection role and synthesize both perspectives. Preserve supported disagreement and keep missing evidence explicitly unknown. Do not repeat or accept the task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
         task = chain.task,
         run = chain.run,
         acceptance = chain.acceptance,
