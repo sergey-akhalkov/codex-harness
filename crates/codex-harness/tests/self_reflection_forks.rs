@@ -151,6 +151,7 @@ enum LeadMode {
 #[derive(Default)]
 struct LeadState {
     accepted: bool,
+    delivery_visible: bool,
     client_id: Option<String>,
     text: Option<String>,
     source_turn: Option<String>,
@@ -289,7 +290,7 @@ fn configure_lead(server: &Server, mode: LeadMode, state: Arc<Mutex<LeadState>>)
                 if let Some(turn) = &state.source_turn {
                     turns.push(json!({"id": turn, "status": "completed", "items": []}));
                 }
-                if state.accepted && mode == LeadMode::Delivered {
+                if state.accepted && (mode == LeadMode::Delivered || state.delivery_visible) {
                     turns.push(json!({
                         "id": LEAD_TURN,
                         "status": "completed",

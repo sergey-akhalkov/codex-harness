@@ -365,6 +365,13 @@ checkpoint, pending work, recovery state and the controller's verified process
 liveness and log location. Disable prevents new stages and preserves retained
 results and journal configuration, including other consumers' use.
 
+Status distinguishes pending model stages from unfinished work and retained,
+undelivered synthesis. `process` also reconciles an already submitted stage or
+delivery; an empty new-stage queue does not mean that the lead received the
+result. The owned consumer observes queued delivery without repeating either
+reflection. An indeterminate or failed delivery stops automatic processing and
+keeps the existing receipt for explicit reconciliation after its cause is resolved.
+
 Recovery is explicit and model-free. After inspecting the reported gap,
 `recover --resolution resume-retained --project CHECKOUT` continues from a
 recorded retained journal floor. For a reconciled source or unjournaled gap,

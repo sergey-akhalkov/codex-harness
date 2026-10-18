@@ -61,6 +61,15 @@ fn success(output: std::process::Output) -> Value {
 }
 
 fn process(workspace: &Workspace, request: &Value) -> ConsoleOutcome {
+    wait_session(
+        ConsoleSession::spawn(ConsoleSpec::new(process_spec(
+            workspace, request, "process",
+        )))
+        .unwrap(),
+    )
+}
+
+fn process_spec(workspace: &Workspace, request: &Value, action: &str) -> CommandSpec {
     let mut spec = chain_spec(
         workspace,
         request,
@@ -70,12 +79,11 @@ fn process(workspace: &Workspace, request: &Value) -> ConsoleOutcome {
         LEAD_RESULT,
         None,
     );
-    // The adapter must derive everything from native owners. A request file
-    // prepared by the shared fixture helper is deliberately unavailable.
+    // Derived native inputs must suffice without a caller-authored request.
     fs::remove_file(&workspace.request).unwrap();
     spec.args = vec![
         "delivery-improvement".into(),
-        "process".into(),
+        action.into(),
         "--project".into(),
         workspace.checkout.as_os_str().to_owned(),
         "--source".into(),
@@ -85,7 +93,7 @@ fn process(workspace: &Workspace, request: &Value) -> ConsoleOutcome {
     ];
     spec.env
         .insert("CODEX_THREAD_ID".into(), Some(LEAD_THREAD.into()));
-    wait_session(ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap())
+    spec
 }
 
 #[test]
@@ -128,6 +136,81 @@ fn normal_cli_derives_the_chain_and_retains_completed_delivery_without_replay() 
     let status = success(command(&workspace, "status", None));
     assert_eq!(status["pending"], 0);
     assert_eq!(status["retained"], 1);
+}
+
+#[test]
+fn normal_cli_reconciles_a_queued_delivery_without_repeating_stages() {
+    let workspace = Workspace::new("lifecycle-queued", LeadMode::Queued);
+    let (controller, request, acceptance) = accepted::accepted(&workspace);
+    install_fixture(&workspace);
+    let first = process(&workspace, &request);
+    assert_eq!(first.outcome.exit_code, 3, "{}", first.transcript);
+    let retained = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(retained.executor.state, StageState::Retained);
+    assert_eq!(retained.lead.state, StageState::Retained);
+    assert_ne!(retained.delivery, DeliveryState::Consumed);
+    let status = success(command(&workspace, "status", None));
+    assert_eq!(status["pending"], 0);
+    assert_eq!(status["unfinished"], 1);
+    assert_eq!(status["undelivered"], 1);
+    let calls = request_counts(&workspace);
+    let second = process(&workspace, &request);
+    assert_eq!(second.outcome.exit_code, 3, "{}", second.transcript);
+    assert_eq!(request_counts(&workspace), calls);
+    assert_ne!(
+        controller.record(&acceptance).unwrap().unwrap().delivery,
+        DeliveryState::Consumed
+    );
+    workspace.lead_state.lock().unwrap().delivery_visible = true;
+    let delivered = process(&workspace, &request);
+    assert_eq!(delivered.outcome.exit_code, 0, "{}", delivered.transcript);
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap().delivery,
+        DeliveryState::Consumed
+    );
+}
+
+#[test]
+fn owned_consumer_observes_queued_delivery_and_stops_after_disable() {
+    let workspace = Workspace::new("lifecycle-owned-queue", LeadMode::Queued);
+    let (controller, request, acceptance) = accepted::accepted(&workspace);
+    install_fixture(&workspace);
+    let state_path = controller.state_file().unwrap();
+    let mut spec = process_spec(&workspace, &request, "_serve");
+    spec.env
+        .insert("HARNESS_REFLECTION_HOST".into(), Some(LEAD_THREAD.into()));
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let await_delivery = |expected: DeliveryState| {
+        let until = Instant::now() + Duration::from_secs(90);
+        loop {
+            let state: harness_core::delivery_reflection::ReflectionState =
+                serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+            let record = &state.records[&acceptance];
+            if record.delivery == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "expected {expected:?}; observed {:?}",
+                record.delivery
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    await_delivery(DeliveryState::Unknown);
+    let calls = request_counts(&workspace);
+    assert_eq!(calls, (1, 1, 1, 1));
+    workspace.lead_state.lock().unwrap().delivery_visible = true;
+    await_delivery(DeliveryState::Consumed);
+    assert_eq!(request_counts(&workspace), calls);
+    success(command(&workspace, "disable", None));
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap().delivery,
+        DeliveryState::Consumed
+    );
 }
 
 #[test]

@@ -5,7 +5,8 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ActivationRequest, JournalPolicy, LifecycleStatus, ReflectionController, ReflectionRecord,
+    ActivationRequest, DeliveryState as RecordedDeliveryState, JournalPolicy, LifecycleStatus,
+    ReflectionController, ReflectionRecord, StageState as RecordedStageState,
 };
 
 const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\nRun enable/process/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
@@ -226,6 +227,8 @@ fn status(controller: &ReflectionController, home: &Path) -> io::Result<i32> {
             "journal": state.journal,
             "retained": state.records.len(),
             "pending": controller.pending_jobs()?.len(),
+            "unfinished": state.records.values().filter(|record| record.delivery != RecordedDeliveryState::Consumed).count(),
+            "undelivered": state.records.values().filter(|record| retained_delivery(record)).count(),
             "recovery": state.recovery,
             "lastPoll": state.last_poll,
             "stateFile": controller.state_file()?,
@@ -325,20 +328,54 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
             recovery.detail
         )));
     }
-    let Some(job) = polled.jobs.first() else {
+    let record = if let Some(job) = polled.jobs.first() {
+        Some(
+            controller
+                .record(&job.acceptance_id)?
+                .ok_or_else(|| invalid("the queued acceptance disappeared"))?,
+        )
+    } else {
+        // New-stage admission and retained delivery are different work. A
+        // restart must still observe an already submitted turn or synthesis;
+        // absence of a new-stage job never proves that delivery finished.
+        controller.stored_state()?.and_then(|state| {
+            state.records.into_values().find(|record| {
+                record.executor.state == RecordedStageState::InFlight
+                    || record.lead.state == RecordedStageState::InFlight
+                    || retained_delivery(record)
+            })
+        })
+    };
+    let Some(record) = record else {
         if !quiet {
-            println!(
-                "{}",
-                json!({"lifecycle": "active", "pending": 0, "modelCalls": 0})
-            );
+            return status(controller, &options.home);
         }
         return Ok(0);
     };
-    let record = controller
-        .record(&job.acceptance_id)?
-        .ok_or_else(|| invalid("the queued acceptance disappeared"))?;
     let request = request(options, controller, &record)?;
-    accepted::execute(request, &options.project)
+    let delivery_path = request.state_dir.join("lead-delivery.json");
+    let exit = accepted::execute(request, &options.project)?;
+    if quiet && exit != 0 {
+        let delivery: DeliveryState = read_json(&delivery_path, MAX_REQUEST_BYTES)?;
+        if !matches!(delivery.state.as_str(), "queued" | "pending") {
+            return Err(invalid(format!(
+                "retained lead delivery is {}; preserve {} and run delivery-improvement process after resolving its cause: {}",
+                delivery.state,
+                delivery_path.display(),
+                delivery
+                    .detail
+                    .as_deref()
+                    .unwrap_or("delivery is not established")
+            )));
+        }
+    }
+    Ok(exit)
+}
+
+fn retained_delivery(record: &ReflectionRecord) -> bool {
+    record.executor.state == RecordedStageState::Retained
+        && record.lead.state == RecordedStageState::Retained
+        && record.delivery != RecordedDeliveryState::Consumed
 }
 
 fn serve(options: &Options) -> io::Result<i32> {
