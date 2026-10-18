@@ -38,6 +38,185 @@ All tasks remain subject to actual checks and the preserved evaluation gate. The
 - [ ] 4.3 Complete update/disconnect/rollback and continuation outside the kit, preserving boards, journal users/settings, pending stage results, original executor slots and unrelated configuration. Verify ordinary feedback and lead/executor behavior with the mode disabled and actual role/model identities when enabled; reuse still-applicable checks.
 - [ ] 4.4 Reconcile docs/project-decisions.md, docs/agent-delegation.md, docs/rust-native.md, docs/installation.md and affected owned skills. Map every scenario in both deltas to applicable evidence, run strict OpenSpec validation and harness-source-check, and keep all unmet implementation/acceptance tasks unchecked.
 
+### Task 4.4 scenario evidence map
+
+Every scenario below is named once: `D` follows delivery-improvement order and
+`F` follows orchestration-feedback-loop order. Evidence keys name a suite/test
+and revision; counts are the executed runs retained by the private 2026-10-18
+acceptance snapshot. They were not rerun at the current base, so an
+earlier-revision run does not cover later source changes. `CTX8` is the exact
+base run. Raw logs, private paths and private identities remain outside this
+repository.
+
+- `CORE10` - `crates/harness-core/tests/delivery_reflection.rs` 10/10 at `25a3dd2`.
+- `FORK24` - complete `crates/codex-harness/tests/self_reflection_forks.rs` 24/24 at `9067f6f` (root, lifecycle, installed and accepted modules then present), including the focused ordinary-acceptance lifecycle case.
+- `CTX8` - source-context module 8/8 at `03b8434` (current base).
+- `BUDGET4` - budget module 4/4 at `a4b641c`; accepted 3/3 and existing accounting 1/1 in the same run.
+- `ASSIGN29` - `crates/codex-harness/tests/executor_assignment.rs` 29/29 at `e390bcb` (acceptance producer and purpose lineage).
+- `ADMIT` - shared admission 4/4 unit, 18/18 native and 1/1 ordinary concurrency at `f7d6479`; retained-capacity case 1/1 at `20f6b8c`.
+- `CHAIN` - native board-to-fork/ledger 17/17 at `6ad0857`, discovery 2/2; accepted-reference delivery 18/18 at `5bf351e`.
+- `BRANCH` - native branch switch and same-acceptance reconciliation 1/1 at `f4e1577`.
+- `INSTALL` - isolated install 1/1 at `16126e9` with role resolution 4/4; installed lifecycle 1/1 and installed-context 3/3 at `9a02dda`.
+- `FEEDBACK25` - `crates/harness-core/src/board_feedback.rs` 25/25 at `70e3d502`.
+- `FEEDBACK28` - `crates/codex-harness/tests/feedback_cli.rs` 28/28 applicable at `70e3d502`; one pre-existing ignored OpenSpec archive case remains excluded.
+- `SEMANTIC` - six synthetic reviewer-calibration cases only; no real panel, reflection judgment or benefit claim.
+- `SRC` - source inspection only; not an executed check.
+
+Tags: `exec` executed native component; `installed` isolated installed/model-free
+consumption; `source` implementation inspection only; `held` deliberately not
+run under qualification; `gap` unmet or unverified acceptance.
+
+**Explicit activation with a bounded mandate**
+
+- `D1 A user enables improvement` - `INSTALL`, `FORK24::normal_cli_derives_the_chain_and_retains_completed_delivery_without_replay` `[installed+exec]`. Real-user enable and ordinary work continuing in a globally installed lead remain `G2`.
+- `D2 Duplicate activation` - `SRC` `ReflectionController::activate` reuses the existing binding and increments only on a lead/run/stopped transition `[source]`. No executed duplicate-enable case; recorded as an unexecuted component check below.
+- `D3 Mode is disabled` - `FORK24::foreign_lead_is_refused_and_disabled_processing_keeps_pending_work`, `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only`, `FEEDBACK25`/`FEEDBACK28` ordinary feedback `[exec]`. Real ordinary lead/executor behavior with the mode off remains `G2`.
+
+**Accepted ordinary work is the automatic trigger**
+
+- `D4 The lead accepts the corrected result` - `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only`, `FORK24::native_accepted_closure_retains_both_stages_delivery_and_usage_without_replay`, `CHAIN` `[exec]`; assignment/comments supply correction history through the retained board context.
+- `D5 The executor submits an initial report` - `CORE10::initial_reports_rejections_and_nonordinary_lineage_never_trigger` `[exec]`.
+- `D6 A task is closed for another reason` - `CORE10::initial_reports_rejections_and_nonordinary_lineage_never_trigger` `[exec]`.
+
+**Durable board events preserve trigger identity**
+
+- `D7 Events are replayed after restart` - `CORE10::durable_chain_unknown_capacity_and_cumulative_limits_survive_restart`, `FORK24::completed_stages_are_reused_without_duplicate_forks_or_turns`, `BUDGET4` `[exec]`.
+- `D8 The same acceptance is closed again` - `CORE10::duplicate_reclose_and_new_identity_are_distinct_then_drift_is_exposed` `[exec]`.
+- `D9 Journal coverage is unavailable` - `CORE10::journal_disable_and_pruned_gap_recover_without_a_silent_cursor_jump`, `FORK24::native_journal_recovery_is_explicit_and_preserves_retained_work`, `BRANCH` `[exec]`.
+- `D10 The feature prepares and stops event access` - `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only`, `FORK24::native_journal_recovery_is_explicit_and_preserves_retained_work`, `INSTALL` disconnect preservation `[exec+installed]`.
+
+**Executor self-reflection and lead synthesis**
+
+- `D11 Missing input caused avoidable rework` - prompt/source context is implemented (`SRC` `self_reflection_cli.rs` prompts and accepted context), but no real-model judgment was executed; `SEMANTIC` does not establish diagnosis `[gap G1]`.
+- `D12 The executor missed an existing requirement` - same evidence boundary; no real-model executor-versus-lead attribution test `[gap G1]`.
+- `D13 No useful improvement is found` - `FORK24::no_finding_completion_is_retained_and_still_synthesized` proves deterministic no-finding retention and lead continuation `[exec]`; whether a real reflection correctly chooses no finding remains `G1`.
+- `D14 A correction implicated both roles` - both stages and synthesis are executed (`FORK24`), but supported-disagreement judgment was not `[gap G1]`.
+- `D15 Lead criticism introduced a new requirement` - no executed semantic distinction between an existing defect and a new requirement `[gap G1]`.
+- `D16 Several executor outcomes are already pending` - `SRC` records and lead eligibility are per acceptance; no shared-synthesis/coalescing case was executed. The scenario says outcomes "may" share one synthesis, so per-record processing is not a hard failure `[source]`.
+
+**Forks have bounded reflection authority**
+
+- `D17 The source has an active goal and write tools` - `FORK24::native_reflection_forks_preserve_sources_retain_results_and_charge_only_new_turns`, `inherited_goal_failure_refuses_turn_and_does_not_replay`, `reflection_marker_blocks_nested_harness_commands` `[exec]`.
+- `D18 A source context was compacted or is unavailable` - `CTX8::accepted_source_missing_stays_explicit_in_both_stages`, `accepted_source_compaction_stays_explicit_in_both_stages`, `accepted_source_fork_marker_is_ambiguous_not_compaction_in_both_stages` `[exec, exact base]`.
+- `D19 Effective routing differs from the declaration` - `FORK24::source_run_and_effective_model_drift_refuse_before_any_fork`, `INSTALL` role resolution `[exec+installed]`.
+
+**Evidence remains attributable to accepted work**
+
+- `D20 The worktree was reused` - `CTX8::accepted_reused_checkout_keeps_exact_retained_evidence_in_both_stages` `[exec, exact base]`.
+- `D21 An operation's cause remains unclear` - `CTX8` gap/identity tests preserve missing coverage and uncertainty; targeted operation/check-detail retrieval for a concrete question was not executed `[gap G9]`.
+- `D22 Acceptance metadata claims success` - `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only`, `CTX8::accepted_evidence_exposes_a_changed_result_in_both_stages`, and the prompt's closure-only trigger rule `[exec+source]`.
+
+**Session purpose prevents recursive improvement**
+
+- `D23 An improvement executor completes` - `ASSIGN29::accept_improvement_work_never_auto_triggers_reflection` `[exec]`.
+- `D24 Improvement work is split or resumed` - `ASSIGN29::improvement_descendants_keep_purpose_across_subdivision_rename_retry_and_resume` `[exec]`.
+- `D25 Purpose metadata is contradictory` - `ASSIGN29::accept_refuses_missing_and_reset_descendant_purpose`, `CORE10::initial_reports_rejections_and_nonordinary_lineage_never_trigger` `[exec]`.
+
+**Reflection is visible and shares capacity**
+
+- `D26 Capacity is occupied` - `ADMIT`, `FORK24::occupied_shared_capacity_keeps_the_closure_pending_then_freed_capacity_runs_it` `[exec]`.
+- `D27 A reflection surface closes` - `FORK24::interrupted_unknown_and_visibility_loss_outcomes_are_not_replayed` proves new work stops and the turn is not replayed, but `SRC` `accepted.rs::run_recorded_stage` then refuses the stage as requiring "explicit recovery" and no restore/reconcile command exists `[gap G5, requirement/implementation mismatch]`.
+
+**Finite cumulative costs**
+
+- `D28 A job reaches its allowance` - `BUDGET4::token_exhaustion_blocks_the_lead_and_resume_keeps_the_first_stage_usage` `[exec]`.
+- `D29 Usage is unavailable or exceeds reservation` - `BUDGET4::unknown_new_turn_usage_stays_explicit_and_blocks_dependent_work`, `FORK24::missing_new_turn_usage_stays_unknown_and_copied_source_is_not_charged` `[exec]`.
+- `D30 Nothing newly eligible has completed` - `SRC` `process` is an explicit model-free poll and there is no timer/watcher; `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only` shows `model_calls=0` and no state mutation `[source+exec]`. Elapsed-time behavior itself was not executed; unexecuted check below.
+
+**Durable outcomes advance the chain safely**
+
+- `D31 A worker prints a final-looking report` - `SRC` `accepted.rs::run_recorded_stage` requires the retained native `StageStatus::Completed` before continuing past a recorded attempt and never consults transcript text `[source]`. No executed case injects final-looking text with an incomplete native stage; listed as an unexecuted component check below.
+- `D32 Delivery is interrupted` - `FORK24::normal_cli_reconciles_a_queued_delivery_without_repeating_stages`, `queued_and_indeterminate_lead_returns_are_not_delivered_or_resent` `[exec]`.
+- `D33 The ordinary lead lacks a supported return path` - `FORK24::missing_lead_return_endpoint_refuses_before_stages_and_retries_once` `[exec]`.
+
+**Findings identify a useful owning remedy**
+
+- `D34 A clear tool defect can be repaired` - `FEEDBACK28::verified_improvement_uses_one_episode_and_repairs_partial_promotion_without_votes`, `FEEDBACK25` verified-admission units `[exec]`; real lead verification remains `G1`.
+- `D35 An incident does not justify a global rule` - no executed semantic restraint or no-finding judgment `[gap G1]`.
+- `D36 A reusable executor practice is proposed` - no executed real reflection recommendation; skill-candidate evaluation remains pending `[gap G1]`.
+- `D37 A synthesis is useful` - `FORK24::normal_cli_derives_the_chain_and_retains_completed_delivery_without_replay` proves verified delivery to the real lead; the real lead's task decision is not executed `[exec+gap G1/G2]`.
+- `D38 A known or rejected idea returns` - `FEEDBACK28::hypothesis_search_reuses_prior_conclusions_and_never_duplicates_cards`, `promotion_is_explicit_recorded_and_never_repeated` `[exec]`; real-lead recommendation deduplication remains `G1`.
+
+**The real lead owns tasks and decisions; proportionate opportunities**
+
+- `D39 Suitable capacity becomes available` - `ADMIT` capacity release and `ASSIGN29` purpose marking `[exec]`; real lead assignment through the ordinary committed-base path remains `G3`.
+- `D40 Main work has higher priority` - no executed real-lead scheduling or trade-off decision `[gap G3]`.
+- `D41 A private task reveals a shared defect` - `FEEDBACK28::verified_improvement_kit_route_keeps_private_provenance_out_of_public_writes` `[exec]`.
+- `D42 A remedy would narrow acceptance` - no executed user/lead decision on changed promised outcome `[gap G1/G3]`.
+
+**Guidance changes are actually consumed**
+
+- `D43 Guidance is published during ongoing work` - `INSTALL` installation/role resolution only; intended new-session skill consumption is unobserved `[gap G8]`.
+- `D44 The updated skill has not been loaded` - correctly remains unverified; installation success is not reported as improved behavior `[gap G8]`.
+
+**Improvement claims retain complete outcome evidence**
+
+- `D45 A deterministic defect is fixed` - deterministic counterexamples are exercised directly by `CTX8::accepted_source_missing_stays_explicit_in_both_stages`, `CTX8::accepted_source_fork_marker_is_ambiguous_not_compaction_in_both_stages` and `ADMIT` refusal cases, and were accepted without a model-backed whole-task run `[exec]`. The proportionality policy itself is acceptance practice, not a separate runtime assertion.
+- `D46 Messages decrease but quality worsens` - no matched guidance comparison was run `[gap G7]`.
+- `D47 Post-acceptance reflection is evaluated` - no frozen real comparison or post-trigger horizon was run `[gap G7]`.
+- `D48 The experiment is not qualified` - `SEMANTIC` plus the snapshot's control status: no measured control was dispatched and candidate models remain inactive `[held]`.
+- `D49 Isolated implementation proceeds during qualification` - model-free implementation and component checks in this map proceeded with the candidate inactive `[exec+held]`.
+- `D50 The matched benefit gate fails` - not run; no benefit or adverse outcome exists yet `[gap G7]`.
+
+**Recovery preserves ownership and partial work; installed use**
+
+- `D51 Stop occurs between reflection stages` - `BUDGET4::token_exhaustion_blocks_the_lead_and_resume_keeps_the_first_stage_usage`, `FORK24::completed_stages_are_reused_without_duplicate_forks_or_turns`, `failed_executor_stage_stays_unknown_and_resume_starts_no_model_work` `[exec]`.
+- `D52 The lead is replaced` - `FORK24::foreign_lead_is_refused_and_disabled_processing_keeps_pending_work` shows a foreign lead refused; `SRC` `lifecycle.rs` refuses `enable` for another lead and `recover` requires the current lead, while core `activate` rebinds only without in-flight/unknown stages. No supported cross-session successor transfer exists `[gap G4, requirement/implementation mismatch]`.
+- `D53 The user disables the feature` - `FORK24::owned_consumer_observes_queued_delivery_and_stops_after_disable`, `foreign_lead_is_refused_and_disabled_processing_keeps_pending_work` `[exec]`; disable during an in-flight model turn or partial implementation remains `G6`.
+- `D54 A consumer completes an improvement` - no real installed vertical slice from accepted ordinary work to applied and consumed improvement `[gap G2]`.
+- `D55 Improvement completion does not recurse` - `ASSIGN29` purpose tests and `CORE10::initial_reports_rejections_and_nonordinary_lineage_never_trigger` `[exec]`; the real installed event path is part of `G2`.
+- `D56 Update or activation fails` - `INSTALL` disconnect preservation, `CORE10` activation refusal and `FORK24::native_journal_recovery_is_explicit_and_preserves_retained_work` `[exec+installed]`; complete update/rollback outside the kit remains `G2/G6`.
+
+**Feedback triage, routing and admission**
+
+- `F1 An executor reports friction twice` - `FEEDBACK25::lead_and_executor_feedback_is_recorded_and_listed_without_chat`, `FEEDBACK28::bounded_triage_counts_once_and_excludes_diagnostics` `[exec+source]`: two records and lead batch triage are exercised; the same-executor two-episode identity and executor-session continuity are source-level only (recording is a separate model-free command), so that remainder is listed below.
+- `F2 The lead wants to correct course` - `FEEDBACK25::lead_and_executor_feedback_is_recorded_and_listed_without_chat` `[exec]`.
+- `F3 Role reflections find actionable friction` - `FEEDBACK28::derived_intake_links_the_source_without_a_vote_or_another_card`, `FORK24` read-only forks `[exec]`; real-lead recording/decision remains `G1`.
+- `F4 A verified procedure is not voted into a skill` - `FEEDBACK25::verified_procedure_is_handed_off_without_votes_or_package_writes` `[exec]`.
+- `F5 Orchestration friction stays in the incubator` - `FEEDBACK25::observation_kinds_route_and_promote_by_consequence` `[exec]`.
+- `F6 Kit skill demand does not write the package` - `FEEDBACK25::kit_concern_promotes_without_private_data_or_package_writes`, `FEEDBACK28::verified_improvement_kit_route_keeps_private_provenance_out_of_public_writes` `[exec]`.
+- `F7 A confirmed tool defect follows the activated path` - `FEEDBACK28::verified_improvement_uses_one_episode_and_repairs_partial_promotion_without_votes`, `FEEDBACK25` admission units `[exec]`.
+- `F8 Similar feedback arrives from two executors` - `FEEDBACK25::lead_batch_triage_merges_similar_feedback_with_one_vote_each`, `FEEDBACK28::bounded_triage_counts_once_and_excludes_diagnostics` `[exec]`.
+- `F9 One agent repeatedly votes for its own idea` - `FEEDBACK25::vote_integrity_rejects_repeats_and_diagnostics_on_the_board`, `same_reporter_repeat_is_visible_and_not_counted` `[exec]`.
+- `F10 Reflection restates a reported correction` - `FEEDBACK25::derived_comment_round_trip_retains_source_and_never_counts_as_a_vote`, `FEEDBACK28::derived_intake_links_the_source_without_a_vote_or_another_card` `[exec]`.
+- `F11 A third distinct vote promotes an item` - `FEEDBACK25::vote_threshold_promotes_to_backlog_with_history`, `distinct_reporters_count_once_each` `[exec]`.
+- `F12 A promoted item changes behavior` - `FEEDBACK25::requirement_change_enters_openspec_with_recorded_override`, `FEEDBACK28::openspec_change_promotion_validates_the_change_and_preserves_its_draft` `[exec]`.
+- `F13 An unverified idea is raised during improvement mode` - `FEEDBACK25::route_and_promotion_records_round_trip_and_evidence_is_validated` rejects below-threshold and empty-consequence evidence; `FEEDBACK28::verified_improvement_refuses_inactive_wrong_lead_unrelated_and_stale_work_before_writes` refuses vote-free admission without the active lifecycle, current lead and matching acceptance, leaving the item in the incubator `[exec]`; real semantic classification remains `G1`.
+- `F14 Repeated vote and diagnostic observation` - `FEEDBACK28::bounded_triage_counts_once_and_excludes_diagnostics`, `FEEDBACK25::vote_integrity_rejects_repeats_and_diagnostics_on_the_board` `[exec]`.
+- `F15 Failure after an applied action` - `FEEDBACK28::partial_triage_failure_reports_the_applied_prefix_and_recovers` `[exec]`.
+- `F16 Real consumer board` - `FEEDBACK28::installed_kit_limits_apply_without_codex_home` uses a temporary outside-checkout board, but through the built manager rather than a globally delivered command `[exec+gap G2]`.
+- `F17 Consumer uses customized installed limits` - `FEEDBACK28::installed_kit_limits_apply_without_a_source_flag` `[exec]`.
+- `F18 Completed promotion is retried` - `FEEDBACK28::completed_promotion_retry_confirms_without_writes`, `verified_improvement_uses_one_episode_and_repairs_partial_promotion_without_votes` `[exec]`.
+- `F19 Retry requests a different promotion` - `FEEDBACK25::requirement_change_enters_openspec_with_recorded_override` refuses a different OpenSpec target, `FEEDBACK28::promotion_is_explicit_recorded_and_never_repeated` confirms recorded outcomes; the different-route branch is `SRC` `reconcile_promotion` `[exec+source]`.
+- `F20 Admission is attempted after the mode stops` - `FEEDBACK28::verified_improvement_refuses_inactive_wrong_lead_unrelated_and_stale_work_before_writes` `[exec]`.
+- `F21 A single reproduced failure has a bounded remedy` - `FEEDBACK28::verified_improvement_uses_one_episode_and_repairs_partial_promotion_without_votes` `[exec]`; real-lead verification and remedy choice remain `G1`.
+- `F22 Evidence becomes inapplicable before assignment` - `FEEDBACK28::verified_improvement_refuses_inactive_wrong_lead_unrelated_and_stale_work_before_writes` (reopened task, unrelated binding, stopped mode) `[exec]`.
+- `F23 A historical item becomes relevant now` - `FEEDBACK28::verified_improvement_uses_one_episode_and_repairs_partial_promotion_without_votes` reuses an existing item and preserves its vote/derived history `[exec]`; explicit prior-rejection reopening by a real lead remains `G1`.
+- `F24 Ordinary optimization has an uncertain opportunity to repay` - `FEEDBACK28::hypothesis_search_reuses_prior_conclusions_and_never_duplicates_cards`, `ledger_keeps_unknown_and_stale_pacing_evidence_honest` `[exec]`; the real-lead benefit judgment remains `G3/G7`.
+- `F25 The real lead delegates a synthesized remedy` - `ASSIGN29::improvement_descendants_keep_purpose_across_subdivision_rename_retry_and_resume`, `accept_improvement_work_never_auto_triggers_reflection` `[exec]`; real lead delegation and creation remain `G2/G3`.
+- `F26 A reflection result is retried` - `FEEDBACK28::derived_provenance_survives_merge_and_partial_retry`, `derived_copy_recovers_an_interrupted_merge_without_duplicates` `[exec]`.
+
+### Remaining acceptance gaps
+
+- `G1` Real-model semantic judgment for both reflection roles and synthesis: missing-input diagnosis, executor-versus-lead causation, lead-introduced requirements, global-rule restraint, reusable practice, real no-finding judgment and real-lead recommendation decisions (`D11,D12,D14,D15,D34-D38,F3,F13,F21-F25`). Six synthetic calibration cases are not a substitute; tasks 1.3, 3.3 and 4.2 remain open.
+- `G2` Real installed vertical slice and global delivery: accepted ordinary work through real executor reflection, lead synthesis, real-lead decision, applied/consumed improvement, plus disabled-mode ordinary use and the globally delivered feedback command (`D1,D3,D37,D43,D54,D55,D56,F16,F25`). Tasks 2.6, 2.7 and 4.1 remain open.
+- `G3` Real-lead scheduling, priority, one-improvement-in-flight and bounded deferral/rejection behavior (`D39,D40,D42,F24,F25`). Task 3.4 remains open.
+- `G4` Lead succession is not implemented as a supported cross-session transfer: `lifecycle.rs` refuses a different lead on `enable`, `recover` requires the retained lead, and core rebinding refuses in-flight/unknown stages (`D52`). Task 3.5 remains open; this is a concrete requirement/implementation mismatch.
+- `G5` A closed reflection surface stops new work but no owning lifecycle restores visibility or reconciles the in-flight turn; the retained stage is permanently refused as "explicit recovery" while no such command exists (`D27`). Tasks 3.2 and 3.5 remain open; this is a concrete requirement/implementation mismatch.
+- `G6` Disable/update/rollback during an in-flight model turn or partial improvement, with preservation of boards, pending results, original executor slots and unrelated configuration (`D53,D56`). Tasks 3.5 and 4.3 remain open.
+- `G7` Frozen real comparison, matched quality/time/token benefit gate, real panel, post-acceptance horizon, adverse/inconclusive retention and baseline restoration (`D46,D47,D50,F24`). Tasks 1.3 and 4.2 remain open; candidate remains inactive.
+- `G8` Actual new-session loading/consumption of both reflection skills and any later guidance revision (`D43,D44`). Tasks 2.6 and 4.1 remain open.
+- `G9` Targeted retrieval of authorized operation/check detail for an unclear cause, without opaque-state decoding (`D21`). Task 3.8 remains open.
+- Unexecuted low-cost component checks, not new acceptance gates: duplicate-enable reuse (`D2`); elapsed-time/no-new-outcome behavior beyond source inspection (`D30`); optional multi-outcome shared synthesis (`D16`, permissive only); final-looking text with an incomplete native stage (`D31`); same-executor two-episode/session-continuity recording (`F1`).
+
+Task 4.4 remains unchecked because `G1-G9` are unmet or unverified. Docs
+`project-decisions.md`, `agent-delegation.md` and `installation.md` already
+describe the candidate as inactive/not delivered; no stale operation claim was
+found. Strict OpenSpec validation passed, and the checkout-built
+`harness-source-check --root .` reported 0 findings on 1,086 working-tree files.
+`docs/rust-native.md` is owned by the sibling work and was not edited. No delta
+requirement was changed or weakened.
+
 ## Workflow follow-up
 
 - After complete implementation and acceptance, archive the change, verify the archived result and push the scoped changes.
