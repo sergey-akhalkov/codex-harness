@@ -24,7 +24,11 @@ fn wait_until(mut ready: impl FnMut() -> bool, timeout: Duration, description: &
 }
 
 fn wait_for_submitted_stage(workspace: &Workspace) -> Value {
-    let path = workspace.state.join("executor-stage.json");
+    wait_for_submitted_stage_in(&workspace.state)
+}
+
+fn wait_for_submitted_stage_in(state_dir: &Path) -> Value {
+    let path = state_dir.join("executor-stage.json");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(bytes) = fs::read(&path)
@@ -88,6 +92,10 @@ fn lose_submitted_stage(name: &str, run: &str) -> (Workspace, Value, Value, Path
 }
 
 fn assert_exact_reflection_frontend(workspace: &Workspace) {
+    assert_exact_reflection_frontend_in(workspace, &workspace.state)
+}
+
+fn assert_exact_reflection_frontend_in(workspace: &Workspace, state_dir: &Path) {
     let argv = fs::read_to_string(workspace.home.join("frontend-argv.txt")).unwrap();
     let args = argv.lines().collect::<Vec<_>>();
     assert!(args.contains(&"--remote"), "{argv}");
@@ -103,12 +111,9 @@ fn assert_exact_reflection_frontend(workspace: &Workspace) {
         .position(|arg| *arg == "resume")
         .unwrap_or_else(|| panic!("frontend did not resume a thread: {argv}"));
     assert_eq!(args.get(resume + 1), Some(&EXECUTOR_FORK), "{argv}");
-    let token = fs::read_to_string(
-        workspace
-            .state
-            .join("executor-self-reflection-reconcile/endpoint.token"),
-    )
-    .unwrap();
+    let token =
+        fs::read_to_string(state_dir.join("executor-self-reflection-reconcile/endpoint.token"))
+            .unwrap();
     assert!(
         !argv.contains(token.trim()),
         "frontend argv leaked its token"
@@ -438,5 +443,194 @@ fn native_accepted_visibility_loss_recovers_exact_submitted_turn_without_second_
     assert_eq!(
         record.executor.usage.context_bytes,
         executor["work"]["context_bytes"].as_u64().unwrap()
+    );
+}
+
+/// The ordinary delivery-improvement process derives its request and state
+/// paths from the retained board acceptance. Losing its owning manager after a
+/// submitted native turn must recover that exact turn without a caller-authored
+/// request, a second fork/turn, or a repeated lead delivery.
+#[test]
+fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_request() {
+    let workspace = Workspace::new("normal-process-visibility-recovery", LeadMode::Delivered);
+    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    lifecycle::install_fixture(&workspace);
+    let before = controller.stored_state().unwrap().unwrap();
+    let enabled = lifecycle::success(lifecycle::command(&workspace, "enable", Some(LEAD_THREAD)));
+    assert_eq!(enabled["checkpoint"], before.checkpoint);
+    assert_eq!(enabled["revision"], before.binding.revision);
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must not require a caller-authored request"
+    );
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+
+    let mut first_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME".into(),
+        Some("mutator-window".into()),
+    );
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let session = ConsoleSession::spawn(ConsoleSpec::new(first_spec)).unwrap();
+    let pid = session.identity().pid;
+    let submitted = wait_for_submitted_stage_in(&state_dir);
+    let accepted_work_before = read_json(&state_dir.join("chain.json"))["acceptedWork"].clone();
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        submitted["fork"]["forkThread"], EXECUTOR_FORK,
+        "{submitted}"
+    );
+    assert_eq!(submitted["turnId"], EXECUTOR_FORK_TURN, "{submitted}");
+    let work_before = submitted["work"].clone();
+    let source_context_before = submitted["sourceContextBytes"].clone();
+    let in_flight = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(in_flight.executor.state, RecordedStageState::InFlight);
+    let (rollout_path, rollout_bytes) = executor_rollout(&workspace.home);
+
+    terminate_pid(pid);
+    let lost = wait_session(session);
+    assert_ne!(lost.outcome.exit_code, 0, "{}", lost.transcript);
+    assert_eq!(read_json(&state_dir.join("executor-stage.json")), submitted);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        in_flight,
+        "the owning process loss changed the accepted ledger"
+    );
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must derive the retained request instead of writing one"
+    );
+
+    let _ = fs::remove_file(workspace.home.join("frontend-argv.txt"));
+    let _ = fs::remove_file(workspace.home.join("frontend-release"));
+    workspace.lead_state.lock().unwrap().source_turn_active = true;
+    let mut recovering_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    recovering_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let recovering = ConsoleSession::spawn(ConsoleSpec::new(recovering_spec)).unwrap();
+    wait_until(
+        || {
+            fs::read(state_dir.join("executor-stage.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|stage| stage["status"] == "completed")
+        },
+        Duration::from_secs(20),
+        "the ordinary process did not recover the submitted executor stage",
+    );
+    assert_exact_reflection_frontend_in(&workspace, &state_dir);
+    workspace.lead_state.lock().unwrap().source_turn_active = false;
+    let recovered = wait_session(recovering);
+    assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
+
+    let executor = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(executor["status"], "completed", "{executor}");
+    assert_eq!(executor["fork"]["forkThread"], EXECUTOR_FORK, "{executor}");
+    assert_eq!(executor["turnId"], EXECUTOR_FORK_TURN, "{executor}");
+    assert_eq!(executor["result"], EXECUTOR_RESULT, "{executor}");
+    assert_actual_route(&executor);
+    assert_eq!(executor["work"], work_before, "{executor}");
+    assert_eq!(
+        executor["sourceContextBytes"], source_context_before,
+        "{executor}"
+    );
+    assert_usage(
+        &executor,
+        120,
+        570,
+        "executor-self-reflection-new-turn",
+        EXECUTOR_SOURCE_TURN,
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 1, 1, 1),
+        "recovery forked or submitted the executor a second time"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "recovery started a new thread"
+    );
+    let resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    assert_eq!(
+        resumes[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{resumes:?}"
+    );
+    assert_eq!(
+        executor_rollout(&workspace.home),
+        (rollout_path, rollout_bytes),
+        "recovery changed the original turn's rollout cost evidence"
+    );
+    assert_eq!(
+        read_json(&state_dir.join("chain.json"))["acceptedWork"],
+        accepted_work_before,
+        "recovery changed the accepted context"
+    );
+
+    let lead = read_json(&state_dir.join("lead-stage.json"));
+    assert_eq!(lead["status"], "completed", "{lead}");
+    assert_eq!(lead["fork"]["forkThread"], LEAD_FORK, "{lead}");
+    assert_eq!(lead["turnId"], LEAD_FORK_TURN, "{lead}");
+    assert_eq!(lead["result"], LEAD_RESULT, "{lead}");
+    assert_eq!(lead["profile"], "default", "{lead}");
+    assert_eq!(lead["provider"], PROVIDER, "{lead}");
+    assert_eq!(lead["model"], MODEL, "{lead}");
+    assert_eq!(lead["effort"], EFFORT, "{lead}");
+    assert_eq!(
+        lead["roleRevision"].as_str(),
+        Some(role_facts().lead_revision.as_str()),
+        "{lead}"
+    );
+    assert!(
+        lead["visibleTitle"]
+            .as_str()
+            .is_some_and(|title| title.contains("profile=default")
+                && title.contains(&format!("provider={PROVIDER}"))
+                && title.contains(&format!("model={MODEL}"))
+                && title.contains(&format!("effort={EFFORT}"))),
+        "{lead}"
+    );
+    let delivery = read_json(&state_dir.join("lead-delivery.json"));
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    assert_eq!(delivery["by"], "clientId", "{delivery}");
+    let lead_requests = workspace.lead.requests_for("turn/start");
+    assert_eq!(lead_requests.len(), 1, "{lead_requests:?}");
+    assert_eq!(
+        lead_requests[0]["params"]["clientUserMessageId"], delivery["clientMessageId"],
+        "{lead_requests:?}"
+    );
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, RecordedStageState::Retained);
+    assert_eq!(record.lead.state, RecordedStageState::Retained);
+    assert_eq!(record.delivery, DeliveryState::Consumed);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 0);
+    assert_eq!(
+        record.executor.usage.context_bytes,
+        executor["work"]["context_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(record.lead.usage.attempts, 1);
+    assert_eq!(record.lead.usage.turns, 1);
+    assert_eq!(record.lead.usage.tokens, 240);
+    assert_eq!(record.usage_totals().tokens, 360);
+    assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must not write a caller-authored request"
     );
 }

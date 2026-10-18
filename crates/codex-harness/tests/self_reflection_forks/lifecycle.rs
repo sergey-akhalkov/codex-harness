@@ -3,7 +3,7 @@
 use super::*;
 use harness_core::delivery_reflection::{DeliveryState, LifecycleStatus, StageState};
 
-fn install_fixture(workspace: &Workspace) {
+pub(super) fn install_fixture(workspace: &Workspace) {
     let bin = workspace.home.join("harness/bin");
     fs::create_dir_all(&bin).unwrap();
     fs::copy(fixture(), bin.join("codex.exe")).unwrap();
@@ -21,7 +21,11 @@ fn install_fixture(workspace: &Workspace) {
     .unwrap();
 }
 
-fn command(workspace: &Workspace, action: &str, lead: Option<&str>) -> std::process::Output {
+pub(super) fn command(
+    workspace: &Workspace,
+    action: &str,
+    lead: Option<&str>,
+) -> std::process::Output {
     command_with(workspace, action, lead, &[])
 }
 
@@ -75,7 +79,7 @@ fn command_from(
         .unwrap()
 }
 
-fn success(output: std::process::Output) -> Value {
+pub(super) fn success(output: std::process::Output) -> Value {
     assert!(
         output.status.success(),
         "{} {}",
@@ -102,7 +106,8 @@ fn process_spec(workspace: &Workspace, request: &Value, action: &str) -> Command
 }
 
 /// Derived native inputs must suffice without a caller-authored request.
-fn process_spec_from(
+
+pub(super) fn process_spec_from(
     workspace: &Workspace,
     manager: &Path,
     lead_thread: &str,
