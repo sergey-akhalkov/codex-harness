@@ -90,22 +90,27 @@ fn wait_for_submitted_stage(workspace: &Workspace) -> Value {
     wait_for_submitted_stage_in(&workspace.state)
 }
 
-fn wait_for_submitted_stage_in(state_dir: &Path) -> Value {
+fn wait_for_stage_status_in(state_dir: &Path, status: &str, description: &str) -> Value {
     let path = state_dir.join("executor-stage.json");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(bytes) = fs::read(&path)
             && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-            && value["status"] == "turn-submitted"
+            && value["status"] == status
         {
             return value;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the executor stage did not retain its submitted turn within 20s"
-        );
+        assert!(Instant::now() < deadline, "{description} within 20s");
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn wait_for_submitted_stage_in(state_dir: &Path) -> Value {
+    wait_for_stage_status_in(
+        state_dir,
+        "turn-submitted",
+        "the executor stage did not retain its submitted turn",
+    )
 }
 
 fn executor_rollout(home: &Path) -> (PathBuf, Vec<u8>) {
@@ -180,7 +185,11 @@ fn assert_exact_reflection_frontend_in(workspace: &Workspace, state_dir: &Path) 
         let retained = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("-native") || name.ends_with("-reconcile"));
+            .is_some_and(|name| {
+                name.ends_with("-native")
+                    || name.ends_with("-reconcile")
+                    || name.ends_with("-recover")
+            });
         let token = path.join("endpoint.token");
         if retained && token.is_file() {
             tokens.push((token.clone(), fs::read_to_string(token).unwrap()));
@@ -528,12 +537,14 @@ fn native_accepted_visibility_loss_recovers_exact_submitted_turn_without_second_
 
 /// The ordinary delivery-improvement process derives its request and state
 /// paths from the retained board acceptance. Losing only its owned reflection
-/// frontend after a submitted native turn must restore visibility in the same
-/// manager and recover that exact turn without a caller-authored request, a
-/// second fork/turn, or a repeated lead delivery.
+/// frontend after a submitted native turn - while the owning manager stays
+/// alive - must restore visibility in the same manager and recover that exact
+/// turn without a caller-authored request, a second fork/turn, or a repeated
+/// lead delivery.
 #[test]
-fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_request() {
-    let workspace = Workspace::new("normal-process-visibility-recovery", LeadMode::Delivered);
+fn native_normal_process_frontend_only_visibility_loss_recovers_exact_accepted_turn_without_request()
+ {
+    let workspace = Workspace::new("normal-process-frontend-loss-recovery", LeadMode::Delivered);
     let (controller, _request, acceptance) = accepted::accepted(&workspace);
     lifecycle::install_fixture(&workspace);
     let before = controller.stored_state().unwrap().unwrap();
@@ -697,6 +708,430 @@ fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_re
     assert_eq!(record.lead.state, RecordedStageState::Retained);
     assert_eq!(record.delivery, DeliveryState::Consumed);
     assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 0);
+    assert_eq!(
+        record.executor.usage.context_bytes,
+        executor["work"]["context_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(record.lead.usage.attempts, 1);
+    assert_eq!(record.lead.usage.turns, 1);
+    assert_eq!(record.lead.usage.tokens, 240);
+    assert_eq!(record.usage_totals().tokens, 360);
+    assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must not write a caller-authored request"
+    );
+}
+
+/// The ordinary delivery-improvement process derives its request and state
+/// paths from the retained board acceptance. Losing its owning manager after a
+/// submitted native turn must recover that exact turn without a caller-authored
+/// request, a second fork/turn, or a repeated lead delivery.
+#[test]
+fn native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_request() {
+    let workspace = Workspace::new("normal-process-visibility-recovery", LeadMode::Delivered);
+    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    lifecycle::install_fixture(&workspace);
+    let before = controller.stored_state().unwrap().unwrap();
+    let enabled = lifecycle::success(lifecycle::command(&workspace, "enable", Some(LEAD_THREAD)));
+    assert_eq!(enabled["checkpoint"], before.checkpoint);
+    assert_eq!(enabled["revision"], before.binding.revision);
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must not require a caller-authored request"
+    );
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+
+    let mut first_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME".into(),
+        Some("mutator-window".into()),
+    );
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let session = ConsoleSession::spawn(ConsoleSpec::new(first_spec)).unwrap();
+    let pid = session.identity().pid;
+    let submitted = wait_for_submitted_stage_in(&state_dir);
+    let accepted_work_before = read_json(&state_dir.join("chain.json"))["acceptedWork"].clone();
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        submitted["fork"]["forkThread"], EXECUTOR_FORK,
+        "{submitted}"
+    );
+    assert_eq!(submitted["turnId"], EXECUTOR_FORK_TURN, "{submitted}");
+    let work_before = submitted["work"].clone();
+    let source_context_before = submitted["sourceContextBytes"].clone();
+    let in_flight = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(in_flight.executor.state, RecordedStageState::InFlight);
+    let (rollout_path, rollout_bytes) = executor_rollout(&workspace.home);
+
+    terminate_pid(pid);
+    let lost = wait_session(session);
+    assert_ne!(lost.outcome.exit_code, 0, "{}", lost.transcript);
+    assert_eq!(read_json(&state_dir.join("executor-stage.json")), submitted);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        in_flight,
+        "the owning process loss changed the accepted ledger"
+    );
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must derive the retained request instead of writing one"
+    );
+
+    let _ = fs::remove_file(workspace.home.join("frontend-argv.txt"));
+    let _ = fs::remove_file(workspace.home.join("frontend-release"));
+    workspace.lead_state.lock().unwrap().source_turn_active = true;
+    let mut recovering_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    recovering_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let recovering = ConsoleSession::spawn(ConsoleSpec::new(recovering_spec)).unwrap();
+    wait_until(
+        || {
+            fs::read(state_dir.join("executor-stage.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|stage| stage["status"] == "completed")
+        },
+        Duration::from_secs(20),
+        "the ordinary process did not recover the submitted executor stage",
+    );
+    assert_exact_reflection_frontend_in(&workspace, &state_dir);
+    workspace.lead_state.lock().unwrap().source_turn_active = false;
+    let recovered = wait_session(recovering);
+    assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
+
+    let executor = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(executor["status"], "completed", "{executor}");
+    assert_eq!(executor["fork"]["forkThread"], EXECUTOR_FORK, "{executor}");
+    assert_eq!(executor["turnId"], EXECUTOR_FORK_TURN, "{executor}");
+    assert_eq!(executor["result"], EXECUTOR_RESULT, "{executor}");
+    assert_actual_route(&executor);
+    assert_eq!(executor["work"], work_before, "{executor}");
+    assert_eq!(
+        executor["sourceContextBytes"], source_context_before,
+        "{executor}"
+    );
+    assert_usage(
+        &executor,
+        120,
+        570,
+        "executor-self-reflection-new-turn",
+        EXECUTOR_SOURCE_TURN,
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 1, 1, 1),
+        "recovery forked or submitted the executor a second time"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "recovery started a new thread"
+    );
+    let resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    assert_eq!(
+        resumes[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{resumes:?}"
+    );
+    assert_eq!(
+        executor_rollout(&workspace.home),
+        (rollout_path, rollout_bytes),
+        "recovery changed the original turn's rollout cost evidence"
+    );
+    assert_eq!(
+        read_json(&state_dir.join("chain.json"))["acceptedWork"],
+        accepted_work_before,
+        "recovery changed the accepted context"
+    );
+
+    let lead = read_json(&state_dir.join("lead-stage.json"));
+    assert_eq!(lead["status"], "completed", "{lead}");
+    assert_eq!(lead["fork"]["forkThread"], LEAD_FORK, "{lead}");
+    assert_eq!(lead["turnId"], LEAD_FORK_TURN, "{lead}");
+    assert_eq!(lead["result"], LEAD_RESULT, "{lead}");
+    assert_eq!(lead["profile"], "default", "{lead}");
+    assert_eq!(lead["provider"], PROVIDER, "{lead}");
+    assert_eq!(lead["model"], MODEL, "{lead}");
+    assert_eq!(lead["effort"], EFFORT, "{lead}");
+    assert_eq!(
+        lead["roleRevision"].as_str(),
+        Some(role_facts().lead_revision.as_str()),
+        "{lead}"
+    );
+    assert!(
+        lead["visibleTitle"]
+            .as_str()
+            .is_some_and(|title| title.contains("profile=default")
+                && title.contains(&format!("provider={PROVIDER}"))
+                && title.contains(&format!("model={MODEL}"))
+                && title.contains(&format!("effort={EFFORT}"))),
+        "{lead}"
+    );
+    let delivery = read_json(&state_dir.join("lead-delivery.json"));
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    assert_eq!(delivery["by"], "clientId", "{delivery}");
+    let lead_requests = workspace.lead.requests_for("turn/start");
+    assert_eq!(lead_requests.len(), 1, "{lead_requests:?}");
+    assert_eq!(
+        lead_requests[0]["params"]["clientUserMessageId"], delivery["clientMessageId"],
+        "{lead_requests:?}"
+    );
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, RecordedStageState::Retained);
+    assert_eq!(record.lead.state, RecordedStageState::Retained);
+    assert_eq!(record.delivery, DeliveryState::Consumed);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 0);
+    assert_eq!(
+        record.executor.usage.context_bytes,
+        executor["work"]["context_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(record.lead.usage.attempts, 1);
+    assert_eq!(record.lead.usage.turns, 1);
+    assert_eq!(record.lead.usage.tokens, 240);
+    assert_eq!(record.usage_totals().tokens, 360);
+    assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must not write a caller-authored request"
+    );
+}
+
+/// A pre-submission surface loss leaves a known fork with no turn. The
+/// ordinary owner must resume that exact fork, verify the replacement surface,
+/// then admit its initial turn once - never fork again and never replay an
+/// ambiguous submission.
+#[test]
+fn native_normal_process_pre_submission_visibility_loss_recovers_exact_retained_fork() {
+    let workspace = Workspace::new("normal-process-pre-submission-loss", LeadMode::Delivered);
+    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    lifecycle::install_fixture(&workspace);
+    lifecycle::success(lifecycle::command(&workspace, "enable", Some(LEAD_THREAD)));
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+
+    // The owned frontend double exits as soon as this marker exists. The
+    // ordinary process still creates and measures the exact fork, then loses
+    // its surface before any turn is submitted.
+    fs::write(
+        workspace.home.join("frontend-release"),
+        "pre-submission surface loss",
+    )
+    .unwrap();
+    let mut first_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME".into(),
+        Some("mutator-window".into()),
+    );
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let session = ConsoleSession::spawn(ConsoleSpec::new(first_spec)).unwrap();
+    let lost = wait_for_stage_status_in(
+        &state_dir,
+        "visibility-lost",
+        "the ordinary process did not retain the pre-submission surface loss",
+    );
+    assert_eq!(lost["fork"]["forkThread"], EXECUTOR_FORK, "{lost}");
+    assert!(lost["turnId"].is_null(), "{lost}");
+    assert!(
+        lost["error"].as_str().is_some_and(|error| {
+            error.contains("no turn was submitted") && error.contains("retryable")
+        }),
+        "{lost}"
+    );
+    let accepted_work_before = read_json(&state_dir.join("chain.json"))["acceptedWork"].clone();
+    let work_before = lost["work"].clone();
+    let source_context_before = lost["sourceContextBytes"].clone();
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 0, 0, 0),
+        "the pre-submission loss submitted model work"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "the first pass started a new thread instead of forking the source"
+    );
+    let in_flight = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(in_flight.executor.state, RecordedStageState::InFlight);
+    assert_eq!(in_flight.executor.usage.attempts, 1);
+    assert_eq!(in_flight.executor.usage.turns, 0);
+    let finished = wait_session(session);
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(read_json(&state_dir.join("executor-stage.json")), lost);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        in_flight,
+        "the pre-submission surface loss changed the accepted ledger"
+    );
+    assert!(
+        !workspace.request.exists(),
+        "ordinary process must derive the retained request instead of writing one"
+    );
+
+    // A second pre-submission loss must remain safely retryable: the owner
+    // resumes the known fork again, submits no turn, and keeps the ledger in
+    // flight for another ordinary-process attempt.
+    let still_lost_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    let still_lost =
+        wait_session(ConsoleSession::spawn(ConsoleSpec::new(still_lost_spec)).unwrap());
+    assert_ne!(still_lost.outcome.exit_code, 0, "{}", still_lost.transcript);
+    let retried_loss = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(retried_loss["status"], "visibility-lost", "{retried_loss}");
+    assert_eq!(
+        retried_loss["fork"]["forkThread"], EXECUTOR_FORK,
+        "{retried_loss}"
+    );
+    assert!(retried_loss["turnId"].is_null(), "{retried_loss}");
+    assert!(
+        retried_loss["error"].as_str().is_some_and(|error| {
+            error.contains("pre-submission reflection recovery")
+                && error.contains("No turn was submitted")
+        }),
+        "{retried_loss}"
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 0, 0, 0),
+        "repeated pre-submission loss submitted model work"
+    );
+    let retried_in_flight = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(
+        retried_in_flight.executor.state,
+        RecordedStageState::InFlight
+    );
+    assert_eq!(retried_in_flight.executor.usage.attempts, 1);
+    assert_eq!(retried_in_flight.executor.usage.turns, 0);
+    let retry_resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(retry_resumes.len(), 1, "{retry_resumes:?}");
+    assert_eq!(
+        retry_resumes[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{retry_resumes:?}"
+    );
+
+    fs::remove_file(workspace.home.join("frontend-release")).unwrap();
+    let mut recovering_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    recovering_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let recovering = ConsoleSession::spawn(ConsoleSpec::new(recovering_spec)).unwrap();
+    wait_until(
+        || {
+            fs::read(state_dir.join("executor-stage.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|stage| stage["status"] == "completed")
+        },
+        Duration::from_secs(20),
+        "the ordinary process did not complete the recovered pre-submission fork",
+    );
+    assert_exact_reflection_frontend_in(&workspace, &state_dir);
+    let recovered = wait_session(recovering);
+    assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
+
+    let executor = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(executor["status"], "completed", "{executor}");
+    assert_eq!(executor["fork"]["forkThread"], EXECUTOR_FORK, "{executor}");
+    assert_eq!(executor["turnId"], EXECUTOR_FORK_TURN, "{executor}");
+    assert_eq!(executor["result"], EXECUTOR_RESULT, "{executor}");
+    assert_actual_route(&executor);
+    assert_eq!(executor["work"], work_before, "{executor}");
+    assert_eq!(
+        executor["sourceContextBytes"], source_context_before,
+        "{executor}"
+    );
+    assert_usage(
+        &executor,
+        120,
+        570,
+        "executor-self-reflection-new-turn",
+        EXECUTOR_SOURCE_TURN,
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 1, 1, 1),
+        "recovery forked or submitted the executor twice"
+    );
+    let executor_turns = fixture_requests(&workspace, "executor-self-reflection", "turn/start");
+    assert_eq!(executor_turns.len(), 1, "{executor_turns:?}");
+    assert_eq!(
+        executor_turns[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{executor_turns:?}"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "recovery started a new thread"
+    );
+    let resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(resumes.len(), 2, "{resumes:?}");
+    for resume in &resumes {
+        assert_eq!(resume["params"]["threadId"], EXECUTOR_FORK, "{resumes:?}");
+    }
+    executor_rollout(&workspace.home);
+    assert_eq!(
+        read_json(&state_dir.join("chain.json"))["acceptedWork"],
+        accepted_work_before,
+        "recovery changed the accepted context"
+    );
+
+    let lead = read_json(&state_dir.join("lead-stage.json"));
+    assert_eq!(lead["status"], "completed", "{lead}");
+    assert_eq!(lead["fork"]["forkThread"], LEAD_FORK, "{lead}");
+    assert_eq!(lead["turnId"], LEAD_FORK_TURN, "{lead}");
+    assert_eq!(lead["result"], LEAD_RESULT, "{lead}");
+    assert_eq!(lead["profile"], "default", "{lead}");
+    assert_eq!(lead["provider"], PROVIDER, "{lead}");
+    assert_eq!(lead["model"], MODEL, "{lead}");
+    assert_eq!(lead["effort"], EFFORT, "{lead}");
+    assert_eq!(
+        lead["roleRevision"].as_str(),
+        Some(role_facts().lead_revision.as_str()),
+        "{lead}"
+    );
+    let delivery = read_json(&state_dir.join("lead-delivery.json"));
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    assert_eq!(delivery["by"], "clientId", "{delivery}");
+    let lead_requests = workspace.lead.requests_for("turn/start");
+    assert_eq!(lead_requests.len(), 1, "{lead_requests:?}");
+    assert_eq!(
+        lead_requests[0]["params"]["clientUserMessageId"], delivery["clientMessageId"],
+        "{lead_requests:?}"
+    );
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, RecordedStageState::Retained);
+    assert_eq!(record.lead.state, RecordedStageState::Retained);
+    assert_eq!(record.delivery, DeliveryState::Consumed);
+    assert_eq!(
+        record.executor.usage.attempts, 1,
+        "pre-submission recovery began a second stage attempt"
+    );
     assert_eq!(record.executor.usage.turns, 1);
     assert_eq!(record.executor.usage.tokens, 120);
     assert_eq!(record.executor.usage.investigations, 0);

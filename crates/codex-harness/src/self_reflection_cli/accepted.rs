@@ -3,8 +3,8 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ReflectionController, ReflectionRecord, Stage, StageStart, StageState as RecordedStageState,
-    UsageDelta,
+    ReflectionController, ReflectionRecord, Stage, StageAdmission,
+    StageState as RecordedStageState, UsageDelta,
 };
 
 pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
@@ -27,14 +27,14 @@ pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
     let (chain, _lease) = prepare_chain_with_acceptance(request, Some(record.binding.clone()))?;
     check_binding(&controller, &chain)?;
     preflight_lead(&chain)?;
-    let executor = run_recorded_stage(&controller, &chain, Stage::Executor, |start| {
-        run_executor(&chain, start.map(|start| &start.admission))
+    let executor = run_recorded_stage(&controller, &chain, Stage::Executor, |admission| {
+        run_executor(&chain, admission)
     })?;
     check_binding(&controller, &chain)?;
     preflight_lead(&chain)?;
     wait_for_lead_turn(&chain)?;
-    let lead = run_recorded_stage(&controller, &chain, Stage::Lead, |start| {
-        run_lead(&chain, &executor, start.map(|start| &start.admission))
+    let lead = run_recorded_stage(&controller, &chain, Stage::Lead, |admission| {
+        run_lead(&chain, &executor, admission)
     })?;
     check_binding(&controller, &chain)?;
     let delivery = match deliver_synthesis(&chain, &executor, &lead) {
@@ -100,7 +100,7 @@ fn run_recorded_stage(
     controller: &ReflectionController,
     chain: &ChainState,
     stage: Stage,
-    run: impl FnOnce(Option<&StageStart>) -> io::Result<StageState>,
+    run: impl FnOnce(Option<&StageAdmission>) -> io::Result<StageState>,
 ) -> io::Result<StageState> {
     let record = controller
         .record(&chain.acceptance)?
@@ -201,23 +201,45 @@ fn run_recorded_stage(
             }
         }
     }
-    let start = if starts_new_attempt {
-        Some(controller.begin_stage(&chain.acceptance, stage)?)
+    let admission = if starts_new_attempt {
+        controller.begin_stage(&chain.acceptance, stage)?.admission
     } else {
-        None
+        // Recovery reuses the retained attempt: it must not begin a new one,
+        // but it still needs the cumulative stage/record allowance captured
+        // before the lost surface so a restored turn cannot exceed it.
+        let state = controller.stored_state()?.ok_or_else(|| {
+            invalid("the accepted closure reflection state disappeared; no stage was admitted")
+        })?;
+        StageAdmission::new(&state.limits, &recorded.usage, &record.usage_totals())
     };
-    let state = match run(start.as_ref()) {
+    let state = match run(Some(&admission)) {
         Ok(state) => state,
         Err(error) => {
-            let submitted = fs::read(&state_path)
+            let native = fs::read(&state_path)
                 .ok()
-                .and_then(|bytes| serde_json::from_slice::<StageState>(&bytes).ok())
-                .is_some_and(|native| native.status == StageStatus::TurnSubmitted);
-            if submitted {
+                .and_then(|bytes| serde_json::from_slice::<StageState>(&bytes).ok());
+            if native
+                .as_ref()
+                .is_some_and(|native| native.status == StageStatus::TurnSubmitted)
+            {
                 // The native turn identity is retained. Keep the accepted
                 // ledger in flight so the ordinary process can restore the
                 // surface and reconcile that exact turn instead of refusing
                 // the record as a generic unknown attempt.
+                return Err(error);
+            }
+            let pre_submission_loss_retained = native.as_ref().is_some_and(|native| {
+                native.status == StageStatus::VisibilityLost
+                    && native.turn_id.is_none()
+                    && native.fork.is_some()
+            });
+            if pre_submission_loss_retained
+                && (starts_new_attempt || recorded.state == RecordedStageState::InFlight)
+            {
+                // The exact fork is known and no turn was submitted. Keep the
+                // accepted ledger in flight so the ordinary process can
+                // restore visibility and admit the initial turn once, instead
+                // of turning a safely retryable loss into an unknown attempt.
                 return Err(error);
             }
             if recorded.state != RecordedStageState::Retained {

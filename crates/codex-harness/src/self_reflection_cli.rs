@@ -2014,6 +2014,21 @@ fn run_stage(
             admission,
         );
     }
+    if state.status == StageStatus::VisibilityLost
+        && state.turn_id.is_none()
+        && state.fork.is_some()
+    {
+        return recover_pre_submission(
+            chain,
+            stage,
+            declaration,
+            prepared,
+            state_path,
+            state,
+            &prompt,
+            admission,
+        );
+    }
     if state.status != StageStatus::NotStarted {
         return Err(invalid(format!(
             "the {} stage already ended as {} ({}); its retained evidence is at {}. A fork or turn whose fate was not established is never replayed; inspect the evidence and start a new chain when appropriate",
@@ -2123,38 +2138,43 @@ fn run_stage(
     ) {
         Ok(frontend) => Some(frontend),
         Err(error) => {
-            state.status = StageStatus::Failed;
-            state.error = Some(error.to_string());
-            state.updated_ms = now_ms();
-            persist(state_path, &state)?;
-            return Err(error);
+            state.status = StageStatus::VisibilityLost;
+            state.error = Some(format!(
+                "the reflection surface could not be attached before model work started: {error}; no turn was submitted and the exact retained fork is retryable"
+            ));
+            return finish(state_path, state);
         }
     };
     let current = frontend
         .as_ref()
         .expect("the reflection frontend was attached immediately above");
-    let visible = wait_for_frontend(current, &mut conversation, true, &plan.title);
-    if let Err(error) = visible {
+    if let Err(error) = wait_for_frontend(current, &mut conversation, true, &plan.title) {
         state.status = StageStatus::VisibilityLost;
-        state.error = Some(error.to_string());
-        state.updated_ms = now_ms();
-        persist(state_path, &state)?;
-        if let Some(frontend) = frontend.take() {
-            let _ = frontend.close();
-        }
-        return Err(error);
-    }
-    if !current.is_running().unwrap_or(false) {
-        state.status = StageStatus::VisibilityLost;
-        state.error = Some("the reflection surface closed before model work started".to_owned());
-        state.updated_ms = now_ms();
-        persist(state_path, &state)?;
-        if let Some(frontend) = frontend.take() {
-            let _ = frontend.close();
-        }
-        return Err(invalid(
-            "the reflection surface closed before model work started; no turn was submitted",
+        state.error = Some(format!(
+            "the reflection surface did not become visible before model work started: {error}; no turn was submitted and the exact retained fork is retryable"
         ));
+        let retained = finish(state_path, state);
+        return close_frontend(
+            frontend
+                .take()
+                .expect("the reflection frontend was attached immediately above"),
+            retained,
+        );
+    }
+    let running = current.is_running().unwrap_or(false);
+    if !running {
+        state.status = StageStatus::VisibilityLost;
+        state.error = Some(
+            "the reflection surface closed before model work started; no turn was submitted and the exact retained fork is retryable"
+                .to_owned(),
+        );
+        let retained = finish(state_path, state);
+        return close_frontend(
+            frontend
+                .take()
+                .expect("the reflection frontend was attached immediately above"),
+            retained,
+        );
     }
     state.status = StageStatus::Visible;
     state.updated_ms = now_ms();
@@ -2169,26 +2189,59 @@ fn run_stage(
                 state.stage
             ));
             let retained = finish(state_path, state);
-            if let Some(frontend) = frontend.take() {
-                let _ = frontend.close();
-            }
-            return match retained {
-                Ok(_) => Err(error),
-                Err(retention) => Err(invalid(format!("{error}; {retention}"))),
+            let original = match retained {
+                Ok(_) => error,
+                Err(retention) => invalid(format!("{error}; {retention}")),
             };
+            return close_frontend(
+                frontend
+                    .take()
+                    .expect("the reflection frontend was attached immediately above"),
+                Err(original),
+            );
         }
     };
     state.turn_id = Some(turn.turn_id.clone());
     state.status = StageStatus::TurnSubmitted;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
+    drive_submitted_stage(
+        chain,
+        stage,
+        &plan,
+        &mut conversation,
+        frontend,
+        state,
+        &fork_thread,
+        &turn.turn_id,
+        state_path,
+        admission,
+    )
+}
+
+/// Drives one already-submitted reflection turn to its terminal state. The
+/// exact fork and turn identity are retained; losing the owned surface once
+/// replaces only that surface, and any later loss keeps the submitted turn
+/// recoverable without replay.
+fn drive_submitted_stage(
+    chain: &ChainState,
+    stage: Stage,
+    plan: &ControlPlan,
+    conversation: &mut Conversation,
+    mut frontend: Option<crate::executor_cli::OwnedFrontend>,
+    mut state: StageState,
+    fork_thread: &str,
+    turn: &str,
+    state_path: &Path,
+    admission: &StageAdmission,
+) -> io::Result<StageState> {
     let mut restored_visibility = false;
     let outcome = loop {
         let current = frontend
             .as_ref()
             .expect("the reflection frontend is present until this drive loop breaks");
         let driven = drive_turn(
-            &mut conversation,
+            conversation,
             current,
             chain,
             stage,
@@ -2200,9 +2253,9 @@ fn run_stage(
                 break retain_completed(
                     chain,
                     stage,
-                    &mut conversation,
+                    conversation,
                     state,
-                    &fork_thread,
+                    fork_thread,
                     state_path,
                     Some(admission),
                 );
@@ -2239,20 +2292,19 @@ fn run_stage(
                 let lost = frontend
                     .take()
                     .expect("the lost reflection frontend was attached");
-                match restore_reflection_frontend(&plan, &mut conversation, lost) {
+                match restore_reflection_frontend(plan, conversation, lost) {
                     Ok(restored) => {
                         frontend = Some(restored);
                         restored_visibility = true;
                         println!(
                             "{}: restored the owned reflection surface for retained fork {} turn {}; no new turn was submitted",
-                            state.stage, fork_thread, turn.turn_id
+                            state.stage, fork_thread, turn
                         );
                     }
                     Err(error) => {
                         state.status = StageStatus::TurnSubmitted;
                         state.error = Some(format!(
-                            "the reflection surface closed while retained turn {} was in flight and could not be restored: {error}. No new turn was started; the submitted turn remains recoverable at {}; rerun `codex-harness delivery-improvement process` to resume the exact retained turn",
-                            turn.turn_id,
+                            "the reflection surface closed while retained turn {turn} was in flight and could not be restored: {error}. No new turn was started; the submitted turn remains recoverable at {}; rerun `codex-harness delivery-improvement process` to resume the exact retained turn",
                             state_path.display()
                         ));
                         break finish(state_path, state);
@@ -2262,8 +2314,7 @@ fn run_stage(
             Err(DriveFailure::LostVisibility) => {
                 state.status = StageStatus::TurnSubmitted;
                 state.error = Some(format!(
-                    "the restored reflection surface closed while retained turn {} was still in flight. No new turn was started; the submitted turn remains recoverable at {}; rerun `codex-harness delivery-improvement process` to resume the exact retained turn",
-                    turn.turn_id,
+                    "the restored reflection surface closed while retained turn {turn} was still in flight. No new turn was started; the submitted turn remains recoverable at {}; rerun `codex-harness delivery-improvement process` to resume the exact retained turn",
                     state_path.display()
                 ));
                 break finish(state_path, state);
@@ -2287,7 +2338,7 @@ fn run_stage(
                 state.error = Some(pause.summary());
                 state.budget_pause = Some(pause);
                 if let Some(turn) = state.turn_id.clone() {
-                    let usage = retain_usage(&chain.codex_home, &fork_thread, &turn);
+                    let usage = retain_usage(&chain.codex_home, fork_thread, &turn);
                     apply_usage(&mut state, usage);
                 }
                 state.updated_ms = now_ms();
@@ -2300,6 +2351,153 @@ fn run_stage(
         let _ = frontend.close();
     }
     outcome
+}
+
+/// Resumes the exact known fork after a pre-submission surface loss, verifies
+/// its replacement surface, and only then admits the initial turn once. The
+/// fork identity and measured work are retained; this function never forks
+/// again and never replays a turn whose submission was not established.
+fn recover_pre_submission(
+    chain: &ChainState,
+    stage: Stage,
+    declaration: &StageDeclaration,
+    prepared: &PreparedStage,
+    state_path: &Path,
+    mut state: StageState,
+    prompt: &str,
+    admission: Option<&StageAdmission>,
+) -> io::Result<StageState> {
+    let fork_thread = state
+        .fork
+        .as_ref()
+        .ok_or_else(|| {
+            invalid("a pre-submission visibility loss carries no fork identity to resume")
+        })?
+        .fork_thread
+        .clone();
+    let admission = admission.ok_or_else(|| {
+        invalid(format!(
+            "the retained pre-submission fork {fork_thread} has no fresh admission snapshot; no turn was submitted"
+        ))
+    })?;
+    ensure_admission_available(admission)?;
+    let retain_lost = |mut state: StageState, cause: String| -> io::Result<StageState> {
+        state.error = Some(format!(
+            "pre-submission reflection recovery for retained fork {fork_thread} did not restore visibility: {cause}. No turn was submitted; the exact fork remains retryable through the ordinary process"
+        ));
+        finish(state_path, state)
+    };
+    let stage_root = state_path
+        .parent()
+        .ok_or_else(|| invalid("the stage state path has no directory"))?
+        .join(format!("{}-recover", declaration.role));
+    let plan = match stage_plan(chain, declaration, prepared, &stage_root) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return retain_lost(
+                state,
+                format!("the recovery plan could not be prepared: {error}"),
+            );
+        }
+    };
+    let job = match Job::new(Limits::default()) {
+        Ok(job) => job,
+        Err(error) => {
+            return retain_lost(
+                state,
+                format!("the recovery process could not be created: {error}"),
+            );
+        }
+    };
+    let mut conversation = match Conversation::start_resuming(&job, &plan, &fork_thread) {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            return retain_lost(
+                state,
+                format!("the retained reflection fork could not be resumed: {error}"),
+            );
+        }
+    };
+    let frontend = match attach_owned_frontend(
+        &plan,
+        &conversation,
+        NativePresentation::NativeTui,
+        FrontendRole::Reflection,
+    ) {
+        Ok(frontend) => frontend,
+        Err(error) => {
+            return retain_lost(
+                state,
+                format!("the owned reflection frontend could not be attached: {error}"),
+            );
+        }
+    };
+    if let Err(error) = wait_for_frontend(&frontend, &mut conversation, true, &plan.title) {
+        return close_frontend(
+            frontend,
+            retain_lost(
+                state,
+                format!("the owned reflection frontend did not attach: {error}"),
+            ),
+        );
+    }
+    match frontend.is_running() {
+        Ok(true) => {}
+        Ok(false) => {
+            return close_frontend(
+                frontend,
+                retain_lost(
+                    state,
+                    "the restored reflection surface closed before the initial turn".to_owned(),
+                ),
+            );
+        }
+        Err(error) => {
+            return close_frontend(
+                frontend,
+                retain_lost(
+                    state,
+                    format!("the restored reflection surface could not be verified: {error}"),
+                ),
+            );
+        }
+    }
+    state.status = StageStatus::Visible;
+    state.error = None;
+    state.updated_ms = now_ms();
+    persist(state_path, &state)?;
+    bound_result(&state.result.clone().unwrap_or_default())?;
+    let turn = match conversation.assign(prompt) {
+        Ok(turn) => turn,
+        Err(error) => {
+            state.status = StageStatus::Unknown;
+            state.error = Some(format!(
+                "submitting the {} reflection turn after pre-submission visibility recovery failed and its fate is unknown: {error}; the retained stage will not be replayed",
+                state.stage
+            ));
+            return close_frontend(frontend, finish(state_path, state));
+        }
+    };
+    state.turn_id = Some(turn.turn_id.clone());
+    state.status = StageStatus::TurnSubmitted;
+    state.updated_ms = now_ms();
+    persist(state_path, &state)?;
+    println!(
+        "{}: resumed retained fork {} and submitted its initial turn {} once after verified visibility; no second fork was started",
+        state.stage, fork_thread, turn.turn_id
+    );
+    drive_submitted_stage(
+        chain,
+        stage,
+        &plan,
+        &mut conversation,
+        Some(frontend),
+        state,
+        &fork_thread,
+        &turn.turn_id,
+        state_path,
+        admission,
+    )
 }
 
 fn finish(state_path: &Path, mut state: StageState) -> io::Result<StageState> {
@@ -2416,7 +2614,7 @@ fn reconcile_submitted(
         }
     };
     if let Err(error) = wait_for_frontend(&frontend, &mut conversation, true, &plan.title) {
-        return close_recovery_frontend(
+        return close_frontend(
             frontend,
             retain_unrestored(
                 state,
@@ -2429,7 +2627,7 @@ fn reconcile_submitted(
         match frontend.is_running() {
             Ok(true) => {}
             Ok(false) => {
-                return close_recovery_frontend(
+                return close_frontend(
                     frontend,
                     retain_unrestored(
                         state,
@@ -2438,7 +2636,7 @@ fn reconcile_submitted(
                 );
             }
             Err(error) => {
-                return close_recovery_frontend(
+                return close_frontend(
                     frontend,
                     retain_unrestored(
                         state,
@@ -2450,7 +2648,7 @@ fn reconcile_submitted(
         let thread = match conversation.read_thread_record(&fork_thread) {
             Ok(thread) => thread,
             Err(error) => {
-                return close_recovery_frontend(
+                return close_frontend(
                     frontend,
                     retain_unrestored(
                         state,
@@ -2467,7 +2665,7 @@ fn reconcile_submitted(
             .unwrap_or_default();
         match status {
             "completed" => {
-                return close_recovery_frontend(
+                return close_frontend(
                     frontend,
                     retain_completed(
                         chain,
@@ -2490,7 +2688,7 @@ fn reconcile_submitted(
                     "reconciliation observed the retained turn {turn} as {status}; it is not replayed"
                 ));
                 let retained = finish(state_path, state);
-                return close_recovery_frontend(frontend, retained);
+                return close_frontend(frontend, retained);
             }
             _ => {}
         }
@@ -2500,20 +2698,23 @@ fn reconcile_submitted(
                 "reconciliation did not establish a terminal state for retained turn {turn}; it is not replayed"
             ));
             let retained = finish(state_path, state);
-            return close_recovery_frontend(frontend, retained);
+            return close_frontend(frontend, retained);
         }
         thread::sleep(POLL);
     }
 }
 
-fn close_recovery_frontend(
+/// Ends the owned reflection surface without masking the original startup,
+/// recovery or reconciliation error. A failed cleanup is reported beside that
+/// cause, and the caller never proceeds to a dependent stage.
+fn close_frontend<T>(
     frontend: crate::executor_cli::OwnedFrontend,
-    retained: io::Result<StageState>,
-) -> io::Result<StageState> {
+    retained: io::Result<T>,
+) -> io::Result<T> {
     match (retained, frontend.close()) {
-        (Ok(state), Ok(())) => Ok(state),
+        (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(error)) => Err(invalid(format!(
-            "the retained reconciliation state was persisted, but the owned reflection frontend cleanup failed: {error}; no dependent stage was started"
+            "the owned reflection frontend cleanup failed: {error}; no dependent stage was started"
         ))),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(invalid(format!(
@@ -2542,25 +2743,27 @@ fn restore_reflection_frontend(
         FrontendRole::Reflection,
     )?;
     if let Err(error) = wait_for_frontend(&frontend, conversation, true, &plan.title) {
-        let _ = frontend.close();
-        return Err(invalid(format!(
-            "the replacement reflection surface did not attach: {error}"
-        )));
+        return close_frontend(
+            frontend,
+            Err(invalid(format!(
+                "the replacement reflection surface did not attach: {error}; the submitted turn was not resumed"
+            ))),
+        );
     }
     match frontend.is_running() {
         Ok(true) => Ok(frontend),
-        Ok(false) => {
-            let _ = frontend.close();
+        Ok(false) => close_frontend(
+            frontend,
             Err(invalid(
-                "the replacement reflection surface closed before its attachment could be verified",
-            ))
-        }
-        Err(error) => {
-            let _ = frontend.close();
+                "the replacement reflection surface closed before its attachment could be verified; the submitted turn was not resumed",
+            )),
+        ),
+        Err(error) => close_frontend(
+            frontend,
             Err(invalid(format!(
-                "the replacement reflection surface could not be verified: {error}"
-            )))
-        }
+                "the replacement reflection surface could not be verified: {error}; the submitted turn was not resumed"
+            ))),
+        ),
     }
 }
 
