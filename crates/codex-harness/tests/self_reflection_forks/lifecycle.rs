@@ -25,13 +25,14 @@ fn command(workspace: &Workspace, action: &str, lead: Option<&str>) -> std::proc
     command_with(workspace, action, lead, &[])
 }
 
-fn command_with(
+fn manager_command(
+    manager: &Path,
     workspace: &Workspace,
     action: &str,
     lead: Option<&str>,
     extra: &[&str],
-) -> std::process::Output {
-    let mut command = Command::new(manager());
+) -> Command {
+    let mut command = Command::new(manager);
     command
         .args(["delivery-improvement", action, "--project"])
         .arg(&workspace.checkout)
@@ -47,7 +48,31 @@ fn command_with(
     if let Some(lead) = lead {
         command.env("CODEX_THREAD_ID", lead);
     }
-    command.output().unwrap()
+    command
+}
+
+fn command_with(
+    workspace: &Workspace,
+    action: &str,
+    lead: Option<&str>,
+    extra: &[&str],
+) -> std::process::Output {
+    manager_command(&manager(), workspace, action, lead, extra)
+        .output()
+        .unwrap()
+}
+
+fn command_from(
+    manager: &Path,
+    workspace: &Workspace,
+    action: &str,
+    lead: Option<&str>,
+    extra: &[&str],
+) -> std::process::Output {
+    manager_command(manager, workspace, action, lead, extra)
+        .current_dir(&workspace.checkout)
+        .output()
+        .unwrap()
 }
 
 fn success(output: std::process::Output) -> Value {
@@ -70,17 +95,20 @@ fn process(workspace: &Workspace, request: &Value) -> ConsoleOutcome {
 }
 
 fn process_spec(workspace: &Workspace, request: &Value, action: &str) -> CommandSpec {
-    let mut spec = chain_spec(
-        workspace,
-        request,
-        "complete",
-        "complete",
-        "NO FINDING",
-        LEAD_RESULT,
-        None,
-    );
-    // Derived native inputs must suffice without a caller-authored request.
-    fs::remove_file(&workspace.request).unwrap();
+    let lead_thread = request["leadSource"]["thread"]
+        .as_str()
+        .unwrap_or(LEAD_THREAD);
+    process_spec_from(workspace, &manager(), lead_thread, action)
+}
+
+/// Derived native inputs must suffice without a caller-authored request.
+fn process_spec_from(
+    workspace: &Workspace,
+    manager: &Path,
+    lead_thread: &str,
+    action: &str,
+) -> CommandSpec {
+    let mut spec = CommandSpec::new(manager);
     spec.args = vec![
         "delivery-improvement".into(),
         action.into(),
@@ -91,6 +119,18 @@ fn process_spec(workspace: &Workspace, request: &Value, action: &str) -> Command
         "--codex-home".into(),
         workspace.home.as_os_str().to_owned(),
     ];
+    spec.current_dir = Some(workspace.checkout.clone());
+    apply_fixture_env(
+        workspace,
+        &mut spec,
+        lead_thread,
+        "complete",
+        "complete",
+        "NO FINDING",
+        LEAD_RESULT,
+    );
+    spec.env
+        .insert("HARNESS_REFLECTION_HOST".into(), Some(lead_thread.into()));
     spec.env
         .insert("CODEX_THREAD_ID".into(), Some(LEAD_THREAD.into()));
     spec
@@ -140,21 +180,34 @@ fn normal_cli_derives_the_chain_and_retains_completed_delivery_without_replay() 
 
 #[test]
 fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes() {
+    let workspace = Workspace::new("lifecycle-normal-accept", LeadMode::Delivered);
+    install_fixture(&workspace);
+    normal_acceptance(&workspace, &manager());
+}
+
+/// The ordinary accepted-work lifecycle, independent of where the manager and
+/// launcher were installed. The producer is the public retained completion and
+/// the only acceptance identity is the board's exact native acceptance.
+pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (String, String) {
     use harness_core::{
         board_cli,
         delivery_reflection::{Purpose, board_source_identity},
         task_worktree::{self, AssignmentSubmission, CompletionFacts, SlotAssignmentBinding},
     };
 
-    let workspace = Workspace::new("lifecycle-normal-accept", LeadMode::Delivered);
-    let (controller, task) = accepted::prepare(&workspace);
-    install_fixture(&workspace);
+    let (controller, task) = accepted::prepare(workspace);
     {
         let mut lead = workspace.lead_state.lock().unwrap();
         lead.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
         lead.source_turn_active = true;
     }
-    success(command(&workspace, "enable", Some(LEAD_THREAD)));
+    success(command_from(
+        manager,
+        workspace,
+        "enable",
+        Some(LEAD_THREAD),
+        &[],
+    ));
     board_cli::set_purpose_metadata(
         Path::new("bd.exe"),
         &workspace.checkout,
@@ -162,14 +215,14 @@ fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes()
         Purpose::Ordinary,
     )
     .unwrap();
-    accepted::native(&workspace, "git", &["add", "."]);
+    accepted::native(workspace, "git", &["add", "."]);
     accepted::native(
-        &workspace,
+        workspace,
         "git",
         &["commit", "--allow-empty", "-qm", "fixture board ready"],
     );
     let assignment = harness_core::build_identity::hash_bytes(b"synthetic structured assignment");
-    let result = workspace._root.path().join("executor-result.txt");
+    let result = workspace.root().join("executor-result.txt");
     fs::write(
         &result,
         "Synthetic accepted executor result with completed checks.",
@@ -206,13 +259,14 @@ fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes()
     assert!(retained.eligibility.eligible, "{retained:?}");
 
     let accept = || {
-        let output = Command::new(manager())
+        let output = Command::new(manager)
             .args(["executor", "accept", &task, "--project"])
             .arg(&workspace.checkout)
             .arg("--source")
             .arg(kit_root())
             .arg("--codex-home")
             .arg(&workspace.home)
+            .current_dir(&workspace.checkout)
             .env("CODEX_HOME", &workspace.home)
             .env("CODEX_THREAD_ID", LEAD_THREAD)
             .env_remove("HARNESS_REFLECTION_SESSION")
@@ -231,15 +285,9 @@ fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes()
     let repeated = accept();
     assert_eq!(repeated["duplicate"], true);
     assert_eq!(repeated["acceptanceId"], acceptance);
-    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert_eq!(request_counts(workspace), (0, 0, 0, 0));
 
-    let mut request = workspace.request("accepted-run");
-    request["task"] = json!(task);
-    request["acceptance"] = json!(acceptance);
-    request["leadSource"]["thread"] = json!(LEAD_THREAD);
-    let mut spec = process_spec(&workspace, &request, "_serve");
-    spec.env
-        .insert("HARNESS_REFLECTION_HOST".into(), Some(LEAD_THREAD.into()));
+    let spec = process_spec_from(workspace, manager, LEAD_THREAD, "_serve");
     let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
     let until = Instant::now() + Duration::from_secs(90);
     loop {
@@ -252,11 +300,13 @@ fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes()
         }
         assert!(
             Instant::now() < until,
-            "executor reflection did not retain its result"
+            "executor reflection did not retain its result: {:?}; requests={:?}",
+            controller.record(acceptance).unwrap(),
+            request_counts(workspace)
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(request_counts(workspace), (1, 1, 0, 0));
     assert_eq!(
         controller.record(acceptance).unwrap().unwrap().lead.state,
         StageState::Pending
@@ -268,19 +318,25 @@ fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes()
         }
         assert!(
             Instant::now() < until,
-            "exact accepted synthesis was not consumed"
+            "exact accepted synthesis was not consumed: {:?}",
+            controller.record(acceptance).unwrap()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(request_counts(workspace), (1, 1, 1, 1));
     let record = controller.record(acceptance).unwrap().unwrap();
     assert_eq!(record.binding.result, retained.result.unwrap().sha256);
     assert_eq!(record.binding.lead_turn.as_deref(), Some(LEAD_SOURCE_TURN));
-    success(command(&workspace, "disable", None));
+    success(command_from(manager, workspace, "disable", None, &[]));
     let finished = wait_session(session);
     assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
     assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
-    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(request_counts(workspace), (1, 1, 1, 1));
+    assert!(
+        !workspace.request.exists(),
+        "the installed chain must derive its identity without a caller-authored request"
+    );
+    (task, acceptance.to_owned())
 }
 
 #[test]

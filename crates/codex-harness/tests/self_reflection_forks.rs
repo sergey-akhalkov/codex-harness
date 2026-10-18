@@ -3,15 +3,20 @@
 //! Native, model-free checks of the two-stage self-reflection runner. The
 //! manager, app-server child, native frontend double, durable state and lead
 //! delivery endpoint are real; the two conversations and their rollout usage
-//! are synthetic fixture responses. No model, subscription or installed CLI is
-//! used.
+//! are synthetic fixture responses. No model or subscription is used. Most
+//! checks use the checkout manager; `installed` additionally drives the accepted
+//! lifecycle through an isolated immutable installation.
 
 #[path = "self_reflection_forks/accepted.rs"]
 mod accepted;
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
+#[path = "self_reflection_forks/installed.rs"]
+mod installed;
 #[path = "self_reflection_forks/lifecycle.rs"]
 mod lifecycle;
+#[path = "fixtures/reflection_install.rs"]
+mod reflection_install;
 
 use control_endpoint::{Answer, Bearer, Server, Wire};
 use harness_core::console::{ConsoleOutcome, ConsoleSession, ConsoleSpec};
@@ -159,7 +164,7 @@ struct LeadState {
 }
 
 struct Workspace {
-    _root: tempfile::TempDir,
+    root: Option<tempfile::TempDir>,
     home: PathBuf,
     checkout: PathBuf,
     state: PathBuf,
@@ -224,7 +229,7 @@ impl Workspace {
         }
         let request = root.path().join(format!("request-{name}.json"));
         Self {
-            _root: root,
+            root: Some(root),
             home,
             checkout,
             state,
@@ -276,6 +281,21 @@ impl Workspace {
             },
             "boundSeconds": 20
         })
+    }
+
+    fn root(&self) -> &Path {
+        self.root.as_ref().expect("workspace root").path()
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        if std::env::var_os("HARNESS_KEEP_WORKSPACE_EVIDENCE").is_none() {
+            return;
+        }
+        if let Some(root) = self.root.take() {
+            eprintln!("retained reflection workspace: {}", root.keep().display());
+        }
     }
 }
 
@@ -415,6 +435,27 @@ fn chain_spec(
         spec.args
             .extend(["--accepted-board".into(), board.as_os_str().to_owned()]);
     }
+    apply_fixture_env(
+        workspace,
+        &mut spec,
+        request["leadSource"]["thread"].as_str().unwrap(),
+        executor_outcome,
+        lead_outcome,
+        executor_result,
+        lead_result,
+    );
+    spec
+}
+
+fn apply_fixture_env(
+    workspace: &Workspace,
+    spec: &mut CommandSpec,
+    lead_thread: &str,
+    executor_outcome: &str,
+    lead_outcome: &str,
+    executor_result: &str,
+    lead_result: &str,
+) {
     spec.env.insert(
         "CODEX_HOME".into(),
         Some(workspace.home.as_os_str().to_owned()),
@@ -437,7 +478,7 @@ fn chain_spec(
     );
     spec.env.insert(
         "HARNESS_REFLECTION_FIXTURE_LEAD_SOURCE_THREAD".into(),
-        Some(request["leadSource"]["thread"].as_str().unwrap().into()),
+        Some(lead_thread.into()),
     );
     spec.env.insert(
         "HARNESS_REFLECTION_FIXTURE_LEAD_SOURCE_TURN".into(),
@@ -478,7 +519,6 @@ fn chain_spec(
     spec.env.insert("HARNESS_REFLECTION_SESSION".into(), None);
     spec.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
     spec.env.insert("WT_SESSION".into(), None);
-    spec
 }
 
 fn run_chain(
