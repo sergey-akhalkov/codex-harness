@@ -9,6 +9,8 @@
 
 #[path = "self_reflection_forks/accepted.rs"]
 mod accepted;
+#[path = "self_reflection_forks/context.rs"]
+mod context;
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
 #[path = "self_reflection_forks/installed.rs"]
