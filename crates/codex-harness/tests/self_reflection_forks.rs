@@ -15,6 +15,8 @@ mod context;
 mod control_endpoint;
 #[path = "self_reflection_forks/installed.rs"]
 mod installed;
+#[path = "self_reflection_forks/lead_recovery.rs"]
+mod lead_recovery;
 #[path = "self_reflection_forks/lifecycle.rs"]
 mod lifecycle;
 #[path = "fixtures/reflection_install.rs"]
