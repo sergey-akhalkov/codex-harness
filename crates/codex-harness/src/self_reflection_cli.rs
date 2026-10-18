@@ -2350,43 +2350,47 @@ fn reconcile_submitted(
         }
     };
     if let Err(error) = wait_for_frontend(&frontend, &mut conversation, true, &plan.title) {
-        let retained = retain_unrestored(
-            state,
-            format!("the owned reflection frontend did not attach: {error}"),
+        return close_recovery_frontend(
+            frontend,
+            retain_unrestored(
+                state,
+                format!("the owned reflection frontend did not attach: {error}"),
+            ),
         );
-        let _ = frontend.close();
-        return retained;
     }
     let until = Instant::now() + Duration::from_secs(chain.bound_seconds);
     loop {
         match frontend.is_running() {
             Ok(true) => {}
             Ok(false) => {
-                let retained = retain_unrestored(
-                    state,
-                    "the restored reflection surface closed before reconciliation".to_owned(),
+                return close_recovery_frontend(
+                    frontend,
+                    retain_unrestored(
+                        state,
+                        "the restored reflection surface closed before reconciliation".to_owned(),
+                    ),
                 );
-                let _ = frontend.close();
-                return retained;
             }
             Err(error) => {
-                let retained = retain_unrestored(
-                    state,
-                    format!("the restored reflection surface could not be verified: {error}"),
+                return close_recovery_frontend(
+                    frontend,
+                    retain_unrestored(
+                        state,
+                        format!("the restored reflection surface could not be verified: {error}"),
+                    ),
                 );
-                let _ = frontend.close();
-                return retained;
             }
         }
         let thread = match conversation.read_thread_record(&fork_thread) {
             Ok(thread) => thread,
             Err(error) => {
-                let retained = retain_unrestored(
-                    state,
-                    format!("the retained turn could not be read: {error}"),
+                return close_recovery_frontend(
+                    frontend,
+                    retain_unrestored(
+                        state,
+                        format!("the retained turn could not be read: {error}"),
+                    ),
                 );
-                let _ = frontend.close();
-                return retained;
             }
         };
         let record = thread["turns"]
@@ -2397,16 +2401,17 @@ fn reconcile_submitted(
             .unwrap_or_default();
         match status {
             "completed" => {
-                let retained = retain_completed(
-                    chain,
-                    &mut conversation,
-                    state,
-                    &fork_thread,
-                    state_path,
-                    admission,
+                return close_recovery_frontend(
+                    frontend,
+                    retain_completed(
+                        chain,
+                        &mut conversation,
+                        state,
+                        &fork_thread,
+                        state_path,
+                        admission,
+                    ),
                 );
-                let _ = frontend.close();
-                return retained;
             }
             "failed" | "interrupted" => {
                 state.status = if status == "failed" {
@@ -2418,8 +2423,7 @@ fn reconcile_submitted(
                     "reconciliation observed the retained turn {turn} as {status}; it is not replayed"
                 ));
                 let retained = finish(state_path, state);
-                let _ = frontend.close();
-                return retained;
+                return close_recovery_frontend(frontend, retained);
             }
             _ => {}
         }
@@ -2429,10 +2433,25 @@ fn reconcile_submitted(
                 "reconciliation did not establish a terminal state for retained turn {turn}; it is not replayed"
             ));
             let retained = finish(state_path, state);
-            let _ = frontend.close();
-            return retained;
+            return close_recovery_frontend(frontend, retained);
         }
         thread::sleep(POLL);
+    }
+}
+
+fn close_recovery_frontend(
+    frontend: crate::executor_cli::OwnedFrontend,
+    retained: io::Result<StageState>,
+) -> io::Result<StageState> {
+    match (retained, frontend.close()) {
+        (Ok(state), Ok(())) => Ok(state),
+        (Ok(_), Err(error)) => Err(invalid(format!(
+            "the retained reconciliation state was persisted, but the owned reflection frontend cleanup failed: {error}; no dependent stage was started"
+        ))),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(invalid(format!(
+            "{error}; additionally, the owned reflection frontend cleanup failed: {cleanup}; no dependent stage was started"
+        ))),
     }
 }
 
