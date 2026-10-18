@@ -602,7 +602,12 @@ is no mandatory escalation ladder.
 ## Global connection and limits
 
 The [harness profile](../global/harness.config.toml) contains a short standing
-policy and a limit of two concurrent child threads.
+policy and a limit of two concurrent native in-session child threads. Harness
+`executor spawn` launches separate sessions governed by
+`max_concurrent_executors` in [orchestration.toml](../global/orchestration.toml);
+the lead is not included in that executor count. Apply each limit only to its
+dispatch mechanism, as specified by the
+[lead responsibility](../global/roles/lead.md#assignment-and-routing).
 The [former Astra source directory](../global/agents/README.md) remains linked
 at `~/.codex/agents/codex-harness` for installer compatibility and contains no
 presets. OpenCodex routing, including its subscription middle, is retired;

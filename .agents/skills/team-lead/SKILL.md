@@ -80,6 +80,9 @@ wording that seems to demand another model or per-task arguments is reported as
 a discrepancy while dispatch proceeds; only a launcher-reported failure blocks
 dispatch. `worktree_pool_size` sizes the shared worktree pool independently of
 that executor limit, and `executor spawn` - not the lead - allocates its slots.
+Apply the dispatch-specific concurrency rule in the
+[lead responsibility](../../../global/roles/lead.md#assignment-and-routing):
+the native child-thread cap is not a second limit on harness executors.
 
 ## Board setup
 
