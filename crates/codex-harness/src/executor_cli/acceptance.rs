@@ -18,7 +18,7 @@ use serde_json::json;
 use std::{
     env,
     ffi::OsString,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -29,8 +29,9 @@ codex-harness executor accept TASK --project DIRECTORY [--source CHECKOUT] [--co
   the newest retained completion for TASK unless --run names the exact
   generation, writes the acceptance binding through the board owner and closes
   the task with reason 'accepted'. It reports whether automatic reflection is
-  eligible. Repeating the same accepted result is a no-op; --run is only for an
-  ambiguous or newer blocked completion whose exact generation the lead chose.";
+  eligible. Repeating the same accepted result is a no-op; --run resolves only
+  an ambiguous timestamp tie and never bypasses a newer retained or unresolved
+  correction.";
 
 const MAX_CANDIDATES: usize = 6;
 
@@ -171,6 +172,8 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         &retained,
     )?;
     validate_completion(&bd, &request.project, &issue, &selected, purpose, &retained)?;
+    refuse_stale_explicit_run(request.run.as_deref(), &selected, &retained)?;
+    refuse_unresolved_correction(&home, &source, &request.task, &selected, &retained)?;
 
     let assignment = selected
         .assignment
@@ -579,6 +582,111 @@ fn select_completion(
         )));
     }
     Ok(newest.clone())
+}
+
+/// An exact generation resolves a retention timestamp tie; it does not make a
+/// superseded result current again. A later completion, even one that is
+/// ineligible, must be resolved rather than silently skipped.
+fn refuse_stale_explicit_run(
+    requested: Option<&str>,
+    selected: &RetainedCompletion,
+    retained: &[RetainedCompletion],
+) -> io::Result<()> {
+    if requested.is_none() {
+        return Ok(());
+    }
+    let Some(newer) = retained.iter().rev().find(|record| {
+        record.run_generation != selected.run_generation
+            && record.recorded_ms > selected.recorded_ms
+    }) else {
+        return Ok(());
+    };
+    Err(invalid(&format!(
+        "run {} was retained at {}ms, before newer completion {} at {}ms for the same task; --run does not bypass a newer correction. Resolve or accept the newest result. No board metadata was changed.{}",
+        selected.run_generation,
+        selected.recorded_ms,
+        newer.run_generation,
+        newer.recorded_ms,
+        candidate_note(retained)
+    )))
+}
+
+/// A correction dispatched for the same board issue has no completion while it
+/// is active, starting or suspended. The board-bound slot record is the durable
+/// owner of that state. Ignore only an occupied slot with no startup reservation
+/// whose current run receipt resolves to a retained completion; any other
+/// same-issue binding is unfinished work.
+fn refuse_unresolved_correction(
+    home: &Path,
+    source: &Path,
+    task: &str,
+    selected: &RetainedCompletion,
+    retained: &[RetainedCompletion],
+) -> io::Result<()> {
+    for active in task_worktree::unresolved_assignments_for_issue(home, source, task)? {
+        let represented = retained.iter().any(|record| {
+            record.task.as_deref() == Some(active.task.as_str())
+                && record.handle.as_deref() == Some(active.handle.as_str())
+        });
+        let current_run = current_run_generation(home, source, active.slot)?;
+        let current_is_retained = current_run
+            .as_deref()
+            .is_some_and(|run| retained.iter().any(|record| record.run_generation == run));
+        if represented && current_is_retained && !active.starting {
+            continue;
+        }
+        let state = match active.state {
+            task_worktree::SlotState::Synchronizing => "startup",
+            task_worktree::SlotState::Occupied if active.starting => "starting",
+            task_worktree::SlotState::Occupied => "active",
+            task_worktree::SlotState::AwaitingReview => "awaiting review",
+            task_worktree::SlotState::Free | task_worktree::SlotState::Released => {
+                continue;
+            }
+        };
+        let startup = if active.starting {
+            "; a startup reservation is recorded, so the current run may not have written its receipt yet"
+        } else {
+            ""
+        };
+        let current = current_run
+            .as_deref()
+            .map(|run| format!("current run {run}"))
+            .unwrap_or_else(|| "no current run generation is recorded".to_owned());
+        return Err(invalid(&format!(
+            "task {task} has an unresolved executor correction in slot {}: task '{}', handle '{}', state {state}, {current}{startup}. Retained completion {} cannot be accepted while that same-task work is unfinished; finish or release that slot, then accept the newest result. Explicit --run does not bypass it. No board metadata was changed.",
+            active.slot, active.task, active.handle, selected.run_generation
+        )));
+    }
+    Ok(())
+}
+
+fn current_run_generation(home: &Path, source: &Path, slot: u32) -> io::Result<Option<String>> {
+    let receipt = task_worktree::pool_state_dir(home, source)?.join(format!("spawn-{slot}.json"));
+    let bytes = match fs::read(&receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "slot {slot} has an unresolved board assignment, but its current run receipt {} is not readable: {error}",
+            receipt.display()
+        ))
+    })?;
+    let generation = value
+        .get("originatingLead")
+        .and_then(|lead| lead.get("runGeneration"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| {
+            invalid(&format!(
+                "slot {slot} has an unresolved board assignment, but its current run receipt {} records no exact generation",
+                receipt.display()
+            ))
+        })?;
+    Ok(Some(generation.to_owned()))
 }
 
 fn candidate_note(retained: &[RetainedCompletion]) -> String {

@@ -2718,6 +2718,22 @@ pub struct TaskSlot {
     pub reason: Option<String>,
 }
 
+/// One slot still holding a board-bound task. Acceptance uses this durable
+/// ownership view to distinguish a retained completion from a later dispatch
+/// of the same board issue that has no completion manifest yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAssignment {
+    pub slot: u32,
+    pub state: SlotState,
+    pub task: String,
+    pub handle: String,
+    pub assignment: SlotAssignmentBinding,
+    /// A startup reservation means the slot's run receipt may still describe
+    /// the prior generation. Until the host lease is published, a retained
+    /// completion for this binding cannot prove the current run is finished.
+    pub starting: bool,
+}
+
 impl TaskSlot {
     fn from_record(
         record: &SlotRecord,
@@ -3472,6 +3488,62 @@ pub fn task_inventory(codex_home: &Path, source: &Path, size: u32) -> io::Result
         slots.push(slot);
     }
     Ok(slots)
+}
+
+/// Lists every non-released pool binding for one board issue. A record in
+/// occupied, startup or awaiting-review state still owns work for that issue;
+/// a released record has already cleared its task and assignment and is not a
+/// reason to keep an older completed result from being accepted.
+pub fn unresolved_assignments_for_issue(
+    codex_home: &Path,
+    source: &Path,
+    issue: &str,
+) -> io::Result<Vec<UnresolvedAssignment>> {
+    if issue.trim().is_empty() {
+        return Err(pool_error(
+            "an unresolved-assignment lookup requires a non-empty board issue",
+        ));
+    }
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let mut unresolved = Vec::new();
+    for index in recorded_indexes(&layout)? {
+        let Some(record) = load_record_at(&layout, index)? else {
+            continue;
+        };
+        refuse_record_conflict(&layout, index)?;
+        if !same_repository(&record.source, &root) {
+            return Err(pool_error(&format!(
+                "slot record {index} belongs to another source checkout {}; unresolved board assignments cannot be verified",
+                record.source.display()
+            )));
+        }
+        let Some(assignment) = record.assignment.as_deref() else {
+            continue;
+        };
+        if assignment.issue != issue
+            || matches!(record.state, SlotState::Free | SlotState::Released)
+        {
+            continue;
+        }
+        let task = record
+            .task
+            .as_deref()
+            .expect("validated assignment record has a task");
+        let handle = record
+            .handle
+            .as_deref()
+            .expect("validated assignment record has a handle");
+        unresolved.push(UnresolvedAssignment {
+            slot: index,
+            state: record.state,
+            task: task.to_owned(),
+            handle: handle.to_owned(),
+            assignment: assignment.clone(),
+            starting: record.startup.is_some(),
+        });
+    }
+    Ok(unresolved)
 }
 
 /// Recorded bindings beyond a proposed pool size. A capacity reduction is

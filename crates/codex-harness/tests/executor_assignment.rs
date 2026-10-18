@@ -383,13 +383,23 @@ impl SpawnFixture {
         serde_json::from_slice(&fs::read(self.record_path(index)).unwrap()).unwrap()
     }
 
-    fn record_path(&self, index: u32) -> PathBuf {
-        let source = fs::read_dir(self.state_dir())
+    fn pool_dir(&self) -> PathBuf {
+        fs::read_dir(self.state_dir())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .find(|path| path.is_dir())
-            .expect("one pool state directory per source checkout");
-        source.join(format!("slot-{index}.json"))
+            .expect("one pool state directory per source checkout")
+    }
+
+    fn record_path(&self, index: u32) -> PathBuf {
+        self.pool_dir().join(format!("slot-{index}.json"))
+    }
+
+    fn receipt(&self, index: u32) -> Value {
+        serde_json::from_slice(
+            &fs::read(self.pool_dir().join(format!("spawn-{index}.json"))).unwrap(),
+        )
+        .unwrap()
     }
 
     fn drop_fixture(self) {
@@ -520,7 +530,6 @@ impl AcceptanceFixture {
         state: &str,
         source: Option<SourceIdentity>,
     ) -> RetainedCompletion {
-        thread::sleep(Duration::from_millis(10));
         let assignment_sha256 = harness_core::build_identity::hash_bytes(run.as_bytes());
         let assignment = SlotAssignmentBinding {
             source: source.unwrap_or_else(|| self.board_source()),
@@ -529,19 +538,43 @@ impl AcceptanceFixture {
             purpose: Some(purpose.as_str().to_owned()),
             purpose_source: "board".to_owned(),
         };
+        self.retain_bound(
+            run,
+            state,
+            "executor-slot-binding",
+            &format!("handle-{run}"),
+            "executor-acceptance",
+            assignment,
+        )
+    }
+
+    /// Retain one completion with the exact task binding and generation
+    /// handle a live slot records. Same-task handoffs reuse both identities, so
+    /// a completion alone cannot show that the current startup is finished.
+    fn retain_bound(
+        &self,
+        run: &str,
+        state: &str,
+        slot_task: &str,
+        slot_handle: &str,
+        owner: &str,
+        assignment: SlotAssignmentBinding,
+    ) -> RetainedCompletion {
+        thread::sleep(Duration::from_millis(10));
         let result = self.spawn.base.root.join(format!("result-{run}.txt"));
         fs::write(&result, format!("synthetic result for {run}\n")).unwrap();
         let state_dir = task_worktree::pool_state_dir(self.home(), self.checkout()).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
+        let assignment_sha256 = assignment.assignment_sha256.clone();
         task_worktree::retain_completion(
             &state_dir,
             &CompletionFacts {
                 run_generation: run.to_owned(),
                 slot: 1,
-                owner: "executor-acceptance".to_owned(),
+                owner: owner.to_owned(),
                 checkout: self.checkout().to_path_buf(),
-                task: Some("executor-slot-binding".to_owned()),
-                handle: Some(format!("handle-{run}")),
+                task: Some(slot_task.to_owned()),
+                handle: Some(slot_handle.to_owned()),
                 assignment: Some(assignment),
                 submitted_assignment: Some(AssignmentSubmission::structured(assignment_sha256)),
                 role: Some("executor".to_owned()),
@@ -1966,7 +1999,7 @@ fn accept_requires_exactly_one_in_progress_lead_turn() {
 }
 
 #[test]
-fn accept_uses_exact_run_or_refuses_a_newer_ineligible_completion() {
+fn accept_refuses_a_newer_ineligible_completion_even_with_the_old_exact_run() {
     let fixture = AcceptanceFixture::new("accept-run-selection");
     let task = fixture.create_task("Run selection", Some(Purpose::Ordinary));
     fixture.retain(&task, Purpose::Ordinary, "run-1", "completed", None);
@@ -1976,6 +2009,12 @@ fn accept_uses_exact_run_or_refuses_a_newer_ineligible_completion() {
     let newest = fixture.refuse(&task, None);
     assert!(newest.contains("run-2"), "{newest}");
     assert!(newest.contains("not a completed zero-exit"), "{newest}");
+    assert_eq!(fixture.acceptance(&task), before);
+    assert_ne!(fixture.show(&task)["status"], "closed");
+
+    let explicit = fixture.refuse(&task, Some("run-1"));
+    assert!(explicit.contains("run-2"), "{explicit}");
+    assert!(explicit.contains("newer correction"), "{explicit}");
     assert_eq!(fixture.acceptance(&task), before);
     assert_ne!(fixture.show(&task)["status"], "closed");
 
@@ -1993,11 +2032,159 @@ fn accept_uses_exact_run_or_refuses_a_newer_ineligible_completion() {
         "{foreign}"
     );
     assert_eq!(fixture.acceptance(&task), before);
+    fixture.drop_fixture();
+}
 
-    let accepted = fixture.accept(&task, Some("run-1"));
-    assert_eq!(accepted["run"], "run-1", "{accepted}");
+/// A retained completion is not enough to accept an open board task when the
+/// durable slot owner records a later correction for that same task. The
+/// unfinished correction has no completion manifest, so only the board-bound
+/// slot record can prevent the older result from being accepted by omission.
+#[test]
+fn accept_refuses_a_stale_result_while_a_newer_correction_is_unresolved() {
+    let fixture = AcceptanceFixture::new("accept-unresolved-correction");
+    let task = fixture.create_task("Corrected task", Some(Purpose::Ordinary));
+    fixture.retain(&task, Purpose::Ordinary, "run-completed", "completed", None);
+    let before = fixture.show(&task);
+
+    let correction =
+        fixture
+            .spawn
+            .assignment("unresolved-correction.json", &task, Some("ordinary"));
+    let dispatched = fixture.spawn.spawn(
+        &["--assignment", correction.to_str().unwrap()],
+        &["--owner", "exec-ds-unresolved-correction"],
+    );
+    let text = output_text(&dispatched);
+    assert!(!dispatched.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "the correction must stop only after its durable slot binding: {text}"
+    );
+    let record = fixture.spawn.record(1);
+    let correction_task = record["task"]
+        .as_str()
+        .expect("durable correction task")
+        .to_owned();
+    let correction_handle = record["handle"]
+        .as_str()
+        .expect("durable correction handle")
+        .to_owned();
+    let correction_run = fixture.spawn.receipt(1)["originatingLead"]["runGeneration"]
+        .as_str()
+        .expect("correction dispatch generation")
+        .to_owned();
+    assert_eq!(record["assignment"]["issue"], task, "{record}");
+    assert_ne!(correction_task, "executor-slot-binding", "{record}");
+
+    let newest = fixture.refuse(&task, None);
+    assert!(newest.contains("run-completed"), "{newest}");
+    assert!(newest.contains(&correction_task), "{newest}");
+    assert!(newest.contains(&correction_run), "{newest}");
+    assert!(newest.contains("unresolved"), "{newest}");
+    assert_eq!(fixture.show(&task)["status"], before["status"]);
+    assert_eq!(fixture.acceptance(&task), None);
+
+    let explicit = fixture.refuse(&task, Some("run-completed"));
+    assert!(explicit.contains("run-completed"), "{explicit}");
+    assert!(explicit.contains(&correction_task), "{explicit}");
+    assert!(explicit.contains(&correction_handle), "{explicit}");
+    assert!(explicit.contains(&correction_run), "{explicit}");
+    assert!(explicit.contains("unresolved"), "{explicit}");
+    assert_eq!(fixture.show(&task)["status"], before["status"]);
+    assert_eq!(fixture.acceptance(&task), None);
+
+    let released = fixture.spawn.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "synthetic correction resolved before accepting the completed run",
+    ]);
+    let released_text = output_text(&released);
+    assert!(released.status.success(), "{released_text}");
+
+    let unrelated = fixture.create_task("Unrelated task", Some(Purpose::Ordinary));
+    let unrelated_assignment =
+        fixture
+            .spawn
+            .assignment("unrelated-reuse.json", &unrelated, Some("ordinary"));
+    let reused = fixture.spawn.spawn(
+        &["--assignment", unrelated_assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-unrelated-reuse"],
+    );
+    let reused_text = output_text(&reused);
+    assert!(!reused.status.success(), "{reused_text}");
+    assert!(
+        reused_text.contains("installed Codex launcher is missing"),
+        "{reused_text}"
+    );
+    let reused_record = fixture.spawn.record(1);
+    assert_eq!(
+        reused_record["assignment"]["issue"], unrelated,
+        "{reused_record}"
+    );
+
+    let accepted = fixture.accept(&task, Some("run-completed"));
+    assert_eq!(accepted["run"], "run-completed", "{accepted}");
     assert_eq!(accepted["duplicate"], false, "{accepted}");
-    assert_eq!(fixture.show(&task)["status"], "closed");
+    let repeated = fixture.accept(&task, Some("run-completed"));
+    assert_eq!(repeated["duplicate"], true, "{repeated}");
+
+    // Same-task handoffs keep the durable task and generation handle. A
+    // startup reservation means the slot's receipt may still describe the
+    // prior run, so a retained completion for that same binding is not proof
+    // that the startup finished.
+    let reused_task = reused_record["task"]
+        .as_str()
+        .expect("reused durable task")
+        .to_owned();
+    let reused_handle = reused_record["handle"]
+        .as_str()
+        .expect("reused generation handle")
+        .to_owned();
+    let reused_owner = reused_record["owner"]
+        .as_str()
+        .expect("reused slot owner")
+        .to_owned();
+    let reused_assignment: SlotAssignmentBinding =
+        serde_json::from_value(reused_record["assignment"].clone()).unwrap();
+    let reused_run = fixture.spawn.receipt(1)["originatingLead"]["runGeneration"]
+        .as_str()
+        .expect("reused dispatch generation")
+        .to_owned();
+    task_worktree::hold_startup_reservation(fixture.home(), fixture.checkout(), 1, &reused_owner)
+        .unwrap();
+    assert!(
+        fixture.spawn.record(1)["startup"].is_object(),
+        "{}",
+        fixture.spawn.record(1)
+    );
+    fixture.retain_bound(
+        &reused_run,
+        "completed",
+        &reused_task,
+        &reused_handle,
+        &reused_owner,
+        reused_assignment,
+    );
+    let before_handoff = fixture.show(&unrelated);
+    let handoff = fixture.refuse(&unrelated, Some(&reused_run));
+    assert!(handoff.contains("startup"), "{handoff}");
+    assert!(handoff.contains(&reused_task), "{handoff}");
+    assert_eq!(fixture.show(&unrelated)["status"], before_handoff["status"]);
+    assert_eq!(fixture.acceptance(&unrelated), None);
+
+    task_worktree::release_startup_reservation(
+        fixture.home(),
+        fixture.checkout(),
+        1,
+        &reused_owner,
+    )
+    .unwrap();
+    let accepted_reuse = fixture.accept(&unrelated, Some(&reused_run));
+    assert_eq!(accepted_reuse["run"], reused_run, "{accepted_reuse}");
+    assert_eq!(accepted_reuse["duplicate"], false, "{accepted_reuse}");
     fixture.drop_fixture();
 }
 

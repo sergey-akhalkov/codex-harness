@@ -272,10 +272,12 @@ do not substitute a plain close when that structured completion should be
 accepted.
 
 Use `--run <generation>` only to resolve an explicitly reported ambiguous
-selection, never as an automatic fallback or to make an ineligible run eligible.
-A repeat for the same accepted result is a no-op. Foreign leads, stale board
-scope or purpose, changed results, cancelled/unrelated closures, and missing or
-ambiguous exact turns are refused before board effects.
+selection. It never bypasses a newer retained completion or an unresolved
+same-task correction that is active, starting or awaiting review; resolve or
+accept the newest result instead. A repeat for the same accepted result is a
+no-op. Foreign leads, stale board scope or purpose, a stale explicit run,
+changed results, cancelled/unrelated closures, and missing or ambiguous exact
+turns are refused before board effects.
 
 Automatic reflection requires an active reflection binding, ordinary purpose,
 and exact executor and lead turns. Improvement work and a mode-off binding
