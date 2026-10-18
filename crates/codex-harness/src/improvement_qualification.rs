@@ -119,8 +119,12 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
     let id = "lead-frame-1".to_owned();
     let owner = dispatch_owner(&run.spec.run, AttemptRole::LeadFrame, 1);
     let prompt = format!(
-        "Frame this ordinary task for an executor in the assigned frozen checkout. Read the relevant project guidance and actual inputs. Do not implement changes or dispatch anyone. Return one usable structured executor assignment as JSON with schema=1, objective, inputs, outputs, invariants, acceptance, consumer and escalate. Every file path must be relative to this checkout and verified here. Writable scope: {}. Preserve all task acceptance. Do not add experiment labels or comparison policy.\n\nTask instructions:\n{}",
-        inputs.task.writable_scope.join(", "),
+        "Frame this ordinary task for an executor in the assigned frozen checkout. Read the relevant project guidance and actual inputs. Do not implement changes or dispatch anyone. Return one usable structured executor assignment as JSON with schema=1, objective, inputs, outputs, invariants, acceptance, consumer and escalate. Every file path must be relative to this checkout and verified here. {}. Preserve all task acceptance. Do not add experiment labels or comparison policy.\n\nTask instructions:\n{}",
+        if inputs.task.read_only {
+            "This is a read-only task: return the requested result in the executor response; do not edit files or create a commit".to_owned()
+        } else {
+            format!("Writable scope: {}", inputs.task.writable_scope.join(", "))
+        },
         fs::read_to_string(&inputs.task_prompt.path)?
     );
     let prompt_path = run.store.assignments_dir().join("lead-frame-1.txt");
@@ -345,8 +349,13 @@ fn advance_work(
                 .ok_or_else(|| invalid("correction has no retained lead review"))?;
             let result = retained_result(review)?;
             let prompt = format!(
-                "Continue your ordinary task in the same checkout. Read the retained lead review at {} and address its concrete corrections; preserve all original acceptance. Run the applicable checks, commit the scoped product and report changes, actual checks and unresolved issues. Do not delegate.\n\nLead review:\n{}",
+                "Continue your ordinary task in the same checkout. Read the retained lead review at {} and address its concrete corrections; preserve all original acceptance. {} Do not delegate.\n\nLead review:\n{}",
                 result.display(),
+                if inputs.task.read_only {
+                    "Use applicable read-only checks and return the corrected result in your response. Do not edit files or create a commit."
+                } else {
+                    "Run the applicable checks, commit the scoped product and report changes, actual checks and unresolved issues."
+                },
                 fs::read_to_string(&result)?
             );
             let path = run.store.assignments_dir().join(format!("{id}.txt"));
