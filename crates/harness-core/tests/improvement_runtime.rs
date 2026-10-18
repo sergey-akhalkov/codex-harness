@@ -1249,6 +1249,16 @@ fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
     // The exact approved bytes remain usable after the counterexamples.
     fs::write(&config, &approved).unwrap();
     verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+
+    // Repeat use: preparation may already record this arm's native approval.
+    // A later authorized workspace entry must still match those frozen bytes
+    // instead of requiring the approval to be removed.
+    runtime.configuration.as_mut().unwrap().sha256 =
+        build_identity::hash_bytes(hook_only.as_bytes());
+    fs::write(&config, &approved).unwrap();
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+    runtime.configuration.as_mut().unwrap().sha256 = build_identity::hash_bytes(&prepared);
+    fs::write(&config, &prepared).unwrap();
     retire_arm(&runtime).unwrap();
 }
 

@@ -2245,15 +2245,16 @@ pub fn verify_consumption_with_trust(
             // (`executor_cli::ensure_workspace_trust` appends one
             // `[projects.'<workspace>'] trust_level = "trusted"` block per
             // slot), and the native client records the user's approval of
-            // this arm's unchanged token hook. A prepared arm legitimately
-            // gains exactly those entries; removing them must reproduce the
-            // prepared bytes.
+            // this arm's unchanged token hook. The approval may already belong
+            // to the frozen preparation or be recorded later; either way the
+            // exact prepared bytes must remain an intermediate candidate.
             let restored =
                 strip_appended_trust(&bytes, trusted_workspaces).is_some_and(|candidates| {
                     candidates.iter().any(|candidate| {
-                        strip_native_hook_trust(candidate, runtime).is_some_and(|stripped| {
-                            build_identity::hash_bytes(&stripped) == configuration.sha256
-                        })
+                        build_identity::hash_bytes(candidate) == configuration.sha256
+                            || strip_native_hook_trust(candidate, runtime).is_some_and(|stripped| {
+                                build_identity::hash_bytes(&stripped) == configuration.sha256
+                            })
                     })
                 });
             if !restored {
