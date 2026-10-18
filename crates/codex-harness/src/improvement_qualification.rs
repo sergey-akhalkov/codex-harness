@@ -27,7 +27,18 @@ const SEMANTIC_REVIEW_INITIAL_ID: &str = "semantic-review-1";
 const SEMANTIC_REVIEW_CORRECTION_ID: &str = "semantic-review-2";
 const SEMANTIC_REVIEW_RECOVERY_ID: &str = "semantic-review-1-recovery-1";
 
-pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
+/// The resolved inputs and installed runtimes shared by preparation and the
+/// unchanged qualification workflow.
+pub(super) struct PreparedQualification {
+    pub(super) inputs: BaselineQualificationInputs,
+    pub(super) state: BaselineQualificationState,
+    pub(super) runtime: ArmRuntime,
+}
+
+/// Resolve, install and verify every frozen qualification input without
+/// dispatching a participant. `advance` consumes this same result so the
+/// ordinary start and resume paths keep their existing gates.
+pub(super) fn prepare(run: &mut Run) -> io::Result<PreparedQualification> {
     let inputs = run
         .spec
         .baseline_qualification
@@ -48,10 +59,23 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
             "the qualification declaration changed after preparation; preserve this run and use its frozen inputs",
         ));
     }
-    let runtime = prepare(run, &inputs, &mut state)?;
+    let runtime = ensure_prepared(run, &inputs, &mut state)?;
     run.cursor.baseline_qualification = Some(state.clone());
     run.cursor.phase = Phase::BaselineQualification;
     run.store.save_cursor(&run.cursor)?;
+    Ok(PreparedQualification {
+        inputs,
+        state,
+        runtime,
+    })
+}
+
+pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
+    let PreparedQualification {
+        inputs,
+        mut state,
+        runtime,
+    } = prepare(run)?;
 
     let mut recovery = None;
     if let Some(id) = state.workflow.lead_frame.clone() {
@@ -4229,7 +4253,7 @@ fn prepare_semantic_review(
     Ok(Some(reviewer))
 }
 
-fn prepare(
+fn ensure_prepared(
     run: &mut Run,
     inputs: &BaselineQualificationInputs,
     state: &mut BaselineQualificationState,

@@ -1115,6 +1115,19 @@ a fresh owned home before installation; explicitly named `private_inputs`
 use the runtime owner's existing validation and identity records. A changed
 task, configuration or participant binding refuses further dispatch.
 
+`improve start --prepare-only --run DIRECTORY --spec FILE` is the model-free
+boundary for a `baseline_qualification` run. It is valid only in single-step
+supervision: omitting `--supervision` defaults to `once` for this mode, while
+`--supervision continuous` is refused before the run directory or any effect is
+created. It installs and verifies the ordinary runtime and any declared
+separate reviewer runtime, freezes the task copy, prepares the independent
+oracle workspace, persists the unchanged gates and participant bindings,
+reports the exact homes, checkout, task and workspace plus the resume command,
+and dispatches no model attempt. `improve resume` then continues the same run
+through the existing lead/executor/reviewer path. Preparation is not acceptance
+and does not trust native hooks: each isolated home may still show its native
+first-use or hook-consent prompt on the first actual launch.
+
 The optional `semantic_review` declaration adds one independent read-only
 reviewer after the ordinary lead `ACCEPT` and the retained final executor
 result. It names its own frozen native runtime and profile; the configuration

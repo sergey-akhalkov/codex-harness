@@ -52,7 +52,7 @@ use serde_json::json;
 use std::{ffi::OsString, io, path::Path, path::PathBuf, time::Duration};
 
 const USAGE: &str = "\
-codex-harness improve start --run DIRECTORY --spec FILE [--supervision once|continuous] [--integration-check FILE] [--successor-spec FILE --successor-run DIRECTORY]
+codex-harness improve start --run DIRECTORY --spec FILE [--supervision once|continuous] [--prepare-only] [--integration-check FILE] [--successor-spec FILE --successor-run DIRECTORY]
 codex-harness improve status --run DIRECTORY [--json]
 codex-harness improve select --run DIRECTORY --variant baseline|candidate
 codex-harness improve stop --run DIRECTORY [--reason TEXT]
@@ -77,6 +77,16 @@ change must qualify before any implementation, and a validated committed
 candidate reaches candidate-ready. Each model conversation uses the visible
 owner; a missing evidence base records idle, a missing gate records blocked,
 and neither starts hidden model work.
+
+--prepare-only is valid only for run inputs with a baseline_qualification
+declaration and single-step supervision. It defaults to once when
+--supervision is omitted and refuses continuous supervision before creating the
+run. It installs and verifies the ordinary and declared reviewer runtimes,
+freezes the task copy, prepares the independent oracle workspace, persists the
+unchanged gates and participant bindings, reports the exact homes, checkout,
+task and workspace plus the resume command, and dispatches no model attempt.
+Preparation is not acceptance and does not trust native hooks; the first actual
+launch may still require native first-use or hook consent.
 
 A run that declares the explicit comparison inputs also prepares and drives
 the sequential measured pair from candidate-ready. Continuous supervision is
@@ -1163,6 +1173,62 @@ fn print_report(run: &Run) -> io::Result<()> {
     Ok(())
 }
 
+fn print_preparation_report(run: &Run) -> io::Result<()> {
+    let state = run
+        .cursor
+        .baseline_qualification
+        .as_ref()
+        .ok_or_else(|| invalid("preparation recorded no qualification state"))?;
+    let ordinary_home = state
+        .home
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no ordinary runtime home"))?;
+    let checkout = state
+        .checkout
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no dispatch checkout"))?;
+    let task_copy = state
+        .task_copy
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no frozen task copy"))?;
+    let task_workspace = state
+        .task_workspace
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no oracle workspace"))?;
+    let runtime = state
+        .runtime
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no ordinary runtime receipt"))?;
+    println!("prepare-only: model-free preparation complete; no model attempt was dispatched");
+    println!("ordinary home: {}", ordinary_home.display());
+    match state.semantic_review.as_ref() {
+        Some(review) => {
+            let reviewer_home = review
+                .home
+                .as_deref()
+                .ok_or_else(|| invalid("preparation recorded no reviewer runtime home"))?;
+            println!("reviewer home: {}", reviewer_home.display());
+        }
+        None => println!("reviewer home: none declared"),
+    }
+    println!("dispatch checkout: {}", checkout.display());
+    println!("task copy: {}", task_copy.display());
+    println!(
+        "task base: {}",
+        state.task_base.as_deref().unwrap_or("unknown")
+    );
+    println!("oracle workspace: {}", task_workspace.display());
+    println!("runtime receipt: {}", runtime.display());
+    println!(
+        "next: codex-harness improve resume --run \"{}\"",
+        run.store.root().display()
+    );
+    println!(
+        "note: preparation does not accept the task or trust native hooks; the first actual launch may still require native first-use or hook consent"
+    );
+    Ok(())
+}
+
 fn start(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(
         args,
@@ -1174,15 +1240,30 @@ fn start(args: &[OsString]) -> io::Result<i32> {
             "--successor-spec",
             "--successor-run",
         ],
-        &[],
+        &["--prepare-only"],
     )?;
     let run_dir = PathBuf::from(options.required("--run")?);
     let spec_path = PathBuf::from(options.required("--spec")?);
-    let supervision = improvement_driver::parse_supervision(options.get("--supervision"))?;
+    let prepare_only = options.has("--prepare-only");
+    let supervision = if prepare_only && options.get("--supervision").is_none() {
+        improvement_driver::Supervision::Once
+    } else {
+        improvement_driver::parse_supervision(options.get("--supervision"))?
+    };
+    if prepare_only && supervision != improvement_driver::Supervision::Once {
+        return Err(invalid(
+            "--prepare-only requires single-step preparation; pass --supervision once or omit it, and resume explicitly afterward",
+        ));
+    }
     if !run_dir.is_absolute() || !spec_path.is_absolute() {
         return Err(invalid("--run and --spec must be absolute paths"));
     }
     let spec = RunSpec::load(&spec_path)?;
+    if prepare_only && spec.baseline_qualification.is_none() {
+        return Err(invalid(
+            "--prepare-only requires a baseline_qualification declaration; no run was created",
+        ));
+    }
     for (name, protected) in [
         ("the run project", &spec.project),
         ("the planning root", &spec.specification.planning_root),
@@ -1275,6 +1356,13 @@ fn start(args: &[OsString]) -> io::Result<i32> {
         options.get("--successor-run"),
         None,
     )?;
+
+    if prepare_only {
+        improvement_qualification::prepare(&mut run)?;
+        print_report(&run)?;
+        print_preparation_report(&run)?;
+        return Ok(0);
+    }
 
     // The planning/implementation workflow advances as far as the recorded
     // state and the dispatch gates allow: it consumes a retained investigator
