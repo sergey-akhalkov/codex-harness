@@ -383,10 +383,24 @@ outcome. Both require the lifecycle's own live managed lead. After disabling,
 enabled; a preexisting enabled journal remains untouched. Retained results and
 checkpoints survive restoration.
 
+Budget pauses retain the exact acceptance, stage, attempts, measured work and
+cumulative costs. Status supplies the `delivery-improvement continue` command
+for that pause. Run it from the lifecycle's live managed lead with the required
+allowance increases; unchanged limits, a different stage or an already consumed
+delivery refuse before another model turn. Stage and record limits cover
+attempts, turns, tokens, investigations and supplied-context bytes.
+
+If status reports unreconciled usage or work, continuation additionally requires
+the measured missing additions through the paired `--reconcile-usage-turns` /
+`--reconcile-usage-tokens` or `--reconcile-investigations` /
+`--reconcile-context-bytes` options. Do not estimate these values or substitute
+zero for unavailable evidence. Already reconciled amounts cannot be charged
+again. This command does not clear an unknown model outcome or reset prior costs.
+
 Only an eligible accepted ordinary task can start the two visible reflection
 forks. Their exact task, run, source turns, result references, role revisions,
 profiles and return address come from the existing owners. The normal lead
-acceptance producer is still being integrated; callers must not invent those
+acceptance producer binds the accepted work; callers must not invent those
 identities to make a task eligible. `delivery-improvement process --project
 CHECKOUT` processes one retained eligible acceptance through the same owner; it
 does not create acceptance. Unknown outcomes and source/binding drift require
