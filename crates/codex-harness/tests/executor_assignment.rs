@@ -8,7 +8,7 @@
 use harness_core::{
     delivery_reflection::{
         ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, JournalPolicy, Purpose,
-        ReflectionController, SourceIdentity,
+        ReflectionController, RefusalCode, SourceIdentity,
     },
     process_service::{self, ServiceProcess},
     task_worktree::{
@@ -229,6 +229,14 @@ impl SpawnFixture {
     fn set_metadata(&self, issue: &str, key: &str, value: &str) {
         let pair = format!("{key}={value}");
         self.bd_json(&["update", issue, "--set-metadata", &pair, "--json"]);
+    }
+
+    fn rename_issue(&self, issue: &str, title: &str) {
+        self.bd_json(&["update", issue, "--title", title, "--json"]);
+    }
+
+    fn unset_metadata(&self, issue: &str, key: &str) {
+        self.bd_json(&["update", issue, "--unset-metadata", key, "--json"]);
     }
 
     fn show(&self, issue: &str) -> Value {
@@ -686,7 +694,20 @@ impl AcceptanceFixture {
         task: &str,
         owner: &str,
     ) -> (String, String, SlotAssignmentBinding, String) {
-        let assignment = self.spawn.assignment(name, task, Some("ordinary"));
+        self.bind_board(name, task, Some("ordinary"), owner)
+    }
+
+    /// Dispatch one structured assignment through the real spawn owner and
+    /// return the durable slot identity it recorded. `purpose` is only the
+    /// assignment's declared override; `None` exercises lineage inheritance.
+    fn bind_board(
+        &self,
+        name: &str,
+        task: &str,
+        purpose: Option<&str>,
+        owner: &str,
+    ) -> (String, String, SlotAssignmentBinding, String) {
+        let assignment = self.spawn.assignment(name, task, purpose);
         let dispatched = self.spawn.spawn(
             &["--assignment", assignment.to_str().unwrap()],
             &["--owner", owner],
@@ -697,22 +718,53 @@ impl AcceptanceFixture {
             text.contains("installed Codex launcher is missing"),
             "the correction must stop only after its durable slot binding: {text}"
         );
-        let record = self.spawn.record(1);
+        let (index, record) = self.bound_slot(task);
         let slot_task = record["task"]
             .as_str()
-            .expect("durable correction task")
+            .expect("durable slot task")
             .to_owned();
         let handle = record["handle"]
             .as_str()
-            .expect("durable correction handle")
+            .expect("durable slot handle")
             .to_owned();
         let assignment = serde_json::from_value(record["assignment"].clone())
-            .expect("verified correction assignment");
-        let run = self.spawn.receipt(1)["originatingLead"]["runGeneration"]
+            .expect("verified board assignment");
+        let run = self.spawn.receipt(index)["originatingLead"]["runGeneration"]
             .as_str()
-            .expect("correction dispatch generation")
+            .expect("dispatch generation")
             .to_owned();
         (slot_task, handle, assignment, run)
+    }
+
+    /// Locate the one slot whose durable record carries this task's board
+    /// assignment. A fixture may bind another task after releasing the first
+    /// slot, so the slot index is never assumed.
+    fn bound_slot(&self, task: &str) -> (u32, Value) {
+        for entry in fs::read_dir(self.spawn.pool_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(number) = name
+                .strip_prefix("slot-")
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Ok(index) = number.parse::<u32>() else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            if record["assignment"]["issue"].as_str() == Some(task) {
+                return (index, record);
+            }
+        }
+        panic!("no durable slot binding records board task {task}");
     }
 
     fn drop_fixture(self) {
@@ -1450,6 +1502,213 @@ fn conflicting_recorded_board_binding_refuses_a_retry() {
     fixture.drop_fixture();
 }
 
+/// A multi-generation improvement descendant keeps the nontriggering purpose
+/// through title changes, a removed leaf purpose and a resumed slot. The
+/// intermediate task records no purpose, so a binding that only reads the
+/// immediate parent would regress to unknown or ordinary here.
+#[test]
+fn improvement_descendants_keep_purpose_across_subdivision_rename_retry_and_resume() {
+    let fixture = SpawnFixture::with_board("lineage-improvement");
+    let epic = fixture.create_issue("Improvement epic", "epic", None);
+    fixture.set_metadata(&epic, "harness.purpose", "improvement");
+    let child = fixture.create_issue("Implementation split", "task", Some(&epic));
+    let leaf = fixture.create_issue("Implementation leaf", "task", Some(&child));
+    fixture.rename_issue(&child, "Renamed implementation split");
+    fixture.rename_issue(&leaf, "Renamed implementation leaf");
+
+    let assignment = fixture.assignment("improvement-lineage.json", &leaf, None);
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-lineage"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let first = fixture.record(1);
+    assert_eq!(first["assignment"]["issue"], leaf, "{first}");
+    assert_eq!(first["assignment"]["purpose"], "improvement", "{first}");
+    assert_eq!(
+        first["assignment"]["purposeSource"],
+        format!("ancestor:{epic}"),
+        "{first}"
+    );
+    assert_eq!(
+        fixture.show(&leaf)["metadata"]["harness.purpose"],
+        "improvement",
+        "the first dispatch records the inherited purpose on the leaf"
+    );
+
+    // A title is not lineage identity: renaming every task and retrying the
+    // same owner continues the exact recorded binding.
+    fixture.rename_issue(&epic, "Renamed improvement epic");
+    fixture.rename_issue(&leaf, "Renamed implementation leaf again");
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-lineage"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let retried = fixture.record(1);
+    assert_eq!(
+        retried["assignment"], first["assignment"],
+        "a title rename must not replace the purpose-bearing binding"
+    );
+    assert_eq!(retried["task"], first["task"], "{retried}");
+    assert_eq!(retried["handle"], first["handle"], "{retried}");
+
+    // Removing the leaf's recorded value must re-derive the improvement from
+    // the multi-generation lineage, not reset it to unknown or ordinary.
+    fixture.unset_metadata(&leaf, "harness.purpose");
+    assert!(
+        fixture.show(&leaf)["metadata"]
+            .get("harness.purpose")
+            .is_none(),
+        "the synthetic removal must erase the leaf purpose"
+    );
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-lineage"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let restored = fixture.record(1);
+    assert_eq!(
+        restored["assignment"], first["assignment"],
+        "the retry must restore the same improvement binding"
+    );
+    assert_eq!(
+        fixture.show(&leaf)["metadata"]["harness.purpose"],
+        "improvement",
+        "the inherited purpose is recorded again"
+    );
+
+    // A contradictory ordinary value on the leaf is refused before a new
+    // slot claim or launcher, and the original binding stays intact.
+    fixture.set_metadata(&leaf, "harness.purpose", "ordinary");
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-lineage"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("records purpose 'ordinary' but ancestor")
+            && text.contains("declares nonordinary purpose 'improvement'"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("installed Codex launcher"),
+        "the conflicting purpose must refuse before launch: {text}"
+    );
+    assert_eq!(
+        fixture.record(1)["assignment"],
+        first["assignment"],
+        "a refused contradiction must not replace the original binding"
+    );
+
+    // The recorded binding is also what a free-text resume continues. The
+    // resume path does not re-resolve the board, so the retained purpose must
+    // already be correct rather than being reset by the continuation.
+    fixture.set_metadata(&leaf, "harness.purpose", "improvement");
+    // The continuation resolves the configured upstream without fetching it;
+    // a local origin keeps this check offline.
+    git(
+        &fixture.base.source,
+        &[
+            "remote",
+            "add",
+            "origin",
+            fixture.base.source.to_str().unwrap(),
+        ],
+    );
+    let resumed = fixture
+        .resume_command(
+            "exec-ds-lineage",
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f6",
+            "continue the improvement leaf",
+        )
+        .output()
+        .unwrap();
+    let text = output_text(&resumed);
+    assert!(!resumed.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let continued = fixture.record(1);
+    assert_eq!(continued["task"], first["task"], "{continued}");
+    assert_eq!(continued["handle"], first["handle"], "{continued}");
+    assert_eq!(
+        continued["assignment"], first["assignment"],
+        "resume must continue the recorded improvement binding"
+    );
+    fixture.drop_fixture();
+}
+
+/// Reflection descendants inherit the same nontriggering exclusion; renaming
+/// the task and retrying its owner continues the recorded binding.
+#[test]
+fn reflection_descendants_inherit_nontriggering_purpose_across_rename() {
+    let fixture = SpawnFixture::with_board("lineage-reflection");
+    let parent = fixture.create_issue("Reflection work", "task", None);
+    fixture.set_metadata(&parent, "harness.purpose", "reflection");
+    let child = fixture.create_issue("Reflection follow-up", "task", Some(&parent));
+    fixture.rename_issue(&child, "Renamed reflection follow-up");
+    let assignment = fixture.assignment("reflection-lineage.json", &child, None);
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-reflection-lineage"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let first = fixture.record(1);
+    assert_eq!(first["assignment"]["issue"], child, "{first}");
+    assert_eq!(first["assignment"]["purpose"], "reflection", "{first}");
+    assert_eq!(
+        first["assignment"]["purposeSource"],
+        format!("ancestor:{parent}"),
+        "{first}"
+    );
+
+    fixture.rename_issue(&child, "Reflection follow-up renamed again");
+    let out = fixture.spawn(
+        &["--assignment", assignment.to_str().unwrap()],
+        &["--owner", "exec-ds-reflection-lineage"],
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert_eq!(
+        fixture.record(1)["assignment"],
+        first["assignment"],
+        "a reflection descendant must not become ordinary after a rename"
+    );
+    assert_eq!(
+        fixture.show(&child)["metadata"]["harness.purpose"],
+        "reflection",
+        "the child retains its inherited reflection purpose"
+    );
+    fixture.drop_fixture();
+}
+
 /// Free text never resolves a board: the dispatch reaches the launcher and
 /// records no assignment binding.
 #[test]
@@ -1976,6 +2235,225 @@ fn accept_improvement_work_never_auto_triggers_reflection() {
     assert!(poll.jobs.is_empty(), "{poll:?}");
     assert_eq!(poll.model_calls, 0, "{poll:?}");
     assert_eq!(fixture.show(&task)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+/// Acceptance of a multi-generation improvement descendant retains the
+/// inherited nontriggering purpose: the task closes normally with its
+/// result, but the active reflection controller records an explicit
+/// non-trigger refusal and schedules no job. A neighboring ordinary
+/// acceptance through the same controller still emits its one job.
+#[test]
+fn accepted_improvement_descendant_stays_nontriggering_while_ordinary_neighbor_triggers() {
+    let fixture = AcceptanceFixture::new("accept-improvement-lineage");
+    let controller = fixture.activate();
+    let epic = fixture
+        .spawn
+        .create_issue("Improvement campaign", "epic", None);
+    fixture
+        .spawn
+        .set_metadata(&epic, "harness.purpose", "improvement");
+    let child = fixture
+        .spawn
+        .create_issue("Split improvement work", "task", Some(&epic));
+    let leaf = fixture
+        .spawn
+        .create_issue("Improvement leaf", "task", Some(&child));
+    fixture
+        .spawn
+        .rename_issue(&leaf, "Renamed improvement leaf");
+
+    let owner = "exec-ds-accepted-lineage";
+    let (slot_task, handle, assignment, run) =
+        fixture.bind_board("accepted-improvement.json", &leaf, None, owner);
+    assert_eq!(assignment.issue, leaf);
+    assert_eq!(assignment.purpose.as_deref(), Some("improvement"));
+    assert_eq!(assignment.purpose_source, format!("ancestor:{epic}"));
+    assert_eq!(
+        fixture.show(&leaf)["metadata"]["harness.purpose"],
+        "improvement"
+    );
+    task_worktree::release_startup_reservation(fixture.home(), fixture.checkout(), 1, owner)
+        .unwrap();
+    let retained = fixture.retain_bound(&run, "completed", &slot_task, &handle, owner, assignment);
+    assert!(!retained.eligibility.eligible, "{retained:?}");
+    assert_eq!(
+        retained.eligibility.reasons,
+        vec![format!(
+            "board task '{leaf}' purpose 'improvement' is not ordinary"
+        )],
+        "{retained:?}"
+    );
+
+    let receipt = fixture.accept(&leaf, Some(&run));
+    assert_eq!(receipt["status"], "accepted", "{receipt}");
+    assert_eq!(receipt["purpose"], "improvement", "{receipt}");
+    assert_eq!(receipt["reflection"]["status"], "active", "{receipt}");
+    assert_eq!(
+        receipt["reflection"]["automaticTrigger"], false,
+        "{receipt}"
+    );
+    assert!(
+        receipt["reflection"]["detail"].as_str().is_some_and(
+            |detail| detail.contains("improvement work never auto-triggers reflection")
+        ),
+        "{receipt}"
+    );
+    let closed = fixture.show(&leaf);
+    assert_eq!(closed["status"], "closed", "{closed}");
+    assert_eq!(closed["close_reason"], "accepted", "{closed}");
+    assert!(fixture.acceptance(&leaf).is_some(), "{closed}");
+
+    let after_improvement = controller.poll().unwrap();
+    assert!(after_improvement.jobs.is_empty(), "{after_improvement:?}");
+    let refusal = after_improvement
+            .refusals
+            .iter()
+            .find(|refusal| refusal.task == leaf)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the accepted improvement descendant must be explicitly refused: {after_improvement:?}"
+                )
+            });
+    assert_eq!(
+        refusal.code,
+        RefusalCode::NonTriggerPurpose,
+        "{after_improvement:?}"
+    );
+    assert!(
+        refusal
+            .detail
+            .contains("improvement work never auto-triggers reflection"),
+        "{after_improvement:?}"
+    );
+
+    // The exclusion is specific to the purpose lineage: an ordinary task
+    // accepted through the same active controller still triggers exactly
+    // one reflection job.
+    let ordinary = fixture.create_task("Neighbor ordinary work", Some(Purpose::Ordinary));
+    fixture.retain(
+        &ordinary,
+        Purpose::Ordinary,
+        "run-ordinary-neighbor",
+        "completed",
+        None,
+    );
+    let ordinary_receipt = fixture.accept(&ordinary, None);
+    assert_eq!(ordinary_receipt["status"], "accepted", "{ordinary_receipt}");
+    assert_eq!(
+        ordinary_receipt["reflection"]["automaticTrigger"], true,
+        "{ordinary_receipt}"
+    );
+    let after_ordinary = controller.poll().unwrap();
+    assert_eq!(after_ordinary.jobs.len(), 1, "{after_ordinary:?}");
+    assert_eq!(
+        after_ordinary.jobs[0].task_id, ordinary,
+        "{after_ordinary:?}"
+    );
+    assert_eq!(after_ordinary.model_calls, 0, "{after_ordinary:?}");
+    assert_eq!(after_ordinary.refusals.len(), 1, "{after_ordinary:?}");
+    assert_eq!(after_ordinary.refusals[0].task, leaf, "{after_ordinary:?}");
+    assert_eq!(
+        after_ordinary.refusals[0].code,
+        RefusalCode::NonTriggerPurpose,
+        "the ordinary acceptance must not add a refusal: {after_ordinary:?}"
+    );
+    fixture.drop_fixture();
+}
+
+/// A missing purpose stays explicitly unknown and refuses acceptance even
+/// with a completed bound run. A descendant that records ordinary after a
+/// real dispatch retained its improvement lineage is refused as stale
+/// instead of becoming an ordinary acceptance. Neither refusal closes the
+/// task or creates a reflection event.
+#[test]
+fn accept_refuses_missing_and_reset_descendant_purpose() {
+    let fixture = AcceptanceFixture::new("accept-lineage-refusals");
+    let controller = fixture.activate();
+
+    let unknown = fixture.create_task("Unknown purpose lineage", None);
+    let unknown_owner = "exec-ds-unknown-lineage";
+    let (slot_task, handle, assignment, run) =
+        fixture.bind_board("unknown-lineage.json", &unknown, None, unknown_owner);
+    assert_eq!(assignment.issue, unknown);
+    assert!(assignment.purpose.is_none(), "{assignment:?}");
+    assert_eq!(assignment.purpose_source, "unknown", "{assignment:?}");
+    task_worktree::release_startup_reservation(
+        fixture.home(),
+        fixture.checkout(),
+        1,
+        unknown_owner,
+    )
+    .unwrap();
+    let retained = fixture.retain_bound(
+        &run,
+        "completed",
+        &slot_task,
+        &handle,
+        unknown_owner,
+        assignment,
+    );
+    assert!(!retained.eligibility.eligible, "{retained:?}");
+    let refused = fixture.refuse(&unknown, Some(&run));
+    assert!(refused.contains("records no harness.purpose"), "{refused}");
+    assert!(
+        refused.contains("unknown purpose never becomes ordinary"),
+        "{refused}"
+    );
+    assert!(fixture.acceptance(&unknown).is_none(), "{refused}");
+    assert_ne!(fixture.show(&unknown)["status"], "closed", "{refused}");
+
+    // Free the only slot for the second real dispatch; the retained result
+    // remains the acceptance input for the refused unknown-purpose run.
+    let released = fixture.spawn.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "synthetic unknown-purpose acceptance refusal reviewed",
+    ]);
+    let text = output_text(&released);
+    assert!(released.status.success(), "{text}");
+
+    let epic = fixture
+        .spawn
+        .create_issue("Improvement parent", "epic", None);
+    fixture
+        .spawn
+        .set_metadata(&epic, "harness.purpose", "improvement");
+    let child = fixture
+        .spawn
+        .create_issue("Improvement reset child", "task", Some(&epic));
+    let owner = "exec-ds-reset-lineage";
+    let (slot_task, handle, assignment, run) =
+        fixture.bind_board("reset-lineage.json", &child, None, owner);
+    assert_eq!(
+        assignment.purpose.as_deref(),
+        Some("improvement"),
+        "{assignment:?}"
+    );
+    task_worktree::release_startup_reservation(fixture.home(), fixture.checkout(), 1, owner)
+        .unwrap();
+    fixture.retain_bound(&run, "completed", &slot_task, &handle, owner, assignment);
+
+    fixture
+        .spawn
+        .set_metadata(&child, "harness.purpose", "ordinary");
+    let refused = fixture.refuse(&child, Some(&run));
+    assert!(
+        refused.contains("stale purpose is never accepted"),
+        "{refused}"
+    );
+    assert!(refused.contains("records purpose improvement"), "{refused}");
+    assert!(refused.contains("records ordinary"), "{refused}");
+    assert!(fixture.acceptance(&child).is_none(), "{refused}");
+    assert_ne!(fixture.show(&child)["status"], "closed", "{refused}");
+
+    let poll = controller.poll().unwrap();
+    assert!(poll.jobs.is_empty(), "{poll:?}");
+    assert!(poll.refusals.is_empty(), "{poll:?}");
+    assert_eq!(poll.model_calls, 0, "{poll:?}");
     fixture.drop_fixture();
 }
 
