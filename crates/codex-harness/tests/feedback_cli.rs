@@ -599,6 +599,178 @@ fn bounded_triage_counts_once_and_excludes_diagnostics() {
     board.drop();
 }
 
+/// Two friction episodes from one synthetic executor session stay distinct
+/// feedback identities. The board stores the reporter label, not a process
+/// handle; the test process supplies the exact pid/creation identity that must
+/// stay live across recording, triage and replay.
+#[cfg(windows)]
+#[test]
+fn same_executor_two_episodes_keep_distinct_identity_and_live_session() {
+    use harness_core::process_service::{ServiceProcess, current_user};
+
+    let board = Board::new("same-executor-episodes");
+    let program = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let user = current_user().unwrap();
+    let session = ServiceProcess::observe(std::process::id(), &program, 0, &user).unwrap();
+    let identity = session.identity();
+    assert!(session.is_running().unwrap());
+    let reporter = format!("executor-{}-{}", identity.pid, identity.creation_time);
+
+    let first = board.record(
+        "executor dispatch waited after tool output",
+        &reporter,
+        "dispatch-wait-1",
+        "executor",
+    );
+    assert!(
+        ServiceProcess::inspect(identity, &program, &user)
+            .unwrap()
+            .is_some_and(|process| process.is_running().unwrap())
+    );
+    let second = board.record(
+        "the same dispatch wait recurred on a second assignment",
+        &reporter,
+        "dispatch-wait-2",
+        "executor",
+    );
+    assert!(
+        ServiceProcess::inspect(identity, &program, &user)
+            .unwrap()
+            .is_some_and(|process| process.is_running().unwrap())
+    );
+    assert_ne!(first, second);
+
+    let listed = output_text(&board.feedback(&["list"]));
+    for (id, episode, observation) in [
+        (
+            &first,
+            "dispatch-wait-1",
+            "executor dispatch waited after tool output",
+        ),
+        (
+            &second,
+            "dispatch-wait-2",
+            "the same dispatch wait recurred on a second assignment",
+        ),
+    ] {
+        assert!(
+            listed.contains(&format!(
+                "{id} reporter={reporter} episode={episode} kind=executor"
+            )),
+            "{listed}"
+        );
+        let item = board.item(id);
+        let description = item["description"]
+            .as_str()
+            .or_else(|| item["content"].as_str())
+            .expect("feedback description");
+        let reporter_line = format!("reporter: {reporter}");
+        let episode_line = format!("episode: {episode}");
+        let observation_line = format!("observation: {observation}");
+        assert_eq!(
+            description
+                .lines()
+                .filter(|line| *line == reporter_line.as_str())
+                .count(),
+            1,
+            "{description}"
+        );
+        assert_eq!(
+            description
+                .lines()
+                .filter(|line| *line == episode_line.as_str())
+                .count(),
+            1,
+            "{description}"
+        );
+        assert!(
+            description
+                .lines()
+                .any(|line| line == observation_line.as_str()),
+            "{description}"
+        );
+    }
+
+    // Both episodes count once before the lead merges the repeated friction;
+    // replaying the accepted decisions remains idempotent.
+    let decisions = board.decisions(
+        "same-executor.json",
+        &[
+            (&first, "process", None),
+            (&second, "process", Some(&first)),
+        ],
+    );
+    let out = board.feedback(&["triage", "--decisions", decisions.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    for id in [&first, &second] {
+        assert!(
+            text.contains(&format!(
+                "applied feedback {id} route=incubator target={first} vote=counted"
+            )),
+            "{text}"
+        );
+    }
+    let replay = board.feedback(&["triage", "--decisions", decisions.to_str().unwrap()]);
+    let text = output_text(&replay);
+    assert!(replay.status.success(), "{text}");
+    assert_eq!(text.matches("vote=repeat").count(), 2, "{text}");
+
+    let ledger = output_text(&board.feedback(&["ledger", "--item", &first]));
+    assert!(
+        ledger.contains("votes=4 counted=2 merges=1 routes=2 promotions=0"),
+        "{ledger}"
+    );
+    assert!(
+        ledger.contains(&format!("merge from={second} into={first}")),
+        "{ledger}"
+    );
+    let votes: Vec<&str> = ledger
+        .lines()
+        .filter(|line| line.starts_with("vote "))
+        .collect();
+    assert_eq!(votes.len(), 4, "{ledger}");
+    for episode in ["dispatch-wait-1", "dispatch-wait-2"] {
+        assert_eq!(
+            votes
+                .iter()
+                .filter(|line| {
+                    line.contains(&format!("episode={episode}"))
+                        && line.contains(&format!("reporter={reporter}"))
+                })
+                .count(),
+            2,
+            "{ledger}"
+        );
+        assert_eq!(
+            votes
+                .iter()
+                .filter(|line| {
+                    line.contains(&format!("episode={episode}")) && line.contains("counted=true")
+                })
+                .count(),
+            1,
+            "{ledger}"
+        );
+    }
+    assert_eq!(
+        votes
+            .iter()
+            .filter(|line| line.contains("reason=repeat"))
+            .count(),
+        2,
+        "{ledger}"
+    );
+
+    // Recording, triage and replay never replace or stop the original session.
+    assert!(
+        ServiceProcess::inspect(identity, &program, &user)
+            .unwrap()
+            .is_some_and(|process| process.is_running().unwrap())
+    );
+    board.drop();
+}
+
 #[test]
 fn derived_intake_links_the_source_without_a_vote_or_another_card() {
     let board = Board::new("derived-link");

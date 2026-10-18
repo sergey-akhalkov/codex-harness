@@ -214,6 +214,63 @@ fn foreign_acceptance_refuses_before_fork_and_unknown_usage_blocks_the_lead() {
 }
 
 #[test]
+fn submitted_turn_without_native_completion_is_retained_and_blocks_the_lead() {
+    let workspace = Workspace::new("accepted-incomplete-turn", LeadMode::Delivered);
+    let (controller, mut request, acceptance) = accepted(&workspace);
+    request["boundSeconds"] = json!(1);
+    // The fixture cannot currently emit final-looking agent text while leaving
+    // the native turn non-completed: complete/missing-usage/source-later-work
+    // pair text with turn/completed, interrupted/failed are textless terminals,
+    // and unknown-hold emits neither. This holds a genuinely submitted turn
+    // open without a terminal event, the closest truthful native boundary.
+    let incomplete = run_accepted(&workspace, &request, "unknown-hold");
+    assert_refused(&incomplete, "no terminal native state");
+
+    let executor = stage(&workspace, "executor-stage");
+    assert_eq!(executor["status"], "unknown", "{executor}");
+    assert!(executor["turnId"].is_string(), "{executor}");
+    assert!(executor["result"].is_null(), "{executor}");
+    assert!(executor["resultState"].is_null(), "{executor}");
+    assert!(
+        executor["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("no terminal native state")),
+        "{executor}"
+    );
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert!(!workspace.state.join("lead-stage.json").exists());
+    assert!(!workspace.state.join("lead-delivery.json").exists());
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Unknown);
+    assert!(record.executor.outcome.is_none());
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert!(!record.executor.usage_reconciled);
+    assert!(
+        record
+            .executor
+            .usage
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("no terminal native state"))
+    );
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.lead.usage.attempts, 0);
+    assert_eq!(record.delivery, DeliveryState::Pending);
+
+    // The incomplete attempt is preserved, and a fresh-looking completion
+    // cannot replace it without an explicit recovery path.
+    let retry = run_accepted(&workspace, &request, "complete");
+    assert_refused(&retry, "requires explicit recovery");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(stage(&workspace, "executor-stage"), executor);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+    assert!(!workspace.state.join("lead-stage.json").exists());
+    assert!(!workspace.state.join("lead-delivery.json").exists());
+}
+
+#[test]
 fn occupied_shared_capacity_keeps_the_closure_pending_then_freed_capacity_runs_it() {
     let workspace = Workspace::new("accepted-capacity", LeadMode::Delivered);
     let (controller, request, acceptance) = accepted(&workspace);

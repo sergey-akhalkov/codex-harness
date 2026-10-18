@@ -1,7 +1,7 @@
 //! User-facing lifecycle commands consume the real board's accepted identity.
 
 use super::*;
-use harness_core::delivery_reflection::{DeliveryState, StageState};
+use harness_core::delivery_reflection::{DeliveryState, LifecycleStatus, StageState};
 
 fn install_fixture(workspace: &Workspace) {
     let bin = workspace.home.join("harness/bin");
@@ -176,6 +176,110 @@ fn normal_cli_derives_the_chain_and_retains_completed_delivery_without_replay() 
     let status = success(command(&workspace, "status", None));
     assert_eq!(status["pending"], 0);
     assert_eq!(status["retained"], 1);
+}
+
+#[test]
+fn duplicate_enable_reuses_the_live_binding_and_retained_records() {
+    let workspace = Workspace::new("lifecycle-duplicate-enable", LeadMode::Delivered);
+    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    install_fixture(&workspace);
+    let initial = controller.stored_state().unwrap().unwrap();
+    assert_eq!(initial.lifecycle, LifecycleStatus::Active);
+    assert_eq!(initial.records.len(), 1);
+    let retained = initial.records.get(&acceptance).unwrap().clone();
+
+    let first = success(command(&workspace, "enable", Some(LEAD_THREAD)));
+    assert_eq!(first["reused"].as_bool(), Some(true), "{first}");
+    assert_eq!(
+        first["binding_id"].as_str(),
+        Some(initial.binding.id.as_str()),
+        "{first}"
+    );
+    assert_eq!(
+        first["revision"].as_u64(),
+        Some(initial.binding.revision),
+        "{first}"
+    );
+    assert_eq!(
+        first["checkpoint"].as_u64(),
+        Some(initial.checkpoint),
+        "{first}"
+    );
+    assert_eq!(
+        first["bound_records"].as_u64(),
+        Some(initial.records.len() as u64),
+        "{first}"
+    );
+    let after_first = controller.stored_state().unwrap().unwrap();
+
+    // A repeated enable of the same live binding is an exact no-op: the same
+    // generation, checkpoint and retained records remain, and no fixture
+    // request (fork or turn) is issued.
+    let second = success(command(&workspace, "enable", Some(LEAD_THREAD)));
+    assert_eq!(second, first);
+    let after_second = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after_second, after_first);
+    assert_eq!(after_second.records.get(&acceptance), Some(&retained));
+    assert_eq!(after_second.binding, initial.binding);
+    assert_eq!(after_second.checkpoint, initial.checkpoint);
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    let status = success(command(&workspace, "status", None));
+    assert_eq!(status["retained"].as_u64(), Some(1), "{status}");
+}
+
+#[test]
+fn process_without_a_new_accepted_outcome_is_model_free_and_preserves_state() {
+    let workspace = Workspace::new("lifecycle-no-new-outcome", LeadMode::Delivered);
+    let (controller, _task) = accepted::prepare(&workspace);
+    install_fixture(&workspace);
+    success(command(&workspace, "enable", Some(LEAD_THREAD)));
+    let before = controller.stored_state().unwrap().unwrap();
+    assert_eq!(before.lifecycle, LifecycleStatus::Active);
+    assert!(before.records.is_empty(), "{before:?}");
+    let before_json = serde_json::to_value(&before).unwrap();
+    let state_entries = || {
+        fs::read_dir(&workspace.state)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>()
+    };
+    assert!(state_entries().is_empty());
+
+    // The fixture board has a committed open task but no accepted closure.
+    // The first explicit process poll may advance the journal cursor over
+    // non-eligible board events; after that, repeated processing is model-free
+    // and changes only its own poll stamp. No stage or delivery result file
+    // appears and no reflection record is created.
+    let mut after_first = None;
+    for iteration in 0..2 {
+        let status = success(command(&workspace, "process", Some(LEAD_THREAD)));
+        assert_eq!(status["pending"].as_u64(), Some(0), "{status}");
+        assert_eq!(status["retained"].as_u64(), Some(0), "{status}");
+        assert_eq!(status["unfinished"].as_u64(), Some(0), "{status}");
+        assert_eq!(status["undelivered"].as_u64(), Some(0), "{status}");
+        assert_eq!(status["lifecycle"].as_str(), Some("active"), "{status}");
+
+        let state = controller.stored_state().unwrap().unwrap();
+        let poll = state.last_poll.as_ref().expect("explicit poll stamp");
+        assert_eq!(poll.accepted, 0);
+        assert_eq!(poll.duplicates, 0);
+        assert_eq!(poll.model_calls, 0);
+        let mut state_without_poll = serde_json::to_value(&state).unwrap();
+        state_without_poll["last_poll"] = before_json["last_poll"].clone();
+        if iteration == 0 {
+            state_without_poll["checkpoint"] = before_json["checkpoint"].clone();
+            assert_eq!(state_without_poll, before_json);
+            after_first = Some((serde_json::to_value(&state).unwrap(), poll.checkpoint));
+        } else {
+            let (first, first_checkpoint) = after_first.as_ref().unwrap();
+            assert_eq!(poll.checkpoint, *first_checkpoint);
+            let mut first_without_poll = first.clone();
+            first_without_poll["last_poll"] = before_json["last_poll"].clone();
+            assert_eq!(state_without_poll, first_without_poll);
+        }
+        assert!(state_entries().is_empty());
+        assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    }
 }
 
 #[test]
