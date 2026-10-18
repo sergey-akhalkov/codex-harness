@@ -32,6 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use harness_core::improvement_loop::PreSubmissionEvidence;
 use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -2774,6 +2775,9 @@ pub(crate) struct ReceiptIdentity {
 pub(crate) struct ReceiptView {
     pub identity: ReceiptIdentity,
     pub state: ConversationState,
+    /// Verified evidence that this receipt records a dispatch that failed
+    /// before any model request. Only explicit native facts produce a value.
+    pub pre_submission: Option<PreSubmissionEvidence>,
 }
 
 pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
@@ -2789,6 +2793,7 @@ pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
                     host: None,
                 },
                 state: ConversationState::Missing,
+                pre_submission: None,
             });
         }
         Err(error) => return Err(error),
@@ -2817,7 +2822,12 @@ pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
         })(),
     };
     let state = conversation_state_of(&value);
-    Ok(ReceiptView { identity, state })
+    let pre_submission = RunObservation::from_receipt(&value).and_then(|run| run.pre_submission());
+    Ok(ReceiptView {
+        identity,
+        state,
+        pre_submission,
+    })
 }
 
 fn conversation_state_of(value: &serde_json::Value) -> ConversationState {
@@ -6186,7 +6196,13 @@ fn host_control_conversation(
     // the successor is spawned so message and stop cannot reach this
     // conversation through the old port, token or process.
     if let Err(error) = retire_stale_endpoint(&plan.paths.endpoint) {
-        return fail_control(receipt, &mut tracker, error.to_string(), plan, None);
+        return fail_control_before_submission(
+            receipt,
+            &mut tracker,
+            error.to_string(),
+            plan,
+            None,
+        );
     }
     let job = Job::new(Limits::default())?;
     let started = match control.resume_session.as_deref() {
@@ -6200,7 +6216,9 @@ fn host_control_conversation(
     };
     let mut conversation = match started {
         Ok(conversation) => conversation,
-        Err(error) => return fail_control(receipt, &mut tracker, error, plan, Some(job)),
+        Err(error) => {
+            return fail_control_before_submission(receipt, &mut tracker, error, plan, Some(job));
+        }
     };
     // The thread identity exists before the first model request and is what
     // the receipt, the visible surface and the resume remedy name. A resume
@@ -6209,7 +6227,7 @@ fn host_control_conversation(
     if let Some(expected) = control.resume_session.as_deref()
         && thread != expected
     {
-        return fail_control(
+        return fail_control_before_submission(
             receipt,
             &mut tracker,
             format!(
@@ -6232,7 +6250,7 @@ fn host_control_conversation(
         match observation::cache::Monitor::new(receipt, &plan.home, Some(&cache_log)) {
             Ok(monitor) => monitor,
             Err(error) => {
-                return fail_control(
+                return fail_control_before_submission(
                     receipt,
                     &mut tracker,
                     format!("the cache-guard monitor could not start: {error}"),
@@ -6245,7 +6263,7 @@ fn host_control_conversation(
     tracker.observation.state = STATE_STARTED.into();
     tracker.observation.updated_ms = observation::now_ms();
     if let Err(error) = observation::update_receipt(receipt, &tracker.observation) {
-        return fail_control(
+        return fail_control_before_submission(
             receipt,
             &mut tracker,
             format!("the native identity record could not be written: {error}"),
@@ -6258,7 +6276,13 @@ fn host_control_conversation(
     // assignment is submitted: a record that does not is a broken address, not
     // a cosmetic detail.
     if let Err(error) = verify_recorded_endpoint(plan, &conversation) {
-        return fail_control(receipt, &mut tracker, format!("{error}"), plan, Some(job));
+        return fail_control_before_submission(
+            receipt,
+            &mut tracker,
+            format!("{error}"),
+            plan,
+            Some(job),
+        );
     }
     let backend = control::app_server_spec(plan, conversation.endpoint().port());
     let backend_args = backend
@@ -6281,7 +6305,7 @@ fn host_control_conversation(
     let mut frontend = None;
     if attach_frontend {
         if let Err(error) = conversation.prepare_named_empty(&plan.slot) {
-            return fail_control(
+            return fail_control_before_submission(
                 receipt,
                 &mut tracker,
                 format!(
@@ -6311,13 +6335,19 @@ fn host_control_conversation(
                     &plan.title,
                 ) {
                     let _ = attached.close();
-                    return fail_control(receipt, &mut tracker, error.to_string(), plan, Some(job));
+                    return fail_control_before_submission(
+                        receipt,
+                        &mut tracker,
+                        error.to_string(),
+                        plan,
+                        Some(job),
+                    );
                 }
                 if let Err(error) =
                     write_frontend_record(plan, &attached, conversation.thread_id(), "attached")
                 {
                     let _ = attached.close();
-                    return fail_control(
+                    return fail_control_before_submission(
                         receipt,
                         &mut tracker,
                         format!(
@@ -6334,10 +6364,12 @@ fn host_control_conversation(
                     && let Err(error) = monitor.set_warnings(attached.warnings())
                 {
                     let _ = attached.close();
-                    return fail_control(
+                    return fail_control_before_submission(
                         receipt,
                         &mut tracker,
-                        format!("the cache-guard warning surface could not be recorded: {error}"),
+                        format!(
+                            "the cache-guard warning surface could not be recorded: {error}; the assignment was not submitted"
+                        ),
                         plan,
                         Some(job),
                     );
@@ -6345,7 +6377,13 @@ fn host_control_conversation(
                 frontend = Some(attached);
             }
             Err(error) => {
-                return fail_control(receipt, &mut tracker, error.to_string(), plan, Some(job));
+                return fail_control_before_submission(
+                    receipt,
+                    &mut tracker,
+                    error.to_string(),
+                    plan,
+                    Some(job),
+                );
             }
         }
     }
@@ -6860,6 +6898,22 @@ fn completed_agent_message(event: &control::ControlEvent) -> Option<String> {
         return None;
     }
     Some(text.to_owned())
+}
+
+/// Fails one control-backed run that provably never reached the assignment
+/// submission. The explicit marker is recorded with the failure so a later
+/// reconciliation can distinguish this generation from an unknown one. Call
+/// only from branches before `conversation.assign`; the assign error branch is
+/// ambiguous and must keep the generic failure.
+fn fail_control_before_submission(
+    receipt: &Path,
+    tracker: &mut RunTracker,
+    cause: String,
+    plan: &ControlPlan,
+    job: Option<Job>,
+) -> io::Result<i32> {
+    tracker.fail_before_submission(cause.clone());
+    fail_control(receipt, tracker, cause, plan, job)
 }
 
 /// Fails one control-backed run honestly: the receipt records a failed state

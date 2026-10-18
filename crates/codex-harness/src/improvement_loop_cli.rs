@@ -41,10 +41,10 @@ use harness_core::improvement_experiment::{self, Arm, CorroborationStatus, Prepa
 use harness_core::improvement_loop::{
     Attempt, AttemptRole, AttemptState, CURSOR_FILE, Cursor, DispatchBinding, DispatchFacts,
     DispatchGate, EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity,
-    ObservedOutcome, Phase, RemovalGate, ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE,
-    VariantSet, candidate_removal_gate, declared_removal_gate, dispatch_gate, dispatch_owner,
-    frozen_removal_digest, now_ms, read_json, selection_gate, settle_completed_reuse,
-    verify_dispatch_identity, write_json_atomic,
+    ObservedOutcome, Phase, PreSubmissionEvidence, RemovalGate, ResumeReport, RunMutation, RunSpec,
+    RunStore, SPEC_FILE, VariantSet, candidate_removal_gate, declared_removal_gate, dispatch_gate,
+    dispatch_owner, frozen_removal_digest, now_ms, read_json, selection_gate,
+    settle_completed_reuse, verify_dispatch_identity, write_json_atomic,
 };
 use harness_core::improvement_spec::OpenSpec;
 use harness_core::orchestration_config;
@@ -569,6 +569,7 @@ enum AttemptEvidence {
     Verified {
         state: ConversationState,
         observed: ObservedIdentity,
+        pre_submission: Option<PreSubmissionEvidence>,
     },
     Refused(String),
 }
@@ -612,6 +613,7 @@ fn attempt_evidence(attempt: &Attempt) -> AttemptEvidence {
         IdentityCheck::Verified => AttemptEvidence::Verified {
             state: view.state,
             observed,
+            pre_submission: view.pre_submission,
         },
         IdentityCheck::Mismatch(reason) | IdentityCheck::Missing(reason) => {
             AttemptEvidence::Refused(reason)
@@ -1319,6 +1321,7 @@ fn record_accepted(cursor: &mut Cursor, attempt_id: &str, accepted: &VisibleAcce
                                 created,
                                 program,
                             }),
+                        pre_submission: None,
                     });
                 }
                 (_, _, None) => {
@@ -1544,6 +1547,7 @@ fn settle_verified(
     attempt: &mut Attempt,
     outcome: ObservedOutcome,
     observed: &ObservedIdentity,
+    pre_submission: Option<PreSubmissionEvidence>,
     at: u64,
     note: String,
 ) -> String {
@@ -1552,9 +1556,18 @@ fn settle_verified(
     let retained = receipt
         .as_deref()
         .map(|receipt| store.retain_evidence(&attempt.id, receipt, result.as_deref()));
-    attempt.settle(outcome, at);
+    // Backoff is measured from the dispatch attempt, not from a later
+    // reconciliation: a pre-submission failure discovered long after it
+    // happened must not restart the retry window merely because resume found
+    // it now.
+    let settled_at = if outcome == ObservedOutcome::Failed && pre_submission.is_some() {
+        attempt.updated_ms.min(at)
+    } else {
+        at
+    };
+    attempt.settle(outcome, settled_at);
     attempt.freeze_observed(observed);
-    let note = match retained {
+    let mut note = match retained {
         Some(Ok(retained)) => {
             attempt.retained = Some(retained);
             note
@@ -1565,6 +1578,17 @@ fn settle_verified(
         }
         None => note,
     };
+    if outcome == ObservedOutcome::Failed
+        && let Some(evidence) = pre_submission
+    {
+        if let Some(binding) = &mut attempt.binding {
+            binding.pre_submission = Some(evidence);
+            note = format!(
+                "{note}; {}; the failed generation is retained and only a separately bound retry may proceed",
+                evidence.reason()
+            );
+        }
+    }
     attempt.reason = Some(note.clone());
     note
 }
@@ -1596,7 +1620,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
             continue;
         };
         let evidence = attempt_evidence(&run.cursor.attempts[index]);
-        let (slot, owner, session, state, observed) = match evidence {
+        let (slot, owner, session, state, observed, pre_submission) = match evidence {
             AttemptEvidence::Refused(reason) => {
                 let note = format!(
                     "cleanup refused: {reason}; the effect stays retained as unknown and is never bound to the current receipt contents"
@@ -1611,7 +1635,11 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                 notes.push((id, note));
                 continue;
             }
-            AttemptEvidence::Verified { state, observed } => {
+            AttemptEvidence::Verified {
+                state,
+                observed,
+                pre_submission,
+            } => {
                 let binding = run.cursor.attempts[index]
                     .binding
                     .as_ref()
@@ -1622,6 +1650,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                     binding.session.clone().or_else(|| observed.session.clone()),
                     state,
                     observed,
+                    pre_submission,
                 )
             }
         };
@@ -1631,7 +1660,15 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                 state_reason(&state).unwrap_or_else(|| "settled from the receipt".to_owned())
             );
             let attempt = &mut run.cursor.attempts[index];
-            let note = settle_verified(&run.store, attempt, outcome, &observed, at, note);
+            let note = settle_verified(
+                &run.store,
+                attempt,
+                outcome,
+                &observed,
+                pre_submission,
+                at,
+                note,
+            );
             run.cursor
                 .effect(EffectKind::OwnedCleanup, format!("attempt={id}: {note}"));
             notes.push((id, note));
@@ -1659,6 +1696,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                         AttemptEvidence::Verified {
                             state: post_state,
                             observed: post_observed,
+                            pre_submission: post_pre_submission,
                         },
                     ) => match terminal_outcome(&post_state) {
                         Some(outcome) => {
@@ -1673,6 +1711,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                                 attempt,
                                 outcome,
                                 &post_observed,
+                                post_pre_submission,
                                 at,
                                 prefix,
                             )
@@ -1843,12 +1882,24 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
                 ));
                 report.unknown.push(attempt.id.clone());
             }
-            AttemptEvidence::Verified { state, observed } => {
+            AttemptEvidence::Verified {
+                state,
+                observed,
+                pre_submission,
+            } => {
                 if let Some(outcome) = terminal_outcome(&state) {
                     let prefix = state_reason(&state)
                         .unwrap_or_else(|| "settled from the verified receipt".to_owned());
                     let attempt = &mut cursor.attempts[index];
-                    settle_verified(&run.store, attempt, outcome, &observed, at, prefix);
+                    settle_verified(
+                        &run.store,
+                        attempt,
+                        outcome,
+                        &observed,
+                        pre_submission,
+                        at,
+                        prefix,
+                    );
                     if outcome == ObservedOutcome::Completed
                         && !settle_completed_reuse(
                             attempt,

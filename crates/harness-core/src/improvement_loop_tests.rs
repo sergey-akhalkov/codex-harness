@@ -986,6 +986,7 @@ fn binding_fixture() -> DispatchBinding {
         receipt: PathBuf::from(r"C:\pool\spawn-1.json"),
         session: None,
         host: None,
+        pre_submission: None,
     }
 }
 
@@ -1889,6 +1890,58 @@ fn dispatch_gate_applies_configured_bounded_backoff_to_refused_dispatches() {
 }
 
 #[test]
+fn accepted_generation_is_retried_only_with_explicit_pre_submission_evidence() {
+    let mut cursor = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    cursor.retry = RetryPolicy {
+        initial_ms: 1_000,
+        factor_percent: 200,
+        max_ms: 4_000,
+    };
+    let now = now_ms();
+
+    let mut submitted = attempt("lead-frame-1", AttemptRole::LeadFrame, AttemptState::Failed);
+    submitted.binding = Some(binding_fixture());
+    assert!(
+        !submitted.failed_before_submission(),
+        "an accepted dispatch without explicit evidence may have submitted a turn"
+    );
+    submitted.binding.as_mut().unwrap().pre_submission = Some(PreSubmissionEvidence::NativeMarker);
+    assert!(submitted.failed_before_submission());
+    cursor.push_attempt(submitted).unwrap();
+
+    let mut legacy = attempt("lead-frame-2", AttemptRole::LeadFrame, AttemptState::Failed);
+    let mut legacy_binding = binding_fixture();
+    legacy_binding.pre_submission = Some(PreSubmissionEvidence::LegacyFrontendAttachment);
+    legacy.binding = Some(legacy_binding);
+    legacy.updated_ms = now.saturating_sub(500);
+    assert!(legacy.failed_before_submission());
+    cursor.push_attempt(legacy).unwrap();
+    let backoff = cursor
+        .dispatch_backoff(AttemptRole::LeadFrame, now)
+        .expect("two consecutive verified pre-submission failures are bounded");
+    assert_eq!(backoff.failures, 2);
+    assert_eq!(backoff.delay_ms, 1_000);
+
+    // A later accepted dispatch without the evidence ends the chain: a
+    // possible turn is never replayed, so it imposes no retry window.
+    let mut submitted = attempt("lead-frame-3", AttemptRole::LeadFrame, AttemptState::Failed);
+    submitted.binding = Some(binding_fixture());
+    submitted.updated_ms = now.saturating_sub(100);
+    cursor.push_attempt(submitted).unwrap();
+    assert!(
+        cursor
+            .dispatch_backoff(AttemptRole::LeadFrame, now)
+            .is_none(),
+        "a failed accepted generation without pre-submission evidence is unknown, not retriable"
+    );
+}
+
+#[test]
 fn researcher_and_measured_dispatch_never_overlap_on_shared_inference() {
     let ctx = tempfile::tempdir().unwrap();
     let facts = ready_facts(ctx.path());
@@ -2410,6 +2463,7 @@ fn baseline_qualification_requires_frozen_task_and_one_explicit_runtime_route() 
         },
         acceptance: comparison.acceptance,
         workflow: workflow_fixture(1, 2),
+        semantic_review: None,
         report: root.path().join("result.txt"),
     });
     spec.validate().unwrap();

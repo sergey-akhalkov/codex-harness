@@ -1725,6 +1725,39 @@ pub struct HostBinding {
     pub program: PathBuf,
 }
 
+/// Why a verified native dispatch is known to have made no model request.
+///
+/// Only two facts establish this: a dispatcher-written marker that exists only
+/// on branches before `conversation.assign`, or a tightly bounded legacy
+/// receipt carrying the exact native frontend-attachment failure for the
+/// observed session with an explicit assignment-not-submitted diagnostic. The
+/// absence of events, turns or a status string alone proves nothing.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreSubmissionEvidence {
+    /// The dispatcher persisted an explicit marker before it could issue
+    /// `turn/start`; the marker is never inferred from an empty stream.
+    NativeMarker,
+    /// A pre-marker receipt classified from the exact native frontend
+    /// attachment failure: the diagnostic names the observed session, the
+    /// assignment-not-submitted sentence is explicit, and no turn was
+    /// recorded. Retained as a legacy classification, not a fresh marker.
+    LegacyFrontendAttachment,
+}
+
+impl PreSubmissionEvidence {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NativeMarker => {
+                "the dispatcher recorded an explicit native pre-submission marker"
+            }
+            Self::LegacyFrontendAttachment => {
+                "legacy classification: the verified receipt records the exact native frontend-attachment failure, no observed turn and the explicit assignment-not-submitted diagnostic"
+            }
+        }
+    }
+}
+
 /// The frozen identity of the native dispatch an attempt accepted.
 ///
 /// A receipt path alone is not identity: the pool reuses `spawn-<slot>.json`
@@ -1744,6 +1777,11 @@ pub struct DispatchBinding {
     pub session: Option<String>,
     #[serde(default)]
     pub host: Option<HostBinding>,
+    /// Verified evidence that this exact accepted dispatch failed before a
+    /// model request. `None` means no such evidence is recorded, so the
+    /// generation is never replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_submission: Option<PreSubmissionEvidence>,
 }
 
 /// A freshly read native receipt identity, as the dispatcher's own receipt
@@ -2015,13 +2053,19 @@ pub struct Attempt {
 }
 
 impl Attempt {
-    /// A dispatch that failed before submission: no dispatch identity was
-    /// accepted, so no model request was made. The documented recovery for
-    /// this case is a fresh attempt under the configured bounded retry; an
-    /// attempt that accepted a dispatch (or settled a model effect) is never
-    /// replayed.
+    /// A dispatch that failed before submission: either no dispatch identity
+    /// was accepted at all, or the accepted generation carries verified
+    /// pre-submission evidence. The documented recovery for this case is a
+    /// fresh attempt under the configured bounded retry; an attempt that
+    /// accepted a dispatch without that evidence (or settled a model effect)
+    /// is never replayed.
     pub fn failed_before_submission(&self) -> bool {
-        self.state == AttemptState::Failed && self.binding.is_none()
+        self.state == AttemptState::Failed
+            && (self.binding.is_none()
+                || self
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.pre_submission.is_some()))
     }
 
     /// The explicit unsupported-evidence result for this attempt, naming the

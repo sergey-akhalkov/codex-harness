@@ -14,6 +14,7 @@
 //! never selects a session by recency and never inspects opaque reasoning
 //! state.
 
+use harness_core::improvement_loop::PreSubmissionEvidence;
 use harness_core::process::{
     Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, ProcessIdentity,
 };
@@ -174,6 +175,15 @@ pub(crate) struct HostIdentity {
     pub program: PathBuf,
 }
 
+/// Explicit pre-submission fact written by a dispatcher branch that has not
+/// called `conversation.assign`. Its absence proves nothing; only this marker
+/// establishes that the dispatch could not have submitted a model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SubmissionMarker {
+    NotAttempted,
+}
+
 /// Recorded lifecycle of one executor run, stored under `observation` in the
 /// kit-local dispatch receipt (`spawn-<index>.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +209,10 @@ pub(crate) struct RunObservation {
     /// turn instead of inferring one from recency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<String>,
+    /// Set only on a failure branch reached before `conversation.assign`; it
+    /// records that no model turn was submitted by this dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<SubmissionMarker>,
     /// Session recorded before a resume attempt, kept so a failed resume
     /// cannot lose the exact identity of the interrupted conversation.
     #[serde(default)]
@@ -313,7 +327,6 @@ pub(crate) struct ObservationClock {
 }
 
 impl RunObservation {
-    /// A run whose process has not started yet.
     pub(crate) fn accepted(result: PathBuf, detail: PathBuf) -> Self {
         Self {
             schema: OBSERVATION_SCHEMA,
@@ -322,6 +335,7 @@ impl RunObservation {
             state: STATE_ACCEPTED.into(),
             session: None,
             turn: None,
+            submission: None,
             previous_session: None,
             exit_code: None,
             events: 0,
@@ -343,8 +357,6 @@ impl RunObservation {
         }
     }
 
-    /// A TUI (or otherwise unobservable) run: the identity and result stay
-    /// explicitly unavailable instead of being guessed.
     pub(crate) fn unavailable(reason: &str) -> Self {
         Self {
             schema: OBSERVATION_SCHEMA,
@@ -353,6 +365,7 @@ impl RunObservation {
             state: STATE_UNOBSERVED.into(),
             session: None,
             turn: None,
+            submission: None,
             previous_session: None,
             exit_code: None,
             events: 0,
@@ -386,6 +399,53 @@ impl RunObservation {
             return None;
         }
         Some(parsed)
+    }
+
+    /// Verified pre-submission evidence for this exact observation.
+    ///
+    /// The explicit marker is the normal proof. A receipt written before the
+    /// marker existed is classified only when the exact native frontend
+    /// attachment timeout names the observed session, the cause carries the
+    /// explicit assignment-not-submitted sentence, and the observation records
+    /// no turn and no model effect. Generic failed, empty, missing or
+    /// turn-bearing receipts return `None`.
+    pub(crate) fn pre_submission(&self) -> Option<PreSubmissionEvidence> {
+        if self.coverage != COVERAGE_NATIVE
+            || self.state != STATE_FAILED
+            || self.turn.is_some()
+            || self.exit_code.is_some()
+        {
+            return None;
+        }
+        let cause = self.cause.as_deref()?;
+        if self.submission == Some(SubmissionMarker::NotAttempted) {
+            return Some(PreSubmissionEvidence::NativeMarker);
+        }
+        if self.events != 0 || self.messages != 0 || self.tool_calls != 0 || self.rounds != 0 {
+            return None;
+        }
+        for artifact in [self.result.as_deref(), self.detail.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            match fs::metadata(artifact) {
+                Ok(metadata) if metadata.len() == 0 => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return None,
+            }
+        }
+        let session = self
+            .session
+            .as_deref()
+            .filter(|session| !session.is_empty())?;
+        let prefix = format!(
+            "the native frontend did not attach to thread {session} within {:?};",
+            super::FRONTEND_ATTACH
+        );
+        (cause.starts_with(&prefix)
+            && cause.contains("; console caption is ")
+            && cause.contains(". The assignment was not submitted."))
+        .then_some(PreSubmissionEvidence::LegacyFrontendAttachment)
     }
 
     /// The exact session this run observed, falling back to the identity a
@@ -932,6 +992,14 @@ impl RunTracker {
         self.observation.exit_code = None;
         self.observation.cause = Some(cause);
         self.observation.updated_ms = now_ms();
+    }
+
+    /// Records an explicit pre-submission failure. Call only from a branch
+    /// that has not called `conversation.assign`; the marker is persisted with
+    /// the failed observation and is never written on an ambiguous assign.
+    pub(crate) fn fail_before_submission(&mut self, cause: String) {
+        self.observation.submission = Some(SubmissionMarker::NotAttempted);
+        self.session_failed(cause);
     }
 
     /// Records that the only frontend exited during active work. Session

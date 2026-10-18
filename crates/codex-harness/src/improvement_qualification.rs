@@ -43,57 +43,87 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
     run.cursor.phase = Phase::BaselineQualification;
     run.store.save_cursor(&run.cursor)?;
 
+    let mut recovery = None;
     if let Some(id) = state.workflow.lead_frame.clone() {
         let attempt = run
             .cursor
             .attempt(&id)
             .cloned()
             .ok_or_else(|| invalid("the recorded lead-frame attempt is missing"))?;
-        if attempt.state != AttemptState::Completed {
-            let note = format!(
-                "qualification lead frame {} is {:?}; its exact native outcome remains owned by the existing resume/wait path",
-                id, attempt.state
-            );
-            return Ok(vec![note]);
+        if attempt.state == AttemptState::Completed {
+            if let Some(reason) = &attempt.reuse_refused {
+                return Err(invalid(format!(
+                    "the lead frame cannot be consumed: {reason}"
+                )));
+            }
+            let retained = attempt
+                .retained
+                .as_ref()
+                .ok_or_else(|| invalid("the completed lead frame has no retained evidence"))?;
+            let result = retained
+                .result
+                .as_ref()
+                .ok_or_else(|| invalid("the completed lead frame has no retained result"))?;
+            if retained.result_sha256.as_deref()
+                != Some(build_identity::hash_file(result)?.as_str())
+            {
+                return Err(invalid(
+                    "the retained lead frame changed; no executor assignment was dispatched",
+                ));
+            }
+            crate::executor_assignment::Assignment::load(result)?;
+            let binding = attempt
+                .binding
+                .as_ref()
+                .ok_or_else(|| invalid("the lead frame has no exact native dispatch binding"))?;
+            let session = binding
+                .session
+                .clone()
+                .ok_or_else(|| invalid("the lead frame has no exact native session"))?;
+            if state.workflow.lead.is_none() {
+                state.workflow.lead = Some(WorkflowParticipant {
+                    slot: binding.slot,
+                    owner: binding.owner.clone(),
+                    session,
+                    profile: attempt.profile,
+                });
+                run.cursor.baseline_qualification = Some(state.clone());
+                run.store.save_cursor(&run.cursor)?;
+            }
+            return advance_work(run, &inputs, &mut state, &runtime);
         }
-        if let Some(reason) = &attempt.reuse_refused {
-            return Err(invalid(format!(
-                "the lead frame cannot be consumed: {reason}"
-            )));
+        let evidence = match (
+            attempt.state,
+            attempt
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.pre_submission),
+        ) {
+            (AttemptState::Failed, Some(evidence)) => evidence,
+            _ => {
+                let note = format!(
+                    "qualification lead frame {} is {:?}; its exact native outcome remains owned by the existing resume/wait path and no retry is dispatched",
+                    id, attempt.state
+                );
+                return Ok(vec![note]);
+            }
+        };
+        let Some(retained) = attempt.retained.as_ref() else {
+            return Ok(vec![format!(
+                "qualification lead frame {id} failed before submission ({}), but no retained terminal evidence is recorded; the attempt is preserved and no retry is dispatched",
+                evidence.reason()
+            )]);
+        };
+        if let Err(fault) = retained.verify() {
+            return Ok(vec![format!(
+                "qualification lead frame {id} failed before submission ({}), but its retained terminal evidence does not verify ({fault:?}); the attempt is preserved and no retry is dispatched",
+                evidence.reason()
+            )]);
         }
-        let retained = attempt
-            .retained
-            .as_ref()
-            .ok_or_else(|| invalid("the completed lead frame has no retained evidence"))?;
-        let result = retained
-            .result
-            .as_ref()
-            .ok_or_else(|| invalid("the completed lead frame has no retained result"))?;
-        if retained.result_sha256.as_deref() != Some(build_identity::hash_file(result)?.as_str()) {
-            return Err(invalid(
-                "the retained lead frame changed; no executor assignment was dispatched",
-            ));
-        }
-        crate::executor_assignment::Assignment::load(result)?;
-        let binding = attempt
-            .binding
-            .as_ref()
-            .ok_or_else(|| invalid("the lead frame has no exact native dispatch binding"))?;
-        let session = binding
-            .session
-            .clone()
-            .ok_or_else(|| invalid("the lead frame has no exact native session"))?;
-        if state.workflow.lead.is_none() {
-            state.workflow.lead = Some(WorkflowParticipant {
-                slot: binding.slot,
-                owner: binding.owner.clone(),
-                session,
-                profile: attempt.profile,
-            });
-            run.cursor.baseline_qualification = Some(state.clone());
-            run.store.save_cursor(&run.cursor)?;
-        }
-        return advance_work(run, &inputs, &mut state, &runtime);
+        recovery = Some(format!(
+            "qualification lead frame {id} failed before submission ({}); its generation, receipt and retained evidence are kept and a new separately bound lead frame is prepared",
+            evidence.reason()
+        ));
     }
     let home = runtime.home.clone();
     let facts = DispatchFacts {
@@ -116,8 +146,22 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
         .task_base
         .clone()
         .ok_or_else(|| invalid("prepared qualification has no frozen task base"))?;
-    let id = "lead-frame-1".to_owned();
-    let owner = dispatch_owner(&run.spec.run, AttemptRole::LeadFrame, 1);
+    let ordinal = run
+        .cursor
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.role == AttemptRole::LeadFrame)
+        .filter_map(|attempt| {
+            attempt
+                .id
+                .strip_prefix("lead-frame-")
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let id = format!("lead-frame-{ordinal}");
+    let owner = dispatch_owner(&run.spec.run, AttemptRole::LeadFrame, ordinal);
     let prompt = format!(
         "Frame this ordinary task for an executor in the assigned frozen checkout. Read the relevant project guidance and actual inputs. Do not implement changes or dispatch anyone. Return one usable structured executor assignment as JSON with schema=1, objective, inputs, outputs, invariants, acceptance, consumer and escalate. Every file path must be relative to this checkout and verified here. {}. Preserve all task acceptance. Do not add experiment labels or comparison policy.\n\nTask instructions:\n{}",
         if inputs.task.read_only {
@@ -127,7 +171,7 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
         },
         fs::read_to_string(&inputs.task_prompt.path)?
     );
-    let prompt_path = run.store.assignments_dir().join("lead-frame-1.txt");
+    let prompt_path = run.store.assignments_dir().join(format!("{id}.txt"));
     fs::create_dir_all(run.store.assignments_dir())?;
     fs::write(&prompt_path, &prompt)?;
     let selected = state
@@ -173,10 +217,12 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
         Ok(accepted) => {
             record_accepted(&mut run.cursor, &id, &accepted);
             run.store.save_cursor(&run.cursor)?;
-            Ok(vec![format!(
+            let mut notes = recovery.into_iter().collect::<Vec<_>>();
+            notes.push(format!(
                 "qualification: visible lead framing accepted through {}",
                 accepted.title
-            )])
+            ));
+            Ok(notes)
         }
         Err(error) => {
             if let Some(attempt) = run.cursor.attempts.iter_mut().find(|a| a.id == id) {
