@@ -1129,6 +1129,489 @@ fn stage_plan(
     Ok(plan)
 }
 
+/// Bounded references that support reflection without becoming acceptance
+/// evidence. The retained completion remains the only source of verified
+/// result identity; board history, guidance and source rollouts are attributed
+/// references whose missing or compacted coverage stays explicit.
+const ACCEPTED_DESCRIPTION_BYTES: usize = 2048;
+const ACCEPTED_COMMENT_BYTES: usize = 768;
+const ACCEPTED_COMMENT_LIMIT: usize = 6;
+const SOURCE_INTEGRITY_WARNINGS: [&str; 11] = [
+    "conflicting_thread_ids",
+    "corrupt_jsonl",
+    "forked_or_compacted_history",
+    "interrupted_turn",
+    "invalid_event",
+    "invalid_event_type",
+    "invalid_payload",
+    "invalid_thread_id",
+    "missing_thread_id",
+    "oversized_jsonl_record",
+    "unreadable_input",
+];
+
+fn bounded_excerpt(text: &str, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_owned(), false);
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut excerpt = text[..end].to_owned();
+    excerpt.push('…');
+    (excerpt, true)
+}
+
+fn accepted_source_boundary(binding: &AcceptanceBinding) -> Value {
+    let other_sessions = binding
+        .executor_sessions
+        .iter()
+        .filter(|session| Some(session.as_str()) != binding.executor_session.as_deref())
+        .cloned()
+        .collect::<Vec<_>>();
+    json!({
+        "executorSessions": binding.executor_sessions,
+        "acceptedExecutorSession": binding.executor_session,
+        "acceptedExecutorTurn": binding.executor_turn,
+        "otherExecutorSessions": other_sessions,
+        "acceptedLeadSession": binding.lead_session,
+        "acceptedLeadTurn": binding.lead_turn,
+        "note": "Only the exact accepted executor session and completed turn are accepted evidence. Other recorded executor sessions are history; their work must not be attributed to the accepted source and must not be reconstructed from the current checkout.",
+    })
+}
+
+fn accepted_boundary_line(chain: &ChainState) -> String {
+    match chain.accepted_work.as_ref() {
+        Some(binding) => {
+            let accepted = binding.executor_session.as_deref().unwrap_or("unrecorded");
+            let turn = binding.executor_turn.as_deref().unwrap_or("unrecorded");
+            let others = binding
+                .executor_sessions
+                .iter()
+                .filter(|session| Some(session.as_str()) != binding.executor_session.as_deref())
+                .cloned()
+                .collect::<Vec<_>>();
+            let others = if others.is_empty() {
+                "none".to_owned()
+            } else {
+                others.join(", ")
+            };
+            format!(
+                "Accepted-source boundary: only executor session '{accepted}' at completed turn '{turn}' is accepted evidence; other recorded executor sessions ({others}) are history and must not be attributed to it."
+            )
+        }
+        None => "No accepted-work binding is attached; accepted-source attribution is unavailable."
+            .to_owned(),
+    }
+}
+
+fn source_context_entry(
+    chain: &ChainState,
+    role: &str,
+    thread: &str,
+    turn: &str,
+    other_sessions: &[String],
+) -> (Value, Vec<String>) {
+    let mut gaps = Vec::new();
+    let mut entry = json!({
+        "role": role,
+        "thread": thread,
+        "turn": turn,
+        "otherSessions": other_sessions,
+        "rollout": Value::Null,
+        "status": "missing",
+        "compactionObserved": false,
+        "warnings": [],
+        "sourceIntegrityWarnings": [],
+        "coverage": Value::Null,
+        "gaps": [],
+    });
+    match find_rollout(&chain.codex_home, thread) {
+        Ok(Some(path)) => {
+            let summary = rollout_reader::read(&path);
+            let warnings = summary.warnings.iter().cloned().collect::<Vec<_>>();
+            let source_integrity_warnings = warnings
+                .iter()
+                .filter(|warning| SOURCE_INTEGRITY_WARNINGS.contains(&warning.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let compaction_observed = summary.warnings.contains("forked_or_compacted_history");
+            let mut status = if compaction_observed {
+                "compacted"
+            } else {
+                "available"
+            };
+            if summary.source.is_none() || summary.warnings.contains("unreadable_input") {
+                status = "unreadable";
+                gaps.push(format!(
+                    "the source rollout {} for {role} session '{thread}' could not be read; source history is unavailable and is not reconstructed",
+                    path.display()
+                ));
+            } else if summary.coverage.corrupt_lines > 0
+                || summary.coverage.oversized_lines > 0
+                || summary.coverage.unrecognized_events > 0
+            {
+                if status != "compacted" {
+                    status = "partial";
+                }
+                gaps.push(format!(
+                    "the source rollout {} for {role} session '{thread}' has incomplete recognized coverage (corrupt={}, oversized={}, unrecognized={}); missing source content is not reconstructed",
+                    path.display(),
+                    summary.coverage.corrupt_lines,
+                    summary.coverage.oversized_lines,
+                    summary.coverage.unrecognized_events
+                ));
+            }
+            if compaction_observed {
+                gaps.push(format!(
+                    "the source rollout {} for {role} session '{thread}' records forked or compacted history; pre-compaction content may be absent and is not decoded or reconstructed",
+                    path.display()
+                ));
+            }
+            if !source_integrity_warnings.is_empty()
+                && status != "compacted"
+                && status != "unreadable"
+            {
+                status = "partial";
+                gaps.push(format!(
+                    "the source rollout {} for {role} session '{thread}' reports source-integrity warnings: {}",
+                    path.display(),
+                    source_integrity_warnings.join(", ")
+                ));
+            }
+            entry = json!({
+                "role": role,
+                "thread": thread,
+                "turn": turn,
+                "otherSessions": other_sessions,
+                "rollout": path.display().to_string(),
+                "status": status,
+                "compactionObserved": compaction_observed,
+                "warnings": warnings,
+                "sourceIntegrityWarnings": source_integrity_warnings,
+                "coverage": {
+                    "lines": summary.coverage.lines,
+                    "events": summary.coverage.events,
+                    "recognizedEvents": summary.coverage.recognized_events,
+                    "unrecognizedEvents": summary.coverage.unrecognized_events,
+                    "corruptLines": summary.coverage.corrupt_lines,
+                    "oversizedLines": summary.coverage.oversized_lines,
+                },
+                "gaps": gaps.clone(),
+            });
+        }
+        Ok(None) => {
+            gaps.push(format!(
+                "no source rollout for {role} session '{thread}' was found under {}; original source history is unavailable and is not reconstructed",
+                chain.codex_home.join("sessions").display()
+            ));
+            entry["gaps"] = json!(gaps);
+        }
+        Err(error) => {
+            gaps.push(format!(
+                "the source rollout for {role} session '{thread}' could not be located: {error}"
+            ));
+            entry["status"] = json!("unreadable");
+            entry["gaps"] = json!(gaps);
+        }
+    }
+    (entry, gaps)
+}
+
+fn accepted_source_context(chain: &ChainState, binding: &AcceptanceBinding) -> Value {
+    let executor_thread = binding
+        .executor_session
+        .as_deref()
+        .unwrap_or(&chain.executor_source.thread);
+    let executor_turn = binding
+        .executor_turn
+        .as_deref()
+        .unwrap_or(&chain.executor_source.last_turn);
+    let other_sessions = binding
+        .executor_sessions
+        .iter()
+        .filter(|session| Some(session.as_str()) != binding.executor_session.as_deref())
+        .cloned()
+        .collect::<Vec<_>>();
+    let (executor, mut gaps) = source_context_entry(
+        chain,
+        "executor",
+        executor_thread,
+        executor_turn,
+        &other_sessions,
+    );
+    let lead_turn = binding
+        .lead_turn
+        .as_deref()
+        .unwrap_or(&chain.lead_source.last_turn);
+    let (lead, lead_gaps) =
+        source_context_entry(chain, "lead", &binding.lead_session, lead_turn, &[]);
+    gaps.extend(lead_gaps);
+
+    if binding.executor_sessions.is_empty() {
+        gaps.push(
+            "the acceptance binding records no executor sessions; source history cannot be attributed"
+                .to_owned(),
+        );
+    }
+    match binding.executor_session.as_deref() {
+        Some(session) => {
+            if !binding
+                .executor_sessions
+                .iter()
+                .any(|recorded| recorded == session)
+            {
+                gaps.push(format!(
+                    "the accepted executor session '{session}' is not listed in executorSessions; the source boundary is inconsistent"
+                ));
+            }
+            if session != chain.executor_source.thread {
+                gaps.push(format!(
+                    "the accepted executor session '{session}' differs from the fork source boundary '{}'; attribution follows the accepted binding",
+                    chain.executor_source.thread
+                ));
+            }
+        }
+        None => gaps.push(
+            "the acceptance binding records no exact executor session; source history cannot be attributed to a successor boundary"
+                .to_owned(),
+        ),
+    }
+    if binding.executor_turn.is_none() {
+        gaps.push(
+            "the acceptance binding records no exact executor turn; source history cannot be attributed to a completed successor turn"
+                .to_owned(),
+        );
+    }
+    if binding.lead_session != chain.lead_source.thread {
+        gaps.push(format!(
+            "the accepted lead session '{}' differs from the fork source boundary '{}'; attribution follows the accepted binding",
+            binding.lead_session, chain.lead_source.thread
+        ));
+    }
+    if binding.lead_turn.is_none() {
+        gaps.push(
+            "the acceptance binding records no exact lead turn; lead source coverage is not a completed accepted boundary"
+                .to_owned(),
+        );
+    }
+
+    let statuses = [
+        executor["status"].as_str().unwrap_or("missing"),
+        lead["status"].as_str().unwrap_or("missing"),
+    ];
+    let status = if statuses.contains(&"missing") {
+        "missing"
+    } else if statuses.contains(&"unreadable") {
+        "unreadable"
+    } else if statuses.contains(&"compacted") {
+        "compacted"
+    } else if statuses.contains(&"partial") {
+        "partial"
+    } else {
+        "available"
+    };
+    json!({
+        "status": status,
+        "statusMeaning": "bounded source rollout coverage; missing or compacted history does not invalidate the retained accepted result, but it must remain explicit",
+        "executor": executor,
+        "lead": lead,
+        "gaps": gaps,
+        "reconstruction": "Opaque reasoning, pre-compaction content and unavailable source history are not decoded or reconstructed.",
+    })
+}
+
+fn retained_assignment_reference(retained: &RetainedCompletion) -> Value {
+    let assignment = retained.assignment.as_ref().map(|assignment| {
+        json!({
+            "issue": assignment.issue,
+            "assignmentSha256": assignment.assignment_sha256,
+            "purpose": assignment.purpose,
+            "purposeSource": assignment.purpose_source,
+            "board": {
+                "projectId": assignment.source.project_id,
+                "beadsDir": assignment.source.beads_dir,
+                "database": assignment.source.database,
+                "repoRoot": assignment.source.repo_root,
+                "branch": assignment.source.branch,
+                "observedCommit": assignment.source.commit,
+            },
+        })
+    });
+    let submitted = retained.submitted_assignment.as_ref().map(|submitted| {
+        json!({
+            "kind": submitted.kind,
+            "assignmentSha256": submitted.assignment_sha256,
+        })
+    });
+    json!({
+        "runGeneration": retained.run_generation,
+        "recordedMs": retained.recorded_ms,
+        "role": retained.role,
+        "state": retained.state,
+        "exitCode": retained.exit_code,
+        "assignment": assignment,
+        "submitted": submitted,
+    })
+}
+
+fn board_task_history(
+    chain: &ChainState,
+    task: &str,
+    assignment: &task_worktree::SlotAssignmentBinding,
+) -> (Value, Vec<String>) {
+    let mut gaps = Vec::new();
+    let bd = match crate::feedback_cli::discover_bd_in(&chain.codex_home) {
+        Ok(bd) => bd,
+        Err(error) => {
+            gaps.push(format!(
+                "board task history for '{task}' is unavailable because bd could not be discovered: {error}"
+            ));
+            return (
+                json!({
+                    "available": false,
+                    "id": task,
+                    "status": "unavailable",
+                    "statusIsAcceptanceEvidence": false,
+                    "gaps": gaps,
+                }),
+                gaps,
+            );
+        }
+    };
+    let project = Path::new(&assignment.source.repo_root);
+    let issue = match harness_core::board_cli::show_issue(&bd, project, task) {
+        Ok(issue) => issue,
+        Err(error) => {
+            gaps.push(format!(
+                "board task history for '{task}' could not be read through bd show: {error}"
+            ));
+            return (
+                json!({
+                    "available": false,
+                    "id": task,
+                    "status": "unavailable",
+                    "statusIsAcceptanceEvidence": false,
+                    "gaps": gaps,
+                }),
+                gaps,
+            );
+        }
+    };
+    let description = issue
+        .get("description")
+        .and_then(Value::as_str)
+        .or_else(|| issue.get("content").and_then(Value::as_str))
+        .unwrap_or_default();
+    let (description_text, description_truncated) =
+        bounded_excerpt(description, ACCEPTED_DESCRIPTION_BYTES);
+    let comments = match harness_core::board_feedback::list_comments(&bd, project, task) {
+        Ok(comments) => comments,
+        Err(error) => {
+            gaps.push(format!(
+                "feedback comments for accepted task '{task}' could not be read through bd comments: {error}"
+            ));
+            Vec::new()
+        }
+    };
+    let comment_count = comments.len();
+    let start = comment_count.saturating_sub(ACCEPTED_COMMENT_LIMIT);
+    let comments = comments
+        .iter()
+        .enumerate()
+        .skip(start)
+        .map(|(index, comment)| {
+            let bytes = comment.len();
+            let chars = comment.chars().count();
+            let (text, truncated) = bounded_excerpt(comment, ACCEPTED_COMMENT_BYTES);
+            json!({
+                "index": index,
+                "text": text,
+                "truncated": truncated,
+                "chars": chars,
+                "bytes": bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let history = json!({
+        "available": true,
+        "source": "bd show/comments through the existing board owners",
+        "id": task,
+        "title": issue.get("title").cloned().unwrap_or(Value::Null),
+        "status": issue.get("status").cloned().unwrap_or(Value::Null),
+        "statusIsAcceptanceEvidence": false,
+        "closeReason": issue.get("close_reason").cloned().unwrap_or(Value::Null),
+        "issueType": issue.get("issue_type").or_else(|| issue.get("type")).cloned().unwrap_or(Value::Null),
+        "priority": issue.get("priority").cloned().unwrap_or(Value::Null),
+        "createdAt": issue.get("created_at").cloned().unwrap_or(Value::Null),
+        "updatedAt": issue.get("updated_at").cloned().unwrap_or(Value::Null),
+        "closedAt": issue.get("closed_at").cloned().unwrap_or(Value::Null),
+        "description": {
+            "text": description_text,
+            "truncated": description_truncated,
+            "chars": description.chars().count(),
+            "bytes": description.len(),
+        },
+        "comments": comments,
+        "commentCount": comment_count,
+        "omittedCommentsBefore": start,
+        "gaps": gaps,
+    });
+    (history, gaps)
+}
+
+fn accepted_assignment_context(
+    chain: &ChainState,
+    binding: &AcceptanceBinding,
+    retained: Option<&RetainedCompletion>,
+) -> Value {
+    let mut gaps = Vec::new();
+    let Some(retained) = retained else {
+        gaps.push(
+            "task/assignment history is unavailable because no retained completion was loaded"
+                .to_owned(),
+        );
+        return json!({
+            "retained": Value::Null,
+            "boardTask": Value::Null,
+            "gaps": gaps,
+        });
+    };
+    let reference = retained_assignment_reference(retained);
+    let Some(assignment) = retained.assignment.as_ref() else {
+        gaps.push(
+            "task/assignment history is unavailable because the retained completion records no verified board assignment"
+                .to_owned(),
+        );
+        return json!({
+            "retained": reference,
+            "boardTask": Value::Null,
+            "gaps": gaps,
+        });
+    };
+    if assignment.issue.as_str() != binding.task.as_str()
+        || assignment.assignment_sha256.as_str() != binding.assignment.as_str()
+    {
+        gaps.push(format!(
+            "board task history was not read because the retained assignment '{}' / {} does not match accepted task '{}' / assignment {}",
+            assignment.issue, assignment.assignment_sha256, binding.task, binding.assignment
+        ));
+        return json!({
+            "retained": reference,
+            "boardTask": Value::Null,
+            "gaps": gaps,
+        });
+    }
+    let (board_task, board_gaps) = board_task_history(chain, &binding.task, assignment);
+    gaps.extend(board_gaps);
+    json!({
+        "retained": reference,
+        "boardTask": board_task,
+        "gaps": gaps,
+    })
+}
+
 fn accepted_context(chain: &ChainState) -> io::Result<String> {
     let Some(binding) = chain.accepted_work.as_ref() else {
         return Ok(String::new());
@@ -1151,6 +1634,7 @@ fn accepted_evidence(chain: &ChainState, binding: &AcceptanceBinding) -> Value {
     let mut retained_source_revision = None;
     let mut retained_result = None;
     let mut gaps = Vec::new();
+    let mut retained_completion = None;
     match task_worktree::load_retained_completion(
         &chain.codex_home,
         &chain.executor_stage.checkout,
@@ -1166,6 +1650,7 @@ fn accepted_evidence(chain: &ChainState, binding: &AcceptanceBinding) -> Value {
             } else {
                 status = "unverified";
             }
+            retained_completion = Some(retained);
         }
         Ok(None) => {
             let pool =
@@ -1185,16 +1670,45 @@ fn accepted_evidence(chain: &ChainState, binding: &AcceptanceBinding) -> Value {
             ));
         }
     }
+    let source_boundary = accepted_source_boundary(binding);
+    let assignment_context =
+        accepted_assignment_context(chain, binding, retained_completion.as_ref());
+    let source_context = accepted_source_context(chain, binding);
+    let guidance = json!({
+        "executor": {
+            "role": chain.executor_stage.role,
+            "revision": chain.executor_stage.revision,
+            "profile": chain.executor_stage.profile,
+            "model": chain.executor_stage.model,
+            "provider": chain.executor_stage.provider,
+            "effort": chain.executor_stage.effort,
+        },
+        "lead": {
+            "role": chain.lead_stage.role,
+            "revision": chain.lead_stage.revision,
+            "profile": chain.lead_stage.profile,
+            "model": chain.lead_stage.model,
+            "provider": chain.lead_stage.provider,
+            "effort": chain.lead_stage.effort,
+        },
+    });
     json!({
         "status": status,
+        "statusMeaning": "retained completion identity and result match the accepted binding; board closure or the current checkout is not acceptance evidence",
         "task": binding.task,
         "run": binding.run,
         "acceptedRevision": binding.revision,
         "retainedSourceRevision": retained_source_revision,
+        "acceptedAssignmentSha256": binding.assignment,
         "acceptedResultSha256": binding.result,
         "retainedResult": retained_result,
         "stageCheckoutIsAcceptedEvidence": false,
         "gaps": gaps,
+        "acceptedSourceBoundary": source_boundary,
+        "assignmentContext": assignment_context,
+        "guidance": guidance,
+        "sourceContext": source_context,
+        "referenceNote": "retainedResult is the exact accepted result/check artifact reference; assignmentContext uses bd show/comments through the existing board owners; sourceContext uses bounded rollout coverage. No source content is duplicated and no opaque reasoning is decoded.",
     })
 }
 
@@ -1279,7 +1793,7 @@ fn push_accepted_gaps(
 
 fn executor_prompt(chain: &ChainState) -> io::Result<String> {
     Ok(format!(
-        "Bounded read-only executor self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\n{accepted_context}\nThis fork preserves the accepted executor conversation as frozen evidence. The stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. Analyze the assignment and the executor's visible work under the executor self-reflection role, separating observed facts from hypotheses. Do not continue the source task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
+        "Bounded read-only executor self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\n{accepted_boundary}\n{accepted_context}\nThis fork preserves the accepted executor conversation as far as the native source provides it; sourceContext.gaps identify missing or compacted coverage. The stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. Source coverage gaps are limits on available evidence, not findings about the accepted work. Do not decode opaque reasoning, reconstruct pre-compaction history, or use the current checkout as a substitute. Analyze the assignment and the executor's visible work under the executor self-reflection role, separating observed facts from hypotheses. Do not continue the source task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
         task = chain.task,
         run = chain.run,
         acceptance = chain.acceptance,
@@ -1287,6 +1801,7 @@ fn executor_prompt(chain: &ChainState) -> io::Result<String> {
         executor_turn = chain.executor_source.last_turn,
         lead_thread = chain.lead_source.thread,
         lead_turn = chain.lead_source.last_turn,
+        accepted_boundary = accepted_boundary_line(chain),
         accepted_context = accepted_context(chain)?,
     ))
 }
@@ -1304,7 +1819,7 @@ fn lead_prompt(chain: &ChainState, executor: &StageState) -> io::Result<String> 
         .unwrap_or("unrecorded");
     let turn = executor.turn_id.as_deref().unwrap_or("unrecorded");
     Ok(format!(
-        "Bounded read-only lead self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\n{accepted_context}\nRetained executor reflection (stage {EXECUTOR_STAGE}, fork {fork}, turn {turn}):\n<<<EXECUTOR REFLECTION\n{result}\nEXECUTOR REFLECTION>>>\n\nThe stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. Analyze the lead's visible conduct under the lead self-reflection role and synthesize both perspectives. Preserve supported disagreement and keep missing evidence explicitly unknown. Do not repeat or accept the task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
+        "Bounded read-only lead self-reflection.\n\nTask: {task}\nRun: {run}\nAcceptance: {acceptance}\nSource lead conversation: thread {lead_thread}, completed turn {lead_turn}\nSource executor conversation: thread {executor_thread}, completed turn {executor_turn}\n{accepted_boundary}\n{accepted_context}\nRetained executor reflection (stage {EXECUTOR_STAGE}, fork {fork}, turn {turn}):\n<<<EXECUTOR REFLECTION\n{result}\nEXECUTOR REFLECTION>>>\n\nThe stage checkout may have been reused for later work; do not treat its current files as reviewed work, and report missing source material explicitly. The lead fork preserves the accepted lead conversation as far as the native source provides it; sourceContext.gaps identify missing or compacted coverage. Source coverage gaps are limits on available evidence, not findings about the accepted work. Do not decode opaque reasoning, reconstruct pre-compaction history, or use the current checkout as a substitute. Analyze the lead's visible conduct under the lead self-reflection role and synthesize both perspectives. Preserve supported disagreement and keep missing evidence explicitly unknown. Do not repeat or accept the task, edit files or boards, dispatch agents, or change guidance. If no attributable remedy is worth pursuing, return exactly: NO FINDING",
         task = chain.task,
         run = chain.run,
         acceptance = chain.acceptance,
@@ -1312,6 +1827,7 @@ fn lead_prompt(chain: &ChainState, executor: &StageState) -> io::Result<String> 
         lead_turn = chain.lead_source.last_turn,
         executor_thread = chain.executor_source.thread,
         executor_turn = chain.executor_source.last_turn,
+        accepted_boundary = accepted_boundary_line(chain),
         accepted_context = accepted_context(chain)?,
         result = result,
     ))
