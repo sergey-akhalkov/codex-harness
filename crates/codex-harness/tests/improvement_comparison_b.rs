@@ -212,6 +212,15 @@ fn one_real_control_backed_pair_settles_through_native_observation() {
 
 #[test]
 fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles() {
+    baseline_workflow_case(true);
+}
+
+#[test]
+fn baseline_qualification_requires_the_independent_oracle_despite_lead_acceptance() {
+    baseline_workflow_case(false);
+}
+
+fn baseline_workflow_case(independent_acceptance_passes: bool) {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("qualification-native-frame");
     let launcher = std::path::PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
@@ -257,6 +266,11 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
         CONTROL_CHILD_MODE,
         ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
         ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", "lead-frame"),
+        (
+            "HARNESS_IMPROVEMENT_FIXTURE_SESSION",
+            "12345678-1234-4234-8234-123456789001",
+        ),
+        ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", "frame"),
         ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", assignment.as_str()),
     ];
     let started = fixture.improve_with_env(
@@ -284,6 +298,22 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
     let terminal = wait_for_terminal_receipt(&receipt);
     assert_eq!(terminal["observation"]["state"], "completed", "{terminal}");
 
+    let report_path = fixture.spec.with_file_name("qualification-result.txt");
+    fs::write(&report_path, "unrelated report must survive").unwrap();
+    let collision = fixture.resume();
+    assert!(!collision.status.success(), "{}", text(&collision));
+    assert!(
+        text(&collision).contains("report already exists"),
+        "{}",
+        text(&collision)
+    );
+    assert_eq!(
+        fs::read_to_string(&report_path).unwrap(),
+        "unrelated report must survive"
+    );
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
+    fs::remove_file(&report_path).unwrap();
+
     let original = fs::read(&receipt).unwrap();
     let mut foreign: Value = serde_json::from_slice(&original).unwrap();
     foreign["originatingLead"]["runGeneration"] = json!("unrelated-generation");
@@ -295,6 +325,10 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
     fs::write(&receipt, original).unwrap();
 
     let resume_turn = |role: &str, result: &str| {
+        let suffix = format!(
+            "attempt-{}",
+            fixture.cursor()["attempts"].as_array().unwrap().len() + 1
+        );
         let output = fixture.improve_with_env(
             &["resume", "--run", fixture.run.to_str().unwrap()],
             &[
@@ -303,11 +337,24 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
                 ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", role),
                 ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", result),
                 (
+                    "HARNESS_IMPROVEMENT_FIXTURE_SESSION",
+                    if role == "lead-review" {
+                        "12345678-1234-4234-8234-123456789001"
+                    } else {
+                        "12345678-1234-4234-8234-123456789002"
+                    },
+                ),
+                ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", suffix.as_str()),
+                (
                     "HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_TEXT",
                     if role == "correction" {
-                        "corrected"
+                        if independent_acceptance_passes {
+                            "solved"
+                        } else {
+                            "still-broken"
+                        }
                     } else {
-                        "solved"
+                        "needs-correction"
                     },
                 ),
             ],
@@ -378,6 +425,27 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
         executor_session
     );
     wait_last();
+    let oracle_workspace = std::path::PathBuf::from(
+        fixture.cursor()["baseline_qualification"]["task_workspace"]
+            .as_str()
+            .unwrap(),
+    );
+    let preserved = oracle_workspace.join("unrelated.txt");
+    fs::write(&preserved, "preserve before acceptance").unwrap();
+    let changed = fixture.resume();
+    assert!(!changed.status.success(), "{}", text(&changed));
+    assert!(
+        text(&changed).contains("oracle workspace changed"),
+        "{}",
+        text(&changed)
+    );
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap(),
+        "preserve before acceptance"
+    );
+    assert!(fixture.cursor()["baseline_qualification"]["oracle"].is_null());
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 5);
+    fs::remove_file(&preserved).unwrap();
     let settled = fixture.resume();
     assert!(settled.status.success(), "{}", text(&settled));
     let cursor = fixture.cursor();
@@ -386,10 +454,30 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
     assert_eq!(workflow["completed"], true);
     assert_eq!(workflow["lead_accepted"], true);
     assert_eq!(workflow["corrections"].as_array().unwrap().len(), 1);
-    assert!(
-        cursor["baseline_qualification"]["accepted"].is_null(),
-        "lead acceptance alone is not independent qualification"
+    assert_eq!(cursor["phase"], "baseline-qualification-recorded");
+    assert_eq!(
+        cursor["baseline_qualification"]["accepted"],
+        independent_acceptance_passes
     );
+    assert_ne!(lead_session, executor_session);
+    let row_path =
+        std::path::PathBuf::from(cursor["baseline_qualification"]["row"].as_str().unwrap());
+    let row_bytes = fs::read(&row_path).unwrap();
+    let row: Value = serde_json::from_slice(&row_bytes).unwrap();
+    assert_eq!(row["native_runs"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        row["usage"]["total_tokens"], 600,
+        "each of the five distinct responses is charged once: {row}"
+    );
+    assert_eq!(row["usage"]["response_count"], 5, "{row}");
+    assert_eq!(
+        row["checks"][0]["passed"], independent_acceptance_passes,
+        "{row}"
+    );
+    assert_eq!(row["accepted"], independent_acceptance_passes, "{row}");
+    let oracle_path =
+        std::path::PathBuf::from(cursor["baseline_qualification"]["oracle"].as_str().unwrap());
+    let oracle_bytes = fs::read(&oracle_path).unwrap();
     let report =
         std::path::PathBuf::from(cursor["baseline_qualification"]["report"].as_str().unwrap());
     assert_eq!(
@@ -399,6 +487,8 @@ fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles()
     let repeated = fixture.resume();
     assert!(repeated.status.success(), "{}", text(&repeated));
     assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 5);
+    assert_eq!(fs::read(row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(oracle_path).unwrap(), oracle_bytes);
     let stopped = fixture.stop();
     assert!(stopped.status.success(), "{}", text(&stopped));
 }

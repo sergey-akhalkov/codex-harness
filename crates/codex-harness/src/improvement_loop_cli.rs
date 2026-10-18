@@ -29,8 +29,7 @@ mod improvement_workflow;
 
 use crate::executor_cli::{
     ConversationState, PromptSource, VisibleAccepted, VisibleConversation,
-    VisibleExecutorContinuation, VisibleExecutorContinuationAccepted, VisibleLeadContinuation,
-    VisibleLeadContinuationAccepted, VisibleLeadConversation,
+    VisibleExecutorContinuation, VisibleLeadContinuation, VisibleLeadConversation,
     continue_visible_executor_conversation, continue_visible_lead_conversation,
     dispatch_visible_conversation, dispatch_visible_lead_conversation, executor_title,
     receipt_view, stop_owned_run,

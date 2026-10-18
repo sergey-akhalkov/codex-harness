@@ -83,9 +83,9 @@ const WORKFLOW_RECORD_FILE: &str = "fixture-workflow-turns.jsonl";
 #[derive(Clone, Debug)]
 struct FixtureTurn {
     role: Option<&'static str>,
-    id: &'static str,
-    message_id: &'static str,
-    response_id: &'static str,
+    id: String,
+    message_id: String,
+    response_id: String,
     message: String,
     commits: bool,
 }
@@ -94,9 +94,9 @@ impl FixtureTurn {
     fn legacy() -> Self {
         Self {
             role: None,
-            id: TURN,
-            message_id: "message-1",
-            response_id: "response-1",
+            id: TURN.to_owned(),
+            message_id: "message-1".to_owned(),
+            response_id: "response-1".to_owned(),
             message: FINAL_MESSAGE.to_owned(),
             commits: true,
         }
@@ -125,9 +125,9 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
     let mut turn = match role.as_str() {
         "lead-frame" => FixtureTurn {
             role: Some("lead-frame"),
-            id: "fixture-turn-lead-frame",
-            message_id: "message-lead-frame",
-            response_id: "response-lead-frame",
+            id: "fixture-turn-lead-frame".to_owned(),
+            message_id: "message-lead-frame".to_owned(),
+            response_id: "response-lead-frame".to_owned(),
             message:
                 "lead-frame: framed the measured task and participants; no executor work committed"
                     .to_owned(),
@@ -135,34 +135,34 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
         },
         "executor" => FixtureTurn {
             role: Some("executor"),
-            id: "fixture-turn-executor",
-            message_id: "message-executor",
-            response_id: "response-executor",
+            id: "fixture-turn-executor".to_owned(),
+            message_id: "message-executor".to_owned(),
+            response_id: "response-executor".to_owned(),
             message: "executor: completed the measured task and committed its solution".to_owned(),
             commits: true,
         },
         "lead-review" => FixtureTurn {
             role: Some("lead-review"),
-            id: "fixture-turn-lead-review",
-            message_id: "message-lead-review",
-            response_id: "response-lead-review",
+            id: "fixture-turn-lead-review".to_owned(),
+            message_id: "message-lead-review".to_owned(),
+            response_id: "response-lead-review".to_owned(),
             message: "lead-review: reviewed the executor artifact; no executor work committed"
                 .to_owned(),
             commits: false,
         },
         "correction" => FixtureTurn {
             role: Some("correction"),
-            id: "fixture-turn-correction",
-            message_id: "message-correction",
-            response_id: "response-correction",
+            id: "fixture-turn-correction".to_owned(),
+            message_id: "message-correction".to_owned(),
+            response_id: "response-correction".to_owned(),
             message: "correction: applied the bounded correction requested by the lead".to_owned(),
             commits: true,
         },
         "lead-acceptance" => FixtureTurn {
             role: Some("lead-acceptance"),
-            id: "fixture-turn-lead-acceptance",
-            message_id: "message-lead-acceptance",
-            response_id: "response-lead-acceptance",
+            id: "fixture-turn-lead-acceptance".to_owned(),
+            message_id: "message-lead-acceptance".to_owned(),
+            response_id: "response-lead-acceptance".to_owned(),
             message: "lead-acceptance: accepted the reviewed result; no executor work committed"
                 .to_owned(),
             commits: false,
@@ -184,6 +184,23 @@ fn synthetic_turn() -> io::Result<Option<FixtureTurn>> {
             ));
         }
         turn.message = result;
+    }
+    if let Ok(suffix) = env::var("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX") {
+        if suffix.is_empty()
+            || suffix.len() > 64
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "synthetic turn suffix must be a bounded identity",
+            ));
+        }
+        for id in [&mut turn.id, &mut turn.message_id, &mut turn.response_id] {
+            id.push('-');
+            id.push_str(&suffix);
+        }
     }
     Ok(Some(turn))
 }
@@ -303,7 +320,7 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                 if !server.requests_for("turn/start").is_empty() {
                     let control = control_mode();
                     if control != "complete" {
-                        record_control_marker(&session, &control, turn.id);
+                        record_control_marker(&session, &control, &turn.id);
                     }
                     if control == "hold" {
                         // The submitted turn stays open: the thread record
@@ -1831,6 +1848,37 @@ fn write_rollout(
                     "total_tokens": 120,
                 },
             },
+        }));
+    }
+    if synthetic && include_usage {
+        let mut cumulative = prefix
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["type"] == "event_msg" && line["payload"]["type"] == "token_count")
+            .map(|line| line["payload"]["info"]["total_token_usage"].clone())
+            .next_back()
+            .unwrap_or_else(|| json!({}));
+        for line in &lines {
+            if line["type"] != "token_usage_record" {
+                continue;
+            }
+            for field in harness_core::rollout_reader::TOKEN_FIELDS {
+                let prior = cumulative[field].as_u64().unwrap_or(0);
+                let next = line["payload"]["usage"][field]
+                    .as_u64()
+                    .ok_or_else(|| io::Error::other("synthetic response usage must be complete"))?;
+                cumulative[field] =
+                    json!(prior.checked_add(next).ok_or_else(|| {
+                        io::Error::other("synthetic cumulative usage overflow")
+                    })?);
+            }
+        }
+        lines.push(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": cumulative}
+            }
         }));
     }
     let text = lines

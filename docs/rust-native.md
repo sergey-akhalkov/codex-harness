@@ -1107,9 +1107,18 @@ decision resumes the same executor within the declared correction allowance,
 then returns to that lead for another review. Each turn's exact native
 generation and result are retained before dependent work; `resume` does not
 repeat settled turns. Only clean committed changes within the frozen scope
-reach review. Independent acceptance and complete cost accounting remain
-pending; a lead's `ACCEPT` alone is not qualification and does not activate
-self-reflection candidates.
+reach review. The independent task oracle then checks that revision in a fresh
+owned copy; `ACCEPT` cannot override a failed check. A pre-existing output report
+or changes to the oracle copy refuse further effects and preserve those files.
+An interrupted check with no retained outcome remains unknown instead of being
+automatically repeated; recovery requires the original check evidence.
+
+The retained row counts each native participant session once, including its
+review and correction turns. Missing or conflicting native usage prevents a
+complete row instead of becoming zero cost. Repeating `resume` reuses the
+retained row and check. This is an ordinary control observation: independent
+semantic-review calibration, the full comparison costs and frozen decision
+policy still require qualification before self-reflection model use or adoption.
 
 `select` activates an already prepared baseline or candidate runtime through
 the shared build-selection owner, records the identity it actually consumed

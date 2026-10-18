@@ -10,6 +10,7 @@ use harness_core::improvement_loop::{
 };
 use harness_core::improvement_runtime::{self, ArmRequest, ArmRuntime};
 use harness_core::task_worktree::{self, FrozenCopy};
+use serde_json::Value;
 use std::fs;
 
 pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
@@ -273,10 +274,7 @@ fn advance_work(
         persist(run, state)?;
     }
     if state.workflow.completed {
-        return Ok(vec![format!(
-            "qualification lead decision retained (accepted={}); independent oracle and accounting remain pending",
-            state.workflow.lead_accepted.unwrap_or(false)
-        )]);
+        return finalize(run, inputs, state, runtime);
     }
     if let Some(review_id) = state.workflow.review.clone() {
         let review = run
@@ -303,9 +301,8 @@ fn advance_work(
                 .report
                 .as_ref()
                 .ok_or_else(|| invalid("executor report is not retained"))?;
-            let checkout = state
-                .task_workspace
-                .as_ref()
+            let checkout = latest_solution_attempt(run, state)?
+                .checkout
                 .ok_or_else(|| invalid("executor checkout is missing"))?;
             let prompt = format!(
                 "Review the completed ordinary task from your original framing. The exact executor checkout is {}; its committed revision is {}. Read the actual changes, checks and the retained executor report at {}. Preserve the original task acceptance. Do not implement or delegate. Start your result with ACCEPT, CORRECT or REJECT. ACCEPT needs a supported acceptance decision, CORRECT needs concrete bounded corrections for this same executor, and REJECT explains the remaining blocker. Do not add experiment policy.\n\nOriginal task:\n{}",
@@ -370,7 +367,7 @@ fn advance_work(
                 state.condition = Some("the lead rejected the task or its declared correction allowance was exhausted; preserve all turns, no replay".to_owned());
             }
             persist(run, state)?;
-            Ok(vec!["qualification workflow settled; independent acceptance and complete accounting remain pending".to_owned()])
+            finalize(run, inputs, state, runtime)
         }
         other => Err(invalid(format!(
             "unexpected qualification step after framing/execution: {other:?}"
@@ -401,12 +398,344 @@ fn retain_solution(
     .map_err(invalid)?;
     fs::copy(&result, &inputs.report)?;
     state.source_revision = Some(solution.revision);
-    state.task_workspace = Some(solution.checkout);
+    // The attempt owns the executor checkout; task_workspace remains the oracle's owned copy.
     state.report_sha256 = Some(build_identity::hash_file(&inputs.report)?);
     state.report_bytes = Some(fs::metadata(&inputs.report)?.len());
     state.report = Some(inputs.report.clone());
     state.report_source = Some(result);
     persist(run, state)
+}
+
+fn latest_solution_attempt(run: &Run, state: &BaselineQualificationState) -> io::Result<Attempt> {
+    let id = state
+        .workflow
+        .corrections
+        .last()
+        .or(state.workflow.executor_attempt.as_ref())
+        .ok_or_else(|| invalid("qualification has no executor result"))?;
+    run.cursor
+        .attempt(id)
+        .cloned()
+        .ok_or_else(|| invalid("the recorded solution attempt is missing"))
+}
+
+fn prepare_oracle_workspace(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    runtime: &ArmRuntime,
+) -> io::Result<()> {
+    use super::improvement_comparison as accounting;
+    let request = accounting::read_acceptance_request(&inputs.acceptance).map_err(invalid)?;
+    let workspace = PathBuf::from(
+        request["case_root"]
+            .as_str()
+            .ok_or_else(|| invalid("independent acceptance names no case_root"))?,
+    );
+    if !workspace.is_absolute() {
+        return Err(invalid(
+            "the independent acceptance workspace must be absolute",
+        ));
+    }
+    harness_core::inventory::ordinary_parents(&workspace)?;
+    let key = |path: &Path| {
+        accounting::overlap_path(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase()
+    };
+    let target = key(&workspace);
+    for protected in [
+        &inputs.task.source,
+        &run.spec.project,
+        &runtime.home,
+        state.checkout.as_ref().unwrap(),
+        state.task_copy.as_ref().unwrap(),
+    ] {
+        let protected = key(protected);
+        if target == protected
+            || target.starts_with(&format!("{protected}/"))
+            || protected.starts_with(&format!("{target}/"))
+        {
+            return Err(invalid(
+                "the independent acceptance workspace overlaps protected task, runtime or dispatch state",
+            ));
+        }
+    }
+    if let Some(owned) = &state.task_workspace {
+        if key(owned) != target || !workspace.is_dir() {
+            return Err(invalid(
+                "the retained acceptance workspace is missing or mismatched; preserve it instead of cleaning another checkout",
+            ));
+        }
+        return Ok(());
+    }
+    if workspace.exists() {
+        return Err(invalid(format!(
+            "independent acceptance workspace {} already exists without this run's ownership; choose a fresh declared path",
+            workspace.display()
+        )));
+    }
+    if let Some(parent) = workspace.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    accounting::clone_workspace(state.task_copy.as_deref().unwrap(), &workspace)
+        .map_err(invalid)?;
+    state.task_workspace = Some(workspace);
+    persist(run, state)
+}
+
+fn finalize(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    runtime: &ArmRuntime,
+) -> io::Result<Vec<String>> {
+    use super::improvement_comparison as accounting;
+    use std::collections::BTreeMap;
+    let attempt = latest_solution_attempt(run, state)?;
+    let solution = accounting::validate_committed_solution(
+        &attempt,
+        state.checkout.as_deref().unwrap(),
+        state.task_base.as_deref().unwrap(),
+        &inputs.task.writable_scope,
+        None,
+    )
+    .map_err(invalid)?;
+    if state.source_revision.as_deref() != Some(solution.revision.as_str())
+        || state.report_sha256.as_deref()
+            != Some(build_identity::hash_file(&inputs.report)?.as_str())
+    {
+        return Err(invalid(
+            "the reviewed revision or retained executor report changed; no independent acceptance was run",
+        ));
+    }
+    if let Some(row_path) = &state.row {
+        let row: Value = read_json(row_path, MAX_RUN_SPEC_BYTES)?;
+        let oracle = state
+            .oracle
+            .as_deref()
+            .ok_or_else(|| invalid("recorded accounting row has no independent check"))?;
+        if row["checks"][0]["evidence_sha256"].as_str()
+            != Some(build_identity::hash_file(oracle)?.as_str())
+        {
+            return Err(invalid(
+                "the retained independent acceptance record changed; its result cannot be reused",
+            ));
+        }
+        run.cursor.phase = Phase::BaselineQualificationRecorded;
+        persist(run, state)?;
+        return Ok(vec![format!(
+            "ordinary baseline result retained at {}; no comparison policy or candidate has been qualified",
+            row_path.display()
+        )]);
+    }
+
+    // Each exact participant session contributes native usage once even when
+    // it contains several resumed turns. Turn receipts remain separately named.
+    let mut participants: BTreeMap<String, Vec<&Attempt>> = BTreeMap::new();
+    for turn in &run.cursor.attempts {
+        if !matches!(
+            turn.role,
+            AttemptRole::LeadFrame
+                | AttemptRole::Executor
+                | AttemptRole::LeadReview
+                | AttemptRole::Correction
+                | AttemptRole::LeadAcceptance
+        ) {
+            continue;
+        }
+        let identity = participant(turn)?;
+        if turn.state != AttemptState::Completed {
+            return Err(invalid(
+                "a participant turn is unresolved; no complete workflow cost can be recorded",
+            ));
+        }
+        retained_result(turn)?;
+        participants.entry(identity.session).or_default().push(turn);
+    }
+    let mut native_runs = Vec::new();
+    let mut all_paths = Vec::new();
+    for (session, turns) in participants {
+        let first = turns[0];
+        if turns.iter().any(|turn| {
+            turn.model != first.model
+                || turn.model_provider != first.model_provider
+                || turn.reasoning_effort != first.reasoning_effort
+        }) {
+            return Err(invalid(
+                "one participant changed model/provider/effort between turns",
+            ));
+        }
+        let model = first
+            .model
+            .as_deref()
+            .ok_or_else(|| invalid("participant model is unknown"))?;
+        let observed = accounting::discover_attempt_sessions(
+            first,
+            &runtime.home,
+            model,
+            first.reasoning_effort.as_deref(),
+        )?;
+        if !observed.verified {
+            return Err(invalid(observed.reason.unwrap_or_else(|| {
+                "participant observation is unverified".to_owned()
+            })));
+        }
+        let usage = accounting::usage_totals(&observed.paths).ok_or_else(|| invalid(format!("native usage remains incomplete for {session}; preserve the completed work and reconcile its rollout, no model turn was repeated")))?;
+        all_paths.extend(observed.paths.iter().cloned());
+        let observations: Vec<Value> = turns
+            .iter()
+            .map(|turn| {
+                accounting::retained_observation(turn)
+                    .ok_or_else(|| invalid("a completed turn has no retained native observation"))
+            })
+            .collect::<io::Result<_>>()?;
+        let sum_counter = |key: &str| -> Option<u64> {
+            observations.iter().try_fold(0u64, |total, observation| {
+                total.checked_add(observation[key].as_u64()?)
+            })
+        };
+        let ended_ms = observations
+            .iter()
+            .filter_map(|o| o["updatedMs"].as_u64())
+            .max()
+            .ok_or_else(|| invalid("participant completion timing is missing"))?;
+        let mut native = json!({
+            "session": session, "profile": first.profile, "model": first.model,
+            "model_provider": first.model_provider, "reasoning_effort": first.reasoning_effort,
+            "started_at": first.started_ms as f64 / 1000.0,
+            "ended_at": ended_ms as f64 / 1000.0, "status":"completed",
+            "usage":usage, "requests":usage["response_count"],
+            "attempts":turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>(),
+            "evidence":observed.paths,
+        });
+        if let Some(rounds) = sum_counter("rounds") {
+            native["rounds"] = json!(rounds);
+        }
+        if let Some(operations) = sum_counter("toolCalls") {
+            native["tool_operations"] = json!(operations);
+        }
+        if let Some(calls) = observed.tool_calls {
+            native["tool_calls"] = json!(calls);
+        }
+        native_runs.push(native);
+    }
+    all_paths.sort();
+    all_paths.dedup();
+    let usage = accounting::usage_totals(&all_paths)
+        .ok_or_else(|| invalid("aggregate native usage is incomplete or conflicting"))?;
+    let oracle_path = run.store.root().join("baseline-qualification/oracle.json");
+    let acceptance;
+    if state.oracle.is_some() {
+        if !oracle_path.is_file() {
+            return Err(invalid(
+                "the independent check was submitted but its result is unknown; preserve the owned oracle workspace and recover the original check evidence before continuing",
+            ));
+        }
+        let record: Value = read_json(&oracle_path, MAX_RUN_SPEC_BYTES)?;
+        let request = accounting::read_acceptance_request(&inputs.acceptance).map_err(invalid)?;
+        if record["kind"] != "real-task"
+            || record["executed"] != true
+            || record["task_contract_sha256"] != request["task_contract_sha256"]
+            || record["oracle_program_sha256"] != request["oracle"]["program_sha256"]
+            || record["oracle_inputs"] != request["oracle"]["inputs"]
+        {
+            return Err(invalid(
+                "retained independent acceptance does not bind the frozen checker and task contract",
+            ));
+        }
+        acceptance = accounting::Acceptance {
+            passed: record["passed"] == true && record["checker_executed"] == true,
+            record_path: oracle_path.clone(),
+            started_at: record["started_at"]
+                .as_f64()
+                .ok_or_else(|| invalid("oracle start time is missing"))?,
+            ended_at: record["ended_at"]
+                .as_f64()
+                .ok_or_else(|| invalid("oracle end time is missing"))?,
+            workspace_preparation: "source-only-fresh-workspace".to_owned(),
+        };
+    } else {
+        let workspace = state.task_workspace.as_deref().unwrap();
+        let head = accounting::git(workspace, &["rev-parse", "HEAD"]).map_err(invalid)?;
+        let changes = accounting::git(
+            workspace,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )
+        .map_err(invalid)?;
+        if Some(head.trim()) != state.task_base.as_deref() || !changes.is_empty() {
+            return Err(invalid(
+                "the owned oracle workspace changed before acceptance; preserve its work before retrying, no check was submitted",
+            ));
+        }
+        state.oracle = Some(oracle_path.clone());
+        persist(run, state)?;
+        acceptance = accounting::execute_oracle(
+            &inputs.acceptance.request,
+            &inputs.acceptance.request_sha256,
+            state.task_workspace.as_deref().unwrap(),
+            &solution.checkout,
+            &solution.revision,
+            &oracle_path,
+        )
+        .map_err(invalid)?;
+    }
+    let accepted = state.workflow.lead_accepted == Some(true) && acceptance.passed;
+    let row_path = run.store.root().join("baseline-qualification/row.json");
+    let row = json!({
+        "attempt_id":format!("{}-ordinary-control", run.spec.run),
+        "case_id":inputs.task.name, "unit":format!("{}/{}", run.spec.run, inputs.task.name),
+        "experiment_id":run.cursor.experiment, "arm":"baseline",
+        "started_at":state.prepared_ms.unwrap_or(run.cursor.attempts[0].started_ms) as f64 / 1000.0,
+        "execution_started_at":run.cursor.attempts[0].started_ms as f64 / 1000.0,
+        "ended_at":acceptance.ended_at,
+        "discovery_verified":true, "observed_model_metadata_verified":true,
+        "native_runs":native_runs, "usage":usage,
+        "checks":[{
+            "id":"independent-acceptance", "round":0, "required":true,
+            "executed":true, "passed":acceptance.passed,
+            "started_at":acceptance.started_at, "ended_at":acceptance.ended_at,
+            "evidence":acceptance.record_path,
+            "evidence_sha256":build_identity::hash_file(&oracle_path)?,
+        }],
+        "children":[], "interventions":[], "retry_of":null,
+        "workflow":state.workflow,
+        "matched":{
+            "task_source_revision":inputs.task.revision, "task_base":state.task_base,
+            "task_prompt_sha256":inputs.task_prompt.sha256,
+            "acceptance_request_sha256":inputs.acceptance.request_sha256,
+            "runtime_source_sha256":runtime.variant.source_sha256,
+            "lead_binding":state.lead_binding, "executor_binding":state.executor_binding,
+            "capacity":state.capacity, "workspace_preparation":acceptance.workspace_preparation,
+        },
+        "solution_revision":solution.revision, "solution_paths":solution.changed_paths,
+        "report_sha256":state.report_sha256, "accepted":accepted,
+        "qualification_scope":"ordinary control observation; no comparison margins, reflection qualification or benefit verdict",
+    });
+    write_json_atomic(&row_path, &row)?;
+    state.accepted = Some(accepted);
+    state.row = Some(row_path.clone());
+    run.cursor.phase = Phase::BaselineQualificationRecorded;
+    run.cursor.effect(
+        EffectKind::BaselineQualificationRecorded,
+        format!(
+            "task={} accepted={accepted} row={}",
+            inputs.task.name,
+            row_path.display()
+        ),
+    );
+    persist(run, state)?;
+    Ok(vec![format!(
+        "ordinary baseline independently checked (accepted={accepted}); native workflow usage retained at {}",
+        row_path.display()
+    )])
 }
 
 fn dispatch_turn(
@@ -576,6 +905,24 @@ fn prepare(
     inputs: &BaselineQualificationInputs,
     state: &mut BaselineQualificationState,
 ) -> io::Result<ArmRuntime> {
+    harness_core::inventory::ordinary_parents(&inputs.report)?;
+    if state.report.is_some() {
+        if state.report.as_ref() != Some(&inputs.report)
+            || state.report_sha256.as_deref()
+                != Some(build_identity::hash_file(&inputs.report)?.as_str())
+        {
+            return Err(invalid(
+                "the owned qualification report changed; preserve it before continuing",
+            ));
+        }
+    } else if inputs.report.exists() {
+        return Err(invalid(
+            "qualification report already exists without this run's ownership; no participant was dispatched",
+        ));
+    }
+    if let Some(parent) = inputs.report.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let root = run.store.root().join("baseline-qualification");
     let runtime_path = root.join("runtime.json");
     let frozen_path = root.join("workload.json");
@@ -723,5 +1070,6 @@ fn prepare(
             format!("runtime={} workload={}", runtime.label, inputs.task.name),
         );
     }
+    prepare_oracle_workspace(run, inputs, state, &runtime)?;
     Ok(runtime)
 }

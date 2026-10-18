@@ -332,7 +332,7 @@ fn process_correlation_requires_a_verified_os_link_not_a_numeric_process_id() {
 
 /// Run one bounded git command with captured output; the controller never
 /// inherits a prompt or an interactive terminal.
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+pub(super) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -967,7 +967,7 @@ fn policy_outside_candidate_reach(run: &Run, comparison: &ComparisonInputs) -> R
 /// missing ones stay absolute so an overlap is still recognized before the
 /// path exists. The Windows verbatim prefix is removed so both sides compare
 /// in the same shape whether or not they already exist.
-fn overlap_path(path: &Path) -> PathBuf {
+pub(super) fn overlap_path(path: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let resolved = fs::canonicalize(&absolute).unwrap_or(absolute);
     let text = resolved.to_string_lossy();
@@ -1461,7 +1461,7 @@ fn ensure_task_workspace(
     Ok(workspace)
 }
 
-fn clone_workspace(source: &Path, target: &Path) -> Result<(), String> {
+pub(super) fn clone_workspace(source: &Path, target: &Path) -> Result<(), String> {
     git(
         source,
         &[
@@ -1478,7 +1478,7 @@ fn clone_workspace(source: &Path, target: &Path) -> Result<(), String> {
 
 /// Read and structurally validate the frozen acceptance request without
 /// rewriting it. The supervisor's digest is checked at every use.
-fn read_acceptance_request(
+pub(super) fn read_acceptance_request(
     acceptance: &harness_core::improvement_loop::AcceptanceInputs,
 ) -> Result<Value, String> {
     let bytes = crate::outcome_run::bounded_read(&acceptance.request, 2 * 1024 * 1024)
@@ -2667,17 +2667,13 @@ pub(super) fn validate_committed_solution(
     })
 }
 
-struct Acceptance {
-    passed: bool,
-    record_path: PathBuf,
-    started_at: f64,
-    ended_at: f64,
-    /// Observed result of preparing the acceptance workspace: the committed
-    /// solution was materialized and the workspace cleaned, so both arms are
-    /// checked from the same fresh source-only state. Any build products an
-    /// acceptance checker needs are prepared by the checker itself and their
-    /// time is part of this check's accounted span.
-    workspace_preparation: String,
+pub(super) struct Acceptance {
+    pub(super) passed: bool,
+    pub(super) record_path: PathBuf,
+    pub(super) started_at: f64,
+    pub(super) ended_at: f64,
+    /// The solution was materialized in an owned fresh source-only workspace.
+    pub(super) workspace_preparation: String,
 }
 
 /// The frozen identity of the supervisor process that owns one comparison
@@ -2821,7 +2817,7 @@ fn run_oracle(
 /// frozen request bytes. Shared by the comparison arms and the one-arm
 /// baseline qualification: neither caller authors the request, and the
 /// retained record is written before its outcome is used.
-fn execute_oracle(
+pub(super) fn execute_oracle(
     request: &Path,
     request_sha256: &str,
     workspace: &Path,
@@ -3663,7 +3659,7 @@ fn verified_command_identity(
     matched.next().is_none().then(|| life.id.clone())
 }
 
-fn retained_observation(attempt: &Attempt) -> Option<Value> {
+pub(super) fn retained_observation(attempt: &Attempt) -> Option<Value> {
     let retained = attempt.retained.as_ref()?;
     let bytes = crate::outcome_run::bounded_read(
         &retained.receipt,
@@ -3674,16 +3670,12 @@ fn retained_observation(attempt: &Attempt) -> Option<Value> {
     value.get("observation").cloned()
 }
 
-struct Sessions {
-    paths: Vec<PathBuf>,
-    verified: bool,
-    /// Why the observation is unverified; named for the arm refusal.
-    reason: Option<String>,
-    /// Distinct outer tool calls (recorded `function_call` items) across this
-    /// attempt's rollout files, deduplicated by call identity. `None` when the
-    /// rollouts were not read or lost lines, so the count stays unknown
-    /// instead of becoming a fabricated low number.
-    tool_calls: Option<u64>,
+pub(super) struct Sessions {
+    pub(super) paths: Vec<PathBuf>,
+    pub(super) verified: bool,
+    pub(super) reason: Option<String>,
+    /// Distinct recorded outer calls; absent when coverage is incomplete.
+    pub(super) tool_calls: Option<u64>,
 }
 
 fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
@@ -3725,7 +3717,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
 /// baseline qualification has one prepared runtime instead of comparison
 /// arms, so it supplies the home and declared binding directly; the observed
 /// identity rules stay identical to the comparison path.
-fn discover_attempt_sessions(
+pub(super) fn discover_attempt_sessions(
     attempt: &Attempt,
     home: &Path,
     declared_model: &str,
@@ -3869,7 +3861,7 @@ fn arm_of_role(role: AttemptRole) -> ComparisonArm {
 /// reader's deduplicated response count retained as the measured model-request
 /// total. A partial or missing measurement is omitted, never reported as a
 /// fabricated zero.
-fn usage_totals(paths: &[PathBuf]) -> Option<Value> {
+pub(super) fn usage_totals(paths: &[PathBuf]) -> Option<Value> {
     if paths.is_empty() {
         return None;
     }
