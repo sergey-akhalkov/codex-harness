@@ -155,6 +155,7 @@ struct LeadState {
     client_id: Option<String>,
     text: Option<String>,
     source_turn: Option<String>,
+    source_turn_active: bool,
 }
 
 struct Workspace {
@@ -288,7 +289,11 @@ fn configure_lead(server: &Server, mode: LeadMode, state: Arc<Mutex<LeadState>>)
                 let state = state.lock().unwrap();
                 let mut turns = Vec::new();
                 if let Some(turn) = &state.source_turn {
-                    turns.push(json!({"id": turn, "status": "completed", "items": []}));
+                    turns.push(json!({
+                        "id": turn,
+                        "status": if state.source_turn_active { "inProgress" } else { "completed" },
+                        "items": []
+                    }));
                 }
                 if state.accepted && (mode == LeadMode::Delivered || state.delivery_visible) {
                     turns.push(json!({

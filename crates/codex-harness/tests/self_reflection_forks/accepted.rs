@@ -11,7 +11,7 @@ use harness_core::{
 
 const ACTOR: &str = "reflection-fixture-lead";
 
-fn native(workspace: &Workspace, program: &str, args: &[&str]) -> std::process::Output {
+pub(super) fn native(workspace: &Workspace, program: &str, args: &[&str]) -> std::process::Output {
     let output = Command::new(program)
         .args(args)
         .current_dir(&workspace.checkout)
@@ -28,7 +28,7 @@ fn native(workspace: &Workspace, program: &str, args: &[&str]) -> std::process::
     output
 }
 
-pub(super) fn accepted(workspace: &Workspace) -> (ReflectionController, Value, String) {
+pub(super) fn prepare(workspace: &Workspace) -> (ReflectionController, String) {
     native(workspace, "git", &["init", "-q", "--initial-branch=main"]);
     native(
         workspace,
@@ -61,15 +61,6 @@ pub(super) fn accepted(workspace: &Workspace) -> (ReflectionController, Value, S
         &["config", "set", "events-journal", "true"],
     );
     let controller = ReflectionController::new("bd.exe", &workspace.checkout, &workspace.home);
-    controller
-        .activate(&ActivationRequest {
-            lead_session: LEAD_THREAD.to_owned(),
-            run: None,
-            boundary: None,
-            journal: JournalPolicy::RequireExisting,
-            limits: None,
-        })
-        .unwrap();
     let output = native(
         workspace,
         "bd.exe",
@@ -82,9 +73,22 @@ pub(super) fn accepted(workspace: &Workspace) -> (ReflectionController, Value, S
         ],
     );
     let task: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let task = task["id"].as_str().unwrap();
+    (controller, task["id"].as_str().unwrap().to_owned())
+}
+
+pub(super) fn accepted(workspace: &Workspace) -> (ReflectionController, Value, String) {
+    let (controller, task) = prepare(workspace);
+    controller
+        .activate(&ActivationRequest {
+            lead_session: LEAD_THREAD.to_owned(),
+            run: None,
+            boundary: None,
+            journal: JournalPolicy::RequireExisting,
+            limits: None,
+        })
+        .unwrap();
     let binding = AcceptanceBinding::new(
-        task,
+        &task,
         "accepted-run",
         "accepted-assignment",
         "accepted-result",
@@ -103,7 +107,7 @@ pub(super) fn accepted(workspace: &Workspace) -> (ReflectionController, Value, S
         Path::new("bd.exe"),
         &workspace.checkout,
         ACTOR,
-        task,
+        &task,
         &acceptance_metadata(&binding).unwrap(),
     )
     .unwrap();

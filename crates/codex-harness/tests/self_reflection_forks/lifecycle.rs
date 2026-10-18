@@ -139,6 +139,151 @@ fn normal_cli_derives_the_chain_and_retains_completed_delivery_without_replay() 
 }
 
 #[test]
+fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes() {
+    use harness_core::{
+        board_cli,
+        delivery_reflection::{Purpose, board_source_identity},
+        task_worktree::{self, AssignmentSubmission, CompletionFacts, SlotAssignmentBinding},
+    };
+
+    let workspace = Workspace::new("lifecycle-normal-accept", LeadMode::Delivered);
+    let (controller, task) = accepted::prepare(&workspace);
+    install_fixture(&workspace);
+    {
+        let mut lead = workspace.lead_state.lock().unwrap();
+        lead.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
+        lead.source_turn_active = true;
+    }
+    success(command(&workspace, "enable", Some(LEAD_THREAD)));
+    board_cli::set_purpose_metadata(
+        Path::new("bd.exe"),
+        &workspace.checkout,
+        &task,
+        Purpose::Ordinary,
+    )
+    .unwrap();
+    accepted::native(&workspace, "git", &["add", "."]);
+    accepted::native(
+        &workspace,
+        "git",
+        &["commit", "--allow-empty", "-qm", "fixture board ready"],
+    );
+    let assignment = harness_core::build_identity::hash_bytes(b"synthetic structured assignment");
+    let result = workspace._root.path().join("executor-result.txt");
+    fs::write(
+        &result,
+        "Synthetic accepted executor result with completed checks.",
+    )
+    .unwrap();
+    let pool = task_worktree::pool_state_dir(&workspace.home, &kit_root()).unwrap();
+    fs::create_dir_all(&pool).unwrap();
+    let retained = task_worktree::retain_completion(
+        &pool,
+        &CompletionFacts {
+            run_generation: "accepted-run".to_owned(),
+            slot: 1,
+            owner: "fixture-ordinary-executor".to_owned(),
+            checkout: workspace.checkout.clone(),
+            task: Some("fixture-durable-task".to_owned()),
+            handle: Some("fixture-task-handle".to_owned()),
+            assignment: Some(SlotAssignmentBinding {
+                source: board_source_identity(Path::new("bd.exe"), &workspace.checkout).unwrap(),
+                issue: task.clone(),
+                assignment_sha256: assignment.clone(),
+                purpose: Some("ordinary".to_owned()),
+                purpose_source: "board".to_owned(),
+            }),
+            submitted_assignment: Some(AssignmentSubmission::structured(assignment)),
+            role: Some("executor".to_owned()),
+            state: "completed".to_owned(),
+            exit_code: Some(0),
+            session: Some(EXECUTOR_SOURCE.to_owned()),
+            turn: Some(EXECUTOR_SOURCE_TURN.to_owned()),
+            result: Some(result),
+        },
+    )
+    .unwrap();
+    assert!(retained.eligibility.eligible, "{retained:?}");
+
+    let accept = || {
+        let output = Command::new(manager())
+            .args(["executor", "accept", &task, "--project"])
+            .arg(&workspace.checkout)
+            .arg("--source")
+            .arg(kit_root())
+            .arg("--codex-home")
+            .arg(&workspace.home)
+            .env("CODEX_HOME", &workspace.home)
+            .env("CODEX_THREAD_ID", LEAD_THREAD)
+            .env_remove("HARNESS_REFLECTION_SESSION")
+            .env_remove("HARNESS_EXECUTOR_SESSION")
+            .env_remove("HARNESS_BOUNDED_LEAD_SESSION")
+            .output()
+            .unwrap();
+        success(output)
+    };
+    let accepted = accept();
+    assert_eq!(accepted["duplicate"], false);
+    assert_eq!(accepted["reflection"]["automaticTrigger"], true);
+    assert_eq!(accepted["leadTurn"], LEAD_SOURCE_TURN);
+    assert_eq!(accepted["executorTurn"], EXECUTOR_SOURCE_TURN);
+    let acceptance = accepted["acceptanceId"].as_str().unwrap();
+    let repeated = accept();
+    assert_eq!(repeated["duplicate"], true);
+    assert_eq!(repeated["acceptanceId"], acceptance);
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+
+    let mut request = workspace.request("accepted-run");
+    request["task"] = json!(task);
+    request["acceptance"] = json!(acceptance);
+    request["leadSource"]["thread"] = json!(LEAD_THREAD);
+    let mut spec = process_spec(&workspace, &request, "_serve");
+    spec.env
+        .insert("HARNESS_REFLECTION_HOST".into(), Some(LEAD_THREAD.into()));
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let until = Instant::now() + Duration::from_secs(90);
+    loop {
+        if controller
+            .record(acceptance)
+            .unwrap()
+            .is_some_and(|record| record.executor.state == StageState::Retained)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "executor reflection did not retain its result"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        controller.record(acceptance).unwrap().unwrap().lead.state,
+        StageState::Pending
+    );
+    workspace.lead_state.lock().unwrap().source_turn_active = false;
+    loop {
+        if controller.record(acceptance).unwrap().unwrap().delivery == DeliveryState::Consumed {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "exact accepted synthesis was not consumed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    let record = controller.record(acceptance).unwrap().unwrap();
+    assert_eq!(record.binding.result, retained.result.unwrap().sha256);
+    assert_eq!(record.binding.lead_turn.as_deref(), Some(LEAD_SOURCE_TURN));
+    success(command(&workspace, "disable", None));
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+}
+
+#[test]
 fn normal_cli_reconciles_a_queued_delivery_without_repeating_stages() {
     let workspace = Workspace::new("lifecycle-queued", LeadMode::Queued);
     let (controller, request, acceptance) = accepted::accepted(&workspace);
