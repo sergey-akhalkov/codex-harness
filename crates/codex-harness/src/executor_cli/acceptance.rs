@@ -163,6 +163,13 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         )));
     }
 
+    // Dispatch preparation publishes its claim and startup reservation under
+    // the pool-wide admission lock; assignment binding and the run receipt
+    // follow after it is released. Hold the same lock across the final
+    // deterministic reads and the board close so a new same-task reservation
+    // cannot appear between the observation and the close. Reflection and
+    // endpoint activity above stay outside this guard.
+    let admission = task_worktree::begin_pool_admission(&home, &source)?;
     let retained = task_worktree::retained_completions_for_task(&home, &source, &request.task)?;
     let selected = select_completion(
         &home,
@@ -221,6 +228,7 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         &request.task,
         &metadata,
     )?;
+    drop(admission);
 
     let accepted = Accepted {
         binding,
@@ -613,9 +621,12 @@ fn refuse_stale_explicit_run(
 
 /// A correction dispatched for the same board issue has no completion while it
 /// is active, starting or suspended. The board-bound slot record is the durable
-/// owner of that state. Ignore only an occupied slot with no startup reservation
-/// whose current run receipt resolves to a retained completion; any other
-/// same-issue binding is unfinished work.
+/// owner of that state. A retained record represents the binding only when its
+/// task, generation handle and assignment identity all match: a new structured
+/// correction may reuse the same task and handle with a different assignment
+/// before its run receipt exists. Ignore only an occupied slot with no startup
+/// reservation whose current run receipt resolves to a retained completion;
+/// any other same-issue binding is unfinished work.
 fn refuse_unresolved_correction(
     home: &Path,
     source: &Path,
@@ -627,6 +638,10 @@ fn refuse_unresolved_correction(
         let represented = retained.iter().any(|record| {
             record.task.as_deref() == Some(active.task.as_str())
                 && record.handle.as_deref() == Some(active.handle.as_str())
+                && record
+                    .assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.same_binding(&active.assignment))
         });
         let current_run = current_run_generation(home, source, active.slot)?;
         let current_is_retained = current_run
@@ -635,15 +650,13 @@ fn refuse_unresolved_correction(
         if represented && current_is_retained && !active.starting {
             continue;
         }
-        let state = match active.state {
-            task_worktree::SlotState::Synchronizing => "startup",
-            task_worktree::SlotState::Occupied if active.starting => "starting",
-            task_worktree::SlotState::Occupied => "active",
-            task_worktree::SlotState::AwaitingReview => "awaiting review",
-            task_worktree::SlotState::Free | task_worktree::SlotState::Released => {
-                continue;
-            }
-        };
+        if matches!(
+            active.state,
+            task_worktree::SlotState::Free | task_worktree::SlotState::Released
+        ) {
+            continue;
+        }
+        let state = slot_state_label(active.state, active.starting);
         let startup = if active.starting {
             "; a startup reservation is recorded, so the current run may not have written its receipt yet"
         } else {
@@ -654,11 +667,76 @@ fn refuse_unresolved_correction(
             .map(|run| format!("current run {run}"))
             .unwrap_or_else(|| "no current run generation is recorded".to_owned());
         return Err(invalid(&format!(
-            "task {task} has an unresolved executor correction in slot {}: task '{}', handle '{}', state {state}, {current}{startup}. Retained completion {} cannot be accepted while that same-task work is unfinished; finish or release that slot, then accept the newest result. Explicit --run does not bypass it. No board metadata was changed.",
-            active.slot, active.task, active.handle, selected.run_generation
+            "task {task} has an unresolved executor correction in slot {}: task '{}', handle '{}', state {state}, assignment {}, {current}{startup}. Retained completion {} cannot be accepted while that same-task work is unfinished; finish or release that slot, then accept the newest result. Explicit --run does not bypass it. No board metadata was changed.",
+            active.slot,
+            active.task,
+            active.handle,
+            active.assignment.assignment_sha256,
+            selected.run_generation
         )));
     }
-    Ok(())
+    // The assignment is bound after the startup reservation is published, so
+    // the retained slot can briefly carry the new same-task reservation with
+    // no board assignment yet. A fresh claim may also reuse the slot task with
+    // a new generation handle, so this observation binds the durable task and
+    // publication state, not the retained completion's handle.
+    refuse_unpublished_same_task_correction(home, source, task, selected)
+}
+
+fn slot_state_label(state: task_worktree::SlotState, starting: bool) -> &'static str {
+    match state {
+        task_worktree::SlotState::Synchronizing => "startup",
+        task_worktree::SlotState::Occupied if starting => "starting",
+        task_worktree::SlotState::Occupied => "active",
+        task_worktree::SlotState::AwaitingReview => "awaiting review",
+        task_worktree::SlotState::Free | task_worktree::SlotState::Released => "released",
+    }
+}
+
+fn refuse_unpublished_same_task_correction(
+    home: &Path,
+    source: &Path,
+    task: &str,
+    selected: &RetainedCompletion,
+) -> io::Result<()> {
+    let Some(record) = task_worktree::load_slot_record(home, source, selected.slot)? else {
+        return Ok(());
+    };
+    if matches!(
+        record.state,
+        task_worktree::SlotState::Free | task_worktree::SlotState::Released
+    ) || record.task.as_deref() != selected.task.as_deref()
+    {
+        return Ok(());
+    }
+    // A settled binding is fully owned by the assignment-aware check above.
+    // This observation only covers the claim-to-bind window and a recorded
+    // startup reservation, where no current receipt can prove completion.
+    if record.assignment.is_some() && record.startup.is_none() {
+        return Ok(());
+    }
+    let current_run = current_run_generation(home, source, selected.slot)?;
+    let current = current_run
+        .as_deref()
+        .map(|run| format!("current run {run}"))
+        .unwrap_or_else(|| "no current run generation is recorded".to_owned());
+    let assignment = match record.assignment.as_deref() {
+        Some(active) => format!("assignment {}", active.assignment_sha256),
+        None => "no board assignment is published".to_owned(),
+    };
+    let startup = if record.startup.is_some() {
+        "; a startup reservation is recorded, so the current run may not have written its receipt yet"
+    } else {
+        ""
+    };
+    Err(invalid(&format!(
+        "task {task} has an unresolved executor correction in slot {}: task '{}', handle '{}', state {}, {assignment}, {current}{startup}. Retained completion {} cannot be accepted while that same-task work is unfinished; finish or release that slot, then accept the newest result. Explicit --run does not bypass it. No board metadata was changed.",
+        selected.slot,
+        record.task.as_deref().unwrap_or("none"),
+        record.handle.as_deref().unwrap_or("none"),
+        slot_state_label(record.state, record.startup.is_some()),
+        selected.run_generation
+    )))
 }
 
 fn current_run_generation(home: &Path, source: &Path, slot: u32) -> io::Result<Option<String>> {

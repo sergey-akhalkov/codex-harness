@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::Duration,
 };
@@ -600,7 +600,7 @@ impl AcceptanceFixture {
         fs::write(&manifest, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     }
 
-    fn accept_raw(&self, thread: &str, task: &str, run: Option<&str>) -> std::process::Output {
+    fn accept_command(&self, thread: &str, task: &str, run: Option<&str>) -> Command {
         let mut command = Command::new(manager());
         command.args([
             "executor",
@@ -630,7 +630,19 @@ impl AcceptanceFixture {
         ] {
             command.env_remove(key);
         }
-        command.output().unwrap()
+        command
+    }
+
+    fn accept_raw(&self, thread: &str, task: &str, run: Option<&str>) -> std::process::Output {
+        self.accept_command(thread, task, run).output().unwrap()
+    }
+
+    fn accept_spawn(&self, task: &str, run: Option<&str>) -> std::process::Child {
+        self.accept_command(&self.lead_thread, task, run)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
     }
 
     fn accept(&self, task: &str, run: Option<&str>) -> Value {
@@ -663,6 +675,44 @@ impl AcceptanceFixture {
     fn close_with_reason(&self, task: &str, reason: &str) {
         self.spawn
             .bd_json(&["close", task, "--reason", reason, "--json"]);
+    }
+
+    /// Dispatch one structured correction through the real spawn owner. The
+    /// missing installed launcher stops it after the durable slot binding and
+    /// receipt, which are the acceptance inputs this fixture needs.
+    fn bind_correction(
+        &self,
+        name: &str,
+        task: &str,
+        owner: &str,
+    ) -> (String, String, SlotAssignmentBinding, String) {
+        let assignment = self.spawn.assignment(name, task, Some("ordinary"));
+        let dispatched = self.spawn.spawn(
+            &["--assignment", assignment.to_str().unwrap()],
+            &["--owner", owner],
+        );
+        let text = output_text(&dispatched);
+        assert!(!dispatched.status.success(), "{text}");
+        assert!(
+            text.contains("installed Codex launcher is missing"),
+            "the correction must stop only after its durable slot binding: {text}"
+        );
+        let record = self.spawn.record(1);
+        let slot_task = record["task"]
+            .as_str()
+            .expect("durable correction task")
+            .to_owned();
+        let handle = record["handle"]
+            .as_str()
+            .expect("durable correction handle")
+            .to_owned();
+        let assignment = serde_json::from_value(record["assignment"].clone())
+            .expect("verified correction assignment");
+        let run = self.spawn.receipt(1)["originatingLead"]["runGeneration"]
+            .as_str()
+            .expect("correction dispatch generation")
+            .to_owned();
+        (slot_task, handle, assignment, run)
     }
 
     fn drop_fixture(self) {
@@ -2185,6 +2235,168 @@ fn accept_refuses_a_stale_result_while_a_newer_correction_is_unresolved() {
     let accepted_reuse = fixture.accept(&unrelated, Some(&reused_run));
     assert_eq!(accepted_reuse["run"], reused_run, "{accepted_reuse}");
     assert_eq!(accepted_reuse["duplicate"], false, "{accepted_reuse}");
+    fixture.drop_fixture();
+}
+
+/// A new structured correction can reuse the same durable task and generation
+/// handle while changing the assignment content before it writes a new run
+/// receipt. The retained completion's task and handle alone must not make the
+/// old result current; acceptance binds the assignment identity as well.
+#[test]
+fn accept_refuses_a_changed_assignment_for_the_same_slot_and_handle() {
+    let fixture = AcceptanceFixture::new("accept-changed-assignment");
+    let task = fixture.create_task("Changed assignment", Some(Purpose::Ordinary));
+    let owner = "exec-ds-changed-assignment";
+    let (slot_task, handle, assignment, run) =
+        fixture.bind_correction("changed-first.json", &task, owner);
+    fixture.retain_bound(&run, "completed", &slot_task, &handle, owner, assignment);
+    let before = fixture.show(&task);
+
+    let changed = harness_core::build_identity::hash_bytes(b"changed same-slot correction");
+    let mut record = fixture.spawn.record(1);
+    assert_eq!(record["task"], json!(slot_task.as_str()), "{record}");
+    assert_eq!(record["handle"], json!(handle.as_str()), "{record}");
+    record["assignment"]["assignmentSha256"] = json!(changed.as_str());
+    fs::write(
+        fixture.spawn.record_path(1),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let changed_record = fixture.spawn.record(1);
+    assert_eq!(
+        changed_record["task"],
+        json!(slot_task.as_str()),
+        "{changed_record}"
+    );
+    assert_eq!(
+        changed_record["handle"],
+        json!(handle.as_str()),
+        "{changed_record}"
+    );
+    assert_eq!(
+        changed_record["assignment"]["assignmentSha256"],
+        json!(changed.as_str()),
+        "{changed_record}"
+    );
+
+    for requested in [None, Some(run.as_str())] {
+        let refused = fixture.refuse(&task, requested);
+        assert!(
+            refused.contains("unresolved executor correction"),
+            "{refused}"
+        );
+        assert!(refused.contains(&changed), "{refused}");
+        assert!(refused.contains(&run), "{refused}");
+        assert!(
+            refused.contains("No board metadata was changed"),
+            "{refused}"
+        );
+        assert_eq!(fixture.show(&task)["status"], before["status"]);
+        assert_eq!(fixture.acceptance(&task), None);
+    }
+
+    let released = fixture.spawn.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "synthetic changed-assignment correction resolved before accepting the completed run",
+    ]);
+    let released_text = output_text(&released);
+    assert!(released.status.success(), "{released_text}");
+
+    let accepted = fixture.accept(&task, Some(&run));
+    assert_eq!(accepted["run"], run, "{accepted}");
+    assert_eq!(accepted["duplicate"], false, "{accepted}");
+    let repeated = fixture.accept(&task, Some(&run));
+    assert_eq!(repeated["run"], run, "{repeated}");
+    assert_eq!(repeated["duplicate"], true, "{repeated}");
+    fixture.drop_fixture();
+}
+
+/// The pre-close observation and dispatch preparation share the pool-wide
+/// admission owner. While that guard is held, acceptance must not close the
+/// board; a same-task reservation published inside the claim-to-bind window
+/// must make the later observation refuse instead of closing from stale state.
+#[test]
+fn accept_does_not_close_while_a_same_task_reservation_crosses_validation() {
+    let fixture = AcceptanceFixture::new("accept-interleaved-reservation");
+    let task = fixture.create_task("Interleaved reservation", Some(Purpose::Ordinary));
+    let owner = "exec-ds-interleaved";
+    let (slot_task, handle, assignment, run) =
+        fixture.bind_correction("interleaved-first.json", &task, owner);
+    fixture.retain_bound(&run, "completed", &slot_task, &handle, owner, assignment);
+    let before = fixture.show(&task);
+
+    let admission =
+        task_worktree::begin_pool_admission(fixture.home(), fixture.checkout()).unwrap();
+    let mut child = fixture.accept_spawn(&task, Some(&run));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "acceptance exited while the pool admission lock was held ({status:?}): {}",
+                output_text(&out)
+            );
+        }
+        assert_ne!(
+            fixture.show(&task)["status"],
+            json!("closed"),
+            "acceptance closed the board while the pool admission lock was held"
+        );
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Publish the same-task startup reservation before the dispatch binds its
+    // board assignment. A fresh claim reuses the slot task with a new
+    // generation handle, so the reservation is identified by its durable task,
+    // not by the retained completion's handle. This is the claim-to-bind window
+    // the admission guard serializes with the acceptance observation.
+    task_worktree::hold_startup_reservation(fixture.home(), fixture.checkout(), 1, owner).unwrap();
+    let mut unbound = fixture.spawn.record(1);
+    assert!(unbound["startup"].is_object(), "{unbound}");
+    unbound["handle"] = json!("interleaved-new-generation");
+    unbound["assignment"] = Value::Null;
+    fs::write(
+        fixture.spawn.record_path(1),
+        serde_json::to_vec_pretty(&unbound).unwrap(),
+    )
+    .unwrap();
+    drop(admission);
+
+    let out = child.wait_with_output().unwrap();
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("unresolved executor correction"), "{text}");
+    assert!(text.contains("no board assignment is published"), "{text}");
+    assert!(text.contains("interleaved-new-generation"), "{text}");
+    assert!(text.contains("startup reservation"), "{text}");
+    assert_eq!(fixture.show(&task)["status"], before["status"]);
+    assert_eq!(fixture.acceptance(&task), None);
+
+    task_worktree::release_startup_reservation(fixture.home(), fixture.checkout(), 1, owner)
+        .unwrap();
+    let released = fixture.spawn.release(&[
+        "--slot",
+        "1",
+        "--disposition",
+        "discarded",
+        "--reason",
+        "synthetic interleaved reservation resolved before accepting the completed run",
+    ]);
+    let released_text = output_text(&released);
+    assert!(released.status.success(), "{released_text}");
+
+    let accepted = fixture.accept(&task, Some(&run));
+    assert_eq!(accepted["run"], run, "{accepted}");
+    assert_eq!(accepted["duplicate"], false, "{accepted}");
+    let repeated = fixture.accept(&task, Some(&run));
+    assert_eq!(repeated["duplicate"], true, "{repeated}");
     fixture.drop_fixture();
 }
 
