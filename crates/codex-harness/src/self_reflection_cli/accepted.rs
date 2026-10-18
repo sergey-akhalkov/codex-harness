@@ -8,7 +8,7 @@ use harness_core::delivery_reflection::{
 
 pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
     let controller = ReflectionController::new(
-        crate::feedback_cli::discover_bd()?,
+        crate::feedback_cli::discover_bd_in(&request.codex_home)?,
         board,
         &request.codex_home,
     );

@@ -343,6 +343,39 @@ output choice, not an ambient `CARGO_TARGET_DIR` override for native build
 identity. Custom compiler wrappers and ambient Rust build overrides are
 rejected before creating build state.
 
+## Accepted-task reflection candidate
+
+The `add-delivery-improvement` implementation remains inactive pending its
+qualification, installed delivery and real-work acceptance. These commands
+describe the candidate, not a claim that an existing installation provides it:
+
+```powershell
+codex-harness delivery-improvement enable --project CHECKOUT
+codex-harness delivery-improvement status --project CHECKOUT
+codex-harness delivery-improvement disable --project CHECKOUT
+```
+
+Enable runs inside the real managed lead conversation. It resolves the kit,
+configured profiles, roles and registered lead address before activating the
+board's native event journal at its current boundary. Repeated activation keeps
+the existing checkpoint and retained work. The existing `lead start` host
+starts its model-free consumer only for an enabled lifecycle, and ends its
+contained processes when the lead exits. Status reports the native journal
+checkpoint, pending work, recovery state and the controller's verified process
+liveness and log location. Disable prevents new stages and preserves retained
+results and journal configuration, including other consumers' use.
+
+Only an eligible accepted ordinary task can start the two visible reflection
+forks. Their exact task, run, source turns, result references, role revisions,
+profiles and return address come from the existing owners. The normal lead
+acceptance producer is still being integrated; callers must not invent those
+identities to make a task eligible. `delivery-improvement process --project
+CHECKOUT` processes one retained eligible acceptance through the same owner; it
+does not create acceptance. Unknown outcomes and source/binding drift require
+reconciliation rather than repeated model calls. The independent skill drafts
+remain outside discovery in `.agents/skill-candidates` until evaluation allows
+publication. No comparison benefit is established by the model-free checks.
+
 ## Heavy-command budget
 
 `codex-harness heavy -- PROGRAM ARGS` runs one batch command and its descendants

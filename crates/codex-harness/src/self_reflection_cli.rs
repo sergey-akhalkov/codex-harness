@@ -44,6 +44,7 @@ use std::{
 };
 
 mod accepted;
+pub(crate) mod host;
 pub(crate) mod lifecycle;
 /// Set on every reflection app-server and frontend. `main` refuses every
 /// `codex-harness` command in a process tree carrying it, so a reflection fork

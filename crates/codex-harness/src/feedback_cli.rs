@@ -247,8 +247,17 @@ fn board_cli_unavailable(detail: &str) -> io::Error {
 }
 
 pub(crate) fn discover_bd() -> io::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEX_HOME") {
-        let candidate = PathBuf::from(home).join("harness/bin").join(bd_name());
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    discover_bd_from_home(home.as_deref())
+}
+
+pub(crate) fn discover_bd_in(home: &Path) -> io::Result<PathBuf> {
+    discover_bd_from_home(Some(home))
+}
+
+fn discover_bd_from_home(home: Option<&Path>) -> io::Result<PathBuf> {
+    if let Some(home) = home {
+        let candidate = home.join("harness/bin").join(bd_name());
         if candidate.is_file() {
             return Ok(candidate);
         }

@@ -4314,6 +4314,142 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
 // Managed lead start acceptance
 // ---------------------------------------------------------------------------
 
+/// Enable the lifecycle on a separate owned native board while a real managed
+/// lead is already visible. No accepted task exists, so journal consumption
+/// must start without launching either reflection conversation.
+fn enable_reflection_for_native_lead(
+    entry: &Path,
+    home: &Path,
+    checkout: &Path,
+    evidence: &Path,
+    thread: &str,
+) -> (ProcessIdentity, PathBuf, PathBuf) {
+    assert!(
+        !home.join("harness/delivery-reflection/hosts").exists(),
+        "a mode-off lead must not create a reflection controller"
+    );
+    let project = evidence.join("reflection-consumer");
+    fs::create_dir_all(&project).unwrap();
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    git(&project, &["config", "user.email", "fixture@example.test"]);
+    git(&project, &["config", "user.name", "Fixture"]);
+    fs::write(
+        project.join("README.md"),
+        "owned native reflection lifecycle check\n",
+    )
+    .unwrap();
+    git(&project, &["add", "README.md"]);
+    git(&project, &["commit", "-qm", "seed"]);
+    let init = Command::new("bd.exe")
+        .args([
+            "init",
+            "--skip-agents",
+            "--non-interactive",
+            "--quiet",
+            "--prefix",
+            "rfl",
+        ])
+        .current_dir(&project)
+        .env("BD_NON_INTERACTIVE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    // Both routes are explicit fixture bindings. No job is eligible and no
+    // provider request is permitted from this lifecycle check.
+    fs::write(home.join("ds.config.toml"), "model = \"deepseek-flash\"\nmodel_provider = \"canned_skill_catalog\"\nmodel_reasoning_effort = \"max\"\n").unwrap();
+    let enabled = Command::new(entry)
+        .args(["delivery-improvement", "enable", "--project"])
+        .arg(&project)
+        .arg("--source")
+        .arg(checkout)
+        .arg("--codex-home")
+        .arg(home)
+        .env("CODEX_HOME", home)
+        .env("CODEX_THREAD_ID", thread)
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_REFLECTION_SESSION")
+        .output()
+        .unwrap();
+    assert!(
+        enabled.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&enabled.stdout),
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let path = home.join("harness/delivery-reflection/hosts").join(format!(
+        "{}.json",
+        build_identity::hash_bytes(thread.as_bytes())
+    ));
+    assert!(
+        wait_until(30, || fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| value["state"] == "running")),
+        "the enabled lifecycle created no native controller; evidence {}",
+        evidence.display()
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    fs::write(
+        evidence.join("reflection-host-start.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let process = ProcessIdentity {
+        pid: receipt["process"]["pid"]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        creation_time: receipt["process"]["creationTime"].as_u64().unwrap(),
+    };
+    let program = PathBuf::from(receipt["process"]["program"].as_str().unwrap());
+    assert!(
+        ServiceProcess::inspect(process, &program, &process_service::current_user().unwrap())
+            .unwrap()
+            .is_some()
+    );
+    let status = Command::new(entry)
+        .args(["delivery-improvement", "status", "--project"])
+        .arg(&project)
+        .arg("--source")
+        .arg(checkout)
+        .arg("--codex-home")
+        .arg(home)
+        .env("CODEX_HOME", home)
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_REFLECTION_SESSION")
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["host"]["processLive"], true);
+    assert_eq!(status["pending"], 0);
+    assert_eq!(status["retained"], 0);
+    let lifecycle_file = PathBuf::from(status["stateFile"].as_str().unwrap());
+    assert!(
+        wait_until(20, || fs::read(&lifecycle_file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| value["last_poll"].is_object())),
+        "the running controller never consumed the native journal; evidence {}",
+        evidence.display()
+    );
+    assert!(
+        ServiceProcess::inspect(process, &program, &process_service::current_user().unwrap())
+            .unwrap()
+            .is_some()
+    );
+    (process, program, path)
+}
+
 /// One actual `codex-harness lead start` session: the checkout-built harness
 /// hosts the lead profile in this terminal through one native app-server, its
 /// attached native frontend, the canned local Responses provider and the
@@ -4633,6 +4769,9 @@ fn managed_lead_start_hosts_the_catalogue_without_native_worktree_tools() {
         body.as_object().map(|map| map.keys().collect::<Vec<_>>())
     );
 
+    let (reflection_process, reflection_program, reflection_receipt) =
+        enable_reflection_for_native_lead(&entry, &home, &checkout, &evidence, &thread);
+
     // Ending the frontend ends the host: the exact thread and this host's
     // working files must retire, the app-server child must be gone, and the
     // retired port must refuse the recorded address.
@@ -4695,6 +4834,20 @@ fn managed_lead_start_hosts_the_catalogue_without_native_worktree_tools() {
         &user,
         "the managed lead session left its app-server child running",
     );
+    assert_process_gone(
+        reflection_process,
+        &reflection_program,
+        &user,
+        "the managed lead left an orphaned reflection journal consumer",
+    );
+    let reflection_status: Value =
+        serde_json::from_slice(&fs::read(&reflection_receipt).unwrap()).unwrap();
+    assert_eq!(reflection_status["state"], "stopped");
+    fs::write(
+        evidence.join("reflection-host-stopped.json"),
+        serde_json::to_vec_pretty(&reflection_status).unwrap(),
+    )
+    .unwrap();
     assert!(
         ControlConnection::connect(port, &token, Duration::from_millis(500)).is_err(),
         "the retired endpoint still accepted a connection on port {port}"

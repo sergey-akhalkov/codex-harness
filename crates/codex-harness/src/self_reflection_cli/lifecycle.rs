@@ -23,12 +23,15 @@ impl Options {
             .first()
             .and_then(|arg| arg.to_str())
             .unwrap_or_default();
-        if !matches!(command, "enable" | "status" | "disable" | "process") {
+        if !matches!(
+            command,
+            "enable" | "status" | "disable" | "process" | "_serve"
+        ) {
             return Err(invalid(USAGE));
         }
         let mut values = BTreeMap::new();
-        let mut pairs = args[1..].chunks_exact(2);
-        for pair in &mut pairs {
+        let (pairs, remainder) = args[1..].as_chunks::<2>();
+        for pair in pairs {
             let name = pair[0].to_str().unwrap_or_default();
             if !matches!(name, "--project" | "--source" | "--codex-home")
                 || values.insert(name, PathBuf::from(&pair[1])).is_some()
@@ -38,7 +41,7 @@ impl Options {
                 )));
             }
         }
-        if !pairs.remainder().is_empty() {
+        if !remainder.is_empty() {
             return Err(invalid(format!("an option has no value; {USAGE}")));
         }
         let project = values
@@ -61,7 +64,7 @@ impl Options {
 
     fn controller(&self) -> io::Result<ReflectionController> {
         Ok(ReflectionController::new(
-            crate::feedback_cli::discover_bd()?,
+            crate::feedback_cli::discover_bd_in(&self.home)?,
             &self.project,
             &self.home,
         ))
@@ -86,9 +89,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         return Ok(0);
     }
     let options = Options::parse(args)?;
+    if options.command == "_serve" {
+        return serve(&options);
+    }
     let controller = options.controller()?;
     match options.command.as_str() {
-        "status" => status(&controller),
+        "status" => status(&controller, &options.home),
         "enable" => {
             let lead = options.lead()?;
             // Resolve both roles and configured routes before changing journal
@@ -129,12 +135,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             }
             Ok(0)
         }
-        "process" => process(&options, &controller),
+        "process" => process(&options, &controller, false),
         _ => unreachable!(),
     }
 }
 
-fn status(controller: &ReflectionController) -> io::Result<i32> {
+fn status(controller: &ReflectionController, home: &Path) -> io::Result<i32> {
     let Some(state) = controller.stored_state()? else {
         println!("{}", json!({"lifecycle": "inactive", "pending": 0}));
         return Ok(0);
@@ -149,7 +155,9 @@ fn status(controller: &ReflectionController) -> io::Result<i32> {
             "retained": state.records.len(),
             "pending": controller.pending_jobs()?.len(),
             "recovery": state.recovery,
+            "lastPoll": state.last_poll,
             "stateFile": controller.state_file()?,
+            "host": host::status(home, &state.binding.lead_session)?,
         })
     );
     Ok(0)
@@ -226,12 +234,12 @@ fn request(
     })
 }
 
-fn process(options: &Options, controller: &ReflectionController) -> io::Result<i32> {
+fn process(options: &Options, controller: &ReflectionController, quiet: bool) -> io::Result<i32> {
     let Some(state) = controller.stored_state()? else {
-        return status(controller);
+        return status(controller, &options.home);
     };
     if state.lifecycle != LifecycleStatus::Active {
-        return status(controller);
+        return status(controller, &options.home);
     }
     let lead = options.lead()?;
     let checked = controller.check_active_binding(&lead, None)?;
@@ -246,10 +254,12 @@ fn process(options: &Options, controller: &ReflectionController) -> io::Result<i
         )));
     }
     let Some(job) = polled.jobs.first() else {
-        println!(
-            "{}",
-            json!({"lifecycle": "active", "pending": 0, "modelCalls": 0})
-        );
+        if !quiet {
+            println!(
+                "{}",
+                json!({"lifecycle": "active", "pending": 0, "modelCalls": 0})
+            );
+        }
         return Ok(0);
     };
     let record = controller
@@ -257,4 +267,86 @@ fn process(options: &Options, controller: &ReflectionController) -> io::Result<i
         .ok_or_else(|| invalid("the queued acceptance disappeared"))?;
     let request = request(options, controller, &record)?;
     accepted::execute(request, &options.project)
+}
+
+fn serve(options: &Options) -> io::Result<i32> {
+    let lead = options.lead()?;
+    if std::env::var("HARNESS_REFLECTION_HOST").as_deref() != Ok(lead.as_str()) {
+        return Err(invalid(
+            "the journal consumer must be started by its owning managed lead host",
+        ));
+    }
+    let lease = options
+        .home
+        .join("harness/delivery-reflection/hosts")
+        .join(format!("{}.lock", digest(&lead)));
+    fs::create_dir_all(lease.parent().unwrap())?;
+    let _lease =
+        harness_core::process::ExclusiveFileLock::try_acquire(&lease)?.ok_or_else(|| {
+            invalid("this lead already owns a journal consumer; no second consumer started")
+        })?;
+    loop {
+        // Reading endpoint state and native journal events is model-free.
+        // Every model stage still needs the shared run admission and a ready
+        // visible frontend. A lost lead cannot start another stage.
+        options.lead()?;
+        let boards = host::active_boards(&options.home, &lead)?;
+        if boards.is_empty() {
+            return Ok(0);
+        }
+        for board in boards {
+            let options = Options {
+                command: "process".to_owned(),
+                project: canonical_dir(&board.project, "consumer project")?,
+                source: options.source.clone(),
+                home: options.home.clone(),
+            };
+            let controller = options.controller()?;
+            if controller.state_file()? != board.state_file {
+                return Err(invalid(
+                    "the retained board lifecycle no longer matches its native board source; reconcile the source before continuation",
+                ));
+            }
+            match process(&options, &controller, true) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        thread::sleep(host::POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_default_provider_does_not_require_editing_the_ordinary_lead_profile() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"xhigh\"\n",
+        )
+        .unwrap();
+        let binding = reflection_binding(home.path(), "default").unwrap();
+        let mut declaration = StageDeclaration {
+            role: LEAD_STAGE.to_owned(),
+            revision: "fixture-role-revision".to_owned(),
+            profile: "default".to_owned(),
+            model: "gpt-6-astra".to_owned(),
+            provider: "openai".to_owned(),
+            effort: "xhigh".to_owned(),
+            checkout: home.path().to_owned(),
+            title: "fixture lead reflection".to_owned(),
+        };
+        require_route(&binding, &declaration, Role::LeadSelfReflection).unwrap();
+        declaration.provider = "different-provider".to_owned();
+        assert!(require_route(&binding, &declaration, Role::LeadSelfReflection).is_err());
+        fs::write(home.path().join("ds.config.toml"),
+            "model = \"deepseek-flash\"\nmodel_provider = \"deepseek\"\nmodel_reasoning_effort = \"max\"\n").unwrap();
+        let executor = reflection_binding(home.path(), "ds").unwrap();
+        assert_eq!(executor.model_provider.as_deref(), Some("deepseek"));
+        assert_eq!(executor.model.as_deref(), Some("deepseek-flash"));
+    }
 }

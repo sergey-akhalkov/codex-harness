@@ -639,6 +639,11 @@ fn host_lead_session(
     };
     let thread = conversation.thread_id().to_owned();
     let (frontend, registry) = expose_lead_conversation(&plan, request, &title, &mut conversation)?;
+    let mut reflection = crate::self_reflection_cli::host::LeadLifecycle::new(
+        &request.codex_home,
+        &request.source,
+        &thread,
+    );
     if let Some(prompt) = request.prompt.as_deref()
         && let Err(error) = conversation.assign(prompt)
     {
@@ -672,10 +677,18 @@ fn host_lead_session(
         } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
+        if failure.is_none()
+            && let Err(error) = reflection.tick()
+        {
+            note_log(&plan.paths.log, &format!("reflection lifecycle: {error}"));
+        }
         thread::sleep(control::DEFAULT_POLL);
     }
     let frontend_code = frontend.exit_code().ok().flatten();
     let mut notes = Vec::new();
+    if let Err(error) = reflection.stop() {
+        notes.push(format!("reflection lifecycle cleanup: {error}"));
+    }
     if let Err(error) = frontend.close() {
         notes.push(format!("the native frontend could not be ended: {error}"));
     }
@@ -1740,7 +1753,7 @@ fn resolve_assignment_binding(
     let Some(issue) = assignment.board_task.as_deref() else {
         return Ok(None);
     };
-    let bd = crate::feedback_cli::discover_bd().map_err(|error| {
+    let bd = crate::feedback_cli::discover_bd_in(request.codex_home).map_err(|error| {
         invalid(&format!(
             "board task '{issue}' is declared but the consumer board executable is unavailable: {error}"
         ))
@@ -3600,11 +3613,14 @@ fn admit_active_run(
             Role::Lead => "run concurrency",
             Role::ExecutorSelfReflection | Role::LeadSelfReflection => "reflection concurrency",
         };
-        return Err(invalid(&format!(
-            "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {}; a free pool slot does not grant another active run - stop or wait for a run",
-            active.len(),
-            active.join("; "),
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            invalid(&format!(
+                "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {}; a free pool slot does not grant another active run - stop or wait for a run",
+                active.len(),
+                active.join("; "),
+            )),
+        ));
     }
     Ok(())
 }
@@ -10664,6 +10680,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         write_test_slot_record(&home, &source, &binding);
         let receipt = run_paths(&home, &source, 1).unwrap().receipt;
