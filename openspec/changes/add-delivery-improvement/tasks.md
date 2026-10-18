@@ -50,7 +50,7 @@ repository.
 
 - `CORE10` - `crates/harness-core/tests/delivery_reflection.rs` 10/10 at `25a3dd2`.
 - `FORK24` - complete `crates/codex-harness/tests/self_reflection_forks.rs` 24/24 at `9067f6f` (root, lifecycle, installed and accepted modules then present), including the focused ordinary-acceptance lifecycle case.
-- `CTX8` - source-context module 8/8 at `03b8434` (current base).
+- `CTX8` - source-context module 8/8 at `03b8434`.
 - `BUDGET4` - budget module 4/4 at `a4b641c`; accepted 3/3 and existing accounting 1/1 in the same run.
 - `ASSIGN29` - `crates/codex-harness/tests/executor_assignment.rs` 29/29 at `e390bcb` (acceptance producer and purpose lineage).
 - `ADMIT` - shared admission 4/4 unit, 18/18 native and 1/1 ordinary concurrency at `f7d6479`; retained-capacity case 1/1 at `20f6b8c`.
@@ -60,6 +60,10 @@ repository.
 - `FEEDBACK25` - `crates/harness-core/src/board_feedback.rs` 25/25 at `70e3d502`.
 - `FEEDBACK28` - `crates/codex-harness/tests/feedback_cli.rs` 28/28 applicable at `70e3d502`; one pre-existing ignored OpenSpec archive case remains excluded.
 - `SEMANTIC` - six synthetic reviewer-calibration cases only; no real panel, reflection judgment or benefit claim.
+- `EVENTS` - duplicate activation and no-new-outcome native cases at `5ff8b9d`; final-looking text without native completion at `30652d4`. Same-reporter recording/triage at `8545dfe`, supplemented by two actual feedback episodes in one unchanged executor session; private receipts retain the session and episode identities.
+- `RECOVERY` - visibility restoration component at `3b1937c`, accepted adapter at `c71935b`, and ordinary `delivery-improvement process` recovery at `2c1f705` (1/1). These cases terminate the manager after submission; frontend-only closure is still a distinct open gap.
+- `PRESERVE` - installed in-flight disable/failed-update/failed-activation/disconnect preservation at `6f4d728`, with the pre-dispatch stop-race correction at `fb2c023`; both installed cases passed together in the retained recovery-consumer check.
+- `READ` - `lead_message_native::self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead` passed with native permitted file reading and refused writes. This establishes tool access, not real-model selection or interpretation of a diagnostic.
 - `SRC` - source inspection only; not an executed check.
 
 Tags: `exec` executed native component; `installed` isolated installed/model-free
@@ -69,7 +73,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 **Explicit activation with a bounded mandate**
 
 - `D1 A user enables improvement` - `INSTALL`, `FORK24::normal_cli_derives_the_chain_and_retains_completed_delivery_without_replay` `[installed+exec]`. Real-user enable and ordinary work continuing in a globally installed lead remain `G2`.
-- `D2 Duplicate activation` - `SRC` `ReflectionController::activate` reuses the existing binding and increments only on a lead/run/stopped transition `[source]`. No executed duplicate-enable case; recorded as an unexecuted component check below.
+- `D2 Duplicate activation` - `EVENTS::duplicate_enable_reuses_the_live_binding_and_retained_records` preserves the live binding, checkpoint and retained records without model work `[exec]`.
 - `D3 Mode is disabled` - `FORK24::foreign_lead_is_refused_and_disabled_processing_keeps_pending_work`, `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only`, `FEEDBACK25`/`FEEDBACK28` ordinary feedback `[exec]`. Real ordinary lead/executor behavior with the mode off remains `G2`.
 
 **Accepted ordinary work is the automatic trigger**
@@ -103,7 +107,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 **Evidence remains attributable to accepted work**
 
 - `D20 The worktree was reused` - `CTX8::accepted_reused_checkout_keeps_exact_retained_evidence_in_both_stages` `[exec, exact base]`.
-- `D21 An operation's cause remains unclear` - `CTX8` gap/identity tests preserve missing coverage and uncertainty; targeted operation/check-detail retrieval for a concrete question was not executed `[gap G9]`.
+- `D21 An operation's cause remains unclear` - `CTX8` preserves missing coverage and uncertainty; `READ` verifies actual authorized reading through the native reflection tool. Real-model targeted retrieval and interpretation for a concrete unclear cause remain `G9` `[exec+gap]`.
 - `D22 Acceptance metadata claims success` - `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only`, `CTX8::accepted_evidence_exposes_a_changed_result_in_both_stages`, and the prompt's closure-only trigger rule `[exec+source]`.
 
 **Session purpose prevents recursive improvement**
@@ -115,17 +119,17 @@ run under qualification; `gap` unmet or unverified acceptance.
 **Reflection is visible and shares capacity**
 
 - `D26 Capacity is occupied` - `ADMIT`, `FORK24::occupied_shared_capacity_keeps_the_closure_pending_then_freed_capacity_runs_it` `[exec]`.
-- `D27 A reflection surface closes` - `FORK24::interrupted_unknown_and_visibility_loss_outcomes_are_not_replayed` proves new work stops and the turn is not replayed, but `SRC` `accepted.rs::run_recorded_stage` then refuses the stage as requiring "explicit recovery" and no restore/reconcile command exists `[gap G5, requirement/implementation mismatch]`.
+- `D27 A reflection surface closes` - `RECOVERY::native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_request` restores the submitted turn through the ordinary owner after manager termination, with one executor result, lead stage and delivery. Frontend-only loss records a different state and remains `G5` `[exec+gap]`.
 
 **Finite cumulative costs**
 
 - `D28 A job reaches its allowance` - `BUDGET4::token_exhaustion_blocks_the_lead_and_resume_keeps_the_first_stage_usage` `[exec]`.
 - `D29 Usage is unavailable or exceeds reservation` - `BUDGET4::unknown_new_turn_usage_stays_explicit_and_blocks_dependent_work`, `FORK24::missing_new_turn_usage_stays_unknown_and_copied_source_is_not_charged` `[exec]`.
-- `D30 Nothing newly eligible has completed` - `SRC` `process` is an explicit model-free poll and there is no timer/watcher; `CORE10::accepted_close_is_eligible_and_binding_check_is_read_only` shows `model_calls=0` and no state mutation `[source+exec]`. Elapsed-time behavior itself was not executed; unexecuted check below.
+- `D30 Nothing newly eligible has completed` - `EVENTS::process_without_a_new_accepted_outcome_is_model_free_and_preserves_state` proves repeated processing without eligible completion launches no model work and preserves acceptance/results. The poll timestamp and initial journal checkpoint may advance `[exec]`.
 
 **Durable outcomes advance the chain safely**
 
-- `D31 A worker prints a final-looking report` - `SRC` `accepted.rs::run_recorded_stage` requires the retained native `StageStatus::Completed` before continuing past a recorded attempt and never consults transcript text `[source]`. No executed case injects final-looking text with an incomplete native stage; listed as an unexecuted component check below.
+- `D31 A worker prints a final-looking report` - `EVENTS::submitted_turn_without_native_completion_is_retained_and_blocks_the_lead` receives final-looking agent text while the native turn remains in progress. No result, lead stage or delivery is accepted; retry preserves the exact fork/turn and refuses replay `[exec]`.
 - `D32 Delivery is interrupted` - `FORK24::normal_cli_reconciles_a_queued_delivery_without_repeating_stages`, `queued_and_indeterminate_lead_returns_are_not_delivered_or_resent` `[exec]`.
 - `D33 The ordinary lead lacks a supported return path` - `FORK24::missing_lead_return_endpoint_refuses_before_stages_and_retries_once` `[exec]`.
 
@@ -162,14 +166,14 @@ run under qualification; `gap` unmet or unverified acceptance.
 
 - `D51 Stop occurs between reflection stages` - `BUDGET4::token_exhaustion_blocks_the_lead_and_resume_keeps_the_first_stage_usage`, `FORK24::completed_stages_are_reused_without_duplicate_forks_or_turns`, `failed_executor_stage_stays_unknown_and_resume_starts_no_model_work` `[exec]`.
 - `D52 The lead is replaced` - `FORK24::foreign_lead_is_refused_and_disabled_processing_keeps_pending_work` shows a foreign lead refused; `SRC` `lifecycle.rs` refuses `enable` for another lead and `recover` requires the current lead, while core `activate` rebinds only without in-flight/unknown stages. No supported cross-session successor transfer exists `[gap G4, requirement/implementation mismatch]`.
-- `D53 The user disables the feature` - `FORK24::owned_consumer_observes_queued_delivery_and_stops_after_disable`, `foreign_lead_is_refused_and_disabled_processing_keeps_pending_work` `[exec]`; disable during an in-flight model turn or partial implementation remains `G6`.
+- `D53 The user disables the feature` - `FORK24::owned_consumer_observes_queued_delivery_and_stops_after_disable`, `foreign_lead_is_refused_and_disabled_processing_keeps_pending_work` and `PRESERVE::installed_in_flight_disable_and_failed_install_changes_preserve_pending_work` exercise in-flight preservation through the installed owner `[exec+installed]`; real partial-improvement acceptance remains `G6`.
 - `D54 A consumer completes an improvement` - no real installed vertical slice from accepted ordinary work to applied and consumed improvement `[gap G2]`.
 - `D55 Improvement completion does not recurse` - `ASSIGN29` purpose tests and `CORE10::initial_reports_rejections_and_nonordinary_lineage_never_trigger` `[exec]`; the real installed event path is part of `G2`.
-- `D56 Update or activation fails` - `INSTALL` disconnect preservation, `CORE10` activation refusal and `FORK24::native_journal_recovery_is_explicit_and_preserves_retained_work` `[exec+installed]`; complete update/rollback outside the kit remains `G2/G6`.
+- `D56 Update or activation fails` - `PRESERVE` exercises failed update/activation and disconnect/reconnect with pending results, task/slot/configuration preservation and one remaining lead stage; `FORK24::native_journal_recovery_is_explicit_and_preserves_retained_work` covers journal recovery `[exec+installed]`. Real deployed use and partial improvements remain `G2/G6`.
 
 **Feedback triage, routing and admission**
 
-- `F1 An executor reports friction twice` - `FEEDBACK25::lead_and_executor_feedback_is_recorded_and_listed_without_chat`, `FEEDBACK28::bounded_triage_counts_once_and_excludes_diagnostics` `[exec+source]`: two records and lead batch triage are exercised; the same-executor two-episode identity and executor-session continuity are source-level only (recording is a separate model-free command), so that remainder is listed below.
+- `F1 An executor reports friction twice` - `EVENTS::same_reporter_episodes_keep_identity_through_triage_and_replay` verifies records and triage. Two genuine episodes were also recorded from the same running executor conversation with unchanged binding and independently triaged by the lead; private receipts retain that continuity evidence `[exec+real]`. This proves recording continuity, not automatic improvement or priority selection.
 - `F2 The lead wants to correct course` - `FEEDBACK25::lead_and_executor_feedback_is_recorded_and_listed_without_chat` `[exec]`.
 - `F3 Role reflections find actionable friction` - `FEEDBACK28::derived_intake_links_the_source_without_a_vote_or_another_card`, `FORK24` read-only forks `[exec]`; real-lead recording/decision remains `G1`.
 - `F4 A verified procedure is not voted into a skill` - `FEEDBACK25::verified_procedure_is_handed_off_without_votes_or_package_writes` `[exec]`.
@@ -202,12 +206,12 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `G2` Real installed vertical slice and global delivery: accepted ordinary work through real executor reflection, lead synthesis, real-lead decision, applied/consumed improvement, plus disabled-mode ordinary use and the globally delivered feedback command (`D1,D3,D37,D43,D54,D55,D56,F16,F25`). Tasks 2.6, 2.7 and 4.1 remain open.
 - `G3` Real-lead scheduling, priority, one-improvement-in-flight and bounded deferral/rejection behavior (`D39,D40,D42,F24,F25`). Task 3.4 remains open.
 - `G4` Lead succession is not implemented as a supported cross-session transfer: `lifecycle.rs` refuses a different lead on `enable`, `recover` requires the retained lead, and core rebinding refuses in-flight/unknown stages (`D52`). Task 3.5 remains open; this is a concrete requirement/implementation mismatch.
-- `G5` A closed reflection surface stops new work but no owning lifecycle restores visibility or reconciles the in-flight turn; the retained stage is permanently refused as "explicit recovery" while no such command exists (`D27`). Tasks 3.2 and 3.5 remain open; this is a concrete requirement/implementation mismatch.
-- `G6` Disable/update/rollback during an in-flight model turn or partial improvement, with preservation of boards, pending results, original executor slots and unrelated configuration (`D53,D56`). Tasks 3.5 and 4.3 remain open.
+- `G5` Manager-loss recovery now restores visibility and the exact submitted turn through the ordinary owner (`RECOVERY`). Frontend-only closure persists `VisibilityLost` while reconciliation admits `TurnSubmitted`; that distinct recovery gap remains open (`D27`). Tasks 3.2 and 3.5 remain open.
+- `G6` Installed model-free in-flight disable/failed-update/failed-activation/disconnect preservation is exercised (`PRESERVE`). Real partial-improvement and deployed continuation acceptance, including rollback, remain open (`D53,D56`); tasks 3.5 and 4.3 are not complete.
 - `G7` Frozen real comparison, matched quality/time/token benefit gate, real panel, post-acceptance horizon, adverse/inconclusive retention and baseline restoration (`D46,D47,D50,F24`). Tasks 1.3 and 4.2 remain open; candidate remains inactive.
 - `G8` Actual new-session loading/consumption of both reflection skills and any later guidance revision (`D43,D44`). Tasks 2.6 and 4.1 remain open.
-- `G9` Targeted retrieval of authorized operation/check detail for an unclear cause, without opaque-state decoding (`D21`). Task 3.8 remains open.
-- Unexecuted low-cost component checks, not new acceptance gates: duplicate-enable reuse (`D2`); elapsed-time/no-new-outcome behavior beyond source inspection (`D30`); optional multi-outcome shared synthesis (`D16`, permissive only); final-looking text with an incomplete native stage (`D31`); same-executor two-episode/session-continuity recording (`F1`).
+- `G9` Native permitted retrieval is exercised (`READ`); real-model selection and interpretation of relevant operation/check detail for an unclear cause remain unverified (`D21`). Task 3.8 remains open.
+- Optional multi-outcome shared synthesis (`D16`) is permissive, not an additional acceptance gate. The previously missing `D2,D30,D31,F1` component checks are now covered by `EVENTS`.
 
 Task 4.4 remains unchecked because `G1-G9` are unmet or unverified. Docs
 `project-decisions.md`, `agent-delegation.md` and `installation.md` already
