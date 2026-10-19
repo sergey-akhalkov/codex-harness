@@ -128,6 +128,10 @@ While `delivery-improvement` is active, the lead SHALL be able to admit a bounde
 - **WHEN** current evidence supports a bounded correction that reduces future change or maintenance cost while preserving quality and timely useful delivery
 - **THEN** the lead can admit it with a concise reason and material trade-offs even without time/token savings, without a new score or repeated-proof quota
 
+#### Scenario: A reflection finding requires a release decision
+- **WHEN** an attributable finding exposes a concrete incident risk in a pending release
+- **THEN** the responsible lead owns mitigation and any release hold through the existing task, retaining a reason and checkable release condition; a reflection recommendation alone neither blocks nor authorizes release
+
 
 ### Requirement: Improvement purpose survives task creation and delegation
 

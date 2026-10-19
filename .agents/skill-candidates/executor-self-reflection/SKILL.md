@@ -11,7 +11,7 @@ Use the supplied task, source-session and accepted-result references to establis
 
 ## Find the useful lesson
 
-Examine the original brief, your decisions, actual lead corrections and the accepted result. Focus on what could have changed the path to that result:
+Examine the original brief, your decisions, actual lead corrections and the accepted result. Look for cheaper future changes and maintenance as well as a better path to that result:
 
 - What necessary input or decision was missing, ambiguous or contradictory?
 - Which existing requirement or applicable practice did you miss?
@@ -22,7 +22,7 @@ These are prompts for judgment, not required sections or a quota of findings. A 
 
 Use the available conversation first. Read the relevant assignment, exact submitted revision, correction or check only when it can resolve a concrete question. A reused checkout may no longer contain the reviewed work. Preserve missing context and uncertainty; do not decode opaque reasoning or reconstruct unavailable history.
 
-Prefer removing an unnecessary step, supplying an input earlier, or fixing an interface/check over adding standing instructions. A skill or executor prompt change is useful when it improves a specific decision or reusable practice. One clearly attributable defect can support a bounded correction; do not wait for votes or repeated incidents. A broad generalization needs evidence appropriate to that claim.
+Prefer removing an unnecessary step, supplying an input earlier, or fixing an interface/check over adding standing instructions. Judge concrete lasting benefit against the change's implementation, recurring complexity and context burden; immediate time/token savings are not mandatory and examples are not a closed checklist. One clearly attributable defect can support a bounded correction without repeated incidents. Report a concrete potential release incident with its exposure and consequences to the real lead; do not wait for it to occur or decide the release yourself. Keep forecasts distinct from observed effects.
 
 ## Return a compact result
 

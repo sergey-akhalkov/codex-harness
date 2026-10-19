@@ -57,8 +57,13 @@ Use existing shared admission for each active reflection stage. A waiting event/
 Healthy executors are not preempted. Pending reflection waits for ordinary available capacity, without delaying launch of more consequential user work. Keep one ordinary improvement implementation in flight within existing capacity; this is neither a fixed project limit nor a reserved lane. Current correctness/integrity blockers retain ordinary urgent handling.
 
 Reflection and improvement implementation may proceed in parallel with ordinary
-delivery when resources and dependencies allow. Neither is a gate on ordinary
-task acceptance or release. Background duration alone is not displaced delivery;
+delivery when resources and dependencies allow. Neither is a routine gate on
+ordinary task acceptance or release. The responsible lead can hold an affected
+release for a concrete potential incident, considering impact, likelihood,
+exposure, mitigation and delay cost without waiting for the incident to occur.
+The existing task retains the reason and checkable release condition. Reflection
+supplies evidence; it cannot impose or lift the hold. Background duration alone
+is not displaced delivery;
 record actual contention, lead distraction or integration conflicts, and count
 overlapping wall-clock spans once while retaining all participant costs.
 

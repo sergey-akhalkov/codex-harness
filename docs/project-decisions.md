@@ -151,8 +151,13 @@ set. More code, tools, instructions or architectural machinery must earn their
 ongoing cost. Endless polishing that delays useful delivery is also a cost.
 Prefer the smallest effective correction, including doing nothing when that is
 better. Reflection and improvement implementation may run alongside ordinary
-work within available capacity; neither becomes a prerequisite for accepting
-or delivering ordinary work. Parallel duration is not itself a delivery delay:
+work within available capacity; neither routinely becomes a prerequisite for
+accepting or delivering ordinary work. The responsible lead may hold a release
+when reflection exposes a concrete incident risk relevant to that release,
+judging impact, likelihood, exposure, mitigation and the cost of delay. A potential
+incident need not occur first. Record the reason and a checkable release condition
+in the existing task; the reflection itself cannot impose or lift the hold.
+Parallel duration is not itself a delivery delay:
 count actual contention, lead distraction, integration conflicts and ongoing
 burden, without adding overlapping elapsed spans twice. Distinguish observed
 effects from forecasts and uncertainty; confidence

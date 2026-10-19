@@ -212,7 +212,7 @@ Only the real lead SHALL admit, reject or defer recommendations and create/updat
 
 ### Requirement: Improvements receive proportionate execution opportunities
 
-A ready accepted improvement SHALL receive a suitable allocation opportunity or a concrete higher-priority conflict/blocker and return condition. Ordinary acceptance and delivery SHALL NOT wait for reflection or improvement implementation. One ordinary improvement implementation SHALL run at a time within existing capacity; urgent correctness/integrity work SHALL retain existing handling. Cheaper-than-handoff corrections can be completed directly.
+A ready improvement SHALL receive capacity or a concrete higher-priority blocker and return condition. Reflection and improvements SHALL NOT routinely gate ordinary acceptance or delivery. The responsible lead MAY hold an affected release for a concrete incident risk, with a reason and checkable release condition. One ordinary improvement SHALL run at a time within existing capacity; urgent correctness/integrity work retains existing handling. Trivial corrections MAY be completed directly.
 
 #### Scenario: Suitable capacity becomes available
 - **WHEN** a ready improvement has no higher-priority conflict
@@ -324,4 +324,8 @@ Adoption SHALL require quality no worse than the control, no P0/P1 regression an
 
 #### Scenario: Improvements proceed alongside ordinary delivery
 - **WHEN** reflection and improvement implementation have available capacity and no blocking dependency on ordinary work
-- **THEN** they can proceed in parallel without gating ordinary acceptance or delivery; accounting retains all participant costs, counts overlapping elapsed spans once and distinguishes actual interference from background duration
+- **THEN** they can proceed in parallel without routinely gating ordinary acceptance or delivery; accounting retains all participant costs, counts overlapping elapsed spans once and distinguishes actual interference from background duration
+
+#### Scenario: Reflection exposes a release incident risk
+- **WHEN** reflection identifies a concrete potential incident relevant to a pending release
+- **THEN** the responsible lead assesses impact, likelihood, exposure, mitigation and delay cost and can hold the affected release with a recorded reason and checkable release condition, without requiring the incident to occur or giving the reflection authority to impose or lift the hold

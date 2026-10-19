@@ -26,7 +26,7 @@ All tasks remain subject to actual checks and the preserved evaluation gate. The
 - [ ] 3.1 Exercise native event replay, same-acceptance reopen/reclose, new accepted work identity, activation boundary, disabled journal, pruned prefix, sync/source/replica/branch changes and bounded reconciliation. Verify no timer model calls, no historical-task sweep and no silent lost or duplicate trigger. Keep journal configuration and checkpoint facts in their existing lifecycle owners.
 - [ ] 3.2 Integrate per-stage shared admission and visible-session lifecycle without a new worktree or reserved slot. Exercise occupied/freed capacity, main-work priority, no preemption, actual configured model/effort, provider refusal, surface loss and restoration. Document the honest saturation trade-off.
 - [ ] 3.3 Evaluate both skills and their synthesis with actual assignment/code/feedback/correction/check chains: faulty brief, executor violation, incorrect lead criticism, changed requirements, infrastructure failure, missing evidence and no useful finding. Verify concrete owning remedies, disagreement/uncertainty, no manufactured findings and no unsupported prompt growth.
-- [ ] 3.4 Verify the real lead's scheduling behavior for received recommendations, occupied/freed capacity, higher-priority main work, due deferral conditions and unchanged rejected ideas. Observe actual decisions/assignments, improve the existing team-lead owner where needed and prove improvement implementations/descendants do not trigger reflection.
+- [ ] 3.4 Verify the real lead's scheduling behavior for received recommendations, occupied/freed capacity, higher-priority main work, due deferral conditions and unchanged rejected ideas. Exercise parallel ordinary delivery and a lead-owned release-risk decision with a reason and checkable release condition. Observe actual decisions/assignments, improve the existing team-lead owner where needed and prove improvement implementations/descendants do not trigger reflection.
 - [ ] 3.5 Exercise interruption before/after each fork, result retention, lead delivery and board mutation, plus unknown outcomes, duplicate activation, source-session succession, lead exit, disable/reactivate and changed model/context binding. Verify stage reuse without repeated effects, preserved source/executor work, no orphan launches and concrete recovery instructions.
 - [ ] 3.6 Exercise board partial failures, stale acceptance/admission references and private-to-kit routing with synthetic identities. Verify applied effects remain observable, real-lead-only task ownership, no private data in public source/output, and existing shared installation/assignment exclusion. Update board-workflow's verified limits.
 - [ ] 3.7 Implement finite installed investigation/turn/context and cumulative-work allowances. Exercise full fork-context accounting, both stages, no-finding and failed jobs, pending work, budget pauses, overruns and missing native usage; verify resume/new fork cannot reset costs and unchanged input cannot trigger another analysis. Document limits and continuation choices.
@@ -181,6 +181,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `D58 Maintenance improves without immediate savings` - revised adoption basis and real consumption remain `G7` `[gap]`.
 - `D59 An improvement adds more burden than value` - revised adoption judgment and restoration remain `G7` `[gap]`.
 - `D60 Improvements proceed alongside ordinary delivery` - real nonblocking scheduling and attribution of actual interference remain `G3/G7` `[gap]`.
+- `D61 Reflection exposes a release incident risk` - real lead-owned risk assessment and release decision remain `G3` `[gap]`.
 
 **Feedback triage, routing and admission**
 
@@ -211,6 +212,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `F25 The real lead delegates a synthesized remedy` - `ASSIGN29::improvement_descendants_keep_purpose_across_subdivision_rename_retry_and_resume`, `accept_improvement_work_never_auto_triggers_reflection` `[exec]`; real lead delegation and creation remain `G2/G3`.
 - `F26 A reflection result is retried` - `FEEDBACK28::derived_provenance_survives_merge_and_partial_retry`, `derived_copy_recovers_an_interrupted_merge_without_duplicates` `[exec]`.
 - `F27 One observation supports a lasting improvement` - real lead judgment under the revised benefit basis remains `G1/G7` `[gap]`.
+- `F28 A reflection finding requires a release decision` - real lead-owned mitigation and release decision remain `G3` `[gap]`.
 
 ### Remaining acceptance gaps
 
