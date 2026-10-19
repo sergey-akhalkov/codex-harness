@@ -12,7 +12,7 @@ Repeated lead corrections and executor friction can expose avoidable work, but a
 - Run executor reflection first. Its retained result automatically makes lead reflection eligible; the lead fork receives its own conversation and the executor's reflection, verifies both sides of corrections, and returns concrete recommendations or no finding to the real lead.
 - Mark ordinary work, reflection and improvement implementation in owned launch/task metadata. Reflection and improvement descendants cannot automatically trigger further reflection. Keep main work moving and at most one ordinary improvement implementation in flight within existing capacity.
 - Keep beads as task/decision owner. The real lead admits a useful evidenced correction without waiting for votes, creates or updates the appropriate task and applies or delegates it through normal acceptance. Uncertain ideas retain ordinary hypothesis/evaluation routes.
-- Preserve installed operation, exact model binding, visible conversations, finite cumulative costs, interruption recovery, public/private boundaries, real consumption and the predeclared quality/time/token benefit gate.
+- Preserve installed operation, exact model binding, visible conversations, finite cumulative costs, interruption recovery, public/private boundaries and real consumption. Adopt only with quality no worse than the control, no P0/P1 regression, and predeclared useful reductions in both complete time and native token cost.
 
 ## Capabilities
 

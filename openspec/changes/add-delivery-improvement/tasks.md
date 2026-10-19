@@ -8,6 +8,7 @@ All tasks remain subject to actual checks and the preserved evaluation gate. The
   - The installed role/pool source identities match the checked checkout. Role checks passed 8/8; the native CLI pool/concurrency check passed, including refusal despite free directory capacity. Installed selection retains the two ordinary roles and no withdrawn observer module or skill; recovery inputs remain inactive. This establishes the existing foundations, not delivery of reflection admission or the new chain.
 - [ ] 1.2 Exercise native executor/lead forks, stable source boundaries, read-only tool authority, inherited-goal suppression, actual role/model binding, visible surfaces and automatic delivery to the actual main session. Exercise beads journal setup, closure identity, source/retention gaps and restart with an owned native board. Document verified capabilities and close required session-owner gaps before dependent model use.
 - [ ] 1.3 Requalify the design's three real-task pairs and three-use preventive sequence for post-acceptance effects. Freeze accepted seed/subsequent task inputs, independent acceptance, control observations, model/effort, capacity, balanced order, practical time/token margins, quality horizon, uncertainty and stopping before candidate model dispatch. Verify missing criteria refuse dispatch; retain all adverse/no-benefit cases and complete costs.
+  - Declare quality noninferiority, no P0/P1 regression and both useful cost reductions. Update the native conjunction owner and verify equal fully successful arms, per-unit regression refusal, missing evidence and both margin failures; retain strict behavior for experiments that explicitly require quality improvement.
 
 ## 2. Deliver the first complete installed reflection chain
 
@@ -34,7 +35,7 @@ All tasks remain subject to actual checks and the preserved evaluation gate. The
 ## 4. Accept shared delivery and measured outcomes
 
 - [ ] 4.1 Extend real installed acceptance to a shared-kit remedy and a role/skill guidance change. Verify public-safe committed-base assignment, required evaluation/specification, actual new-session consumption and safe handling of active sessions; verify normal acceptance of improvements while their closures produce no recursive reflection.
-- [ ] 4.2 Run every frozen task 1.3 unit through real entry points and agents. Apply the preserved conjunctive quality/time/token gate to full seed/reflection/improvement/subsequent-work costs and observed reuse. Retain adverse/inconclusive outcomes; verify rejection restores accepted source/runtime selection without losing inactive patches or evidence.
+- [ ] 4.2 Run every frozen task 1.3 unit through real entry points and agents. Apply quality noninferiority, no P0/P1 regression and both predeclared useful time/token reductions to full seed/reflection/improvement/subsequent-work costs and observed reuse. Retain adverse/inconclusive outcomes; verify rejection restores accepted source/runtime selection without losing inactive patches or evidence.
 - [ ] 4.3 Complete update/disconnect/rollback and continuation outside the kit, preserving boards, journal users/settings, pending stage results, original executor slots and unrelated configuration. Verify ordinary feedback and lead/executor behavior with the mode disabled and actual role/model identities when enabled; reuse still-applicable checks.
 - [ ] 4.4 Reconcile docs/project-decisions.md, docs/agent-delegation.md, docs/rust-native.md, docs/installation.md and affected owned skills. Map every scenario in both deltas to applicable evidence, run strict OpenSpec validation and harness-source-check, and keep all unmet implementation/acceptance tasks unchecked.
 
@@ -170,6 +171,10 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `D54 A consumer completes an improvement` - no real installed vertical slice from accepted ordinary work to applied and consumed improvement `[gap G2]`.
 - `D55 Improvement completion does not recurse` - `ASSIGN29` purpose tests and `CORE10::initial_reports_rejections_and_nonordinary_lineage_never_trigger` `[exec]`; the real installed event path is part of `G2`.
 - `D56 Update or activation fails` - `PRESERVE` exercises failed update/activation and disconnect/reconnect with pending results, task/slot/configuration preservation and one remaining lead stage; `FORK24::native_journal_recovery_is_explicit_and_preserves_retained_work` covers journal recovery `[exec+installed]`. Real deployed use and partial improvements remain `G2/G6`.
+
+**Adoption preserves quality and improves both costs**
+
+- `D57 The control already accepts every task` - explicit quality-noninferiority conjunction and its native counterexamples are pending; the real matched comparison remains `G7` `[gap]`.
 
 **Feedback triage, routing and admission**
 

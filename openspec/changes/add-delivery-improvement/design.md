@@ -115,12 +115,16 @@ native recorded token usage. Finding counts and admission latency are diagnostic
 metrics only. Freeze metric coverage, the horizon, practical effect thresholds
 and any uncertainty/repetition rule in the existing comparison policy from the
 baseline measurements before reflection candidate model dispatch or evaluation;
-an unset threshold is a blocked experiment, not zero. Preserve the owner's
-addition gate: quality must improve
-with no critical regression and both time and token cost must improve by their
-declared useful margins. Do not add time and tokens into an invented score.
-Missing counters, a verdict-changing bound, an unchanged success rate or absent
-relevant reuse cannot be reported as supported addition benefit.
+an unset threshold is a blocked experiment, not zero. Declare the owner's
+conjunction with quality noninferiority: quality must be no worse than the
+control, with no P0/P1 or other critical regression, and both time and token
+cost must improve by their declared useful margins. An unchanged independent
+success rate is allowed, including when both arms accept every task; it is not
+itself a benefit. A failed candidate outcome cannot be offset by another unit's
+success. Do not add time and tokens into an invented score. Missing counters,
+a verdict-changing bound or absent relevant reuse cannot be reported as
+supported addition benefit. Preserve strict quality-improvement behavior for
+other experiments that explicitly declare it; do not rewrite their policies.
 
 Stop after the declared panel. Reject when quality regresses or complete evidence
 fails the frozen benefit gate; classify insufficient attribution as inconclusive.

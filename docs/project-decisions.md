@@ -134,6 +134,17 @@ a separate transcript feed. This is the selected design, not a delivery claim;
 the active [change](../openspec/changes/add-delivery-improvement/proposal.md)
 owns implementation and acceptance.
 
+**2026-10-19, confirmed:** adoption of post-acceptance self-reflection requires
+quality no worse than the control, no P0/P1 regression, and useful reductions
+in both total time through acceptance and native recorded token cost. Equal
+independent task success is allowed; it is not itself evidence of benefit.
+This replaces the strict quality-improvement condition for this change, so a
+fully successful control does not make adoption impossible. Freeze both useful
+margins, the observation horizon and complete cost coverage before candidate
+model dispatch. Keep every adverse or inconclusive result and the rejection
+and baseline-restoration rules. Existing experiments that explicitly require
+strict quality improvement retain that requirement.
+
 One clear, attributable bottleneck should produce a bounded correction promptly. Do not
 wait for repeated episodes, votes or statistical proof when the available facts
 already support the remedy. Investigate only uncertainty that changes the
@@ -145,7 +156,7 @@ owns this [single-observation admission](../openspec/changes/add-delivery-improv
 The user also authorized isolated candidate implementation in parallel with
 comparison preparation to shorten delivery. The candidate remains inactive;
 the [evaluation and acceptance gates](../openspec/changes/add-delivery-improvement/design.md#parallel-candidate-implementation-and-predeclared-evaluation)
-remain unchanged. This accepts possible unused implementation, not a lower
+remain required as declared by the active change. This accepts possible unused implementation, not a lower
 acceptance standard.
 
 Deliver a quality, verified end-to-end MVP through real components as early as

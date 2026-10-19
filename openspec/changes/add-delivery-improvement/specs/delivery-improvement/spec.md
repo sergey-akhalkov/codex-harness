@@ -305,3 +305,11 @@ Global delivery SHALL include both skills, purpose metadata, event trigger, nati
 #### Scenario: Update or activation fails
 - **WHEN** an owned installation or activation cannot complete
 - **THEN** prior accepted behavior can be restored without erasing boards, retained results, unrelated settings or unfinished executor work
+
+### Requirement: Adoption preserves quality and improves both costs
+
+Adoption of automatic reflection SHALL require quality no worse than the control, no P0/P1 regression, and both predeclared useful time and native-token cost reductions. Margins and the quality horizon SHALL be frozen before candidate model dispatch. One unit's success SHALL NOT offset another unit's quality regression; missing or verdict-changing evidence SHALL remain inconclusive.
+
+#### Scenario: The control already accepts every task
+- **WHEN** both arms independently satisfy every task and neither has a quality regression within the frozen horizon
+- **THEN** equal success satisfies the quality condition, while adoption still requires both predeclared useful cost reductions and all other evidence gates
