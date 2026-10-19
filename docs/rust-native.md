@@ -2121,6 +2121,20 @@ new installed-consumer checks belong to the change that needs them.
 
 `codex-harness.exe outcome-report --input <private-json> [--markdown]` formats
 local attempt accounting without executing anything.
+To freeze an existing comparison policy and evaluate a retained report through
+the same policy owner, use:
+
+```powershell
+codex-harness outcome-report --declare-policy policy.json > declaration.json
+codex-harness outcome-report --input report.json --policy declaration.json
+```
+
+The second command returns the policy evaluation, rebuilding derived accounting
+from the retained attempts and preserving valid corroboration. Neither command
+dispatches a model or publishes an adoption decision. The declaration's digest
+checks its contents; the experiment owner must establish that it was frozen
+before the candidate ran and that the supplied observations are genuine.
+
 `delegation-usage` reads explicit local telemetry without model calls.
 `token-audit` scans rollout sessions through the shared reader with
 `cargo test --locked -p token-audit --jobs 1 -- --test-threads=1`; its
