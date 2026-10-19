@@ -1240,6 +1240,15 @@ completed participant turn's bounded visible stream before a pool slot can be
 reused and keeps one explicit coverage record per turn. Missing, truncated,
 malformed or unavailable action coverage makes the packet incomplete and
 refuses reviewer dispatch or acceptance; it is never evidence of no effects.
+Declared sources keep their repository-relative packet path when it is
+ordinary. A source under `global/` or at a packet-owned path (`task.txt`,
+`criteria.txt`, `submission.txt`, `actions.json` or `manifest.json`) is
+written under `semantic-review-evidence/` or, when a declared path already
+uses that prefix, the next `semantic-review-evidence-<number>/`. The original
+relative path remains the suffix, so the manifest and reviewer assignment name
+the exact physical evidence path while `global/orchestration.toml` stays
+reviewer configuration. Noncolliding declarations retain their existing
+packet paths and manifest identities.
 Every retained action is bound to its participant attempt, exact session and
 completed native turn. A nonempty action turn that disagrees with the stream's
 terminal turn is a coverage gap, not a retargeted action; only an item that

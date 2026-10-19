@@ -39,7 +39,36 @@ fn assignment() -> String {
 }
 
 fn prepare_fixture() -> Fixture {
-    let fixture = Fixture::new("qualification-packet-recovery");
+    prepare_fixture_with_sources("qualification-packet-recovery", &[])
+}
+
+fn prepare_fixture_with_sources(name: &str, sources: &[(&str, &str)]) -> Fixture {
+    let mut fixture = Fixture::new(name);
+    if !sources.is_empty() {
+        for (path, contents) in sources {
+            let target = fixture.wl.join(path);
+            if target.exists() {
+                continue;
+            }
+            fs::create_dir_all(target.parent().expect("the source has a parent")).unwrap();
+            fs::write(&target, contents).unwrap();
+        }
+        git(&fixture.wl, &["add", "."]);
+        git(
+            &fixture.wl,
+            &[
+                "-c",
+                "user.email=fixture@example.test",
+                "-c",
+                "user.name=Fixture",
+                "commit",
+                "-qm",
+                "add semantic review source evidence",
+            ],
+        );
+        fixture.workload_revision = git_output(&fixture.wl, &["rev-parse", "HEAD"]);
+        fixture.write_spec(&[], None);
+    }
     let launcher = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
     fixture_build(
         &fixture.state,
@@ -81,6 +110,11 @@ fn prepare_fixture() -> Fixture {
         "The submitted result must implement the frozen task and preserve its declared acceptance.\n",
     )
     .unwrap();
+    let review_sources: Vec<&str> = if sources.is_empty() {
+        vec!["solution.txt"]
+    } else {
+        sources.iter().map(|(path, _)| *path).collect()
+    };
     spec["local_runner"] = Value::Null;
     spec["qualification"] = Value::Null;
     spec["baseline_qualification"] = json!({
@@ -116,7 +150,7 @@ fn prepare_fixture() -> Fixture {
                 "path": criteria,
                 "sha256": build_identity::hash_file(&criteria).unwrap()
             },
-            "sources": ["solution.txt"],
+            "sources": review_sources,
             "max_corrections": 1
         }
     });
@@ -176,6 +210,18 @@ fn read_packet_inputs(source: &Path) -> BTreeMap<String, Vec<u8>> {
             (
                 (*name).to_owned(),
                 fs::read(source.join(name)).expect("the packet input is present"),
+            )
+        })
+        .collect()
+}
+
+fn tracked_packet_bytes(source: &Path) -> BTreeMap<String, Vec<u8>> {
+    git_output(source, &["ls-files"])
+        .lines()
+        .map(|path| {
+            (
+                path.to_owned(),
+                fs::read(source.join(path)).expect("the tracked packet file is readable"),
             )
         })
         .collect()
@@ -400,6 +446,13 @@ fn interrupted_precommit_packet_recovers_once_and_preserves_refusals() {
     // reviewer. The executor-session marker is refused by the visible dispatch
     // owner only after the accepted workflow and packet are persisted.
     let inputs = harvest_complete_packet(&fixture);
+    let noncolliding_manifest: Value =
+        serde_json::from_slice(&fs::read(packet_source(&fixture).join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        noncolliding_manifest["sources"][0]["path"], "solution.txt",
+        "a noncolliding declaration keeps its existing physical path"
+    );
     let ready = retained_pre_packet_state(fixture.cursor());
     assert_eq!(ready["attempts"].as_array().unwrap().len(), 3, "{ready}");
     assert_eq!(
@@ -569,4 +622,200 @@ fn interrupted_precommit_packet_recovers_once_and_preserves_refusals() {
     assert_eq!(&repeated_attempts[..3], ordinary_attempts.as_slice());
     assert_eq!(artifact_bytes(&ordinary_paths), ordinary_artifacts);
     assert_eq!(artifact_bytes(&semantic_paths), semantic_artifacts);
+}
+
+#[test]
+fn reserved_source_paths_move_to_a_collision_free_evidence_namespace() {
+    let _serial = INSTALL.lock().unwrap();
+    let sources = [
+        (
+            "global/principles-of-work.md",
+            "# Principles\nfrozen principle evidence\n",
+        ),
+        ("task.txt", "frozen record-name evidence\n"),
+        (
+            "semantic-review-evidence/notes.md",
+            "legitimate evidence beside the namespace\n",
+        ),
+        ("solution.txt", ""),
+    ];
+    let fixture = prepare_fixture_with_sources("qualification-packet-collision", &sources);
+    let terminal = run_ordinary_workflow(&fixture);
+    assert_eq!(terminal["attempts"].as_array().unwrap().len(), 3);
+    let report = fixture.spec.with_file_name("qualification-result.txt");
+    let report_bytes = fs::read(&report).unwrap();
+
+    // The first post-accept resume freezes the packet and writes the first
+    // reviewer assignment. The nested-executor marker refuses the dispatch
+    // only after that visible preparation, as the former reserved-path
+    // refusal did.
+    let inputs = harvest_complete_packet(&fixture);
+    let source = packet_source(&fixture);
+    let namespace = "semantic-review-evidence-2";
+    let relocated_global = format!("{namespace}/global/principles-of-work.md");
+    let relocated_task = format!("{namespace}/task.txt");
+    let ordinary_notes = "semantic-review-evidence/notes.md";
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(source.join("manifest.json")).unwrap()).unwrap();
+    let manifest_paths: Vec<&str> = manifest["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        manifest_paths,
+        [
+            relocated_global.as_str(),
+            relocated_task.as_str(),
+            ordinary_notes,
+            "solution.txt"
+        ]
+    );
+
+    // Exact declared bytes are retained separately from the packet-owned
+    // files; the legitimate namespace-like path keeps its ordinary location.
+    assert_eq!(
+        fs::read(source.join(&relocated_global)).unwrap(),
+        b"# Principles\nfrozen principle evidence\n"
+    );
+    assert_eq!(
+        fs::read(source.join(&relocated_task)).unwrap(),
+        b"frozen record-name evidence\n"
+    );
+    assert_eq!(
+        fs::read(source.join(ordinary_notes)).unwrap(),
+        b"legitimate evidence beside the namespace\n"
+    );
+    assert_eq!(fs::read(source.join("solution.txt")).unwrap(), b"solved\n");
+    let prompt = fixture.spec.with_file_name("qualification-task.txt");
+    assert_eq!(
+        fs::read(source.join("task.txt")).unwrap(),
+        fs::read(&prompt).unwrap(),
+        "the packet-owned task prompt is not replaced by declared evidence"
+    );
+    assert_ne!(
+        fs::read(source.join("task.txt")).unwrap(),
+        fs::read(source.join(&relocated_task)).unwrap()
+    );
+    let config = source.join("global/orchestration.toml");
+    let config_bytes = fs::read(&config).unwrap();
+    let config_text = String::from_utf8(config_bytes.clone()).unwrap();
+    assert!(
+        config_text.contains("executor_profiles = [\"ds\"]"),
+        "{config_text}"
+    );
+    assert!(
+        !source.join("global/principles-of-work.md").exists(),
+        "declared evidence must not overwrite reviewer configuration"
+    );
+    for identity in manifest["sources"].as_array().unwrap() {
+        let bytes = fs::read(source.join(identity["path"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            identity["sha256"].as_str().unwrap(),
+            build_identity::hash_bytes(&bytes)
+        );
+    }
+    assert_eq!(
+        fs::read(source.join("submission.txt")).unwrap(),
+        report_bytes
+    );
+    assert_packet_inputs(&source, &inputs);
+    assert!(
+        git_output(
+            &source,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        )
+        .is_empty()
+    );
+
+    let assignment_path = fixture.run.join("assignments/semantic-review-1.json");
+    let assignment_bytes = fs::read(&assignment_path).unwrap();
+    let assignment: Value = serde_json::from_slice(&assignment_bytes).unwrap();
+    let assignment_inputs: Vec<&str> = assignment["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|input| input.as_str().unwrap())
+        .collect();
+    for expected in [
+        relocated_global.as_str(),
+        relocated_task.as_str(),
+        ordinary_notes,
+    ] {
+        assert!(
+            assignment_inputs.contains(&expected),
+            "{assignment_inputs:?}"
+        );
+    }
+    let invariants = assignment["invariants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        invariants.contains("semantic-review-evidence"),
+        "{invariants}"
+    );
+    assert!(
+        invariants.contains("global/orchestration.toml"),
+        "{invariants}"
+    );
+
+    let tracked = tracked_packet_bytes(&source);
+    let head = git_output(&source, &["rev-parse", "HEAD"]);
+    let ready = retained_pre_packet_state(fixture.cursor());
+    let ordinary_attempts = ready["attempts"].as_array().unwrap().clone();
+    let mut ordinary_paths = Vec::new();
+    for attempt in &ordinary_attempts {
+        ordinary_paths.extend(artifact_paths(attempt));
+    }
+    let ordinary_artifacts = artifact_bytes(&ordinary_paths);
+    fixture.write_cursor(&ready);
+
+    // Re-entering from the retained accepted turns reuses the frozen packet
+    // and dispatches only the first independent reviewer.
+    let dispatched = resume_turn(
+        &fixture,
+        "lead-acceptance",
+        REVIEW_SESSION,
+        "semantic-review-1",
+        &semantic_acceptance(&fixture),
+        "needs-correction",
+    );
+    assert!(dispatched.status.success(), "{}", text(&dispatched));
+    let cursor = fixture.cursor();
+    let attempts = cursor["attempts"].as_array().expect("attempts");
+    assert_eq!(attempts.len(), 4, "{cursor}");
+    assert_eq!(&attempts[..3], ordinary_attempts.as_slice(), "{cursor}");
+    assert_eq!(artifact_bytes(&ordinary_paths), ordinary_artifacts);
+    assert_eq!(attempts[3]["id"], "semantic-review-1", "{cursor}");
+    assert_eq!(attempts[3]["role"], "semantic-review", "{cursor}");
+    assert_eq!(fs::read(&assignment_path).unwrap(), assignment_bytes);
+    assert_eq!(tracked_packet_bytes(&source), tracked);
+    assert_eq!(fs::read(&config).unwrap(), config_bytes);
+    assert_eq!(git_output(&source, &["rev-parse", "HEAD"]), head);
+
+    let reviewer = wait_last(&fixture);
+    assert_eq!(reviewer["observation"]["state"], "completed", "{reviewer}");
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    let settled_cursor = fixture.cursor();
+    assert_eq!(
+        settled_cursor["baseline_qualification"]["semantic_review"]["judgment_kind"], "accept",
+        "{settled_cursor}"
+    );
+    assert_eq!(settled_cursor["attempts"].as_array().unwrap().len(), 4);
+    assert_eq!(tracked_packet_bytes(&source), tracked);
+    assert_eq!(fs::read(&config).unwrap(), config_bytes);
+    assert_eq!(git_output(&source, &["rev-parse", "HEAD"]), head);
+
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 4);
+    assert_eq!(tracked_packet_bytes(&source), tracked);
+    assert_eq!(fs::read(&config).unwrap(), config_bytes);
+    assert_eq!(fs::read(&report).unwrap(), report_bytes);
 }
