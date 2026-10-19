@@ -109,14 +109,94 @@ fn summarize_input(path: &Path) -> io::Result<serde_json::Value> {
 
 fn evaluation_report(path: &Path) -> io::Result<serde_json::Value> {
     let value = read_input(path)?;
-    if value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        == Some(2)
-    {
-        return Ok(value);
+    let report = summarize_attempts_in(&value)?;
+    match value.get("corroboration") {
+        Some(corroboration) => attach_retained_corroboration(report, corroboration),
+        None => Ok(report),
     }
-    summarize_attempts_in(&value)
+}
+
+fn attach_retained_corroboration(
+    report: serde_json::Value,
+    corroboration: &serde_json::Value,
+) -> io::Result<serde_json::Value> {
+    let section: outcome_report::CorroborationSection =
+        serde_json::from_value(corroboration.clone())
+            .map_err(|_| invalid("the report carries an invalid corroboration section"))?;
+    if section.schema != outcome_report::CORROBORATION_SCHEMA {
+        return Err(invalid(
+            "the report corroboration section has an unsupported schema",
+        ));
+    }
+    if outcome_report::corroboration_digest(&section)? != section.digest {
+        return Err(invalid(
+            "the report corroboration section does not bind its own content",
+        ));
+    }
+    let receipt = retained_corroboration_receipt(&section)?;
+    outcome_report::attach_corroboration(&report, &receipt)
+}
+
+fn retained_corroboration_receipt(
+    section: &outcome_report::CorroborationSection,
+) -> io::Result<serde_json::Value> {
+    let selection = match section.status {
+        outcome_report::CorroborationState::Ready => {
+            if !section.ready || section.reason.is_some() {
+                return Err(invalid(
+                    "the report corroboration ready state contradicts its reason",
+                ));
+            }
+            serde_json::json!({
+                "schema": 1,
+                "requiredUnits": section.required_units,
+                "status": "ready",
+                "units": &section.units,
+                "excluded": &section.excluded,
+            })
+        }
+        outcome_report::CorroborationState::Inconclusive => {
+            if section.ready {
+                return Err(invalid(
+                    "the report corroboration inconclusive state claims readiness",
+                ));
+            }
+            let reason = section.reason.as_deref().ok_or_else(|| {
+                invalid("the report corroboration inconclusive state has no reason")
+            })?;
+            serde_json::json!({
+                "schema": 1,
+                "requiredUnits": section.required_units,
+                "status": {"inconclusive": reason},
+                "units": &section.units,
+                "excluded": &section.excluded,
+            })
+        }
+        outcome_report::CorroborationState::Unavailable => {
+            if section.ready || !section.units.is_empty() || !section.excluded.is_empty() {
+                return Err(invalid(
+                    "the report corroboration unavailable state carries selected units",
+                ));
+            }
+            let reason = section.reason.as_deref().ok_or_else(|| {
+                invalid("the report corroboration unavailable state has no reason")
+            })?;
+            return Ok(serde_json::json!({
+                "schema": 1,
+                "status": "unavailable",
+                "required_units": section.required_units,
+                "selection": serde_json::Value::Null,
+                "reason": reason,
+            }));
+        }
+    };
+    Ok(serde_json::json!({
+        "schema": 1,
+        "status": "selected",
+        "required_units": section.required_units,
+        "selection": selection,
+        "reason": serde_json::Value::Null,
+    }))
 }
 
 fn emit(result: String) -> io::Result<i32> {

@@ -1874,12 +1874,17 @@ fn composed_schema_two_report_preserves_corroboration_for_evaluation() {
                 "revision": "rev-prior",
                 "treeSha256": "c".repeat(64)
             }],
-            "excluded": []
+            "excluded": [{
+                "owner": "card-other",
+                "caseId": "case-other",
+                "reason": "notApplicable"
+            }]
         },
         "reason": Value::Null
     });
     let report = harness_core::outcome_report::attach_corroboration(&report, &receipt).unwrap();
     assert_eq!(report["corroboration"]["status"], "ready");
+    let corroboration_digest = report["corroboration"]["digest"].clone();
     fs::write(&input_path, serde_json::to_vec(&report).unwrap()).unwrap();
     let report_bytes = fs::read(&input_path).unwrap();
 
@@ -1902,5 +1907,113 @@ fn composed_schema_two_report_preserves_corroboration_for_evaluation() {
         "{evaluation}"
     );
     assert_eq!(evaluation["corroboration"]["ready"], true);
+    assert_eq!(evaluation["corroboration"]["digest"], corroboration_digest);
+    assert_eq!(
+        evaluation["corroboration"]["excluded"][0]["owner"],
+        "card-other"
+    );
+    assert_eq!(
+        evaluation["corroboration"]["excluded"][0]["caseId"],
+        "case-other"
+    );
+    assert_eq!(
+        evaluation["corroboration"]["excluded"][0]["reason"],
+        "notApplicable"
+    );
     assert_eq!(fs::read(&input_path).unwrap(), report_bytes);
+}
+
+#[test]
+fn schema_two_report_attempts_are_renormalized_before_evaluation() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("report.json");
+    let policy_json = policy_json();
+    fs::write(&policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json).unwrap();
+    let declaration = policy.declaration();
+    fs::write(
+        &declaration_path,
+        serde_json::to_vec(&policy.declare().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let rows = vec![
+        policy_attempt("b", "baseline", 0.0, 100.0, true, &declaration),
+        policy_attempt("c", "candidate", 200.0, 80.0, true, &declaration),
+    ];
+    let mut report = harness_core::outcome_report::summarize_attempts(&rows).unwrap();
+    assert_eq!(
+        report["units"][0]["effect"]["candidate_seconds"],
+        json!(80.0)
+    );
+    assert_eq!(report["units"][0]["positive_effect"], json!(true));
+
+    // Change the retained candidate attempt itself, while leaving every
+    // derived positive field and status from the earlier serialization in
+    // place. A schema number alone cannot make those fields authoritative.
+    report["attempts"][1]["ended_at"] = json!(320.0);
+    report["attempts"][1]["checks"][0]["ended_at"] = json!(320.0);
+    assert_eq!(report["attempts"][1]["elapsed_seconds"], json!(80.0));
+    assert_eq!(report["attempts"][1]["total_result_seconds"], json!(80.0));
+    assert_eq!(report["attempts"][1]["status"], json!("accepted"));
+    assert_eq!(
+        report["units"][0]["effect"]["candidate_seconds"],
+        json!(80.0)
+    );
+    fs::write(&input_path, serde_json::to_vec(&report).unwrap()).unwrap();
+
+    let output = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let evaluation: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(evaluation["decision"], "reject", "{evaluation}");
+}
+
+#[test]
+fn schema_two_report_attempt_bound_cannot_be_bypassed_by_derived_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("report.json");
+    let policy_json = policy_json();
+    fs::write(&policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json).unwrap();
+    let declaration = policy.declaration();
+    fs::write(
+        &declaration_path,
+        serde_json::to_vec(&policy.declare().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let rows = vec![
+        policy_attempt("b", "baseline", 0.0, 100.0, true, &declaration),
+        policy_attempt("c", "candidate", 200.0, 80.0, true, &declaration),
+    ];
+    let mut report = harness_core::outcome_report::summarize_attempts(&rows).unwrap();
+    assert_eq!(report["attempts"].as_array().unwrap().len(), 2);
+    let mut attempts = report["attempts"].as_array().unwrap().clone();
+    attempts.resize(1025, attempts[0].clone());
+    report["attempts"] = Value::Array(attempts);
+    assert_eq!(report["accounting"]["attempts"], json!(2));
+    fs::write(&input_path, serde_json::to_vec(&report).unwrap()).unwrap();
+
+    let output = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
 }
