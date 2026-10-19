@@ -1189,6 +1189,17 @@ through the existing lead/executor/reviewer path. Preparation is not acceptance
 and does not trust native hooks: each isolated home may still show its native
 first-use or hook-consent prompt on the first actual launch.
 
+If the independent checker cannot acquire its shared heavy-command slot before
+the declared deadline, qualification remains incomplete. After capacity is
+available, `improve resume --run DIRECTORY` makes at most one new attempt when
+the retained native evidence proves that the previous checker never started.
+It preserves the prior admission wait and its costs, the frozen inputs and
+completed model turns. Recovery of an older mistaken rejection also retains
+the exact old row in `row-unstarted.json`; the replacement row names the new
+checker result. A checker that actually ran and failed remains a final failure.
+An unknown start refuses replay and requires recovery of the original checker
+evidence; neither an empty run list nor a missing result proves nonexecution.
+
 A subsequent qualification may instead adopt completed native runtimes at their
 existing home paths. Add `reuse` to each runtime declaration:
 

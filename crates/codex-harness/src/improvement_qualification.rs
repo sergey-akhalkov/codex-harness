@@ -3812,9 +3812,6 @@ fn finalize(
     all_paths.dedup();
     let usage = accounting::usage_totals(&all_paths)
         .ok_or_else(|| invalid("aggregate native usage is incomplete or conflicting"))?;
-    for evidence in &state.unstarted_oracles {
-        interventions.push(unstarted_intervention(evidence));
-    }
     // One explicit resume may make one new checker attempt. A record loaded
     // from an earlier resume is retained and then replaced; a record produced
     // by this invocation is retained and returned as incomplete so continuous
@@ -3889,6 +3886,11 @@ fn finalize(
             }
         }
     };
+    // Recovery may discover a retained unstarted check in this invocation.
+    // Include its wait cost after the complete admission ledger is settled.
+    for evidence in &state.unstarted_oracles {
+        interventions.push(unstarted_intervention(evidence));
+    }
     let accepted = state.workflow.lead_accepted == Some(true)
         && acceptance.passed
         && semantic

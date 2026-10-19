@@ -265,6 +265,16 @@ fn baseline_unstarted_oracle_is_incomplete_and_retries_once() {
 }
 
 #[test]
+fn baseline_unstarted_oracle_before_ledger_preserves_wait_cost() {
+    baseline_workflow_case_with(
+        true,
+        None,
+        ActionCapture::Complete,
+        RetainedOracleCase::HeldUnstartedBeforeLedger,
+    );
+}
+
+#[test]
 fn baseline_legacy_false_row_is_preserved_and_recovered() {
     baseline_workflow_case_with(
         true,
@@ -292,6 +302,7 @@ enum ActionCapture {
 enum RetainedOracleCase {
     Ordinary,
     HeldUnstarted,
+    HeldUnstartedBeforeLedger,
     LegacyFalseRow,
 }
 
@@ -315,7 +326,10 @@ fn baseline_workflow_case_with(
 ) {
     let _serial = INSTALL.lock().unwrap();
     let mut fixture = Fixture::new("qualification-native-frame");
-    if retained_oracle_case == RetainedOracleCase::HeldUnstarted {
+    if matches!(
+        retained_oracle_case,
+        RetainedOracleCase::HeldUnstarted | RetainedOracleCase::HeldUnstartedBeforeLedger
+    ) {
         let mut request: Value =
             serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
         request["timeout_seconds"] = json!(5);
@@ -988,8 +1002,12 @@ fn baseline_workflow_case_with(
     fs::remove_file(&preserved).unwrap();
     match retained_oracle_case {
         RetainedOracleCase::Ordinary => {}
-        RetainedOracleCase::HeldUnstarted => {
-            run_held_unstarted_case(&fixture, expected_attempts);
+        RetainedOracleCase::HeldUnstarted | RetainedOracleCase::HeldUnstartedBeforeLedger => {
+            run_held_unstarted_case(
+                &fixture,
+                expected_attempts,
+                retained_oracle_case == RetainedOracleCase::HeldUnstartedBeforeLedger,
+            );
             return;
         }
         RetainedOracleCase::LegacyFalseRow => {
@@ -1203,7 +1221,7 @@ fn hold_isolated_heavy(fixture: &Fixture, name: &str) -> std::process::Child {
 /// resume must record incomplete evidence, not task rejection; releasing the
 /// slot lets exactly one later explicit resume run the checker and settle a
 /// genuinely verified row that keeps the original failure and workflow costs.
-fn run_held_unstarted_case(fixture: &Fixture, expected_attempts: usize) {
+fn run_held_unstarted_case(fixture: &Fixture, expected_attempts: usize, before_ledger: bool) {
     let account = fixture.root.join("unstarted-heavy-account");
     let cpu = fixture.root.join("unstarted-cpu-account");
     let mut holder = hold_isolated_heavy(fixture, "unstarted-heavy-account");
@@ -1344,6 +1362,13 @@ fn run_held_unstarted_case(fixture: &Fixture, expected_attempts: usize) {
     );
     let mut restored = after_interruption;
     restored["baseline_qualification"]["oracle"] = Value::Null;
+    if before_ledger {
+        // A crash after the oracle record was written, before its admission
+        // failure reached the cursor ledger, must retain that wait cost too.
+        restored["baseline_qualification"]["oracle"] =
+            json!(fixture.run.join("baseline-qualification/oracle.json"));
+        restored["baseline_qualification"]["unstarted_oracles"] = json!([]);
+    }
     fixture.write_cursor(&restored);
 
     holder.kill().unwrap();
