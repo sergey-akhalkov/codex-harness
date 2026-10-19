@@ -1,11 +1,11 @@
 use super::*;
 use harness_core::delivery_reflection::{DeliveryState, StageState as RecordedStageState};
-use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 
 fn terminate_pid(pid: u32) {
@@ -34,7 +34,26 @@ fn process_image(pid: u32) -> Option<PathBuf> {
         .then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize])))
 }
 
-fn reflection_frontends(parent: u32) -> Vec<u32> {
+fn process_running(pid: u32) -> bool {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0u32;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    ok != 0 && exit_code as i32 == STILL_ACTIVE
+}
+
+/// Every reflection frontend owned by `root`.
+///
+/// The ordinary manager launches one foreground stage runner in its own
+/// console, and that runner owns the native frontend. The frontend is
+/// therefore a grandchild of the manager, not its direct child: ownership is
+/// the manager's process tree, not one parent link.
+fn reflection_frontends(root: u32) -> Vec<u32> {
     let expected = frontend_double();
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot.is_null() || snapshot as isize == -1 {
@@ -43,33 +62,52 @@ fn reflection_frontends(parent: u32) -> Vec<u32> {
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
     let mut present = unsafe { Process32FirstW(snapshot, &mut entry) };
-    let mut found = Vec::new();
+    let mut processes = Vec::new();
     while present != 0 {
-        if entry.th32ParentProcessID == parent
-            && process_image(entry.th32ProcessID).is_some_and(|image| image == expected)
-        {
-            found.push(entry.th32ProcessID);
-        }
+        processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
         present = unsafe { Process32NextW(snapshot, &mut entry) };
     }
     unsafe {
         CloseHandle(snapshot);
     }
+    let mut descendants = vec![root];
+    let mut found = Vec::new();
+    let mut next = 0;
+    while next < descendants.len() {
+        let parent = descendants[next];
+        next += 1;
+        for &(pid, parent_pid) in &processes {
+            if parent_pid == parent && pid != root {
+                descendants.push(pid);
+                if process_image(pid).is_some_and(|image| image == expected) {
+                    found.push(pid);
+                }
+            }
+        }
+    }
     found
 }
 
-fn wait_for_reflection_frontend(parent: u32, previous: Option<u32>) -> u32 {
+fn wait_for_reflection_frontend(root: u32, previous: Option<u32>) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(pid) = reflection_frontends(parent)
+        assert!(
+            process_running(root),
+            "the owning manager pid {root} exited before its reflection frontend was established"
+        );
+        if let Some(pid) = reflection_frontends(root)
             .into_iter()
             .find(|pid| Some(*pid) != previous)
         {
+            println!(
+                "reflection frontend pid {pid} is live under owning manager pid {root}{}",
+                previous.map_or_else(String::new, |lost| format!(" after losing pid {lost}"))
+            );
             return pid;
         }
         assert!(
             Instant::now() < deadline,
-            "the ordinary process did not attach another reflection frontend within 20s"
+            "the ordinary manager pid {root} did not attach another reflection frontend within 20s"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -589,8 +627,25 @@ fn native_normal_process_frontend_only_visibility_loss_recovers_exact_accepted_t
     let (rollout_path, rollout_bytes) = executor_rollout(&workspace.home);
 
     let frontend = wait_for_reflection_frontend(pid, None);
+    assert!(
+        process_running(pid),
+        "the ordinary manager exited before only its reflection frontend was closed"
+    );
     terminate_pid(frontend);
+    wait_until(
+        || !process_running(frontend),
+        Duration::from_secs(5),
+        "the test-owned reflection frontend did not exit",
+    );
+    assert!(
+        process_running(pid),
+        "closing only the reflection frontend also ended the ordinary manager"
+    );
     let restored_frontend = wait_for_reflection_frontend(pid, Some(frontend));
+    assert!(
+        process_running(pid),
+        "the restored reflection frontend did not belong to a live ordinary manager"
+    );
     assert_ne!(restored_frontend, frontend);
     assert_eq!(read_json(&state_dir.join("executor-stage.json")), submitted);
     assert_eq!(
