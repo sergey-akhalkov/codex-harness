@@ -3373,6 +3373,115 @@ fn cumulative_judgment_costs_are_derived_without_manual_totals_and_refuse_drift(
     board.drop();
 }
 
+fn publish_cumulative_counterexample(
+    board: &Board,
+    item: &str,
+    experiment: &str,
+    revisions: (&str, &str),
+    tokens: (&str, &str),
+) -> std::process::Output {
+    let supported = payback_file(
+        board,
+        "cumulative-counterexample-payback.json",
+        "fewer-correction-rounds",
+        json!([{
+            "measure": "rounds",
+            "unit": "count",
+            "direction": "lower-is-better",
+            "baseline": 3.0,
+            "candidate": 1.0,
+            "evidence": "evidence-9"
+        }]),
+    );
+    let mut args = decision_arguments(item, experiment, "adopt", "unchanged", "115", false, None);
+    replace_argument(&mut args, "--reason", JUDGMENT_REASON);
+    replace_argument(&mut args, "--accounting", JUDGMENT_ACCOUNTING);
+    replace_argument(&mut args, "--baseline-revision", revisions.0);
+    replace_argument(&mut args, "--candidate-revision", revisions.1);
+    push_argument(&mut args, "--basis", "engineering-judgment");
+    push_argument(
+        &mut args,
+        "--basis-ref",
+        "reflection:cumulative-counterexample",
+    );
+    push_argument(&mut args, "--baseline-tokens", tokens.0);
+    push_argument(&mut args, "--candidate-tokens", tokens.1);
+    push_argument(
+        &mut args,
+        "--payback-file",
+        supported.to_str().expect("payback path"),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    board.feedback(&args)
+}
+
+#[test]
+fn cumulative_judgment_counterexample_accepts_measured_token_reduction() {
+    let board = Board::new("judgment-cumulative-saving");
+    let item = admit(&board, "m-saving", "c-synthetic", "basis-saving");
+    let first = publish_cumulative_counterexample(
+        &board,
+        &item,
+        "exp-first",
+        ("base001", "cand002"),
+        ("1000", "1100"),
+    );
+    assert!(first.status.success(), "{}", output_text(&first));
+    let saving = publish_cumulative_counterexample(
+        &board,
+        &item,
+        "exp-saving",
+        ("cand002", "cand003"),
+        ("1100", "900"),
+    );
+    assert!(
+        saving.status.success(),
+        "measured savings must not be classified as a reset: {}",
+        output_text(&saving)
+    );
+    let retained = board
+        .comment_texts(&item)
+        .into_iter()
+        .find(|comment| comment.contains("experiment=exp-saving"))
+        .expect("saving publication");
+    assert!(retained.contains("cumulative_baseline_tokens=1000 cumulative_candidate_tokens=900 cumulative_baseline=base001"), "{retained}");
+    assert_no_votes(&board, &item);
+    board.drop();
+}
+
+#[test]
+fn cumulative_judgment_counterexample_retains_baseline_across_hypotheses() {
+    let board = Board::new("judgment-cumulative-hypotheses");
+    let first_item = admit(&board, "m-first", "c-synthetic", "basis-first");
+    let second_item = admit(&board, "m-second", "c-synthetic", "basis-second");
+    let first = publish_cumulative_counterexample(
+        &board,
+        &first_item,
+        "exp-first",
+        ("base001", "cand002"),
+        ("1000", "1100"),
+    );
+    assert!(first.status.success(), "{}", output_text(&first));
+    let second = publish_cumulative_counterexample(
+        &board,
+        &second_item,
+        "exp-second",
+        ("cand002", "cand003"),
+        ("1100", "1300"),
+    );
+    assert!(second.status.success(), "{}", output_text(&second));
+    let retained = board
+        .comment_texts(&second_item)
+        .into_iter()
+        .find(|comment| comment.contains("experiment=exp-second"))
+        .expect("second publication");
+    assert!(retained.contains("cumulative_baseline_tokens=1000 cumulative_candidate_tokens=1300 cumulative_baseline=base001"),
+        "a new hypothesis in the same scope must not erase retained spending: {retained}");
+    assert_no_votes(&board, &first_item);
+    assert_no_votes(&board, &second_item);
+    board.drop();
+}
+
 /// Reconciliation binds the claimed outcome and change to what the board and
 /// card actually record before any OpenSpec effect: an unpublished decision,
 /// an unadopted-outcome mismatch, an adopted outcome or another change name
