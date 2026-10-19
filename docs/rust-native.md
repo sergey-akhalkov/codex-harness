@@ -415,16 +415,25 @@ owner exits. Run this from the live successor conversation:
 codex-harness delivery-improvement succeed --project CHECKOUT
 ```
 
-The command derives both identities from existing owners: the retained lead from
-the lifecycle and the successor from the current managed-lead registration.
-Neither recipient nor old owner is caller-supplied. It requires the retained
-owner's registered process to be verifiably absent; a live, unreadable,
-mismatched or process-less registry record refuses without changing state, as
-do a missing or stale current registration, a stopped lifecycle, pending
-recovery, a changed source scope or branch, and a call from a lead already
-retired by succession. Repeating the command as the current owner is an
-idempotent no-op that writes nothing. `succeed` only transfers control; it
-starts no model work and performs no delivery.
+The command derives both identities from existing owners: the retained lead and
+its exact app-server process identity come from the lifecycle, and the successor
+comes from the current managed-lead registration. Neither recipient nor old
+owner is caller-supplied. Activation and the ordinary `process`, `continue` and
+`recover` routes retain the exact current managed-lead process identity (pid,
+creation time and program) as lifecycle metadata; accepted provenance is never
+rewritten.
+
+Succession requires that exact retained process to be positively observed as
+exited. A missing registration alone is not exit evidence because normal
+managed-lead shutdown removes it. A live retained process, unreadable,
+malformed, mismatched or process-less registration, missing retained proof, a
+missing or stale successor registration, a stopped lifecycle, pending recovery,
+a changed source scope or branch, and a call from a lead already retired by
+succession all refuse without changing state. Repeating the command as the
+current owner is an idempotent no-op: it writes nothing when the observed
+process identity is unchanged, and refreshes stale proof without transferring
+ownership after a same-conversation restart. `succeed` only transfers control;
+it starts no model work and performs no delivery.
 
 Transfer changes only the lifecycle revision and current control/delivery
 ownership. Accepted provenance (task, run, acceptance identity and the original
@@ -441,11 +450,24 @@ The successor's conversation is current delivery ownership, never a substitute
 for the immutable accepted source conversation.
 
 To recover, stop or exit the old managed lead and verify its process has ended,
-start or resume the successor so its live `CODEX_THREAD_ID` is registered, then
-rerun `succeed --project CHECKOUT`. If the old registry record is unreadable or
-malformed, repair or remove it so the exit can be established. Reconcile any
-reported recovery state or retained unknown stage through the existing
-exact-stage recovery flow before attempting succession.
+start or resume the successor so its live `CODEX_THREAD_ID` and process identity
+are registered, then rerun `succeed --project CHECKOUT`. For a legacy lifecycle
+without retained proof, or an unverifiable retained identity, start or resume
+that exact old managed lead with `codex-harness lead start --session THREAD`, run
+`delivery-improvement enable --project CHECKOUT` from it while registered to
+refresh the proof, exit it normally, then retry succession from the successor.
+Do not fabricate or delete identity evidence. Reconcile any reported recovery
+state or retained unknown stage through the existing exact-stage recovery flow
+before attempting succession.
+
+The focused model-free succession checks use synthetic native fixtures and
+loopback endpoints; they do not call a model or establish real-work or installed
+acceptance:
+
+```powershell
+codex-harness heavy -- cargo test -p harness-core --test integration --locked delivery_reflection::succession -- --nocapture --test-threads=1
+codex-harness heavy -- cargo test -p codex-harness --test self_reflection_forks --locked succession:: -- --nocapture --test-threads=1
+```
 
 The native branch-recovery check additionally needs an existing Dolt binary;
 set `HARNESS_DOLT_EXE` to its absolute path before running:

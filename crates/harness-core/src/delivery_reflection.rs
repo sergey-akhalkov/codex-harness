@@ -8,6 +8,7 @@
 //! persisted before the next stage becomes eligible.
 
 use crate::board_cli;
+use crate::process::ProcessIdentity;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -488,6 +489,44 @@ pub enum LifecycleStatus {
     Stopped,
 }
 
+/// Exact managed-lead app-server process retained with current lifecycle
+/// control ownership. This is lifecycle metadata used to establish that a
+/// previous owner exited after its ordinary registration was retired; it is
+/// never accepted source provenance and never rewrites an acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedOwnerProcess {
+    pub identity: ProcessIdentity,
+    pub program: PathBuf,
+}
+
+impl RetainedOwnerProcess {
+    /// Inspects the retained identity against the current process table.
+    ///
+    /// `Ok(Some)` means the same exact process is still live. `Ok(None)` means
+    /// the recorded process was positively observed as exited or its identity
+    /// was reused, which is the only basis for permitting succession. `Err`
+    /// means the identity could not be verified and must be treated as live or
+    /// ambiguous, never as an exit.
+    pub fn inspect(&self) -> io::Result<Option<ProcessIdentity>> {
+        if self.identity.pid == 0
+            || self.identity.creation_time == 0
+            || self.program.as_os_str().is_empty()
+        {
+            return Err(invalid(
+                "the retained managed-lead process identity is incomplete; pid, creation time and program are required",
+            ));
+        }
+        let user = crate::process_service::current_user()?;
+        crate::process_service::ServiceProcess::inspect_endpoint(
+            self.identity,
+            &self.program,
+            &user,
+        )
+        .map(|process| process.map(|_| self.identity))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LifecycleBinding {
@@ -856,6 +895,13 @@ pub struct ReflectionState {
     /// restarts.
     #[serde(default)]
     pub retired_leads: Vec<String>,
+    /// Exact live managed-lead process last observed through the lead registry.
+    /// Succession uses it after the registration record is retired; legacy
+    /// state without this proof must refresh it through the ordinary enable
+    /// route rather than infer an exit from a missing registration. This is
+    /// current ownership metadata, never accepted source provenance.
+    #[serde(default)]
+    pub owner_process: Option<RetainedOwnerProcess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -887,6 +933,11 @@ pub struct SuccessionRequest {
     /// observation.
     pub expected_lead_session: String,
     pub successor_lead: String,
+    /// Exact live process identity of the successor, derived by the caller
+    /// from the current managed-lead registration. It is revalidated under
+    /// the lifecycle lock before transfer and retained for the next
+    /// succession.
+    pub successor_process: RetainedOwnerProcess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1109,12 +1160,49 @@ impl ReflectionController {
     }
 
     pub fn activate(&self, request: &ActivationRequest) -> io::Result<ActivationReceipt> {
+        self.activate_inner(request, None)
+    }
+
+    /// Activates the lifecycle with the exact managed-lead process observed by
+    /// the caller through the lead registry. The process is revalidated here
+    /// before any lifecycle write; it is retained as succession metadata, not
+    /// as an acceptance identity.
+    pub fn activate_with_owner_process(
+        &self,
+        request: &ActivationRequest,
+        owner_process: &RetainedOwnerProcess,
+    ) -> io::Result<ActivationReceipt> {
+        self.activate_inner(request, Some(owner_process))
+    }
+
+    fn activate_inner(
+        &self,
+        request: &ActivationRequest,
+        owner_process: Option<&RetainedOwnerProcess>,
+    ) -> io::Result<ActivationReceipt> {
         require_text("lead_session", &request.lead_session, MAX_TEXT_BYTES)?;
         if let Some(run) = &request.run {
             require_text("run", run, MAX_TEXT_BYTES)?;
         }
         if let Some(limits) = &request.limits {
             limits.validate()?;
+        }
+        if let Some(process) = owner_process {
+            match process.inspect() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(invalid(&format!(
+                        "the managed-lead process named for activation of '{}' is no longer live; start or resume that managed lead and repeat enable",
+                        request.lead_session.trim()
+                    )));
+                }
+                Err(error) => {
+                    return Err(invalid(&format!(
+                        "the managed-lead process identity named for activation of '{}' cannot be verified: {error}; start or resume that managed lead and repeat enable",
+                        request.lead_session.trim()
+                    )));
+                }
+            }
         }
         let source = self.current_source()?;
         let path = self.state_path(&source);
@@ -1191,6 +1279,11 @@ impl ReflectionController {
                     state.binding.run = request.run.as_ref().map(|run| run.trim().to_owned());
                     state.binding.activated_at = now.clone();
                 }
+                // Activation is the ordinary current-owner route. A proof
+                // supplied there refreshes the retained identity; activation
+                // through the compatibility path clears it instead of leaving
+                // a stale identity that was not observed for this owner.
+                state.owner_process = owner_process.cloned();
                 if let Some(limits) = &request.limits {
                     state.limits = limits.clone();
                 }
@@ -1221,6 +1314,7 @@ impl ReflectionController {
                 stopped_at: None,
                 last_recovery_evidence: None,
                 retired_leads: Vec::new(),
+                owner_process: owner_process.cloned(),
             },
         };
         let receipt = ActivationReceipt {
@@ -1236,15 +1330,6 @@ impl ReflectionController {
         Ok(receipt)
     }
 
-    /// Moves current lifecycle control and delivery ownership to an explicit
-    /// successor without changing accepted source provenance or retained
-    /// effects. The old owner must have been verified inactive by the caller
-    /// that owns the managed-lead registry; this operation only accepts the
-    /// successor identity and validates the lifecycle it can observe.
-    ///
-    /// A repeated call by the current owner is idempotent and performs no
-    /// write. A lead that was already replaced is refused so it cannot reclaim
-    /// retained work after restarting.
     pub fn succeed(&self, request: &SuccessionRequest) -> io::Result<SuccessionReceipt> {
         let expected = request.expected_lead_session.trim();
         let successor = request.successor_lead.trim();
@@ -1280,6 +1365,23 @@ impl ReflectionController {
                 recovery.kind, recovery.detail
             )));
         }
+        // Revalidate the successor under the same lock that guards the write:
+        // a process that exits or a registration that changes between the
+        // caller's observation and this transfer must not be retained as the
+        // new owner, and the idempotent same-owner branch below can also write.
+        match request.successor_process.inspect() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(conflict(&format!(
+                    "the successor managed-lead process for '{successor}' is no longer live; start or resume it with `codex-harness lead start --session {successor}` and repeat `codex-harness delivery-improvement succeed --project DIRECTORY`; nothing was changed"
+                )));
+            }
+            Err(error) => {
+                return Err(conflict(&format!(
+                    "the successor managed-lead process identity for '{successor}' cannot be verified: {error}; start or resume that managed lead and repeat succession; nothing was changed"
+                )));
+            }
+        }
         let previous = state.binding.lead_session.clone();
         if expected != previous {
             return Err(conflict(&format!(
@@ -1287,6 +1389,14 @@ impl ReflectionController {
             )));
         }
         if successor == previous {
+            // A repeated call by the current owner writes nothing when the
+            // observed process identity is unchanged. If that owner restarted
+            // under the same conversation, refresh the proof instead of
+            // leaving a stale identity for a later succession.
+            if state.owner_process.as_ref() != Some(&request.successor_process) {
+                state.owner_process = Some(request.successor_process.clone());
+                self.write_state_at(&path, &state)?;
+            }
             return Ok(SuccessionReceipt {
                 binding_id: state.binding.id,
                 previous_lead_session: previous,
@@ -1304,6 +1414,24 @@ impl ReflectionController {
                 "lead session '{successor}' was already superseded by succession and cannot reclaim this reflection lifecycle; inspect retained work under the current owner or start a fresh lifecycle for new work"
             )));
         }
+        let Some(previous_process) = state.owner_process.clone() else {
+            return Err(conflict(&format!(
+                "the retained lifecycle has no exact managed-lead process identity for '{previous}', so its exit cannot be established; run `codex-harness delivery-improvement enable --project DIRECTORY` from that current managed lead while it is registered to record the proof, then repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; nothing was changed"
+            )));
+        };
+        match previous_process.inspect() {
+            Ok(Some(_)) => {
+                return Err(conflict(&format!(
+                    "the retained lead '{previous}' process is still live; stop or exit that managed lead, verify the process has ended, then repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; nothing was changed"
+                )));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(conflict(&format!(
+                    "the retained lead '{previous}' process identity cannot be verified: {error}; start or resume that managed lead and run `codex-harness delivery-improvement enable --project DIRECTORY` from it to refresh the proof, then repeat succession from the successor; nothing was changed"
+                )));
+            }
+        }
         let revision = state
             .binding
             .revision
@@ -1314,6 +1442,7 @@ impl ReflectionController {
         state.binding.revision = revision;
         state.binding.lead_session = successor.to_owned();
         state.binding.activated_at = now();
+        state.owner_process = Some(request.successor_process.clone());
         let receipt = SuccessionReceipt {
             binding_id: state.binding.id.clone(),
             previous_lead_session: previous,
@@ -1323,6 +1452,70 @@ impl ReflectionController {
         };
         self.write_state_at(&path, &state)?;
         Ok(receipt)
+    }
+
+    /// Refreshes the exact managed-lead process proof for the current owner.
+    /// This is model-free lifecycle metadata: it changes no accepted
+    /// provenance, stage, delivery or cost. A concurrent ownership change is
+    /// refused so a retired owner cannot refresh proof after succession.
+    pub fn retain_owner_process(
+        &self,
+        lead: &str,
+        owner_process: &RetainedOwnerProcess,
+    ) -> io::Result<()> {
+        require_text("lead_session", lead, MAX_TEXT_BYTES)?;
+        let source = self.current_source()?;
+        let path = self.state_path(&source);
+        let _lock = self.lock(&path)?;
+        let mut state = self.read_state_at(&path)?.ok_or_else(|| {
+            conflict(
+                "delivery reflection is inactive; no managed-lead process identity was retained",
+            )
+        })?;
+        if !state.source.same_scope(&source) {
+            return Err(conflict(&format!(
+                "reflection state is bound to project {} / {}, not the current board scope; no managed-lead process identity was retained",
+                state.source.project_id, state.source.beads_dir
+            )));
+        }
+        if normalize(&state.source.branch) != normalize(&source.branch) {
+            return Err(recovery_error(
+                "source branch changed; reconcile the retained lifecycle before refreshing its owner process identity",
+            ));
+        }
+        if state.lifecycle != LifecycleStatus::Active {
+            return Err(conflict(
+                "delivery reflection is stopped; no managed-lead process identity was retained",
+            ));
+        }
+        if state.binding.lead_session != lead.trim() {
+            return Err(conflict(&format!(
+                "reflection ownership changed: expected current owner '{}' but the lifecycle names '{}'; no managed-lead process identity was retained",
+                lead.trim(),
+                state.binding.lead_session
+            )));
+        }
+        if state.owner_process.as_ref() == Some(owner_process) {
+            return Ok(());
+        }
+        // The proof is verified while the lifecycle lock is held, immediately
+        // before it is written, so a process that exited or changed between the
+        // caller's observation and this refresh is never retained as live.
+        match owner_process.inspect() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(conflict(&format!(
+                    "the current managed-lead process for '{lead}' is no longer live; its identity cannot be retained"
+                )));
+            }
+            Err(error) => {
+                return Err(conflict(&format!(
+                    "the current managed-lead process identity for '{lead}' cannot be verified: {error}; its identity cannot be retained"
+                )));
+            }
+        }
+        state.owner_process = Some(owner_process.clone());
+        self.write_state_at(&path, &state)
     }
 
     fn state_path(&self, source: &SourceIdentity) -> PathBuf {

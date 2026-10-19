@@ -7,8 +7,8 @@ use super::*;
 use harness_core::delivery_reflection::{
     ActivationRequest, BindingStatus, BudgetLimit, BudgetPause,
     DeliveryState as RecordedDeliveryState, JournalPolicy, LifecycleStatus, ReflectionController,
-    ReflectionLimits, ReflectionRecord, Stage, StageRecord, StageState as RecordedStageState,
-    StageWork, SuccessionRequest, UsageDelta,
+    ReflectionLimits, ReflectionRecord, RetainedOwnerProcess, Stage, StageRecord,
+    StageState as RecordedStageState, StageWork, SuccessionRequest, UsageDelta,
 };
 
 const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|succeed|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement continue --acceptance ACCEPTANCE --stage executor|lead --project DIRECTORY [--source KIT] [--codex-home DIRECTORY] [--max-attempts-per-stage N] [--max-turns-per-stage N] [--max-tokens-per-stage N] [--max-tokens-per-record N] [--max-investigations-per-stage N] [--max-investigations-per-record N] [--max-context-bytes-per-stage N] [--max-context-bytes-per-record N] [--reconcile-usage-turns N --reconcile-usage-tokens N] [--reconcile-investigations N --reconcile-context-bytes N]\nRun enable/process/succeed/continue/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance or retained continuation; succeed transfers current ownership to the live managed lead running it after the retained owner is verified inactive; continue resumes only the exact retained budget-paused stage named by status, with every supplied allowance strictly above its current value and the paused allowance above its observed value. Reconciliation values are measured additions, never estimates, and each pair must be supplied together; unchanged input starts no model work. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
@@ -275,11 +275,32 @@ impl Options {
     }
 
     fn lead(&self) -> io::Result<String> {
+        self.managed_lead().map(|(lead, _)| lead)
+    }
+
+    /// Resolves the current managed lead and the exact live app-server process
+    /// registered for it. The process identity is lifecycle ownership proof,
+    /// not a caller-authored recipient or acceptance identity.
+    fn managed_lead(&self) -> io::Result<(String, RetainedOwnerProcess)> {
         let thread = std::env::var("CODEX_THREAD_ID").ok()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| invalid("CODEX_THREAD_ID is missing; run this command from the managed lead conversation"))?;
         match control::registered_lead(&self.home, &thread) {
-            control::RegisteredLead::Live(_) => Ok(thread),
+            control::RegisteredLead::Live(endpoint) => {
+                let process = endpoint.process.as_ref().ok_or_else(|| invalid(format!(
+                    "the real lead '{thread}' is registered without an app-server process identity; start or resume it with `codex-harness lead start --session THREAD`"
+                )))?;
+                Ok((
+                    thread,
+                    RetainedOwnerProcess {
+                        identity: harness_core::process::ProcessIdentity {
+                            pid: process.pid,
+                            creation_time: process.creation_time,
+                        },
+                        program: process.program.clone(),
+                    },
+                ))
+            }
             control::RegisteredLead::Unavailable(reason) => Err(invalid(format!(
                 "the real lead is unavailable: {reason}; start or resume it with `codex-harness lead start --session THREAD`"
             ))),
@@ -300,7 +321,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     match options.command.as_str() {
         "status" => status(&controller, &options.home),
         "enable" => {
-            let lead = options.lead()?;
+            let (lead, owner_process) = options.managed_lead()?;
             // Resolve both roles and configured routes before changing journal
             // configuration. Actual stage startup revalidates these identities.
             let config = orchestration_config::load(&options.source)?;
@@ -318,13 +339,16 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                     "reflection belongs to another lead session; after that owner exits, run `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor to transfer current ownership without rewriting retained work",
                 ));
             }
-            let receipt = controller.activate(&ActivationRequest {
-                lead_session: lead,
-                run: None,
-                boundary: None,
-                journal: JournalPolicy::EnableIfMissing,
-                limits: config.reflection_limits,
-            })?;
+            let receipt = controller.activate_with_owner_process(
+                &ActivationRequest {
+                    lead_session: lead,
+                    run: None,
+                    boundary: None,
+                    journal: JournalPolicy::EnableIfMissing,
+                    limits: config.reflection_limits,
+                },
+                &owner_process,
+            )?;
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(0)
         }
@@ -342,8 +366,8 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         "process" => process(&options, &controller, false),
         "succeed" => succession(&options, &controller),
         "continue" => {
-            let lead = options.lead()?;
-            continuation(&options, &controller, &lead)
+            let (lead, owner_process) = options.managed_lead()?;
+            continuation(&options, &controller, &lead, &owner_process)
         }
         "restore-journal" => {
             let receipt = controller.restore_owned_journal()?;
@@ -351,7 +375,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             Ok(0)
         }
         "recover" => {
-            let lead = options.lead()?;
+            let (lead, owner_process) = options.managed_lead()?;
             let state = controller.stored_state()?.ok_or_else(|| {
                 invalid("reflection is inactive; there is no recovery to resolve")
             })?;
@@ -360,6 +384,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                     "recovery requires the active lifecycle's own managed lead; retained work was not changed",
                 ));
             }
+            controller.retain_owner_process(&lead, &owner_process)?;
             let receipt = match options
                 .recovery
                 .as_ref()
@@ -533,50 +558,86 @@ fn request(
     })
 }
 
-/// What the managed-lead registry proves about the retained lifecycle owner.
-/// Succession requires an explicit exit: a missing record or a recorded
-/// process that is no longer live. Live, malformed, mismatched or process-less
-/// records are not evidence of exit.
+/// What the managed-lead registry and the retained lifecycle proof establish
+/// about the retained owner's exact app-server process. Succession requires a
+/// positively verified exit. A missing registration is not an exit by itself:
+/// normal managed-lead shutdown removes it, so the exact process identity
+/// retained with lifecycle ownership is inspected as the fallback. Live,
+/// malformed, mismatched, process-less or unverifiable evidence refuses.
 enum RetainedOwner {
     Inactive,
     Live,
     Unverifiable(String),
 }
 
-fn retained_owner(options: &Options, thread: &str) -> io::Result<RetainedOwner> {
+fn retained_owner(
+    options: &Options,
+    thread: &str,
+    retained: Option<&RetainedOwnerProcess>,
+) -> io::Result<RetainedOwner> {
     let path = control::lead_endpoint_path(&options.home, thread).map_err(|error| {
         invalid(format!(
-            "the retained lead identity '{thread}' cannot name a managed registry record: {error}; verify the managed-lead registry and repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor"
+            "the retained lead identity '{thread}' cannot name a managed registry record: {error}; verify the managed-lead registry and repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; no ownership or lifecycle state was changed"
         ))
     })?;
-    let endpoint = match Endpoint::read(&path) {
-        Ok(endpoint) => endpoint,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RetainedOwner::Inactive);
+    match Endpoint::read(&path) {
+        Ok(endpoint) => {
+            if endpoint.thread_id.as_deref() != Some(thread.trim()) {
+                return Ok(RetainedOwner::Unverifiable(format!(
+                    "the registered lead endpoint record at {} belongs to another conversation",
+                    path.display()
+                )));
+            }
+            let Some(process) = endpoint.process.as_ref() else {
+                return Ok(RetainedOwner::Unverifiable(format!(
+                    "the registered lead endpoint record at {} records no app-server process",
+                    path.display()
+                )));
+            };
+            let user = harness_core::process_service::current_user().map_err(|error| {
+                invalid(format!(
+                    "the registered lead endpoint process identity for '{thread}' cannot be inspected: {error}; no ownership or lifecycle state was changed"
+                ))
+            })?;
+            match harness_core::process_service::ServiceProcess::inspect_endpoint(
+                harness_core::process::ProcessIdentity {
+                    pid: process.pid,
+                    creation_time: process.creation_time,
+                },
+                &process.program,
+                &user,
+            ) {
+                Ok(Some(_)) => return Ok(RetainedOwner::Live),
+                // The registration positively names an exited or reused
+                // process, so fall through to the retained exact identity.
+                Ok(None) => {}
+                Err(error) => {
+                    return Ok(RetainedOwner::Unverifiable(format!(
+                        "the registered lead endpoint process identity at {} cannot be verified: {error}",
+                        path.display()
+                    )));
+                }
+            }
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => {
             return Ok(RetainedOwner::Unverifiable(format!(
                 "the registered lead endpoint record at {} is unreadable or malformed",
                 path.display()
             )));
         }
-    };
-    if endpoint.thread_id.as_deref() != Some(thread.trim()) {
-        return Ok(RetainedOwner::Unverifiable(format!(
-            "the registered lead endpoint record at {} belongs to another conversation",
-            path.display()
-        )));
     }
-    let Some(process) = endpoint.process.as_ref() else {
+    let Some(retained) = retained else {
         return Ok(RetainedOwner::Unverifiable(format!(
-            "the registered lead endpoint record at {} records no app-server process",
-            path.display()
+            "the retained lifecycle has no exact managed-lead process identity for '{thread}', so its exit cannot be established from the absent or already-exited registration"
         )));
     };
-    if endpoint_process_live(process) {
-        Ok(RetainedOwner::Live)
-    } else {
-        Ok(RetainedOwner::Inactive)
+    match retained.inspect() {
+        Ok(Some(_)) => Ok(RetainedOwner::Live),
+        Ok(None) => Ok(RetainedOwner::Inactive),
+        Err(error) => Ok(RetainedOwner::Unverifiable(format!(
+            "the exact managed-lead process identity retained for '{thread}' cannot be verified: {error}"
+        ))),
     }
 }
 
@@ -585,7 +646,7 @@ fn retained_owner(options: &Options, thread: &str) -> io::Result<RetainedOwner> 
 /// supplied by the caller, and must be verifiably inactive before the atomic
 /// lifecycle write. A repeat by the current owner is an idempotent no-op.
 fn succession(options: &Options, controller: &ReflectionController) -> io::Result<i32> {
-    let successor = options.lead()?;
+    let (successor, successor_process) = options.managed_lead()?;
     let state = controller.stored_state()?.ok_or_else(|| {
         invalid(
             "delivery reflection is inactive; enable it under the retained lead before succession; nothing was changed",
@@ -608,7 +669,7 @@ fn succession(options: &Options, controller: &ReflectionController) -> io::Resul
     }
     let previous = state.binding.lead_session.clone();
     if successor != previous {
-        match retained_owner(options, &previous)? {
+        match retained_owner(options, &previous, state.owner_process.as_ref())? {
             RetainedOwner::Live => {
                 return Err(invalid(format!(
                     "the retained lead '{previous}' is still live; stop or exit that managed lead, verify the process has ended, then repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; no ownership or lifecycle state was changed"
@@ -616,7 +677,7 @@ fn succession(options: &Options, controller: &ReflectionController) -> io::Resul
             }
             RetainedOwner::Unverifiable(reason) => {
                 return Err(invalid(format!(
-                    "{reason}; repair or remove that managed-lead registry record so the retained owner's exit can be established, then repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; no ownership or lifecycle state was changed"
+                    "{reason}; start or resume that exact managed lead with `codex-harness lead start --session {previous}` so its own owner rewrites the registration, run `codex-harness delivery-improvement enable --project DIRECTORY` from it while registered to refresh the exact process proof, exit it normally, then repeat succession from the successor; do not fabricate or delete identity evidence; no ownership or lifecycle state was changed"
                 )));
             }
             RetainedOwner::Inactive => {}
@@ -625,6 +686,7 @@ fn succession(options: &Options, controller: &ReflectionController) -> io::Resul
     let receipt = controller.succeed(&SuccessionRequest {
         expected_lead_session: previous,
         successor_lead: successor,
+        successor_process,
     })?;
     println!("{}", serde_json::to_string(&receipt)?);
     Ok(0)
@@ -644,7 +706,7 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
     if state.lifecycle != LifecycleStatus::Active {
         return idle();
     }
-    let lead = options.lead()?;
+    let (lead, owner_process) = options.managed_lead()?;
     let checked = controller.check_active_binding(&lead, None)?;
     if !checked.is_active() {
         if matches!(
@@ -655,6 +717,10 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
         }
         return Err(invalid(checked.detail));
     }
+    // This is the ordinary current-owner route. Refresh the exact process
+    // proof while the registration is available so a later retirement of the
+    // registry record can still distinguish exit from an unreadable absence.
+    controller.retain_owner_process(&lead, &owner_process)?;
     let Some(polled) = controller.poll_if_active()? else {
         return idle();
     };
@@ -729,6 +795,7 @@ fn continuation(
     options: &Options,
     controller: &ReflectionController,
     lead: &str,
+    owner_process: &RetainedOwnerProcess,
 ) -> io::Result<i32> {
     let continuation = options.continuation.as_ref().ok_or_else(|| {
         invalid("continue requires --acceptance and --stage; nothing was changed")
@@ -813,6 +880,7 @@ fn continuation(
     // retained state changes. The continuation then executes only this
     // acceptance through the same accepted-stage controller as `process`.
     let request = request(options, controller, &record, lead)?;
+    controller.retain_owner_process(lead, owner_process)?;
 
     if let Some(usage) = continuation.usage {
         controller.record_unknown_usage(acceptance, stage, usage)?;

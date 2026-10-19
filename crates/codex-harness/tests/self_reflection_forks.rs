@@ -30,13 +30,14 @@ mod visibility;
 
 use control_endpoint::{Answer, Bearer, Server, Wire};
 use harness_core::console::{ConsoleOutcome, ConsoleSession, ConsoleSpec};
+use harness_core::delivery_reflection::RetainedOwnerProcess;
 use harness_core::process::{Cancellation, CommandSpec, Deadline};
 use harness_core::role_context::{self, Role};
 use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -188,6 +189,10 @@ struct Workspace {
     successor_endpoint: PathBuf,
     successor: Server,
     successor_state: Arc<Mutex<LeadState>>,
+    /// A real long-lived process standing in for the retained managed lead's
+    /// app-server. Its exact identity is what lifecycle activation retains, so
+    /// removing the registry can be distinguished from the owner exiting.
+    old_owner: Mutex<Option<Child>>,
 }
 
 impl Workspace {
@@ -279,7 +284,55 @@ impl Workspace {
             successor_endpoint,
             successor,
             successor_state,
+            old_owner: Mutex::new(None),
         }
+    }
+
+    /// Starts the exact process identity recorded for the retained owner and
+    /// returns its proof for lifecycle activation.
+    fn spawn_owner_process(&self) -> RetainedOwnerProcess {
+        let program = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
+        let child = Command::new(&program)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 900",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the project PowerShell 7 host starts");
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity =
+            harness_core::process_service::ServiceProcess::observe(child.id(), &program, 0, &user)
+                .unwrap()
+                .identity();
+        *self.old_owner.lock().unwrap() = Some(child);
+        RetainedOwnerProcess { identity, program }
+    }
+
+    /// Ends the synthetic owner process and waits for its real exit. The
+    /// retained proof then positively observes an exited process.
+    fn stop_owner_process(&self) {
+        if let Some(mut child) = self.old_owner.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Replaces only the process identity a synthetic endpoint record carries.
+    /// Port, bearer and thread remain the fixture's own.
+    fn set_endpoint_process(&self, path: &Path, proof: &RetainedOwnerProcess) {
+        let mut endpoint = read_json(path);
+        endpoint["process"] = json!({
+            "pid": proof.identity.pid,
+            "creationTime": proof.identity.creation_time,
+            "program": proof.program,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&endpoint).unwrap()).unwrap();
     }
 
     fn request(&self, run: &str) -> Value {
@@ -330,6 +383,12 @@ impl Workspace {
 
 impl Drop for Workspace {
     fn drop(&mut self) {
+        if let Ok(slot) = self.old_owner.get_mut()
+            && let Some(mut child) = slot.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if std::env::var_os("HARNESS_KEEP_WORKSPACE_EVIDENCE").is_none() {
             return;
         }

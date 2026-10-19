@@ -26,7 +26,11 @@ fn remove_old_registry(workspace: &Workspace) {
     fs::remove_file(registry(workspace, LEAD_THREAD)).unwrap();
 }
 
-fn restore_old_registry(workspace: &Workspace) {
+/// Re-registers the retained lead with a fresh live owner process so a retired
+/// owner can attempt ordinary commands through the real managed-lead route.
+fn install_live_old_registry(workspace: &Workspace) {
+    let owner = workspace.spawn_owner_process();
+    workspace.set_endpoint_process(&workspace.endpoint, &owner);
     fs::copy(&workspace.endpoint, registry(workspace, LEAD_THREAD)).unwrap();
 }
 
@@ -65,6 +69,20 @@ fn process_with(workspace: &Workspace, thread: &str, lead_outcome: &str) -> Cons
 
 fn succeed(workspace: &Workspace, thread: &str) -> Value {
     lifecycle::success(lifecycle::command(workspace, "succeed", Some(thread)))
+}
+
+/// Activates the shared acceptance fixture, then records the exact live owner
+/// process through the ordinary current-owner lifecycle route. The endpoint
+/// file is updated before it is installed in the managed-lead registry, so
+/// removing that record later is distinct from the process exiting.
+fn accepted_with_owner(workspace: &Workspace) -> (ReflectionController, String) {
+    let (controller, _request, acceptance) = accepted::accepted(workspace);
+    let owner = workspace.spawn_owner_process();
+    workspace.set_endpoint_process(&workspace.endpoint, &owner);
+    controller
+        .retain_owner_process(LEAD_THREAD, &owner)
+        .unwrap();
+    (controller, acceptance)
 }
 
 fn command_failure(output: std::process::Output) -> String {
@@ -117,7 +135,7 @@ fn lead_dispatches(server: &Server) -> usize {
 #[test]
 fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() {
     let workspace = Workspace::new("succession-delivery", LeadMode::Delivered);
-    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    let (controller, acceptance) = accepted_with_owner(&workspace);
     lifecycle::install_fixture(&workspace);
     install_successor_registry(&workspace);
 
@@ -137,7 +155,21 @@ fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() 
     assert_eq!(chain_before["leadSource"]["thread"], LEAD_THREAD);
     assert_eq!(chain_before["leadReturn"]["thread"], LEAD_THREAD);
 
+    // The registration is gone, but the exact retained owner process is still
+    // live: this is not exit evidence and must refuse with no state change.
     remove_old_registry(&workspace);
+    let settled_before_succession = state_bytes(&controller);
+    let live = command_failure(lifecycle::command(
+        &workspace,
+        "succeed",
+        Some(SUCCESSOR_THREAD),
+    ));
+    assert!(live.contains("still live"), "{live}");
+    assert_eq!(state_bytes(&controller), settled_before_succession);
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+
+    // A real exit plus the absent registration is the positive proof.
+    workspace.stop_owner_process();
     let receipt = succeed(&workspace, SUCCESSOR_THREAD);
     assert_eq!(receipt["changed"], true);
     assert_eq!(receipt["previous_lead_session"], LEAD_THREAD);
@@ -203,7 +235,7 @@ fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() 
     assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
     let settled = state_bytes(&controller);
 
-    restore_old_registry(&workspace);
+    install_live_old_registry(&workspace);
     let old_process = process(&workspace, LEAD_THREAD);
     assert_ne!(
         old_process.outcome.exit_code, 0,
@@ -229,7 +261,7 @@ fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() 
 #[test]
 fn succession_refuses_live_unverifiable_old_and_invalid_current_identity() {
     let workspace = Workspace::new("succession-refusals", LeadMode::Delivered);
-    let (controller, _request, _acceptance) = accepted::accepted(&workspace);
+    let (controller, _acceptance) = accepted_with_owner(&workspace);
     lifecycle::install_fixture(&workspace);
     let settled = state_bytes(&controller);
 
@@ -304,11 +336,20 @@ fn succession_refuses_live_unverifiable_old_and_invalid_current_identity() {
     assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
 
     remove_old_registry(&workspace);
+    let live_retained = command_failure(lifecycle::command(
+        &workspace,
+        "succeed",
+        Some(SUCCESSOR_THREAD),
+    ));
+    assert!(live_retained.contains("still live"), "{live_retained}");
+    assert_eq!(state_bytes(&controller), settled);
+
+    workspace.stop_owner_process();
     let transferred = succeed(&workspace, SUCCESSOR_THREAD);
     assert_eq!(transferred["changed"], true);
     let transferred_state = state_bytes(&controller);
 
-    restore_old_registry(&workspace);
+    install_live_old_registry(&workspace);
     let reclaimed = command_failure(lifecycle::command(&workspace, "succeed", Some(LEAD_THREAD)));
     assert!(reclaimed.contains("cannot reclaim"), "{reclaimed}");
     assert_eq!(state_bytes(&controller), transferred_state);
@@ -322,7 +363,7 @@ fn succession_refuses_live_unverifiable_old_and_invalid_current_identity() {
 #[test]
 fn changed_route_after_succession_refuses_before_any_reflection_fork() {
     let workspace = Workspace::new("succession-route", LeadMode::Delivered);
-    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    let (controller, acceptance) = accepted_with_owner(&workspace);
     lifecycle::install_fixture(&workspace);
     install_successor_registry(&workspace);
 
@@ -337,6 +378,7 @@ fn changed_route_after_succession_refuses_before_any_reflection_fork() {
     assert_eq!(retained.lead.state, StageState::Pending);
 
     remove_old_registry(&workspace);
+    workspace.stop_owner_process();
     assert_eq!(succeed(&workspace, SUCCESSOR_THREAD)["changed"], true);
 
     fs::write(
@@ -359,7 +401,7 @@ fn changed_route_after_succession_refuses_before_any_reflection_fork() {
 #[test]
 fn unknown_delivery_is_retained_and_never_resent_to_the_successor() {
     let workspace = Workspace::new("succession-unknown-delivery", LeadMode::Indeterminate);
-    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    let (controller, acceptance) = accepted_with_owner(&workspace);
     lifecycle::install_fixture(&workspace);
     install_successor_registry(&workspace);
 
@@ -378,6 +420,7 @@ fn unknown_delivery_is_retained_and_never_resent_to_the_successor() {
     );
 
     remove_old_registry(&workspace);
+    workspace.stop_owner_process();
     assert_eq!(succeed(&workspace, SUCCESSOR_THREAD)["changed"], true);
     let successor_process = process(&workspace, SUCCESSOR_THREAD);
     assert_ne!(
@@ -411,7 +454,7 @@ fn unknown_delivery_is_retained_and_never_resent_to_the_successor() {
 #[test]
 fn in_flight_lead_attempt_is_restored_not_relaunched_under_the_successor() {
     let workspace = Workspace::new("succession-in-flight", LeadMode::Delivered);
-    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    let (controller, acceptance) = accepted_with_owner(&workspace);
     lifecycle::install_fixture(&workspace);
     install_successor_registry(&workspace);
 
@@ -432,6 +475,7 @@ fn in_flight_lead_attempt_is_restored_not_relaunched_under_the_successor() {
     let retained_counts = request_counts(&workspace);
 
     remove_old_registry(&workspace);
+    workspace.stop_owner_process();
     assert_eq!(succeed(&workspace, SUCCESSOR_THREAD)["changed"], true);
     let resumed = process_with(&workspace, SUCCESSOR_THREAD, "visibility-lost");
     assert_ne!(resumed.outcome.exit_code, 0, "{}", resumed.transcript);
@@ -445,4 +489,62 @@ fn in_flight_lead_attempt_is_restored_not_relaunched_under_the_successor() {
         controller.record(&acceptance).unwrap().unwrap().lead.state,
         StageState::InFlight
     );
+}
+
+#[test]
+fn successor_refuses_an_incomplete_retired_source_checkpoint_before_any_lead_fork() {
+    let workspace = Workspace::new("succession-source-checkpoint", LeadMode::Delivered);
+    let (controller, acceptance) = accepted_with_owner(&workspace);
+    lifecycle::install_fixture(&workspace);
+    install_successor_registry(&workspace);
+
+    // Retain the executor result under the original owner without running the
+    // pending lead stage.
+    workspace.lead_state.lock().unwrap().source_turn = None;
+    let first = process(&workspace, LEAD_THREAD);
+    assert_refused(&first, "exact accepting lead turn");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Retained
+    );
+
+    remove_old_registry(&workspace);
+    workspace.stop_owner_process();
+    assert_eq!(succeed(&workspace, SUCCESSOR_THREAD)["changed"], true);
+
+    // The fixture recovers its fork slot from this marker. With the outcome
+    // below it reports the retired source checkpoint as inProgress, which the
+    // existing native source-completion validation must refuse before any
+    // successor lead fork or turn is started.
+    let fork = json!({
+        "forkThread": LEAD_FORK,
+        "cwd": workspace.checkout,
+        "model": MODEL,
+        "modelProvider": PROVIDER,
+        "reasoningEffort": EFFORT,
+        "config": {},
+    });
+    fs::write(
+        workspace.fixture_dir.join("fork-lead-self-reflection.json"),
+        serde_json::to_vec_pretty(&fork).unwrap(),
+    )
+    .unwrap();
+
+    let refused = process_with(&workspace, SUCCESSOR_THREAD, "source-checkpoint-changed");
+    assert_refused(&refused, "not completed");
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(lead_dispatches(&workspace.successor), 0);
+    assert!(
+        fixture_requests(&workspace, "lead-self-reflection", "thread/fork").is_empty(),
+        "the successor forked the retired source before completing it"
+    );
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Retained);
+    assert_ne!(record.delivery, DeliveryState::Consumed);
 }

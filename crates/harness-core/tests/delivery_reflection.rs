@@ -5,14 +5,14 @@
 use harness_core::delivery_reflection::{
     ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, BindingStatus, DeliveryState,
     EventRefusal, Finding, JournalOwnership, JournalPolicy, PURPOSE_METADATA, PollReceipt, Purpose,
-    RecoveryKind, ReflectionController, ReflectionLimits, RefusalCode, Stage, StageOutcome,
-    SuccessionRequest, TaskBindingStatus, UsageDelta, acceptance_metadata,
+    RecoveryKind, ReflectionController, ReflectionLimits, RefusalCode, RetainedOwnerProcess, Stage,
+    StageOutcome, SuccessionRequest, TaskBindingStatus, UsageDelta, acceptance_metadata,
 };
 use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
 };
 
 #[path = "delivery_reflection/native_branch.rs"]
@@ -280,6 +280,70 @@ fn activate(
             limits: None,
         })
         .unwrap()
+}
+
+fn activate_with_process(
+    controller: &ReflectionController,
+    journal: JournalPolicy,
+    owner_process: &RetainedOwnerProcess,
+) -> harness_core::delivery_reflection::ActivationReceipt {
+    controller
+        .activate_with_owner_process(
+            &ActivationRequest {
+                lead_session: LEAD.to_owned(),
+                run: Some("run-main".to_owned()),
+                boundary: None,
+                journal,
+                limits: None,
+            },
+            owner_process,
+        )
+        .unwrap()
+}
+
+/// Starts the exact process identity a retained lifecycle can prove exited.
+/// The project PowerShell 7 host is already a required native dependency.
+fn spawn_owner() -> (Child, RetainedOwnerProcess) {
+    let program = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
+    let child = Command::new(&program)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 900",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the project PowerShell 7 host starts");
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity =
+        harness_core::process_service::ServiceProcess::observe(child.id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+    (child, RetainedOwnerProcess { identity, program })
+}
+
+fn stop_owner(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A live successor proof for the process running these checks.
+fn live_self() -> RetainedOwnerProcess {
+    let program = std::env::current_exe().unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity = harness_core::process_service::ServiceProcess::observe(
+        std::process::id(),
+        &program,
+        0,
+        &user,
+    )
+    .unwrap()
+    .identity();
+    RetainedOwnerProcess { identity, program }
 }
 
 fn acceptance_for_task(poll: &PollReceipt, task: &str) -> String {
@@ -1088,7 +1152,8 @@ fn succession_preserves_retained_work_and_refuses_retired_owner_reclaim() {
     let board = Board::new(temp.path());
     board.json(&["config", "set", "events-journal", "true", "--json"]);
     let controller = board.controller();
-    activate(&controller, JournalPolicy::RequireExisting);
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
     let task = board.create_task("Succession work", Some(Purpose::Ordinary), None);
     board.set_binding(&task, &binding(&task, Purpose::Ordinary, "succession"));
     board.close(&task);
@@ -1097,10 +1162,25 @@ fn succession_preserves_retained_work_and_refuses_retired_owner_reclaim() {
     let acceptance = acceptance_for_task(&poll, &task);
     let before = controller.stored_state().unwrap().unwrap();
 
+    let state_file = controller.state_file().unwrap();
+    let settled_before_succession = fs::read(&state_file).unwrap();
+    let live = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(live.contains("still live"), "{live}");
+    assert_eq!(fs::read(&state_file).unwrap(), settled_before_succession);
+
+    stop_owner(&mut owner);
     let receipt = controller
         .succeed(&SuccessionRequest {
             expected_lead_session: LEAD.to_owned(),
             successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
         })
         .unwrap();
     assert!(receipt.changed);
@@ -1143,12 +1223,12 @@ fn succession_preserves_retained_work_and_refuses_retired_owner_reclaim() {
         BindingStatus::WrongLead
     );
 
-    let state_file = controller.state_file().unwrap();
     let settled = fs::read(&state_file).unwrap();
     let repeat = controller
         .succeed(&SuccessionRequest {
             expected_lead_session: SUCCESSOR.to_owned(),
             successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
         })
         .unwrap();
     assert!(!repeat.changed);
@@ -1159,6 +1239,7 @@ fn succession_preserves_retained_work_and_refuses_retired_owner_reclaim() {
         .succeed(&SuccessionRequest {
             expected_lead_session: LEAD.to_owned(),
             successor_lead: "another-successor".to_owned(),
+            successor_process: live_self(),
         })
         .unwrap_err()
         .to_string();
@@ -1169,6 +1250,7 @@ fn succession_preserves_retained_work_and_refuses_retired_owner_reclaim() {
         .succeed(&SuccessionRequest {
             expected_lead_session: SUCCESSOR.to_owned(),
             successor_lead: LEAD.to_owned(),
+            successor_process: live_self(),
         })
         .unwrap_err()
         .to_string();
@@ -1203,6 +1285,7 @@ fn succession_refuses_stopped_and_recovery_pending_lifecycles() {
         .succeed(&SuccessionRequest {
             expected_lead_session: LEAD.to_owned(),
             successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
         })
         .unwrap_err()
         .to_string();
@@ -1221,9 +1304,96 @@ fn succession_refuses_stopped_and_recovery_pending_lifecycles() {
         .succeed(&SuccessionRequest {
             expected_lead_session: LEAD.to_owned(),
             successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
         })
         .unwrap_err()
         .to_string();
     assert!(error.contains("reflection recovery is pending"), "{error}");
     assert_eq!(fs::read(&state_file).unwrap(), pending);
+}
+
+#[test]
+fn succession_refuses_legacy_owner_without_process_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    activate(&controller, JournalPolicy::RequireExisting);
+    // Compatibility activation predates retained owner proof. Removing the
+    // field leaves the truthful legacy shape rather than inventing an exit.
+    rewrite_state(&controller, |value| {
+        value.as_object_mut().unwrap().remove("owner_process");
+    });
+    let state_file = controller.state_file().unwrap();
+    let before = fs::read(&state_file).unwrap();
+    let error = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no exact managed-lead process identity"),
+        "{error}"
+    );
+    assert!(error.contains("enable"), "{error}");
+    assert_eq!(fs::read(&state_file).unwrap(), before);
+}
+
+#[test]
+fn succession_refuses_incomplete_or_unverifiable_retained_process_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    activate(&controller, JournalPolicy::RequireExisting);
+    let state_file = controller.state_file().unwrap();
+
+    rewrite_state(&controller, |value| {
+        value["owner_process"] = json!({
+            "identity": {"pid": 0, "creation_time": 0},
+            "program": ""
+        });
+    });
+    let incomplete = fs::read(&state_file).unwrap();
+    let error = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("identity is incomplete"), "{error}");
+    assert!(error.contains("enable"), "{error}");
+    assert_eq!(fs::read(&state_file).unwrap(), incomplete);
+
+    // The documented recovery works: the current managed lead refreshes the
+    // proof through the ordinary activation route instead of editing state.
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &live_self());
+    assert_eq!(
+        controller.stored_state().unwrap().unwrap().owner_process,
+        Some(live_self())
+    );
+
+    let mut mismatched = live_self();
+    mismatched.program = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
+    rewrite_state(&controller, |value| {
+        value["owner_process"] = serde_json::to_value(&mismatched).unwrap();
+    });
+    let unverifiable = fs::read(&state_file).unwrap();
+    let error = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot be verified"), "{error}");
+    assert!(error.contains("enable"), "{error}");
+    assert_eq!(fs::read(&state_file).unwrap(), unverifiable);
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &live_self());
 }
