@@ -40,11 +40,19 @@ The retired script interface and its native equivalent. Selectors, preview
 
 ## Prerequisites and checks
 
-Windows x64, Rust MSVC toolchain (minimum Rust 1.98, currently verified with
-1.98.1), Cargo, the MSVC C++ linker and Windows SDK. Workspace dependencies
-are locked in the root
-`Cargo.lock`. The RTK adapter is a workspace member with no independent
-lockfile. Use the existing toolchain; Check does not install packages.
+Windows x64, Rust MSVC toolchain (workspace MSRV Rust 1.98; the tracked
+`rust-toolchain.toml` pins the supported build toolchain to 1.98.1 with
+`rustfmt` and `clippy`), Cargo, the MSVC C++ linker and Windows SDK. Workspace
+dependencies are locked in the root `Cargo.lock`. The RTK adapter is a
+workspace member with no independent lockfile. Use the existing pinned
+toolchain; Check does not install packages.
+
+The pin applies to every checkout, including sibling worktrees and fresh
+clones. Rustup selects it for ordinary `rustc` and `cargo` commands without a
+`+TOOLCHAIN` argument or a `RUSTUP_TOOLCHAIN` environment variable. A
+machine-local rustup directory override takes precedence, so no checkout needs
+one. The workspace `rust-version = "1.98"` remains the minimum language and
+library contract; it is not a second build selector.
 
 ```powershell
 codex-harness heavy -- cargo build --workspace --locked --jobs 2
