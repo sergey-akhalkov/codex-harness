@@ -61,6 +61,7 @@ repository.
 - `FEEDBACK25` - `crates/harness-core/src/board_feedback.rs` 25/25 at `70e3d502`.
 - `FEEDBACK28` - `crates/codex-harness/tests/feedback_cli.rs` 28/28 applicable at `70e3d502`; one pre-existing ignored OpenSpec archive case remains excluded.
 - `SEMANTIC` - six synthetic reviewer-calibration cases only; no real panel, reflection judgment or benefit claim.
+- `QUALITY` - explicit quality noninferiority at `ff649f6`: focused core cases 6/6 and native comparison cases 3/3. Equal accepted outcomes require both useful cost margins; strict mode, per-unit acceptance loss, critical cost regression, missing evidence, attribution bounds and malformed mode refusal remain covered. These are policy checks, not real benefit evidence.
 - `EVENTS` - duplicate activation and no-new-outcome native cases at `5ff8b9d`; final-looking text without native completion at `30652d4`. Same-reporter recording/triage at `8545dfe`, supplemented by two actual feedback episodes in one unchanged executor session; private receipts retain the session and episode identities.
 - `RECOVERY` - visibility restoration component at `3b1937c`, accepted adapter at `c71935b`, and ordinary `delivery-improvement process` recovery at `2c1f705` (1/1). These cases terminate the manager after submission; frontend-only closure is still a distinct open gap.
 - `PRESERVE` - installed in-flight disable/failed-update/failed-activation/disconnect preservation at `6f4d728`, with the pre-dispatch stop-race correction at `fb2c023`; both installed cases passed together in the retained recovery-consumer check.
@@ -174,7 +175,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 
 **Adoption preserves quality and improves both costs**
 
-- `D57 The control already accepts every task` - explicit quality-noninferiority conjunction and its native counterexamples are pending; the real matched comparison remains `G7` `[gap]`.
+- `D57 The control already accepts every task` - `QUALITY` exercises explicit noninferiority with equal successful arms and both useful cost margins; the real matched comparison remains `G7` `[exec+gap]`.
 
 **Feedback triage, routing and admission**
 
@@ -211,7 +212,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `G2` Real installed vertical slice and global delivery: accepted ordinary work through real executor reflection, lead synthesis, real-lead decision, applied/consumed improvement, plus disabled-mode ordinary use and the globally delivered feedback command (`D1,D3,D37,D43,D54,D55,D56,F16,F25`). Tasks 2.6, 2.7 and 4.1 remain open.
 - `G3` Real-lead scheduling, priority, one-improvement-in-flight and bounded deferral/rejection behavior (`D39,D40,D42,F24,F25`). Task 3.4 remains open.
 - `G4` Lead succession is not implemented as a supported cross-session transfer: `lifecycle.rs` refuses a different lead on `enable`, `recover` requires the retained lead, and core rebinding refuses in-flight/unknown stages (`D52`). Task 3.5 remains open; this is a concrete requirement/implementation mismatch.
-- `G5` Manager-loss recovery now restores visibility and the exact submitted turn through the ordinary owner (`RECOVERY`). Frontend-only closure persists `VisibilityLost` while reconciliation admits `TurnSubmitted`; that distinct recovery gap remains open (`D27`). Tasks 3.2 and 3.5 remain open.
+- `G5` Manager-loss recovery restores visibility and the exact submitted turn through the ordinary owner (`RECOVERY`). The existing frontend-only test failed at `ff649f6` while locating the frontend; its direct-child lookup does not yet establish whether attachment or recovery failed through the stage runner. That distinct recovery check remains open (`D27`). Tasks 3.2 and 3.5 remain open.
 - `G6` Installed model-free in-flight disable/failed-update/failed-activation/disconnect preservation is exercised (`PRESERVE`). Real partial-improvement and deployed continuation acceptance, including rollback, remain open (`D53,D56`); tasks 3.5 and 4.3 are not complete.
 - `G7` Frozen real comparison, matched quality/time/token benefit gate, real panel, post-acceptance horizon, adverse/inconclusive retention and baseline restoration (`D46,D47,D50,F24`). Tasks 1.3 and 4.2 remain open; candidate remains inactive.
 - `G8` Actual new-session loading/consumption of both reflection skills and any later guidance revision (`D43,D44`). Tasks 2.6 and 4.1 remain open.
