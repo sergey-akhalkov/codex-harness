@@ -308,14 +308,14 @@ Global delivery SHALL include both skills, purpose metadata, event trigger, nati
 
 ### Requirement: Adoption preserves quality and lowers the cost of future work
 
-Adoption SHALL require quality no worse than the control, no P0/P1 regression and a grounded lead judgment that lasting benefit justifies full costs and risks. The objective SHALL be cheaper future changes and maintenance with timely useful delivery. Benefits SHALL NOT be limited to a checklist or mandatory savings. One unit's success SHALL NOT offset another's quality regression; decision-changing uncertainty SHALL remain inconclusive.
+Adoption SHALL preserve quality against the control, with no P0/P1 or per-unit regression, and require grounded lead judgment that lasting benefit justifies full costs and risks. The objective SHALL be cheaper future changes and maintenance with timely useful delivery. Benefits SHALL NOT be a closed checklist or mandatory savings percentage; decisive uncertainty SHALL remain inconclusive. The token-cost requirement below SHALL also apply.
 
 #### Scenario: The control already accepts every task
 - **WHEN** both arms independently satisfy every task and neither has a quality regression within the frozen horizon
 - **THEN** equal success satisfies the quality condition, while adoption still requires a concrete justified benefit and all other applicable acceptance checks
 
 #### Scenario: Maintenance improves without immediate savings
-- **WHEN** real use and checks support easier future changes or maintenance while time or token use does not decrease
+- **WHEN** real use and checks support easier future changes or maintenance without immediate savings and full token cost does not increase
 - **THEN** the lead can accept the change with its concrete benefit, full costs, trade-offs and forecast limits recorded in the existing decision owner, without a numeric savings prerequisite, score or assertion of confidence substituting for grounded judgment
 
 #### Scenario: An improvement adds more burden than value
@@ -329,3 +329,23 @@ Adoption SHALL require quality no worse than the control, no P0/P1 regression an
 #### Scenario: Reflection exposes a release incident risk
 - **WHEN** reflection identifies a concrete potential incident relevant to a pending release
 - **THEN** the responsible lead assesses impact, likelihood, exposure, mitigation and delay cost and can hold the affected release with a recorded reason and checkable release condition, without requiring the incident to occur or giving the reflection authority to impose or lift the hold
+
+### Requirement: Added token spending has observable payback
+
+Adoption SHALL account for full accepted-result token cost and cumulative changes against the retained baseline. Increased spending SHALL require a predeclared payback mechanism, observable benefit measures and a bounded relevant-use horizon, supported by actual use and checks. Forecast-only benefit or missing usage SHALL NOT establish payback or nonincrease. Admission to bounded investigation SHALL NOT authorize adoption.
+
+#### Scenario: Larger instructions prevent correction cycles
+- **WHEN** a bounded guidance change adds recurring input tokens but actual use shows fewer returns for correction or other declared benefits
+- **THEN** the lead evaluates full costs including reflection, implementation, checks, coordination, failed attempts and rework, allowing adoption at nonincreasing token cost or with supported payback for an increase; instruction length alone neither accepts nor rejects the change
+
+#### Scenario: Added token spending has no demonstrated return
+- **WHEN** full token cost increases and the claimed return is only qualitative confidence, forecast-only benefit or an unobserved metric
+- **THEN** the change is not adopted; decisive uncertainty remains inconclusive and evidence against payback supports rejection, without relabeling the increase as a maintenance benefit
+
+#### Scenario: Added spending has observable payback
+- **WHEN** increased full token cost is covered and actual use and checks support the predeclared return in relevant observable measures within the bounded horizon
+- **THEN** the lead may adopt with the concrete trade-off and limits recorded, preserving independent quality acceptance and every other applicable check without requiring an arbitrary savings percentage
+
+#### Scenario: Small improvements accumulate token cost drift
+- **WHEN** successive adopted changes each appear small but their combined full token cost exceeds the retained baseline
+- **THEN** the lead evaluates cumulative spending and supported payback; changing the local comparison point or starting another reflection does not erase earlier costs or authorize unexplained drift

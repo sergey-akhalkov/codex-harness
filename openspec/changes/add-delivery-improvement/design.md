@@ -134,9 +134,25 @@ regression. Equal independent task success is allowed, including when both arms
 accept every task; equality alone is not benefit. A failed candidate outcome cannot
 be offset by another unit's success. Retain accepted task outcomes, later rework,
 total time through acceptance and native recorded token usage as separate evidence.
-Missing usage remains unknown and forbids a savings claim, rather than becoming
-zero or automatically defeating a separately supported maintenance benefit. Any
-unknown that could reverse the adoption judgment leaves it inconclusive.
+Missing usage remains unknown, never zero or evidence of nonincrease. If missing
+cost coverage could change the token-cost or payback decision, adoption remains
+inconclusive; a separately supported maintenance benefit does not waive this.
+
+Tokens are the spending currency. Compare the full accepted-result path, including
+seed work, reflection, implementation, checks, coordination, failed attempts and
+later corrections within the declared relevant-use horizon. A larger prompt can
+repay its input cost by preventing correction cycles; prompt size and per-call
+usage alone do not determine value. At equal or lower full token cost, supported
+lasting benefit needs no mandatory savings percentage. Increased full token cost
+requires a predeclared concrete payback mechanism, observable benefit measures
+and bounded horizon, with actual use and checks supporting the claimed return.
+Measures may concern correction cycles, delivery time, defects or future change
+effort; these are examples, not a closed checklist or a token-to-quality score.
+A forecast or qualitative confidence alone cannot establish payback. Retain the
+baseline and cumulative adopted costs so separate small increases cannot reset
+the comparison or conceal drift. Prefer lower long-term token cost alongside
+faster delivery and preserved or better quality. Bounded investigation can test
+an uncertain hypothesis; admission to investigation is not adoption.
 
 Judge the concrete effect on affected users and likely future work against the
 cost of implementation, checks, coordination, deployment, recovery, ongoing
@@ -147,13 +163,17 @@ must justify their recurring cost; polishing without useful delivery is a cost
 too. Prefer the smallest effective correction, including no change. Real use and
 checks must support the benefit mechanism, while expected long-term effects remain
 explicit forecasts. Record a concise reason and material trade-offs in the existing
-decision owner; do not demand repeated signals or numeric proof when available
-facts suffice. Other experiments retain their explicitly frozen strict policies.
+decision owner; do not demand repeated signals or arbitrary proof quotas when
+available facts suffice, while retaining measured token costs and observable
+payback for increased spending. Other experiments retain their explicitly frozen
+strict policies.
 
 Stop after the declared panel. Reject when quality regresses or the concrete
 benefit does not justify complete costs and risks; classify decision-changing
 uncertainty as inconclusive. Lack of immediate time or token savings alone is not
-rejection, and passing correctness alone is not benefit.
+rejection when full token cost does not increase or its payback is supported as
+above; unsupported added spending cannot be adopted. Passing correctness alone
+is not benefit.
 A further trial needs a named new decision-changing observation and its own
 predeclared scope, not repeated sampling until favorable. Keep unsuccessful
 reflection code/guidance out of accepted source and installation; restore verified

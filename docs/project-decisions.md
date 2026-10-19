@@ -149,6 +149,18 @@ incidents, lower context burden and easier replacement can justify adoption
 without immediate time or token savings; these are examples, not an exhaustive
 set. More code, tools, instructions or architectural machinery must earn their
 ongoing cost. Endless polishing that delays useful delivery is also a cost.
+Tokens are the spending currency: assess the complete accepted-result path,
+including reflection, implementation, failed attempts, coordination and rework.
+Larger instructions can be worthwhile when their recurring input cost is repaid
+by fewer corrections or other supported effects; neither prompt length nor a
+single call's token count decides value. Without token savings, useful changes
+may still be adopted at no greater full token cost. Increased full token cost
+requires a concrete payback mechanism, observable benefit measures and a bounded
+relevant-use horizon, supported by actual use and checks. Qualitative confidence
+or a forecast alone does not establish payback. Consider cumulative adopted
+changes against the retained baseline so successive small increases cannot hide
+drift. Prefer long-term lower token cost with faster delivery and preserved or
+better quality; benefit measures remain task-specific, not a closed checklist.
 Prefer the smallest effective correction, including doing nothing when that is
 better. Reflection and improvement implementation may run alongside ordinary
 work within available capacity; neither routinely becomes a prerequisite for
