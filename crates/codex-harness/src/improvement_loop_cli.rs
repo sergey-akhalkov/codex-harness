@@ -43,8 +43,8 @@ use harness_core::improvement_loop::{
     DispatchGate, EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity,
     ObservedOutcome, Phase, PreSubmissionEvidence, RemovalGate, ResumeReport, RunMutation, RunSpec,
     RunStore, SPEC_FILE, VariantSet, candidate_removal_gate, declared_removal_gate, dispatch_gate,
-    dispatch_owner, frozen_removal_digest, now_ms, read_json, selection_gate,
-    settle_completed_reuse, verify_dispatch_identity, write_json_atomic,
+    dispatch_owner, frozen_removal_digest, now_ms, read_json, retain_attempt_evidence,
+    selection_gate, settle_completed_reuse, verify_dispatch_identity, write_json_atomic,
 };
 use harness_core::improvement_spec::OpenSpec;
 use harness_core::orchestration_config;
@@ -93,8 +93,11 @@ launch may still require native first-use or hook consent.
 review --prepare freezes one eligible retained ordinary completion together with
 its verified Git source, retained result and action sidecars, then prepares the
 shared semantic-review packet and reviewer runtime without dispatching a model.
-review --resume validates the retained review identity; dispatch remains owned by
-the ordinary review lifecycle.
+review --resume revalidates the frozen declaration, completion, packet and
+reviewer runtime, reconciles the retained native review generation, and advances
+the ordinary semantic-review lifecycle once. A settled judgment is reported as
+accepted or rejected and repeats without another model request; live or unknown
+state never launches a duplicate reviewer.
 
 A run that declares the explicit comparison inputs also prepares and drives
 the sequential measured pair from candidate-ready. Continuous supervision is
@@ -1680,7 +1683,7 @@ fn state_reason(state: &ConversationState) -> Option<String> {
 /// evidence before the pool files can be overwritten. Returns the recorded
 /// note, including an explicit retention failure.
 fn settle_verified(
-    store: &RunStore,
+    root: &Path,
     attempt: &mut Attempt,
     outcome: ObservedOutcome,
     observed: &ObservedIdentity,
@@ -1692,7 +1695,7 @@ fn settle_verified(
     let result = attempt.result.clone();
     let retained = receipt
         .as_deref()
-        .map(|receipt| store.retain_evidence(&attempt.id, receipt, result.as_deref()));
+        .map(|receipt| retain_attempt_evidence(root, &attempt.id, receipt, result.as_deref()));
     // Backoff is measured from the dispatch attempt, not from a later
     // reconciliation: a pre-submission failure discovered long after it
     // happened must not restart the retry window merely because resume found
@@ -1798,7 +1801,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
             );
             let attempt = &mut run.cursor.attempts[index];
             let note = settle_verified(
-                &run.store,
+                run.store.root(),
                 attempt,
                 outcome,
                 &observed,
@@ -1844,7 +1847,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                             );
                             let attempt = &mut run.cursor.attempts[index];
                             settle_verified(
-                                &run.store,
+                                run.store.root(),
                                 attempt,
                                 outcome,
                                 &post_observed,
@@ -1985,25 +1988,20 @@ fn stop(args: &[OsString]) -> io::Result<i32> {
     Ok(0)
 }
 
-fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
-    let mut cursor = run.cursor.clone();
-    let mut report = ResumeReport::default();
-    let mut notes = Vec::new();
-    let planning_ok = OpenSpec::default()
-        .revalidate(&run.store.planning()?)
-        .map_err(|error| error.to_string());
-    if let Err(reason) = &planning_ok {
-        notes.push(format!(
-            "planning revalidation failed: {reason}; dependent comparison requires preparation again"
-        ));
-    }
-    let stale_planning = || "planning inputs changed since the attempt".to_owned();
-    let at = now_ms();
-    // In-flight attempts and attempts retained as unknown both reconcile from
-    // the receipts of their frozen accepted dispatch generation: an
-    // authoritative terminal outcome settles them once, a live host stays
-    // retained live, and a receipt that now belongs to another run - or a
-    // truly unobserved effect - stays unknown without ever being replayed.
+/// Reconcile every in-flight or unknown attempt from the receipt of its
+/// frozen accepted dispatch generation. An authoritative terminal outcome
+/// settles the attempt once and retains its evidence before the pool can
+/// reuse the files; a live host stays retained live; a receipt that now
+/// belongs to another generation, or an unobserved effect, stays unknown
+/// without ever being replayed. This is shared by the OpenSpec run resume and
+/// the independent ordinary-review resume so both paths use one evidence
+/// protocol.
+pub(super) fn reconcile_attempts(
+    root: &Path,
+    cursor: &mut Cursor,
+    at: u64,
+    report: &mut ResumeReport,
+) {
     let reconcile_ids: Vec<String> = cursor
         .attempts_requiring_reconciliation()
         .iter()
@@ -2036,7 +2034,7 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
                         .unwrap_or_else(|| "settled from the verified receipt".to_owned());
                     let attempt = &mut cursor.attempts[index];
                     settle_verified(
-                        &run.store,
+                        root,
                         attempt,
                         outcome,
                         &observed,
@@ -2044,17 +2042,6 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
                         at,
                         prefix,
                     );
-                    if outcome == ObservedOutcome::Completed
-                        && !settle_completed_reuse(
-                            attempt,
-                            planning_ok.clone().map_err(|_| stale_planning()),
-                        )
-                    {
-                        report.remeasure.push((
-                            attempt.id.clone(),
-                            attempt.reuse_refused.clone().unwrap_or_default(),
-                        ));
-                    }
                     report.settled.push(attempt.id.clone());
                     continue;
                 }
@@ -2099,6 +2086,22 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
             }
         }
     }
+}
+
+fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
+    let mut cursor = run.cursor.clone();
+    let mut report = ResumeReport::default();
+    let mut notes = Vec::new();
+    let planning_ok = OpenSpec::default()
+        .revalidate(&run.store.planning()?)
+        .map_err(|error| error.to_string());
+    if let Err(reason) = &planning_ok {
+        notes.push(format!(
+            "planning revalidation failed: {reason}; dependent comparison requires preparation again"
+        ));
+    }
+    let stale_planning = || "planning inputs changed since the attempt".to_owned();
+    reconcile_attempts(run.store.root(), &mut cursor, now_ms(), &mut report);
     // Completed attempts settle reuse against the current planning inputs.
     for attempt in &mut cursor.attempts {
         if attempt.state == AttemptState::Completed {

@@ -1,16 +1,18 @@
-//! Public `improve review` preparation for one retained ordinary completion.
+//! Public `improve review` preparation and resumable semantic review for one
+//! retained ordinary completion.
 //!
 //! This adapter binds the immutable completion, its verified Git source and
 //! its retained action sidecars to the shared semantic-review packet and
-//! ReviewHost lifecycle. It deliberately does not create a qualification run,
-//! dispatch a model turn, or invent a second review protocol.
+//! ReviewHost lifecycle. Resume reuses the shared visible dispatch/recovery
+//! protocol; it does not create a qualification run or a second controller.
 
 use harness_core::{
     build_identity,
     delivery_reflection::Purpose,
     improvement_loop::{
-        AttemptRole, Cursor, MAX_RUN_SPEC_BYTES, Phase, QualificationBindingIdentity,
-        SemanticReviewInputs, SemanticReviewState, TaskInputs, WorkflowParticipant,
+        AttemptRole, Cursor, MAX_RUN_SPEC_BYTES, MUTATION_LOCK_WAIT, Phase,
+        QualificationBindingIdentity, ResumeReport, SemanticReviewInputs, SemanticReviewState,
+        TaskInputs, WorkflowParticipant, acquire_mutation_lock, now_ms,
     },
     improvement_runtime::{self, FileIdentity},
     task_worktree::{self, AssignmentSubmission, CompletionResult, RetainedCompletion},
@@ -22,11 +24,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::super::{Options, improvement_comparison as accounting, invalid};
+use super::super::{Options, improvement_comparison as accounting, invalid, reconcile_attempts};
 use super::{
     ACTION_EVIDENCE_SCHEMA, RetainedActionStream, ReviewHost, ReviewPacketView, ReviewSubject,
-    action_evidence_from, ensure_review_packet, load_or_install_reviewer_runtime,
-    same_retained_place, write_bytes_atomic,
+    action_evidence_from, advance_semantic_review_host, ensure_review_packet,
+    load_or_install_reviewer_runtime, retained_judgment, same_retained_place, write_bytes_atomic,
 };
 
 const ORDINARY_REVIEW_SCHEMA: u32 = 1;
@@ -177,7 +179,14 @@ impl ReviewHost for OrdinaryReviewHost {
     }
 
     fn runner_declared(&self) -> bool {
-        false
+        // The ordinary declaration has no separate custom runner. Its validated
+        // semantic-review runtime and profile are the model declaration, so a
+        // prepared reviewer binding is the truthful dispatch input; the shared
+        // gate still enforces every other visibility and replay condition.
+        self.state
+            .semantic_review
+            .as_ref()
+            .is_some_and(|review| review.binding.is_some())
     }
 
     fn set_condition(&mut self, condition: Option<String>) {
@@ -368,9 +377,10 @@ fn incomplete_action_stream(
     }
 }
 
-/// `improve review` accepts one and only one of preparation or the retained
-/// resume intent. Resume wiring is intentionally separate from this bounded
-/// preparation slice, but both paths share the same frozen declaration.
+/// `improve review` accepts one and only one of preparation or resume. Both
+/// paths share the same retained declaration, packet and reviewer lifecycle;
+/// resume either dispatches the one pending reviewer turn or reports its
+/// retained accepted, rejected, pending or unknown outcome without replay.
 pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(
         args,
@@ -399,6 +409,8 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
 }
 
 fn prepare(review: &Path, declaration_path: &Path) -> io::Result<()> {
+    let review_root = ensure_owned_directory(review, "ordinary review root")?;
+    let _mutation = acquire_mutation_lock(&review_root, MUTATION_LOCK_WAIT)?;
     let raw = read_bounded_file(declaration_path, "ordinary review declaration")?;
     let declaration: OrdinaryReviewDeclaration = serde_json::from_slice(&raw).map_err(|error| {
         invalid(format!(
@@ -408,7 +420,6 @@ fn prepare(review: &Path, declaration_path: &Path) -> io::Result<()> {
     })?;
     validate_declaration(&declaration)?;
     let declaration_sha256 = build_identity::hash_bytes(&raw);
-    let review_root = ensure_owned_directory(review, "ordinary review root")?;
     let declaration_copy = review_root.join("declaration.json");
     retain_declaration(&declaration_copy, &raw)?;
 
@@ -477,6 +488,7 @@ fn prepare(review: &Path, declaration_path: &Path) -> io::Result<()> {
 
 fn resume(review: &Path, declaration_path: Option<PathBuf>) -> io::Result<i32> {
     let review_root = ensure_owned_directory(review, "ordinary review root")?;
+    let _mutation = acquire_mutation_lock(&review_root, MUTATION_LOCK_WAIT)?;
     let state_path = review_root.join("state.json");
     let state = load_state(&state_path)?.ok_or_else(|| {
         invalid(format!(
@@ -484,17 +496,120 @@ fn resume(review: &Path, declaration_path: Option<PathBuf>) -> io::Result<i32> {
             state_path.display()
         ))
     })?;
+
+    let declaration_copy = review_root.join("declaration.json");
+    let retained = read_bounded_file(&declaration_copy, "retained ordinary review declaration")?;
     if let Some(path) = declaration_path {
-        let raw = read_bounded_file(&path, "ordinary review declaration")?;
-        if build_identity::hash_bytes(&raw) != state.declaration_sha256 {
+        let supplied = read_bounded_file(&path, "ordinary review declaration")?;
+        if supplied != retained {
             return Err(invalid(
                 "the ordinary review declaration changed after preparation; preserve the frozen review and declaration",
             ));
         }
     }
-    Err(invalid(
-        "the ordinary review is prepared, but resume dispatch is not connected in this bounded preparation slice; preserve state.json and wire advance_semantic_review_host next",
-    ))
+    let declaration: OrdinaryReviewDeclaration =
+        serde_json::from_slice(&retained).map_err(|error| {
+            invalid(format!(
+                "the retained ordinary review declaration {} is not valid schema-1 JSON: {error}",
+                declaration_copy.display()
+            ))
+        })?;
+    validate_declaration(&declaration)?;
+    let declaration_sha256 = build_identity::hash_bytes(&retained);
+
+    let completion = task_worktree::load_retained_completion(
+        &declaration.completion.codex_home,
+        &declaration.task.source,
+        &declaration.completion.run_generation,
+    )?
+    .ok_or_else(|| {
+        invalid(format!(
+            "the retained ordinary completion for run generation {} is missing; preserve the review and restore the exact completion",
+            declaration.completion.run_generation
+        ))
+    })?;
+    let binding = validate_completion(&declaration, &completion)?;
+    let subject = review_subject(&declaration, &binding)?;
+    validate_state(&state, &declaration_sha256, &binding, &declaration.review)?;
+
+    let reviewer_root = review_root.join("reviewer");
+    let runtime_path = reviewer_root.join("runtime.json");
+    read_bounded_file(
+        &runtime_path,
+        "retained ordinary reviewer runtime receipt",
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "the ordinary reviewer runtime receipt is missing or changed at {}; run improve review --prepare again before resuming: {error}",
+            runtime_path.display()
+        ))
+    })?;
+    if state.semantic_review.is_none() {
+        return Err(invalid(
+            "the ordinary review has no prepared reviewer state; run improve review --prepare before resuming",
+        ));
+    }
+
+    let mut host = OrdinaryReviewHost::new(
+        review_root.join("packet"),
+        reviewer_root,
+        review_root.join("assignments"),
+        state_path,
+        declaration.action_evidence_root.clone(),
+        state,
+        subject,
+    );
+    // Resume may load the retained runtime, but it must never install a
+    // replacement after preparation. The receipt check above makes the shared
+    // loader take its existing-runtime branch; every declaration, completion,
+    // criteria and runtime binding is validated before this point.
+    prepare_reviewer(&mut host, &declaration)?;
+    host.persist()?;
+
+    let mut report = ResumeReport::default();
+    reconcile_attempts(&review_root, &mut host.state.cursor, now_ms(), &mut report);
+    host.persist()?;
+
+    match advance_semantic_review_host(&mut host, &declaration.semantic_review)? {
+        super::SemanticReviewOutcome::Settled => {
+            let review = host.state.semantic_review.clone().ok_or_else(|| {
+                invalid("the settled ordinary review has no retained semantic review state")
+            })?;
+            let acceptance = retained_judgment(&host, &review, &declaration.semantic_review)?
+                .ok_or_else(|| {
+                    invalid("the settled ordinary judgment is not an accepted or rejected result")
+                })?;
+            let result = match acceptance.kind.as_str() {
+                "accept" => "accepted",
+                "reject" => "rejected",
+                other => {
+                    return Err(invalid(format!(
+                        "the retained ordinary judgment kind {other:?} is not accepted or rejected"
+                    )));
+                }
+            };
+            println!(
+                "ordinary review {result}; judgment={} sha256={} findings={} unresolved_issues={}",
+                acceptance.judgment.display(),
+                acceptance.sha256,
+                acceptance.findings,
+                acceptance.unresolved_issues
+            );
+            Ok(0)
+        }
+        super::SemanticReviewOutcome::Notes(notes) => {
+            if !report.settled.is_empty() {
+                println!(
+                    "ordinary review reconciled settled attempts: {}",
+                    report.settled.join(", ")
+                );
+            }
+            for note in notes {
+                println!("ordinary review pending: {note}");
+            }
+            Ok(0)
+        }
+    }
 }
 
 fn fresh_cursor(
@@ -600,7 +715,14 @@ fn prepare_reviewer(
             "the ordinary semantic reviewer model/provider/effort changed after preparation; preserve the review instead of selecting a fallback",
         ));
     }
-    improvement_runtime::verify_consumption_with_trust(&reviewer, &[])?;
+    let trusted: Vec<PathBuf> = host
+        .cursor()
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.role == AttemptRole::SemanticReview)
+        .filter_map(|attempt| attempt.checkout.clone())
+        .collect();
+    improvement_runtime::verify_consumption_with_trust(&reviewer, &trusted)?;
     review.runtime = Some(runtime_path);
     review.home = Some(reviewer.home);
     review.binding = Some(binding);

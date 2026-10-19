@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, process::Output};
 
 const EXECUTOR_SESSION: &str = "12345678-1234-4234-8234-123456789023";
+const REVIEW_SESSION: &str = "12345678-1234-4234-8234-123456789024";
+const REVIEW_ID: &str = "ordinary-review-fixture";
 const RUN: &str = "ordinary-review-source";
 const TURN: &str = "ordinary-source-turn";
 
@@ -36,6 +38,21 @@ impl OrdinarySetup {
             "--declaration",
             self.declaration.to_str().unwrap(),
         ])
+    }
+
+    fn resume(&self, result: &str, suffix: &str) -> Output {
+        let review = self.review.to_str().unwrap();
+        self.fixture.improve_with_env(
+            &["review", "--resume", "--review", review],
+            &[
+                CONTROL_CHILD_MODE,
+                ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
+                ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", "lead-acceptance"),
+                ("HARNESS_IMPROVEMENT_FIXTURE_SESSION", REVIEW_SESSION),
+                ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", suffix),
+                ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", result),
+            ],
+        )
     }
 }
 
@@ -340,6 +357,109 @@ fn assert_prepared(setup: &OrdinarySetup) {
     assert_no_attempts(setup);
 }
 
+fn review_state(setup: &OrdinarySetup) -> Value {
+    serde_json::from_slice(&fs::read(setup.review.join("state.json")).unwrap()).unwrap()
+}
+
+fn review_attempts(setup: &OrdinarySetup) -> Vec<Value> {
+    review_state(setup)["cursor"]["attempts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn attempt_receipt_path(attempt: &Value) -> PathBuf {
+    PathBuf::from(
+        attempt["receipt"]
+            .as_str()
+            .or_else(|| attempt["retained"]["receipt"].as_str())
+            .expect("the review attempt records a receipt"),
+    )
+}
+
+fn dispatch_review(
+    setup: &OrdinarySetup,
+    result: &str,
+    suffix: &str,
+    expected_id: &str,
+) -> (PathBuf, Value) {
+    let output = setup.resume(result, suffix);
+    assert!(output.status.success(), "{}", text(&output));
+    let attempts = review_attempts(setup);
+    let attempt = attempts
+        .iter()
+        .find(|attempt| attempt["id"] == expected_id)
+        .unwrap_or_else(|| panic!("missing review attempt {expected_id}: {attempts:?}"));
+    let receipt = attempt_receipt_path(attempt);
+    let completed = wait_for_terminal_receipt(&receipt);
+    (receipt, completed)
+}
+
+fn accepted_judgment() -> String {
+    format!("{{\"run_id\":\"{REVIEW_ID}\",\"findings\":[],\"unresolved_issues\":[]}}")
+}
+
+fn rejected_judgment() -> String {
+    format!(
+        "{{\"run_id\":\"{REVIEW_ID}\",\"findings\":[{{\"path\":\"submission.txt\",\"line\":1,\"description\":\"the submission does not demonstrate the requested result\",\"evidence\":\"submission.txt:1 records the submitted result\"}}],\"unresolved_issues\":[]}}"
+    )
+}
+
+fn unknown_judgment() -> String {
+    format!(
+        "{{\"run_id\":\"{REVIEW_ID}\",\"findings\":[],\"unresolved_issues\":[\"the frozen packet does not expose enough information to judge the task\"]}}"
+    )
+}
+
+fn assert_review_settled(setup: &OrdinarySetup, expected: &str) {
+    let before = review_attempts(setup);
+    let output = setup.resume(&accepted_judgment(), "settled-repeat");
+    assert!(output.status.success(), "{}", text(&output));
+    let rendered = text(&output);
+    assert!(rendered.contains(expected), "{rendered}");
+    assert_eq!(review_attempts(setup).len(), before.len());
+}
+
+fn interrupted_receipt(completed: &Value) -> Value {
+    let mut value = completed.clone();
+    let observation = value["observation"]
+        .as_object_mut()
+        .expect("the fixture receipt records an observation");
+    observation.insert("state".to_owned(), json!("interrupted"));
+    observation.insert("cause".to_owned(), json!("synthetic interruption"));
+    observation.insert("exitCode".to_owned(), Value::Null);
+    observation.insert("result".to_owned(), Value::Null);
+    observation.insert("updatedMs".to_owned(), json!(unix_ms_now()));
+    value
+}
+
+fn running_receipt(completed: &Value) -> Value {
+    let mut value = completed.clone();
+    let observation = value["observation"]
+        .as_object_mut()
+        .expect("the fixture receipt records an observation");
+    observation.insert("state".to_owned(), json!("running"));
+    observation.insert("host".to_owned(), Value::Null);
+    observation.insert("exitCode".to_owned(), Value::Null);
+    observation.insert("cause".to_owned(), Value::Null);
+    observation.insert("result".to_owned(), Value::Null);
+    observation.insert("updatedMs".to_owned(), json!(unix_ms_now()));
+    value
+}
+
+fn assert_resume_refused(setup: &OrdinarySetup, state: &[u8], expected: &str) {
+    let output = setup.resume(&accepted_judgment(), "frozen-input-refused");
+    let rendered = text(&output);
+    assert!(!output.status.success(), "{rendered}");
+    assert!(rendered.contains(expected), "{rendered}");
+    assert!(review_attempts(setup).is_empty(), "{rendered}");
+    assert_eq!(
+        fs::read(setup.review.join("state.json")).unwrap(),
+        state,
+        "a refused frozen-input check must not change review state"
+    );
+}
+
 #[test]
 fn changed_declaration_is_refused_after_preparation() {
     let _guard = INSTALL.lock().unwrap();
@@ -479,4 +599,257 @@ fn retained_action_copy_survives_loss_of_original_capture_path() {
     fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
     fs::remove_file(&original).unwrap();
     assert_prepared(&setup);
+}
+
+#[test]
+fn accepted_judgment_settles_once_and_repeats_without_dispatch() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-accepted");
+    assert_prepared(&setup);
+    let (receipt, completed) = dispatch_review(
+        &setup,
+        &accepted_judgment(),
+        "accepted-1",
+        "semantic-review-1",
+    );
+    assert_eq!(completed["observation"]["state"], "completed");
+
+    let settled = setup.resume(&accepted_judgment(), "accepted-settle");
+    let rendered = text(&settled);
+    assert!(settled.status.success(), "{rendered}");
+    assert!(rendered.contains("ordinary review accepted"), "{rendered}");
+
+    let attempts = review_attempts(&setup);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["id"], "semantic-review-1");
+    assert_eq!(attempts[0]["binding"]["session"], REVIEW_SESSION);
+    assert_ne!(attempts[0]["binding"]["session"], EXECUTOR_SESSION);
+    let state = review_state(&setup);
+    assert_eq!(
+        state["semantic_review"]["judgment_kind"], "accept",
+        "{state}"
+    );
+    let retained = PathBuf::from(
+        attempts[0]["retained"]["receipt"]
+            .as_str()
+            .expect("the accepted attempt retains its receipt"),
+    );
+    assert_eq!(fs::read(&retained).unwrap(), fs::read(&receipt).unwrap());
+
+    assert_review_settled(&setup, "ordinary review accepted");
+}
+
+#[test]
+fn rejected_judgment_settles_as_rejected_and_is_not_replayed() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-rejected");
+    assert_prepared(&setup);
+    dispatch_review(
+        &setup,
+        &rejected_judgment(),
+        "rejected-1",
+        "semantic-review-1",
+    );
+
+    let settled = setup.resume(&rejected_judgment(), "rejected-settle");
+    let rendered = text(&settled);
+    assert!(settled.status.success(), "{rendered}");
+    assert!(rendered.contains("ordinary review rejected"), "{rendered}");
+    assert_eq!(
+        review_state(&setup)["semantic_review"]["judgment_kind"],
+        "reject"
+    );
+    assert_eq!(review_attempts(&setup).len(), 1);
+
+    assert_review_settled(&setup, "ordinary review rejected");
+}
+
+#[test]
+fn unknown_judgment_refuses_and_repeats_without_dispatch() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-unknown");
+    assert_prepared(&setup);
+    dispatch_review(
+        &setup,
+        &unknown_judgment(),
+        "unknown-1",
+        "semantic-review-1",
+    );
+
+    let refused = setup.resume(&unknown_judgment(), "unknown-refused");
+    let rendered = text(&refused);
+    assert!(!refused.status.success(), "{rendered}");
+    assert!(rendered.contains("unresolved issues"), "{rendered}");
+    assert_eq!(
+        review_state(&setup)["semantic_review"]["judgment_kind"],
+        "unknown"
+    );
+    assert_eq!(review_attempts(&setup).len(), 1);
+
+    let repeated = setup.resume(&unknown_judgment(), "unknown-repeat");
+    let repeated_rendered = text(&repeated);
+    assert!(!repeated.status.success(), "{repeated_rendered}");
+    assert!(
+        repeated_rendered.contains("unresolved issues"),
+        "{repeated_rendered}"
+    );
+    assert_eq!(review_attempts(&setup).len(), 1);
+}
+
+#[test]
+fn live_review_receipt_is_pending_without_duplicate_dispatch() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-live");
+    assert_prepared(&setup);
+    let (receipt, completed) =
+        dispatch_review(&setup, &accepted_judgment(), "live-1", "semantic-review-1");
+    let terminal_bytes = fs::read(&receipt).unwrap();
+    fs::write(
+        &receipt,
+        serde_json::to_vec_pretty(&running_receipt(&completed)).unwrap(),
+    )
+    .unwrap();
+
+    let pending = setup.resume(&accepted_judgment(), "live-pending");
+    let rendered = text(&pending);
+    assert!(pending.status.success(), "{rendered}");
+    assert!(rendered.contains("ordinary review pending"), "{rendered}");
+    assert_eq!(review_attempts(&setup).len(), 1, "{rendered}");
+
+    // Restore the terminal bytes without dispatching another reviewer. The
+    // same attempt must settle from its retained evidence.
+    fs::write(&receipt, terminal_bytes).unwrap();
+    let settled = setup.resume(&accepted_judgment(), "live-settled");
+    let settled_rendered = text(&settled);
+    assert!(settled.status.success(), "{settled_rendered}");
+    assert!(
+        settled_rendered.contains("ordinary review accepted"),
+        "{settled_rendered}"
+    );
+    assert_eq!(review_attempts(&setup).len(), 1);
+}
+
+#[test]
+fn interrupted_receipt_reconciles_without_replay() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-interrupted");
+    assert_prepared(&setup);
+    let (receipt, completed) = dispatch_review(
+        &setup,
+        &accepted_judgment(),
+        "interrupted-1",
+        "semantic-review-1",
+    );
+    fs::write(
+        &receipt,
+        serde_json::to_vec_pretty(&interrupted_receipt(&completed)).unwrap(),
+    )
+    .unwrap();
+
+    let refused = setup.resume(&accepted_judgment(), "interrupted-refused");
+    let rendered = text(&refused);
+    assert!(!refused.status.success(), "{rendered}");
+    assert!(rendered.contains("Interrupted"), "{rendered}");
+    assert!(rendered.contains("not replayed"), "{rendered}");
+    let attempts = review_attempts(&setup);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["state"], "interrupted", "{attempts:?}");
+    let retained = PathBuf::from(
+        attempts[0]["retained"]["receipt"]
+            .as_str()
+            .expect("the interrupted attempt retains its receipt"),
+    );
+    assert!(retained.is_file(), "{}", retained.display());
+
+    let repeated = setup.resume(&accepted_judgment(), "interrupted-repeat");
+    let repeated_rendered = text(&repeated);
+    assert!(!repeated.status.success(), "{repeated_rendered}");
+    assert!(
+        repeated_rendered.contains("Interrupted"),
+        "{repeated_rendered}"
+    );
+    assert_eq!(review_attempts(&setup).len(), 1);
+}
+
+#[test]
+fn malformed_first_judgment_uses_one_bounded_correction() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-correction");
+    assert_prepared(&setup);
+    dispatch_review(
+        &setup,
+        "not a semantic judgment",
+        "correction-1",
+        "semantic-review-1",
+    );
+
+    let correction = setup.resume(&accepted_judgment(), "correction-2");
+    let rendered = text(&correction);
+    assert!(correction.status.success(), "{rendered}");
+    assert!(rendered.contains("semantic-review-2"), "{rendered}");
+    let attempts = review_attempts(&setup);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[1]["id"], "semantic-review-2");
+    let correction_receipt = attempt_receipt_path(&attempts[1]);
+    wait_for_terminal_receipt(&correction_receipt);
+
+    let settled = setup.resume(&accepted_judgment(), "correction-settle");
+    let settled_rendered = text(&settled);
+    assert!(settled.status.success(), "{settled_rendered}");
+    assert!(
+        settled_rendered.contains("ordinary review accepted"),
+        "{settled_rendered}"
+    );
+    let state = review_state(&setup);
+    assert_eq!(
+        state["semantic_review"]["judgment_kind"], "accept",
+        "{state}"
+    );
+    assert_eq!(state["semantic_review"]["correction_used"], true, "{state}");
+    assert_eq!(review_attempts(&setup).len(), 2);
+}
+
+#[test]
+fn frozen_input_tampering_is_refused_before_review_effects() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-frozen-inputs");
+    assert_prepared(&setup);
+    let state_before = fs::read(setup.review.join("state.json")).unwrap();
+
+    let declaration_copy = setup.review.join("declaration.json");
+    let declaration_bytes = fs::read(&declaration_copy).unwrap();
+    let mut declaration: Value = serde_json::from_slice(&declaration_bytes).unwrap();
+    declaration["review"] = json!("ordinary-review-fixture-tampered");
+    fs::write(
+        &declaration_copy,
+        serde_json::to_vec_pretty(&declaration).unwrap(),
+    )
+    .unwrap();
+    assert_resume_refused(&setup, &state_before, "does not bind this declaration");
+    fs::write(&declaration_copy, declaration_bytes).unwrap();
+
+    let prompt = setup.fixture.root.join("ordinary-task.txt");
+    let prompt_bytes = fs::read(&prompt).unwrap();
+    fs::write(&prompt, "tampered prompt\n").unwrap();
+    assert_resume_refused(&setup, &state_before, "ordinary task prompt");
+    fs::write(&prompt, prompt_bytes).unwrap();
+
+    let criteria = setup.fixture.root.join("ordinary-criteria.txt");
+    let criteria_bytes = fs::read(&criteria).unwrap();
+    fs::write(&criteria, "tampered criteria\n").unwrap();
+    assert_resume_refused(&setup, &state_before, "semantic review criteria");
+    fs::write(&criteria, criteria_bytes).unwrap();
+
+    let result_bytes = fs::read(&setup.retained_result).unwrap();
+    fs::write(&setup.retained_result, "tampered completion result\n").unwrap();
+    assert_resume_refused(&setup, &state_before, "retained result artifact");
+    fs::write(&setup.retained_result, result_bytes).unwrap();
+
+    let runtime_path = setup.review.join("reviewer/runtime.json");
+    let runtime_bytes = fs::read(&runtime_path).unwrap();
+    let mut runtime: Value = serde_json::from_slice(&runtime_bytes).unwrap();
+    runtime["label"] = json!("tampered-reviewer-runtime");
+    fs::write(&runtime_path, serde_json::to_vec_pretty(&runtime).unwrap()).unwrap();
+    assert_resume_refused(&setup, &state_before, "retained semantic reviewer runtime");
+    fs::write(&runtime_path, runtime_bytes).unwrap();
 }

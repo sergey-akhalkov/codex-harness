@@ -4038,7 +4038,7 @@ pub struct RunMutation {
     _lock: ExclusiveFileLock,
 }
 
-fn acquire_mutation_lock(root: &Path, wait: Duration) -> io::Result<RunMutation> {
+pub fn acquire_mutation_lock(root: &Path, wait: Duration) -> io::Result<RunMutation> {
     let path = root.join(MUTATION_LOCK_FILE);
     let deadline = Deadline::after(wait)?;
     ExclusiveFileLock::acquire(&path, deadline, &Cancellation::default())
@@ -4053,6 +4053,60 @@ fn acquire_mutation_lock(root: &Path, wait: Duration) -> io::Result<RunMutation>
             )
         })
         .map(|lock| RunMutation { _lock: lock })
+}
+
+/// Copies one verified terminal attempt's evidence into an owned root: the
+/// receipt snapshot and, when bounded, the terminal result. The pool reuses
+/// its `spawn-<slot>.json` and result files for later dispatches, so
+/// controller consumption reads these retained locators instead of the
+/// mutable pool files once an attempt has settled.
+pub fn retain_attempt_evidence(
+    root: &Path,
+    attempt_id: &str,
+    receipt: &Path,
+    result: Option<&Path>,
+) -> io::Result<RetainedEvidence> {
+    let safe: String = attempt_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    if safe.is_empty() || safe.len() > MAX_OWNER_BYTES {
+        return Err(invalid("invalid attempt identity for evidence retention"));
+    }
+    let dir = root.join("evidence").join(&safe);
+    fs::create_dir_all(&dir)?;
+    let receipt_bytes = bounded_read(receipt, MAX_RETAINED_RECEIPT_BYTES)?;
+    let receipt_path = dir.join("receipt.json");
+    fs::write(&receipt_path, &receipt_bytes)?;
+    let mut retained = RetainedEvidence {
+        receipt: receipt_path,
+        receipt_sha256: digest_bytes(&receipt_bytes),
+        result: None,
+        result_sha256: None,
+        note: None,
+        retained_ms: now_ms(),
+    };
+    if let Some(result) = result {
+        match bounded_read(result, MAX_RETAINED_RESULT_BYTES) {
+            Ok(bytes) => {
+                let path = dir.join("result.txt");
+                fs::write(&path, &bytes)?;
+                retained.result = Some(path);
+                retained.result_sha256 = Some(digest_bytes(&bytes));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                retained.note = Some(
+                    "the terminal result file was already gone when the attempt settled".to_owned(),
+                );
+            }
+            Err(error) => {
+                retained.note = Some(format!(
+                    "the terminal result was not retained within its bound: {error}"
+                ));
+            }
+        }
+    }
+    Ok(retained)
 }
 
 impl RunStore {
@@ -4252,59 +4306,15 @@ impl RunStore {
         })
     }
 
-    /// Copies one verified terminal attempt's evidence into the private run
-    /// store: the receipt snapshot and, when bounded, the terminal result.
-    /// The pool reuses its `spawn-<slot>.json` and result files for later
-    /// dispatches, so controller consumption reads these retained locators
-    /// instead of the mutable pool files once an attempt has settled.
+    /// Copies one verified terminal attempt's evidence into this private run
+    /// store. See [`retain_attempt_evidence`].
     pub fn retain_evidence(
         &self,
         attempt_id: &str,
         receipt: &Path,
         result: Option<&Path>,
     ) -> io::Result<RetainedEvidence> {
-        let safe: String = attempt_id
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
-            .collect();
-        if safe.is_empty() || safe.len() > MAX_OWNER_BYTES {
-            return Err(invalid("invalid attempt identity for evidence retention"));
-        }
-        let dir = self.root.join("evidence").join(&safe);
-        fs::create_dir_all(&dir)?;
-        let receipt_bytes = bounded_read(receipt, MAX_RETAINED_RECEIPT_BYTES)?;
-        let receipt_path = dir.join("receipt.json");
-        fs::write(&receipt_path, &receipt_bytes)?;
-        let mut retained = RetainedEvidence {
-            receipt: receipt_path,
-            receipt_sha256: digest_bytes(&receipt_bytes),
-            result: None,
-            result_sha256: None,
-            note: None,
-            retained_ms: now_ms(),
-        };
-        if let Some(result) = result {
-            match bounded_read(result, MAX_RETAINED_RESULT_BYTES) {
-                Ok(bytes) => {
-                    let path = dir.join("result.txt");
-                    fs::write(&path, &bytes)?;
-                    retained.result = Some(path);
-                    retained.result_sha256 = Some(digest_bytes(&bytes));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    retained.note = Some(
-                        "the terminal result file was already gone when the attempt settled"
-                            .to_owned(),
-                    );
-                }
-                Err(error) => {
-                    retained.note = Some(format!(
-                        "the terminal result was not retained within its bound: {error}"
-                    ));
-                }
-            }
-        }
-        Ok(retained)
+        retain_attempt_evidence(&self.root, attempt_id, receipt, result)
     }
 }
 
