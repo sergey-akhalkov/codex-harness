@@ -568,11 +568,16 @@ impl Plan {
 /// Delivery calls this before reset can remove any current connection.
 pub fn validate_candidate_build(source: &Path, build: &Path) -> io::Result<()> {
     let report = build_identity::check(build, Some(source));
-    if report.status != build_identity::Health::Healthy {
-        return Err(io::Error::other(format!(
-            "native candidate build is not deployable from the requested --source; {}; preserving installed state",
-            report.action
-        )));
+    if !report.runtime_allowed {
+        return Err(io::Error::other(
+            "native candidate build is stale, missing or altered; explicit build required",
+        ));
+    }
+    let recorded_source = build_identity::read_record(build)?.source_root;
+    if key(&plain(&recorded_source)?)? != key(&plain(&source.canonicalize()?)?)? {
+        return Err(io::Error::other(
+            "native candidate build belongs to another source checkout; build from the requested --source before deployment; preserving installed state",
+        ));
     }
     Ok(())
 }

@@ -3,7 +3,7 @@
 use harness_core::installation_state::LegacyInstallation;
 use serde_json::{Value, json};
 use std::{
-    fs, io,
+    fs,
     os::windows::fs::{symlink_dir, symlink_file},
     path::PathBuf,
     process::{Command, Output},
@@ -86,43 +86,19 @@ impl Fixture {
 }
 
 #[test]
-fn candidate_build_binds_to_source_content_not_checkout_path() {
-    let root = tempfile::Builder::new()
-        .prefix("harness-build-source-")
-        .tempdir()
-        .unwrap();
-    let recorded = synthetic_role_build::kit_source(&root.path().join("recorded"));
-    let identical = synthetic_role_build::kit_source(&root.path().join("identical"));
-    let build = synthetic_role_build::recorded_build(root.path(), &recorded);
-
-    harness_core::core_install::validate_candidate_build(&identical, &build).unwrap();
-
-    fs::write(recorded.join("crates/one/src/lib.rs"), b"stale").unwrap();
-    let error =
-        harness_core::core_install::validate_candidate_build(&recorded, &build).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Other);
-    assert!(
-        error
-            .to_string()
-            .contains("not deployable from the requested --source")
-    );
-}
-
-#[test]
-fn deploy_reset_rejects_a_mismatched_source_build_before_removing_owned_links() {
+fn deploy_reset_rejects_a_foreign_source_build_before_removing_owned_links() {
     let f = Fixture::new();
     let original = synthetic_role_build::kit_source(&f.root.path().join("original"));
     let requested = synthetic_role_build::kit_source(&f.root.path().join("requested"));
     let build = synthetic_role_build::recorded_build(f.root.path(), &original);
-    fs::write(requested.join("crates/one/src/lib.rs"), b"stale").unwrap();
-    assert_ne!(
+    assert_eq!(
         harness_core::build_identity::source_identity(&original)
             .unwrap()
             .sha256,
         harness_core::build_identity::source_identity(&requested)
             .unwrap()
             .sha256,
-        "the failure must concern changed source contents"
+        "the failure must concern the checkout path, not changed source contents"
     );
 
     let mut metadata = f.metadata();
@@ -162,7 +138,7 @@ fn deploy_reset_rejects_a_mismatched_source_build_before_removing_owned_links() 
     );
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("not deployable from the requested --source"),
+            .contains("build belongs to another source checkout"),
         "{output:?}"
     );
 }
