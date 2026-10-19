@@ -456,3 +456,27 @@ fn mismatched_action_evidence_is_an_explicit_gap() {
     );
     assert_no_attempts(&setup);
 }
+
+#[test]
+fn retained_action_copy_survives_loss_of_original_capture_path() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-retained-origin");
+    let sidecar_path = fs::read_dir(&setup.actions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .expect("retained action sidecar");
+    let mut sidecar: Value = serde_json::from_slice(&fs::read(&sidecar_path).unwrap()).unwrap();
+    // The existing capture owner records the original live detail locator,
+    // while evidence consumption reads the immutable adjacent JSONL copy.
+    let original = setup.fixture.root.join("original-native-detail.jsonl");
+    fs::write(
+        &original,
+        fs::read(sidecar_path.with_extension("jsonl")).unwrap(),
+    )
+    .unwrap();
+    sidecar["source"] = json!(original);
+    fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+    fs::remove_file(&original).unwrap();
+    assert_prepared(&setup);
+}

@@ -336,37 +336,9 @@ impl ReviewHost for OrdinaryReviewHost {
                         raw,
                     )));
                 }
-                if let Some(source) = record.source.as_deref() {
-                    match same_retained_place(source, &raw) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Ok(Some((
-                                incomplete_action_stream(
-                                    participant,
-                                    format!(
-                                        "the retained action sidecar {} names a different raw stream than {}",
-                                        sidecar.display(),
-                                        raw.display()
-                                    ),
-                                ),
-                                raw,
-                            )));
-                        }
-                        Err(error) => {
-                            return Ok(Some((
-                                incomplete_action_stream(
-                                    participant,
-                                    format!(
-                                        "the retained action sidecar {} names a raw stream that cannot be matched to {}: {error}",
-                                        sidecar.display(),
-                                        raw.display()
-                                    ),
-                                ),
-                                raw,
-                            )));
-                        }
-                    }
-                }
+                // `source` records the original live capture path. The adjacent
+                // retained copy is authenticated by its recorded digest and native
+                // session/turn evidence; the original may have been released.
             }
             Ok(Some((record, raw)))
         })
