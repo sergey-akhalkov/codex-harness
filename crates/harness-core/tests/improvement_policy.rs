@@ -6151,6 +6151,19 @@ fn conjunction_policy() -> ComparisonPolicy {
     policy
 }
 
+/// The same conjunction with the explicit noninferiority quality member:
+/// equal independently accepted outcomes may pass, while every other member
+/// remains mandatory.
+fn noninferiority_policy() -> ComparisonPolicy {
+    let mut policy = conjunction_policy();
+    policy
+        .conjunction
+        .as_mut()
+        .expect("conjunction policy")
+        .require_quality_improvement = false;
+    policy
+}
+
 /// Record a definite per-run native usage total on an attempt, in the shape
 /// the accounting owner's usage summary and the conjunction consume.
 fn recorded_tokens(mut row: Value, total_tokens: u64) -> Value {
@@ -6330,6 +6343,325 @@ fn the_conjunction_requires_quality_improvement_with_time_and_token_reductions()
 }
 
 #[test]
+fn explicit_quality_noninferiority_adopts_equal_success_only_with_both_cost_margins() {
+    let policy = noninferiority_policy();
+    let declared = declare(&policy);
+
+    // Equal fully successful arms are quality noninferiority, not a benefit
+    // by themselves. Both independently declared cost margins must hold.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, true, 400, 40.0, true, 160),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("quality noninferiority 1->1")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The time member fails on its own even though acceptance is preserved
+    // and the recorded-token reduction exceeds its useful margin.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, true, 400, 95.0, true, 80),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("total time through acceptance")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The recorded-token member fails on its own even though acceptance is
+    // preserved and the time reduction exceeds its useful margin.
+    let report = summarize(
+        &conjunction_pair("case-q", 100.0, true, 400, 40.0, true, 380),
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("recorded native token cost improved by 5.0%")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+/// A per-unit cost regression remains critical under the noninferiority
+/// quality mode: while every accepted outcome is preserved and both aggregate
+/// margins pass, one matched unit losing more than the declared tolerance on
+/// time or tokens still rejects adoption.
+#[test]
+fn quality_noninferiority_keeps_critical_per_unit_cost_regressions() {
+    let policy = noninferiority_policy();
+    let declared = declare(&policy);
+
+    // Aggregate time improves 30% and tokens improve 60%, but the first unit
+    // records +20% time on the candidate arm beyond the 5% tolerance.
+    let mut rows = conjunction_pair("case-time-regressed", 100.0, true, 400, 120.0, true, 160);
+    rows.extend(conjunction_pair(
+        "case-time-improved",
+        100.0,
+        true,
+        400,
+        20.0,
+        true,
+        160,
+    ));
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("materially regressed the recorded total time")
+                && reason.contains("at least one matched unit")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Aggregate time improves 60% and tokens improve 12.5%, but the first unit
+    // records +50% token cost on the candidate arm beyond the 5% tolerance.
+    let mut rows = conjunction_pair("case-token-regressed", 100.0, true, 400, 40.0, true, 600);
+    rows.extend(conjunction_pair(
+        "case-token-improved",
+        100.0,
+        true,
+        400,
+        40.0,
+        true,
+        100,
+    ));
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("materially regressed the recorded native token cost")
+                && reason.contains("at least one matched unit")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+/// A lost accepted outcome is a quality regression on the matched unit and is
+/// never offset by another unit's gain. A P0/P1 regression that blocks
+/// independent acceptance reaches this evaluator through this acceptance
+/// boundary; there is no separate severity field to invent.
+#[test]
+fn quality_noninferiority_rejects_lost_acceptance_even_when_the_aggregate_does_not_fall() {
+    // Aggregate tie: one accepted outcome is lost and another is gained.
+    let policy = noninferiority_policy();
+    let declared = declare(&policy);
+    let mut rows = conjunction_pair("case-lost", 100.0, true, 400, 40.0, false, 160);
+    rows.extend(conjunction_pair(
+        "case-gained",
+        100.0,
+        false,
+        400,
+        40.0,
+        true,
+        160,
+    ));
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("independent acceptance failed")
+                && reason.contains("case-lost")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Aggregate improvement: two gained outcomes cannot offset one lost
+    // accepted outcome, even under the strict policy.
+    let mut rows = conjunction_pair("case-lost", 100.0, true, 400, 40.0, false, 160);
+    rows.extend(conjunction_pair(
+        "case-gained-a",
+        100.0,
+        false,
+        400,
+        40.0,
+        true,
+        160,
+    ));
+    rows.extend(conjunction_pair(
+        "case-gained-b",
+        100.0,
+        false,
+        400,
+        40.0,
+        true,
+        160,
+    ));
+    for policy in [noninferiority_policy(), conjunction_policy()] {
+        let declared = declare(&policy);
+        let report = summarize(&rows, &policy);
+        let evaluation = evaluate(&declared, &report).unwrap();
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::Reject,
+            "{:?}",
+            evaluation.reasons
+        );
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("independent acceptance failed")
+                    && reason.contains("case-lost")),
+            "{:?}",
+            evaluation.reasons
+        );
+    }
+}
+
+#[test]
+fn explicit_quality_noninferiority_keeps_missing_time_usage_and_bounds_inconclusive() {
+    let policy = noninferiority_policy();
+    let declared = declare(&policy);
+
+    // Missing time on an otherwise accepted candidate result is unknown, not
+    // a zero duration. The native/check starts are removed so the accounting
+    // cannot reconstruct a wall span while acceptance evidence stays complete.
+    let mut rows = conjunction_pair("case-time", 100.0, true, 400, 40.0, true, 160);
+    let candidate = &mut rows[1];
+    candidate["started_at"] = Value::Null;
+    candidate["native_runs"][0]["started_at"] = Value::Null;
+    candidate["checks"][0]["started_at"] = Value::Null;
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("panel of 1 independent unit(s) is incomplete")
+                && reason.contains("0 complete matched unit(s)")
+        }),
+        "missing timing is refused as incomplete evidence, not a zero duration: {:?}",
+        evaluation.reasons
+    );
+
+    // Missing recorded usage on either arm is unknown, not a zero cost.
+    let rows = vec![
+        attempt(
+            "b-usage",
+            "baseline",
+            "case-tokens",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            false,
+        ),
+        recorded_tokens(
+            attempt(
+                "c-usage",
+                "candidate",
+                "case-tokens",
+                200.0,
+                40.0,
+                true,
+                Some(3),
+                Some(6),
+                false,
+            ),
+            160,
+        ),
+    ];
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("token usage is missing or unknown")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Admissible bounds that can move equal-success time below the declared
+    // useful margin leave the conjunction inconclusive rather than adopting
+    // the point estimate.
+    let mut rows = conjunction_pair("case-bounds", 100.0, true, 400, 40.0, true, 160);
+    bounded(&mut rows[0], 100.0, 100.0);
+    bounded(&mut rows[1], 30.0, 95.0);
+    let report = summarize(&rows, &policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("admissible attribution bounds")
+                && reason.contains("below its declared useful margin")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
 fn the_conjunction_stays_inconclusive_without_complete_measured_evidence() {
     let policy = conjunction_policy();
     let declared = declare(&policy);
@@ -6452,15 +6784,41 @@ fn a_conjunction_criterion_cannot_be_relaxed_or_removed_after_results() {
             .minimum_time_reduction_percent = margin;
         assert!(invalid.declare().is_err(), "margin {margin}");
     }
-    // The quality member and the quality objective are hard members of the
-    // conjunction declaration.
-    let mut waived = policy.clone();
-    waived
-        .conjunction
-        .as_mut()
+    // Explicit false is the noninferiority mode and remains a distinct,
+    // declared criterion from strict quality improvement.
+    let noninferiority = noninferiority_policy();
+    let noninferiority_declared = declare(&noninferiority);
+    assert_ne!(declared.digest, noninferiority_declared.digest);
+    let strict_encoded = serde_json::to_value(&policy).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ComparisonPolicy>(strict_encoded).unwrap(),
+        policy,
+        "an existing strict declaration keeps its exact meaning"
+    );
+
+    // The recorded mode is a required boolean: omission, null, a string or a
+    // numeric substitute cannot silently select noninferiority, and no alias
+    // field is accepted as an alternative mode declaration.
+    let mut value = serde_json::to_value(&noninferiority).unwrap();
+    value["conjunction"]
+        .as_object_mut()
         .unwrap()
-        .require_quality_improvement = false;
-    assert!(waived.declare().is_err());
+        .remove("requireQualityImprovement");
+    let error = serde_json::from_value::<ComparisonPolicy>(value).unwrap_err();
+    assert!(
+        error.to_string().contains("requireQualityImprovement"),
+        "{error}"
+    );
+    for malformed in [Value::Null, json!("false"), json!(0)] {
+        let mut value = serde_json::to_value(&noninferiority).unwrap();
+        value["conjunction"]["requireQualityImprovement"] = malformed;
+        assert!(serde_json::from_value::<ComparisonPolicy>(value).is_err());
+    }
+    let mut aliased = serde_json::to_value(&noninferiority).unwrap();
+    aliased["conjunction"]["qualityMode"] = json!("noninferiority");
+    assert!(serde_json::from_value::<ComparisonPolicy>(aliased).is_err());
+
+    // The conjunction still decides the quality objective.
     let mut time_objective = policy.clone();
     time_objective.objective = Objective::Time;
     assert!(time_objective.declare().is_err());

@@ -1548,16 +1548,21 @@ pub struct Overhead {
 }
 
 /// A declared conjunction of adoption criteria over one observed unit set:
-/// strictly more independently accepted outcomes, no critical regression, and
-/// both a useful total-time and a useful recorded-token reduction. Every
-/// member is a hard requirement; a declared trade-off never waives one, and an
-/// unmeasured member leaves the result inconclusive instead of satisfied.
+/// preserved independent acceptance (or strictly improved independent
+/// acceptance when explicitly required), no critical regression, and both a
+/// useful total-time and a useful recorded-token reduction. Every member is a
+/// hard requirement; a declared trade-off never waives one, and an unmeasured
+/// member leaves the result inconclusive instead of satisfied.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConjunctionPolicy {
-    /// The quality member: adoption requires more independently accepted
-    /// outcomes than the baseline arm recorded. The declaration must require
-    /// it; an unchanged success count is not a benefit.
+    /// The quality member. `true` keeps the strict legacy requirement of more
+    /// independently accepted outcomes than the baseline arm recorded.
+    /// Explicit `false` selects quality noninferiority: every unit accepted on
+    /// the baseline arm must remain accepted, so equal fully successful arms
+    /// may proceed to the independently required cost margins. The field is a
+    /// required boolean, so an omitted or malformed declaration is refused
+    /// rather than selecting either mode implicitly.
     pub require_quality_improvement: bool,
     /// Minimum useful reduction of the total measured time through
     /// acceptance, in percent; positive and finite.
@@ -1767,11 +1772,9 @@ impl ComparisonPolicy {
                     "a conjunction comparison requires the efficiency basis; a maintenance declaration cannot carry required savings margins",
                 ));
             }
-            if !conjunction.require_quality_improvement {
-                return Err(invalid(
-                    "a conjunction cannot waive its quality-improvement member",
-                ));
-            }
+            // An explicit `false` is the noninferiority mode. The field stays
+            // a required serde boolean, so omission or malformed input cannot
+            // silently select it, and `true` keeps the strict legacy meaning.
             if !conjunction.minimum_time_reduction_percent.is_finite()
                 || conjunction.minimum_time_reduction_percent <= 0.0
             {
@@ -2584,12 +2587,13 @@ fn exclusion_text(reason: &crate::improvement_experiment::ExclusionReason) -> St
 }
 
 /// Evaluate the declared conjunction over one observed unit set: quality
-/// improvement, no critical regression, and useful total-time and
-/// recorded-token reductions. Every member is a hard requirement and no
-/// trade-off waives one. A member that cannot be measured over complete
-/// evidence leaves the result inconclusive (unknown is not a reduction); a
-/// measured member below its declared criterion, or a material per-unit
-/// regression beyond the declared tolerance, rejects adoption.
+/// noninferiority (or strict quality improvement when declared), no critical
+/// regression, and useful total-time and recorded-token reductions. Every
+/// member is a hard requirement and no trade-off waives one. A member that
+/// cannot be measured over complete evidence leaves the result inconclusive
+/// (unknown is not a reduction); a measured member below its declared
+/// criterion, or a material per-unit regression beyond the declared tolerance,
+/// rejects adoption.
 fn conjunction_verdict(
     policy: &ComparisonPolicy,
     conjunction: &ConjunctionPolicy,
@@ -2701,7 +2705,7 @@ fn conjunction_verdict(
     let time_reduction = (baseline_seconds - candidate_seconds) / baseline_seconds * 100.0;
     let token_reduction =
         (baseline_tokens as f64 - candidate_tokens as f64) / baseline_tokens as f64 * 100.0;
-    if candidate_accepted <= baseline_accepted {
+    if conjunction.require_quality_improvement && candidate_accepted <= baseline_accepted {
         reasons.push(format!(
             "the conjunction requires quality improvement: {candidate_accepted} of {} independent outcome(s) independently accepted versus {baseline_accepted} on the baseline arm; an unchanged success count is not a benefit",
             facts.len()
@@ -2827,8 +2831,13 @@ fn conjunction_verdict(
             }
         }
     }
+    let quality = if conjunction.require_quality_improvement {
+        format!("strict quality improvement {baseline_accepted}->{candidate_accepted}")
+    } else {
+        format!("quality noninferiority {baseline_accepted}->{candidate_accepted}")
+    };
     reasons.push(format!(
-        "the conjunction holds over {} complete matched unit(s): independent acceptance {baseline_accepted}->{candidate_accepted}, total time through acceptance -{time_reduction:.1}% and recorded native token cost -{token_reduction:.1}% (declared useful margins {:.1}% time and {:.1}% tokens) with no critical regression beyond the {:.1}% tolerance",
+        "the conjunction holds over {} complete matched unit(s): {quality}, total time through acceptance -{time_reduction:.1}% and recorded native token cost -{token_reduction:.1}% (declared useful margins {:.1}% time and {:.1}% tokens) with no critical regression beyond the {:.1}% tolerance",
         facts.len(),
         conjunction.minimum_time_reduction_percent,
         conjunction.minimum_token_reduction_percent,

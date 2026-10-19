@@ -845,6 +845,88 @@ fn a_declared_conjunction_consumes_the_combined_verdict() {
     );
 }
 
+/// The native policy file selects noninferiority only through an explicit
+/// `false`: equal fully successful arms can adopt when both predeclared cost
+/// margins hold. The unchanged strict `true` declaration refuses the same
+/// equal-success evidence.
+#[test]
+fn explicit_quality_noninferiority_adopts_equal_success_while_strict_mode_refuses_it() {
+    let _serial = INSTALL.lock().unwrap();
+
+    for (name, require_quality_improvement, expected) in [
+        ("conjunction-noninferiority-equal", false, "adopt"),
+        ("conjunction-strict-equal", true, "reject"),
+    ] {
+        let fixture = Fixture::new(name);
+        let mut policy = load_json(&fixture.policy);
+        policy["objective"] = json!("quality");
+        policy["conjunction"] = json!({
+            "requireQualityImprovement": require_quality_improvement,
+            "minimumTimeReductionPercent": 10.0,
+            "minimumTokenReductionPercent": 25.0,
+        });
+        fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+        fixture.prepare_builds(&checkout);
+        fixture.start_with_ready_candidate(&checkout, false);
+        let resume = fixture.resume();
+        assert!(resume.status.success(), "{}", text(&resume));
+
+        let session = session_id(&format!("{name}-baseline"));
+        fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+        let resume = fixture.resume();
+        assert!(resume.status.success(), "{}", text(&resume));
+        assert_eq!(
+            fixture.status_json()["comparison"]["baseline"]["accepted"],
+            true,
+            "the control arm is fully successful"
+        );
+
+        let session = session_id(&format!("{name}-candidate"));
+        fixture.simulate_arm_with_tokens(
+            "candidate",
+            "candidate",
+            "solved",
+            50,
+            1.5,
+            1,
+            1,
+            &session,
+            60,
+        );
+        let resume = fixture.resume();
+        let output = text(&resume);
+        assert!(resume.status.success(), "{output}");
+        let status = fixture.status_json();
+        assert_eq!(status["phase"], "decision-recorded", "{status}\n{output}");
+        assert!(
+            status["comparison"]["decision"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("outcome={expected}")),
+            "{status}\n{output}"
+        );
+        let evaluation = load_json(&fixture.run.join("comparison/evaluation.json"));
+        assert_eq!(evaluation["decision"], expected, "{evaluation}");
+        let reasons = evaluation["reasons"].as_array().unwrap();
+        if require_quality_improvement {
+            assert!(
+                reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("quality improvement"))),
+                "strict equality remains refused: {evaluation}"
+            );
+        } else {
+            assert!(
+                reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("quality noninferiority 1->1"))),
+                "the explicit noninferiority mode is reported: {evaluation}"
+            );
+        }
+    }
+}
+
 /// The continuous controller consumes a supported adoption through the real
 /// integration and activation owners: the checked revision reaches the
 /// mainline, the prepared candidate runtime becomes the experimental
