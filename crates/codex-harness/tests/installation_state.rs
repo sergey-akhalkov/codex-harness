@@ -957,4 +957,42 @@ fn escape(text: &str) -> String {
             "a later update leaves the materialized setting and every user choice as they are"
         );
     }
+
+    #[test]
+    fn update_preview_accepts_a_verbatim_build_path() {
+        let tree = tree();
+        let home = tree.root.join("codex-verbatim");
+        let user = tree.root.join("user-verbatim");
+        let installed = lifecycle(&tree, "install", false, &home, &user, &tree.upstream);
+        assert_eq!(installed["status"], "connected");
+        let metadata = home.join("harness/installation.json");
+        let before = fs::read(&metadata).unwrap();
+        let build = OsString::from(format!(r"\\?\{}", tree.build.display()));
+        let args = vec![
+            OsString::from("update"),
+            OsString::from("--core-only"),
+            OsString::from("--preview"),
+            OsString::from("--source"),
+            tree.source.clone().into(),
+            OsString::from("--build"),
+            build,
+            OsString::from("--codex-home"),
+            home.clone().into(),
+            OsString::from("--user-home"),
+            user.clone().into(),
+            OsString::from("--dependency-user-home"),
+            user.into(),
+            OsString::from("--upstream"),
+            tree.upstream.clone().into(),
+            OsString::from("--path-scope"),
+            OsString::from("process"),
+            OsString::from("--timeout-seconds"),
+            OsString::from("90"),
+        ];
+        let output = command(&tree, &args);
+        let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(preview["status"], "preview");
+        assert_eq!(preview["model_calls"], 0);
+        assert_eq!(fs::read(&metadata).unwrap(), before);
+    }
 }

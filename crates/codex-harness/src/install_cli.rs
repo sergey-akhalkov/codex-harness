@@ -325,10 +325,10 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
             // verified build of the selected source in this manager's owned
             // state, so new sessions pick up a fresh manager without replacing
             // one that is still running.
-            let build = match optional(&options.values, "--build") {
+            let build = plain_path(match optional(&options.values, "--build") {
                 Some(build) => build,
                 None => native_build::delivery_build(&source)?,
-            };
+            });
             let timeout = options
                 .values
                 .get(&OsString::from("--timeout-seconds"))
