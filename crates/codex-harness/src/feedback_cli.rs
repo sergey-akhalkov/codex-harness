@@ -29,6 +29,7 @@ use harness_core::board_feedback::{
     RouteTarget, RoutedAction, VoteDecision, VoteLedger,
 };
 use harness_core::board_hypothesis;
+use harness_core::improvement_policy::PaybackRecord;
 use harness_core::improvement_spec::{OpenSpec, Specification};
 use harness_core::{benefit_gate, pacing, scoped_observations};
 use serde::Deserialize;
@@ -39,10 +40,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback record --project DIRECTORY --source-feedback ID --observation TEXT --reporter ID --kind derived-evidence [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--verified-work WORK --improvement-reason TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-admit --project DIRECTORY --mechanism TOKEN --conditions TOKEN --observation REF --predicted TEXT --counterexample TEXT --acceptance TEXT --spec REF --basis REF [--fresh-basis REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-search --project DIRECTORY [--mechanism TOKEN] [--conditions TOKEN] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-trial --project DIRECTORY --item ID --experiment ID --role candidate|workload --counterpart ID [--evidence REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-implement --project DIRECTORY --item ID --role candidate|workload --branch NAME --base REVISION --revision REVISION --worktree LOCATOR [--runtime ID] [--baseline-runtime ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-decision --project DIRECTORY --item ID --experiment ID --outcome adopt|reject|inconclusive --quality unchanged|improved|regressed|unmeasurable --matched N --tolerance-percent VALUE --baseline-seconds VALUE --candidate-seconds VALUE --baseline-arm NAME --candidate-arm NAME --accounting TERMS --baseline-revision REVISION --candidate-revision REVISION --acceptance REF --coverage TERMS --scope TOKEN --reason TOKEN [--basis efficiency|engineering-judgment --basis-ref REF] [--baseline-tokens N --candidate-tokens N --cumulative-baseline-tokens N --cumulative-candidate-tokens N --cumulative-baseline REVISION] [--payback-mechanism TOKEN --payback-measures M[+M...] --payback-horizon N --payback-evidence REF] [--detail TEXT] [--close yes] [--defer UNTIL] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-reconcile --project DIRECTORY --item ID --outcome reject|inconclusive --change NAME [--action retain|archive] [--openspec-project DIRECTORY] [--planning-root DIRECTORY] [--store ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-propose --project DIRECTORY --item ID --proposal REF --target TOKEN --evidence REF --loss TOKEN [--preview REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-decide --project DIRECTORY --item ID --decision approve|refuse|withdraw --proposal REF --target TOKEN [--actions experiment,integration,publication] --loss TOKEN [--basis REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-check --project DIRECTORY --item ID --proposal REF --target TOKEN --action experiment|integration|publication [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. `record --kind derived-evidence` requires --source-feedback and appends bounded analysis to that existing record without creating a feedback card or vote; source episode, reporter kind and parent come from the board record. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `feedback-derived`, `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` (v1 and v2) records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's recorded benefit-gate decision with its comparison consistency, its recorded evidence binding (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) and its limitations (the record is read back; it is not rerun or independently certified here). Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board.\nThe hypothesis verbs keep one durable `task` labeled hypothesis per hypothesis: admission searches open, closed and deferred cards first, reuses the prior same-condition conclusion and requires a recorded fresh basis before reconsideration, so a repeated trial creates no duplicate card; `hypothesis-trial` records the explicit candidate/workload relationship as a nonblocking `related` edge plus its experiment reference; `hypothesis-implement` records the candidate branch/base/revision/worktree and prepared runtime identities without adopting or closing anything; `hypothesis-decision` publishes the evidence-bound `benefit-gate v2` record (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) idempotently and refuses a decision its own comparison cannot support, then optionally closes or defers the card; under `--basis engineering-judgment` it also carries complete local and cumulative token cost bound to the retained baseline, and an increased cost is published only with the predeclared payback mechanism, observable measures already in the recorded coverage, a positive whole-task horizon and acceptance-bound evidence, while a reset or unexplained drift in the retained cumulative totals is refused; `hypothesis-reconcile` reconciles an unadopted outcome with the change's actual task state read through the installed OpenSpec CLI: retention writes nothing, archival uses the supported non-synchronizing path only when every required task is actually done, and an unfinished required task is never closed through an outcome. The removal verbs keep the user's decision separate from measured benefit: `removal-propose` records each reviewed proposal version (any changed reviewed field, including the bounded prose detail, is appended as the new current version), `removal-decide` records the user's approve/refuse/withdraw bound to that exact reviewed content (an approval must name its reviewed loss, which must equal the recorded proposal's loss; the recorded `reviewed=` digest covers every reviewed field), and `removal-check` resolves the latest decision for one exact proposal/target/action (exit 0 only when authorized): an unreadable, incomplete-proposal or changed-proposal newer record never falls back to an older approval, a refusal or withdrawal authorizes nothing, a proposal version recorded after the decision needs a fresh decision before any further removal effect, and no benefit verdict is accepted as consent. No verb creates votes, another tracker or a model call.";
+const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback record --project DIRECTORY --source-feedback ID --observation TEXT --reporter ID --kind derived-evidence [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--verified-work WORK --improvement-reason TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-admit --project DIRECTORY --mechanism TOKEN --conditions TOKEN --observation REF --predicted TEXT --counterexample TEXT --acceptance TEXT --spec REF --basis REF [--fresh-basis REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-search --project DIRECTORY [--mechanism TOKEN] [--conditions TOKEN] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-trial --project DIRECTORY --item ID --experiment ID --role candidate|workload --counterpart ID [--evidence REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-implement --project DIRECTORY --item ID --role candidate|workload --branch NAME --base REVISION --revision REVISION --worktree LOCATOR [--runtime ID] [--baseline-runtime ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-decision --project DIRECTORY --item ID --experiment ID --outcome adopt|reject|inconclusive --quality unchanged|improved|regressed|unmeasurable --matched N --tolerance-percent VALUE --baseline-seconds VALUE --candidate-seconds VALUE --baseline-arm NAME --candidate-arm NAME --accounting TERMS --baseline-revision REVISION --candidate-revision REVISION --acceptance REF --coverage TERMS --scope TOKEN --reason TOKEN [--basis efficiency|engineering-judgment --basis-ref REF] [--baseline-tokens N --candidate-tokens N --cumulative-baseline-tokens N --cumulative-candidate-tokens N --cumulative-baseline REVISION] [--payback-file PAYBACK.json] [--detail TEXT] [--close yes] [--defer UNTIL] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-reconcile --project DIRECTORY --item ID --outcome reject|inconclusive --change NAME [--action retain|archive] [--openspec-project DIRECTORY] [--planning-root DIRECTORY] [--store ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-propose --project DIRECTORY --item ID --proposal REF --target TOKEN --evidence REF --loss TOKEN [--preview REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-decide --project DIRECTORY --item ID --decision approve|refuse|withdraw --proposal REF --target TOKEN [--actions experiment,integration,publication] --loss TOKEN [--basis REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-check --project DIRECTORY --item ID --proposal REF --target TOKEN --action experiment|integration|publication [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. `record --kind derived-evidence` requires --source-feedback and appends bounded analysis to that existing record without creating a feedback card or vote; source episode, reporter kind and parent come from the board record. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `feedback-derived`, `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` (v1 and v2) records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's recorded benefit-gate decision with its comparison consistency, its recorded evidence binding (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) and its limitations (the record is read back; it is not rerun or independently certified here). Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board.\nThe hypothesis verbs keep one durable `task` labeled hypothesis per hypothesis: admission searches open, closed and deferred cards first, reuses the prior same-condition conclusion and requires a recorded fresh basis before reconsideration, so a repeated trial creates no duplicate card; `hypothesis-trial` records the explicit candidate/workload relationship as a nonblocking `related` edge plus its experiment reference; `hypothesis-implement` records the candidate branch/base/revision/worktree and prepared runtime identities without adopting or closing anything; `hypothesis-decision` publishes the evidence-bound `benefit-gate v2` record (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) idempotently and refuses a decision its own comparison cannot support, then optionally closes or defers the card; under `--basis engineering-judgment` it also carries complete measured local token cost and derives cumulative cost from the retained baseline and prior adopted experiments; an increased cost is published only with the predeclared `PaybackRecord` from `--payback-file`, including each observed measure, unit, direction and acceptance-bound evidence, while a stale baseline, conflicting explicit totals or unsupported return is refused before mutation; `hypothesis-reconcile` reconciles an unadopted outcome with the change's actual task state read through the installed OpenSpec CLI: retention writes nothing, archival uses the supported non-synchronizing path only when every required task is actually done, and an unfinished required task is never closed through an outcome. The removal verbs keep the user's decision separate from measured benefit: `removal-propose` records each reviewed proposal version (any changed reviewed field, including the bounded prose detail, is appended as the new current version), `removal-decide` records the user's approve/refuse/withdraw bound to that exact reviewed content (an approval must name its reviewed loss, which must equal the recorded proposal's loss; the recorded `reviewed=` digest covers every reviewed field), and `removal-check` resolves the latest decision for one exact proposal/target/action (exit 0 only when authorized): an unreadable, incomplete-proposal or changed-proposal newer record never falls back to an older approval, a refusal or withdrawal authorizes nothing, a proposal version recorded after the decision needs a fresh decision before any further removal effect, and no benefit verdict is accepted as consent. No verb creates votes, another tracker or a model call.";
 
 /// Bound on the caller-supplied triage decision document.
 const MAX_DECISIONS_BYTES: u64 = 256 * 1024;
+/// Bound on one caller-supplied payback record.
+const MAX_PAYBACK_BYTES: u64 = 64 * 1024;
 /// Bound on one batch document; larger sets are split by the caller.
 const MAX_DECISIONS: usize = 512;
 /// Bound on the installation record read for the installed kit source.
@@ -1104,10 +1107,7 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         "--cumulative-baseline-tokens",
         "--cumulative-candidate-tokens",
         "--cumulative-baseline",
-        "--payback-mechanism",
-        "--payback-measures",
-        "--payback-horizon",
-        "--payback-evidence",
+        "--payback-file",
         "--baseline-arm",
         "--candidate-arm",
         "--accounting",
@@ -1167,14 +1167,7 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
     ]
     .iter()
     .any(|flag| options.get(flag).is_some());
-    let any_payback = [
-        "--payback-mechanism",
-        "--payback-measures",
-        "--payback-horizon",
-        "--payback-evidence",
-    ]
-    .iter()
-    .any(|flag| options.get(flag).is_some());
+    let any_payback = options.get("--payback-file").is_some();
     if !engineering && (any_tokens || any_payback) {
         return Err(invalid(
             "token cost and payback options require --basis engineering-judgment",
@@ -1210,21 +1203,9 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
             "--cumulative-baseline-tokens, --cumulative-candidate-tokens and --cumulative-baseline are recorded together",
         ));
     }
-    let payback_fields = [
-        options.get("--payback-mechanism").is_some(),
-        options.get("--payback-measures").is_some(),
-        options.get("--payback-horizon").is_some(),
-        options.get("--payback-evidence").is_some(),
-    ];
-    let payback_count = payback_fields.iter().filter(|present| **present).count();
-    if payback_count != 0 && payback_count != payback_fields.len() {
-        return Err(invalid(
-            "--payback-mechanism, --payback-measures, --payback-horizon and --payback-evidence are recorded together",
-        ));
-    }
-    let payback_horizon = options
-        .get("--payback-horizon")
-        .map(|value| count("--payback-horizon", value))
+    let payback = options
+        .get("--payback-file")
+        .map(|value| load_payback(Path::new(value)))
         .transpose()?;
     let close = match options.get("--close") {
         None | Some("no") => false,
@@ -1265,10 +1246,7 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         cumulative_baseline_tokens,
         cumulative_candidate_tokens,
         cumulative_baseline: options.get("--cumulative-baseline").map(str::to_owned),
-        payback_mechanism: options.get("--payback-mechanism").map(str::to_owned),
-        payback_measures: options.get("--payback-measures").map(str::to_owned),
-        payback_horizon,
-        payback_evidence: options.get("--payback-evidence").map(str::to_owned),
+        payback,
     };
     let publication = benefit_gate::publish_decision(&board.bd, &board.project, &draft)?;
     println!(
@@ -1666,6 +1644,44 @@ fn routed_kinds(ledger: &VoteLedger) -> Vec<ObservationKind> {
         }
     }
     kinds
+}
+
+/// Reads the one bounded payback record file used by the decision verb.
+/// The file carries the existing `PaybackRecord` shape rather than expanding
+/// repeated command-line fields; the publication owner validates its declared
+/// measures and observed values against the decision.
+fn load_payback(path: &Path) -> io::Result<PaybackRecord> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        invalid(&format!(
+            "payback file {} is unreadable: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(invalid(&format!(
+            "payback path {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_PAYBACK_BYTES {
+        return Err(invalid(&format!(
+            "payback file {} is {} bytes; the limit is {MAX_PAYBACK_BYTES}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        invalid(&format!(
+            "payback file {} is unreadable: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "payback file {} is not a PaybackRecord JSON document: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn load_decisions(path: &Path) -> io::Result<Vec<RoutedAction>> {

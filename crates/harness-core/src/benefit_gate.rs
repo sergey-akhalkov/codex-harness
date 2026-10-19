@@ -36,6 +36,9 @@
 use crate::board_cli::json_ok_actor;
 use crate::board_feedback;
 use crate::board_hypothesis::{self, require_line, require_token};
+use crate::improvement_policy::{
+    PaybackMeasure, PaybackProblem, PaybackRecord, validate_payback_record,
+};
 use std::{io, path::Path};
 
 pub const GATE_PREFIX: &str = "benefit-gate v1";
@@ -207,6 +210,10 @@ pub struct GateRecord {
     /// v2 engineering-judgment payback: the evidence the observed return is
     /// bound to (the recorded acceptance reference).
     pub payback_evidence: Option<String>,
+    /// v2 engineering-judgment payback: the exact observed arm totals, units,
+    /// directions and evidence, as compact JSON. Missing means the return was
+    /// declared but never observed and cannot authorize an increased cost.
+    pub payback_observed: Option<String>,
 }
 
 impl GateRecord {
@@ -315,6 +322,8 @@ pub enum Limitation {
     PaybackUnobserved,
     PaybackHorizon,
     PaybackEvidence,
+    PaybackObserved,
+    PaybackNotImproved,
     CumulativeBaselineChanged,
     CumulativeCostReset,
     CumulativeHistory,
@@ -390,6 +399,12 @@ impl Limitation {
             Self::PaybackEvidence => {
                 "payback evidence is missing or not bound to the recorded acceptance evidence"
             }
+            Self::PaybackObserved => {
+                "payback observations are missing, malformed or not finite non-negative values in the declared unit and direction"
+            }
+            Self::PaybackNotImproved => {
+                "the observed payback did not improve in the predeclared direction"
+            }
             Self::CumulativeBaselineChanged => {
                 "cumulative token cost is bound to a different retained baseline than the earlier adopted change"
             }
@@ -463,6 +478,7 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
             let mut payback_measures = None;
             let mut payback_horizon = None;
             let mut payback_evidence = None;
+            let mut payback_observed = None;
             for part in head.split_whitespace() {
                 let Some((key, value)) = part.split_once('=') else {
                     continue;
@@ -500,6 +516,7 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
                     "payback_measures" => payback_measures = Some(value.to_owned()),
                     "payback_horizon" => payback_horizon = Some(value.to_owned()),
                     "payback_evidence" => payback_evidence = Some(value.to_owned()),
+                    "payback_observed" => payback_observed = Some(value.to_owned()),
                     _ => {}
                 }
             }
@@ -534,6 +551,7 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
                 payback_measures,
                 payback_horizon,
                 payback_evidence,
+                payback_observed,
             })
         })
         .collect()
@@ -623,6 +641,7 @@ fn has_token_or_payback(record: &GateRecord) -> bool {
         record.payback_measures.is_some(),
         record.payback_horizon.is_some(),
         record.payback_evidence.is_some(),
+        record.payback_observed.is_some(),
     ]
     .into_iter()
     .any(|present| present)
@@ -634,35 +653,16 @@ fn has_payback(record: &GateRecord) -> bool {
         record.payback_measures.is_some(),
         record.payback_horizon.is_some(),
         record.payback_evidence.is_some(),
+        record.payback_observed.is_some(),
     ]
     .into_iter()
     .any(|present| present)
-}
-
-/// The measured dimensions named by a coverage field, before its trailing
-/// descriptive clauses. A payback measure is observable only when it is part
-/// of this recorded set.
-fn coverage_dimensions(coverage: &str) -> Vec<&str> {
-    coverage
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .split('+')
-        .filter(|dimension| !dimension.is_empty())
-        .collect()
 }
 
 fn push_unique(limitations: &mut Vec<Limitation>, limitation: Limitation) {
     if !limitations.contains(&limitation) {
         limitations.push(limitation);
     }
-}
-
-/// The native observable return dimensions a declared payback measure may
-/// name. `usage` is the token spending being repaid, not a return, and no
-/// other recorded dimension has a comparable before/after total.
-fn observable_payback_measure(measure: &str) -> bool {
-    matches!(measure, "time" | "rounds" | "tool_ops")
 }
 
 fn payback_limitations(record: &GateRecord) -> Vec<Limitation> {
@@ -673,21 +673,21 @@ fn payback_limitations(record: &GateRecord) -> Vec<Limitation> {
     if mechanism.is_none() {
         push_unique(&mut limitations, Limitation::PaybackMechanism);
     }
-    let measures = record.payback_measures.as_deref().and_then(|value| {
+    let declared: Option<Vec<&str>> = record.payback_measures.as_deref().and_then(|value| {
         let measures: Vec<&str> = value.split('+').collect();
         (!measures.is_empty()
             && measures.iter().all(|measure| {
                 !measure.is_empty()
-                    && observable_payback_measure(measure)
                     && crate::board_hypothesis::require_token("payback measure", measure, 64)
                         .is_ok()
             }))
         .then_some(measures)
     });
-    if measures.is_none() {
+    if declared.is_none() {
         push_unique(&mut limitations, Limitation::PaybackMeasures);
     }
-    if positive_tokens(record.payback_horizon.as_deref()).is_none() {
+    let horizon = positive_tokens(record.payback_horizon.as_deref());
+    if horizon.is_none() {
         push_unique(&mut limitations, Limitation::PaybackHorizon);
     }
     let evidence_bound = match (
@@ -700,21 +700,55 @@ fn payback_limitations(record: &GateRecord) -> Vec<Limitation> {
     if !evidence_bound {
         push_unique(&mut limitations, Limitation::PaybackEvidence);
     }
-    if let Some(measures) = measures {
-        let dimensions = coverage_dimensions(record.coverage.as_deref().unwrap_or(""));
-        if measures.iter().any(|measure| !dimensions.contains(measure)) {
-            push_unique(&mut limitations, Limitation::PaybackUnobserved);
+    // A declaration is not a return. The exact observed arm values, units,
+    // directions and evidence must be recorded and validated with the same
+    // rules the evaluator applies; a names-only record can never authorize an
+    // increased cost.
+    let observed: Option<Vec<PaybackMeasure>> = record
+        .payback_observed
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let Some(observed) = observed else {
+        push_unique(&mut limitations, Limitation::PaybackObserved);
+        return limitations;
+    };
+    if let Some(declared) = &declared {
+        let declared: std::collections::BTreeSet<&str> = declared.iter().copied().collect();
+        let observed_names: std::collections::BTreeSet<&str> = observed
+            .iter()
+            .map(|measure| measure.measure.as_str())
+            .collect();
+        if declared != observed_names {
+            push_unique(&mut limitations, Limitation::PaybackMeasures);
+        }
+    }
+    if let (Some(mechanism), Some(horizon)) = (mechanism, horizon) {
+        let payback = PaybackRecord {
+            mechanism: mechanism.to_owned(),
+            measures: observed,
+            horizon_tasks: horizon as f64,
+        };
+        if let Err(problem) = validate_payback_record(
+            &payback,
+            record.coverage.as_deref(),
+            record.acceptance.as_deref(),
+            true,
+        ) {
+            let limitation = match problem {
+                PaybackProblem::Mechanism => Limitation::PaybackMechanism,
+                PaybackProblem::Measures(_) => Limitation::PaybackMeasures,
+                PaybackProblem::Coverage(_) => Limitation::PaybackUnobserved,
+                PaybackProblem::Horizon => Limitation::PaybackHorizon,
+                PaybackProblem::Observed(_) => Limitation::PaybackObserved,
+                PaybackProblem::Evidence(_) => Limitation::PaybackEvidence,
+                PaybackProblem::NotImproved(_) => Limitation::PaybackNotImproved,
+            };
+            push_unique(&mut limitations, limitation);
         }
     }
     limitations
 }
 
-/// Complete token-cost evidence for one explicit engineering-judgment
-/// adoption. Missing or malformed values stay unknown and never read as zero
-/// or as a nonincrease. Equal or lower cost needs no payback; any increase,
-/// including a cumulative increase across adopted changes, needs the complete
-/// predeclared mechanism, observable measures, positive horizon and acceptance
-/// binding.
 fn token_cost_limitations(record: &GateRecord) -> Vec<Limitation> {
     let mut limitations = Vec::new();
     let baseline = positive_tokens(record.baseline_tokens.as_deref());
@@ -748,7 +782,7 @@ fn token_cost_limitations(record: &GateRecord) -> Vec<Limitation> {
         cumulative_baseline,
         cumulative_candidate,
     ) {
-        if cumulative_baseline < baseline || cumulative_candidate < candidate {
+        if cumulative_candidate < candidate {
             push_unique(&mut limitations, Limitation::TokenCostInconsistent);
         }
         let increased = candidate > baseline || cumulative_candidate > cumulative_baseline;
@@ -761,11 +795,180 @@ fn token_cost_limitations(record: &GateRecord) -> Vec<Limitation> {
     limitations
 }
 
-/// The retained-baseline identity and additive totals of the latest explicit
-/// engineering-judgment adoption. A first record starts at its local totals;
-/// a later record extends the most recent adopted judgment record for the
-/// same item. An earlier adopted record without usable cumulative evidence is
-/// unknown, never zero; a changed identity or a backward total is drift.
+/// Fills the missing cumulative token fields for one engineering-judgment
+/// draft from the retained adopted history. The local comparison remains
+/// caller-measured; this owner derives the retained baseline identity and
+/// accumulated candidate cost. Explicit cumulative input is retained only as
+/// an assertion and must agree with the derived values.
+fn derive_cumulative_cost(
+    draft: &DecisionDraft,
+    records: &[GateRecord],
+) -> io::Result<DecisionDraft> {
+    let mut derived = draft.clone();
+    if !matches!(draft.basis, DecisionBasis::EngineeringJudgment { .. }) {
+        return Ok(derived);
+    }
+    let (Some(baseline), Some(candidate)) = (draft.baseline_tokens, draft.candidate_tokens) else {
+        return Ok(derived);
+    };
+    if baseline == 0 {
+        return Ok(derived);
+    }
+    let prior: Vec<&GateRecord> = records
+        .iter()
+        .filter(|record| {
+            record.item == draft.item
+                && record.outcome.as_deref() == Some("adopt")
+                && matches!(
+                    record.recorded_basis(),
+                    Ok(RecordedBasis::EngineeringJudgment(_))
+                )
+        })
+        .collect();
+    let previous_same = prior
+        .iter()
+        .rev()
+        .find(|record| record.experiment.as_deref() == Some(draft.experiment.as_str()))
+        .copied();
+    let (cumulative_baseline, cumulative_candidate, identity) = if let Some(previous) =
+        previous_same
+    {
+        if prior
+            .last()
+            .is_some_and(|latest| latest.experiment.as_deref() != Some(draft.experiment.as_str()))
+        {
+            return Err(board_hypothesis::invalid(
+                "the experiment has an earlier retained adoption that is no longer the latest; a repeat would be stale",
+            ));
+        }
+        let previous_revisions = previous.revisions.as_deref();
+        let same_revisions = previous_revisions
+            .and_then(|revisions| revisions.split_once(".."))
+            .is_some_and(|(previous_baseline, previous_candidate)| {
+                previous_baseline == draft.baseline_revision
+                    && previous_candidate == draft.candidate_revision
+            });
+        if !same_revisions
+            || positive_tokens(previous.baseline_tokens.as_deref()) != Some(baseline)
+            || nonnegative_tokens(previous.candidate_tokens.as_deref()) != Some(candidate)
+        {
+            return Err(board_hypothesis::invalid(
+                "a repeated experiment must retain its exact revisions and measured local token cost",
+            ));
+        }
+        let (cumulative_baseline, cumulative_candidate) = (
+            nonnegative_tokens(previous.cumulative_baseline_tokens.as_deref()),
+            nonnegative_tokens(previous.cumulative_candidate_tokens.as_deref()),
+        );
+        let (Some(cumulative_baseline), Some(cumulative_candidate)) =
+            (cumulative_baseline, cumulative_candidate)
+        else {
+            return Err(board_hypothesis::invalid(
+                "the repeated experiment's retained cumulative token cost is missing",
+            ));
+        };
+        let identity = previous
+            .cumulative_baseline
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                board_hypothesis::invalid(
+                    "the repeated experiment's retained cumulative baseline is missing",
+                )
+            })?;
+        (
+            cumulative_baseline,
+            cumulative_candidate,
+            identity.to_owned(),
+        )
+    } else if let Some(previous) = prior.last().copied() {
+        let (Some(previous_baseline), Some(_previous_candidate)) = (
+            nonnegative_tokens(previous.cumulative_baseline_tokens.as_deref()),
+            nonnegative_tokens(previous.cumulative_candidate_tokens.as_deref()),
+        ) else {
+            return Err(board_hypothesis::invalid(
+                "the latest retained engineering-judgment adoption has no usable cumulative token cost",
+            ));
+        };
+        let identity = previous
+            .cumulative_baseline
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                board_hypothesis::invalid(
+                    "the latest retained engineering-judgment adoption has no cumulative baseline identity",
+                )
+            })?;
+        let expected_baseline_revision = previous
+            .revisions
+            .as_deref()
+            .and_then(|revisions| revisions.split_once("..").map(|(_, candidate)| candidate));
+        if expected_baseline_revision != Some(draft.baseline_revision.as_str()) {
+            return Err(board_hypothesis::invalid(
+                "the local comparison does not start from the latest retained candidate revision; the retained baseline is stale",
+            ));
+        }
+        let previous_candidate =
+            positive_tokens(previous.candidate_tokens.as_deref()).ok_or_else(|| {
+                board_hypothesis::invalid(
+                    "the latest retained adoption has no measured local candidate token cost",
+                )
+            })?;
+        if baseline != previous_candidate {
+            return Err(board_hypothesis::invalid(
+                "the local baseline token cost does not equal the latest retained candidate cost; the retained baseline is stale or would be counted twice",
+            ));
+        }
+        let delta = i128::from(candidate) - i128::from(baseline);
+        let expected_candidate = i128::from(previous_candidate) + delta;
+        if expected_candidate < 0 || expected_candidate > i128::from(u64::MAX) {
+            return Err(board_hypothesis::invalid(
+                "the accumulated candidate token cost is out of range",
+            ));
+        }
+        (
+            previous_baseline,
+            expected_candidate as u64,
+            identity.to_owned(),
+        )
+    } else {
+        (baseline, candidate, draft.baseline_revision.clone())
+    };
+    let supplied = [
+        draft.cumulative_baseline_tokens.is_some(),
+        draft.cumulative_candidate_tokens.is_some(),
+        draft.cumulative_baseline.is_some(),
+    ];
+    if supplied.iter().any(|present| *present) {
+        if !supplied.iter().all(|present| *present) {
+            return Err(board_hypothesis::invalid(
+                "explicit cumulative token cost needs both totals and the retained baseline identity",
+            ));
+        }
+        if draft.cumulative_baseline_tokens != Some(cumulative_baseline)
+            || draft.cumulative_candidate_tokens != Some(cumulative_candidate)
+            || draft.cumulative_baseline.as_deref() != Some(identity.as_str())
+        {
+            return Err(board_hypothesis::invalid(
+                "explicit cumulative token cost conflicts with the totals derived from the retained board history",
+            ));
+        }
+    }
+    derived.cumulative_baseline_tokens = Some(cumulative_baseline);
+    derived.cumulative_candidate_tokens = Some(cumulative_candidate);
+    derived.cumulative_baseline = Some(identity);
+    Ok(derived)
+}
+
+/// The retained-baseline identity and accumulated totals of the latest
+/// explicit engineering-judgment adoption. A first record starts at its local
+/// totals. A later record extends the most recent adopted judgment record for
+/// the same item: its local baseline must be the retained candidate (same
+/// revision and token cost), the cumulative baseline stays the original
+/// baseline and the cumulative candidate grows by the local delta only. A
+/// repeat of the same experiment must retain the earlier cumulative totals
+/// instead of adding again. An earlier adopted record without usable
+/// cumulative evidence is unknown, never zero.
 fn cumulative_limitations(records: &[GateRecord], latest_index: usize) -> Vec<Limitation> {
     let Some(latest) = records.get(latest_index) else {
         return Vec::new();
@@ -789,23 +992,52 @@ fn cumulative_limitations(records: &[GateRecord], latest_index: usize) -> Vec<Li
     else {
         return Vec::new();
     };
-    // Only a different adopted experiment extends the cumulative total: a
-    // repeated or conflicting record for the same experiment is the same
-    // experiment, not another change to add again.
     let prior: Vec<&GateRecord> = records[..latest_index]
         .iter()
         .filter(|record| {
-            record != &latest
-                && record.item == latest.item
+            record.item == latest.item
                 && record.outcome.as_deref() == Some("adopt")
-                && record.experiment != latest.experiment
                 && matches!(
                     record.recorded_basis(),
                     Ok(RecordedBasis::EngineeringJudgment(_))
                 )
         })
         .collect();
-    let Some(previous) = prior.last().copied() else {
+
+    // A repeated record for the same experiment is the same change: it must
+    // retain the earlier cumulative totals and may not add its local totals
+    // again.
+    if let Some(previous) = prior
+        .iter()
+        .rev()
+        .find(|record| record.experiment == latest.experiment)
+        .copied()
+    {
+        let (Some(previous_baseline), Some(previous_candidate)) = (
+            nonnegative_tokens(previous.cumulative_baseline_tokens.as_deref()),
+            nonnegative_tokens(previous.cumulative_candidate_tokens.as_deref()),
+        ) else {
+            return vec![Limitation::CumulativeHistory];
+        };
+        if previous.cumulative_baseline.as_deref() != Some(identity) {
+            return vec![Limitation::CumulativeBaselineChanged];
+        }
+        if cumulative_baseline != previous_baseline || cumulative_candidate != previous_candidate {
+            return vec![Limitation::TokenCostInconsistent];
+        }
+        if positive_tokens(previous.baseline_tokens.as_deref()) != Some(baseline)
+            || nonnegative_tokens(previous.candidate_tokens.as_deref()) != Some(candidate)
+        {
+            return vec![Limitation::TokenCostInconsistent];
+        }
+        return Vec::new();
+    }
+
+    let extending: Vec<&GateRecord> = prior
+        .into_iter()
+        .filter(|record| record.experiment != latest.experiment)
+        .collect();
+    let Some(previous) = extending.last().copied() else {
         let mut limitations = Vec::new();
         let revisions_match = latest.revisions.as_deref().and_then(|revisions| {
             let (baseline_revision, _) = revisions.split_once("..")?;
@@ -819,7 +1051,7 @@ fn cumulative_limitations(records: &[GateRecord], latest_index: usize) -> Vec<Li
         }
         return limitations;
     };
-    if prior
+    if extending
         .first()
         .is_some_and(|first| first.cumulative_baseline.as_deref() != Some(identity))
         || previous.cumulative_baseline.as_deref() != Some(identity)
@@ -835,11 +1067,34 @@ fn cumulative_limitations(records: &[GateRecord], latest_index: usize) -> Vec<Li
     if cumulative_baseline < previous_baseline || cumulative_candidate < previous_candidate {
         return vec![Limitation::CumulativeCostReset];
     }
-    let expected_baseline = previous_baseline.checked_add(baseline);
-    let expected_candidate = previous_candidate.checked_add(candidate);
-    if expected_baseline != Some(cumulative_baseline)
-        || expected_candidate != Some(cumulative_candidate)
+    // The local comparison must start from the retained candidate: the same
+    // revision and the same token cost. Adding a fresh local baseline would
+    // count the retained cost twice.
+    let previous_candidate_revision = previous
+        .revisions
+        .as_deref()
+        .and_then(|revisions| revisions.split_once("..").map(|(_, candidate)| candidate));
+    let latest_baseline_revision = latest
+        .revisions
+        .as_deref()
+        .and_then(|revisions| revisions.split_once("..").map(|(baseline, _)| baseline));
+    if previous_candidate_revision.is_none()
+        || previous_candidate_revision != latest_baseline_revision
     {
+        return vec![Limitation::CumulativeBaseline];
+    }
+    if baseline != previous_candidate {
+        return vec![Limitation::TokenCostInconsistent];
+    }
+    if cumulative_baseline != previous_baseline {
+        return vec![Limitation::TokenCostInconsistent];
+    }
+    let delta = i128::from(candidate) - i128::from(baseline);
+    let expected_candidate = i128::from(previous_candidate) + delta;
+    if expected_candidate < 0 || expected_candidate > i128::from(u64::MAX) {
+        return vec![Limitation::TokenCostInconsistent];
+    }
+    if expected_candidate != i128::from(cumulative_candidate) {
         return vec![Limitation::TokenCostInconsistent];
     }
     Vec::new()
@@ -1079,14 +1334,10 @@ pub struct DecisionDraft {
     pub cumulative_candidate_tokens: Option<u64>,
     /// The retained baseline identity the cumulative totals are bound to.
     pub cumulative_baseline: Option<String>,
-    /// The predeclared payback mechanism for a measured increase.
-    pub payback_mechanism: Option<String>,
-    /// `+`-separated observable measures already in the recorded coverage.
-    pub payback_measures: Option<String>,
-    /// The positive relevant-use horizon in whole tasks.
-    pub payback_horizon: Option<u64>,
-    /// The acceptance evidence the observed return is bound to.
-    pub payback_evidence: Option<String>,
+    /// The predeclared payback plan together with its exact observed arm
+    /// totals, units, directions and evidence. A names-only plan is refused
+    /// before mutation.
+    pub payback: Option<PaybackRecord>,
 }
 
 impl DecisionDraft {
@@ -1123,30 +1374,15 @@ impl DecisionDraft {
         ];
         let any_tokens = token_fields.iter().any(|present| *present);
         let complete_tokens = token_fields.iter().all(|present| *present);
-        let payback_fields = [
-            self.payback_mechanism.is_some(),
-            self.payback_measures.is_some(),
-            self.payback_horizon.is_some(),
-            self.payback_evidence.is_some(),
-        ];
-        let any_payback = payback_fields.iter().any(|present| *present);
-        let complete_payback = payback_fields.iter().all(|present| *present);
         if !matches!(self.basis, DecisionBasis::EngineeringJudgment { .. }) {
-            if any_tokens || any_payback {
+            if any_tokens || self.payback.is_some() {
                 return Err(board_hypothesis::invalid(
                     "token cost and payback fields belong to the engineering-judgment basis",
                 ));
             }
-        } else if (self.outcome == DecisionOutcome::Adopt || any_tokens || any_payback)
-            && !complete_tokens
-        {
+        } else if (any_tokens || self.outcome == DecisionOutcome::Adopt) && !complete_tokens {
             return Err(board_hypothesis::invalid(
-                "an engineering-judgment decision needs complete local and cumulative token cost",
-            ));
-        }
-        if any_payback && !complete_payback {
-            return Err(board_hypothesis::invalid(
-                "a payback record needs a mechanism, observable measures, a positive horizon and acceptance evidence",
+                "an engineering-judgment adoption needs complete local and cumulative token cost",
             ));
         }
         if let (
@@ -1168,68 +1404,21 @@ impl DecisionDraft {
                 ));
             }
             require_token("cumulative baseline", identity, 128)?;
-            if cumulative_baseline < baseline || cumulative_candidate < candidate {
+            if cumulative_candidate < candidate {
                 return Err(board_hypothesis::invalid(
-                    "cumulative token cost cannot be lower than the local comparison it extends",
+                    "cumulative candidate token cost cannot be lower than the local comparison it extends",
                 ));
             }
             let increased = candidate > baseline || cumulative_candidate > cumulative_baseline;
-            if self.outcome == DecisionOutcome::Adopt && increased && !complete_payback {
+            if self.outcome == DecisionOutcome::Adopt && increased && self.payback.is_none() {
                 return Err(board_hypothesis::invalid(
-                    "increased complete token cost requires a predeclared payback mechanism, observable measures, a positive horizon and acceptance evidence",
+                    "increased complete token cost requires a predeclared payback mechanism and its observed return",
                 ));
             }
         }
-        if complete_payback {
-            require_token(
-                "payback mechanism",
-                self.payback_mechanism.as_deref().unwrap_or(""),
-                64,
-            )?;
-            let measures: Vec<&str> = self
-                .payback_measures
-                .as_deref()
-                .unwrap_or("")
-                .split('+')
-                .collect();
-            if measures.iter().any(|measure| measure.is_empty()) {
-                return Err(board_hypothesis::invalid(
-                    "every payback measure must be a single non-empty token",
-                ));
-            }
-            let dimensions = coverage_dimensions(&coverage);
-            let mut seen = std::collections::BTreeSet::new();
-            for measure in &measures {
-                require_token("payback measure", measure, 64)?;
-                if !observable_payback_measure(measure) {
-                    return Err(board_hypothesis::invalid(
-                        "a payback measure must be an observable return dimension: time, rounds or tool_ops",
-                    ));
-                }
-                if !seen.insert(*measure) {
-                    return Err(board_hypothesis::invalid("a payback measure is repeated"));
-                }
-                if !dimensions.contains(measure) {
-                    return Err(board_hypothesis::invalid(
-                        "every payback measure must already be part of the recorded metric coverage",
-                    ));
-                }
-            }
-            if self.payback_horizon == Some(0) {
-                return Err(board_hypothesis::invalid(
-                    "the payback horizon must be a positive whole number of tasks",
-                ));
-            }
-            let evidence = require_token(
-                "payback evidence",
-                self.payback_evidence.as_deref().unwrap_or(""),
-                160,
-            )?;
-            if evidence != acceptance {
-                return Err(board_hypothesis::invalid(
-                    "payback evidence must be the recorded acceptance evidence",
-                ));
-            }
+        if let Some(payback) = &self.payback {
+            validate_payback_record(payback, Some(&coverage), Some(&acceptance), true)
+                .map_err(|problem| board_hypothesis::invalid(problem.message()))?;
         }
         let accounting = require_token("accounting", &self.accounting, 160)?;
         if self.matched == 0 {
@@ -1292,18 +1481,31 @@ impl DecisionDraft {
                 " baseline_tokens={baseline_tokens} candidate_tokens={candidate_tokens} cumulative_baseline_tokens={cumulative_baseline_tokens} cumulative_candidate_tokens={cumulative_candidate_tokens} cumulative_baseline={cumulative_baseline}"
             ));
         }
-        if let (Some(mechanism), Some(measures), Some(horizon), Some(evidence)) = (
-            self.payback_mechanism.as_deref(),
-            self.payback_measures.as_deref(),
-            self.payback_horizon,
-            self.payback_evidence.as_deref(),
-        ) {
-            let mechanism = require_token("payback mechanism", mechanism, 64)?;
-            let measures: Vec<&str> = measures.split('+').collect();
-            let evidence = require_token("payback evidence", evidence, 160)?;
+        if let Some(payback) = &self.payback {
+            let mechanism = require_token("payback mechanism", &payback.mechanism, 64)?;
+            let measures = payback
+                .measures
+                .iter()
+                .map(|measure| measure.measure.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
+            let evidence = require_token(
+                "payback evidence",
+                payback
+                    .measures
+                    .first()
+                    .and_then(|measure| measure.evidence.as_deref())
+                    .unwrap_or(""),
+                160,
+            )?;
+            let horizon = payback.horizon_tasks as u64;
+            let observed = serde_json::to_string(&payback.measures).map_err(|error| {
+                board_hypothesis::invalid(format!(
+                    "the observed payback measures cannot be recorded: {error}"
+                ))
+            })?;
             text.push_str(&format!(
-                " payback_mechanism={mechanism} payback_measures={} payback_horizon={horizon} payback_evidence={evidence}",
-                measures.join("+")
+                " payback_mechanism={mechanism} payback_measures={measures} payback_horizon={horizon} payback_evidence={evidence} payback_observed={observed}"
             ));
         }
         if let Some(detail) = &self.detail {
@@ -1323,28 +1525,15 @@ pub enum Publication {
     Confirmed { text: String },
 }
 
-/// Publishes one evidence-bound hypothesis decision as a `benefit-gate v2`
-/// comment on the hypothesis card.
-///
-/// - The record must satisfy its own claimed outcome: an `adopt` whose
-///   comparison is incomplete, contradictory or shows no positive effect is
-///   refused, and so is a `reject`/`inconclusive` missing its bindings. An
-///   explicit engineering-judgment adoption is exempt only from the positive
-///   numeric effect: it still needs complete, consistent evidence and its
-///   predeclared basis reference.
-/// - A new engineering-judgment record cannot reinterpret an earlier record
-///   for the same experiment that was decided on a different or absent basis.
-/// - The item must be an existing hypothesis card; the decision is never
-///   inferred from an evaluator verdict and never written to another tracker.
-/// - Publication is idempotent: retrying the identical decision confirms the
-///   recorded record without adding another comment or counting the
-///   experiment twice. A *different* decision for the same experiment is a
-///   deliberate new record; the newest record controls the item's state.
 pub fn publish_decision(
     bd: &Path,
     project: &Path,
     draft: &DecisionDraft,
 ) -> io::Result<Publication> {
+    board_hypothesis::require_hypothesis_card(bd, project, &draft.item)?;
+    let comments = board_feedback::list_comments(bd, project, &draft.item)?;
+    let existing = parse_gate_comments(&comments);
+    let draft = derive_cumulative_cost(draft, &existing)?;
     let text = draft.record()?;
     let head = head_of(&text);
     let parsed = parse_gate_comments(std::slice::from_ref(&text));
@@ -1371,16 +1560,12 @@ pub fn publish_decision(
             }
         )));
     }
-
-    board_hypothesis::require_hypothesis_card(bd, project, &draft.item)?;
-    let comments = board_feedback::list_comments(bd, project, &draft.item)?;
     if comments.iter().any(|comment| head_of(comment) == head) {
         return Ok(Publication::Confirmed { text });
     }
     if draft.outcome == DecisionOutcome::Adopt
         && let DecisionBasis::EngineeringJudgment { basis } = &draft.basis
     {
-        let existing = parse_gate_comments(&comments);
         let reinterpreted = existing.iter().any(|record| {
             record.item == draft.item
                 && record.experiment.as_deref() == Some(draft.experiment.as_str())
@@ -1397,7 +1582,7 @@ pub fn publish_decision(
         && matches!(draft.basis, DecisionBasis::EngineeringJudgment { .. })
         && let Some(candidate) = parsed.first()
     {
-        let mut combined = parse_gate_comments(&comments);
+        let mut combined = existing;
         combined.push(candidate.clone());
         let latest_index = combined.len() - 1;
         let cumulative = cumulative_limitations(&combined, latest_index);
@@ -2354,10 +2539,7 @@ mod tests {
             cumulative_baseline_tokens: None,
             cumulative_candidate_tokens: None,
             cumulative_baseline: None,
-            payback_mechanism: None,
-            payback_measures: None,
-            payback_horizon: None,
-            payback_evidence: None,
+            payback: None,
         }
     }
 
@@ -2409,6 +2591,94 @@ mod tests {
     }
 
     #[test]
+    fn named_quality_payback_requires_observed_values_bound_to_acceptance() {
+        let mut draft = publication();
+        draft.basis = DecisionBasis::EngineeringJudgment {
+            basis: "reflection:lead-1".to_owned(),
+        };
+        draft.baseline_tokens = Some(1000);
+        draft.candidate_tokens = Some(1100);
+        draft.cumulative_baseline_tokens = Some(1000);
+        draft.cumulative_candidate_tokens = Some(1100);
+        draft.cumulative_baseline = Some("base123".to_owned());
+        draft.payback = Some(PaybackRecord {
+            mechanism: "fewer-future-incidents".to_owned(),
+            measures: vec![PaybackMeasure {
+                measure: "quality_score".to_owned(),
+                unit: "points".to_owned(),
+                direction: crate::improvement_policy::PaybackDirection::HigherIsBetter,
+                baseline: Some(80.0),
+                candidate: Some(90.0),
+                evidence: Some("evidence-9".to_owned()),
+            }],
+            horizon_tasks: 3.0,
+        });
+
+        // The coverage field names the recorded counters, not every possible
+        // concrete benefit. The observed per-arm values and evidence make the
+        // custom measure usable without an exclusive whitelist.
+        assert_eq!(draft.coverage, "time+rounds+tool_ops");
+        let text = draft
+            .record()
+            .expect("an observed custom measure is a supported payback");
+        assert!(text.contains("payback_measures=quality_score"), "{text}");
+        assert!(text.contains(r#""measure":"quality_score""#), "{text}");
+        let records = parse_gate_comments(std::slice::from_ref(&text));
+        assert_eq!(
+            assess(&records, "codex-harness-pvr.5")
+                .expect("attributable")
+                .verdict,
+            Verdict::Consistent
+        );
+
+        // A bare name is a declaration, not an observed return.
+        draft.payback.as_mut().unwrap().measures[0].baseline = None;
+        let error = draft.record().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lacks finite non-negative values"),
+            "{error}"
+        );
+
+        // A non-finite or negative value is unusable, never zero.
+        draft.payback.as_mut().unwrap().measures[0].baseline = Some(f64::NAN);
+        let error = draft.record().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lacks finite non-negative values"),
+            "{error}"
+        );
+        draft.payback.as_mut().unwrap().measures[0].baseline = Some(-1.0);
+        let error = draft.record().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lacks finite non-negative values"),
+            "{error}"
+        );
+
+        // Evidence must be bound to the decision's own acceptance reference.
+        draft.payback.as_mut().unwrap().measures[0].baseline = Some(80.0);
+        draft.payback.as_mut().unwrap().measures[0].evidence = Some("stale-9".to_owned());
+        let error = draft.record().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not bound to the recorded acceptance evidence"),
+            "{error}"
+        );
+
+        // A measured value that did not improve in the predeclared direction
+        // is evidence against the claimed return.
+        draft.payback.as_mut().unwrap().measures[0].evidence = Some("evidence-9".to_owned());
+        draft.payback.as_mut().unwrap().measures[0].candidate = Some(80.0);
+        let error = draft.record().unwrap_err();
+        assert!(error.to_string().contains("did not improve"), "{error}");
+    }
+
+    #[test]
     fn payback_measures_must_be_observable_returns() {
         let mut draft = publication();
         draft.basis = DecisionBasis::EngineeringJudgment {
@@ -2419,17 +2689,31 @@ mod tests {
         draft.cumulative_baseline_tokens = Some(1000);
         draft.cumulative_candidate_tokens = Some(1100);
         draft.cumulative_baseline = Some("base123".to_owned());
-        draft.payback_mechanism = Some("fewer-corrections".to_owned());
-        draft.payback_measures = Some("usage".to_owned());
-        draft.payback_horizon = Some(3);
-        draft.payback_evidence = Some("evidence-9".to_owned());
+        draft.payback = Some(PaybackRecord {
+            mechanism: "fewer-corrections".to_owned(),
+            measures: vec![PaybackMeasure {
+                measure: "usage".to_owned(),
+                unit: "count".to_owned(),
+                direction: crate::improvement_policy::PaybackDirection::LowerIsBetter,
+                baseline: Some(10.0),
+                candidate: Some(5.0),
+                evidence: Some("evidence-9".to_owned()),
+            }],
+            horizon_tasks: 3.0,
+        });
         draft.coverage = "time+rounds+tool_ops+usage".to_owned();
         let error = draft.record().unwrap_err();
-        assert!(error.to_string().contains("observable return dimension"));
+        assert!(error.to_string().contains("observable return"));
 
-        draft.payback_measures = Some("elapsed".to_owned());
+        draft.payback.as_mut().unwrap().measures[0].measure = "elapsed".to_owned();
+        draft.payback.as_mut().unwrap().measures[0].baseline = None;
+        draft.coverage = "time+elapsed".to_owned();
         let error = draft.record().unwrap_err();
-        assert!(error.to_string().contains("observable return dimension"));
+        assert!(
+            error
+                .to_string()
+                .contains("lacks finite non-negative values")
+        );
 
         let legacy = v2_variant(
             &judgment_v2("item-a"),
@@ -2454,16 +2738,13 @@ mod tests {
         );
         let records = parse_gate_comments(&[legacy]);
         assert!(
-            limitations_of(&records, "item-a").contains(&Limitation::PaybackMeasures),
+            limitations_of(&records, "item-a").contains(&Limitation::PaybackObserved),
             "{:?}",
             limitations_of(&records, "item-a")
         );
 
         draft.outcome = DecisionOutcome::Reject;
-        draft.payback_mechanism = None;
-        draft.payback_measures = None;
-        draft.payback_horizon = None;
-        draft.payback_evidence = None;
+        draft.payback = None;
         let text = draft
             .record()
             .expect("a rejection records increased cost without payback");

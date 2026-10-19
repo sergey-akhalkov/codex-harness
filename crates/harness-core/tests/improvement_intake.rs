@@ -346,10 +346,7 @@ fn supported_proposal_admits_once_reuses_rejection_and_links_reconsideration() {
         cumulative_baseline_tokens: None,
         cumulative_candidate_tokens: None,
         cumulative_baseline: None,
-        payback_mechanism: None,
-        payback_measures: None,
-        payback_horizon: None,
-        payback_evidence: None,
+        payback: None,
     };
     assert!(matches!(
         publish_decision(&bd, &project, &rejection).unwrap(),
