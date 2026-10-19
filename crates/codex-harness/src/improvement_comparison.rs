@@ -3920,9 +3920,15 @@ fn verified_command_identity(
 }
 
 pub(super) fn retained_observation(attempt: &Attempt) -> Option<Value> {
-    let retained = attempt.retained.as_ref()?;
+    retained_observation_at(&attempt.retained.as_ref()?.receipt)
+}
+
+/// The recorded observation object of one exact native receipt. The ordinary
+/// adapter holds a verified receipt path and must not fabricate an attempt just
+/// to reach the same bounded observation shape.
+pub(super) fn retained_observation_at(receipt: &Path) -> Option<Value> {
     let bytes = crate::outcome_run::bounded_read(
-        &retained.receipt,
+        receipt,
         harness_core::improvement_loop::MAX_RETAINED_RECEIPT_BYTES,
     )
     .ok()?;

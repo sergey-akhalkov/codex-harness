@@ -1144,8 +1144,28 @@ codex-harness improve status --run DIRECTORY [--json]
 codex-harness improve select --run DIRECTORY --variant baseline|candidate
 codex-harness improve stop   --run DIRECTORY [--reason TEXT]
 codex-harness improve resume --run DIRECTORY
+codex-harness improve review --prepare --review DIRECTORY --declaration FILE
+codex-harness improve review --resume  --review DIRECTORY [--declaration FILE]
 codex-harness improve prepare-runtime --source DIRECTORY --state DIRECTORY --output FILE
 ```
+
+`review` consumes one retained ordinary completion without a qualification
+run and without prewritten action sidecars. Its declaration is the existing
+schema-1 `OrdinaryReviewDeclaration`: `schema`, `review`, `task`,
+`task_prompt`, `completion` (`codex_home`, `run_generation`,
+`executor_profile`), `lead_session`, `action_evidence_root` and
+`semantic_review`. On first preparation it resolves the recorded pool slot's
+native receipt through the existing pool state resolver and requires its
+generation, slot, owner, session and completed turn to match the retained
+completion before copying the bounded visible stream into the ordinary-owned
+evidence root. The locator rule is fixed: the sidecar is
+`<action_evidence_root>/<run_generation>.json`, the retained stream is
+`<action_evidence_root>/<run_generation>.jsonl`, the sidecar attempt is the
+run generation and its role is `executor`. A retained sidecar pair is
+immutable; repeated preparation never rereads a possibly reused pool slot. A
+lost, mismatched, live, truncated or otherwise partial stream remains an
+explicit gap or refusal before any reviewer dispatch. `--resume` reuses the
+frozen declaration, packet and captured evidence.
 
 `start` validates the strict schema-1 run inputs (project, board, OpenSpec
 change, base revision, writable scope, runner profile, evidence root, oracle,

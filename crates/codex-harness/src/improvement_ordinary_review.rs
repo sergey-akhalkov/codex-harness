@@ -26,10 +26,11 @@ use std::{
 
 use super::super::{Options, improvement_comparison as accounting, invalid, reconcile_attempts};
 use super::{
-    ACTION_EVIDENCE_SCHEMA, RetainedActionStream, ReviewHost, ReviewPacketView, ReviewSubject,
-    action_evidence_from, advance_semantic_review_host, ensure_review_packet,
+    ACTION_EVIDENCE_SCHEMA, ActionStreamFacts, RetainedActionStream, ReviewHost, ReviewPacketView,
+    ReviewSubject, action_evidence_from, advance_semantic_review_host, ensure_review_packet,
     load_or_install_reviewer_runtime, retained_judgment, same_retained_place, write_bytes_atomic,
 };
+use crate::executor_cli::{ConversationState, pool_evidence_paths, receipt_view};
 
 const ORDINARY_REVIEW_SCHEMA: u32 = 1;
 
@@ -408,6 +409,79 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
+/// Capture one completed ordinary executor turn's visible action stream into
+/// the ordinary-owned evidence root before the recorded pool slot can be
+/// reused. First preparation reuses the shared qualification capture
+/// implementation with exact completion and native receipt facts; later
+/// preparation never rereads the pool. Existing sidecars are immutable, and
+/// the shared review host still reports any recorded gap before dispatch.
+fn capture_ordinary_action_stream(
+    declaration: &OrdinaryReviewDeclaration,
+    completion: &RetainedCompletion,
+    previously_prepared: bool,
+) -> io::Result<()> {
+    let root = &declaration.action_evidence_root;
+    let sidecar = root.join(format!("{}.json", completion.run_generation));
+    let raw = root.join(format!("{}.jsonl", completion.run_generation));
+    if sidecar.exists() || raw.exists() || previously_prepared {
+        return Ok(());
+    }
+    let session = completion
+        .session
+        .as_deref()
+        .filter(|session| !session.trim().is_empty())
+        .ok_or_else(|| invalid("the retained ordinary completion has no executor session"))?;
+    let turn = completion
+        .turn
+        .as_deref()
+        .filter(|turn| !turn.trim().is_empty())
+        .ok_or_else(|| invalid("the retained ordinary completion has no completed turn"))?;
+    let (receipt, detail) = pool_evidence_paths(
+        &declaration.completion.codex_home,
+        &declaration.task.source,
+        completion.slot,
+    )?;
+    let view = receipt_view(&receipt)?;
+    if view.state != ConversationState::Completed {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} for run generation {} is not completed ({:?}); preserve the retained completion instead of reading a reused, lost or live pool slot",
+            receipt.display(),
+            completion.run_generation,
+            view.state
+        )));
+    }
+    let identity = &view.identity;
+    if identity.generation.as_deref() != Some(completion.run_generation.as_str())
+        || identity.slot != Some(completion.slot)
+        || identity.owner.as_deref() != Some(completion.owner.as_str())
+        || identity.session.as_deref() != Some(session)
+        || identity.turn.as_deref() != Some(turn)
+    {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} does not bind run generation {}, slot {}, owner {}, session {} and turn {}; preserve the retained completion instead of capturing a later pool occupant",
+            receipt.display(),
+            completion.run_generation,
+            completion.slot,
+            completion.owner,
+            session,
+            turn
+        )));
+    }
+    let observation = super::super::improvement_comparison::retained_observation_at(&receipt);
+    super::retain_action_stream_at(
+        &sidecar,
+        &raw,
+        ActionStreamFacts {
+            attempt: &completion.run_generation,
+            role: "executor",
+            session,
+            source: Some(&detail),
+            observation: observation.as_ref(),
+        },
+    )?;
+    Ok(())
+}
+
 fn prepare(review: &Path, declaration_path: &Path) -> io::Result<()> {
     let review_root = ensure_owned_directory(review, "ordinary review root")?;
     let _mutation = acquire_mutation_lock(&review_root, MUTATION_LOCK_WAIT)?;
@@ -442,7 +516,9 @@ fn prepare(review: &Path, declaration_path: &Path) -> io::Result<()> {
     let binding = validate_completion(&declaration, &completion)?;
     let subject = review_subject(&declaration, &binding)?;
 
-    let state = match load_state(&state_path)? {
+    let retained_state = load_state(&state_path)?;
+    let previously_prepared = retained_state.is_some();
+    let state = match retained_state {
         Some(state) => state,
         None => OrdinaryReviewState {
             schema: ORDINARY_REVIEW_SCHEMA,
@@ -471,6 +547,7 @@ fn prepare(review: &Path, declaration_path: &Path) -> io::Result<()> {
         state,
         subject,
     );
+    capture_ordinary_action_stream(&declaration, &completion, previously_prepared)?;
     prepare_reviewer(&mut host, &declaration)?;
     host.persist()?;
 

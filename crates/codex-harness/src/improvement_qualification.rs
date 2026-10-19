@@ -1122,14 +1122,50 @@ fn action_evidence_paths(run: &Run, attempt: &str) -> (PathBuf, PathBuf) {
     )
 }
 
-/// Copy one completed participant turn's raw visible stream before the next
-/// dispatch can reuse its pool slot. The capture is idempotent: a recorded
-/// sidecar is never replaced or recaptured. A missing or unreadable source is
-/// recorded as an explicit gap.
 fn retain_action_stream(run: &Run, attempt: &Attempt) -> io::Result<RetainedActionStream> {
     let (sidecar, raw) = action_evidence_paths(run, &attempt.id);
+    let session = attempt
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.session.clone())
+        .unwrap_or_default();
+    let observation = super::improvement_comparison::retained_observation(attempt);
+    retain_action_stream_at(
+        &sidecar,
+        &raw,
+        ActionStreamFacts {
+            attempt: &attempt.id,
+            role: attempt.role.as_str(),
+            session: &session,
+            source: attempt.detail.as_deref(),
+            observation: observation.as_ref(),
+        },
+    )
+}
+
+/// The verified facts one retained action-stream capture binds. The
+/// qualification wrapper supplies them from a retained attempt; the ordinary
+/// adapter supplies the same facts from the immutable completion and its exact
+/// native receipt.
+struct ActionStreamFacts<'a> {
+    attempt: &'a str,
+    role: &'a str,
+    session: &'a str,
+    source: Option<&'a Path>,
+    observation: Option<&'a Value>,
+}
+
+/// Copy one completed participant turn's raw visible stream into the exact
+/// sidecar pair. A recorded sidecar is immutable: it is validated and returned,
+/// never replaced or recaptured. A raw copy without its sidecar, or any read
+/// failure, stays an explicit gap instead of a guessed provenance.
+fn retain_action_stream_at(
+    sidecar: &Path,
+    raw: &Path,
+    facts: ActionStreamFacts<'_>,
+) -> io::Result<RetainedActionStream> {
     if sidecar.is_file() {
-        let bytes = fs::read(&sidecar)?;
+        let bytes = fs::read(sidecar)?;
         let recorded: RetainedActionStream = serde_json::from_slice(&bytes).map_err(|error| {
             invalid(format!(
                 "the retained action evidence sidecar {} is not readable: {error}; preserve it instead of recapturing from a mutable pool slot",
@@ -1137,14 +1173,14 @@ fn retain_action_stream(run: &Run, attempt: &Attempt) -> io::Result<RetainedActi
             ))
         })?;
         if recorded.schema != ACTION_EVIDENCE_SCHEMA
-            || recorded.attempt != attempt.id
-            || recorded.role != attempt.role.as_str()
+            || recorded.attempt != facts.attempt
+            || recorded.role != facts.role
         {
             return Err(invalid(format!(
                 "the retained action evidence sidecar {} does not bind attempt {} role {}; preserve it instead of repointing it",
                 sidecar.display(),
-                attempt.id,
-                attempt.role.as_str()
+                facts.attempt,
+                facts.role
             )));
         }
         return Ok(recorded);
@@ -1155,19 +1191,15 @@ fn retain_action_stream(run: &Run, attempt: &Attempt) -> io::Result<RetainedActi
             raw.display()
         )));
     }
-    let root = run.store.root().join(ACTION_EVIDENCE_DIR);
-    fs::create_dir_all(&root)?;
-    let session = attempt
-        .binding
-        .as_ref()
-        .and_then(|binding| binding.session.clone())
-        .unwrap_or_default();
+    if let Some(parent) = sidecar.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut record = RetainedActionStream {
         schema: ACTION_EVIDENCE_SCHEMA,
-        attempt: attempt.id.clone(),
-        role: attempt.role.as_str().to_owned(),
-        session,
-        source: attempt.detail.clone(),
+        attempt: facts.attempt.to_owned(),
+        role: facts.role.to_owned(),
+        session: facts.session.to_owned(),
+        source: facts.source.map(Path::to_path_buf),
         captured: false,
         source_bytes: 0,
         retained_bytes: 0,
@@ -1182,37 +1214,38 @@ fn retain_action_stream(run: &Run, attempt: &Attempt) -> io::Result<RetainedActi
                 .to_owned(),
         ),
     };
-    write_json_atomic(&sidecar, &record)?;
+    write_json_atomic(sidecar, &record)?;
     if record.session.is_empty() {
         record.note = Some(
             "the completed attempt has no exact native session binding, so its visible action stream cannot be attributed"
                 .to_owned(),
         );
-        write_json_atomic(&sidecar, &record)?;
+        write_json_atomic(sidecar, &record)?;
         return Ok(record);
     }
-    let (events, malformed, rounds, detail_truncated, turn) = action_observation_counts(attempt);
+    let (events, malformed, rounds, detail_truncated, turn) =
+        action_observation_counts(facts.observation);
     record.observed_events = events;
     record.observed_malformed = malformed;
     record.observed_rounds = rounds;
     record.observed_turn = turn;
     record.truncated = detail_truncated;
-    let Some(source) = attempt.detail.clone() else {
+    let Some(source) = facts.source else {
         record.note = Some(
             "the completed attempt records no raw visible action stream locator; its actions are unavailable"
                 .to_owned(),
         );
-        write_json_atomic(&sidecar, &record)?;
+        write_json_atomic(sidecar, &record)?;
         return Ok(record);
     };
-    let metadata = match fs::metadata(&source) {
+    let metadata = match fs::metadata(source) {
         Ok(metadata) => metadata,
         Err(error) => {
             record.note = Some(format!(
                 "the raw visible action stream {} is unavailable: {error}",
                 source.display()
             ));
-            write_json_atomic(&sidecar, &record)?;
+            write_json_atomic(sidecar, &record)?;
             return Ok(record);
         }
     };
@@ -1221,18 +1254,18 @@ fn retain_action_stream(run: &Run, attempt: &Attempt) -> io::Result<RetainedActi
             "the raw visible action stream {} is not an ordinary file",
             source.display()
         ));
-        write_json_atomic(&sidecar, &record)?;
+        write_json_atomic(sidecar, &record)?;
         return Ok(record);
     }
     record.source_bytes = metadata.len();
-    let mut file = match fs::File::open(&source) {
+    let mut file = match fs::File::open(source) {
         Ok(file) => file,
         Err(error) => {
             record.note = Some(format!(
                 "the raw visible action stream {} could not be opened: {error}",
                 source.display()
             ));
-            write_json_atomic(&sidecar, &record)?;
+            write_json_atomic(sidecar, &record)?;
             return Ok(record);
         }
     };
@@ -1245,7 +1278,7 @@ fn retain_action_stream(run: &Run, attempt: &Attempt) -> io::Result<RetainedActi
             "the raw visible action stream {} could not be read: {error}",
             source.display()
         ));
-        write_json_atomic(&sidecar, &record)?;
+        write_json_atomic(sidecar, &record)?;
         return Ok(record);
     }
     record.retained_bytes = bytes.len() as u64;
@@ -1261,18 +1294,18 @@ fn retain_action_stream(run: &Run, attempt: &Attempt) -> io::Result<RetainedActi
     } else {
         record.note = None;
     }
-    write_bytes_atomic(&raw, &bytes)?;
+    write_bytes_atomic(raw, &bytes)?;
     record.captured = true;
-    write_json_atomic(&sidecar, &record)?;
+    write_json_atomic(sidecar, &record)?;
     Ok(record)
 }
 
 fn action_observation_counts(
-    attempt: &Attempt,
+    observation: Option<&Value>,
 ) -> (Option<u64>, Option<u64>, Option<u64>, bool, Option<String>) {
-    // Reuse the existing bounded retained-observation owner instead of
+    // Reuse the existing bounded retained-observation shape instead of
     // keeping a second receipt reader with its own size and error policy.
-    let Some(observation) = super::improvement_comparison::retained_observation(attempt) else {
+    let Some(observation) = observation else {
         return (None, None, None, false, None);
     };
     let number = |name: &str| observation.get(name).and_then(Value::as_u64);

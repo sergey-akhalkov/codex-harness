@@ -57,6 +57,24 @@ impl OrdinarySetup {
 }
 
 fn ordinary_setup(name: &str) -> OrdinarySetup {
+    ordinary_setup_with(name, ActionEvidenceMode::RetainedSidecars)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionEvidenceMode {
+    /// Already-retained sidecars are supplied directly, as previously
+    /// supported inputs.
+    RetainedSidecars,
+    /// The evidence root starts empty; a synthetic native pool receipt and
+    /// stream stand in for the completed executor dispatch.
+    NativePool,
+}
+
+fn native_ordinary_setup(name: &str) -> OrdinarySetup {
+    ordinary_setup_with(name, ActionEvidenceMode::NativePool)
+}
+
+fn ordinary_setup_with(name: &str, mode: ActionEvidenceMode) -> OrdinarySetup {
     let fixture = Fixture::new(name);
     let launcher = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
     fixture_build(
@@ -131,7 +149,7 @@ fn ordinary_setup(name: &str) -> OrdinarySetup {
 
     let actions = fixture.root.join("retained-actions");
     fs::create_dir(&actions).unwrap();
-    let raw = format!(
+    let events = format!(
         "{}\n{}\n",
         json!({"method":"item/completed","params":{"turnId":TURN,"item":{
             "id":"command-1","type":"commandExecution","command":"git status --short",
@@ -139,20 +157,45 @@ fn ordinary_setup(name: &str) -> OrdinarySetup {
         }}}),
         json!({"method":"turn/completed","params":{"turn":{"id":TURN,"status":"completed"}}})
     );
-    let raw_path = actions.join(format!("{RUN}.jsonl"));
-    fs::write(&raw_path, &raw).unwrap();
-    fs::write(
-        actions.join(format!("{RUN}.json")),
-        serde_json::to_vec_pretty(&json!({
-            "schema":1,"attempt":RUN,"role":"executor","session":EXECUTOR_SESSION,
-            "source":raw_path,"captured":true,"source_bytes":raw.len(),
-            "retained_bytes":raw.len(),"source_sha256":build_identity::hash_bytes(raw.as_bytes()),
-            "truncated":false,"observed_events":2,"observed_malformed":0,
-            "observed_rounds":1,"observed_turn":TURN,"note":null
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    match mode {
+        ActionEvidenceMode::RetainedSidecars => {
+            let raw_path = actions.join(format!("{RUN}.jsonl"));
+            fs::write(&raw_path, &events).unwrap();
+            fs::write(
+                actions.join(format!("{RUN}.json")),
+                serde_json::to_vec_pretty(&json!({
+                    "schema":1,"attempt":RUN,"role":"executor","session":EXECUTOR_SESSION,
+                    "source":raw_path,"captured":true,"source_bytes":events.len(),
+                    "retained_bytes":events.len(),
+                    "source_sha256":build_identity::hash_bytes(events.as_bytes()),
+                    "truncated":false,"observed_events":2,"observed_malformed":0,
+                    "observed_rounds":1,"observed_turn":TURN,"note":null
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        ActionEvidenceMode::NativePool => {
+            fs::create_dir_all(&state_dir).unwrap();
+            let detail = state_dir.join("stream-1.jsonl");
+            fs::write(&detail, &events).unwrap();
+            fs::write(
+                state_dir.join("spawn-1.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "slot":{"index":1,"owner":"ordinary-review-fixture"},
+                    "originatingLead":{"runGeneration":RUN},
+                    "observation":{
+                        "schema":1,"coverage":"native","state":"completed","exitCode":0,
+                        "session":EXECUTOR_SESSION,"turn":TURN,"events":2,"messages":0,
+                        "toolCalls":1,"rounds":1,"malformed":0,
+                        "detail":detail,"result":retained_result.clone(),"updatedMs":0
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
 
     let declaration = fixture.root.join("ordinary-review.json");
     let review = fixture.root.join("ordinary-review");
@@ -599,6 +642,178 @@ fn retained_action_copy_survives_loss_of_original_capture_path() {
     fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
     fs::remove_file(&original).unwrap();
     assert_prepared(&setup);
+}
+
+#[test]
+fn native_pool_completion_captures_action_evidence_without_prewritten_sidecars() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = native_ordinary_setup("ordinary-review-native-capture");
+    let sidecar = setup.actions.join(format!("{RUN}.json"));
+    let raw = setup.actions.join(format!("{RUN}.jsonl"));
+    assert!(
+        !sidecar.exists() && !raw.exists(),
+        "the native case must start without prewritten action sidecars"
+    );
+    let pool_dir = task_worktree::pool_state_dir(&setup.fixture.home, &setup.fixture.wl).unwrap();
+    let pool_stream = pool_dir.join("stream-1.jsonl");
+    let pool_bytes = fs::read(&pool_stream).unwrap();
+
+    let first = setup.prepare();
+    assert!(
+        first.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let record: Value = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+    assert_eq!(record["attempt"], RUN);
+    assert_eq!(record["role"], "executor");
+    assert_eq!(record["session"], EXECUTOR_SESSION);
+    assert_eq!(record["observed_turn"], TURN);
+    assert_eq!(record["observed_events"], 2);
+    assert_eq!(record["observed_rounds"], 1);
+    assert_eq!(record["captured"], true);
+    assert_eq!(record["truncated"], false);
+    assert_eq!(fs::read(&raw).unwrap(), pool_bytes);
+    assert_no_attempts(&setup);
+    assert!(!review_state(&setup)["semantic_review"].is_null());
+
+    // Release the recorded slot to a later dispatch. Repreparation must reuse
+    // the captured packet and never reread the replaced receipt or stream.
+    let state_bytes = fs::read(setup.review.join("state.json")).unwrap();
+    let sidecar_bytes = fs::read(&sidecar).unwrap();
+    let raw_bytes = fs::read(&raw).unwrap();
+    fs::write(
+        pool_dir.join("spawn-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "slot":{"index":1,"owner":"later-owner"},
+            "originatingLead":{"runGeneration":"later-generation"},
+            "observation":{
+                "schema":1,"coverage":"native","state":"completed","exitCode":0,
+                "session":"later-session","turn":"later-turn","events":1,
+                "messages":0,"toolCalls":0,"rounds":1,"malformed":0,
+                "detail":pool_stream,"result":setup.retained_result.clone(),"updatedMs":0
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(&pool_stream, b"{\"later\":true}\n").unwrap();
+
+    let repeated = setup.prepare();
+    assert!(
+        repeated.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&repeated.stdout),
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
+    assert_eq!(fs::read(&raw).unwrap(), raw_bytes);
+    assert_eq!(
+        fs::read(setup.review.join("state.json")).unwrap(),
+        state_bytes
+    );
+    assert_no_attempts(&setup);
+}
+
+#[test]
+fn native_capture_refuses_mismatched_receipt_before_review_effects() {
+    let _guard = INSTALL.lock().unwrap();
+
+    let generation = native_ordinary_setup("ordinary-review-native-wrong-generation");
+    let pool_dir =
+        task_worktree::pool_state_dir(&generation.fixture.home, &generation.fixture.wl).unwrap();
+    let receipt = pool_dir.join("spawn-1.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    value["originatingLead"]["runGeneration"] = json!("later-generation");
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let refused = generation.prepare();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("does not bind run generation"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!generation.review.join("state.json").exists());
+    assert!(!generation.actions.join(format!("{RUN}.json")).exists());
+
+    let turn = native_ordinary_setup("ordinary-review-native-wrong-turn");
+    let pool_dir = task_worktree::pool_state_dir(&turn.fixture.home, &turn.fixture.wl).unwrap();
+    let receipt = pool_dir.join("spawn-1.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    value["observation"]["turn"] = json!("different-turn");
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let refused = turn.prepare();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("does not bind run generation"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!turn.review.join("state.json").exists());
+    assert!(!turn.actions.join(format!("{RUN}.json")).exists());
+
+    let lost = native_ordinary_setup("ordinary-review-native-lost-receipt");
+    let pool_dir = task_worktree::pool_state_dir(&lost.fixture.home, &lost.fixture.wl).unwrap();
+    fs::remove_file(pool_dir.join("spawn-1.json")).unwrap();
+    let refused = lost.prepare();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("is not completed"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!lost.review.join("state.json").exists());
+    assert!(!lost.actions.join(format!("{RUN}.json")).exists());
+}
+
+#[test]
+fn native_capture_records_gap_for_missing_or_truncated_stream() {
+    let _guard = INSTALL.lock().unwrap();
+
+    let missing = native_ordinary_setup("ordinary-review-native-missing-stream");
+    let pool_dir =
+        task_worktree::pool_state_dir(&missing.fixture.home, &missing.fixture.wl).unwrap();
+    fs::remove_file(pool_dir.join("stream-1.jsonl")).unwrap();
+    let refused = missing.prepare();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("action view is missing or incomplete"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(missing.actions.join(format!("{RUN}.json"))).unwrap())
+            .unwrap();
+    assert_eq!(record["captured"], false);
+    assert!(
+        record["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("unavailable")),
+        "{record}"
+    );
+    assert_no_attempts(&missing);
+
+    let truncated = native_ordinary_setup("ordinary-review-native-truncated-stream");
+    let pool_dir =
+        task_worktree::pool_state_dir(&truncated.fixture.home, &truncated.fixture.wl).unwrap();
+    let receipt = pool_dir.join("spawn-1.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    value["observation"]["detailTruncated"] = json!(true);
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let refused = truncated.prepare();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("action view is missing or incomplete"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(truncated.actions.join(format!("{RUN}.json"))).unwrap())
+            .unwrap();
+    assert_eq!(record["captured"], true);
+    assert_eq!(record["truncated"], true);
+    assert_no_attempts(&truncated);
 }
 
 #[test]

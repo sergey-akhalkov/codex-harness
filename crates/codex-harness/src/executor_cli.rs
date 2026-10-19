@@ -2765,6 +2765,8 @@ pub(crate) struct ReceiptIdentity {
     /// The per-dispatch generation the dispatcher recorded.
     pub generation: Option<String>,
     pub session: Option<String>,
+    /// The exact native turn this dispatch submitted, when recorded.
+    pub turn: Option<String>,
     pub host: Option<(u32, u64, PathBuf)>,
 }
 
@@ -2790,6 +2792,7 @@ pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
                     owner: None,
                     generation: None,
                     session: None,
+                    turn: None,
                     host: None,
                 },
                 state: ConversationState::Missing,
@@ -2809,6 +2812,7 @@ pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
             .as_str()
             .map(str::to_owned),
         session: value["observation"]["session"].as_str().map(str::to_owned),
+        turn: value["observation"]["turn"].as_str().map(str::to_owned),
         host: (|| {
             let host = value.get("observation")?.get("host")?;
             if host.is_null() {
@@ -3750,6 +3754,19 @@ fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPath
         result: dir.join(format!("message-{index}.txt")),
         detail: dir.join(format!("stream-{index}.jsonl")),
     })
+}
+
+/// Resolve one recorded pool slot's receipt and visible detail stream through
+/// the exact existing pool state resolver. The caller must still verify the
+/// receipt's generation, slot, owner, session and turn before treating the
+/// stream as that completion's evidence.
+pub(crate) fn pool_evidence_paths(
+    codex_home: &Path,
+    source: &Path,
+    slot: u32,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let paths = run_paths(codex_home, source, slot)?;
+    Ok((paths.receipt, paths.detail))
 }
 
 /// Builds one run's exact completion facts from its terminal dispatch receipt
