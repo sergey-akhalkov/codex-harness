@@ -3465,6 +3465,7 @@ fn cumulative_judgment_counterexample_retains_baseline_across_hypotheses() {
         "c-synthetic",
         "basis-disconnected",
     );
+    let stale_item = admit(&board, "m-stale", "c-synthetic", "basis-stale");
     let first = publish_cumulative_counterexample(
         &board,
         &first_item,
@@ -3474,18 +3475,6 @@ fn cumulative_judgment_counterexample_retains_baseline_across_hypotheses() {
         ("1000", "1100"),
     );
     assert!(first.status.success(), "{}", output_text(&first));
-    bd_json(
-        &board.bd,
-        &board.project,
-        &[
-            "close",
-            &first_item,
-            "--reason",
-            "retained-history",
-            "--json",
-        ],
-    );
-    assert_eq!(board.item(&first_item)["status"], "closed");
     let unrelated = publish_cumulative_counterexample(
         &board,
         &unrelated_item,
@@ -3511,6 +3500,72 @@ fn cumulative_judgment_counterexample_retains_baseline_across_hypotheses() {
         .expect("second publication");
     assert!(retained.contains("cumulative_baseline_tokens=1000 cumulative_candidate_tokens=1300 cumulative_baseline=base001"),
         "a new hypothesis in the same scope must not erase retained spending: {retained}");
+    let stale_before = board.comment_texts(&stale_item).len();
+    let stale = publish_cumulative_counterexample(
+        &board,
+        &stale_item,
+        "exp-stale-fork",
+        "task:synthetic",
+        ("cand002", "cand004"),
+        ("1100", "1200"),
+    );
+    let text = output_text(&stale);
+    assert!(!stale.status.success(), "{text}");
+    assert!(text.contains("retained baseline is stale"), "{text}");
+    assert_eq!(board.comment_texts(&stale_item).len(), stale_before);
+    let first_before = board.comment_texts(&first_item).len();
+    let old_card = publish_cumulative_counterexample(
+        &board,
+        &first_item,
+        "exp-old-card",
+        "task:synthetic",
+        ("cand002", "cand004"),
+        ("1100", "1200"),
+    );
+    let text = output_text(&old_card);
+    assert!(!old_card.status.success(), "{text}");
+    assert!(text.contains("retained baseline is stale"), "{text}");
+    assert_eq!(board.comment_texts(&first_item).len(), first_before);
+    bd_json(
+        &board.bd,
+        &board.project,
+        &[
+            "close",
+            &first_item,
+            "--reason",
+            "retained-history",
+            "--json",
+        ],
+    );
+    assert_eq!(board.item(&first_item)["status"], "closed");
+    let tip_saving = publish_cumulative_counterexample(
+        &board,
+        &second_item,
+        "exp-tip-saving",
+        "task:synthetic",
+        ("cand003", "cand004"),
+        ("1300", "1200"),
+    );
+    assert!(tip_saving.status.success(), "{}", output_text(&tip_saving));
+    let retained = board
+        .comment_texts(&second_item)
+        .into_iter()
+        .find(|comment| comment.contains("experiment=exp-tip-saving"))
+        .expect("current-tip saving publication");
+    assert!(retained.contains("cumulative_baseline_tokens=1000 cumulative_candidate_tokens=1200 cumulative_baseline=base001"), "{retained}");
+    let first_before = board.comment_texts(&first_item).len();
+    let repeated = publish_cumulative_counterexample(
+        &board,
+        &first_item,
+        "exp-first",
+        "task:synthetic",
+        ("base001", "cand002"),
+        ("1000", "1100"),
+    );
+    let text = output_text(&repeated);
+    assert!(repeated.status.success(), "{text}");
+    assert!(text.contains("publication=already-recorded"), "{text}");
+    assert_eq!(board.comment_texts(&first_item).len(), first_before);
     let before = board.comment_texts(&disconnected_item).len();
     let disconnected = publish_cumulative_counterexample(
         &board,
@@ -3528,6 +3583,7 @@ fn cumulative_judgment_counterexample_retains_baseline_across_hypotheses() {
     assert_no_votes(&board, &second_item);
     assert_no_votes(&board, &unrelated_item);
     assert_no_votes(&board, &disconnected_item);
+    assert_no_votes(&board, &stale_item);
     board.drop();
 }
 

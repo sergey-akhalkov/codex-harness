@@ -1099,6 +1099,11 @@ fn cumulative_totals(
             identity: baseline_revision.to_owned(),
         });
     };
+    if points.iter().any(|point| {
+        point.index != anchor.index && point.baseline_revision == anchor.candidate_revision
+    }) {
+        return Err(CumulativeProblem::StaleBaseline);
+    }
     if anchor.candidate_tokens != baseline_tokens {
         return Err(CumulativeProblem::StaleBaseline);
     }
