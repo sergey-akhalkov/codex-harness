@@ -1180,7 +1180,7 @@ task, configuration or participant binding refuses further dispatch.
 boundary for a `baseline_qualification` run. It is valid only in single-step
 supervision: omitting `--supervision` defaults to `once` for this mode, while
 `--supervision continuous` is refused before the run directory or any effect is
-created. It installs and verifies the ordinary runtime and any declared
+created. By default it installs and verifies the ordinary runtime and any declared
 separate reviewer runtime, freezes the task copy, prepares the independent
 oracle workspace, persists the unchanged gates and participant bindings,
 reports the exact homes, checkout, task and workspace plus the resume command,
@@ -1188,6 +1188,38 @@ and dispatches no model attempt. `improve resume` then continues the same run
 through the existing lead/executor/reviewer path. Preparation is not acceptance
 and does not trust native hooks: each isolated home may still show its native
 first-use or hook-consent prompt on the first actual launch.
+
+A subsequent qualification may instead adopt completed native runtimes at their
+existing home paths. Add `reuse` to each runtime declaration:
+
+```json
+"reuse": {
+  "runtime": {"path": "C:/runs/completed/baseline-qualification/runtime.json", "sha256": "<exact digest>"},
+  "cursor": {"path": "C:/runs/completed/cursor.json", "sha256": "<exact digest>"}
+}
+```
+
+When an independent reviewer is declared, both roles must adopt their own
+runtime receipts; they may name the same completed origin cursor. The origin
+must have a completed workflow, retained acceptance row and no in-flight or
+unknown attempts. Frozen non-reuse runtime inputs, role, model and effort must
+match. Preparation verifies the retained configuration, native hook trust and
+workspace provenance through the existing consumption owner. It does not
+install, connect, copy configuration or write hook approval. Task checkouts,
+reports, oracle artifacts and conversations remain fresh for the new run.
+
+A durable exclusive claim beside each runtime receipt prevents concurrent
+adoption. The same run can recover its claim after interruption or explicit
+stop; another run cannot take an active claim because time elapsed. Completion
+or `improve stop` settles the claim without retiring the origin homes or losing
+their evidence. A failed preparation after claiming is recoverable through the
+same run or explicit stop. Changed runtime inputs require fresh preparation.
+
+`--prepare-only` still verifies adoption without model work. To let the normal
+controller advance a new qualification between participant stages, use
+`improve start --supervision continuous --run DIRECTORY --spec FILE` without
+`--prepare-only`. Each model conversation retains its native visible surface;
+the controller preserves ordinary review and independent acceptance gates.
 
 The optional `semantic_review` declaration adds one independent read-only
 reviewer after the ordinary lead `ACCEPT` and the retained final executor
@@ -1197,8 +1229,8 @@ and the selected profile must resolve an explicit model and reasoning effort.
 It also takes an absolute frozen `criteria: {path, sha256}` file, up to 32
 declared relative `sources` reproduced at the submitted revision, and a
 finite `max_corrections` of 0 or 1. Omitting the declaration preserves the
-program-only route and its serialized digest. The reviewer is installed into
-its own fresh home; the implementation runtime stays writable and shared user
+program-only route and its serialized digest. The reviewer uses its own fresh
+home unless its completed runtime is explicitly adopted as above; the implementation runtime stays writable and shared user
 configuration is never changed. The frozen packet contains the actual task
 prompt, the submitted result, the declared sources, bounded participant/action
 evidence and a manifest with the exact revisions, hashes and physical line
