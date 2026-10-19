@@ -2460,6 +2460,7 @@ fn baseline_qualification_requires_frozen_task_and_one_explicit_runtime_route() 
             client: None,
             native_config: Some(identity(&config)),
             private_inputs: Vec::new(),
+            reuse: None,
         },
         acceptance: comparison.acceptance,
         workflow: workflow_fixture(1, 2),

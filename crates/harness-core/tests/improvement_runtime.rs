@@ -15,8 +15,10 @@ use harness_core::{
     build_identity, build_selection,
     improvement_experiment::{Arm, prepare_home, prepare_variant, select_variant},
     improvement_runtime::{
-        ArmRequest, ClientInputs, PrivateInput, discard_arm, install_arm, retire_arm, select_arm,
-        verify_consumption, verify_consumption_with_trust,
+        AdoptionClaimStatus, ArmRequest, ClientInputs, FileIdentity, PrivateInput,
+        acquire_adoption_claim, discard_arm, install_arm, require_adoption_claim, retire_arm,
+        select_arm, settle_adoption_claim, verify_adoption_placement, verify_consumption,
+        verify_consumption_with_trust,
     },
     outcome_qualification::{LocalRunner, MaterialIdentity},
 };
@@ -2089,4 +2091,145 @@ fn prepared_arm_selection_cycles_without_source_rebuild_or_model_call() {
 
     retire_arm(&baseline_runtime).unwrap();
     retire_arm(&candidate_runtime).unwrap();
+}
+
+#[test]
+fn adoption_claims_are_exclusive_durable_and_same_owner_recoverable() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime_path = root.path().join("runtime.json");
+    let cursor_path = root.path().join("cursor.json");
+    fs::write(&runtime_path, b"retained runtime receipt\n").unwrap();
+    fs::write(&cursor_path, b"completed origin cursor\n").unwrap();
+    let runtime = FileIdentity {
+        path: runtime_path.clone(),
+        sha256: build_identity::hash_file(&runtime_path).unwrap(),
+    };
+    let cursor = FileIdentity {
+        path: cursor_path.clone(),
+        sha256: build_identity::hash_file(&cursor_path).unwrap(),
+    };
+    let spec_a = "a".repeat(64);
+    let spec_b = "b".repeat(64);
+
+    let claimed = acquire_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(claimed.status, AdoptionClaimStatus::Active);
+    assert_eq!(claimed.run, "run-a");
+
+    // An old update timestamp is not a lease expiry: only the owner can settle
+    // or resume the claim.
+    let ledger_path = runtime_path.with_file_name("runtime.json.adoption.json");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    ledger["claims"][0]["updatedMs"] = serde_json::json!(1);
+    fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    let error = acquire_adoption_claim(&runtime, &cursor, "run-b", &spec_b, "ordinary")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("actively adopted by run run-a"), "{error}");
+    assert_eq!(
+        fs::read(&ledger_path).unwrap(),
+        serde_json::to_vec_pretty(&ledger).unwrap()
+    );
+
+    let resumed = require_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(resumed.status, AdoptionClaimStatus::Active);
+    assert!(resumed.updated_ms > 1);
+
+    let stopped = settle_adoption_claim(&runtime, "run-a", AdoptionClaimStatus::Stopped)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, AdoptionClaimStatus::Stopped);
+    assert!(stopped.settled_ms.is_some());
+    let reactivated =
+        require_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(reactivated.status, AdoptionClaimStatus::Active);
+    assert!(reactivated.settled_ms.is_none());
+
+    settle_adoption_claim(&runtime, "run-a", AdoptionClaimStatus::Completed).unwrap();
+    let completed =
+        require_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(completed.status, AdoptionClaimStatus::Completed);
+    let error = acquire_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already settled"), "{error}");
+
+    let second = acquire_adoption_claim(&runtime, &cursor, "run-b", &spec_b, "ordinary").unwrap();
+    assert_eq!(second.status, AdoptionClaimStatus::Active);
+    settle_adoption_claim(&runtime, "run-b", AdoptionClaimStatus::Completed).unwrap();
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    assert_eq!(ledger["claims"].as_array().unwrap().len(), 2, "{ledger}");
+    assert!(ledger["claims"].as_array().unwrap().iter().all(|claim| {
+        claim["status"] == "completed" && claim["runtime"]["sha256"] == runtime.sha256
+    }));
+}
+
+#[test]
+fn adoption_placement_admits_an_owned_home_without_weakening_guards() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-adoption-placement-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let fixture = arm_fixture(
+        root,
+        &state,
+        "adoption",
+        Arm::Baseline,
+        "H",
+        "baseline",
+        &fixtures.launcher,
+        &fixtures.upstream,
+    );
+    let runtime = install_arm(&fixture.request).unwrap();
+    let installation_path = runtime.home.join("harness/installation.json");
+    let config_path = runtime.home.join("config.toml");
+    let installation = fs::read(&installation_path).unwrap();
+    let configuration = fs::read(&config_path).unwrap();
+
+    verify_adoption_placement(&runtime, &[]).unwrap();
+    assert_eq!(fs::read(&installation_path).unwrap(), installation);
+    assert_eq!(fs::read(&config_path).unwrap(), configuration);
+
+    let error =
+        verify_adoption_placement(&runtime, &[runtime.home.parent().unwrap().to_path_buf()])
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("protected experiment allocation"), "{error}");
+
+    let ambient = EnvironmentGuard::capture("CODEX_HOME");
+    ambient.set(&runtime.home);
+    let error = verify_adoption_placement(&runtime, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ambient Codex home"), "{error}");
+    drop(ambient);
+
+    let override_path = runtime.home.join("AGENTS.override.md");
+    fs::write(&override_path, "shadow the prepared instructions\n").unwrap();
+    let error = verify_adoption_placement(&runtime, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("AGENTS override"), "{error}");
+    fs::remove_file(&override_path).unwrap();
+
+    let mut missing = runtime.clone();
+    missing.home = prepare_home(&root.join("homes/never-installed")).unwrap();
+    let error = verify_adoption_placement(&missing, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no retained installation record"), "{error}");
+
+    let error = install_arm(&fixture.request).unwrap_err().to_string();
+    assert!(error.contains("already carries an installation"), "{error}");
+    assert_eq!(fs::read(&installation_path).unwrap(), installation);
+    assert_eq!(fs::read(&config_path).unwrap(), configuration);
 }

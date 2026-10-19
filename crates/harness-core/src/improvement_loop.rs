@@ -729,6 +729,53 @@ impl ComparisonInputs {
     }
 }
 
+/// The exact retained identities that let one sequential qualification run
+/// adopt an already prepared home from a completed run. Both files are
+/// verified by digest before any local preparation or participant dispatch.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationRuntimeReuse {
+    /// The retained ordinary or reviewer runtime receipt being adopted.
+    pub runtime: crate::improvement_runtime::FileIdentity,
+    /// The completed origin run's terminal cursor. It binds the receipt, the
+    /// participant bindings and the frozen provenance of workspace trust.
+    pub cursor: crate::improvement_runtime::FileIdentity,
+}
+
+/// The role whose occupied native home one sequential run adopts. Ordinary
+/// implementation and reviewer homes remain distinct ownership domains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QualificationRuntimeRole {
+    Ordinary,
+    Reviewer,
+}
+
+impl QualificationRuntimeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Reviewer => "reviewer",
+        }
+    }
+}
+
+/// Persisted proof that one role consumed its exact retained runtime receipt
+/// and every workspace trust entry that receipt may legitimately carry. The
+/// trusted paths are derived from frozen prior role attempts and recursively
+/// from the origin's own adoption record, never from caller-declared lists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationRuntimeAdoption {
+    pub role: QualificationRuntimeRole,
+    pub runtime: crate::improvement_runtime::FileIdentity,
+    pub origin_cursor: crate::improvement_runtime::FileIdentity,
+    pub origin_spec_digest: String,
+    pub origin_declaration_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_workspaces: Vec<PathBuf>,
+}
+
 /// One immutable runtime prepared for an ordinary control workflow.
 /// Local comparisons retain their explicit route; native role workflows use
 /// a frozen base configuration and explicitly named private profile/auth files.
@@ -749,9 +796,23 @@ pub struct QualificationRuntimeInputs {
     /// existing runtime owner validates destinations and retains their hashes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_inputs: Vec<crate::improvement_runtime::PrivateInput>,
+    /// Explicit sequential adoption from a completed, unchanged native home.
+    /// Omitted reuse keeps the existing fresh-install route and serialized
+    /// declaration bytes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<QualificationRuntimeReuse>,
 }
 
 impl QualificationRuntimeInputs {
+    /// The declaration with its adoption link removed. Sequential adoption
+    /// compares this form so every generation keeps the same underlying
+    /// native runtime declaration even though its origin link differs.
+    pub fn without_reuse(&self) -> Self {
+        let mut declaration = self.clone();
+        declaration.reuse = None;
+        declaration
+    }
+
     pub fn validate(&self) -> io::Result<()> {
         absolute_directory("the prepared qualification runtime state", &self.state)?;
         if !self.build.is_absolute() {
@@ -805,6 +866,35 @@ impl QualificationRuntimeInputs {
             _ => {
                 return Err(invalid(
                     "qualification requires exactly one declared local client or frozen native configuration; no implicit model route is selected",
+                ));
+            }
+        }
+        if let Some(reuse) = &self.reuse {
+            if !reuse.runtime.path.is_absolute() || !reuse.runtime.path.is_file() {
+                return Err(invalid(
+                    "the adopted qualification runtime receipt is missing or not absolute",
+                ));
+            }
+            if !reuse.cursor.path.is_absolute() || !reuse.cursor.path.is_file() {
+                return Err(invalid(
+                    "the adopted qualification origin cursor is missing or not absolute",
+                ));
+            }
+            for (name, identity, limit) in [
+                ("runtime receipt", &reuse.runtime, MAX_RUN_SPEC_BYTES),
+                ("origin cursor", &reuse.cursor, MAX_CURSOR_BYTES),
+            ] {
+                if fs::metadata(&identity.path)?.len() > limit
+                    || crate::build_identity::hash_file(&identity.path)? != identity.sha256
+                {
+                    return Err(invalid(format!(
+                        "the adopted qualification {name} changed; supply its exact retained identity"
+                    )));
+                }
+            }
+            if reuse.runtime.path == reuse.cursor.path {
+                return Err(invalid(
+                    "the adopted runtime receipt and origin cursor must be distinct files",
                 ));
             }
         }
@@ -1065,6 +1155,19 @@ impl BaselineQualificationInputs {
         }
         if let Some(review) = &self.semantic_review {
             review.validate()?;
+            match (&self.runtime.reuse, &review.runtime.reuse) {
+                (None, Some(_)) => {
+                    return Err(invalid(
+                        "a semantic reviewer cannot adopt a retained runtime while the ordinary implementation runtime is prepared fresh; both occupy the same consent decision",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(invalid(
+                        "the declared semantic reviewer must adopt its retained runtime together with the ordinary implementation runtime; a fresh reviewer would request new native consent",
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -2717,6 +2820,10 @@ pub struct SemanticReviewState {
     pub findings: Option<u64>,
     #[serde(default)]
     pub unresolved_issues: Option<u64>,
+    /// The retained reviewer home and workspace provenance when this run
+    /// adopted a completed prior reviewer runtime instead of installing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<QualificationRuntimeAdoption>,
 }
 
 /// One participant binding resolved from the installed configuration before
@@ -2819,6 +2926,10 @@ pub struct BaselineQualificationState {
     /// Omitted cursors retain the legacy program-only route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_review: Option<SemanticReviewState>,
+    /// The retained ordinary home and workspace provenance when this run
+    /// adopted a completed prior ordinary runtime instead of installing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<QualificationRuntimeAdoption>,
     #[serde(default)]
     pub prepared_ms: Option<u64>,
 }
@@ -2831,6 +2942,66 @@ impl BaselineQualificationState {
             capacity,
             ..Self::default()
         }
+    }
+
+    /// The retained runtime receipt that owns this role's home.
+    pub fn role_runtime_path(&self, role: QualificationRuntimeRole) -> Option<&Path> {
+        match role {
+            QualificationRuntimeRole::Ordinary => self.runtime.as_deref(),
+            QualificationRuntimeRole::Reviewer => self
+                .semantic_review
+                .as_ref()
+                .and_then(|review| review.runtime.as_deref()),
+        }
+    }
+
+    /// The recorded adoption link for this role, if the run adopted a
+    /// completed prior home instead of installing one.
+    pub fn role_adoption(
+        &self,
+        role: QualificationRuntimeRole,
+    ) -> Option<&QualificationRuntimeAdoption> {
+        match role {
+            QualificationRuntimeRole::Ordinary => self.adoption.as_ref(),
+            QualificationRuntimeRole::Reviewer => self
+                .semantic_review
+                .as_ref()
+                .and_then(|review| review.adoption.as_ref()),
+        }
+    }
+
+    /// Record one role's adoption link. Repeating the same derived record is
+    /// accepted; a changed record refuses instead of repointing retained
+    /// provenance.
+    pub fn set_role_adoption(
+        &mut self,
+        role: QualificationRuntimeRole,
+        adoption: QualificationRuntimeAdoption,
+    ) -> io::Result<()> {
+        if adoption.role != role {
+            return Err(invalid(
+                "an adoption record must retain the role whose home it consumes",
+            ));
+        }
+        if let Some(existing) = self.role_adoption(role) {
+            return if existing == &adoption {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "the retained runtime adoption provenance changed; preserve the run instead of repointing it",
+                ))
+            };
+        }
+        match role {
+            QualificationRuntimeRole::Ordinary => self.adoption = Some(adoption),
+            QualificationRuntimeRole::Reviewer => {
+                let review = self.semantic_review.as_mut().ok_or_else(|| {
+                    invalid("the reviewer adoption has no retained semantic review state")
+                })?;
+                review.adoption = Some(adoption);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3147,6 +3318,524 @@ impl Cursor {
         self.updated_ms = now_ms();
         Ok(())
     }
+}
+
+/// The bound on a retained adoption chain. A sequential qualification may
+/// follow earlier adoptions, but the chain is recovery data and must stay
+/// finite; a longer chain is refused instead of being walked indefinitely.
+const MAX_ADOPTION_CHAIN: usize = 64;
+
+/// One verified completed origin run whose occupied home a sequential
+/// qualification adopts. The runtime receipt and the origin cursor/state are
+/// retained so the caller can bind the origin's frozen participant identities
+/// before any effect.
+#[derive(Clone, Debug)]
+pub struct QualificationAdoptionOrigin {
+    pub adoption: QualificationRuntimeAdoption,
+    pub runtime: crate::improvement_runtime::ArmRuntime,
+    pub cursor: Cursor,
+    pub state: BaselineQualificationState,
+}
+
+fn same_retained_place(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = fs::canonicalize(left)?;
+    let right = fs::canonicalize(right)?;
+    Ok(crate::improvement_runtime::trust_workspace_key(&left)
+        == crate::improvement_runtime::trust_workspace_key(&right))
+}
+
+/// The exact workspaces one retained run's role conversations may have
+/// trusted: the run's own dispatch checkout/source plus every accepted or
+/// attempted role checkout. Reviewer provenance never borrows the ordinary
+/// checkout and ordinary provenance never borrows the reviewer source.
+fn role_workspaces(
+    cursor: &Cursor,
+    state: &BaselineQualificationState,
+    role: QualificationRuntimeRole,
+) -> Vec<PathBuf> {
+    let mut workspaces = Vec::new();
+    match role {
+        QualificationRuntimeRole::Ordinary => {
+            if let Some(checkout) = &state.checkout {
+                workspaces.push(checkout.clone());
+            }
+            for attempt in &cursor.attempts {
+                if matches!(
+                    attempt.role,
+                    AttemptRole::LeadFrame
+                        | AttemptRole::Executor
+                        | AttemptRole::LeadReview
+                        | AttemptRole::Correction
+                        | AttemptRole::LeadAcceptance
+                ) && let Some(checkout) = &attempt.checkout
+                {
+                    workspaces.push(checkout.clone());
+                }
+            }
+        }
+        QualificationRuntimeRole::Reviewer => {
+            if let Some(source) = state
+                .semantic_review
+                .as_ref()
+                .and_then(|review| review.source.clone())
+            {
+                workspaces.push(source);
+            }
+            for attempt in &cursor.attempts {
+                if attempt.role == AttemptRole::SemanticReview
+                    && let Some(checkout) = &attempt.checkout
+                {
+                    workspaces.push(checkout.clone());
+                }
+            }
+        }
+    }
+    workspaces
+}
+
+/// Verify and normalize one provenance set. Every workspace must still be an
+/// ordinary retained directory; a missing checkout, a file, or a relative
+/// path is a changed provenance record and refuses before effects.
+fn validated_workspaces(workspaces: Vec<PathBuf>, description: &str) -> io::Result<Vec<PathBuf>> {
+    for workspace in &workspaces {
+        if !workspace.is_absolute() || !workspace.is_dir() {
+            return Err(invalid(format!(
+                "the {description} at {} is missing or not an absolute retained workspace; preserve the origin checkouts",
+                workspace.display()
+            )));
+        }
+    }
+    let mut keyed = std::collections::BTreeMap::new();
+    for workspace in workspaces {
+        keyed
+            .entry(crate::improvement_runtime::trust_workspace_key(&workspace))
+            .or_insert(workspace);
+    }
+    Ok(keyed.into_values().collect())
+}
+
+struct OriginRun {
+    cursor_path: PathBuf,
+    cursor: Cursor,
+    spec: RunSpec,
+    state: BaselineQualificationState,
+}
+
+/// Load and verify one completed origin cursor and its sibling frozen spec.
+/// This is read-only and performs every origin gate before the caller acquires
+/// a claim, installs anything or dispatches a participant.
+fn load_origin_run(
+    cursor_path: &Path,
+    cursor_identity: &crate::improvement_runtime::FileIdentity,
+) -> io::Result<OriginRun> {
+    if cursor_path.file_name().and_then(|name| name.to_str()) != Some(CURSOR_FILE) {
+        return Err(invalid(format!(
+            "the adopted origin must name the retained run's {CURSOR_FILE}, not {}",
+            cursor_path.display()
+        )));
+    }
+    if crate::build_identity::hash_file(cursor_path)? != cursor_identity.sha256 {
+        return Err(invalid(
+            "the adopted origin cursor changed; supply its exact retained identity",
+        ));
+    }
+    let cursor: Cursor = read_json(cursor_path, MAX_CURSOR_BYTES)?;
+    if cursor.schema != CURSOR_SCHEMA {
+        return Err(invalid(
+            "the adopted origin cursor has an unsupported schema",
+        ));
+    }
+    let spec_path = cursor_path.with_file_name(SPEC_FILE);
+    let spec = RunSpec::load(&spec_path)?;
+    if cursor.run != spec.run {
+        return Err(invalid(
+            "the adopted origin cursor and frozen spec name different runs",
+        ));
+    }
+    if cursor.spec_digest != spec.digest()? {
+        return Err(invalid(
+            "the adopted origin spec changed after the origin started; its cursor no longer binds the frozen inputs",
+        ));
+    }
+    let declaration = spec
+        .baseline_qualification
+        .as_ref()
+        .ok_or_else(|| invalid("the adopted origin declares no baseline qualification"))?;
+    let state = cursor
+        .baseline_qualification
+        .clone()
+        .ok_or_else(|| invalid("the adopted origin retains no qualification state"))?;
+    if state.schema != BASELINE_QUALIFICATION_STATE_SCHEMA {
+        return Err(invalid(
+            "the adopted origin qualification state has an unsupported schema",
+        ));
+    }
+    if state.declaration_digest != declaration.digest()? {
+        return Err(invalid(
+            "the adopted origin state no longer binds its frozen declaration",
+        ));
+    }
+    if cursor.phase != Phase::BaselineQualificationRecorded {
+        return Err(invalid(format!(
+            "the adopted origin is in phase {} instead of the completed baseline-qualification-recorded phase",
+            cursor.phase.as_str()
+        )));
+    }
+    if !state.workflow.completed {
+        return Err(invalid(
+            "the adopted origin did not complete its participant workflow",
+        ));
+    }
+    if state.accepted.is_none() {
+        return Err(invalid(
+            "the adopted origin recorded no completed acceptance result",
+        ));
+    }
+    let row = state
+        .row
+        .as_ref()
+        .ok_or_else(|| invalid("the adopted origin retained no accounting row"))?;
+    if !row.is_absolute() || !row.is_file() {
+        return Err(invalid(format!(
+            "the adopted origin accounting row {} is missing; preserve it before adopting the home",
+            row.display()
+        )));
+    }
+    for attempt in &cursor.attempts {
+        if attempt.state.is_in_flight() || attempt.state == AttemptState::Unknown {
+            return Err(invalid(format!(
+                "the adopted origin attempt {} is {}; its effect is not terminal, so the home cannot be adopted",
+                attempt.id,
+                attempt.state.as_str()
+            )));
+        }
+    }
+    Ok(OriginRun {
+        cursor_path: cursor_path.to_path_buf(),
+        cursor,
+        spec,
+        state,
+    })
+}
+
+/// Derive and verify the complete workspace provenance of one role. The
+/// immediate origin contributes its frozen attempts and checkouts; every
+/// earlier adoption contributes exactly the workspaces its own record
+/// retained. A missing, changed, foreign, or cyclic link refuses instead of
+/// widening the trust allowance.
+fn chain_workspaces(
+    run: &OriginRun,
+    role: QualificationRuntimeRole,
+    expected_runtime: &Path,
+    visited: &mut std::collections::BTreeSet<String>,
+    depth: usize,
+) -> io::Result<Vec<PathBuf>> {
+    if depth > MAX_ADOPTION_CHAIN {
+        return Err(invalid(format!(
+            "the retained adoption chain exceeds {MAX_ADOPTION_CHAIN} links; preserve it instead of adopting an unbounded history"
+        )));
+    }
+    let key = format!(
+        "{}:{}",
+        crate::improvement_runtime::trust_workspace_key(&run.cursor_path),
+        run.cursor.spec_digest
+    );
+    if !visited.insert(key) {
+        return Err(invalid(
+            "the retained adoption provenance is cyclic; preserve the runs instead of adopting through a loop",
+        ));
+    }
+    let mut workspaces = role_workspaces(&run.cursor, &run.state, role);
+    if let Some(adoption) = run.state.role_adoption(role) {
+        if adoption.role != role {
+            return Err(invalid(format!(
+                "the retained {} adoption record names role {}; cross-role home sharing is refused",
+                role.as_str(),
+                adoption.role.as_str()
+            )));
+        }
+        let runtime = crate::improvement_runtime::normalized_adoption_identity(&adoption.runtime)?;
+        if !same_retained_place(&runtime.path, expected_runtime)? {
+            return Err(invalid(
+                "the retained adoption chain points at a different runtime receipt; preserve the original home",
+            ));
+        }
+        let recorded_runtime = run.state.role_runtime_path(role).ok_or_else(|| {
+            invalid(format!(
+                "the retained {} adoption records no runtime receipt",
+                role.as_str()
+            ))
+        })?;
+        if !same_retained_place(recorded_runtime, &runtime.path)? {
+            return Err(invalid(format!(
+                "the retained {} adoption no longer names this run's runtime receipt",
+                role.as_str()
+            )));
+        }
+        let ancestor_identity =
+            crate::improvement_runtime::normalized_adoption_identity(&adoption.origin_cursor)?;
+        let ancestor = load_origin_run(&ancestor_identity.path, &ancestor_identity)?;
+        if ancestor.cursor.spec_digest != adoption.origin_spec_digest {
+            return Err(invalid(
+                "the retained adoption origin spec digest changed; preserve the provenance instead of reusing it",
+            ));
+        }
+        let ancestor_declaration = ancestor
+            .spec
+            .baseline_qualification
+            .as_ref()
+            .ok_or_else(|| invalid("the adopted ancestor declares no baseline qualification"))?;
+        if ancestor_declaration.digest()? != adoption.origin_declaration_digest {
+            return Err(invalid(
+                "the retained adoption origin declaration changed; preserve the provenance instead of reusing it",
+            ));
+        }
+        let recorded_ancestor_runtime =
+            ancestor.state.role_runtime_path(role).ok_or_else(|| {
+                invalid(format!(
+                    "the adopted ancestor retains no {} runtime",
+                    role.as_str()
+                ))
+            })?;
+        if !same_retained_place(recorded_ancestor_runtime, &runtime.path)? {
+            return Err(invalid(
+                "the retained adoption ancestor no longer binds the same runtime receipt",
+            ));
+        }
+        let inherited = chain_workspaces(&ancestor, role, expected_runtime, visited, depth + 1)?;
+        let retained = validated_workspaces(
+            adoption.trusted_workspaces.clone(),
+            "recorded adoption provenance",
+        )?;
+        if retained != inherited {
+            return Err(invalid(
+                "the retained adoption provenance changed; derive it again from the frozen origin attempts instead of editing it",
+            ));
+        }
+        workspaces.extend(inherited);
+    }
+    validated_workspaces(workspaces, "retained role workspace")
+}
+
+/// Bind one retained runtime receipt to the exact non-reuse declaration it was
+/// prepared from. Every value the origin declaration could have changed is
+/// checked here; the live configuration and hook trust are then verified by
+/// the existing consumption owner at the same absolute home.
+fn bind_origin_receipt(
+    declaration: &QualificationRuntimeInputs,
+    runtime: &crate::improvement_runtime::ArmRuntime,
+) -> io::Result<()> {
+    if runtime.arm != crate::improvement_experiment::Arm::Baseline {
+        return Err(invalid(
+            "the adopted runtime is not the baseline control arm; candidate home sharing is refused",
+        ));
+    }
+    if runtime.label != declaration.label {
+        return Err(invalid(
+            "the adopted runtime label does not match the frozen declaration",
+        ));
+    }
+    if !same_retained_place(&runtime.variant.build, &declaration.build)? {
+        return Err(invalid(
+            "the adopted runtime build differs from the frozen declaration",
+        ));
+    }
+    if !same_retained_place(&runtime.upstream, &declaration.upstream)? {
+        return Err(invalid(
+            "the adopted runtime upstream client differs from the frozen declaration",
+        ));
+    }
+    if runtime.upstream_sha256 != crate::build_identity::hash_file(&declaration.upstream)? {
+        return Err(invalid(
+            "the adopted runtime upstream client changed since preparation",
+        ));
+    }
+    if runtime.private.len() != declaration.private_inputs.len() {
+        return Err(invalid(
+            "the adopted runtime retains a different set of private inputs than the frozen declaration",
+        ));
+    }
+    for input in &declaration.private_inputs {
+        let recorded = runtime
+            .private
+            .iter()
+            .find(|private| private.destination == input.destination)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "the adopted runtime retains no private input {} from the frozen declaration",
+                    input.destination
+                ))
+            })?;
+        if recorded.sha256 != crate::build_identity::hash_file(&input.source)? {
+            return Err(invalid(format!(
+                "the frozen private input {} changed since the origin prepared it",
+                input.destination
+            )));
+        }
+    }
+    match (&declaration.client, &declaration.native_config) {
+        (Some(client), None) => {
+            let configuration = runtime.configuration.as_ref().ok_or_else(|| {
+                invalid("the adopted runtime retains no client configuration receipt")
+            })?;
+            if !same_retained_place(&configuration.path, &runtime.home.join("config.toml"))? {
+                return Err(invalid(
+                    "the adopted runtime client configuration is not its owned home configuration",
+                ));
+            }
+            let recorded = configuration.client.as_ref().ok_or_else(|| {
+                invalid("the adopted runtime no longer records the declared client route")
+            })?;
+            if recorded.runner != crate::outcome_qualification::RunnerRecord::new(&client.runner) {
+                return Err(invalid(
+                    "the adopted runtime client route changed since preparation",
+                ));
+            }
+            if let Some(effort) = client.reasoning_effort.as_deref()
+                && recorded.reasoning_effort.as_deref() != Some(effort)
+            {
+                return Err(invalid(
+                    "the adopted runtime reasoning effort changed since preparation",
+                ));
+            }
+            match (&client.catalogue, &recorded.catalogue) {
+                (Some(path), Some(identity)) => {
+                    if !same_retained_place(&identity.path, path)?
+                        || identity.sha256 != crate::build_identity::hash_file(path)?
+                    {
+                        return Err(invalid(
+                            "the adopted runtime catalogue changed since preparation",
+                        ));
+                    }
+                }
+                (None, None) => {}
+                (None, Some(identity)) => {
+                    if client.overlay.is_none()
+                        || identity.sha256 != crate::build_identity::hash_file(&identity.path)?
+                    {
+                        return Err(invalid(
+                            "the adopted runtime catalogue is not traceable to the frozen declaration",
+                        ));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(invalid(
+                        "the adopted runtime lost the declared catalogue reference",
+                    ));
+                }
+            }
+            match (&client.overlay, &configuration.overlay) {
+                (Some(path), Some(identity)) => {
+                    if !same_retained_place(&identity.path, path)?
+                        || identity.sha256 != crate::build_identity::hash_file(path)?
+                    {
+                        return Err(invalid(
+                            "the adopted runtime client overlay changed since preparation",
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(invalid(
+                        "the adopted runtime client overlay does not match the frozen declaration",
+                    ));
+                }
+            }
+        }
+        (None, Some(_)) => {
+            let configuration = runtime.configuration.as_ref().ok_or_else(|| {
+                invalid("the adopted native runtime retains no configuration receipt")
+            })?;
+            if configuration.client.is_some()
+                || !same_retained_place(&configuration.path, &runtime.home.join("config.toml"))?
+            {
+                return Err(invalid(
+                    "the adopted native runtime configuration is not the declared owned home configuration",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "the adopted runtime declaration must carry exactly one frozen model route",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify a completed origin and derive the exact adoption record for one
+/// frozen runtime declaration. Every check here is read-only; the caller
+/// acquires the exclusive adoption claim and then runs the existing
+/// consumption verifier before any task, oracle or participant effect.
+pub fn validate_adoption_origin(
+    role: QualificationRuntimeRole,
+    reuse: &QualificationRuntimeReuse,
+    declaration: &QualificationRuntimeInputs,
+) -> io::Result<QualificationAdoptionOrigin> {
+    let runtime_identity =
+        crate::improvement_runtime::normalized_adoption_identity(&reuse.runtime)?;
+    let cursor_identity = crate::improvement_runtime::normalized_adoption_identity(&reuse.cursor)?;
+    if same_retained_place(&runtime_identity.path, &cursor_identity.path)? {
+        return Err(invalid(
+            "the adopted runtime receipt and origin cursor must be distinct files",
+        ));
+    }
+    let origin = load_origin_run(&cursor_identity.path, &cursor_identity)?;
+    let origin_declaration = origin
+        .spec
+        .baseline_qualification
+        .as_ref()
+        .ok_or_else(|| invalid("the adopted origin declares no baseline qualification"))?;
+    let role_declaration = match role {
+        QualificationRuntimeRole::Ordinary => &origin_declaration.runtime,
+        QualificationRuntimeRole::Reviewer => {
+            &origin_declaration
+                .semantic_review
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid("the adopted origin declares no independent semantic reviewer runtime")
+                })?
+                .runtime
+        }
+    };
+    if role_declaration.without_reuse() != declaration.without_reuse() {
+        return Err(invalid(format!(
+            "the adopted {} runtime declaration differs from the origin's frozen non-reuse inputs; a changed variant, client, private input or model route needs a fresh preparation",
+            role.as_str()
+        )));
+    }
+    let recorded_runtime = origin.state.role_runtime_path(role).ok_or_else(|| {
+        invalid(format!(
+            "the adopted origin records no {} runtime receipt",
+            role.as_str()
+        ))
+    })?;
+    if !same_retained_place(recorded_runtime, &runtime_identity.path)? {
+        return Err(invalid(format!(
+            "the adopted origin does not name this {} role's retained runtime receipt; cross-role home sharing is refused",
+            role.as_str()
+        )));
+    }
+    let runtime: crate::improvement_runtime::ArmRuntime =
+        read_json(&runtime_identity.path, MAX_RUN_SPEC_BYTES)?;
+    bind_origin_receipt(declaration, &runtime)?;
+    let mut visited = std::collections::BTreeSet::new();
+    let trusted_workspaces =
+        chain_workspaces(&origin, role, &runtime_identity.path, &mut visited, 0)?;
+    let adoption = QualificationRuntimeAdoption {
+        role,
+        runtime: runtime_identity,
+        origin_cursor: cursor_identity,
+        origin_spec_digest: origin.cursor.spec_digest.clone(),
+        origin_declaration_digest: origin_declaration.digest()?,
+        trusted_workspaces,
+    };
+    Ok(QualificationAdoptionOrigin {
+        adoption,
+        runtime,
+        cursor: origin.cursor,
+        state: origin.state,
+    })
 }
 
 pub fn now_ms() -> u64 {

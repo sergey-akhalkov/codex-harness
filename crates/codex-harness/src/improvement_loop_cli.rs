@@ -1199,15 +1199,47 @@ fn print_preparation_report(run: &Run) -> io::Result<()> {
         .runtime
         .as_deref()
         .ok_or_else(|| invalid("preparation recorded no ordinary runtime receipt"))?;
+    let ordinary_adoption =
+        state.role_adoption(harness_core::improvement_loop::QualificationRuntimeRole::Ordinary);
+    let reviewer_adoption = state
+        .semantic_review
+        .as_ref()
+        .and_then(|review| review.adoption.as_ref());
     println!("prepare-only: model-free preparation complete; no model attempt was dispatched");
-    println!("ordinary home: {}", ordinary_home.display());
+    if let Some(adoption) = ordinary_adoption {
+        println!(
+            "ordinary home: {} (adopted unchanged; no installation or trust write)",
+            ordinary_home.display()
+        );
+        println!(
+            "ordinary adoption: runtime={} origin cursor={} retained workspaces={}",
+            adoption.runtime.path.display(),
+            adoption.origin_cursor.path.display(),
+            adoption.trusted_workspaces.len()
+        );
+    } else {
+        println!("ordinary home: {}", ordinary_home.display());
+    }
     match state.semantic_review.as_ref() {
         Some(review) => {
             let reviewer_home = review
                 .home
                 .as_deref()
                 .ok_or_else(|| invalid("preparation recorded no reviewer runtime home"))?;
-            println!("reviewer home: {}", reviewer_home.display());
+            if let Some(adoption) = reviewer_adoption {
+                println!(
+                    "reviewer home: {} (adopted unchanged; no installation or trust write)",
+                    reviewer_home.display()
+                );
+                println!(
+                    "reviewer adoption: runtime={} origin cursor={} retained workspaces={}",
+                    adoption.runtime.path.display(),
+                    adoption.origin_cursor.path.display(),
+                    adoption.trusted_workspaces.len()
+                );
+            } else {
+                println!("reviewer home: {}", reviewer_home.display());
+            }
         }
         None => println!("reviewer home: none declared"),
     }
@@ -1223,9 +1255,17 @@ fn print_preparation_report(run: &Run) -> io::Result<()> {
         "next: codex-harness improve resume --run \"{}\"",
         run.store.root().display()
     );
-    println!(
-        "note: preparation does not accept the task or trust native hooks; the first actual launch may still require native first-use or hook consent"
-    );
+    if ordinary_adoption.is_some()
+        && (state.semantic_review.is_none() || reviewer_adoption.is_some())
+    {
+        println!(
+            "note: every declared native home was adopted unchanged at its retained path; preparation performed no installation, connection or trust write. The unchanged token hook is already approved; a later dispatch may still append its own workspace trust entry."
+        );
+    } else {
+        println!(
+            "note: preparation does not accept the task or trust native hooks; the first actual launch may still require native first-use or hook consent"
+        );
+    }
     Ok(())
 }
 
@@ -1902,6 +1942,10 @@ fn stop(args: &[OsString]) -> io::Result<i32> {
         run.cursor.stop(&reason);
     }
     run.store.save_cursor(&run.cursor)?;
+    let settled_adoptions = improvement_qualification::settle_adoption_claims(
+        &run,
+        harness_core::improvement_runtime::AdoptionClaimStatus::Stopped,
+    )?;
 
     if already_stopped {
         println!(
@@ -1911,6 +1955,9 @@ fn stop(args: &[OsString]) -> io::Result<i32> {
         );
     } else {
         println!("improve stop: run {} stopped ({reason})", run.spec.run);
+    }
+    for note in &settled_adoptions {
+        println!("improve stop: {note}");
     }
     for (id, note) in &cleanup {
         println!("improve stop: attempt {id}: {note}");

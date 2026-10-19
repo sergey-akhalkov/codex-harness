@@ -8,10 +8,11 @@ mod assessment;
 use super::*;
 use harness_core::improvement_experiment::{ArmBinding, prepare_home, prepare_variant};
 use harness_core::improvement_loop::{
-    BaselineQualificationInputs, BaselineQualificationState, QualificationBindingIdentity,
-    SemanticReviewState, WorkflowParticipant,
+    BaselineQualificationInputs, BaselineQualificationState, QualificationAdoptionOrigin,
+    QualificationBindingIdentity, QualificationRuntimeRole, SemanticReviewState,
+    WorkflowParticipant, validate_adoption_origin,
 };
-use harness_core::improvement_runtime::{self, ArmRequest, ArmRuntime};
+use harness_core::improvement_runtime::{self, AdoptionClaimStatus, ArmRequest, ArmRuntime};
 use harness_core::task_worktree::{self, FrozenCopy};
 use serde_json::Value;
 use std::fs;
@@ -357,6 +358,220 @@ fn participant(attempt: &Attempt) -> io::Result<WorkflowParticipant> {
 fn persist(run: &mut Run, state: &BaselineQualificationState) -> io::Result<()> {
     run.cursor.baseline_qualification = Some(state.clone());
     run.store.save_cursor(&run.cursor)
+}
+
+/// Case-insensitive identity of two retained paths that must already exist.
+fn same_retained_place(left: &Path, right: &Path) -> io::Result<bool> {
+    let key = |path: &Path| {
+        Ok::<_, io::Error>(improvement_runtime::trust_workspace_key(&fs::canonicalize(
+            path,
+        )?))
+    };
+    Ok(key(left)? == key(right)?)
+}
+
+/// Acquire the exclusive adoption claim on first preparation, or require and
+/// reconcile the same run's retained claim after interruption. A different
+/// run owns no claim here and refuses before this run creates any task,
+/// checkout, oracle or participant effect.
+fn adoption_claim(
+    run: &Run,
+    state: &BaselineQualificationState,
+    role: QualificationRuntimeRole,
+    origin: &QualificationAdoptionOrigin,
+) -> io::Result<()> {
+    if let Some(recorded) = state.role_runtime_path(role)
+        && !same_retained_place(recorded, &origin.adoption.runtime.path)?
+    {
+        return Err(invalid(format!(
+            "the retained {} runtime receipt changed; preserve the run instead of repointing it",
+            role.as_str()
+        )));
+    }
+    match state.role_adoption(role) {
+        Some(recorded) if recorded != &origin.adoption => Err(invalid(format!(
+            "the retained {} adoption provenance changed; preserve the run instead of repointing it",
+            role.as_str()
+        ))),
+        Some(_) => {
+            improvement_runtime::require_adoption_claim(
+                &origin.adoption.runtime,
+                &origin.adoption.origin_cursor,
+                &run.spec.run,
+                &run.cursor.spec_digest,
+                role.as_str(),
+            )?;
+            Ok(())
+        }
+        None => {
+            improvement_runtime::acquire_adoption_claim(
+                &origin.adoption.runtime,
+                &origin.adoption.origin_cursor,
+                &run.spec.run,
+                &run.cursor.spec_digest,
+                role.as_str(),
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// Refuse any retained ordinary/reviewer receipt or home sharing. The two
+/// roles remain separate ownership domains even when they consume the same
+/// prepared build.
+fn refuse_cross_role_homes(
+    ordinary: &QualificationAdoptionOrigin,
+    reviewer: &QualificationAdoptionOrigin,
+) -> io::Result<()> {
+    for (label, left, right) in [
+        (
+            "runtime receipts",
+            &ordinary.adoption.runtime.path,
+            &reviewer.adoption.runtime.path,
+        ),
+        ("homes", &ordinary.runtime.home, &reviewer.runtime.home),
+        (
+            "user homes",
+            &ordinary.runtime.user_home,
+            &reviewer.runtime.user_home,
+        ),
+        (
+            "dependency user homes",
+            &ordinary.runtime.dependency_user_home,
+            &reviewer.runtime.dependency_user_home,
+        ),
+    ] {
+        if same_retained_place(left, right)? {
+            return Err(invalid(format!(
+                "the ordinary and independent reviewer roles must not share {label}; cross-role home reuse is refused"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Require one already resolved participant binding before an adopted home is
+/// claimed. The binding includes the role's profile, model, provider and
+/// reasoning effort, so a changed route cannot borrow the origin's consent.
+fn require_adopted_binding(
+    role: &str,
+    binding: &QualificationBindingIdentity,
+    recorded: Option<&QualificationBindingIdentity>,
+) -> io::Result<()> {
+    if binding
+        .model
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        || binding
+            .reasoning_effort
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(invalid(format!(
+            "the adopted {role} profile must resolve an explicit model and reasoning effort"
+        )));
+    }
+    if recorded != Some(binding) {
+        return Err(invalid(format!(
+            "the adopted {role} profile/model/provider/effort differs from the completed origin; a changed participant role needs a fresh home"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_adopted_ordinary_bindings(
+    inputs: &BaselineQualificationInputs,
+    origin: &QualificationAdoptionOrigin,
+) -> io::Result<()> {
+    let lead = QualificationBindingIdentity::of(&orchestration_config::binding(
+        &origin.runtime.home,
+        &inputs.workflow.lead_profile,
+    )?);
+    let executor = QualificationBindingIdentity::of(&orchestration_config::binding(
+        &origin.runtime.home,
+        &inputs.workflow.executor_profile,
+    )?);
+    require_adopted_binding("lead", &lead, origin.state.lead_binding.as_ref())?;
+    require_adopted_binding(
+        "executor",
+        &executor,
+        origin.state.executor_binding.as_ref(),
+    )
+}
+
+fn verify_adopted_reviewer_binding(
+    inputs: &BaselineQualificationInputs,
+    origin: &QualificationAdoptionOrigin,
+) -> io::Result<()> {
+    let declaration = inputs.semantic_review.as_ref().ok_or_else(|| {
+        invalid("the adopted reviewer runtime has no semantic review declaration")
+    })?;
+    let binding = QualificationBindingIdentity::of(&orchestration_config::binding(
+        &origin.runtime.home,
+        &declaration.profile,
+    )?);
+    require_adopted_binding(
+        "semantic reviewer",
+        &binding,
+        origin
+            .state
+            .semantic_review
+            .as_ref()
+            .and_then(|review| review.binding.as_ref()),
+    )
+}
+
+/// Settle every retained adoption claim after completion or stop. Other runs'
+/// claims, pending effects and prior evidence remain untouched.
+pub(super) fn settle_adoption_claims(
+    run: &Run,
+    status: AdoptionClaimStatus,
+) -> io::Result<Vec<String>> {
+    let mut runtimes = Vec::new();
+    if let Some(state) = run.cursor.baseline_qualification.as_ref() {
+        for role in [
+            QualificationRuntimeRole::Ordinary,
+            QualificationRuntimeRole::Reviewer,
+        ] {
+            if let Some(adoption) = state.role_adoption(role) {
+                runtimes.push(adoption.runtime.clone());
+            }
+        }
+    }
+    // A failed prepared attempt may have acquired its claim before the role
+    // state was persisted. The frozen declaration still identifies this run's
+    // own ledger entry, so an explicit stop can settle it without touching a
+    // different adopter.
+    if let Some(declaration) = run.spec.baseline_qualification.as_ref() {
+        if let Some(reuse) = &declaration.runtime.reuse {
+            runtimes.push(reuse.runtime.clone());
+        }
+        if let Some(reuse) = declaration
+            .semantic_review
+            .as_ref()
+            .and_then(|review| review.runtime.reuse.as_ref())
+        {
+            runtimes.push(reuse.runtime.clone());
+        }
+    }
+    let mut notes = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for runtime in runtimes {
+        if !seen.insert(improvement_runtime::trust_workspace_key(&runtime.path)) {
+            continue;
+        }
+        if let Some(claim) =
+            improvement_runtime::settle_adoption_claim(&runtime, &run.spec.run, status)?
+        {
+            notes.push(format!(
+                "adoption claim role={} runtime={} status={}",
+                claim.role,
+                claim.runtime.path.display(),
+                status.as_str()
+            ));
+        }
+    }
+    Ok(notes)
 }
 
 fn pending(attempt: &Attempt) -> Vec<String> {
@@ -3430,10 +3645,12 @@ fn finalize(
         state.accepted = Some(accepted);
         run.cursor.phase = Phase::BaselineQualificationRecorded;
         persist(run, state)?;
-        return Ok(vec![format!(
+        let mut notes = vec![format!(
             "ordinary baseline result retained at {}; no comparison policy or candidate has been qualified",
             row_path.display()
-        )]);
+        )];
+        notes.extend(settle_adoption_claims(run, AdoptionClaimStatus::Completed)?);
+        return Ok(notes);
     }
 
     // Each exact participant session contributes native usage once even when
@@ -3675,10 +3892,12 @@ fn finalize(
         ),
     );
     persist(run, state)?;
-    Ok(vec![format!(
+    let mut notes = vec![format!(
         "ordinary baseline independently checked (accepted={accepted}); native workflow usage retained at {}",
         row_path.display()
-    )])
+    )];
+    notes.extend(settle_adoption_claims(run, AdoptionClaimStatus::Completed)?);
+    Ok(notes)
 }
 
 fn load_retained_acceptance(
@@ -4142,6 +4361,7 @@ fn prepare_semantic_review(
     inputs: &BaselineQualificationInputs,
     state: &mut BaselineQualificationState,
     runtime: &ArmRuntime,
+    reviewer_origin: Option<&QualificationAdoptionOrigin>,
 ) -> io::Result<Option<ArmRuntime>> {
     let Some(declaration) = inputs.semantic_review.as_ref() else {
         return Ok(None);
@@ -4149,14 +4369,33 @@ fn prepare_semantic_review(
     let root = run.store.root().join("baseline-qualification/reviewer");
     let runtime_path = root.join("runtime.json");
     let mut review = state.semantic_review.take().unwrap_or_default();
+    let expected_runtime = reviewer_origin
+        .map(|origin| origin.adoption.runtime.path.as_path())
+        .unwrap_or(&runtime_path);
     if let Some(recorded) = &review.runtime
-        && recorded != &runtime_path
+        && recorded != expected_runtime
     {
         return Err(invalid(
             "the retained semantic reviewer runtime receipt changed; preserve the run instead of repointing it",
         ));
     }
-    let reviewer: ArmRuntime = if runtime_path.is_file() {
+    let reviewer: ArmRuntime = if let Some(origin) = reviewer_origin {
+        let local_installation = [
+            runtime_path.clone(),
+            root.join("home"),
+            root.join("home-user"),
+            root.join("home-dep"),
+        ]
+        .into_iter()
+        .any(|path| path.exists());
+        if local_installation {
+            return Err(invalid(format!(
+                "the adopted semantic reviewer retains local installation state at {}; preserve it instead of mixing installation with adoption",
+                root.display()
+            )));
+        }
+        origin.runtime.clone()
+    } else if runtime_path.is_file() {
         let retained: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
         if retained.label != declaration.runtime.label
             || retained.variant.build != declaration.runtime.build.canonicalize()?
@@ -4236,7 +4475,12 @@ fn prepare_semantic_review(
             "the semantic reviewer model/provider/effort changed after preparation; preserve the run instead of selecting a fallback",
         ));
     }
-    let mut trusted = Vec::new();
+    if let Some(origin) = reviewer_origin {
+        verify_adopted_reviewer_binding(inputs, origin)?;
+    }
+    let mut trusted = reviewer_origin
+        .map(|origin| origin.adoption.trusted_workspaces.clone())
+        .unwrap_or_default();
     for attempt in &run.cursor.attempts {
         if attempt.role == AttemptRole::SemanticReview
             && let Some(checkout) = &attempt.checkout
@@ -4244,10 +4488,24 @@ fn prepare_semantic_review(
             trusted.push(checkout.clone());
         }
     }
-    improvement_runtime::verify_consumption_with_trust(&reviewer, &trusted)?;
-    review.runtime = Some(runtime_path);
+    if reviewer_origin.is_none() {
+        improvement_runtime::verify_consumption_with_trust(&reviewer, &trusted)?;
+    }
+    review.runtime = Some(expected_runtime.to_path_buf());
     review.home = Some(reviewer.home.clone());
     review.binding = Some(binding);
+    if let Some(origin) = reviewer_origin {
+        if review
+            .adoption
+            .as_ref()
+            .is_some_and(|recorded| recorded != &origin.adoption)
+        {
+            return Err(invalid(
+                "the retained semantic reviewer adoption provenance changed; preserve the run instead of repointing it",
+            ));
+        }
+        review.adoption = Some(origin.adoption.clone());
+    }
     state.semantic_review = Some(review);
     persist(run, state)?;
     Ok(Some(reviewer))
@@ -4273,15 +4531,176 @@ fn ensure_prepared(
             "qualification report already exists without this run's ownership; no participant was dispatched",
         ));
     }
-    if let Some(parent) = inputs.report.parent() {
-        fs::create_dir_all(parent)?;
+
+    // Every declared adoption origin is verified read-only before this run
+    // creates a report parent, task copy, checkout or oracle. The completed
+    // origin, exact receipt identities, frozen non-reuse declaration and
+    // derived provenance chain must all bind before any local effect.
+    let ordinary_origin = inputs
+        .runtime
+        .reuse
+        .as_ref()
+        .map(|reuse| {
+            validate_adoption_origin(QualificationRuntimeRole::Ordinary, reuse, &inputs.runtime)
+        })
+        .transpose()?;
+    let reviewer_origin = match (&inputs.semantic_review, &inputs.runtime.reuse) {
+        (Some(declaration), Some(_)) => {
+            let reuse = declaration.runtime.reuse.as_ref().ok_or_else(|| {
+                invalid(
+                    "the declared semantic reviewer must adopt its retained runtime together with the ordinary implementation runtime",
+                )
+            })?;
+            Some(validate_adoption_origin(
+                QualificationRuntimeRole::Reviewer,
+                reuse,
+                &declaration.runtime,
+            )?)
+        }
+        (Some(declaration), None) if declaration.runtime.reuse.is_some() => {
+            return Err(invalid(
+                "a semantic reviewer cannot adopt a retained runtime while the ordinary implementation runtime is prepared fresh; both occupy the same consent decision",
+            ));
+        }
+        _ => None,
+    };
+    if let Some(reuse) = &inputs.runtime.reuse {
+        let own = run.store.root().join(CURSOR_FILE);
+        if own.is_file() && same_retained_place(&own, &reuse.cursor.path)? {
+            return Err(invalid(
+                "a run cannot adopt its own completed cursor; name the earlier completed run instead",
+            ));
+        }
     }
+    if let (Some(ordinary), Some(reviewer)) = (&ordinary_origin, &reviewer_origin) {
+        refuse_cross_role_homes(ordinary, reviewer)?;
+    }
+    if let Some(origin) = &ordinary_origin {
+        verify_adopted_ordinary_bindings(inputs, origin)?;
+    }
+    if let Some(origin) = &reviewer_origin {
+        verify_adopted_reviewer_binding(inputs, origin)?;
+    }
+
     let root = run.store.root().join("baseline-qualification");
     let runtime_path = root.join("runtime.json");
     let frozen_path = root.join("workload.json");
+    let planned_workload = root.join("workload");
+    let planned_checkout = root.join("checkout");
+
+    // Admit the occupied homes through the native owner's placement guards
+    // before any local preparation. The checks retain the ambient, overlap,
+    // ordinary-path, protected-allocation and AGENTS-override refusals while
+    // accepting only the home's own retained installation record.
+    if let Some(origin) = &ordinary_origin {
+        let mut protected = vec![
+            inputs.task.source.clone(),
+            planned_workload.clone(),
+            run.spec.project.clone(),
+            planned_checkout.clone(),
+        ];
+        if let Some(reviewer) = &reviewer_origin {
+            protected.extend([
+                reviewer.runtime.home.clone(),
+                reviewer.runtime.user_home.clone(),
+                reviewer.runtime.dependency_user_home.clone(),
+            ]);
+        }
+        improvement_runtime::verify_adoption_placement(&origin.runtime, &protected)?;
+    }
+    if let Some(origin) = &reviewer_origin {
+        let mut protected = vec![
+            inputs.task.source.clone(),
+            run.spec.project.clone(),
+            planned_workload.clone(),
+            planned_checkout.clone(),
+        ];
+        if let Some(ordinary) = &ordinary_origin {
+            protected.extend([
+                ordinary.runtime.home.clone(),
+                ordinary.runtime.user_home.clone(),
+                ordinary.runtime.dependency_user_home.clone(),
+            ]);
+        }
+        improvement_runtime::verify_adoption_placement(&origin.runtime, &protected)?;
+    }
+
+    // Acquire (first preparation) or reconcile (same-owner resume) the
+    // exclusive durable claim before dependent local effects. A second
+    // adopter owns no claim and refuses here, before any task or dispatch.
+    if let Some(origin) = &ordinary_origin {
+        adoption_claim(run, state, QualificationRuntimeRole::Ordinary, origin)?;
+    }
+    if let Some(origin) = &reviewer_origin {
+        adoption_claim(run, state, QualificationRuntimeRole::Reviewer, origin)?;
+    }
+
+    // The existing consumption verifier checks the retained absolute home,
+    // configuration, unchanged hook trust and derived workspace provenance.
+    // It neither installs nor connects, and the origin homes stay owned by
+    // the origin run.
+    if let Some(origin) = &ordinary_origin {
+        let mut trusted = origin.adoption.trusted_workspaces.clone();
+        trusted.push(planned_checkout.clone());
+        trusted.extend(
+            run.cursor
+                .attempts
+                .iter()
+                .filter_map(|a| a.checkout.clone()),
+        );
+        improvement_runtime::verify_consumption_with_trust(&origin.runtime, &trusted)?;
+    }
+    if let Some(origin) = &reviewer_origin {
+        let mut trusted = origin.adoption.trusted_workspaces.clone();
+        trusted.extend(
+            run.cursor
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.role == AttemptRole::SemanticReview)
+                .filter_map(|attempt| attempt.checkout.clone()),
+        );
+        improvement_runtime::verify_consumption_with_trust(&origin.runtime, &trusted)?;
+    }
+
+    if let Some(parent) = inputs.report.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let runtime: ArmRuntime;
     let workload: FrozenCopy;
-    if runtime_path.is_file() {
+    if let Some(origin) = &ordinary_origin {
+        if runtime_path.exists() {
+            return Err(invalid(format!(
+                "the adopted qualification retains local installation state at {}; preserve it instead of mixing installation with adoption",
+                runtime_path.display()
+            )));
+        }
+        if frozen_path.is_file() {
+            workload = read_json(&frozen_path, MAX_RUN_SPEC_BYTES)?;
+            if workload.source.canonicalize()? != inputs.task.source.canonicalize()?
+                || workload.source_revision != inputs.task.revision
+            {
+                return Err(invalid(
+                    "the retained adopted qualification preparation does not bind the frozen task",
+                ));
+            }
+        } else {
+            if root.exists() {
+                return Err(invalid(format!(
+                    "partial adopted qualification preparation at {}; preserve it and recover the owned task copy before preparing again",
+                    root.display()
+                )));
+            }
+            fs::create_dir_all(&root)?;
+            workload = task_worktree::frozen_copy(
+                &inputs.task.source,
+                &inputs.task.revision,
+                &planned_workload,
+            )?;
+            task_worktree::verify_frozen_pristine(&workload)?;
+            write_json_atomic(&frozen_path, &workload)?;
+        }
+        runtime = origin.runtime.clone();
+    } else if runtime_path.is_file() {
         runtime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
         workload = read_json(&frozen_path, MAX_RUN_SPEC_BYTES)?;
         if workload.source.canonicalize()? != inputs.task.source.canonicalize()?
@@ -4344,7 +4763,7 @@ fn ensure_prepared(
         write_json_atomic(&runtime_path, &runtime)?;
     }
     task_worktree::verify_frozen_pristine(&workload)?;
-    let checkout = root.join("checkout");
+    let checkout = planned_checkout;
     let arm = ArmBinding {
         arm: Arm::Baseline,
         home: runtime.home.clone(),
@@ -4399,15 +4818,20 @@ fn ensure_prepared(
             "a prepared participant model/provider/effort changed; no fallback or fresh binding is allowed",
         ));
     }
-    let mut trusted = vec![checkout.clone()];
-    trusted.extend(
-        run.cursor
-            .attempts
-            .iter()
-            .filter_map(|a| a.checkout.clone()),
-    );
-    improvement_runtime::verify_consumption_with_trust(&runtime, &trusted)?;
-    state.runtime = Some(runtime_path);
+    if ordinary_origin.is_none() {
+        let mut trusted = vec![checkout.clone()];
+        trusted.extend(
+            run.cursor
+                .attempts
+                .iter()
+                .filter_map(|a| a.checkout.clone()),
+        );
+        improvement_runtime::verify_consumption_with_trust(&runtime, &trusted)?;
+    }
+    state.runtime = Some(match &ordinary_origin {
+        Some(origin) => origin.adoption.runtime.path.clone(),
+        None => runtime_path,
+    });
     state.label = Some(runtime.label.clone());
     state.build = Some(runtime.variant.build.clone());
     state.task_copy = Some(workload.path.clone());
@@ -4416,6 +4840,9 @@ fn ensure_prepared(
     state.home = Some(runtime.home.clone());
     state.lead_binding = Some(lead);
     state.executor_binding = Some(executor);
+    if let Some(origin) = &ordinary_origin {
+        state.set_role_adoption(QualificationRuntimeRole::Ordinary, origin.adoption.clone())?;
+    }
     if state.prepared_ms.is_none() {
         state.prepared_ms = Some(now_ms());
         run.cursor.effect(
@@ -4423,7 +4850,7 @@ fn ensure_prepared(
             format!("runtime={} workload={}", runtime.label, inputs.task.name),
         );
     }
-    prepare_semantic_review(run, inputs, state, &runtime)?;
+    prepare_semantic_review(run, inputs, state, &runtime, reviewer_origin.as_ref())?;
     prepare_oracle_workspace(run, inputs, state, &runtime)?;
     Ok(runtime)
 }

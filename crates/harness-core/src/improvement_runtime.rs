@@ -59,11 +59,13 @@
 use crate::{
     build_identity, core_disconnect, core_install,
     improvement_experiment::{Arm, ConsumedVariant, PreparedVariant, select_variant},
+    improvement_loop::{OwnerRecord, now_ms, read_json, write_json_atomic},
     installation_lock::InstallationLock,
     installation_state::PathScope,
     inventory,
     native_launcher::Registration as LaunchRegistration,
     outcome_qualification::{LocalRunner, RunnerRecord},
+    process::{Cancellation, Deadline, ExclusiveFileLock},
     registration_native,
 };
 use serde::{Deserialize, Serialize};
@@ -75,6 +77,10 @@ use std::{
 };
 
 pub const RUNTIME_SCHEMA: u32 = 2;
+
+const ADOPTION_CLAIM_SCHEMA: u32 = 1;
+const ADOPTION_CLAIM_LIMIT: u64 = 256 * 1024;
+const MAX_ADOPTION_CLAIMS: usize = 128;
 
 /// Provider id of the explicit local route written into every prepared arm.
 /// It matches the existing explicit local outcome route; no other provider is
@@ -394,6 +400,387 @@ pub struct FileIdentity {
     pub sha256: String,
 }
 
+/// The durable process identity of one run adopting an occupied home. It is
+/// recorded beside the origin cursor so another run can distinguish an
+/// interrupted same-owner resume from a second adopter. Liveness alone never
+/// releases the claim: only the owning run's completion or stop settles it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionOwner {
+    pub run: String,
+    pub pid: u32,
+    pub created: u64,
+    pub program: PathBuf,
+    pub claimed_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdoptionClaimStatus {
+    Active,
+    Completed,
+    Stopped,
+}
+
+impl AdoptionClaimStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// One bounded history entry of an adoption claim. Active claims are never
+/// reclaimed because time passed or because the recorded owner is no longer
+/// live; the same run may reconcile its own interrupted preparation, while a
+/// different run must wait for that run to complete or stop.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionClaim {
+    pub run: String,
+    pub spec_digest: String,
+    pub role: String,
+    pub runtime: FileIdentity,
+    pub origin_cursor: FileIdentity,
+    pub owner: AdoptionOwner,
+    pub status: AdoptionClaimStatus,
+    pub claimed_ms: u64,
+    pub updated_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdoptionClaimHistory {
+    schema: u32,
+    runtime: FileIdentity,
+    claims: Vec<AdoptionClaim>,
+}
+
+impl AdoptionOwner {
+    fn current(run: &str) -> io::Result<Self> {
+        let owner = OwnerRecord::current(run)?;
+        Ok(Self {
+            run: owner.run,
+            pid: owner.pid,
+            created: owner.created,
+            program: owner.program,
+            claimed_ms: owner.claimed_ms,
+        })
+    }
+}
+
+fn adoption_sidecar(path: &Path, suffix: &str) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid("the adopted runtime receipt has no usable file name"))?;
+    Ok(path.with_file_name(format!("{name}.{suffix}")))
+}
+
+fn adoption_claim_path(runtime: &Path) -> io::Result<PathBuf> {
+    adoption_sidecar(runtime, "adoption.json")
+}
+
+fn adoption_claim_lock_path(runtime: &Path) -> io::Result<PathBuf> {
+    adoption_sidecar(runtime, "adoption.lock")
+}
+
+fn verify_adoption_identity(identity: &FileIdentity, description: &str) -> io::Result<()> {
+    if !identity.path.is_absolute() || !identity.path.is_file() {
+        return Err(invalid(format!(
+            "the {description} is missing or not an absolute retained file"
+        )));
+    }
+    if build_identity::hash_file(&identity.path)? != identity.sha256 {
+        return Err(invalid(format!(
+            "the {description} changed; supply its exact retained identity"
+        )));
+    }
+    Ok(())
+}
+
+/// Canonicalize one retained file identity and re-verify its exact digest.
+/// Sequential adoption records and compares identities in this form so a
+/// caller-supplied path spelling cannot retarget a retained file.
+pub fn normalized_adoption_identity(identity: &FileIdentity) -> io::Result<FileIdentity> {
+    verify_adoption_identity(identity, "retained file")?;
+    let path = plain(&fs::canonicalize(&identity.path)?)?;
+    if build_identity::hash_file(&path)? != identity.sha256 {
+        return Err(invalid(
+            "the retained file changed; supply its exact retained identity",
+        ));
+    }
+    Ok(FileIdentity {
+        path,
+        sha256: identity.sha256.clone(),
+    })
+}
+
+fn read_adoption_claims(runtime: &FileIdentity) -> io::Result<AdoptionClaimHistory> {
+    verify_adoption_identity(runtime, "adoption runtime receipt")?;
+    let path = adoption_claim_path(&runtime.path)?;
+    match read_json::<AdoptionClaimHistory>(&path, ADOPTION_CLAIM_LIMIT) {
+        Ok(history) if history.schema == ADOPTION_CLAIM_SCHEMA => {
+            if history.runtime != *runtime {
+                return Err(invalid(format!(
+                    "the adoption claim ledger at {} belongs to another runtime receipt; preserve it instead of repointing it",
+                    path.display()
+                )));
+            }
+            Ok(history)
+        }
+        Ok(_) => Err(invalid(format!(
+            "the adoption claim ledger at {} has an unsupported schema; preserve it",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AdoptionClaimHistory {
+            schema: ADOPTION_CLAIM_SCHEMA,
+            runtime: runtime.clone(),
+            claims: Vec::new(),
+        }),
+        Err(error) => Err(invalid(format!(
+            "the adoption claim ledger at {} cannot be read ({error}); preserve it instead of replacing it",
+            path.display()
+        ))),
+    }
+}
+
+fn save_adoption_claims(
+    runtime: &FileIdentity,
+    history: &mut AdoptionClaimHistory,
+) -> io::Result<()> {
+    while history.claims.len() > MAX_ADOPTION_CLAIMS {
+        let Some(index) = history
+            .claims
+            .iter()
+            .position(|claim| claim.status != AdoptionClaimStatus::Active)
+        else {
+            return Err(invalid(
+                "the adoption claim ledger cannot shed history while every claim is active",
+            ));
+        };
+        history.claims.remove(index);
+    }
+    let path = adoption_claim_path(&runtime.path)?;
+    let bytes = serde_json::to_vec_pretty(history)?;
+    if bytes.len() as u64 > ADOPTION_CLAIM_LIMIT {
+        return Err(invalid(format!(
+            "the adoption claim ledger at {} would exceed its bound",
+            path.display()
+        )));
+    }
+    write_json_atomic(&path, history)
+}
+
+fn with_adoption_claim_lock<T>(
+    runtime: &FileIdentity,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let path = adoption_claim_lock_path(&runtime.path)?;
+    let deadline = Deadline::after(Duration::from_secs(5))?;
+    let _lock = ExclusiveFileLock::acquire(&path, deadline, &Cancellation::default()).map_err(
+        |error| {
+            invalid(format!(
+                "the exclusive adoption claim lock at {} was not acquired: {error}; no runtime was adopted",
+                path.display()
+            ))
+        },
+    )?;
+    action()
+}
+
+/// Acquire or reconcile this run's exclusive claim on one occupied runtime
+/// home. A different run's active claim always refuses before any installation,
+/// trust or model effect. Repeating the same exact run after interruption
+/// refreshes only its process identity and timestamp.
+pub fn acquire_adoption_claim(
+    runtime: &FileIdentity,
+    origin_cursor: &FileIdentity,
+    run: &str,
+    spec_digest: &str,
+    role: &str,
+) -> io::Result<AdoptionClaim> {
+    verify_adoption_identity(runtime, "adoption runtime receipt")?;
+    verify_adoption_identity(origin_cursor, "adoption origin cursor")?;
+    if run.trim().is_empty() || spec_digest.len() != 64 || role.trim().is_empty() {
+        return Err(invalid(
+            "an adoption claim requires a run, full spec digest and role",
+        ));
+    }
+    with_adoption_claim_lock(runtime, || {
+        let mut history = read_adoption_claims(runtime)?;
+        if let Some(active) = history
+            .claims
+            .iter()
+            .find(|claim| claim.status == AdoptionClaimStatus::Active)
+        {
+            if active.run != run
+                || active.spec_digest != spec_digest
+                || active.role != role
+                || active.runtime != *runtime
+                || active.origin_cursor != *origin_cursor
+            {
+                return Err(invalid(format!(
+                    "the retained runtime at {} is actively adopted by run {}; no second adopter or changed binding is allowed until that run completes or stops",
+                    runtime.path.display(),
+                    active.run
+                )));
+            }
+            let at = now_ms();
+            let owner = AdoptionOwner::current(run)?;
+            let claim = history
+                .claims
+                .iter_mut()
+                .find(|claim| claim.run == run)
+                .expect("the active claim was just found");
+            claim.owner = owner;
+            claim.updated_ms = at;
+            let settled = claim.clone();
+            save_adoption_claims(runtime, &mut history)?;
+            return Ok(settled);
+        }
+        if history.claims.iter().any(|claim| claim.run == run) {
+            return Err(invalid(format!(
+                "run {run} already settled its adoption claim on {}; a settled run cannot reopen that claim",
+                runtime.path.display()
+            )));
+        }
+        let at = now_ms();
+        let claim = AdoptionClaim {
+            run: run.to_owned(),
+            spec_digest: spec_digest.to_owned(),
+            role: role.to_owned(),
+            runtime: runtime.clone(),
+            origin_cursor: origin_cursor.clone(),
+            owner: AdoptionOwner::current(run)?,
+            status: AdoptionClaimStatus::Active,
+            claimed_ms: at,
+            updated_ms: at,
+            settled_ms: None,
+        };
+        history.claims.push(claim.clone());
+        save_adoption_claims(runtime, &mut history)?;
+        Ok(claim)
+    })
+}
+
+/// Require this run's previously acquired claim. A prepared run and every
+/// resume verify that the exact claim still exists; an active claim is
+/// reconciled to the current process identity, while a settled claim is
+/// returned unchanged so a completed run can re-verify its retained home.
+pub fn require_adoption_claim(
+    runtime: &FileIdentity,
+    origin_cursor: &FileIdentity,
+    run: &str,
+    spec_digest: &str,
+    role: &str,
+) -> io::Result<AdoptionClaim> {
+    with_adoption_claim_lock(runtime, || {
+        let mut history = read_adoption_claims(runtime)?;
+        if let Some(active) = history
+            .claims
+            .iter()
+            .find(|claim| claim.status == AdoptionClaimStatus::Active)
+            && active.run != run
+        {
+            return Err(invalid(format!(
+                "the retained runtime at {} is actively adopted by run {}; no resume through another run is allowed",
+                runtime.path.display(),
+                active.run
+            )));
+        }
+        let index = history
+            .claims
+            .iter()
+            .position(|claim| claim.run == run)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "run {run} holds no recorded adoption claim on {}; preserve the runtime and recover the original run instead of re-adopting it",
+                    runtime.path.display()
+                ))
+            })?;
+        let claim = &history.claims[index];
+        if claim.runtime != *runtime || claim.origin_cursor != *origin_cursor || claim.role != role
+        {
+            return Err(invalid(format!(
+                "run {run}'s adoption claim on {} no longer binds this runtime, origin cursor and role",
+                runtime.path.display()
+            )));
+        }
+        if claim.spec_digest != spec_digest {
+            return Err(invalid(format!(
+                "run {run}'s adoption claim on {} belongs to a different frozen declaration",
+                runtime.path.display()
+            )));
+        }
+        match claim.status {
+            AdoptionClaimStatus::Active => {
+                let at = now_ms();
+                let owner = AdoptionOwner::current(run)?;
+                let claim = &mut history.claims[index];
+                claim.owner = owner;
+                claim.updated_ms = at;
+                let retained = claim.clone();
+                save_adoption_claims(runtime, &mut history)?;
+                Ok(retained)
+            }
+            AdoptionClaimStatus::Stopped => {
+                // A stopped run that resumes keeps using the same retained
+                // home. Reactivate its exact claim so no other run can start
+                // adopting while this one continues; completion still cannot
+                // reopen a completed claim.
+                let at = now_ms();
+                let owner = AdoptionOwner::current(run)?;
+                let claim = &mut history.claims[index];
+                claim.status = AdoptionClaimStatus::Active;
+                claim.owner = owner;
+                claim.updated_ms = at;
+                claim.settled_ms = None;
+                let retained = claim.clone();
+                save_adoption_claims(runtime, &mut history)?;
+                Ok(retained)
+            }
+            AdoptionClaimStatus::Completed => Ok(claim.clone()),
+        }
+    })
+}
+
+/// Settle this run's claim after completion or stop. Other runs' claims and
+/// the bounded history are preserved. A completed claim is never downgraded to
+/// stopped by a later repeated stop.
+pub fn settle_adoption_claim(
+    runtime: &FileIdentity,
+    run: &str,
+    status: AdoptionClaimStatus,
+) -> io::Result<Option<AdoptionClaim>> {
+    if status == AdoptionClaimStatus::Active {
+        return Err(invalid(
+            "an adoption claim can only settle as completed or stopped",
+        ));
+    }
+    with_adoption_claim_lock(runtime, || {
+        let mut history = read_adoption_claims(runtime)?;
+        let Some(claim) = history.claims.iter_mut().find(|claim| claim.run == run) else {
+            return Ok(None);
+        };
+        if claim.status == AdoptionClaimStatus::Active {
+            let at = now_ms();
+            claim.status = status;
+            claim.updated_ms = at;
+            claim.settled_ms = Some(at);
+            let settled = claim.clone();
+            save_adoption_claims(runtime, &mut history)?;
+            return Ok(Some(settled));
+        }
+        Ok(Some(claim.clone()))
+    })
+}
+
 /// One declared client setting exactly as it was written into the arm
 /// configuration, for drift checks and native-precedence reconciliation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -614,6 +1001,164 @@ impl Plan {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_arm_homes(
+    home: &Path,
+    user_home: &Path,
+    dependency_user_home: &Path,
+    build: &Path,
+    source: &Path,
+    protected: &[PathBuf],
+    occupied: bool,
+) -> io::Result<()> {
+    for (name, path) in [
+        ("home", home),
+        ("user home", user_home),
+        ("dependency user home", dependency_user_home),
+    ] {
+        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(invalid(format!(
+                "the {name} must be an absolute normalized directory"
+            )));
+        }
+        if !path.is_dir() {
+            return Err(invalid(format!(
+                "the {name} {} is not a fresh owned directory; prepare the homes first",
+                path.display()
+            )));
+        }
+        build_identity::ordinary(path)?;
+    }
+    let installation = home.join("harness/installation.json");
+    match (occupied, fs::symlink_metadata(&installation)) {
+        (false, Ok(_)) => {
+            return Err(invalid(format!(
+                "{} already carries an installation; restore it through the lifecycle owner before preparing this arm",
+                home.display()
+            )));
+        }
+        (true, Ok(metadata)) if !metadata.file_type().is_file() => {
+            return Err(invalid(format!(
+                "the adopted arm home {} does not carry an ordinary installation record",
+                home.display()
+            )));
+        }
+        (true, Ok(_)) => build_identity::ordinary(&installation)?,
+        (true, Err(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(format!(
+                "the adopted arm home {} carries no retained installation record; it cannot be adopted",
+                home.display()
+            )));
+        }
+        (true, Err(error)) => return Err(error),
+        (false, Err(_)) => {}
+    }
+    if home.join("AGENTS.override.md").exists() {
+        return Err(invalid(
+            "the arm home carries an AGENTS override; a fresh arm home must not shadow the prepared instructions",
+        ));
+    }
+    if let Some(ambient) = ambient_codex_home()
+        && same_place(home, &ambient)?
+    {
+        return Err(invalid(
+            "refusing to install an experiment arm into the ambient Codex home",
+        ));
+    }
+    if let Some(ambient) = ambient_user_home()
+        && (same_place(user_home, &ambient)? || same_place(dependency_user_home, &ambient)?)
+    {
+        return Err(invalid(
+            "refusing to install an experiment arm into the ambient user home",
+        ));
+    }
+    if overlaps(home, user_home) || overlaps(home, dependency_user_home) {
+        return Err(invalid(
+            "the arm home must stay disjoint from its user and dependency homes",
+        ));
+    }
+    if !same_place(user_home, dependency_user_home)? && overlaps(user_home, dependency_user_home) {
+        return Err(invalid(
+            "the arm user home and dependency user home must not nest inside each other",
+        ));
+    }
+    for (name, path) in [
+        ("home", home),
+        ("user home", user_home),
+        ("dependency user home", dependency_user_home),
+    ] {
+        if overlaps(path, build) {
+            return Err(invalid(format!(
+                "the arm {name} overlaps the prepared runtime; each experiment allocation must be separately owned"
+            )));
+        }
+        if overlaps(path, source) {
+            return Err(invalid(format!(
+                "the arm {name} overlaps its kit source checkout"
+            )));
+        }
+        for protected in protected {
+            if overlaps(path, protected) {
+                return Err(invalid(format!(
+                    "the arm {name} overlaps a protected experiment allocation ({}); each allocation must be separately owned",
+                    protected.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read-only admission for an already occupied, owned native home. It applies
+/// the same ambient, overlap, ordinary-path, protected-allocation and
+/// AGENTS-override guards as fresh installation while allowing only the home's
+/// own retained installation record. It never prepares, connects or copies
+/// configuration.
+pub fn verify_adoption_placement(runtime: &ArmRuntime, protected: &[PathBuf]) -> io::Result<()> {
+    let build = resolved(&runtime.variant.build)?;
+    let source = resolved(&runtime.source)?;
+    validate_arm_homes(
+        &runtime.home,
+        &runtime.user_home,
+        &runtime.dependency_user_home,
+        &build,
+        &source,
+        protected,
+        true,
+    )?;
+    let upstream = plain(&runtime.upstream)?;
+    if !upstream
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        || !upstream.is_absolute()
+    {
+        return Err(invalid(
+            "the adopted runtime's upstream client must be an absolute native executable",
+        ));
+    }
+    for (name, path) in [
+        ("prepared runtime", &build),
+        ("kit source", &source),
+        ("arm home", &runtime.home),
+        ("user home", &runtime.user_home),
+        ("dependency user home", &runtime.dependency_user_home),
+    ] {
+        if overlaps(&upstream, path) {
+            return Err(invalid(format!(
+                "the adopted runtime's upstream client overlaps the {name}"
+            )));
+        }
+    }
+    for protected in protected {
+        if overlaps(&upstream, protected) {
+            return Err(invalid(
+                "the adopted runtime's upstream client overlaps a protected experiment allocation",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate every explicit input without touching any installation state.
 fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
     let variant = &request.variant;
@@ -667,91 +1212,15 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
     let home = plain(&request.home)?;
     let user_home = plain(&request.user_home)?;
     let dependency_user_home = plain(&request.dependency_user_home)?;
-    for (name, path) in [
-        ("home", &home),
-        ("user home", &user_home),
-        ("dependency user home", &dependency_user_home),
-    ] {
-        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(invalid(format!(
-                "the {name} must be an absolute normalized directory"
-            )));
-        }
-        if !path.is_dir() {
-            return Err(invalid(format!(
-                "the {name} {} is not a fresh owned directory; prepare the homes first",
-                path.display()
-            )));
-        }
-        build_identity::ordinary(path)?;
-    }
-    if home.join("harness/installation.json").exists() {
-        return Err(invalid(format!(
-            "{} already carries an installation; restore it through the lifecycle owner before preparing this arm",
-            home.display()
-        )));
-    }
-    if home.join("AGENTS.override.md").exists() {
-        return Err(invalid(
-            "the arm home carries an AGENTS override; a fresh arm home must not shadow the prepared instructions",
-        ));
-    }
-    if let Some(ambient) = ambient_codex_home()
-        && same_place(&home, &ambient)?
-    {
-        return Err(invalid(
-            "refusing to install an experiment arm into the ambient Codex home",
-        ));
-    }
-    if let Some(ambient) = ambient_user_home()
-        && (same_place(&user_home, &ambient)? || same_place(&dependency_user_home, &ambient)?)
-    {
-        return Err(invalid(
-            "refusing to install an experiment arm into the ambient user home",
-        ));
-    }
-    if overlaps(&home, &user_home) || overlaps(&home, &dependency_user_home) {
-        return Err(invalid(
-            "the arm home must stay disjoint from its user and dependency homes",
-        ));
-    }
-    if !same_place(&user_home, &dependency_user_home)?
-        && overlaps(&user_home, &dependency_user_home)
-    {
-        return Err(invalid(
-            "the arm user home and dependency user home must not nest inside each other",
-        ));
-    }
-    for (name, path) in [
-        ("home", &home),
-        ("user home", &user_home),
-        ("dependency user home", &dependency_user_home),
-    ] {
-        if overlaps(path, &build) {
-            return Err(invalid(format!(
-                "the arm {name} overlaps the prepared runtime; each experiment allocation must be separately owned"
-            )));
-        }
-        if overlaps(path, &source) {
-            return Err(invalid(format!(
-                "the arm {name} overlaps its kit source checkout"
-            )));
-        }
-    }
-    for protected in &request.protected {
-        for (name, path) in [
-            ("home", &home),
-            ("user home", &user_home),
-            ("dependency user home", &dependency_user_home),
-        ] {
-            if overlaps(path, protected) {
-                return Err(invalid(format!(
-                    "the arm {name} overlaps a protected experiment allocation ({}); each allocation must be separately owned",
-                    protected.display()
-                )));
-            }
-        }
-    }
+    validate_arm_homes(
+        &home,
+        &user_home,
+        &dependency_user_home,
+        &build,
+        &source,
+        &request.protected,
+        false,
+    )?;
 
     let upstream = plain(&request.upstream)?;
     if !upstream
@@ -2616,6 +3085,13 @@ fn normalized_hook_trust_hash(definition: &serde_json::Value) -> Option<String> 
 /// separators and case are compared through one normalized form.
 fn same_trust_workspace(named: &str, workspace: &Path) -> bool {
     normalize_trust_workspace(named) == normalize_trust_workspace(&workspace.to_string_lossy())
+}
+
+/// The normalized identity used for retained workspace-trust provenance.
+/// Sequential adoption derives its allowance from frozen checkouts, so the
+/// same spelling rules must be visible to the state owner.
+pub fn trust_workspace_key(path: &Path) -> String {
+    normalize_trust_workspace(&path.to_string_lossy())
 }
 
 fn normalize_trust_workspace(path: &str) -> String {
