@@ -969,6 +969,7 @@ struct ValidatedClient {
 struct ValidatedPrivate {
     source: PathBuf,
     destination: String,
+    sha256: String,
 }
 
 struct Plan {
@@ -1160,7 +1161,8 @@ pub fn verify_adoption_placement(runtime: &ArmRuntime, protected: &[PathBuf]) ->
 }
 
 /// Validate every explicit input without touching any installation state.
-fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
+fn prepare_plan(request: &ArmRequest, previous: Option<&ArmRuntime>) -> io::Result<Plan> {
+    let occupied = previous.is_some();
     let variant = &request.variant;
     bounded_value("arm label", &variant.label, 64)?;
     if variant.record_sha256.len() != 64 || variant.source_sha256.len() != 64 {
@@ -1219,7 +1221,7 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
         &build,
         &source,
         &request.protected,
-        false,
+        occupied,
     )?;
 
     let upstream = plain(&request.upstream)?;
@@ -1319,7 +1321,7 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
             let table = parse_config_bytes(&bytes, "the existing arm configuration")?;
             declared_settings_present(&table, &validated.settings).map_err(|error| {
                 invalid(format!(
-                    "an existing config.toml does not match the declared client inputs ({error}); a fresh arm home is never merged"
+                    "an existing config.toml does not match the declared client inputs ({error}); an arm home is never merged"
                 ))
             })?;
             verify_client_values(&table, &validated.record)?;
@@ -1336,7 +1338,7 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
         (Some(_), Err(error)) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
     }
-    let private_inputs = validate_private_inputs(&home, &request.private_inputs)?;
+    let private_inputs = validate_private_inputs(&home, &request.private_inputs, previous)?;
 
     Ok(Plan {
         variant: variant.clone(),
@@ -1802,6 +1804,7 @@ fn kit_manifest(source: &Path) -> io::Result<inventory::Manifest> {
 fn validate_private_inputs(
     home: &Path,
     inputs: &[PrivateInput],
+    previous: Option<&ArmRuntime>,
 ) -> io::Result<Vec<ValidatedPrivate>> {
     let mut seen = BTreeSet::new();
     let mut validated = Vec::new();
@@ -1811,12 +1814,13 @@ fn validate_private_inputs(
                 "every private runner input needs an explicit absolute source file",
             ));
         }
-        hash_file("a private runner input", &input.source, FILE_LIMIT).map_err(|error| {
-            invalid(format!(
-                "the private input {} is unresolved ({error})",
-                input.destination
-            ))
-        })?;
+        let sha256 =
+            hash_file("a private runner input", &input.source, FILE_LIMIT).map_err(|error| {
+                invalid(format!(
+                    "the private input {} is unresolved ({error})",
+                    input.destination
+                ))
+            })?;
         let relative = Path::new(&input.destination);
         let valid = !input.destination.is_empty()
             && !relative.is_absolute()
@@ -1852,9 +1856,14 @@ fn validate_private_inputs(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
             Ok(_) => {
-                if fs::read(&destination)? != fs::read(&input.source)? {
+                if !private_input_destination_matches(
+                    &destination,
+                    &sha256,
+                    &input.destination,
+                    previous,
+                )? {
                     return Err(invalid(format!(
-                        "the private input destination {} already exists with different content; a fresh arm home is never merged",
+                        "the private input destination {} already exists with different content; an arm home is never merged",
                         input.destination
                     )));
                 }
@@ -1863,6 +1872,7 @@ fn validate_private_inputs(
         validated.push(ValidatedPrivate {
             source: input.source.clone(),
             destination: input.destination.clone(),
+            sha256,
         });
     }
     Ok(validated)
@@ -1877,11 +1887,37 @@ fn validate_private_inputs(
 /// presented as ready. Installed state is restored through
 /// [`retire_arm`]/[`discard_arm`], never rewritten in place.
 pub fn install_arm(request: &ArmRequest) -> io::Result<ArmRuntime> {
-    let plan = prepare_plan(request)?;
+    let plan = prepare_plan(request, None)?;
+    install_plan(&plan, None)
+}
+
+/// Update one already prepared arm to an explicitly requested immutable build
+/// in its existing owned homes through the native installation owner.
+///
+/// The previous runtime is evidence for the exact arm, upstream client, homes
+/// and retained inputs, not a claim that its mutable source still matches the
+/// old build. A prior source change therefore does not block the request; the
+/// new build and the installed ownership are verified independently. Repeating
+/// the same request after the update completed but before the caller persisted
+/// its result is safe: the native owner recognizes the already-installed build
+/// and performs fresh runtime and consumption verification.
+pub fn refresh_arm(previous: &ArmRuntime, request: &ArmRequest) -> io::Result<ArmRuntime> {
+    validate_refresh_identity(previous, request)?;
+    let plan = prepare_plan(request, Some(previous))?;
+    validate_refresh_authority(previous, &plan)?;
+    install_plan(&plan, Some(previous))
+}
+
+fn install_plan(plan: &Plan, previous: Option<&ArmRuntime>) -> io::Result<ArmRuntime> {
+    let operation = if previous.is_some() {
+        "refresh"
+    } else {
+        "installation"
+    };
     let preview = core_install::connect(&plan.connect_request(), true).map_err(|error| {
         invalid(format!(
-            "the {} arm failed its installation preflight ({error}); nothing was installed",
-            plan.variant.label
+            "the {} arm failed its {operation} preflight ({error}); no state was changed",
+            plan.variant.label,
         ))
     })?;
     if preview.status != "preview" || preview.model_calls != 0 || preview.runtime.is_some() {
@@ -1890,49 +1926,18 @@ pub fn install_arm(request: &ArmRequest) -> io::Result<ArmRuntime> {
         ));
     }
 
-    if let Some(client) = &plan.client {
-        let path = plan.home.join("config.toml");
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::write(&path, &client.config_bytes)?;
-            }
-            Err(error) => return Err(error),
-            Ok(_) => {}
-        }
-    }
-    for input in &plan.private_inputs {
-        let destination = plan.home.join(&input.destination);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::symlink_metadata(&destination) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::copy(&input.source, &destination)?;
-            }
-            Err(error) => return Err(error),
-            Ok(_) => {
-                // An identical destination from the same explicit input is
-                // reused; changed content is never recorded as prepared.
-                if fs::read(&destination)? != fs::read(&input.source)? {
-                    return Err(invalid(format!(
-                        "the private input destination {} changed during preparation; preserving it",
-                        input.destination
-                    )));
-                }
-            }
-        }
-    }
+    install_plan_inputs(plan, previous)?;
 
     let report = core_install::connect(&plan.connect_request(), false).map_err(|error| {
         invalid(format!(
-            "the {} arm installation was not completed ({error}); the arm is not ready and its owned state can be restored with the lifecycle owner",
-            plan.variant.label
+            "the {} arm {operation} was not completed ({error}); the requested build is not claimed ready and the native owner retains recovery state",
+            plan.variant.label,
         ))
     })?;
     if report.status != "connected" || report.model_calls != 0 {
         return Err(invalid(format!(
-            "the {} arm installation did not report a completed model-free connection",
-            plan.variant.label
+            "the {} arm {operation} did not report a completed model-free connection",
+            plan.variant.label,
         )));
     }
     let runtime = report
@@ -1952,18 +1957,275 @@ pub fn install_arm(request: &ArmRequest) -> io::Result<ArmRuntime> {
         runtime_executable_sha256: runtime.executable_sha256.clone(),
         runtime_evidence: runtime.evidence.clone(),
     };
-    if token_workflow_advertised(&plan.source)? {
-        prepare_token_workflow(&plan)?;
-        restore_declared_settings(&plan)?;
+    if token_workflow_advertised(&plan.source).map_err(|error| {
+        unverified_native_update(
+            plan,
+            "the token workflow advertisement could not be re-read",
+            &error,
+        )
+    })? {
+        prepare_token_workflow(plan).map_err(|error| {
+            unverified_native_update(
+                plan,
+                "the token workflow component was not retained as prepared evidence",
+                &error,
+            )
+        })?;
+        restore_declared_settings(plan).map_err(|error| {
+            unverified_native_update(
+                plan,
+                "the declared client settings were not restored after native consent",
+                &error,
+            )
+        })?;
     }
-    let observed = observe(&plan, facts)?;
+    let observed = observe(plan, facts).map_err(|error| {
+        unverified_native_update(
+            plan,
+            "the installed runtime could not be observed as a fresh arm receipt",
+            &error,
+        )
+    })?;
     verify_consumption(&observed).map_err(|error| {
-        invalid(format!(
-            "the {} arm installation was applied but its consumption identity did not verify ({error}); it is not ready and must be restored through the lifecycle owner",
-            plan.variant.label
-        ))
+        unverified_native_update(
+            plan,
+            "the installed runtime's consumption identity did not verify",
+            &error,
+        )
     })?;
     Ok(observed)
+}
+
+fn install_plan_inputs(plan: &Plan, previous: Option<&ArmRuntime>) -> io::Result<()> {
+    if let Some(client) = &plan.client {
+        let path = plan.home.join("config.toml");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::write(&path, &client.config_bytes)?;
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+    }
+    for input in &plan.private_inputs {
+        let destination = plan.home.join(&input.destination);
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if previous.is_some() {
+                    return Err(invalid(format!(
+                        "the retained private runner input {} is missing from the occupied arm home; a refresh never recreates retained inputs",
+                        input.destination
+                    )));
+                }
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&input.source, &destination)?;
+                if hash_file("a copied private runner input", &destination, FILE_LIMIT)?
+                    != input.sha256
+                {
+                    return Err(invalid(format!(
+                        "the private input {} changed while being prepared; preserving it",
+                        input.destination
+                    )));
+                }
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {
+                // An identical destination from the same explicit input is
+                // reused; a refresh also retains the exact native hook
+                // approval the client appended to its own profile. Changed
+                // content is never recorded as prepared.
+                if !private_input_destination_matches(
+                    &destination,
+                    &input.sha256,
+                    &input.destination,
+                    previous,
+                )? {
+                    return Err(invalid(format!(
+                        "the private input destination {} changed during preparation; preserving it",
+                        input.destination
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Accepts an existing private runner input destination when it still carries
+/// the explicit source bytes, or during a refresh when it carries exactly the
+/// retained bytes plus the native client's own hook approval for this arm.
+fn private_input_destination_matches(
+    destination: &Path,
+    frozen_sha256: &str,
+    destination_name: &str,
+    previous: Option<&ArmRuntime>,
+) -> io::Result<bool> {
+    if hash_file("a copied private runner input", destination, FILE_LIMIT)? == frozen_sha256 {
+        return Ok(true);
+    }
+    let Some(runtime) = previous else {
+        return Ok(false);
+    };
+    let destination_bytes = fs::read(destination)?;
+    Ok(private_input_matches_with_native_trust(
+        &destination_bytes,
+        frozen_sha256,
+        destination_name,
+        runtime,
+    ))
+}
+
+/// Preserve the prior configuration authority across a refresh: the explicit
+/// declaration may request a different immutable build, but it must not
+/// silently change the approved client identity, its declared settings or the
+/// explicit overlay the arm was installed with.
+fn validate_refresh_authority(previous: &ArmRuntime, plan: &Plan) -> io::Result<()> {
+    let configuration = previous.configuration.as_ref();
+    let prior_client = configuration.and_then(|record| record.client.as_ref());
+    let requested_client = plan.client.as_ref();
+    if requested_client.map(|client| &client.record) != prior_client {
+        return Err(invalid(
+            "the refresh request changes the approved client identity; preserve the installed client or prepare a new arm",
+        ));
+    }
+    let prior_settings = configuration
+        .map(|record| record.settings.as_slice())
+        .unwrap_or_default();
+    let requested_settings = requested_client
+        .map(|client| client.settings.as_slice())
+        .unwrap_or_default();
+    if requested_settings != prior_settings {
+        return Err(invalid(
+            "the refresh request changes the declared client settings; preserve the installed declaration",
+        ));
+    }
+    let prior_overlay = configuration.and_then(|record| record.overlay.as_ref());
+    let requested_overlay = requested_client.and_then(|client| client.overlay.as_ref());
+    if requested_overlay != prior_overlay {
+        return Err(invalid(
+            "the refresh request changes the explicit client overlay; preserve the installed declaration",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_refresh_identity(previous: &ArmRuntime, request: &ArmRequest) -> io::Result<()> {
+    if previous.schema != RUNTIME_SCHEMA || previous.model_calls != 0 {
+        return Err(invalid(
+            "the previous arm identity is not a model-free runtime receipt",
+        ));
+    }
+    if previous.arm != previous.variant.arm || previous.label != previous.variant.label {
+        return Err(invalid(
+            "the previous arm receipt does not match its prepared variant",
+        ));
+    }
+    if previous.installation.status != "connected"
+        || previous.installation.runtime_executable_sha256 != previous.upstream_sha256
+    {
+        return Err(invalid(
+            "the previous arm identity does not describe a verified native connection",
+        ));
+    }
+    if request.variant.arm != previous.arm || request.variant.label != previous.label {
+        return Err(invalid(
+            "a runtime refresh cannot change the prepared arm or label",
+        ));
+    }
+    for (name, previous_path, requested_path) in [
+        ("home", &previous.home, &request.home),
+        ("user home", &previous.user_home, &request.user_home),
+        (
+            "dependency user home",
+            &previous.dependency_user_home,
+            &request.dependency_user_home,
+        ),
+    ] {
+        if !same_place(previous_path, requested_path)? {
+            return Err(invalid(format!(
+                "the refresh request must retain the previous arm {name} exactly"
+            )));
+        }
+    }
+    if !same_place(&previous.upstream, &request.upstream)? {
+        return Err(invalid(
+            "the refresh request must retain the previous approved upstream client",
+        ));
+    }
+    if upstream_client_digest(&request.upstream)? != previous.upstream_sha256 {
+        return Err(invalid(
+            "the refresh request changes the approved upstream client; preserve the verified client or prepare a new arm",
+        ));
+    }
+    if previous.client_configured() != request.client.is_some() {
+        return Err(invalid(
+            "the refresh request changes whether approved local client inputs were declared",
+        ));
+    }
+    if previous.private.len() != request.private_inputs.len() {
+        return Err(invalid(
+            "the refresh request changes the retained private runner inputs",
+        ));
+    }
+    for retained in &previous.private {
+        let input = request
+            .private_inputs
+            .iter()
+            .find(|input| input.destination == retained.destination)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "the refresh request omits the retained private runner input {}",
+                    retained.destination
+                ))
+            })?;
+        if hash_file("a private runner input", &input.source, FILE_LIMIT)? != retained.sha256 {
+            return Err(invalid(format!(
+                "the refresh request changes the retained private runner input {}",
+                retained.destination
+            )));
+        }
+    }
+    let build = resolved(&previous.variant.build).map_err(|error| {
+        invalid(format!(
+            "the previous arm runtime build is unavailable ({error}); retain its immutable build as the prior receipt evidence"
+        ))
+    })?;
+    let record = build_identity::verify_record_integrity(&build).map_err(|error| {
+        invalid(format!(
+            "the previous arm runtime build is not intact ({error}); foreign or incomplete prior evidence is refused"
+        ))
+    })?;
+    if build_identity::hash_file(&build.join("build.json"))? != previous.variant.record_sha256
+        || record.source.sha256 != previous.variant.source_sha256
+    {
+        return Err(invalid(
+            "the previous arm runtime build no longer matches its retained receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn unverified_native_update(plan: &Plan, stage: &str, error: &io::Error) -> io::Error {
+    let recovery = match core_install::preview_recovery(
+        &plan.home,
+        &plan.user_home,
+        &plan.dependency_user_home,
+    ) {
+        Ok(preview) => format!(
+            "status={} action={} journal={} model_calls={}",
+            preview.status,
+            preview.action,
+            preview.journal.unwrap_or("none"),
+            preview.model_calls,
+        ),
+        Err(recovery) => format!("unavailable ({recovery})"),
+    };
+    invalid(format!(
+        "the {} arm native update completed, but {stage} ({error}); no success receipt is returned and the previous runtime is not claimed restored. Native recovery: {recovery}",
+        plan.variant.label,
+    ))
 }
 
 fn checked_link(destination: &Path, source: &Path, directory: bool) -> io::Result<PathBuf> {
@@ -2461,11 +2723,12 @@ fn observe(plan: &Plan, facts: InstallationFacts) -> io::Result<ArmRuntime> {
 
     let mut private = Vec::new();
     for input in &plan.private_inputs {
-        let destination = plan.home.join(&input.destination);
-        let sha256 = hash_file("a copied private runner input", &destination, FILE_LIMIT)?;
         private.push(PrivateRecord {
             destination: input.destination.clone(),
-            sha256,
+            // The retained identity is the declared source bytes. Native
+            // consent may legitimately append its approval to the live
+            // profile; consumption verifies that exact record separately.
+            sha256: input.sha256.clone(),
         });
     }
     let components = observe_components(plan)?;
@@ -3297,6 +3560,7 @@ mod tests {
                 source: source.clone(),
                 destination: "notes.txt".to_owned(),
             }],
+            None,
         )
         .err()
         .expect("a private input over the shared bound must refuse");
@@ -3335,6 +3599,7 @@ mod tests {
                 source: source.clone(),
                 destination: "notes.bin".to_owned(),
             }],
+            None,
         )
         .err()
         .expect("a private input over the shared bound must refuse");

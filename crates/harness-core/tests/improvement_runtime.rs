@@ -16,9 +16,9 @@ use harness_core::{
     improvement_experiment::{Arm, prepare_home, prepare_variant, select_variant},
     improvement_runtime::{
         AdoptionClaimStatus, ArmRequest, ClientInputs, FileIdentity, PrivateInput,
-        acquire_adoption_claim, discard_arm, install_arm, require_adoption_claim, retire_arm,
-        select_arm, settle_adoption_claim, verify_adoption_placement, verify_consumption,
-        verify_consumption_with_trust,
+        acquire_adoption_claim, discard_arm, install_arm, refresh_arm, require_adoption_claim,
+        retire_arm, select_arm, settle_adoption_claim, verify_adoption_placement,
+        verify_consumption, verify_consumption_with_trust,
     },
     outcome_qualification::{LocalRunner, MaterialIdentity},
 };
@@ -2232,4 +2232,432 @@ fn adoption_placement_admits_an_owned_home_without_weakening_guards() {
     assert!(error.contains("already carries an installation"), "{error}");
     assert_eq!(fs::read(&installation_path).unwrap(), installation);
     assert_eq!(fs::read(&config_path).unwrap(), configuration);
+}
+
+/// A refresh moves one owned arm to a newly requested immutable build without
+/// requiring the old mutable source to stay frozen. It preserves native hook
+/// approval and unrelated state, returns a fresh verified receipt, and safely
+/// replays when the caller lost the first receipt after native completion.
+#[test]
+fn refresh_arm_updates_changed_build_and_replays_after_lost_receipt() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-refresh-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let source = kit_source(root, "kit-refresh", "refresh-v1");
+    for relative in [
+        "crates/harness-rtk/Cargo.toml",
+        "crates/harness-rtk/src/main.rs",
+    ] {
+        let path = source.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, relative.as_bytes()).unwrap();
+    }
+    fs::write(
+        source.join("global/rtk-hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "harness-rtk.exe hook",
+                        "timeout": 2
+                    }]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let home = prepare_home(&root.join("homes/refresh")).unwrap();
+    let user_home = prepare_home(&root.join("homes/refresh-user")).unwrap();
+    let dependency_user_home = prepare_home(&root.join("homes/refresh-dep")).unwrap();
+    let vendor = home.join("harness/rtk/packages/0.48.0/rtk.exe");
+    fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+    fs::write(&vendor, b"staged-rtk-for-refresh").unwrap();
+    fs::write(
+        source.join("global/rtk.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": "0.48.0",
+            "executableSha256": build_identity::hash_file(&vendor).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let identity =
+        harness_core::token_workflow_lifecycle::component_source_identity(&source).unwrap();
+    let adapter = home.join(format!("harness/rtk/build/{identity}/harness-rtk.exe"));
+    fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+    fs::write(&adapter, b"staged-adapter-for-refresh").unwrap();
+    fs::write(
+        adapter.parent().unwrap().join("build.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "sourceIdentity": identity,
+            "binarySha256": build_identity::hash_file(&adapter).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let build = fixture_build(
+        &state,
+        "refresh-v1",
+        &source,
+        &fixtures.launcher,
+        "refresh-v1",
+    );
+    let catalogue = root.join("model-catalogue.json");
+    fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    let overlay = root.join("qualified-client.config.toml");
+    fs::write(
+        &overlay,
+        "model_context_window = 65536\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\n",
+    )
+    .unwrap();
+    let private_profile_source = root.join("private/ds.config.toml");
+    fs::create_dir_all(private_profile_source.parent().unwrap()).unwrap();
+    fs::write(
+        &private_profile_source,
+        b"sandbox_mode = \"read-only\"\r\nmodel = \"fixture-glyph-1\"\r\nmodel_reasoning_effort = \"high\"\r\napproval_policy = \"never\"\r\n\r\n[features]\r\ncode_mode = false\r\n",
+    )
+    .unwrap();
+    let request = ArmRequest {
+        variant: prepare_variant(&state, Arm::Baseline, "H", &build).unwrap(),
+        home: home.clone(),
+        user_home,
+        dependency_user_home,
+        upstream: fixtures.upstream.clone(),
+        timeout: Duration::from_secs(60),
+        client: Some(local_client(&catalogue, Some(&overlay))),
+        private_inputs: vec![PrivateInput {
+            source: private_profile_source.clone(),
+            destination: "ds.config.toml".into(),
+        }],
+        protected: Vec::new(),
+    };
+    let previous = install_arm(&request).unwrap();
+    verify_consumption(&previous).unwrap();
+
+    let component = previous
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+        .expect("the token workflow is retained");
+    let hooks = component
+        .links
+        .iter()
+        .find(|link| link.name == "hooks.json")
+        .expect("the retained hook definition is recorded");
+    let definition: serde_json::Value =
+        serde_json::from_slice(&fs::read(&hooks.source).unwrap()).unwrap();
+    assert_eq!(
+        definition["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "harness-rtk.exe hook"
+    );
+    let config_path = previous.configuration.as_ref().unwrap().path.clone();
+    let installed = fs::read(&config_path).unwrap();
+    let installed_text = std::str::from_utf8(&installed).unwrap();
+    let hook_digest = "sha256:1914caf6f4ea4f558efc894660fb096e808a44e7de9061c688d172c05450f135";
+    let hook_key = format!("{}:pre_tool_use:0:0", hooks.destination.to_string_lossy());
+    let approval = format!("\n[hooks.state.'{hook_key}']\ntrusted_hash = \"{hook_digest}\"\n");
+    let marker = "# END codex-harness MCP registrations";
+    let at = installed_text.find(marker).unwrap_or(installed_text.len());
+    let approved = format!(
+        "{}{}{}",
+        &installed_text[..at],
+        approval,
+        &installed_text[at..]
+    );
+    fs::write(&config_path, approved.as_bytes()).unwrap();
+    verify_consumption(&previous).unwrap();
+    // Foreign configuration drift in a declared setting is refused before any
+    // native effect; the accepted configuration is then restored exactly.
+    let drifted = approved.replace(
+        "model_reasoning_effort = \"low\"",
+        "model_reasoning_effort = \"high\"",
+    );
+    assert_ne!(drifted, approved, "the drift changed the configuration");
+    fs::write(&config_path, drifted.as_bytes()).unwrap();
+    let error = refresh_arm(&previous, &request).unwrap_err().to_string();
+    assert!(
+        error.contains("existing config.toml does not match"),
+        "{error}"
+    );
+    fs::write(&config_path, approved.as_bytes()).unwrap();
+    verify_consumption(&previous).unwrap();
+    // The native client may rewrite the retained private profile to LF and
+    // append its own approval for the same hook definition. The receipt keeps
+    // the frozen declared digest; consumption accepts only that exact record.
+    let profile_destination = previous.home.join("ds.config.toml");
+    let frozen_profile = fs::read(&profile_destination).unwrap();
+    let retained_profile = previous
+        .private
+        .iter()
+        .find(|input| input.destination == "ds.config.toml")
+        .expect("the private profile is retained");
+    assert_eq!(
+        retained_profile.sha256,
+        build_identity::hash_bytes(&frozen_profile)
+    );
+    let profile_trust_record = format!(
+        "\n[hooks.state]\n\n[hooks.state.'{hook_key}']\ntrusted_hash = \"{hook_digest}\"\n"
+    );
+    let profile_native = format!(
+        "{}{profile_trust_record}",
+        std::str::from_utf8(&frozen_profile)
+            .unwrap()
+            .replace("\r\n", "\n")
+    );
+    fs::write(&profile_destination, &profile_native).unwrap();
+    verify_consumption(&previous).unwrap();
+    let previous_receipt = serde_json::to_vec(&previous).unwrap();
+    let previous_evidence = previous.installation.runtime_evidence.clone();
+    assert!(previous_evidence.is_dir());
+    let unrelated = home.join("unrelated-auth.json");
+    fs::write(&unrelated, b"unrelated-credentials-stand-in").unwrap();
+
+    // The old source is now stale relative to the old immutable build. That
+    // must not be confused with foreign ownership drift in the installed homes.
+    fs::write(source.join("crates/one/src/lib.rs"), "pub fn two() {}\n").unwrap();
+    assert_eq!(
+        build_identity::check(&previous.variant.build, Some(&source)).status,
+        build_identity::Health::SourceStale
+    );
+    let stale = verify_consumption(&previous).unwrap_err().to_string();
+    assert!(
+        stale.contains("no longer a verified unchanged build"),
+        "{stale}"
+    );
+
+    let refreshed_build = fixture_build(
+        &state,
+        "refresh-v2",
+        &source,
+        &fixtures.launcher,
+        "refresh-v2",
+    );
+    let mut refresh_request = request.clone();
+    refresh_request.variant =
+        prepare_variant(&state, Arm::Baseline, "H", &refreshed_build).unwrap();
+    let refreshed = refresh_arm(&previous, &refresh_request).unwrap();
+    assert_eq!(
+        refreshed.variant.record_sha256,
+        refresh_request.variant.record_sha256
+    );
+    assert_eq!(refreshed.home, previous.home);
+    assert_eq!(refreshed.user_home, previous.user_home);
+    assert_eq!(
+        refreshed.dependency_user_home,
+        previous.dependency_user_home
+    );
+    assert_eq!(
+        fs::canonicalize(&refreshed.launcher.source).unwrap(),
+        fs::canonicalize(refreshed_build.join("codex.exe")).unwrap()
+    );
+    assert_eq!(
+        refreshed.installation.runtime_executable_sha256,
+        previous.upstream_sha256
+    );
+    assert!(refreshed.installation.runtime_evidence.is_dir());
+    assert_ne!(refreshed.installation.runtime_evidence, previous_evidence);
+    verify_consumption(&refreshed).unwrap();
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes(),
+        "the native profile approval survived the refresh"
+    );
+    assert_eq!(
+        refreshed
+            .private
+            .iter()
+            .find(|input| input.destination == "ds.config.toml")
+            .unwrap()
+            .sha256,
+        build_identity::hash_bytes(&frozen_profile),
+        "the fresh receipt retains the declared private identity"
+    );
+    let refreshed_config = fs::read(&config_path).unwrap();
+    let refreshed_text = std::str::from_utf8(&refreshed_config).unwrap();
+    assert!(refreshed_text.contains(&approval), "{refreshed_text}");
+    assert!(refreshed_text.contains("hooks = true"), "{refreshed_text}");
+    let refreshed_definition: serde_json::Value =
+        serde_json::from_slice(&fs::read(&hooks.source).unwrap()).unwrap();
+    assert_eq!(
+        refreshed_definition["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "harness-rtk.exe hook"
+    );
+    assert_eq!(
+        fs::read(&unrelated).unwrap(),
+        b"unrelated-credentials-stand-in"
+    );
+    assert!(
+        previous_evidence.is_dir(),
+        "historical native evidence was lost"
+    );
+    assert_eq!(serde_json::to_vec(&previous).unwrap(), previous_receipt);
+
+    // Simulate the caller dying after native completion but before persisting
+    // the fresh receipt: replay exactly the same old receipt and declaration.
+    let replayed = refresh_arm(&previous, &refresh_request).unwrap();
+    assert_eq!(
+        replayed.variant.record_sha256,
+        refresh_request.variant.record_sha256
+    );
+    assert_eq!(replayed.installation.changed_links, 0);
+    assert_ne!(
+        replayed.installation.runtime_evidence,
+        refreshed.installation.runtime_evidence
+    );
+    assert!(replayed.installation.runtime_evidence.is_dir());
+    verify_consumption(&replayed).unwrap();
+    let replayed_text = fs::read_to_string(&config_path).unwrap();
+    assert!(replayed_text.contains(&approval), "{replayed_text}");
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes()
+    );
+    assert_eq!(serde_json::to_vec(&previous).unwrap(), previous_receipt);
+    assert!(previous_evidence.is_dir());
+    assert!(unrelated.is_file());
+
+    // A persisted fresh receipt must chain: its retained private identity is
+    // still the declared bytes even though the live profile carries native
+    // approval. Select a third immutable build and refresh again.
+    let chained_build = fixture_build(
+        &state,
+        "refresh-v3",
+        &source,
+        &fixtures.launcher,
+        "refresh-v3",
+    );
+    let mut chained_request = refresh_request.clone();
+    chained_request.variant = prepare_variant(&state, Arm::Baseline, "H", &chained_build).unwrap();
+    let chained = refresh_arm(&refreshed, &chained_request).unwrap();
+    assert_eq!(
+        chained.variant.record_sha256,
+        chained_request.variant.record_sha256
+    );
+    verify_consumption(&chained).unwrap();
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes()
+    );
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(&approval)
+    );
+    assert_eq!(
+        chained
+            .private
+            .iter()
+            .find(|input| input.destination == "ds.config.toml")
+            .unwrap()
+            .sha256,
+        build_identity::hash_bytes(&frozen_profile)
+    );
+
+    // A request for another home is refused before touching either home.
+    let foreign_home = prepare_home(&root.join("homes/foreign")).unwrap();
+    let mut mismatched = refresh_request.clone();
+    mismatched.home = foreign_home.clone();
+    let error = refresh_arm(&previous, &mismatched).unwrap_err().to_string();
+    assert!(
+        error.contains("retain the previous arm home exactly"),
+        "{error}"
+    );
+    assert!(!foreign_home.join("harness/installation.json").exists());
+
+    // A changed client identity (here the declared runner material) is refused
+    // before any native effect; the installed record stays exactly as it was.
+    let installation_before_authority = fs::read(home.join("harness/installation.json")).unwrap();
+    let mut changed_client = local_client(&catalogue, Some(&overlay));
+    changed_client.runner.identity.weights = Some("sha256:different-weights".into());
+    let mut changed_authority = refresh_request.clone();
+    changed_authority.client = Some(changed_client);
+    let error = refresh_arm(&previous, &changed_authority)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("changes the approved client identity"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(home.join("harness/installation.json")).unwrap(),
+        installation_before_authority
+    );
+
+    // A native update that completes before its post-update component check
+    // fails must name the stage, cause and native recovery status instead of
+    // returning a success receipt. Repeating the same request after restoring
+    // the interrupted component recovers through the same native owner.
+    let chained_receipt = serde_json::to_vec(&chained).unwrap();
+    let adapter_bytes = fs::read(&adapter).unwrap();
+    fs::remove_file(&adapter).unwrap();
+    let recovering_build = fixture_build(
+        &state,
+        "refresh-v4",
+        &source,
+        &fixtures.launcher,
+        "refresh-v4",
+    );
+    let mut recovering_request = chained_request.clone();
+    recovering_request.variant =
+        prepare_variant(&state, Arm::Baseline, "H", &recovering_build).unwrap();
+    let failed = refresh_arm(&chained, &recovering_request)
+        .unwrap_err()
+        .to_string();
+    assert!(failed.contains("native update completed"), "{failed}");
+    assert!(
+        failed.contains("token workflow component was not retained"),
+        "{failed}"
+    );
+    assert!(failed.contains("Native recovery: status="), "{failed}");
+    assert_eq!(serde_json::to_vec(&chained).unwrap(), chained_receipt);
+    fs::write(&adapter, &adapter_bytes).unwrap();
+    let recovered = refresh_arm(&chained, &recovering_request).unwrap();
+    assert_eq!(
+        recovered.variant.record_sha256,
+        recovering_request.variant.record_sha256
+    );
+    assert_eq!(
+        recovered.installation.changed_links, 0,
+        "the failed call must not be mislabeled as having no native effect"
+    );
+    verify_consumption(&recovered).unwrap();
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes()
+    );
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(&approval)
+    );
+
+    // Foreign drift in an owned link is rejected by the native ownership check
+    // before the refresh can publish or verify anything.
+    let installation = home.join("harness/installation.json");
+    let installation_bytes = fs::read(&installation).unwrap();
+    let configuration_bytes = fs::read(&config_path).unwrap();
+    let replayed_evidence = replayed.installation.runtime_evidence.clone();
+    let launcher = home.join("harness/bin/codex.exe");
+    fs::remove_file(&launcher).unwrap();
+    fs::write(&launcher, b"foreign-launcher").unwrap();
+    let error = refresh_arm(&previous, &refresh_request)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refresh preflight"), "{error}");
+    assert_eq!(fs::read(&installation).unwrap(), installation_bytes);
+    assert_eq!(fs::read(&config_path).unwrap(), configuration_bytes);
+    assert!(replayed_evidence.is_dir());
+    assert_eq!(serde_json::to_vec(&previous).unwrap(), previous_receipt);
 }
