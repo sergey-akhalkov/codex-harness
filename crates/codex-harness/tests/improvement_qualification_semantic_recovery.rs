@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Output,
+    process::{Command, Output},
 };
 
 const FIRST_SESSION: &str = "12345678-1234-4234-8234-123456789021";
@@ -542,5 +542,67 @@ fn verified_pre_submission_failure_keeps_action_evidence_and_reaches_semantic_re
         row["usage"]["total_tokens"].as_u64(),
         Some(responses * 120),
         "the failed zero-turn dispatch contributes no usage: {row}"
+    );
+
+    let reviewer_run = native_runs
+        .iter()
+        .find(|run| run["session"] == REVIEW_SESSION)
+        .expect("the independent reviewer has one native run");
+    let semantic_check = row["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "independent-semantic-review")
+        .expect("the accepted row records the required semantic review check");
+    assert_eq!(
+        semantic_check["started_at"], reviewer_run["started_at"],
+        "the semantic check starts with its exact completed native reviewer session: {row}"
+    );
+    assert_eq!(
+        semantic_check["ended_at"], reviewer_run["ended_at"],
+        "the semantic check ends with its exact completed native reviewer session: {row}"
+    );
+
+    let report_input = fixture
+        .spec
+        .with_file_name("qualification-outcome-row.json");
+    fs::write(
+        &report_input,
+        serde_json::to_vec(&json!([row.clone()])).unwrap(),
+    )
+    .unwrap();
+    let report = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["outcome-report", "--input"])
+        .arg(&report_input)
+        .output()
+        .expect("the real outcome-report CLI runs");
+    assert!(report.status.success(), "{}", text(&report));
+    let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+    let measured = &report["attempts"][0];
+    assert_eq!(measured["status"], "accepted", "{report}");
+    assert_eq!(measured["correct"], true, "{report}");
+    let expected =
+        row["ended_at"].as_f64().unwrap() - row["execution_started_at"].as_f64().unwrap();
+    assert_eq!(
+        measured["elapsed_seconds"].as_f64(),
+        Some(expected),
+        "the native reviewer and its check share one enclosing wall span: {report}"
+    );
+    assert_eq!(
+        measured["verified_seconds"].as_f64(),
+        Some(expected),
+        "the complete measured result is verified without a guessed interval: {report}"
+    );
+    assert_eq!(
+        measured["total_result_seconds"].as_f64(),
+        Some(expected),
+        "the outcome report accounts the complete measured result: {report}"
+    );
+    assert!(
+        !measured["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("incomplete_timing")),
+        "a measured semantic review is not timing-incomplete: {report}"
     );
 }

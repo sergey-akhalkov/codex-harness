@@ -3994,6 +3994,44 @@ fn prepare_oracle_workspace(
     persist(run, state)
 }
 
+/// The exact interval finalize already verified for the completed independent
+/// reviewer. The required semantic check reuses it so outcome-report counts
+/// the reviewer work inside its enclosing wall span instead of treating the
+/// check as unmeasured.
+fn completed_reviewer_interval(
+    native_runs: &[Value],
+    reviewer_session: &str,
+) -> io::Result<(f64, f64)> {
+    let mut runs = native_runs
+        .iter()
+        .filter(|run| run["session"].as_str() == Some(reviewer_session));
+    let run = runs.next().ok_or_else(|| {
+        invalid(
+            "the completed semantic reviewer has no verified native run; no complete measured row can be recorded",
+        )
+    })?;
+    if runs.next().is_some() {
+        return Err(invalid(
+            "the semantic reviewer session has more than one native run; no complete measured row can be recorded",
+        ));
+    }
+    if run["status"] != "completed" {
+        return Err(invalid(
+            "the semantic reviewer native run is not completed; no complete measured row can be recorded",
+        ));
+    }
+    match (run["started_at"].as_f64(), run["ended_at"].as_f64()) {
+        (Some(started_at), Some(ended_at))
+            if started_at.is_finite() && ended_at.is_finite() && ended_at >= started_at =>
+        {
+            Ok((started_at, ended_at))
+        }
+        _ => Err(invalid(
+            "the semantic reviewer native timing is missing or invalid; no complete measured row can be recorded",
+        )),
+    }
+}
+
 fn finalize(
     run: &mut Run,
     inputs: &BaselineQualificationInputs,
@@ -4286,9 +4324,21 @@ fn finalize(
         "evidence_sha256":build_identity::hash_file(&acceptance.record_path)?,
     })];
     if let Some(review) = &semantic {
+        let reviewer_session = state
+            .semantic_review
+            .as_ref()
+            .and_then(|review| review.participant.as_ref())
+            .map(|participant| participant.session.as_str())
+            .ok_or_else(|| {
+                invalid(
+                    "the completed semantic reviewer participant is missing; no complete measured row can be recorded",
+                )
+            })?;
+        let (started_at, ended_at) = completed_reviewer_interval(&native_runs, reviewer_session)?;
         checks.push(json!({
             "id":"independent-semantic-review", "round":0, "required":true,
             "executed":true, "passed":review.kind == "accept",
+            "started_at":started_at, "ended_at":ended_at,
             "evidence":review.judgment.clone(),
             "evidence_sha256":review.sha256.clone(),
             "findings":review.findings,
