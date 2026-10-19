@@ -57,6 +57,8 @@ codex-harness improve status --run DIRECTORY [--json]
 codex-harness improve select --run DIRECTORY --variant baseline|candidate
 codex-harness improve stop --run DIRECTORY [--reason TEXT]
 codex-harness improve resume --run DIRECTORY
+codex-harness improve review --prepare --review DIRECTORY --declaration FILE
+codex-harness improve review --resume --review DIRECTORY [--declaration FILE]
 codex-harness improve prepare-runtime --source DIRECTORY --state DIRECTORY --output FILE
 
 One explicitly started, durable improvement run. Beads owns the hypothesis and
@@ -87,6 +89,12 @@ unchanged gates and participant bindings, reports the exact homes, checkout,
 task and workspace plus the resume command, and dispatches no model attempt.
 Preparation is not acceptance and does not trust native hooks; the first actual
 launch may still require native first-use or hook consent.
+
+review --prepare freezes one eligible retained ordinary completion together with
+its verified Git source, retained result and action sidecars, then prepares the
+shared semantic-review packet and reviewer runtime without dispatching a model.
+review --resume validates the retained review identity; dispatch remains owned by
+the ordinary review lifecycle.
 
 A run that declares the explicit comparison inputs also prepares and drives
 the sequential measured pair from candidate-ready. Continuous supervision is
@@ -166,6 +174,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         Some("select") => select(&args[1..]),
         Some("stop") => stop(&args[1..]),
         Some("resume") => resume(&args[1..]),
+        Some("review") => improvement_qualification::review(&args[1..]),
         Some("prepare-runtime") => improvement_driver::prepare_runtime(&args[1..]),
         _ => Err(invalid(
             "invalid improve options; use codex-harness improve --help",

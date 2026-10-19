@@ -5,6 +5,9 @@
 #[path = "improvement_qualification_review.rs"]
 mod assessment;
 
+#[path = "improvement_ordinary_review.rs"]
+mod ordinary_review;
+
 use super::*;
 use harness_core::improvement_experiment::{ArmBinding, prepare_home, prepare_variant};
 use harness_core::improvement_loop::{
@@ -77,6 +80,13 @@ pub(super) fn prepare(run: &mut Run) -> io::Result<PreparedQualification> {
         state,
         runtime,
     })
+}
+
+/// `improve review` preparation for one retained ordinary completion. The
+/// ordinary adapter owns its own review directory and never creates or
+/// advances a baseline qualification run.
+pub(super) fn review(args: &[OsString]) -> io::Result<i32> {
+    ordinary_review::run(args)
 }
 
 pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
@@ -2318,15 +2328,7 @@ fn ensure_review_packet(
         "/global/orchestration.toml\n",
     )?;
     let (value, files) = assessment::load_packet(&source, &manifest)?;
-    verify_review_packet(
-        host,
-        declaration,
-        &source,
-        &manifest,
-        None,
-        &value,
-        &files,
-    )?;
+    verify_review_packet(host, declaration, &source, &manifest, None, &value, &files)?;
     let manifest_sha256 = build_identity::hash_file(&manifest)?;
     review.source = Some(source.clone());
     review.manifest = Some(manifest.clone());
@@ -2804,7 +2806,11 @@ fn baseline_review_subject(
         checkout: solution.checkout.clone(),
         changed_paths: solution.changed_paths.clone(),
         participants: workflow_review_participants(run, state)?,
-        lead_session: state.workflow.lead.as_ref().map(|lead| lead.session.clone()),
+        lead_session: state
+            .workflow
+            .lead
+            .as_ref()
+            .map(|lead| lead.session.clone()),
         executor_session: state
             .workflow
             .executor
@@ -3549,7 +3555,10 @@ fn recover_semantic_review(
     }
     if review.correction_attempt.is_some()
         || review.correction_used
-        || host.cursor().attempt(SEMANTIC_REVIEW_CORRECTION_ID).is_some()
+        || host
+            .cursor()
+            .attempt(SEMANTIC_REVIEW_CORRECTION_ID)
+            .is_some()
         || host.cursor().attempt(SEMANTIC_REVIEW_RECOVERY_ID).is_some()
     {
         return Err(invalid(
@@ -3658,7 +3667,11 @@ fn recover_semantic_review(
         failed.id,
         verified.evidence.reason()
     );
-    let outcome = dispatch_reviewer_turn(host, SEMANTIC_REVIEW_RECOVERY_ID.to_owned(), assignment_path)?;
+    let outcome = dispatch_reviewer_turn(
+        host,
+        SEMANTIC_REVIEW_RECOVERY_ID.to_owned(),
+        assignment_path,
+    )?;
     match outcome {
         SemanticReviewOutcome::Notes(mut notes) => {
             notes.insert(0, note);
@@ -5194,36 +5207,7 @@ fn prepare_semantic_review(
             )));
         }
         origin.runtime.clone()
-    } else if runtime_path.is_file() {
-        let retained: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
-        if retained.label != declaration.runtime.label
-            || retained.variant.build != declaration.runtime.build.canonicalize()?
-        {
-            return Err(invalid(
-                "the retained semantic reviewer runtime no longer binds the frozen declaration",
-            ));
-        }
-        retained
     } else {
-        if root.exists() {
-            return Err(invalid(format!(
-                "partial semantic reviewer preparation at {}; preserve it and recover the owned installation before preparing a fresh run",
-                root.display()
-            )));
-        }
-        let variant = prepare_variant(
-            &declaration.runtime.state,
-            Arm::Baseline,
-            &declaration.runtime.label,
-            &declaration.runtime.build,
-        )?;
-        fs::create_dir_all(&root)?;
-        let home = prepare_home(&root.join("home"))?;
-        let user_home = prepare_home(&root.join("home-user"))?;
-        let dependency_user_home = prepare_home(&root.join("home-dep"))?;
-        if let Some(config) = &declaration.runtime.native_config {
-            fs::copy(&config.path, home.join("config.toml"))?;
-        }
         let mut protected = vec![
             inputs.task.source.clone(),
             run.spec.project.clone(),
@@ -5233,19 +5217,7 @@ fn prepare_semantic_review(
         if let Some(object) = &state.task_copy {
             protected.push(object.clone());
         }
-        let installed = improvement_runtime::install_arm(&ArmRequest {
-            variant,
-            home,
-            user_home,
-            dependency_user_home,
-            upstream: declaration.runtime.upstream.clone(),
-            timeout: Duration::from_secs(300),
-            client: None,
-            private_inputs: declaration.runtime.private_inputs.clone(),
-            protected,
-        })?;
-        write_json_atomic(&runtime_path, &installed)?;
-        installed
+        load_or_install_reviewer_runtime(&root, declaration, protected)?
     };
     if reviewer.home == runtime.home || reviewer.home == state.home.clone().unwrap_or_default() {
         return Err(invalid(
@@ -5308,6 +5280,61 @@ fn prepare_semantic_review(
     state.semantic_review = Some(review);
     persist(run, state)?;
     Ok(Some(reviewer))
+}
+
+/// Bind the reviewer runtime receipt when it already exists, otherwise install
+/// one fresh read-only runtime into its own owned home. The baseline
+/// qualification and the external ordinary-result review share this exact
+/// retained-receipt validation and installation lifecycle.
+fn load_or_install_reviewer_runtime(
+    root: &Path,
+    declaration: &harness_core::improvement_loop::SemanticReviewInputs,
+    protected: Vec<PathBuf>,
+) -> io::Result<ArmRuntime> {
+    let runtime_path = root.join("runtime.json");
+    if runtime_path.is_file() {
+        let retained: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
+        if retained.label != declaration.runtime.label
+            || retained.variant.build != declaration.runtime.build.canonicalize()?
+        {
+            return Err(invalid(
+                "the retained semantic reviewer runtime no longer binds the frozen declaration",
+            ));
+        }
+        return Ok(retained);
+    }
+    if root.exists() {
+        return Err(invalid(format!(
+            "partial semantic reviewer preparation at {}; preserve it and recover the owned installation before preparing a fresh run",
+            root.display()
+        )));
+    }
+    let variant = prepare_variant(
+        &declaration.runtime.state,
+        Arm::Baseline,
+        &declaration.runtime.label,
+        &declaration.runtime.build,
+    )?;
+    fs::create_dir_all(root)?;
+    let home = prepare_home(&root.join("home"))?;
+    let user_home = prepare_home(&root.join("home-user"))?;
+    let dependency_user_home = prepare_home(&root.join("home-dep"))?;
+    if let Some(config) = &declaration.runtime.native_config {
+        fs::copy(&config.path, home.join("config.toml"))?;
+    }
+    let installed = improvement_runtime::install_arm(&ArmRequest {
+        variant,
+        home,
+        user_home,
+        dependency_user_home,
+        upstream: declaration.runtime.upstream.clone(),
+        timeout: Duration::from_secs(300),
+        client: None,
+        private_inputs: declaration.runtime.private_inputs.clone(),
+        protected,
+    })?;
+    write_json_atomic(&runtime_path, &installed)?;
+    Ok(installed)
 }
 
 fn ensure_prepared(
