@@ -1589,8 +1589,14 @@ fn comparison_inputs_are_validated_before_preparation() {
             implementation_seconds: 1.0,
             evaluation_seconds: 1.0,
             maintenance_seconds_per_task: 0.0,
+            seed_tokens: None,
+            reflection_tokens: None,
+            implementation_tokens: None,
+            evaluation_tokens: None,
+            maintenance_tokens_per_task: None,
         },
         conjunction: None,
+        payback: None,
     };
     let policy_path = spec.comparison.as_ref().unwrap().policy.clone();
     fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();

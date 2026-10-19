@@ -531,8 +531,14 @@ fn policy() -> ComparisonPolicy {
             implementation_seconds: 10.0,
             evaluation_seconds: 5.0,
             maintenance_seconds_per_task: 0.5,
+            seed_tokens: None,
+            reflection_tokens: None,
+            implementation_tokens: None,
+            evaluation_tokens: None,
+            maintenance_tokens_per_task: None,
         },
         conjunction: None,
+        payback: None,
     }
 }
 
@@ -1131,6 +1137,15 @@ fn publication_is_idempotent_and_a_newer_conflicting_decision_blocks_integration
         scope: "case-b".into(),
         reason: "contradictory-fixture".into(),
         detail: None,
+        baseline_tokens: None,
+        candidate_tokens: None,
+        cumulative_baseline_tokens: None,
+        cumulative_candidate_tokens: None,
+        cumulative_baseline: None,
+        payback_mechanism: None,
+        payback_measures: None,
+        payback_horizon: None,
+        payback_evidence: None,
     };
     let Publication::Recorded { .. } =
         publish_decision(&scenario.bd, &scenario.board, &contradictory).unwrap()

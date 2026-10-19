@@ -7,9 +7,9 @@ use harness_core::improvement_policy::{
     AnalysisMethod, BASELINE_REUSE_CLAUSE, BaselineReusePlan, Basis, ClaimScope, ComparisonPolicy,
     ConjunctionPolicy, DeclaredComparison, EffectPath, ExperimentMethod, ExperimentSelection,
     FaultRule, InitialState, LoadRule, MeasurementStatus, NuisanceControlPlan, Objective,
-    OrderRule, Overhead, PerSuccessStatus, PolicyDecision, REUSE_IDENTITIES, RealizedFirst,
-    RepeatedSelection, RetryRule, SharedState, StatisticalClaim, StoppingRule, TradeOff,
-    VariationStatus, baseline_reuse_clause, evaluate, experiment_selection_clause,
+    OrderRule, Overhead, PaybackPolicy, PerSuccessStatus, PolicyDecision, REUSE_IDENTITIES,
+    RealizedFirst, RepeatedSelection, RetryRule, SharedState, StatisticalClaim, StoppingRule,
+    TradeOff, VariationStatus, baseline_reuse_clause, evaluate, experiment_selection_clause,
     nuisance_control_clause, parse_baseline_reuse, parse_experiment_selection,
     parse_nuisance_control, parse_statistical_claim, refuse_cross_task_speed_claim,
     statistical_clause,
@@ -43,8 +43,14 @@ fn policy() -> ComparisonPolicy {
             implementation_seconds: 10.0,
             evaluation_seconds: 5.0,
             maintenance_seconds_per_task: 0.5,
+            seed_tokens: Some(0),
+            reflection_tokens: Some(0),
+            implementation_tokens: Some(0),
+            evaluation_tokens: Some(0),
+            maintenance_tokens_per_task: Some(0),
         },
         conjunction: None,
+        payback: None,
     }
 }
 
@@ -75,6 +81,7 @@ fn attempt(
     if usage {
         native["usage"] = json!({
             "model": "fixed",
+            "total_tokens": 100,
             "input_tokens": 100,
             "cached_input_tokens": 40,
             "output_tokens": 20,
@@ -964,7 +971,11 @@ fn engineering_judgment_adopts_equal_or_slower_accepted_outcomes_without_a_savin
     judgment.meaningful_effect_percent = None;
     let declared = declare(&judgment);
 
-    for (case, candidate_seconds) in [("case-equal", 100.0), ("case-slower", 115.0)] {
+    for (case, candidate_seconds, candidate_tokens) in [
+        ("case-equal", 100.0, 100_u64),
+        ("case-slower", 115.0, 100),
+        ("case-cheaper", 100.0, 80),
+    ] {
         let baseline = attempt(
             "bj",
             "baseline",
@@ -976,7 +987,7 @@ fn engineering_judgment_adopts_equal_or_slower_accepted_outcomes_without_a_savin
             Some(6),
             true,
         );
-        let candidate = attempt(
+        let mut candidate = attempt(
             "cj",
             "candidate",
             case,
@@ -987,6 +998,7 @@ fn engineering_judgment_adopts_equal_or_slower_accepted_outcomes_without_a_savin
             Some(6),
             true,
         );
+        candidate["native_runs"][0]["usage"]["total_tokens"] = json!(candidate_tokens);
         let report = summarize(&[baseline, candidate], &judgment);
         let evaluation = evaluate(&declared, &report).unwrap();
         assert_eq!(
@@ -1004,6 +1016,19 @@ fn engineering_judgment_adopts_equal_or_slower_accepted_outcomes_without_a_savin
         assert!(
             !evaluation.trade_off_used,
             "{case}: no numeric exchange is invented"
+        );
+        let cost = evaluation
+            .token_cost
+            .as_ref()
+            .expect("the complete measured token cost stays recorded");
+        assert_eq!(cost.baseline, 100, "{case}");
+        assert_eq!(
+            cost.candidate, candidate_tokens,
+            "{case}: equal or lower complete cost needs no savings quota"
+        );
+        assert!(
+            evaluation.payback.is_none(),
+            "{case}: no payback is asserted for an equal or lower cost"
         );
         assert!(
             evaluation
@@ -1063,15 +1088,15 @@ fn engineering_judgment_adopts_equal_or_slower_accepted_outcomes_without_a_savin
     }
 }
 
-#[test]
-fn engineering_judgment_retains_a_measured_token_cost_increase() {
-    let mut judgment = with_binding(Mechanism::None);
-    judgment.basis = Basis::EngineeringJudgment {
-        basis: "reflection-pilot:lead-token-cost".into(),
-    };
-    judgment.meaningful_effect_percent = None;
-    let declared = declare(&judgment);
-
+/// One synthetic engineering-judgment pair with complete measured participant
+/// usage. The candidate may be slower or spend more tokens; the judgment
+/// basis retains that measured cost rather than inventing a saving.
+fn judgment_pair(
+    baseline_tokens: u64,
+    candidate_tokens: u64,
+    baseline_rounds: u64,
+    candidate_rounds: u64,
+) -> (Value, Value) {
     let mut baseline = attempt(
         "bt",
         "baseline",
@@ -1079,7 +1104,7 @@ fn engineering_judgment_retains_a_measured_token_cost_increase() {
         0.0,
         100.0,
         true,
-        Some(4),
+        Some(baseline_rounds),
         Some(6),
         true,
     );
@@ -1090,25 +1115,69 @@ fn engineering_judgment_retains_a_measured_token_cost_increase() {
         100.0,
         115.0,
         true,
-        Some(4),
+        Some(candidate_rounds),
         Some(6),
         true,
     );
     bounded(&mut baseline, 100.0, 100.0);
     bounded(&mut candidate, 115.0, 115.0);
-    baseline["infrastructure"]["usage"] = json!({
-        "incomplete": false,
-        "raw": {"total_tokens": 125},
-        "adjusted": {"total_tokens": 125},
-        "excluded": {"total_tokens": 0},
-    });
-    candidate["infrastructure"]["usage"] = json!({
-        "incomplete": false,
-        "raw": {"total_tokens": 175},
-        "adjusted": {"total_tokens": 175},
-        "excluded": {"total_tokens": 0},
-    });
+    baseline["native_runs"][0]["usage"]["total_tokens"] = json!(baseline_tokens);
+    candidate["native_runs"][0]["usage"]["total_tokens"] = json!(candidate_tokens);
+    (baseline, candidate)
+}
 
+fn judgment_policy() -> ComparisonPolicy {
+    let mut judgment = with_binding(Mechanism::None);
+    judgment.basis = Basis::EngineeringJudgment {
+        basis: "reflection-pilot:lead-token-cost".into(),
+    };
+    judgment.meaningful_effect_percent = None;
+    judgment
+}
+
+#[test]
+fn engineering_judgment_rejects_an_increased_token_cost_without_a_demonstrated_payback() {
+    let judgment = judgment_policy();
+    let declared = declare(&judgment);
+    let (baseline, candidate) = judgment_pair(125, 175, 4, 4);
+    let report = summarize(&[baseline, candidate], &judgment);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no payback mechanism was predeclared")),
+        "an increased committed cost cannot pass on qualitative confidence alone: {:?}",
+        evaluation.reasons
+    );
+    let cost = evaluation
+        .token_cost
+        .expect("the complete measured token cost stays recorded");
+    assert_eq!(cost.baseline_participant, 125);
+    assert_eq!(cost.candidate_participant, 175);
+    assert_eq!(cost.baseline, 125);
+    assert_eq!(cost.candidate, 175);
+    assert!(evaluation.payback.is_none());
+}
+
+#[test]
+fn engineering_judgment_adopts_an_increased_token_cost_repaid_by_fewer_correction_rounds() {
+    let mut judgment = judgment_policy();
+    judgment.payback = Some(PaybackPolicy {
+        mechanism: "fewer-corrections".into(),
+        measures: vec!["rounds".into()],
+        horizon_tasks: 3.0,
+    });
+    let declared = declare(&judgment);
+    // The candidate spends more prompt tokens but needs three rather than six
+    // correction rounds; the measured return is the declared payback.
+    let (baseline, candidate) = judgment_pair(125, 175, 6, 3);
     let report = summarize(&[baseline, candidate], &judgment);
     let evaluation = evaluate(&declared, &report).unwrap();
     assert_eq!(
@@ -1119,13 +1188,209 @@ fn engineering_judgment_retains_a_measured_token_cost_increase() {
     );
     assert!(
         evaluation.reasons.iter().any(|reason| {
-            reason.contains("recorded native token usage is retained")
-                && reason.contains("+40.000%")
+            reason.contains("is supported by the recorded acceptance evidence")
+                && reason.contains("rounds 6.000 -> 3.000")
         }),
-        "the measured token cost increase stays recorded: {:?}",
+        "{:?}",
         evaluation.reasons
     );
-    assert!(!evaluation.trade_off_used);
+    let payback = evaluation
+        .payback
+        .clone()
+        .expect("the observed payback stays recorded");
+    assert_eq!(payback.mechanism, "fewer-corrections");
+    assert_eq!(payback.measures, "rounds");
+    assert_eq!(payback.horizon_tasks, 3.0);
+    assert_eq!(payback.observed.len(), 1);
+    let observed = &payback.observed[0];
+    assert_eq!(observed.measure, "rounds");
+    assert_eq!(observed.baseline, 6.0);
+    assert_eq!(observed.candidate, 3.0);
+
+    let draft = evaluation
+        .decision_draft("sample-task", "exp-1", "base-sha", "cand-sha", "acceptance")
+        .unwrap();
+    let text = draft.record().unwrap();
+    assert!(
+        text.contains(
+            "payback_mechanism=fewer-corrections payback_measures=rounds payback_horizon=3 payback_evidence=acceptance"
+        ),
+        "{text}"
+    );
+    let records = harness_core::benefit_gate::parse_gate_comments(std::slice::from_ref(&text));
+    let assessment = harness_core::benefit_gate::assess(&records, "sample-task")
+        .expect("the published judgment is attributable");
+    assert_eq!(
+        assessment.verdict,
+        harness_core::benefit_gate::Verdict::Consistent,
+        "{:?}",
+        assessment.limitations
+    );
+}
+
+#[test]
+fn engineering_judgment_rejects_an_increased_token_cost_whose_declared_return_does_not_improve() {
+    let mut judgment = judgment_policy();
+    judgment.payback = Some(PaybackPolicy {
+        mechanism: "fewer-corrections".into(),
+        measures: vec!["rounds".into()],
+        horizon_tasks: 3.0,
+    });
+    let declared = declare(&judgment);
+    let (baseline, candidate) = judgment_pair(125, 175, 4, 4);
+    let report = summarize(&[baseline, candidate], &judgment);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("is not demonstrated by the recorded acceptance evidence")
+                && reason.contains("rounds")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(evaluation.payback.is_none());
+}
+
+#[test]
+fn engineering_judgment_refuses_usage_as_its_own_payback() {
+    let mut judgment = judgment_policy();
+    judgment.payback = Some(PaybackPolicy {
+        mechanism: "cheaper-tokens".into(),
+        measures: vec!["usage".into()],
+        horizon_tasks: 3.0,
+    });
+    let declared = declare(&judgment);
+    let (baseline, candidate) = judgment_pair(125, 175, 4, 4);
+    let report = summarize(&[baseline, candidate], &judgment);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("usage is the token spending being repaid") }),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn engineering_judgment_keeps_an_unusable_payback_declaration_inconclusive() {
+    let mut judgment = judgment_policy();
+    judgment.payback = Some(PaybackPolicy {
+        mechanism: "fewer-corrections".into(),
+        measures: vec!["requests".into()],
+        horizon_tasks: 3.0,
+    });
+    let declared = declare(&judgment);
+    let (baseline, candidate) = judgment_pair(125, 175, 4, 3);
+    let report = summarize(&[baseline, candidate], &judgment);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("the declared payback is not usable")
+                && reason.contains("not part of the recorded metric coverage")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(evaluation.payback.is_none());
+}
+
+#[test]
+fn engineering_judgment_refuses_a_payback_horizon_beyond_the_declared_horizon() {
+    let mut judgment = judgment_policy();
+    judgment.horizon_tasks = 2.0;
+    judgment.payback = Some(PaybackPolicy {
+        mechanism: "fewer-corrections".into(),
+        measures: vec!["rounds".into()],
+        horizon_tasks: 3.0,
+    });
+    assert!(
+        judgment
+            .declare()
+            .unwrap_err()
+            .to_string()
+            .contains("payback horizon"),
+        "a return beyond the relevant-use horizon is not a bounded payback"
+    );
+}
+
+#[test]
+fn engineering_judgment_treats_unknown_decisive_token_cost_as_inconclusive() {
+    let judgment = judgment_policy();
+    let declared = declare(&judgment);
+    let (baseline, candidate) = judgment_pair(125, 175, 4, 4);
+    let mut candidate = candidate;
+    // No per-run usage was recorded for the candidate: the decisive cost is
+    // unknown, not a measured zero or a nonincrease.
+    candidate["native_runs"][0]
+        .as_object_mut()
+        .expect("native run object")
+        .remove("usage");
+    let report = summarize(&[baseline, candidate], &judgment);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("complete token cost for the accepted-result path is unknown")
+                && reason.contains("unknown decisive cost is not a nonincrease")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(evaluation.token_cost.is_none());
+}
+
+#[test]
+fn engineering_judgment_reads_an_explicitly_empty_run_list_as_measured_zero() {
+    let judgment = judgment_policy();
+    let declared = declare(&judgment);
+    let (baseline, candidate) = judgment_pair(125, 175, 4, 4);
+    let report = summarize(&[baseline, candidate], &judgment);
+    let mut report = report;
+    for row in report["attempts"]
+        .as_array_mut()
+        .expect("summarized attempts")
+    {
+        row["usage"] = json!({"status": "per_run", "runs": []});
+    }
+    let evaluation = evaluate(&declared, &report).unwrap();
+    let cost = evaluation
+        .token_cost
+        .expect("an explicitly empty run list is a measured zero");
+    assert_eq!(cost.baseline_participant, 0);
+    assert_eq!(cost.candidate_participant, 0);
+    assert_eq!(cost.baseline, 0);
+    assert_eq!(cost.candidate, 0);
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "equal complete cost needs no savings quota: {:?}",
+        evaluation.reasons
+    );
 }
 
 #[test]
@@ -4001,6 +4266,11 @@ fn broader_scope_policy() -> ComparisonPolicy {
         implementation_seconds: 0.0,
         evaluation_seconds: 0.0,
         maintenance_seconds_per_task: 0.0,
+        seed_tokens: None,
+        reflection_tokens: None,
+        implementation_tokens: None,
+        evaluation_tokens: None,
+        maintenance_tokens_per_task: None,
     };
     policy
 }
@@ -5425,6 +5695,11 @@ fn a_single_pair_or_crossing_pair_range_cannot_establish_repeatable_savings() {
         implementation_seconds: 0.0,
         evaluation_seconds: 0.0,
         maintenance_seconds_per_task: 0.0,
+        seed_tokens: None,
+        reflection_tokens: None,
+        implementation_tokens: None,
+        evaluation_tokens: None,
+        maintenance_tokens_per_task: None,
     };
     let repeatable = with_claim(repeatable, ClaimScope::Repeatable);
     let declared = declare(&repeatable);
@@ -5854,6 +6129,11 @@ fn resource_verdicts_hold_across_time_bounds_and_declared_trade_offs() {
         implementation_seconds: 0.0,
         evaluation_seconds: 0.0,
         maintenance_seconds_per_task: 0.0,
+        seed_tokens: None,
+        reflection_tokens: None,
+        implementation_tokens: None,
+        evaluation_tokens: None,
+        maintenance_tokens_per_task: None,
     };
     resource.trade_off = Some(TradeOff {
         basis: "declared before results: bounded time exchange".into(),
@@ -5910,6 +6190,11 @@ fn resource_verdicts_hold_across_time_bounds_and_declared_trade_offs() {
         implementation_seconds: 0.0,
         evaluation_seconds: 0.0,
         maintenance_seconds_per_task: 0.0,
+        seed_tokens: None,
+        reflection_tokens: None,
+        implementation_tokens: None,
+        evaluation_tokens: None,
+        maintenance_tokens_per_task: None,
     };
     covered.trade_off = Some(TradeOff {
         basis: "declared before results: bounded time exchange".into(),

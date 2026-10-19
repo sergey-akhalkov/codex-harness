@@ -225,8 +225,14 @@ fn policy(uncertainty: &str) -> ComparisonPolicy {
             implementation_seconds: 0.0,
             evaluation_seconds: 0.0,
             maintenance_seconds_per_task: 0.0,
+            seed_tokens: None,
+            reflection_tokens: None,
+            implementation_tokens: None,
+            evaluation_tokens: None,
+            maintenance_tokens_per_task: None,
         },
         conjunction: None,
+        payback: None,
     }
 }
 

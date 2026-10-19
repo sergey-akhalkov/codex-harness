@@ -1577,6 +1577,49 @@ pub struct Overhead {
     pub implementation_seconds: f64,
     pub evaluation_seconds: f64,
     pub maintenance_seconds_per_task: f64,
+    /// Complete token cost of the seed work that produced the improvement.
+    /// `None` keeps a policy without token accounting unknown, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_tokens: Option<u64>,
+    /// Complete token cost of both reflection sessions for the improvement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection_tokens: Option<u64>,
+    /// Complete shared token cost of implementing and coordinating the
+    /// candidate. `None` keeps every policy written before token accounting
+    /// unknown rather than zero; an explicit `0` is a measured zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_tokens: Option<u64>,
+    /// Complete shared token cost of the evaluation/check work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_tokens: Option<u64>,
+    /// Retained maintenance token cost per task over the declared horizon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_tokens_per_task: Option<u64>,
+}
+
+/// A predeclared payback for a measured token-cost increase. It names the
+/// mechanism and the observable measures that must already be part of the
+/// recorded coverage; the horizon is bounded by the experiment's declared
+/// `horizon_tasks`. The gate checks that the declaration and its evidence
+/// binding exist, while the lead judges the concrete trade-off.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PaybackPolicy {
+    pub mechanism: String,
+    pub measures: Vec<String>,
+    pub horizon_tasks: f64,
+}
+
+impl PaybackPolicy {
+    /// The payback plan exactly as recorded with every measured attempt before
+    /// results, so a plan relaxed after an outcome exists is declaration drift.
+    pub fn declaration(&self) -> Value {
+        json!({
+            "mechanism": self.mechanism,
+            "measures": self.measures,
+            "horizon_tasks": self.horizon_tasks,
+        })
+    }
 }
 
 /// A declared conjunction of adoption criteria over one observed unit set:
@@ -1645,6 +1688,11 @@ pub struct ComparisonPolicy {
     /// and serialized identity unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conjunction: Option<ConjunctionPolicy>,
+    /// The predeclared payback plan for a full token-cost increase under the
+    /// engineering-judgment basis. `None` is valid until a measured increase
+    /// needs a return; an increase cannot be adopted without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payback: Option<PaybackPolicy>,
 }
 
 /// A policy fixed and digested before results.
@@ -1673,6 +1721,28 @@ impl ComparisonPolicy {
             // zero so its evidence remains complete rather than ambiguous.
             _ => Some(self.meaningful_effect_percent.unwrap_or(0.0)),
         };
+        let mut costs = json!({
+            "implementation_seconds": self.overhead.implementation_seconds,
+            "evaluation_seconds": self.overhead.evaluation_seconds,
+            "maintenance_seconds_per_task": self.overhead.maintenance_seconds_per_task,
+        });
+        // Token overhead is recorded only when it was declared. A missing
+        // value stays unknown; an explicit zero is a measured zero.
+        if let Some(tokens) = self.overhead.seed_tokens {
+            costs["seed_tokens"] = json!(tokens);
+        }
+        if let Some(tokens) = self.overhead.reflection_tokens {
+            costs["reflection_tokens"] = json!(tokens);
+        }
+        if let Some(tokens) = self.overhead.implementation_tokens {
+            costs["implementation_tokens"] = json!(tokens);
+        }
+        if let Some(tokens) = self.overhead.evaluation_tokens {
+            costs["evaluation_tokens"] = json!(tokens);
+        }
+        if let Some(tokens) = self.overhead.maintenance_tokens_per_task {
+            costs["maintenance_tokens_per_task"] = json!(tokens);
+        }
         let mut value = json!({
             "task_mix": self.task_mix,
             "objective": self.objective.as_str(),
@@ -1681,11 +1751,7 @@ impl ComparisonPolicy {
             "stopping": self.stopping_text(),
             "uncertainty": self.uncertainty,
             "horizon_tasks": self.horizon_tasks,
-            "costs": {
-                "implementation_seconds": self.overhead.implementation_seconds,
-                "evaluation_seconds": self.overhead.evaluation_seconds,
-                "maintenance_seconds_per_task": self.overhead.maintenance_seconds_per_task,
-            },
+            "costs": costs,
         });
         if let Some(effect) = declared_effect {
             value["effect_percent"] = json!(effect);
@@ -1715,6 +1781,9 @@ impl ComparisonPolicy {
         // both useful margins cannot be relaxed after an outcome exists.
         if let Some(conjunction) = &self.conjunction {
             value["conjunction"] = conjunction.declaration();
+        }
+        if let Some(payback) = &self.payback {
+            value["payback"] = payback.declaration();
         }
         value
     }
@@ -1774,6 +1843,21 @@ impl ComparisonPolicy {
                 if self.conjunction.is_some() {
                     return Err(invalid(
                         "an engineering-judgment basis cannot also declare a conjunctive numeric savings rule; choose one adoption basis",
+                    ));
+                }
+                if self.overhead.seed_tokens.is_none()
+                    || self.overhead.reflection_tokens.is_none()
+                    || self.overhead.implementation_tokens.is_none()
+                    || self.overhead.evaluation_tokens.is_none()
+                    || self.overhead.maintenance_tokens_per_task.is_none()
+                {
+                    return Err(invalid(
+                        "an engineering-judgment policy must declare complete token overhead: seed, both reflections, implementation, evaluation and maintenance tokens per task; unknown shared cost cannot be read as zero",
+                    ));
+                }
+                if self.horizon_tasks.fract() != 0.0 {
+                    return Err(invalid(
+                        "an engineering-judgment token cost needs a whole-task horizon so retained maintenance is an exact token total",
                     ));
                 }
             }
@@ -1857,6 +1941,44 @@ impl ComparisonPolicy {
         }
         if !self.horizon_tasks.is_finite() || self.horizon_tasks <= 0.0 {
             return Err(invalid("horizon_tasks must be a finite positive number"));
+        }
+        if let Some(payback) = &self.payback {
+            if !matches!(&self.basis, Basis::EngineeringJudgment { .. }) {
+                return Err(invalid(
+                    "a payback plan belongs to the explicit engineering-judgment basis; efficiency and maintenance keep their strict meanings",
+                ));
+            }
+            if crate::board_hypothesis::require_token("payback mechanism", &payback.mechanism, 64)
+                .is_err()
+            {
+                return Err(invalid(
+                    "a payback mechanism must be a single bounded token naming the predeclared return",
+                ));
+            }
+            if payback.measures.is_empty() {
+                return Err(invalid(
+                    "a payback plan needs at least one observable measure",
+                ));
+            }
+            for (index, measure) in payback.measures.iter().enumerate() {
+                if crate::board_hypothesis::require_token("payback measure", measure, 64).is_err() {
+                    return Err(invalid(
+                        "every payback measure must be a single bounded observed-dimension token",
+                    ));
+                }
+                if payback.measures[..index].contains(measure) {
+                    return Err(invalid("a payback measure is repeated"));
+                }
+            }
+            if !payback.horizon_tasks.is_finite()
+                || payback.horizon_tasks <= 0.0
+                || payback.horizon_tasks.fract() != 0.0
+                || payback.horizon_tasks > self.horizon_tasks
+            {
+                return Err(invalid(
+                    "a payback horizon must be a finite positive number within the declared task horizon",
+                ));
+            }
         }
         for (name, value) in [
             (
@@ -2118,6 +2240,51 @@ pub struct AttributionEvidence {
     pub basis: String,
 }
 
+/// Complete token cost retained for an explicit engineering-judgment
+/// decision: the native participant work on both arms (every attempt of each
+/// accepted-result retry chain), the shared implementation/evaluation cost,
+/// and retained maintenance over the declared horizon. The baseline carries
+/// maintenance because the existing baseline remains in use; implementation
+/// and evaluation are the candidate's added cost.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TokenCostRecord {
+    pub baseline_participant: u64,
+    pub candidate_participant: u64,
+    pub seed: u64,
+    pub reflection: u64,
+    pub implementation: u64,
+    pub evaluation: u64,
+    pub maintenance: u64,
+    pub horizon_tasks: f64,
+    pub baseline: u64,
+    pub candidate: u64,
+}
+
+/// The predeclared payback plan retained with a judgment that carries a full
+/// token-cost increase. Evidence binding stays with the publication owner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PaybackRecord {
+    pub mechanism: String,
+    pub measures: String,
+    pub horizon_tasks: f64,
+    /// Exact totals observed in this experiment for every declared measure.
+    /// Empty only while the plan is being checked; an increased-cost adoption
+    /// requires one entry per declared measure.
+    pub observed: Vec<PaybackMeasure>,
+}
+
+/// One declared payback measure's measured totals across the included units.
+/// `time` is seconds; all other supported measures are event counts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PaybackMeasure {
+    pub measure: String,
+    pub baseline: f64,
+    pub candidate: f64,
+}
+
 /// Operational evaluation evidence. Publishing the decision stays with the
 /// benefit-gate owner; this record only states what was measured and decided.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2167,6 +2334,16 @@ pub struct PolicyEvaluation {
     /// every arm was measured in this comparison.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reused_baselines: Vec<ReusedBaselineEvidence>,
+    /// Complete token cost for an engineering-judgment decision. `None` means
+    /// the decisive token cost is unknown or the basis does not use it; it is
+    /// never read as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cost: Option<TokenCostRecord>,
+    /// The predeclared payback plan retained when the complete token cost
+    /// increased. `None` means no increase needed a return or the plan is
+    /// missing; a missing plan cannot support an increased-cost adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payback: Option<PaybackRecord>,
 }
 
 /// One reused retained baseline as consumed by the decision: the retained
@@ -2211,6 +2388,10 @@ struct UnitFacts {
     candidate_bounds: Option<(f64, f64)>,
     baseline_steps: Option<u64>,
     candidate_steps: Option<u64>,
+    baseline_rounds: Option<u64>,
+    candidate_rounds: Option<u64>,
+    baseline_tool_operations: Option<u64>,
+    candidate_tool_operations: Option<u64>,
     /// Recorded native token totals per arm from the accounting owner's unit
     /// usage summary; `None` when either arm's recorded usage is unknown.
     baseline_tokens: Option<u64>,
@@ -2345,6 +2526,7 @@ fn usage_measured(row: &Value) -> bool {
         .is_some_and(|usage| {
             usage.get("status").and_then(Value::as_str) == Some("per_run")
                 && usage.get("unknown_runs").is_none()
+                && usage.get("runs").is_some_and(Value::is_array)
         })
 }
 
@@ -2385,24 +2567,21 @@ fn recorded_native_tokens(row: &Value) -> Option<u64> {
     {
         return None;
     }
+    // `runs` must exist so a missing per-run record stays unknown. An
+    // explicitly empty array is a measured zero submission, not a missing
+    // measurement: a failed attempt before any model call costs zero tokens.
+    let runs = usage.get("runs")?.as_array()?;
     let mut total: u64 = 0;
-    let mut measured = false;
-    for run in usage
-        .get("runs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for run in runs {
         total = total.checked_add(run.get("total_tokens")?.as_u64()?)?;
-        measured = true;
     }
-    if let Some(workers) = usage.get("workers").and_then(Value::as_array) {
+    if let Some(workers) = usage.get("workers") {
+        let workers = workers.as_array()?;
         for worker in workers {
             total = total.checked_add(worker.get("usage")?.get("total_tokens")?.as_u64()?)?;
-            measured = true;
         }
     }
-    measured.then_some(total)
+    Some(total)
 }
 
 /// Work-efficiency time is selected before the decision tree. Other objectives
@@ -3148,6 +3327,10 @@ fn conjunction_observation(
             candidate_bounds: crate::infrastructure_accounting::arm_bounds(candidate),
             baseline_steps: None,
             candidate_steps: None,
+            baseline_rounds: None,
+            candidate_rounds: None,
+            baseline_tool_operations: None,
+            candidate_tool_operations: None,
             baseline_tokens,
             candidate_tokens,
             usage_measured: baseline_usage && candidate_usage,
@@ -3235,6 +3418,207 @@ fn chain_native_tokens(row: &Value, results: &BTreeMap<&str, &Value>) -> (Option
     (Some(total), usage)
 }
 
+/// The complete participant token cost across every included unit's accepted
+/// result chain. A missing unit, missing chain member or unknown attempt usage
+/// keeps the total unknown; an explicitly empty per-run list contributes a
+/// measured zero.
+fn total_chain_tokens(
+    units: &[&Value],
+    results: &BTreeMap<&str, &Value>,
+    result_key: &str,
+) -> Option<u64> {
+    let mut total: u64 = 0;
+    for unit in units {
+        let row = arm_result(results, unit, result_key)?;
+        let (tokens, _) = chain_native_tokens(row, results);
+        total = total.checked_add(tokens?)?;
+    }
+    Some(total)
+}
+
+/// The complete accepted-result token cost for an explicit
+/// engineering-judgment decision. Participant totals include every attempt of
+/// each final result's retry chain; the candidate additionally carries the
+/// declared implementation and evaluation work, and both arms carry retained
+/// maintenance over the same bounded horizon. Any unknown component keeps the
+/// whole cost unknown rather than reading it as zero.
+fn complete_token_cost(
+    policy: &ComparisonPolicy,
+    included: &[&Value],
+    results: &BTreeMap<&str, &Value>,
+) -> Option<TokenCostRecord> {
+    let baseline_participant = total_chain_tokens(included, results, "baseline_result")?;
+    let candidate_participant = total_chain_tokens(included, results, "candidate_result")?;
+    let seed = policy.overhead.seed_tokens?;
+    let reflection = policy.overhead.reflection_tokens?;
+    let implementation = policy.overhead.implementation_tokens?;
+    let evaluation = policy.overhead.evaluation_tokens?;
+    let maintenance_per_task = policy.overhead.maintenance_tokens_per_task?;
+    let horizon = policy.horizon_tasks;
+    if !horizon.is_finite() || horizon <= 0.0 || horizon.fract() != 0.0 {
+        return None;
+    }
+    let horizon_tasks = u64::try_from(horizon as u128).ok()?;
+    let maintenance = maintenance_per_task.checked_mul(horizon_tasks)?;
+    let baseline = baseline_participant.checked_add(maintenance)?;
+    let candidate = candidate_participant
+        .checked_add(seed)?
+        .checked_add(reflection)?
+        .checked_add(implementation)?
+        .checked_add(evaluation)?
+        .checked_add(maintenance)?;
+    Some(TokenCostRecord {
+        baseline_participant,
+        candidate_participant,
+        seed,
+        reflection,
+        implementation,
+        evaluation,
+        maintenance,
+        horizon_tasks: horizon,
+        baseline,
+        candidate,
+    })
+}
+
+/// The predeclared payback plan, retained only when its bounded mechanism and
+/// unique observable measures are already part of the recorded metric
+/// coverage and its positive integral horizon lies within the declared task
+/// horizon. A plan or forecast alone is not a measured return: the recorded
+/// acceptance evidence stays the binding the publication owner checks.
+fn predeclared_payback(
+    policy: &ComparisonPolicy,
+    coverage: &str,
+) -> Result<Option<PaybackRecord>, String> {
+    let Some(plan) = &policy.payback else {
+        return Ok(None);
+    };
+    if crate::board_hypothesis::require_token("payback mechanism", &plan.mechanism, 64).is_err() {
+        return Err("the payback mechanism is not a single bounded token".to_owned());
+    }
+    if plan.measures.is_empty() {
+        return Err("the payback plan names no observable measure".to_owned());
+    }
+    let dimensions: Vec<&str> = coverage
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .split('+')
+        .filter(|dimension| !dimension.is_empty())
+        .collect();
+    let mut seen = BTreeSet::new();
+    for measure in &plan.measures {
+        if crate::board_hypothesis::require_token("payback measure", measure, 64).is_err() {
+            return Err(format!(
+                "payback measure {measure:?} is not a single bounded token"
+            ));
+        }
+        if !seen.insert(measure.as_str()) {
+            return Err(format!("payback measure {measure:?} is repeated"));
+        }
+        if !dimensions.contains(&measure.as_str()) {
+            return Err(format!(
+                "payback measure {measure:?} is not part of the recorded metric coverage ({})",
+                if dimensions.is_empty() {
+                    "none".to_owned()
+                } else {
+                    dimensions.join("+")
+                }
+            ));
+        }
+    }
+    let horizon = plan.horizon_tasks;
+    if !horizon.is_finite()
+        || horizon <= 0.0
+        || horizon.fract() != 0.0
+        || horizon > policy.horizon_tasks
+    {
+        return Err(
+            "the payback horizon is not a positive integer within the declared task horizon"
+                .to_owned(),
+        );
+    }
+    Ok(Some(PaybackRecord {
+        mechanism: plan.mechanism.clone(),
+        measures: plan.measures.join("+"),
+        horizon_tasks: horizon,
+        observed: Vec::new(),
+    }))
+}
+
+/// How the recorded experiment bears on a declared payback plan.
+enum PaybackObservation {
+    /// Every declared measure was measured and improved across the included
+    /// independently accepted units.
+    Supported(Vec<PaybackMeasure>),
+    /// The measures were observed and at least one did not improve. Evidence
+    /// against the predeclared return supports rejection.
+    NotDemonstrated(String),
+    /// A decisive measure is missing or not measurable in this experiment.
+    /// Unknown evidence is not a return and leaves the decision inconclusive.
+    Unmeasured(String),
+}
+
+/// Compare the declared observable measures using the same unit facts the
+/// adoption decision consumes. Counts are event totals (rounds and tool
+/// operations), not per-call averages; `time` is total result seconds. The
+/// spending dimension `usage` is not a payback measure because it is the cost
+/// being repaid. No score is computed: every declared measure must show a
+/// lower candidate total or the claimed payback is unsupported.
+fn observed_payback(plan: &PaybackRecord, facts: &[UnitFacts]) -> PaybackObservation {
+    if facts.is_empty() {
+        return PaybackObservation::Unmeasured(
+            "no independently accepted matched unit records the declared payback".to_owned(),
+        );
+    }
+    let mut observed = Vec::new();
+    for measure in plan.measures.split('+').filter(|value| !value.is_empty()) {
+        let mut baseline = 0.0_f64;
+        let mut candidate = 0.0_f64;
+        for fact in facts {
+            let pair = match measure {
+                "time" => fact.baseline_seconds.zip(fact.candidate_seconds),
+                "rounds" => fact
+                    .baseline_rounds
+                    .zip(fact.candidate_rounds)
+                    .map(|(baseline, candidate)| (baseline as f64, candidate as f64)),
+                "tool_ops" => fact
+                    .baseline_tool_operations
+                    .zip(fact.candidate_tool_operations)
+                    .map(|(baseline, candidate)| (baseline as f64, candidate as f64)),
+                "usage" => {
+                    return PaybackObservation::NotDemonstrated(
+                        "usage is the token spending being repaid, not an observable return"
+                            .to_owned(),
+                    );
+                }
+                other => {
+                    return PaybackObservation::Unmeasured(format!(
+                        "payback measure {other:?} has no measured comparison in this experiment"
+                    ));
+                }
+            };
+            let Some((baseline_value, candidate_value)) = pair else {
+                return PaybackObservation::Unmeasured(format!(
+                    "payback measure {measure:?} is not measured on every included unit"
+                ));
+            };
+            baseline += baseline_value;
+            candidate += candidate_value;
+        }
+        if candidate.partial_cmp(&baseline) != Some(std::cmp::Ordering::Less) {
+            return PaybackObservation::NotDemonstrated(format!(
+                "payback measure {measure:?} did not improve ({baseline} -> {candidate})"
+            ));
+        }
+        observed.push(PaybackMeasure {
+            measure: measure.to_owned(),
+            baseline,
+            candidate,
+        });
+    }
+    PaybackObservation::Supported(observed)
+}
 /// Evaluate the declared policy against the authoritative outcome summary.
 pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<PolicyEvaluation> {
     declared.verify()?;
@@ -3517,6 +3901,12 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                     .and_then(crate::infrastructure_accounting::arm_bounds),
                 baseline_steps: baseline_row.and_then(steps),
                 candidate_steps: candidate_row.and_then(steps),
+                baseline_rounds: baseline_row.and_then(|row| counter(row, "total_rounds")),
+                candidate_rounds: candidate_row.and_then(|row| counter(row, "total_rounds")),
+                baseline_tool_operations: baseline_row
+                    .and_then(|row| counter(row, "total_tool_operations")),
+                candidate_tool_operations: candidate_row
+                    .and_then(|row| counter(row, "total_tool_operations")),
                 baseline_tokens,
                 candidate_tokens,
                 usage_measured: usages,
@@ -3917,6 +4307,10 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
     // repayment rejections stay untouched.
     let mut effect_only_reject = false;
     let mut decision = PolicyDecision::Inconclusive;
+    // Complete token accounting for an explicit engineering-judgment
+    // decision. Unknown values stay `None`; they are never coerced to zero.
+    let mut token_cost: Option<TokenCostRecord> = None;
+    let mut payback_record: Option<PaybackRecord> = None;
     if !drift.is_empty() {
         reasons.push(
             "the recorded attempt declaration differs from the predeclared policy; the comparison is invalid"
@@ -4088,28 +4482,98 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                     policy.overhead.maintenance_seconds_per_task,
                     policy.horizon_tasks
                 ));
-                if facts.iter().all(|fact| fact.usage_measured) {
-                    let worst_tokens = facts
-                        .iter()
-                        .filter_map(|fact| fact.token_regression)
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    if worst_tokens.is_finite() {
-                        reasons.push(format!(
-                            "recorded native token usage is retained (worst measured change {worst_tokens:+.3}%); the judgment does not assert a token saving"
-                        ));
-                    } else {
+                match complete_token_cost(policy, &included, &results) {
+                    Some(cost) => {
+                        let increased = cost.candidate > cost.baseline;
+                        token_cost = Some(cost.clone());
+                        if increased {
+                            match predeclared_payback(policy, &coverage) {
+                                Ok(Some(mut plan)) => {
+                                    // A declaration is not a return: the
+                                    // recorded experiment itself must show
+                                    // every declared observable measure
+                                    // improving across the included units.
+                                    match observed_payback(&plan, &facts) {
+                                        PaybackObservation::Supported(observed) => {
+                                            let measured = observed
+                                                .iter()
+                                                .map(|measure| {
+                                                    format!(
+                                                        "{} {:.3} -> {:.3}",
+                                                        measure.measure,
+                                                        measure.baseline,
+                                                        measure.candidate
+                                                    )
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            reasons.push(format!(
+                                                "complete token cost increased from {} to {} (+{}); the predeclared payback {} over {} task(s) is supported by the recorded acceptance evidence: {measured}",
+                                                cost.baseline,
+                                                cost.candidate,
+                                                cost.candidate - cost.baseline,
+                                                plan.mechanism,
+                                                plan.horizon_tasks
+                                            ));
+                                            plan.observed = observed;
+                                            payback_record = Some(plan);
+                                            decision = PolicyDecision::Adopt;
+                                        }
+                                        PaybackObservation::NotDemonstrated(why) => {
+                                            reasons.push(format!(
+                                                "complete token cost increased from {} to {} (+{}); the predeclared payback {} is not demonstrated by the recorded acceptance evidence: {why}",
+                                                cost.baseline,
+                                                cost.candidate,
+                                                cost.candidate - cost.baseline,
+                                                plan.mechanism
+                                            ));
+                                            decision = PolicyDecision::Reject;
+                                        }
+                                        PaybackObservation::Unmeasured(why) => {
+                                            reasons.push(format!(
+                                                "complete token cost increased from {} to {} (+{}); the declared payback {} cannot be measured in this experiment: {why}; unknown return is not a return",
+                                                cost.baseline,
+                                                cost.candidate,
+                                                cost.candidate - cost.baseline,
+                                                plan.mechanism
+                                            ));
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    reasons.push(format!(
+                                        "complete token cost increased from {} to {} (+{}) and no payback mechanism was predeclared; an increased committed cost cannot be adopted on qualitative confidence alone",
+                                        cost.baseline,
+                                        cost.candidate,
+                                        cost.candidate - cost.baseline
+                                    ));
+                                    decision = PolicyDecision::Reject;
+                                }
+                                Err(problem) => {
+                                    reasons.push(format!(
+                                        "complete token cost increased from {} to {} (+{}); the declared payback is not usable: {problem}",
+                                        cost.baseline,
+                                        cost.candidate,
+                                        cost.candidate - cost.baseline
+                                    ));
+                                }
+                            }
+                        } else {
+                            reasons.push(format!(
+                                "complete token cost is {} on the baseline and {} on the candidate; equal or lower cost needs no savings quota, and no payback is asserted",
+                                cost.baseline, cost.candidate
+                            ));
+                            decision = PolicyDecision::Adopt;
+                        }
+                    }
+                    None => {
                         reasons.push(
-                            "native token usage is measured but carries no per-unit change; no token saving is asserted"
+                            "complete token cost for the accepted-result path is unknown (a retry-chain attempt or its usage is missing); unknown decisive cost is not a nonincrease and no adoption is stated"
                                 .to_owned(),
                         );
+                        decision = PolicyDecision::Inconclusive;
                     }
-                } else {
-                    reasons.push(
-                        "native token usage is not fully measured and remains unknown; no token saving is asserted"
-                            .to_owned(),
-                    );
                 }
-                decision = PolicyDecision::Adopt;
             } else {
                 reasons.push(
                     "the engineering-judgment adoption lacks matched total arm seconds; the measured cost cannot be retained"
@@ -4447,6 +4911,8 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         corroboration,
         attribution,
         reused_baselines,
+        token_cost,
+        payback: payback_record,
     })
 }
 
@@ -5437,6 +5903,21 @@ impl PolicyEvaluation {
             scope: token_text(&self.scope, 160),
             reason: record_token,
             detail,
+            baseline_tokens: self.token_cost.as_ref().map(|cost| cost.baseline),
+            candidate_tokens: self.token_cost.as_ref().map(|cost| cost.candidate),
+            cumulative_baseline_tokens: self.token_cost.as_ref().map(|cost| cost.baseline),
+            cumulative_candidate_tokens: self.token_cost.as_ref().map(|cost| cost.candidate),
+            cumulative_baseline: self
+                .token_cost
+                .as_ref()
+                .map(|_| baseline_revision.to_owned()),
+            payback_mechanism: self.payback.as_ref().map(|plan| plan.mechanism.clone()),
+            payback_measures: self.payback.as_ref().map(|plan| plan.measures.clone()),
+            payback_horizon: self
+                .payback
+                .as_ref()
+                .and_then(|plan| u64::try_from(plan.horizon_tasks as u128).ok()),
+            payback_evidence: self.payback.as_ref().map(|_| acceptance.to_owned()),
         })
     }
 }

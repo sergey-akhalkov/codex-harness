@@ -2413,8 +2413,53 @@ fn judgment_decision(
         args.push("--basis-ref".to_owned());
         args.push(reference.to_owned());
     }
+    args.extend(judgment_token_arguments());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     board.feedback(&args)
+}
+
+/// Complete synthetic token-cost and payback declaration for one
+/// engineering-judgment publication: the candidate spends more tokens and the
+/// predeclared return is the fewer correction rounds already in the recorded
+/// coverage. The first change starts its cumulative total at the local
+/// comparison, bound to the retained baseline revision.
+fn judgment_token_arguments() -> Vec<String> {
+    [
+        "--baseline-tokens",
+        "1000",
+        "--candidate-tokens",
+        "1100",
+        "--cumulative-baseline-tokens",
+        "1000",
+        "--cumulative-candidate-tokens",
+        "1100",
+        "--cumulative-baseline",
+        "base001",
+        "--payback-mechanism",
+        "fewer-corrections",
+        "--payback-measures",
+        "rounds",
+        "--payback-horizon",
+        "5",
+        "--payback-evidence",
+        "evidence-9",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn replace_argument(args: &mut [String], flag: &str, value: &str) {
+    let position = args
+        .iter()
+        .position(|argument| argument == flag)
+        .unwrap_or_else(|| panic!("{flag} is part of the decision fixture"));
+    args[position + 1] = value.to_owned();
+}
+
+fn push_argument(args: &mut Vec<String>, flag: &str, value: &str) {
+    args.push(flag.to_owned());
+    args.push(value.to_owned());
 }
 
 /// Records one scoped user removal decision through the real entry point.
@@ -2927,6 +2972,7 @@ fn engineering_judgment_publication_retains_cost_and_refuses_relabelling() {
     regressed_args.push("engineering-judgment".to_owned());
     regressed_args.push("--basis-ref".to_owned());
     regressed_args.push("reflection:lead-judgment-1".to_owned());
+    regressed_args.extend(judgment_token_arguments());
     let args: Vec<&str> = regressed_args.iter().map(String::as_str).collect();
     let regressed = board.feedback(&args);
     let text = output_text(&regressed);
@@ -2984,6 +3030,142 @@ fn engineering_judgment_publication_retains_cost_and_refuses_relabelling() {
         before + 2,
         "only the judgment decision and the strict decision were written"
     );
+    assert_no_votes(&board, &h);
+    board.drop();
+}
+
+#[test]
+fn cumulative_judgment_costs_extend_the_retained_baseline_and_refuse_drift() {
+    let board = Board::new("judgment-cumulative");
+    let h = admit(&board, "m-cumulative", "c-synthetic", "basis-cumulative");
+    let before = board.comment_texts(&h).len();
+
+    let publish = |experiment: &str,
+                   baseline_revision: &str,
+                   candidate_revision: &str,
+                   baseline_tokens: &str,
+                   candidate_tokens: &str,
+                   cumulative_baseline_tokens: &str,
+                   cumulative_candidate_tokens: &str,
+                   cumulative_baseline: &str,
+                   payback_evidence: &str| {
+        let mut args = decision_arguments(&h, experiment, "adopt", "unchanged", "115", false, None);
+        replace_argument(&mut args, "--reason", JUDGMENT_REASON);
+        replace_argument(&mut args, "--accounting", JUDGMENT_ACCOUNTING);
+        replace_argument(&mut args, "--baseline-revision", baseline_revision);
+        replace_argument(&mut args, "--candidate-revision", candidate_revision);
+        push_argument(&mut args, "--basis", "engineering-judgment");
+        push_argument(&mut args, "--basis-ref", "reflection:lead-cumulative");
+        for (flag, value) in [
+            ("--baseline-tokens", baseline_tokens),
+            ("--candidate-tokens", candidate_tokens),
+            ("--cumulative-baseline-tokens", cumulative_baseline_tokens),
+            ("--cumulative-candidate-tokens", cumulative_candidate_tokens),
+            ("--cumulative-baseline", cumulative_baseline),
+            ("--payback-mechanism", "fewer-corrections"),
+            ("--payback-measures", "rounds"),
+            ("--payback-horizon", "5"),
+            ("--payback-evidence", payback_evidence),
+        ] {
+            push_argument(&mut args, flag, value);
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        board.feedback(&args)
+    };
+
+    // The first adopted change starts its cumulative total at the local
+    // comparison, bound to the retained baseline.
+    let first = publish(
+        "exp-first",
+        "base001",
+        "cand002",
+        "1000",
+        "1100",
+        "1000",
+        "1100",
+        "base001",
+        "evidence-9",
+    );
+    assert!(first.status.success(), "{}", output_text(&first));
+    assert_eq!(board.comment_texts(&h).len(), before + 1);
+
+    // A second adopted change adds its local totals to the same retained
+    // baseline; the cumulative total grows rather than restarting.
+    let second = publish(
+        "exp-second",
+        "cand002",
+        "cand003",
+        "1200",
+        "1300",
+        "2200",
+        "2400",
+        "base001",
+        "evidence-9",
+    );
+    assert!(second.status.success(), "{}", output_text(&second));
+    assert_eq!(board.comment_texts(&h).len(), before + 2);
+
+    // A reset back to the local totals would erase the earlier adopted cost.
+    let reset = publish(
+        "exp-reset",
+        "cand003",
+        "cand004",
+        "1400",
+        "1500",
+        "1400",
+        "1500",
+        "base001",
+        "evidence-9",
+    );
+    let text = output_text(&reset);
+    assert!(!reset.status.success(), "{text}");
+    assert!(
+        text.contains("not bound to its retained cumulative cost"),
+        "{text}"
+    );
+    assert_eq!(
+        board.comment_texts(&h).len(),
+        before + 2,
+        "a refused cumulative reset writes nothing"
+    );
+
+    // Switching the retained baseline identity is drift, not a fresh start.
+    let drift = publish(
+        "exp-drift",
+        "cand003",
+        "cand005",
+        "1400",
+        "1500",
+        "3600",
+        "3900",
+        "base000",
+        "evidence-9",
+    );
+    let text = output_text(&drift);
+    assert!(!drift.status.success(), "{text}");
+    assert!(text.contains("different retained baseline"), "{text}");
+    assert_eq!(board.comment_texts(&h).len(), before + 2);
+
+    // The payback evidence must be the decision's own acceptance evidence; a
+    // free-form or stale reference cannot certify the observed return.
+    let stale = publish(
+        "exp-stale",
+        "cand003",
+        "cand006",
+        "1400",
+        "1500",
+        "3600",
+        "3900",
+        "base001",
+        "evidence-other",
+    );
+    let text = output_text(&stale);
+    assert!(!stale.status.success(), "{text}");
+    assert!(
+        text.contains("payback evidence must be the recorded acceptance evidence"),
+        "{text}"
+    );
+    assert_eq!(board.comment_texts(&h).len(), before + 2);
     assert_no_votes(&board, &h);
     board.drop();
 }
