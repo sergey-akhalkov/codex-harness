@@ -850,6 +850,12 @@ pub struct ReflectionState {
     pub refusals: Vec<EventRefusal>,
     pub stopped_at: Option<String>,
     pub last_recovery_evidence: Option<String>,
+    /// Lead sessions that previously owned this lifecycle and were replaced by
+    /// explicit succession. They are retained so a superseded owner cannot
+    /// reclaim current control or delivery ownership, including after it
+    /// restarts.
+    #[serde(default)]
+    pub retired_leads: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -871,6 +877,25 @@ pub struct ActivationReceipt {
     pub reused: bool,
     pub journal: JournalOwnership,
     pub bound_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessionRequest {
+    /// The owner whose inactivity the caller verified before requesting the
+    /// transfer. Rechecking it under the lifecycle lock closes the window in
+    /// which two successors could otherwise transfer through the same stale
+    /// observation.
+    pub expected_lead_session: String,
+    pub successor_lead: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SuccessionReceipt {
+    pub binding_id: String,
+    pub previous_lead_session: String,
+    pub lead_session: String,
+    pub revision: u64,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1107,6 +1132,17 @@ impl ReflectionController {
                     "source branch changed; call rebaseline_current after scoped reconciliation, or resume_from_floor when the recorded gap has a floor",
                 ));
             }
+            if state
+                .retired_leads
+                .iter()
+                .any(|retired| retired.trim() == request.lead_session.trim())
+            {
+                return Err(conflict(&format!(
+                    "lead session '{}' was superseded by succession and cannot reclaim this reflection lifecycle; current ownership remains with '{}'; use the ordinary successor command from the live owner",
+                    request.lead_session.trim(),
+                    state.binding.lead_session
+                )));
+            }
             if state.lifecycle == LifecycleStatus::Active
                 && !state
                     .binding
@@ -1184,6 +1220,7 @@ impl ReflectionController {
                 refusals: Vec::new(),
                 stopped_at: None,
                 last_recovery_evidence: None,
+                retired_leads: Vec::new(),
             },
         };
         let receipt = ActivationReceipt {
@@ -1194,6 +1231,95 @@ impl ReflectionController {
             reused,
             journal: state.journal,
             bound_records: state.records.len(),
+        };
+        self.write_state_at(&path, &state)?;
+        Ok(receipt)
+    }
+
+    /// Moves current lifecycle control and delivery ownership to an explicit
+    /// successor without changing accepted source provenance or retained
+    /// effects. The old owner must have been verified inactive by the caller
+    /// that owns the managed-lead registry; this operation only accepts the
+    /// successor identity and validates the lifecycle it can observe.
+    ///
+    /// A repeated call by the current owner is idempotent and performs no
+    /// write. A lead that was already replaced is refused so it cannot reclaim
+    /// retained work after restarting.
+    pub fn succeed(&self, request: &SuccessionRequest) -> io::Result<SuccessionReceipt> {
+        let expected = request.expected_lead_session.trim();
+        let successor = request.successor_lead.trim();
+        require_text("expected lead_session", expected, MAX_TEXT_BYTES)?;
+        require_text("successor lead_session", successor, MAX_TEXT_BYTES)?;
+        let source = self.current_source()?;
+        let path = self.state_path(&source);
+        let _lock = self.lock(&path)?;
+        let mut state = self.read_state_at(&path)?.ok_or_else(|| {
+            conflict(
+                "delivery reflection is inactive; enable it under the retained lead before succession",
+            )
+        })?;
+        if state.lifecycle != LifecycleStatus::Active {
+            return Err(conflict(
+                "delivery reflection is stopped; enable the retained lifecycle before succession",
+            ));
+        }
+        if !state.source.same_scope(&source) {
+            return Err(conflict(&format!(
+                "reflection state is bound to project {} / {}, not the current board scope; preserve it and use the matching project",
+                state.source.project_id, state.source.beads_dir
+            )));
+        }
+        if normalize(&state.source.branch) != normalize(&source.branch) {
+            return Err(recovery_error(
+                "source branch changed; reconcile the retained lifecycle before succession",
+            ));
+        }
+        if let Some(recovery) = &state.recovery {
+            return Err(recovery_error(&format!(
+                "reflection recovery is pending ({:?}: {}); reconcile it under the retained owner before succession",
+                recovery.kind, recovery.detail
+            )));
+        }
+        let previous = state.binding.lead_session.clone();
+        if expected != previous {
+            return Err(conflict(&format!(
+                "reflection ownership changed while succession was being verified: the caller checked '{expected}', but the current retained owner is '{previous}'; nothing was changed. Verify the current owner's exit and repeat `codex-harness delivery-improvement succeed --project DIRECTORY`"
+            )));
+        }
+        if successor == previous {
+            return Ok(SuccessionReceipt {
+                binding_id: state.binding.id,
+                previous_lead_session: previous,
+                lead_session: successor.to_owned(),
+                revision: state.binding.revision,
+                changed: false,
+            });
+        }
+        if state
+            .retired_leads
+            .iter()
+            .any(|retired| retired.trim() == successor)
+        {
+            return Err(conflict(&format!(
+                "lead session '{successor}' was already superseded by succession and cannot reclaim this reflection lifecycle; inspect retained work under the current owner or start a fresh lifecycle for new work"
+            )));
+        }
+        let revision = state
+            .binding
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| conflict("reflection lifecycle revision cannot be advanced"))?;
+        state.retired_leads.retain(|retired| retired != &previous);
+        state.retired_leads.push(previous.clone());
+        state.binding.revision = revision;
+        state.binding.lead_session = successor.to_owned();
+        state.binding.activated_at = now();
+        let receipt = SuccessionReceipt {
+            binding_id: state.binding.id.clone(),
+            previous_lead_session: previous,
+            lead_session: state.binding.lead_session.clone(),
+            revision,
+            changed: true,
         };
         self.write_state_at(&path, &state)?;
         Ok(receipt)
@@ -3405,6 +3531,20 @@ fn validate_state(state: &ReflectionState) -> io::Result<()> {
         &state.binding.lead_session,
         MAX_TEXT_BYTES,
     )?;
+    let mut retired = BTreeSet::new();
+    for lead in &state.retired_leads {
+        require_text("retired lead_session", lead, MAX_TEXT_BYTES)?;
+        if lead.trim() == state.binding.lead_session.trim() {
+            return Err(invalid(
+                "reflection lifecycle names its current lead as retired",
+            ));
+        }
+        if !retired.insert(lead.trim().to_owned()) {
+            return Err(invalid(
+                "reflection lifecycle contains a duplicate retired lead",
+            ));
+        }
+    }
     state.limits.validate()?;
     for (id, record) in &state.records {
         if id != &record.acceptance_id {

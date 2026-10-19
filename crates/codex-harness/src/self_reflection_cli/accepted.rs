@@ -3,7 +3,7 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ReflectionController, ReflectionRecord, Stage, StageAdmission,
+    LifecycleStatus, ReflectionController, ReflectionRecord, Stage, StageAdmission,
     StageState as RecordedStageState, UsageDelta,
 };
 
@@ -23,8 +23,20 @@ pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
     let record = controller.record(&request.acceptance)?.ok_or_else(|| {
         invalid("the requested acceptance is not a retained eligible local closure")
     })?;
-    validate_request(&request, &record)?;
-    let (chain, _lease) = prepare_chain_with_acceptance(request, Some(record.binding.clone()))?;
+    let state = controller
+        .stored_state()?
+        .ok_or_else(|| invalid("the accepted reflection lifecycle disappeared"))?;
+    if state.lifecycle != LifecycleStatus::Active {
+        return Err(invalid(
+            "delivery reflection is stopped; enable it under the current managed lead before processing retained work",
+        ));
+    }
+    validate_request(&request, &record, &state.binding.lead_session)?;
+    let (chain, _lease) = prepare_chain_with_acceptance(
+        request,
+        Some(record.binding.clone()),
+        Some((&state.binding.lead_session, &state.retired_leads)),
+    )?;
     check_binding(&controller, &chain)?;
     preflight_lead(&chain)?;
     let executor = run_recorded_stage(&controller, &chain, Stage::Executor, |admission| {
@@ -66,7 +78,11 @@ pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
     print_result(&chain, &executor, &lead, &delivery)
 }
 
-fn validate_request(request: &Request, record: &ReflectionRecord) -> io::Result<()> {
+fn validate_request(
+    request: &Request,
+    record: &ReflectionRecord,
+    current_lead: &str,
+) -> io::Result<()> {
     let binding = &record.binding;
     if request.task != binding.task
         || request.run != binding.run
@@ -74,11 +90,11 @@ fn validate_request(request: &Request, record: &ReflectionRecord) -> io::Result<
         || Some(request.executor_source.thread.as_str()) != binding.executor_session.as_deref()
         || Some(request.executor_source.last_turn.as_str()) != binding.executor_turn.as_deref()
         || request.lead_source.thread != binding.lead_session
-        || request.lead_return.thread != binding.lead_session
+        || request.lead_return.thread != current_lead
         || Some(request.lead_source.last_turn.as_str()) != binding.lead_turn.as_deref()
     {
         return Err(invalid(
-            "the request does not match the accepted task/run and exact executor/lead turn binding; no fork was started",
+            "the request does not match the accepted task/run and exact immutable executor/lead source turns, or its return thread is not the current lifecycle owner; no fork was started",
         ));
     }
     Ok(())

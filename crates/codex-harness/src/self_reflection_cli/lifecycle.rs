@@ -8,10 +8,10 @@ use harness_core::delivery_reflection::{
     ActivationRequest, BindingStatus, BudgetLimit, BudgetPause,
     DeliveryState as RecordedDeliveryState, JournalPolicy, LifecycleStatus, ReflectionController,
     ReflectionLimits, ReflectionRecord, Stage, StageRecord, StageState as RecordedStageState,
-    StageWork, UsageDelta,
+    StageWork, SuccessionRequest, UsageDelta,
 };
 
-const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement continue --acceptance ACCEPTANCE --stage executor|lead --project DIRECTORY [--source KIT] [--codex-home DIRECTORY] [--max-attempts-per-stage N] [--max-turns-per-stage N] [--max-tokens-per-stage N] [--max-tokens-per-record N] [--max-investigations-per-stage N] [--max-investigations-per-record N] [--max-context-bytes-per-stage N] [--max-context-bytes-per-record N] [--reconcile-usage-turns N --reconcile-usage-tokens N] [--reconcile-investigations N --reconcile-context-bytes N]\nRun enable/process/continue/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance; continue resumes only the exact retained budget-paused stage named by status, with every supplied allowance strictly above its current value and the paused allowance above its observed value. Reconciliation values are measured additions, never estimates, and each pair must be supplied together; unchanged input starts no model work. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
+const USAGE: &str = "codex-harness delivery-improvement enable|status|disable|process|succeed|restore-journal --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement recover --resolution resume-retained|rebaseline-current [--evidence TEXT] --project DIRECTORY [--source KIT] [--codex-home DIRECTORY]\ncodex-harness delivery-improvement continue --acceptance ACCEPTANCE --stage executor|lead --project DIRECTORY [--source KIT] [--codex-home DIRECTORY] [--max-attempts-per-stage N] [--max-turns-per-stage N] [--max-tokens-per-stage N] [--max-tokens-per-record N] [--max-investigations-per-stage N] [--max-investigations-per-record N] [--max-context-bytes-per-stage N] [--max-context-bytes-per-record N] [--reconcile-usage-turns N --reconcile-usage-tokens N] [--reconcile-investigations N --reconcile-context-bytes N]\nRun enable/process/succeed/continue/recover from the real managed lead conversation. Enable binds the current board journal head; process handles one pending acceptance or retained continuation; succeed transfers current ownership to the live managed lead running it after the retained owner is verified inactive; continue resumes only the exact retained budget-paused stage named by status, with every supplied allowance strictly above its current value and the paused allowance above its observed value. Reconciliation values are measured additions, never estimates, and each pair must be supplied together; unchanged input starts no model work. Status is model-free. Disable preserves results and stops new stages. After disable, restore-journal removes only a journal setting enabled by this lifecycle. Recovery never retries an unknown model outcome; rebaseline-current requires evidence acknowledging the reconciled event gap.";
 
 const LIMIT_OPTIONS: [(&str, BudgetLimit); 8] = [
     ("--max-attempts-per-stage", BudgetLimit::StageAttempts),
@@ -190,6 +190,7 @@ impl Options {
                 | "status"
                 | "disable"
                 | "process"
+                | "succeed"
                 | "recover"
                 | "restore-journal"
                 | "continue"
@@ -314,7 +315,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 && state.binding.lead_session != lead
             {
                 return Err(invalid(
-                    "reflection belongs to another lead session; reconcile the retained lifecycle before transferring it",
+                    "reflection belongs to another lead session; after that owner exits, run `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor to transfer current ownership without rewriting retained work",
                 ));
             }
             let receipt = controller.activate(&ActivationRequest {
@@ -339,6 +340,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             Ok(0)
         }
         "process" => process(&options, &controller, false),
+        "succeed" => succession(&options, &controller),
         "continue" => {
             let lead = options.lead()?;
             continuation(&options, &controller, &lead)
@@ -493,6 +495,7 @@ fn request(
     options: &Options,
     controller: &ReflectionController,
     record: &ReflectionRecord,
+    current_lead: &str,
 ) -> io::Result<Request> {
     let config = orchestration_config::load(&options.source)?;
     let (executor_stage, lead_stage) = declarations(options, &config)?;
@@ -523,11 +526,108 @@ fn request(
         executor_stage,
         lead_stage,
         lead_return: LeadReturn {
-            endpoint: control::lead_endpoint_path(&options.home, &binding.lead_session)?,
-            thread: binding.lead_session.clone(),
+            endpoint: control::lead_endpoint_path(&options.home, current_lead)?,
+            thread: current_lead.to_owned(),
         },
         bound_seconds: DEFAULT_BOUND_SECONDS,
     })
+}
+
+/// What the managed-lead registry proves about the retained lifecycle owner.
+/// Succession requires an explicit exit: a missing record or a recorded
+/// process that is no longer live. Live, malformed, mismatched or process-less
+/// records are not evidence of exit.
+enum RetainedOwner {
+    Inactive,
+    Live,
+    Unverifiable(String),
+}
+
+fn retained_owner(options: &Options, thread: &str) -> io::Result<RetainedOwner> {
+    let path = control::lead_endpoint_path(&options.home, thread).map_err(|error| {
+        invalid(format!(
+            "the retained lead identity '{thread}' cannot name a managed registry record: {error}; verify the managed-lead registry and repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor"
+        ))
+    })?;
+    let endpoint = match Endpoint::read(&path) {
+        Ok(endpoint) => endpoint,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RetainedOwner::Inactive);
+        }
+        Err(_) => {
+            return Ok(RetainedOwner::Unverifiable(format!(
+                "the registered lead endpoint record at {} is unreadable or malformed",
+                path.display()
+            )));
+        }
+    };
+    if endpoint.thread_id.as_deref() != Some(thread.trim()) {
+        return Ok(RetainedOwner::Unverifiable(format!(
+            "the registered lead endpoint record at {} belongs to another conversation",
+            path.display()
+        )));
+    }
+    let Some(process) = endpoint.process.as_ref() else {
+        return Ok(RetainedOwner::Unverifiable(format!(
+            "the registered lead endpoint record at {} records no app-server process",
+            path.display()
+        )));
+    };
+    if endpoint_process_live(process) {
+        Ok(RetainedOwner::Live)
+    } else {
+        Ok(RetainedOwner::Inactive)
+    }
+}
+
+/// Transfers current control and delivery ownership to the live managed lead
+/// running this command. The retained owner is derived from the lifecycle, not
+/// supplied by the caller, and must be verifiably inactive before the atomic
+/// lifecycle write. A repeat by the current owner is an idempotent no-op.
+fn succession(options: &Options, controller: &ReflectionController) -> io::Result<i32> {
+    let successor = options.lead()?;
+    let state = controller.stored_state()?.ok_or_else(|| {
+        invalid(
+            "delivery reflection is inactive; enable it under the retained lead before succession; nothing was changed",
+        )
+    })?;
+    if state.lifecycle != LifecycleStatus::Active {
+        return Err(invalid(
+            "delivery reflection is stopped; enable the retained lifecycle before succession; nothing was changed",
+        ));
+    }
+    if state
+        .retired_leads
+        .iter()
+        .any(|retired| retired.trim() == successor)
+    {
+        return Err(invalid(format!(
+            "lead session '{successor}' was superseded by succession and cannot reclaim this reflection lifecycle; inspect retained work under '{}' or start a fresh lifecycle for new work; no ownership or lifecycle state was changed",
+            state.binding.lead_session
+        )));
+    }
+    let previous = state.binding.lead_session.clone();
+    if successor != previous {
+        match retained_owner(options, &previous)? {
+            RetainedOwner::Live => {
+                return Err(invalid(format!(
+                    "the retained lead '{previous}' is still live; stop or exit that managed lead, verify the process has ended, then repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; no ownership or lifecycle state was changed"
+                )));
+            }
+            RetainedOwner::Unverifiable(reason) => {
+                return Err(invalid(format!(
+                    "{reason}; repair or remove that managed-lead registry record so the retained owner's exit can be established, then repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; no ownership or lifecycle state was changed"
+                )));
+            }
+            RetainedOwner::Inactive => {}
+        }
+    }
+    let receipt = controller.succeed(&SuccessionRequest {
+        expected_lead_session: previous,
+        successor_lead: successor,
+    })?;
+    println!("{}", serde_json::to_string(&receipt)?);
+    Ok(0)
 }
 
 fn process(options: &Options, controller: &ReflectionController, quiet: bool) -> io::Result<i32> {
@@ -588,7 +688,7 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
         }
         return Ok(0);
     };
-    let request = request(options, controller, &record)?;
+    let request = request(options, controller, &record, &lead)?;
     let delivery_path = request.state_dir.join("lead-delivery.json");
     let exit = accepted::execute(request, &options.project)?;
     if quiet && exit != 0 {
@@ -712,7 +812,7 @@ fn continuation(
     // Stage routing and the exact accepted boundaries are validated before any
     // retained state changes. The continuation then executes only this
     // acceptance through the same accepted-stage controller as `process`.
-    let request = request(options, controller, &record)?;
+    let request = request(options, controller, &record, lead)?;
 
     if let Some(usage) = continuation.usage {
         controller.record_unknown_usage(acceptance, stage, usage)?;

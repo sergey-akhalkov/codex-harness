@@ -408,6 +408,45 @@ reconciliation rather than repeated model calls. The independent skill drafts
 remain outside discovery in `.agents/skill-candidates` until evaluation allows
 publication. No comparison benefit is established by the model-free checks.
 
+A retained lifecycle can move to a different managed lead after its original
+owner exits. Run this from the live successor conversation:
+
+```powershell
+codex-harness delivery-improvement succeed --project CHECKOUT
+```
+
+The command derives both identities from existing owners: the retained lead from
+the lifecycle and the successor from the current managed-lead registration.
+Neither recipient nor old owner is caller-supplied. It requires the retained
+owner's registered process to be verifiably absent; a live, unreadable,
+mismatched or process-less registry record refuses without changing state, as
+do a missing or stale current registration, a stopped lifecycle, pending
+recovery, a changed source scope or branch, and a call from a lead already
+retired by succession. Repeating the command as the current owner is an
+idempotent no-op that writes nothing. `succeed` only transfers control; it
+starts no model work and performs no delivery.
+
+Transfer changes only the lifecycle revision and current control/delivery
+ownership. Accepted provenance (task, run, acceptance identity and the original
+executor/lead source turns), stage artifacts, attempts, cumulative costs,
+purpose and activation boundary stay intact. A later `process` therefore reuses
+a retained executor result, runs only the remaining lead stage once, and
+delivers once to the successor's registered endpoint. Before that continuation
+the existing owners revalidate source scope, purpose, stage routing, role
+revision, profile, model, provider, effort and guidance; drift refuses before a
+new fork. An unknown or indeterminate delivery stays retained for explicit
+reconciliation and is never resent merely because ownership moved. Completed
+effects remain recorded once, and the retired owner fails closed if it returns.
+The successor's conversation is current delivery ownership, never a substitute
+for the immutable accepted source conversation.
+
+To recover, stop or exit the old managed lead and verify its process has ended,
+start or resume the successor so its live `CODEX_THREAD_ID` is registered, then
+rerun `succeed --project CHECKOUT`. If the old registry record is unreadable or
+malformed, repair or remove it so the exit can be established. Reconcile any
+reported recovery state or retained unknown stage through the existing
+exact-stage recovery flow before attempting succession.
+
 The native branch-recovery check additionally needs an existing Dolt binary;
 set `HARNESS_DOLT_EXE` to its absolute path before running:
 

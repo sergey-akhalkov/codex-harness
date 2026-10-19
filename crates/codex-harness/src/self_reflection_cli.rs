@@ -145,8 +145,10 @@ fn default_bound_seconds() -> u64 {
     DEFAULT_BOUND_SECONDS
 }
 
-/// The immutable identity of one chain. A restart must match it exactly; any
-/// change is drift, not a resume, and refuses before a native request.
+/// The retained identity of one chain. Accepted work and its source boundaries
+/// are immutable. `lead_return` is current delivery ownership, so it may move
+/// only through a verified lifecycle succession; every other change is drift
+/// and refuses before a native request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct ChainState {
@@ -528,12 +530,13 @@ fn print_result(
 pub(crate) fn prepare_chain(
     request: Request,
 ) -> io::Result<(ChainState, harness_core::process::ExclusiveFileLock)> {
-    prepare_chain_with_acceptance(request, None)
+    prepare_chain_with_acceptance(request, None, None)
 }
 
 fn prepare_chain_with_acceptance(
     request: Request,
     accepted: Option<harness_core::delivery_reflection::AcceptanceBinding>,
+    ownership: Option<(&str, &[String])>,
 ) -> io::Result<(ChainState, harness_core::process::ExclusiveFileLock)> {
     let mut chain = chain_state(request)?;
     chain.accepted_work = accepted.map(|binding| binding.normalized()).transpose()?;
@@ -554,10 +557,30 @@ fn prepare_chain_with_acceptance(
     if chain_path.exists() {
         let retained: ChainState = read_json(&chain_path, MAX_REQUEST_BYTES)?;
         if retained != chain {
-            return Err(invalid(format!(
-                "the request drifts from the retained chain at {}; task, run, acceptance, source, accepted references, stage routing, role revision or lead address changed. Retained evidence is preserved; close or archive this chain (a new state directory) instead of overwriting it",
-                chain_path.display()
-            )));
+            let successor_transition = ownership.is_some_and(|(current_lead, retired)| {
+                retained.accepted_work.is_some()
+                    && retained.lead_return.thread != current_lead
+                    && chain.lead_return.thread == current_lead
+                    && retired
+                        .iter()
+                        .any(|lead| lead == &retained.lead_return.thread)
+                    && {
+                        let mut candidate = retained.clone();
+                        candidate.lead_return = chain.lead_return.clone();
+                        candidate == chain
+                    }
+            });
+            if !successor_transition {
+                return Err(invalid(format!(
+                    "the request drifts from the retained chain at {}; task, run, acceptance, source, accepted references, stage routing, role revision or lead address changed. Retained evidence is preserved; only the current verified successor may move an existing chain's delivery owner, and a new state directory is required for every other identity",
+                    chain_path.display()
+                )));
+            }
+            // The lifecycle already recorded the old lead as retired under its
+            // own lock. Rewrite only this chain's current return address; the
+            // executor/lead artifacts, cumulative usage and delivery attempt
+            // stay in place for exact-stage reuse or retention.
+            write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
         }
     } else {
         write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
@@ -913,6 +936,15 @@ fn canonical_stage(stage: &StageDeclaration, label: &str) -> io::Result<StageDec
 /// pending; the automatic controller re-runs process after it completes rather
 /// than forking an unfinished boundary or guessing a later turn.
 fn wait_for_exact_turn_completed(chain: &ChainState) -> io::Result<()> {
+    if chain.lead_source.thread != chain.lead_return.thread {
+        // Succession separates immutable accepted provenance from current
+        // delivery ownership. The retired source conversation is not the
+        // successor's conversation, so it must never be read as if it were the
+        // return surface. The lead stage's native fork revalidates the exact
+        // completed source checkpoint, and a retained lead stage revalidates
+        // the same boundary from its durable state.
+        return Ok(());
+    }
     let endpoint = Endpoint::read(&chain.lead_return.endpoint).map_err(|error| {
         invalid(format!(
             "the real lead endpoint {} is unavailable while waiting for the accepting turn {}: {error}; start or resume the managed lead with `codex-harness lead start --session THREAD`, then retry",

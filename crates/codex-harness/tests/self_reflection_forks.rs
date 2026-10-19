@@ -23,6 +23,8 @@ mod lead_recovery;
 mod lifecycle;
 #[path = "fixtures/reflection_install.rs"]
 mod reflection_install;
+#[path = "self_reflection_forks/succession.rs"]
+mod succession;
 #[path = "self_reflection_forks/visibility.rs"]
 mod visibility;
 
@@ -48,6 +50,7 @@ const EXECUTOR_FORK_TURN: &str = "fixture-executor-reflection-turn";
 const LEAD_FORK: &str = "fixture-lead-reflection-fork";
 const LEAD_FORK_TURN: &str = "fixture-lead-reflection-turn";
 const LEAD_THREAD: &str = "fixture-real-lead";
+const SUCCESSOR_THREAD: &str = "fixture-successor-lead";
 const LEAD_TURN: &str = "fixture-live-lead-turn";
 const MODEL: &str = "deepseek-flash";
 const PROVIDER: &str = "deepseek";
@@ -182,6 +185,9 @@ struct Workspace {
     lead: Server,
     lead_state: Arc<Mutex<LeadState>>,
     lead_mode: LeadMode,
+    successor_endpoint: PathBuf,
+    successor: Server,
+    successor_state: Arc<Mutex<LeadState>>,
 }
 
 impl Workspace {
@@ -219,7 +225,7 @@ impl Workspace {
         fs::write(&token_path, TOKEN).unwrap();
         let lead = Server::start(Bearer::File(token_path));
         let lead_state = Arc::new(Mutex::new(LeadState::default()));
-        configure_lead(&lead, lead_mode, Arc::clone(&lead_state));
+        configure_lead(&lead, lead_mode, Arc::clone(&lead_state), LEAD_THREAD);
         let endpoint = root.path().join(format!("lead-{name}-endpoint.json"));
         if lead_mode != LeadMode::Unavailable {
             fs::write(
@@ -235,6 +241,29 @@ impl Workspace {
             )
             .unwrap();
         }
+        let successor_token_path = root.path().join(format!("successor-{name}.token"));
+        fs::write(&successor_token_path, TOKEN).unwrap();
+        let successor = Server::start(Bearer::File(successor_token_path));
+        let successor_state = Arc::new(Mutex::new(LeadState::default()));
+        configure_lead(
+            &successor,
+            LeadMode::Delivered,
+            Arc::clone(&successor_state),
+            SUCCESSOR_THREAD,
+        );
+        let successor_endpoint = root.path().join(format!("successor-{name}-endpoint.json"));
+        fs::write(
+            &successor_endpoint,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "port": successor.port,
+                "token": TOKEN,
+                "threadId": SUCCESSOR_THREAD,
+                "process": live_endpoint_process()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let request = root.path().join(format!("request-{name}.json"));
         Self {
             root: Some(root),
@@ -247,6 +276,9 @@ impl Workspace {
             lead,
             lead_state,
             lead_mode,
+            successor_endpoint,
+            successor,
+            successor_state,
         }
     }
 
@@ -307,7 +339,8 @@ impl Drop for Workspace {
     }
 }
 
-fn configure_lead(server: &Server, mode: LeadMode, state: Arc<Mutex<LeadState>>) {
+fn configure_lead(server: &Server, mode: LeadMode, state: Arc<Mutex<LeadState>>, thread_id: &str) {
+    let thread_id = thread_id.to_owned();
     server.answer_fn(move |request| {
         let method = request["method"].as_str().unwrap_or_default();
         let params = &request["params"];
@@ -336,7 +369,7 @@ fn configure_lead(server: &Server, mode: LeadMode, state: Arc<Mutex<LeadState>>)
                     }));
                 }
                 Answer::Result(json!({
-                    "thread": {"id": LEAD_THREAD, "status": {"type": "idle"}, "turns": turns}
+                    "thread": {"id": thread_id, "status": {"type": "idle"}, "turns": turns}
                 }))
             }
             "turn/start" | "turn/steer" => {

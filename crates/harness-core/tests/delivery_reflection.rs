@@ -6,7 +6,7 @@ use harness_core::delivery_reflection::{
     ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, BindingStatus, DeliveryState,
     EventRefusal, Finding, JournalOwnership, JournalPolicy, PURPOSE_METADATA, PollReceipt, Purpose,
     RecoveryKind, ReflectionController, ReflectionLimits, RefusalCode, Stage, StageOutcome,
-    TaskBindingStatus, UsageDelta, acceptance_metadata,
+    SuccessionRequest, TaskBindingStatus, UsageDelta, acceptance_metadata,
 };
 use serde_json::{Value, json};
 use std::{
@@ -20,6 +20,7 @@ mod native_branch;
 #[path = "delivery_reflection/native_import.rs"]
 mod native_import;
 const LEAD: &str = "lead-fixture";
+const SUCCESSOR: &str = "successor-fixture";
 const APPROVER: &str = "board-contract";
 
 fn bd_name() -> &'static str {
@@ -1079,4 +1080,150 @@ fn acceptance_turn_identities_are_trimmed_and_must_name_a_recorded_session() {
             .contains("is not one of executor_sessions"),
         "{error}"
     );
+}
+
+#[test]
+fn succession_preserves_retained_work_and_refuses_retired_owner_reclaim() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    activate(&controller, JournalPolicy::RequireExisting);
+    let task = board.create_task("Succession work", Some(Purpose::Ordinary), None);
+    board.set_binding(&task, &binding(&task, Purpose::Ordinary, "succession"));
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+    let before = controller.stored_state().unwrap().unwrap();
+
+    let receipt = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+        })
+        .unwrap();
+    assert!(receipt.changed);
+    assert_eq!(receipt.previous_lead_session, LEAD);
+    assert_eq!(receipt.lead_session, SUCCESSOR);
+    assert_eq!(receipt.binding_id, before.binding.id);
+    assert_eq!(receipt.revision, before.binding.revision + 1);
+
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.binding.lead_session, SUCCESSOR);
+    assert_eq!(after.binding.run, before.binding.run);
+    assert_eq!(after.source, before.source);
+    assert_eq!(after.journal, before.journal);
+    assert_eq!(after.checkpoint, before.checkpoint);
+    assert_eq!(after.records, before.records);
+    assert_eq!(
+        after.records.get(&acceptance).unwrap().binding.lead_session,
+        LEAD,
+        "accepted provenance keeps the original lead"
+    );
+    assert_eq!(after.limits, before.limits);
+    assert_eq!(after.recovery, before.recovery);
+    assert_eq!(after.last_poll, before.last_poll);
+    assert_eq!(after.refusals, before.refusals);
+    assert_eq!(after.stopped_at, before.stopped_at);
+    assert_eq!(after.last_recovery_evidence, before.last_recovery_evidence);
+    assert_eq!(after.retired_leads, vec![LEAD.to_owned()]);
+    assert_eq!(
+        controller
+            .check_active_binding(SUCCESSOR, Some(&acceptance))
+            .unwrap()
+            .status,
+        BindingStatus::Active
+    );
+    assert_eq!(
+        controller
+            .check_active_binding(LEAD, Some(&acceptance))
+            .unwrap()
+            .status,
+        BindingStatus::WrongLead
+    );
+
+    let state_file = controller.state_file().unwrap();
+    let settled = fs::read(&state_file).unwrap();
+    let repeat = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: SUCCESSOR.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+        })
+        .unwrap();
+    assert!(!repeat.changed);
+    assert_eq!(repeat.revision, receipt.revision);
+    assert_eq!(fs::read(&state_file).unwrap(), settled);
+
+    let stale = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: "another-successor".to_owned(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(stale.contains("ownership changed"), "{stale}");
+    assert_eq!(fs::read(&state_file).unwrap(), settled);
+
+    let reclaim = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: SUCCESSOR.to_owned(),
+            successor_lead: LEAD.to_owned(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(reclaim.contains("already superseded"), "{reclaim}");
+    assert_eq!(fs::read(&state_file).unwrap(), settled);
+
+    let activate_old = controller
+        .activate(&ActivationRequest {
+            lead_session: LEAD.to_owned(),
+            run: Some("run-main".to_owned()),
+            boundary: None,
+            journal: JournalPolicy::RequireExisting,
+            limits: None,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(activate_old.contains("cannot reclaim"), "{activate_old}");
+    assert_eq!(fs::read(&state_file).unwrap(), settled);
+}
+
+#[test]
+fn succession_refuses_stopped_and_recovery_pending_lifecycles() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    activate(&controller, JournalPolicy::RequireExisting);
+    controller.stop().unwrap();
+    let state_file = controller.state_file().unwrap();
+    let stopped = fs::read(&state_file).unwrap();
+    let error = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("stopped"), "{error}");
+    assert_eq!(fs::read(&state_file).unwrap(), stopped);
+
+    activate(&controller, JournalPolicy::RequireExisting);
+    board.json(&["config", "set", "events-journal", "false", "--json"]);
+    let hidden = board.create_task("Unjournaled succession work", Some(Purpose::Ordinary), None);
+    board.set_binding(&hidden, &binding(&hidden, Purpose::Ordinary, "unjournaled"));
+    board.close(&hidden);
+    let polled = controller.poll().unwrap();
+    assert!(polled.recovery.is_some(), "{polled:?}");
+    let pending = fs::read(&state_file).unwrap();
+    let error = controller
+        .succeed(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("reflection recovery is pending"), "{error}");
+    assert_eq!(fs::read(&state_file).unwrap(), pending);
 }
