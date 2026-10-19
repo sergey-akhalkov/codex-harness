@@ -2,13 +2,35 @@
 
 ### Requirement: Experiment design is proportionate to the declared hypothesis
 
-Before candidate implementation and comparative outcomes, each hypothesis SHALL declare its observed problem and baseline evidence, causal mechanism, intended-use conditions, primary outcome, minimum useful effect, retained quality and regression constraints, claimed scope, measurement method, stopping rule and supported next actions. Initial exploratory measurements SHALL be distinguishable from the frozen confirmatory plan. A change of mechanism, scope or success criteria SHALL create an explicit plan revision and reassess applicable evidence rather than retroactively turn a failed comparison into success.
+Before candidate edits, the experiment SHALL freeze a falsifiable mechanism, sufficient real workload, baseline, independent acceptance, measurable useful effect, controls and stopping policy. Evidence SHALL support only the exercised scope; missing decision-changing observations SHALL prevent unsupported adoption.
 
-The loop SHALL select the smallest experimental unit and method that exercise the mechanism and cover decision-relevant failure paths: a real operation or bounded input replay, a short agent task, complete task implementations, or a sequence preserving repeated-use and recovery conditions. Selection SHALL explain why omitted work cannot change the declared decision, considering effect propagation through agent choices, relevant variability and confounders, error consequences, reversibility, expected frequency/use horizon and total investigation/implementation/experiment cost. Predictions SHALL remain estimates; no fixed score, universal budget or mandatory sequence of methods SHALL be required. Lack of justification for an expensive experiment SHALL permit deferral, never an unsupported adoption or waiver of required correctness.
+#### Scenario: Exploration becomes a confirmatory hypothesis
+- **WHEN** a hypothesis is prepared for candidate implementation or comparative measurement
+- **THEN** Before candidate implementation and comparative outcomes, each hypothesis SHALL declare its observed problem and baseline evidence, causal mechanism, intended-use conditions, primary outcome, minimum useful effect, retained quality and regression constraints, claimed scope, measurement method, stopping rule and supported next actions.
+- **AND** Initial exploratory measurements SHALL be distinguishable from the frozen confirmatory plan.
+- **AND** A change of mechanism, scope or success criteria SHALL create an explicit plan revision and reassess applicable evidence rather than retroactively turn a failed comparison into success.
 
-Controlled baseline/candidate comparisons SHALL remain necessary for comparative benefit claims, but they SHALL NOT universally require two code implementations. A local operation comparison can support its directly measured operational claim with applicable integration and retained-behavior checks; a claim about agent strategy or accepted-task productivity SHALL include the affected real agent behavior through independent acceptance. Replaying a fixed trace SHALL NOT establish behavior of a changed agent trajectory. A repeated-use claim SHALL include the required sequence and relevant state instead of extrapolating from a single operation. Diagnostic proxies SHALL remain distinct from the outcome they might explain, and a smaller experiment SHALL NOT silently narrow agreed product requirements.
+#### Scenario: The mechanism determines sufficient experimental scope
+- **WHEN** an experimental unit and method are selected
+- **THEN** The loop SHALL select the smallest experimental unit and method that exercise the mechanism and cover decision-relevant failure paths: a real operation or bounded input replay, a short agent task, complete task implementations, or a sequence preserving repeated-use and recovery conditions.
+- **AND** Selection SHALL explain why omitted work cannot change the declared decision, considering effect propagation through agent choices, relevant variability and confounders, error consequences, reversibility, expected frequency/use horizon and total investigation/implementation/experiment cost.
+- **AND** Predictions SHALL remain estimates; no fixed score, universal budget or mandatory sequence of methods SHALL be required.
+- **AND** Lack of justification for an expensive experiment SHALL permit deferral, never an unsupported adoption or waiver of required correctness.
 
-The chosen plan SHALL fix input/runtime identities, independent acceptance, control conditions, admissible baseline evidence, metric coverage, repetition/stopping and escalation or deferral conditions before candidate outcomes. Escalation SHALL identify a missing observation that can change the decision and why obtaining it is justified; repetition SHALL NOT continue merely until a favorable result occurs. The result SHALL state the selected method, actual experimental units, evidence limits and supported scope. A valid short experiment SHALL be eligible for scoped adoption without a mandatory full implementation trial; an insufficient short experiment SHALL remain inconclusive or proceed under the declared stronger check.
+#### Scenario: The comparison exercises the actual claimed effect
+- **WHEN** a comparative benefit claim is evaluated
+- **THEN** Controlled baseline/candidate comparisons SHALL remain necessary for comparative benefit claims, but they SHALL NOT universally require two code implementations.
+- **AND** A local operation comparison can support its directly measured operational claim with applicable integration and retained-behavior checks; a claim about agent strategy or accepted-task productivity SHALL include the affected real agent behavior through independent acceptance.
+- **AND** Replaying a fixed trace SHALL NOT establish behavior of a changed agent trajectory.
+- **AND** A repeated-use claim SHALL include the required sequence and relevant state instead of extrapolating from a single operation.
+- **AND** Diagnostic proxies SHALL remain distinct from the outcome they might explain, and a smaller experiment SHALL NOT silently narrow agreed product requirements.
+
+#### Scenario: The frozen plan controls continuation
+- **WHEN** the experiment begins, produces results or considers another measurement
+- **THEN** The chosen plan SHALL fix input/runtime identities, independent acceptance, control conditions, admissible baseline evidence, metric coverage, repetition/stopping and escalation or deferral conditions before candidate outcomes.
+- **AND** Escalation SHALL identify a missing observation that can change the decision and why obtaining it is justified; repetition SHALL NOT continue merely until a favorable result occurs.
+- **AND** The result SHALL state the selected method, actual experimental units, evidence limits and supported scope.
+- **AND** A valid short experiment SHALL be eligible for scoped adoption without a mandatory full implementation trial; an insufficient short experiment SHALL remain inconclusive or proceed under the declared stronger check.
 
 #### Scenario: Reusing a verified build is a local mechanism
 - **WHEN** the hypothesis changes whether a build/check cycle repeats unchanged compilation
@@ -30,15 +52,71 @@ The chosen plan SHALL fix input/runtime identities, independent acceptance, cont
 - **WHEN** the plan cannot justify a decision-changing additional experiment relative to expected use and error consequences
 - **THEN** the loop records deferral and its reconsideration condition, preserves required acceptance and does not manufacture a benefit verdict
 
+#### Scenario: A deterministic defect is the claimed improvement
+- **WHEN** the hypothesis claims to eliminate an observed failure rather than improve agent productivity
+- **THEN** the plan freezes the triggering inputs, an applicable failing control and violation metric, verifies zero corresponding candidate violations with retained regression checks, and makes no speed or broad reliability claim unsupported by those observations
+
+#### Scenario: Only a diagnostic proxy improves
+- **WHEN** the candidate reduces bytes, messages, finding counts or code size but the declared accepted-work outcome does not improve
+- **THEN** the proxy does not satisfy the benefit criterion, and the result remains rejected or inconclusive according to actual outcome coverage without a post-result change of metric
+
 ### Requirement: Prior measurements can serve as a baseline only with applicable evidence
 
-Existing baseline measurements SHALL be reusable when retained inputs, source/runtime revisions, acceptance, metric definitions and coverage, and relevant operating conditions satisfy the current experiment's declared comparability policy. Model-dependent reuse SHALL additionally satisfy the selected runtime qualification and context-isolation requirements. Evidence selection and exclusions SHALL be fixed before candidate outcomes, retain relevant earlier attempts and costs, and expose age, coverage and unresolved drift. A summary, identity hash or successful previous task alone SHALL NOT establish comparability.
+Retained measurements SHALL replace a new baseline execution only when their actual provenance, acceptance, identities, coverage and operating conditions satisfy the frozen comparison policy. Reuse SHALL preserve original costs, failures and dependence; unresolved applicability SHALL NOT authorize adoption.
 
-Unknown or changed relevant conditions SHALL require the smallest sufficient fresh control or yield an inconclusive claim; different-task durations and uncontrolled before/after trends SHALL NOT establish causation. Reuse SHALL NOT fabricate a fresh execution, zero measurement uncertainty or unavailable telemetry. Methods without model execution SHALL report model metrics as inapplicable, not measured zero, and SHALL NOT require unrelated model qualification or claim model savings.
+#### Scenario: Retained observations are checked for applicability
+- **WHEN** existing measurements are proposed as the baseline
+- **THEN** Existing baseline measurements SHALL be reusable when retained inputs, source/runtime revisions, acceptance, metric definitions and coverage, and relevant operating conditions satisfy the current experiment's declared comparability policy.
+- **AND** Model-dependent reuse SHALL additionally satisfy the selected runtime qualification and context-isolation requirements.
+- **AND** Evidence selection and exclusions SHALL be fixed before candidate outcomes, retain relevant earlier attempts and costs, and expose age, coverage and unresolved drift.
+- **AND** A summary, identity hash or successful previous task alone SHALL NOT establish comparability.
+
+#### Scenario: A retained baseline is consumed through the controller
+- **WHEN** a new comparison selects prior-run baseline evidence
+- **THEN** The controller SHALL support a retained baseline from an earlier run as an explicit input to a new comparison.
+- **AND** Its evidence reference, selection and exclusions SHALL be bound to the frozen experiment plan before dependent candidate implementation or measurement.
+- **AND** Before dispatch, the controller SHALL verify the underlying execution, inputs, outputs, acceptance and applicable qualification and operating-condition evidence against that plan; operator-supplied labels alone SHALL NOT authorize reuse.
+- **AND** A valid retained baseline SHALL satisfy the baseline side without a new baseline operation or model attempt.
+- **AND** The candidate SHALL still execute under its declared conditions and unchanged independent acceptance, with prior solution content and traces kept outside its measured executor's context and accessible sources.
+
+#### Scenario: Reuse preserves original execution accounting
+- **WHEN** baseline evidence is accounted or reconciled after interruption
+- **THEN** The existing comparison state and outcome accounting SHALL distinguish retained execution from new execution and preserve the original attempt, timestamps, metrics, failures, uncertainty and evidence provenance.
+- **AND** Original execution costs SHALL remain available for comparison and be counted once in aggregate accounting; recovery, validation and new execution costs SHALL remain explicit.
+- **AND** Reusing one observation across comparisons SHALL NOT create additional independent samples or erase dependence under the declared repeated-selection policy.
+- **AND** Resume SHALL revalidate the retained binding and reconcile interrupted consumption without fabricating a completed model attempt or replaying the old baseline.
+
+#### Scenario: Unknown conditions prevent unsupported reuse
+- **WHEN** reused evidence has changed or unknown relevant conditions
+- **THEN** Unknown or changed relevant conditions SHALL require the smallest sufficient fresh control or yield an inconclusive claim; different-task durations and uncontrolled before/after trends SHALL NOT establish causation.
+- **AND** Reuse SHALL NOT fabricate a fresh execution, zero measurement uncertainty or unavailable telemetry.
+- **AND** Methods without model execution SHALL report model metrics as inapplicable, not measured zero, and SHALL NOT require unrelated model qualification or claim model savings.
+
+#### Scenario: Refused reuse follows the declared fallback
+- **WHEN** baseline reuse is refused or cannot establish comparability
+- **THEN** If reuse is refused, the controller SHALL retain the evidence and concrete reason.
+- **AND** A fresh control SHALL require the predeclared fallback or an explicit revised plan before dependent execution; refusal or resume alone SHALL NOT silently launch a replacement pair.
+- **AND** Unresolved comparability SHALL hold benefit as inconclusive, and an observed correctness failure SHALL remain a rejection regardless of reuse or resource savings.
 
 #### Scenario: A retained operation baseline is sufficient
 - **WHEN** actual retained baseline inputs, outputs, acceptance and conditions meet the frozen reuse policy for the selected operation
 - **THEN** the loop can execute only the candidate operation, reference the original baseline evidence and account for its reuse without running the old operation again
+
+#### Scenario: A new comparison reuses a qualified agent baseline
+- **WHEN** an earlier agent attempt satisfies the frozen workload, runtime, qualification, acceptance and operating-condition requirements
+- **THEN** the controller dispatches no new baseline conversation, executes the declared candidate attempt in an isolated context, and submits the original baseline evidence and new candidate evidence to the unchanged evaluator
+
+#### Scenario: Consumption is interrupted or its source changes
+- **WHEN** resume finds partially recorded reuse or a missing, changed or expired baseline source
+- **THEN** it reconciles valid retained evidence without duplicate execution or reports the invalid binding and applies only the declared fresh-control or inconclusive path
+
+#### Scenario: Several comparisons reference one baseline attempt
+- **WHEN** the same retained observation supports more than one candidate comparison
+- **THEN** accounting retains its original cost once, identifies the shared observation and does not count it as independent repetitions or fabricate narrower uncertainty
+
+#### Scenario: A cheaper candidate fails acceptance
+- **WHEN** a comparison reuses a valid baseline and the candidate fails the unchanged independent acceptance
+- **THEN** the candidate is rejected and its failure and costs remain recorded despite avoiding a new baseline execution
 
 #### Scenario: Historical conditions could explain the apparent gain
 - **WHEN** task content, runtime identity, cache state or relevant load is changed or unobserved enough to affect the decision
@@ -50,7 +128,16 @@ Unknown or changed relevant conditions SHALL require the smallest sufficient fre
 
 ### Requirement: Rolling comparisons freeze the task separately from the runtime
 
-A controlled comparison SHALL bind the same workload contract, input/source snapshot, allowed effects, acceptance version and limits to baseline and candidate, while identifying their harness runtimes separately. Workload state SHALL be equivalent under the declared experiment and reuse policy. Agent-based arms SHALL additionally bind the same task prompt and begin in fresh executor contexts without the earlier solution, sibling traces, researcher memory or mutable shared candidate installation. Consumed instructions, tools, plugins and skills SHALL be attributable to the selected arm. Provider/model settings for model-dependent methods and other relevant non-treatment environment settings SHALL remain common. Only the declared treatment SHALL vary; changed task inputs or accidental sharing SHALL invalidate the comparison.
+Baseline and candidate SHALL share frozen workload and acceptance inputs while retaining separately identified runtimes. Only the declared treatment SHALL vary; agent contexts and task copies SHALL prevent solution leakage and actual consumed assets SHALL remain attributable.
+
+#### Scenario: Both arms receive the frozen workload
+- **WHEN** a controlled baseline/candidate comparison is prepared or consumed
+- **THEN** A controlled comparison SHALL bind the same workload contract, input/source snapshot, allowed effects, acceptance version and limits to baseline and candidate, while identifying their harness runtimes separately.
+- **AND** Workload state SHALL be equivalent under the declared experiment and reuse policy.
+- **AND** Agent-based arms SHALL additionally bind the same task prompt and begin in fresh executor contexts without the earlier solution, sibling traces, researcher memory or mutable shared candidate installation.
+- **AND** Consumed instructions, tools, plugins and skills SHALL be attributable to the selected arm.
+- **AND** Provider/model settings for model-dependent methods and other relevant non-treatment environment settings SHALL remain common.
+- **AND** Only the declared treatment SHALL vary; changed task inputs or accidental sharing SHALL invalidate the comparison.
 
 #### Scenario: A harness-code task is used as the workload
 - **WHEN** candidate A changes the harness repository that also supplies task B
@@ -66,9 +153,24 @@ A controlled comparison SHALL bind the same workload contract, input/source snap
 
 ### Requirement: Local model comparisons require repeatability qualification
 
-For model-dependent experiments, the evaluator SHALL accept an explicit local serving configuration and an explicit identity policy. It SHALL record actual available model/deployment metadata, quantization, tokenizer and prompt template, server/backend identity, sampling settings, seed behavior, reasoning mode, context/cache settings, effective client profile/catalogue and relevant execution-environment facts, with unavailable facts identified rather than guessed. Under the user-selected API-observed policy, required observable fields and their provenance SHALL be declared before qualification; endpoint/model and effective client configuration remain required, while unavailable weight hashes and hardware details SHALL be retained as limits rather than prerequisites. Full-material identity checks SHALL remain enforced when that stronger policy is selected. The policy itself SHALL be bound to the qualification; neither a field nor the policy may silently be dropped to obtain a pass.
+Model-dependent comparisons SHALL qualify the actual configured agent/tool route under an explicit identity policy and predeclared equality rule. Missing required observations, divergent output or relevant drift SHALL suspend dependent comparisons without guessed identity or route substitution.
 
-Before relying on repeated identical inputs, the evaluator SHALL perform a declared repeatability qualification through the actual agent and tools, not only a completion API. The required solution output SHALL repeat under identical controlled inputs; timing and explicitly identified nonsemantic metadata SHALL be excluded from output equality only by a rule fixed before qualification. Temperature or a fixed seed alone SHALL NOT establish qualification. Divergence, an unavailable required observation, disappearance or drift of a declared observed field, or unknown identity required by the selected policy SHALL suspend dependent comparisons until corrected and requalified or a different policy is explicitly agreed. API-observed qualification SHALL NOT claim to detect unobservable changes to weights or hardware. A changed model or billing route SHALL never be an implicit recovery action.
+#### Scenario: The selected identity policy is qualified
+- **WHEN** a model-dependent experiment establishes its runtime identity
+- **THEN** For model-dependent experiments, the evaluator SHALL accept an explicit local serving configuration and an explicit identity policy.
+- **AND** It SHALL record actual available model/deployment metadata, quantization, tokenizer and prompt template, server/backend identity, sampling settings, seed behavior, reasoning mode, context/cache settings, effective client profile/catalogue and relevant execution-environment facts, with unavailable facts identified rather than guessed.
+- **AND** Under the user-selected API-observed policy, required observable fields and their provenance SHALL be declared before qualification; endpoint/model and effective client configuration remain required, while unavailable weight hashes and hardware details SHALL be retained as limits rather than prerequisites.
+- **AND** Full-material identity checks SHALL remain enforced when that stronger policy is selected.
+- **AND** The policy itself SHALL be bound to the qualification; neither a field nor the policy may silently be dropped to obtain a pass.
+
+#### Scenario: Repeated inputs establish observed repeatability
+- **WHEN** the evaluator relies on repeated identical model-dependent inputs
+- **THEN** Before relying on repeated identical inputs, the evaluator SHALL perform a declared repeatability qualification through the actual agent and tools, not only a completion API.
+- **AND** The required solution output SHALL repeat under identical controlled inputs; timing and explicitly identified nonsemantic metadata SHALL be excluded from output equality only by a rule fixed before qualification.
+- **AND** Temperature or a fixed seed alone SHALL NOT establish qualification.
+- **AND** Divergence, an unavailable required observation, disappearance or drift of a declared observed field, or unknown identity required by the selected policy SHALL suspend dependent comparisons until corrected and requalified or a different policy is explicitly agreed.
+- **AND** API-observed qualification SHALL NOT claim to detect unobservable changes to weights or hardware.
+- **AND** A changed model or billing route SHALL never be an implicit recovery action.
 
 #### Scenario: Identical seeds produce different solutions
 - **WHEN** repeated qualified-input attempts differ in required solution output despite identical sampling settings
@@ -92,7 +194,15 @@ Before relying on repeated identical inputs, the evaluator SHALL perform a decla
 
 ### Requirement: Measurements distinguish useful work from experiment overhead
 
-Each attempt SHALL preserve workload acceptance, elapsed time through independent checking and corrections, applicable model requests, sequential interaction rounds, tool operations and failures, and measured token categories with their subset relationships and coverage; inapplicable categories SHALL be distinct from zero and missing measurements. Repeated input processing, cached input and reasoning/output categories SHALL not be double counted or converted from bytes into claimed measurements. Failed, cancelled and retried attempts SHALL remain accounted. Hypothesis investigation, planning, candidate preparation, evaluation, integration and recovery SHALL have separately attributable overhead without charging the same shared work twice. Time comparisons SHALL use actual elapsed intervals; token comparisons SHALL identify the model/tokenizer, and currency or local compute cost SHALL require an explicit measured basis.
+Outcome accounting SHALL retain independent acceptance, all attempted work, measured time and applicable token/resource categories with coverage. Shared overhead SHALL be counted once and missing or inapplicable quantities SHALL NOT be converted into zero or invented savings.
+
+#### Scenario: Attempt outcomes and overhead are recorded
+- **WHEN** an attempt or shared experiment activity is measured
+- **THEN** Each attempt SHALL preserve workload acceptance, elapsed time through independent checking and corrections, applicable model requests, sequential interaction rounds, tool operations and failures, and measured token categories with their subset relationships and coverage; inapplicable categories SHALL be distinct from zero and missing measurements.
+- **AND** Repeated input processing, cached input and reasoning/output categories SHALL not be double counted or converted from bytes into claimed measurements.
+- **AND** Failed, cancelled and retried attempts SHALL remain accounted.
+- **AND** Hypothesis investigation, planning, candidate preparation, evaluation, integration and recovery SHALL have separately attributable overhead without charging the same shared work twice.
+- **AND** Time comparisons SHALL use actual elapsed intervals; token comparisons SHALL identify the model/tokenizer, and currency or local compute cost SHALL require an explicit measured basis.
 
 #### Scenario: A batched tool call replaces several operations
 - **WHEN** an arm uses one outer tool call to perform multiple operations
@@ -104,15 +214,50 @@ Each attempt SHALL preserve workload acceptance, elapsed time through independen
 
 ### Requirement: Infrastructure noise is separated through attributable lifecycle evidence
 
-The evaluator SHALL retain observed end-to-end time and resource accounting and SHALL separately derive metrics adjusted for verified external infrastructure blocking. Neither view SHALL erase failed, cancelled, retried or waiting work. Native admission/process evidence SHALL correlate each wait with its attempt, tool call, command, resource, admission and parent identities, verified blocking ownership, and monotonic start/end cause. The evaluator SHALL distinguish unrelated contention, work belonging to the same attempt or experiment, and unknown ownership. An agent statement, queue diagnostic without complete boundaries or an unverified timestamp SHALL NOT establish a measured deductible interval.
+The evaluator SHALL preserve observed totals and derive adjusted metrics only from attributable native blocking evidence under a frozen deterministic rule. Exclusions SHALL reconcile without double counting; treatment effects, downstream costs and unresolved uncertainty SHALL remain visible.
 
-The algorithm SHALL clip eligible waits to the attempt, union overlapping and nested intervals, retain only intervals of verified task blocking, and exclude concurrent useful activity. It SHALL subtract that duration once from observed elapsed time without counting queue time as command execution or producing negative time. Model activity not independently established as wait-only SHALL NOT be assumed idle. Cross-process timestamps SHALL have verified clock alignment. Coverage gaps, ambiguous ownership and execution slowdown without a measured idle boundary SHALL remain explicit uncertainty, not estimated zero or guessed deductions. Existing local evidence/process/admission and rollout owners SHALL own the trace; no independent monitoring service or second accounting journal is required.
+#### Scenario: A wait is attributed to its real owner
+- **WHEN** infrastructure blocking is proposed for metric adjustment
+- **THEN** The evaluator SHALL retain observed end-to-end time and resource accounting and SHALL separately derive metrics adjusted for verified external infrastructure blocking.
+- **AND** Neither view SHALL erase failed, cancelled, retried or waiting work.
+- **AND** Native admission/process evidence SHALL correlate each wait with its attempt, tool call, command, resource, admission and parent identities, verified blocking ownership, and monotonic start/end cause.
+- **AND** The evaluator SHALL distinguish unrelated contention, work belonging to the same attempt or experiment, and unknown ownership.
+- **AND** An agent statement, queue diagnostic without complete boundaries or an unverified timestamp SHALL NOT establish a measured deductible interval.
 
-Waiting-related model requests, tool operations and measured usage SHALL be reported separately from passive wait duration. Only whole requests independently correlated with a wait and structurally verified to perform waiting alone MAY be excluded from adjusted usage. Mixed task/status requests SHALL remain included with incomplete attribution; token categories SHALL preserve their subset relationships. Duration, bytes or prose SHALL NOT be converted into token or currency measurements. Candidate-controlled polling, redundant work, self-contention and execution after admission SHALL retain attributable cost. Changes in build demand, queue exposure or waiting strategy SHALL remain visible in the benefit analysis even where an adjusted view excludes verified external waiting.
+#### Scenario: Eligible blocked intervals are reduced
+- **WHEN** retained wait intervals are converted into adjusted elapsed time
+- **THEN** The algorithm SHALL clip eligible waits to the attempt, union overlapping and nested intervals, retain only intervals of verified task blocking, and exclude concurrent useful activity.
+- **AND** It SHALL subtract that duration once from observed elapsed time without counting queue time as command execution or producing negative time.
+- **AND** Model activity not independently established as wait-only SHALL NOT be assumed idle.
+- **AND** Cross-process timestamps SHALL have verified clock alignment.
+- **AND** Coverage gaps, ambiguous ownership and execution slowdown without a measured idle boundary SHALL remain explicit uncertainty, not estimated zero or guessed deductions.
+- **AND** Existing local evidence/process/admission and rollout owners SHALL own the trace; no independent monitoring service or second accounting journal is required.
 
-Attribution SHALL run automatically as a deterministic reduction of retained native evidence under the frozen policy, without model-based classification or manual per-attempt labels. Every exclusion and unresolved classification SHALL identify its evidence and rule/reason. Replaying the same complete evidence and policy SHALL reproduce the deductions and decision inputs without model execution. Each measured quantity eligible for subtraction SHALL reconcile as observed total equals adjusted total plus excluded amount; unresolved usage SHALL remain included. Duplicate request usage or inconsistent totals SHALL degrade accounting coverage, not create savings. A time deduction SHALL NOT imply proportional token, energy or currency deductions.
+#### Scenario: Waiting usage remains separate from passive duration
+- **WHEN** waiting-related requests, tool activity or token usage are accounted
+- **THEN** Waiting-related model requests, tool operations and measured usage SHALL be reported separately from passive wait duration.
+- **AND** Only whole requests independently correlated with a wait and structurally verified to perform waiting alone MAY be excluded from adjusted usage.
+- **AND** Mixed task/status requests SHALL remain included with incomplete attribution; token categories SHALL preserve their subset relationships.
+- **AND** Duration, bytes or prose SHALL NOT be converted into token or currency measurements.
+- **AND** Candidate-controlled polling, redundant work, self-contention and execution after admission SHALL retain attributable cost.
+- **AND** Changes in build demand, queue exposure or waiting strategy SHALL remain visible in the benefit analysis even where an adjusted view excludes verified external waiting.
 
-An externally caused wait SHALL NOT imply that its downstream effects are removable. Context growth, compaction, deadline expiry, retries and changed work SHALL remain visible. Subsequent mixed-request usage, including repeated waiting context, SHALL remain included rather than being fractionally reconstructed as a hypothetical wait-free request. Material unresolved effects on the work trajectory SHALL apply the comparability and uncertainty gates even if the idle interval itself is fully measured. This SHALL NOT require identical tool sequences across arms or remove strategy changes caused by the treatment.
+#### Scenario: Attribution is replayed and reconciled
+- **WHEN** the evaluator derives deductions from retained native evidence
+- **THEN** Attribution SHALL run automatically as a deterministic reduction of retained native evidence under the frozen policy, without model-based classification or manual per-attempt labels.
+- **AND** Every exclusion and unresolved classification SHALL identify its evidence and rule/reason.
+- **AND** Replaying the same complete evidence and policy SHALL reproduce the deductions and decision inputs without model execution.
+- **AND** Each measured quantity eligible for subtraction SHALL reconcile as observed total equals adjusted total plus excluded amount; unresolved usage SHALL remain included.
+- **AND** Duplicate request usage or inconsistent totals SHALL degrade accounting coverage, not create savings.
+- **AND** A time deduction SHALL NOT imply proportional token, energy or currency deductions.
+
+#### Scenario: External waiting changes subsequent work
+- **WHEN** a measured external wait affects context, deadlines, retries or later execution
+- **THEN** An externally caused wait SHALL NOT imply that its downstream effects are removable.
+- **AND** Context growth, compaction, deadline expiry, retries and changed work SHALL remain visible.
+- **AND** Subsequent mixed-request usage, including repeated waiting context, SHALL remain included rather than being fractionally reconstructed as a hypothetical wait-free request.
+- **AND** Material unresolved effects on the work trajectory SHALL apply the comparability and uncertainty gates even if the idle interval itself is fully measured.
+- **AND** This SHALL NOT require identical tool sequences across arms or remove strategy changes caused by the treatment.
 
 #### Scenario: Attribution is replayed after recovery
 - **WHEN** the same complete native evidence is evaluated again with the same policy
@@ -156,9 +301,22 @@ An externally caused wait SHALL NOT imply that its downstream effects are remova
 
 ### Requirement: Benefit policy fixes the metric view and handles infrastructure uncertainty
 
-Before observing comparative results, the policy SHALL bind the claim to work-efficiency or operational metrics, the attribution rule/version, eligible causes, coverage requirements and a material-uncertainty rule. The same rule SHALL apply to both arms and remain bound to retained evidence and decisions through resume. Work-efficiency analysis SHALL use adjusted metrics with sufficient comparable coverage; the operational view SHALL retain actual waiting and cost. A treatment targeting admission, scheduling or waiting SHALL be evaluated under controlled relevant load without excluding its own mechanism. Acceptance and cost/time trade-off requirements SHALL remain in force. A favorable adjusted result alone SHALL NOT establish net savings or justify a treatment-induced operational regression hidden in excluded categories.
+The predeclared policy SHALL bind metric view, attribution identity, coverage and uncertainty consistently across arms and recovery. Verdict-changing unresolved infrastructure effects SHALL yield an inconclusive causal claim; adjustment SHALL NOT erase the treatment's own operational costs.
 
-If unresolved infrastructure effects could change whether the declared meaningful effect or regression threshold is met, the evaluator SHALL record `inconclusive`, identify the missing evidence and the smallest relevant controlled check, and SHALL NOT infer adoption or model/harness regression from the contaminated pair. A conservative bound that demonstrates the decision is unchanged MAY support the scoped conclusion with its limits. Any repeat SHALL follow the predeclared stopping rule, retain earlier attempts and costs, and SHALL NOT select away unfavorable load after seeing results.
+#### Scenario: The experiment declares its metric view
+- **WHEN** a comparison policy is frozen before comparative outcomes
+- **THEN** Before observing comparative results, the policy SHALL bind the claim to work-efficiency or operational metrics, the attribution rule/version, eligible causes, coverage requirements and a material-uncertainty rule.
+- **AND** The same rule SHALL apply to both arms and remain bound to retained evidence and decisions through resume.
+- **AND** Work-efficiency analysis SHALL use adjusted metrics with sufficient comparable coverage; the operational view SHALL retain actual waiting and cost.
+- **AND** A treatment targeting admission, scheduling or waiting SHALL be evaluated under controlled relevant load without excluding its own mechanism.
+- **AND** Acceptance and cost/time trade-off requirements SHALL remain in force.
+- **AND** A favorable adjusted result alone SHALL NOT establish net savings or justify a treatment-induced operational regression hidden in excluded categories.
+
+#### Scenario: Infrastructure uncertainty can change the verdict
+- **WHEN** unresolved external effects can cross a declared effect or regression threshold
+- **THEN** If unresolved infrastructure effects could change whether the declared meaningful effect or regression threshold is met, the evaluator SHALL record `inconclusive`, identify the missing evidence and the smallest relevant controlled check, and SHALL NOT infer adoption or model/harness regression from the contaminated pair.
+- **AND** A conservative bound that demonstrates the decision is unchanged MAY support the scoped conclusion with its limits.
+- **AND** Any repeat SHALL follow the predeclared stopping rule, retain earlier attempts and costs, and SHALL NOT select away unfavorable load after seeing results.
 
 #### Scenario: Infrastructure imbalance can reverse the verdict
 - **WHEN** raw times suggest benefit or regression but attribution gaps could move the effect across a decision threshold
@@ -174,9 +332,28 @@ If unresolved infrastructure effects could change whether the declared meaningfu
 
 ### Requirement: Paired experiments control non-treatment operating conditions
 
-For the selected experimental unit, the evaluator SHALL compare both harness versions on the same frozen real workload, applying the prior-measurement reuse contract where applicable. Before either arm starts, its existing policy SHALL bind initial cache and warm-up conditions, arm ordering, relevant load controls, observed environment identity, fault classification and retry/stopping rules. Preflight SHALL verify available task, runtime, model/client and acceptance identities and the resulting owned cache state or preparation recipe. Unknown shared/OS/inference-cache state SHALL remain explicit; a reset command alone SHALL NOT prove equivalent conditions. Resets SHALL affect only owned state. Preparation costs SHALL remain accounted under the declared operating mode. Randomized arm order or a balanced repetition schedule SHALL be fixed before results, with single-pair order exposure retained. No proxy metric or comparison of different task durations SHALL replace acceptance and measurement of the declared effect; a full-task claim SHALL retain its required real-agent comparison.
+Matched experiments SHALL freeze and verify relevant input, cache, order, load, identity and retry conditions before execution while preserving effects caused by the treatment. Uncontrolled differences that can change the conclusion SHALL remain inconclusive rather than be corrected by guesswork.
 
-Equivalent initial conditions SHALL preserve the treatment's subsequent caching, build demand, scheduling, recovery and model-strategy effects. For model-dependent comparisons, required solution-repeatability qualification and the selected identity policy SHALL remain enforced without adding unavailable hardware access as an API-observed prerequisite. Uncertainty bounds SHALL NOT waive required identity, input-state or qualification gates. Uncontrolled execution load SHALL NOT authorize a guessed utilization-based time correction. Ordinary inference/tool execution and unattributed request latency SHALL NOT be classified as external idle waiting. A network fault affecting response delivery, retries, context or subsequent work SHALL retain the original attempt, errors and usage; elapsed subtraction alone SHALL NOT make its trajectory comparable. Material unresolved operating differences SHALL make the causal conclusion inconclusive, and further attempts SHALL follow the predeclared policy without selecting favorable failures or load.
+#### Scenario: Paired initial conditions are established
+- **WHEN** a matched experiment prepares or reuses either arm
+- **THEN** For the selected experimental unit, the evaluator SHALL compare both harness versions on the same frozen real workload, applying the prior-measurement reuse contract where applicable.
+- **AND** Before either arm starts, its existing policy SHALL bind initial cache and warm-up conditions, arm ordering, relevant load controls, observed environment identity, fault classification and retry/stopping rules.
+- **AND** Preflight SHALL verify available task, runtime, model/client and acceptance identities and the resulting owned cache state or preparation recipe.
+- **AND** Unknown shared/OS/inference-cache state SHALL remain explicit; a reset command alone SHALL NOT prove equivalent conditions.
+- **AND** Resets SHALL affect only owned state.
+- **AND** Preparation costs SHALL remain accounted under the declared operating mode.
+- **AND** Randomized arm order or a balanced repetition schedule SHALL be fixed before results, with single-pair order exposure retained.
+- **AND** No proxy metric or comparison of different task durations SHALL replace acceptance and measurement of the declared effect; a full-task claim SHALL retain its required real-agent comparison.
+
+#### Scenario: Treatment effects and contaminated trajectories remain visible
+- **WHEN** cache evolution, load, faults or model behavior changes during a paired comparison
+- **THEN** Equivalent initial conditions SHALL preserve the treatment's subsequent caching, build demand, scheduling, recovery and model-strategy effects.
+- **AND** For model-dependent comparisons, required solution-repeatability qualification and the selected identity policy SHALL remain enforced without adding unavailable hardware access as an API-observed prerequisite.
+- **AND** Uncertainty bounds SHALL NOT waive required identity, input-state or qualification gates.
+- **AND** Uncontrolled execution load SHALL NOT authorize a guessed utilization-based time correction.
+- **AND** Ordinary inference/tool execution and unattributed request latency SHALL NOT be classified as external idle waiting.
+- **AND** A network fault affecting response delivery, retries, context or subsequent work SHALL retain the original attempt, errors and usage; elapsed subtraction alone SHALL NOT make its trajectory comparable.
+- **AND** Material unresolved operating differences SHALL make the causal conclusion inconclusive, and further attempts SHALL follow the predeclared policy without selecting favorable failures or load.
 
 #### Scenario: The second arm inherits a warmer cache
 - **WHEN** an arm violates the declared initial owned cache or warm-up conditions
@@ -196,9 +373,24 @@ Equivalent initial conditions SHALL preserve the treatment's subsequent caching,
 
 ### Requirement: Measurement bounds and run variability support distinct claims
 
-The evaluator SHALL retain measurement/attribution uncertainty separately from empirical run-to-run variation. Every numerical bound SHALL identify its evidence and assumptions; missing uncertainty SHALL NOT become zero, and unknown dependence SHALL NOT be treated as independence. A bounded decision SHALL hold across the supported range of all decision-driving metrics, including acceptance, resource regressions and declared trade-offs, not merely the preferred time metric. Threshold-crossing uncertainty SHALL yield an inconclusive causal conclusion. A measurement bound SHALL NOT be labeled a statistical confidence interval without a valid statistical basis.
+Measurement bounds SHALL remain distinct from empirical run variation. Numerical and statistical claims SHALL identify their evidence, assumptions and predeclared complete units; insufficient or threshold-crossing evidence SHALL NOT become confidence, equivalence or repeatable benefit.
 
-A statistical claim SHALL declare its analysis method, confidence level, assumptions, complete experimental units for the selected comparison method, repetition/stopping rule and treatment of repeated selection before comparative outcomes. Requests, tokens, tool calls and repeated readings within one task SHALL NOT count as independent task replications. Fixed sampling parameters and qualification success SHALL NOT establish zero timing or trajectory variance. One pair MAY support a limited description of its observed task result and measurement bounds, but SHALL NOT establish repeatable/general savings or an unsupported confidence percentage. Material uncertainty about the declared claim SHALL remain inconclusive when permitted evidence is insufficient; no universal repetition count or favorable-result stopping rule SHALL be invented. The existing API-observed identity limits SHALL remain visible in that claim.
+#### Scenario: Measurement bounds drive a decision
+- **WHEN** measurement or attribution uncertainty is used in a benefit conclusion
+- **THEN** The evaluator SHALL retain measurement/attribution uncertainty separately from empirical run-to-run variation.
+- **AND** Every numerical bound SHALL identify its evidence and assumptions; missing uncertainty SHALL NOT become zero, and unknown dependence SHALL NOT be treated as independence.
+- **AND** A bounded decision SHALL hold across the supported range of all decision-driving metrics, including acceptance, resource regressions and declared trade-offs, not merely the preferred time metric.
+- **AND** Threshold-crossing uncertainty SHALL yield an inconclusive causal conclusion.
+- **AND** A measurement bound SHALL NOT be labeled a statistical confidence interval without a valid statistical basis.
+
+#### Scenario: A statistical or repeatability claim is made
+- **WHEN** the experiment claims statistical confidence or repeatable benefit
+- **THEN** A statistical claim SHALL declare its analysis method, confidence level, assumptions, complete experimental units for the selected comparison method, repetition/stopping rule and treatment of repeated selection before comparative outcomes.
+- **AND** Requests, tokens, tool calls and repeated readings within one task SHALL NOT count as independent task replications.
+- **AND** Fixed sampling parameters and qualification success SHALL NOT establish zero timing or trajectory variance.
+- **AND** One pair MAY support a limited description of its observed task result and measurement bounds, but SHALL NOT establish repeatable/general savings or an unsupported confidence percentage.
+- **AND** Material uncertainty about the declared claim SHALL remain inconclusive when permitted evidence is insufficient; no universal repetition count or favorable-result stopping rule SHALL be invented.
+- **AND** The existing API-observed identity limits SHALL remain visible in that claim.
 
 #### Scenario: A bounded effect clears the declared threshold
 - **WHEN** the supported measurement range lies wholly beyond the meaningful-effect threshold and every other decision gate holds across its range
@@ -214,7 +406,16 @@ A statistical claim SHALL declare its analysis method, confidence level, assumpt
 
 ### Requirement: Independent controls verify noise accounting
 
-The existing controller, report and decision path SHALL be exercised with owned independent calibration inputs and retained expected properties. Identical runtimes with a known eligible external idle delay SHALL show that delay in raw accounting and exclude only its verified blocked portion from adjusted metrics within observed error bounds. Controls adding real work or changing quality SHALL preserve their effect and applicable rejection gates. Missing or inconsistent evidence SHALL reduce coverage or yield inconclusive analysis rather than false precision. Calibration identity and results SHALL remain tied to the relevant collector, algorithm, policy and clock contracts; changed relevant inputs SHALL invalidate unsupported reuse. These controls SHALL NOT replace actual local-model or installed-loop acceptance.
+Independent owned controls SHALL calibrate the actual controller/report/decision path for known idle delay, added work, quality failure and incomplete evidence. Calibration reuse SHALL bind relevant algorithm, collector, policy and clock identities and SHALL NOT replace real installed acceptance.
+
+#### Scenario: The actual accounting path is calibrated
+- **WHEN** noise accounting or its retained calibration is qualified
+- **THEN** The existing controller, report and decision path SHALL be exercised with owned independent calibration inputs and retained expected properties.
+- **AND** Identical runtimes with a known eligible external idle delay SHALL show that delay in raw accounting and exclude only its verified blocked portion from adjusted metrics within observed error bounds.
+- **AND** Controls adding real work or changing quality SHALL preserve their effect and applicable rejection gates.
+- **AND** Missing or inconsistent evidence SHALL reduce coverage or yield inconclusive analysis rather than false precision.
+- **AND** Calibration identity and results SHALL remain tied to the relevant collector, algorithm, policy and clock contracts; changed relevant inputs SHALL invalidate unsupported reuse.
+- **AND** These controls SHALL NOT replace actual local-model or installed-loop acceptance.
 
 #### Scenario: Only an external idle delay is injected
 - **WHEN** a controlled comparison adds an attributable external blocked interval with no useful-work overlap or trajectory change
@@ -230,7 +431,16 @@ The existing controller, report and decision path SHALL be exercised with owned 
 
 ### Requirement: Rolling evidence retains applicability and exact candidate lineage
 
-The evaluation policy SHALL declare the meaningful effect, quality constraints, tolerable noncritical variation, repetition/stopping rule and treatment of repeated candidate selection before observing comparative results. Baseline and candidate observations SHALL be matched by the declared workload and operating conditions, including applicable controls on order, cache and load and verified conditions for reused evidence. A result on B SHALL support only its exercised scope; task difficulty changes from B to C SHALL not be interpreted as a longitudinal speed improvement. The evaluator SHALL retain replayable completed real-task inputs and independent checks linked through their Beads owners, and use applicable prior real tasks for corroboration when the declared adoption scope requires it. A task that does not exercise the proposed mechanism SHALL not be treated as evidence of general uselessness. Rebased, edited, substituted or combined candidates SHALL require acceptance of their new exact identity rather than inherit another patch's benefit result.
+Rolling comparisons SHALL preserve declared thresholds, matched conditions, applicable corroboration and exact candidate identities. A result SHALL support only its measured scope; changed tasks or patches SHALL NOT inherit another experiment's benefit.
+
+#### Scenario: A result supports continuation or another candidate
+- **WHEN** rolling evidence is retained, corroborated or considered for baseline advancement
+- **THEN** The evaluation policy SHALL declare the meaningful effect, quality constraints, tolerable noncritical variation, repetition/stopping rule and treatment of repeated candidate selection before observing comparative results.
+- **AND** Baseline and candidate observations SHALL be matched by the declared workload and operating conditions, including applicable controls on order, cache and load and verified conditions for reused evidence.
+- **AND** A result on B SHALL support only its exercised scope; task difficulty changes from B to C SHALL not be interpreted as a longitudinal speed improvement.
+- **AND** The evaluator SHALL retain replayable completed real-task inputs and independent checks linked through their Beads owners, and use applicable prior real tasks for corroboration when the declared adoption scope requires it.
+- **AND** A task that does not exercise the proposed mechanism SHALL not be treated as evidence of general uselessness.
+- **AND** Rebased, edited, substituted or combined candidates SHALL require acceptance of their new exact identity rather than inherit another patch's benefit result.
 
 #### Scenario: A is faster on B but B is easier than C
 - **WHEN** the next loop step has a slower absolute duration on C
@@ -250,11 +460,28 @@ The evaluation policy SHALL declare the meaningful effect, quality constraints, 
 
 ### Requirement: Subtractive treatments prove useful effects and retained behavior
 
-A simplification comparison SHALL name the removed burden and the intended-use conditions in which it incurs cost. It SHALL measure the declared outcome through independent workload acceptance using the same accounting as additive candidates, including accepted-task elapsed time for productivity claims and applicable interaction/tool steps and token/resource categories, including applicable startup, discovery, fallback, manual work, verification, maintenance and recovery overhead over the declared use horizon. Measurements SHALL distinguish invocation from exposure: a skill or tool need not be invoked to incur catalogue, instruction or initialization cost, but that cost and its removal SHALL require evidence of actual consumption in each arm. Missing telemetry SHALL remain unknown; smaller source files or zero invocations SHALL NOT be reported as measured context or token savings.
+Subtractive candidates SHALL demonstrate the declared useful outcome through actual consumption and retained behavior over the intended-use horizon. Size or nonuse alone SHALL NOT establish benefit or authorize retirement, and independent acceptance SHALL survive the treatment.
 
-Both arms SHALL retain the same frozen task acceptance, including required correctness, diagnostics, supported compatibility and recovery. For any explicitly approved capability retirement, the changed product scope and lost scenarios SHALL be declared before comparison; the workload SHALL exercise the retained contract and SHALL NOT be rewritten after seeing failures to conceal a regression. Applicable caller/configuration/dependency checks and an exercised restoration path SHALL accompany the benefit evidence. Removing tests or checks SHALL NOT remove the independent oracle or prove retained behavior merely because fewer checks now run.
+#### Scenario: The removed burden and full cost are measured
+- **WHEN** a simplification or subtraction is evaluated
+- **THEN** A simplification comparison SHALL name the removed burden and the intended-use conditions in which it incurs cost.
+- **AND** It SHALL measure the declared outcome through independent workload acceptance using the same accounting as additive candidates, including accepted-task elapsed time for productivity claims and applicable interaction/tool steps and token/resource categories, including applicable startup, discovery, fallback, manual work, verification, maintenance and recovery overhead over the declared use horizon.
+- **AND** Measurements SHALL distinguish invocation from exposure: a skill or tool need not be invoked to incur catalogue, instruction or initialization cost, but that cost and its removal SHALL require evidence of actual consumption in each arm.
+- **AND** Missing telemetry SHALL remain unknown; smaller source files or zero invocations SHALL NOT be reported as measured context or token savings.
 
-The default efficiency adoption policy SHALL require a meaningful measured benefit with required quality preserved; fewer steps alone SHALL be insufficient when work is merely moved or total time/resources materially worsen. No detected gain or regression SHALL NOT prove equivalence or uselessness. A maintainability-only or exposure-only claim SHALL remain separately identified and SHALL require an explicit predeclared user-agreed decision basis if it does not meet the efficiency policy; reduced size alone SHALL NOT justify adoption. Experiments SHALL NOT authorize retirement independently of the user's scoped removal decision.
+#### Scenario: Retained behavior survives the treatment
+- **WHEN** both arms exercise retained product behavior under a subtractive comparison
+- **THEN** Both arms SHALL retain the same frozen task acceptance, including required correctness, diagnostics, supported compatibility and recovery.
+- **AND** For any explicitly approved capability retirement, the changed product scope and lost scenarios SHALL be declared before comparison; the workload SHALL exercise the retained contract and SHALL NOT be rewritten after seeing failures to conceal a regression.
+- **AND** Applicable caller/configuration/dependency checks and an exercised restoration path SHALL accompany the benefit evidence.
+- **AND** Removing tests or checks SHALL NOT remove the independent oracle or prove retained behavior merely because fewer checks now run.
+
+#### Scenario: A subtraction is considered for adoption
+- **WHEN** a measured subtractive treatment reaches its benefit decision
+- **THEN** The default efficiency adoption policy SHALL require a meaningful measured benefit with required quality preserved; fewer steps alone SHALL be insufficient when work is merely moved or total time/resources materially worsen.
+- **AND** No detected gain or regression SHALL NOT prove equivalence or uselessness.
+- **AND** A maintainability-only or exposure-only claim SHALL remain separately identified and SHALL require an explicit predeclared user-agreed decision basis if it does not meet the efficiency policy; reduced size alone SHALL NOT justify adoption.
+- **AND** Experiments SHALL NOT authorize retirement independently of the user's scoped removal decision.
 
 #### Scenario: A skill is absent on disk but still appears in the executor context
 - **WHEN** an approved treatment removes a skill yet the actual candidate conversation consumes the old catalogue

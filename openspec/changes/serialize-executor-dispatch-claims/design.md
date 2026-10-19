@@ -1,13 +1,17 @@
 ## Context
 
-The normal user action is to dispatch independent assignments concurrently.
-Each must keep its own checkout, assignment and visible conversation. Retained
-feedback describes two accepted spawns sharing one slot and one receipt, losing
-the first assignment. Source inspection finds a compatible failure window:
-`task_worktree::claim_slot` can reclaim an existing clean claim when its owner
-is not reported live, while `executor_cli::prepare_dispatch` acquires that claim
-before preparing the receipt and starting its host. This inspection supports
-the hypothesis; the controlled native reproduction must establish the trigger.
+The normal user action is concurrent independent dispatch with distinct
+checkout, assignment and conversation identities. The historical failure window
+is now guarded by startup reservations and atomic admission. Reuse the current
+`task_worktree` and `executor_cli::acquire_pool_slot` owners and existing tests;
+establish any remaining defect through a controlled native reproduction.
+
+The shared lifecycle in `unify-reusable-worktree-pool` owns allocation and base
+selection. An explicit available local base needs no fetch, and continuation of
+a held task preserves HEAD and partial work. This change adds the continuous
+ownership invariant without replacing that pool contract or reviving owner-id
+reset semantics. Integrate the deltas in either order without losing either
+contract, and keep the prerequisite's unfinished acceptance visible.
 
 ## Goals / Non-Goals
 
@@ -43,6 +47,22 @@ and avoid claiming a throughput benefit from a correctness fix alone. Parallel
 model work after handoff must remain available at the configured capacity.
 
 ## Acceptance
+
+Before comparison, freeze the exact historical source exhibiting the gap, the
+current candidate, checker, startup bounds and synchronization gates. Locate and
+qualify the historical control from the reservation change's history; a commit
+label alone is not a failing result. An already-correct current HEAD is a valid
+candidate, not an assumed negative control. If neither applicable historical
+evidence nor a reproducible gap is available, retain the acceptance limitation
+and make no new corrective implementation on the strength of the old narrative.
+
+Measure lost/overwritten assignments, false accepted receipts, duplicate live
+bindings and out-of-capacity allocations. The historical control must exhibit
+the selected violation and the candidate must produce zero violations across
+the declared schedules below. Retain startup wait times and enforce the frozen
+existing bounds, without inferring speed from a correctness improvement.
+Reject additional candidate changes that fail retained behavior; restore the
+accepted source/runtime through the existing owners and preserve the evidence.
 
 Reproduce the overlap with controlled native processes against an owned source,
 home and pool, without a model request or live installation mutation. Gate the

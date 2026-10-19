@@ -1,11 +1,11 @@
 ## Context
 
 See [proposal.md](proposal.md) for the observed user-facing failure.
-The native watch loop currently treats the receipt's `completed` state as
-terminal before examining the final exit status. The existing receipt-view
-path already distinguishes a successful recorded exit from an unsettled
-completion. Native observation tests provide real host/receipt fixtures and
-cover bounded waiting, interruption and reply holds.
+Current source already distinguishes a successful recorded exit from an
+unsettled completion in the watch loop and receipt view. The implementation
+introduced in `e2395f5` and its native observation regression are reuse inputs.
+Reconcile their actual coverage before adding code; zero checked tasks is not
+evidence that the fix is absent. Native fixtures cover the host/receipt boundary.
 
 The everyday path is a lead waiting once for a dispatched assignment, reading
 its result and then reviewing or releasing the slot. The relevant counterexample
@@ -43,6 +43,24 @@ model request or terminal scraping. Run the same assertions in text and JSON
 mode. Reuse existing fixture and process ownership instead of another watcher.
 
 ## Acceptance
+
+Freeze exact source and executable identities before running the comparison.
+Use the parent of `e2395f5` as the historical defect control only after verifying
+its applicability; use the current candidate for the corrected arm. Keep the
+same external checker and controlled event sequence in both. If the historical
+input is unavailable or already passes, report the control as unqualified and
+investigate; never label current HEAD as failing by assumption. Existing valid
+evidence may be reused with its identities and limits.
+
+For each text/JSON mode, hold finalization pending, then publish result and exit;
+also exercise never-finalized, failed and empty-result outcomes. Require at
+least one premature success from the historical defect control, zero from the
+candidate, the exact retained result after successful finalization, and the
+specified timeout/failure outcomes with no stopped or replayed run. These are
+deterministic correctness outcomes, not a statistical speed claim. An unchanged
+current implementation that already satisfies them is retained; a new patch
+without additional demonstrated benefit is unnecessary. A failing candidate is
+excluded from accepted source/runtime and its evidence remains retained.
 
 The independent acceptance owner supplies a frozen checker outside the
 implementation's writable paths and invokes the built native CLI. It must

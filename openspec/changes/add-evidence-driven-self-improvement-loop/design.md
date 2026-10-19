@@ -60,6 +60,28 @@ The existing feedback incubator remains lead-owned. The new explicitly invoked i
 
 ### 3. One linked OpenSpec change owns each hypothesis from initial measurement
 
+The executable cycle is data collection -> analysis and falsifiable hypothesis
+-> frozen experiment/solution -> implementation -> practical comparison ->
+supported adoption or verified removal of candidate effects. Reuse the current
+owners below; no extra report schema, tracker or controller is needed.
+
+| Boundary | Existing owner and evidence | Refusal or recovery |
+| --- | --- | --- |
+| Data to hypothesis | `improvement_intake`: retained observation, actual source/conditions and causal applicability | Missing locator, prediction presented as observation or stale problem statement leaves investigation unqualified |
+| Hypothesis to implementation | `improvement_spec` and `improvement_policy`: frozen artifacts, baseline/control identities, independent oracle, outcomes, meaningful thresholds and stopping | Complete Markdown alone is insufficient; unresolved decisive inputs prevent candidate dispatch |
+| Implementation to decision | Native comparison/outcome owners: actual control/candidate executions and acceptance, failed attempts and total costs | No effect is rejection when adequately measured; missing decisive coverage is inconclusive, never favorable |
+| Decision to accepted use | `improvement_activation` and `improvement_driver`: exact supported revision, actual selected runtime and checked restoration | No unadopted code enters accepted mainline; rejected/inconclusive candidate effects are removed from active delivery before conflicting work |
+
+Record the primary metric, unit/denominator, direction, minimum useful change,
+regression constraints, observation horizon and evidence locator in the existing
+experiment policy/acceptance section before candidate edits. For a deterministic
+defect the outcome can be violation count under a qualified failing control;
+quality improvement need not be misrepresented as speed. For agent-productivity
+claims use real accepted work, include unsuccessful attempts and overhead, and
+apply the separately confirmed stricter addition policy. A historical defect
+already fixed in current source needs a qualified historical control and a
+remaining-work assessment, not a new implementation of the same fix.
+
 Before the first targeted measurement for an investigation, resolve the intended OpenSpec root/store and scaffold its change through `openspec new change`. Start from existing attributable observations and an explicit measurement question, scope, inputs, baseline-measurement tasks and local evidence references; a concrete solution is not required yet. Routine telemetry and previously retained evidence do not need a new change per event. Use the same change as measurements inform the falsifiable hypothesis, design, candidate implementation, new measurements, decision and adoption/restoration checks.
 
 Before any candidate edit, complete proposal, requirements, design and tasks using the installed instructions, validate them, and freeze the mechanism, counterexample, claimed scope, selected method, baseline/workload identity, independent acceptance, meaningful effect, controls and stopping/escalation policy. This applies separately to A and B when both are improvement hypotheses, including small instruction/configuration changes. A build or other ordinary workload uses its existing contract or the hypothesis's experiment plan, not an artificial B change. A materially different causal hypothesis receives its own change; further trials of the same hypothesis remain linked to its existing owner.
@@ -139,13 +161,21 @@ Keep candidate code on a dedicated hypothesis branch in an owned Git worktree. A
 
 Prepare H and H+A runtime artifacts once and reuse them while source, configuration and build inputs are unchanged. The proposed `improve select --run <id> --variant baseline|candidate` operation selects the prepared variant through the existing runtime-selection owner, returns its effective identity, and performs no model call or source revert. It rejects changes during an active measured attempt; subsequent agent attempts still begin with fresh executor context. Missing/stale artifacts cause explicit preparation or a clear error, not a silent rebuild hidden from accounting. The controller uses the same selection primitive for paired trials.
 
-Each variant performs the selected workload against S. If that workload is implementing B, both executors implement B independently; neither receives an existing B solution, sibling branch/logs, investigator notes that reveal the solution, or mutable shared candidate files. Direct operation trials need no artificial model conversation; agent-dependent trials still need fresh contexts and applicable qualification. An identifier can bind an artifact but does not prove it executed. The independent oracle observes the relevant real product entry point and remains outside candidate writes. Deliberately incorrect, skipped or forged-success results must fail that oracle before it is trusted for comparison.
+Each freshly executed arm performs the selected workload against S; an admissible retained baseline supplies its original execution evidence. If that workload is implementing B, its baseline and candidate solutions remain independent; the candidate executor receives neither an existing B solution, sibling branch/logs, investigator notes that reveal the solution, nor mutable shared candidate files. Direct operation trials need no artificial model conversation; agent-dependent trials still need fresh contexts and applicable qualification. An identifier can bind an artifact but does not prove it executed. The independent oracle observes the relevant real product entry point and remains outside candidate writes. Deliberately incorrect, skipped or forged-success results must fail that oracle before it is trusted for comparison.
 
 Linked worktrees share repository objects and most references, as documented by [Git worktree](https://git-scm.com/docs/git-worktree). They therefore retain candidates but do not by themselves hide an earlier B solution from another B executor. Materialize each measured source snapshot without sibling solution history, using an independent minimal repository when Git-aware tools require one. Keep shared MCP workers, ports, installation configuration and caches separately allocated or explicitly serialized/controlled. This preserves the convenience of candidate worktrees without claiming they isolate external runtime state.
 
 If B inherently requires A's source change, choose a different applicable real task; do not compare different source prerequisites and call the result a harness effect. An experiment that legitimately changes recurring tool preparation includes it according to the declared everyday warm/cold operating condition rather than hiding it behind asymmetric setup.
 
 **Alternative:** install A in the current session and solve B again. Rejected because remembered solutions, shared files and changed task source would confound the result.
+
+#### Consume a retained baseline through the comparison controller
+
+Extend the existing comparison inputs with an optional retained-evidence reference and bind its selection and exclusions to the experiment plan before dependent candidate work. Resolve it through the existing evidence owner before choosing a fresh baseline dispatch. The controller verifies actual retained artifacts and comparability; `BaselineReusePlan` and the outcome evaluator remain the policy owner, not a substitute for source validation. Keep method-specific checks: agent reuse needs qualification and isolated context, while an operation without model execution does not acquire an unrelated model gate. Matching revisions alone cannot establish comparable caches, load, calibration or measurement coverage.
+
+Record the original attempt and verified evidence binding in the existing comparison state, with an explicit retained origin rather than a fabricated completed dispatch. Both the direct-operation and agent paths consume that state and skip baseline execution only when it remains valid. Preserve original measurements, failures and uncertainty; account for original shared cost once and for current recovery/validation separately. The evaluator sees the same acceptance and benefit requirements, including dependence when several comparisons reuse one observation. Keep evidence and solutions in supervisor-owned storage outside measured executor access.
+
+Persist the binding before candidate dispatch and revalidate it on resume. A partial write is reconciled against the original artifacts; missing or changed evidence produces a concrete refusal. Follow only the predeclared fresh-control fallback or a recorded plan revision, otherwise retain an inconclusive result. No automatic replacement pair follows a reuse refusal. Existing runtime restoration, decision and publication gates remain in force. Extend the current controller integration tests with a prior-run baseline and assert actual operation/dispatch counts, invalidation, interruption and candidate rejection; evaluator-only reuse tests cannot prove this path is connected.
 
 ### 6. Advance one candidate at a time and preserve exact lineage
 
@@ -161,6 +191,14 @@ The normal path is:
 8. Select the next grounded hypothesis automatically within run authority, or expose an evidence-based idle/waiting reason. An inconclusive result permits only its justified declared next measurement or deferral, not an endless identical retry.
 
 When useful, the chosen workload can be another improvement B. Retain both accepted B implementations, decide A without waiting for B's benefit, and select an exact B patch only if B is independently chosen next. Integrate/check that patch on its candidate branch against the resulting baseline, recording any changed identity, then evaluate B on an applicable C. This optional rotation preserves useful work and exact lineage without constraining all experiments to produce a next candidate. B's correct implementation is not proof of B's benefit or authority for its adoption/removal.
+
+#### Recover the selected solution before considering substitute implementation
+
+In the existing workflow owner, resolve retained workload records before implementer dispatch and distinguish verified absence, recoverable evidence and unresolved evidence. Preserve the recorded source locator as well as base/revision and acceptance references. A missing object in the candidate repository may be normal isolation: inspect the recorded owned source and transfer the exact verified change into the candidate allocation using the existing Git transfer/materialization facilities. Do not search arbitrary repositories, alter the source, or expose sibling solutions to measured executors. A malformed relevant record, unavailable lookup or failed Git read is unresolved evidence, never `Absent`.
+
+Reuse the existing checks for ownership, clean destination, exact change identity, writable scope, frozen planning, removal authority and independent acceptance. A changed base or corrected patch revalidates affected evidence under the existing integration contract. Preserve the original artifact and record lineage before advancing readiness. Resume recognizes an already materialized exact change and completes only missing bookkeeping. If no eligible retained solution can be recovered, block with the exact missing fact and recovery action; substitute implementation requires a separate reasoned decision on the existing hypothesis card within run authority. This does not add a general user-approval gate or a second journal.
+
+Test the transfer from a genuinely separate repository: a fixture sharing Git objects with the candidate cannot cover the missing-object case. Include unavailable and malformed sources, changed identities/bases, an interrupted transfer and verified absence, observing model-dispatch counts and preserved original work. Reuse applicable completed evidence; this correction does not require solving a feature twice merely to exercise artifact recovery.
 
 Routine restoration of the owned experimental runtime to the accepted baseline is covered by the experiment's recovery scope. It does not introduce another removal-approval ritual. Removing accepted capability as a candidate treatment, changing unrelated work, deleting evidence or publishing outside scope still requires the existing authority. Keep decision, integration, activation and restoration receipts distinct.
 
@@ -182,7 +220,7 @@ Keep independent task acceptance as a prerequisite. Report elapsed time through 
 
 Report reusable planning, investigation, candidate construction, repeated trials, integration and recovery separately from the matched task attempts. Count each shared activity once. Per-accepted-task resources include unsuccessful attempts and acceptance rate; zero accepted tasks has no finite per-success estimate. The fixed planning artifacts shared by a pair are a common input, with their preparation cost retained as experiment overhead. Claims about a planning-only optimization require a workload that actually exercises that work, not an extrapolation from implementation timings. A model-free operation reports model metrics as inapplicable, not measured zero, and does not trigger unrelated model qualification. Measurement scope and claims remain bound to its selected method.
 
-Before comparisons, declare a practically meaningful effect and the allowed noncritical measurement variation. The default decision rule preserves correctness and requires a meaningful improvement in time or resources without a material regression in the other. A genuine cost/time trade-off needs an explicit predeclared policy rather than an invented weighted score. Do not mistake lack of detected regression for proven equivalence.
+Before comparisons, declare a practically meaningful effect and the allowed noncritical measurement variation. For an eligible efficiency simplification, require a meaningful improvement in time or resources without material regression in the other and preserve correctness/task-closing ability. Additions and enhancements retain the confirmed stricter rule in the simplification requirement: both time and token consumption improve and task-closing quality improves, including success rate and later P0/P1 rework. A generic single-objective policy cannot silently weaken that treatment-specific rule. A genuine permitted trade-off needs an explicit predeclared policy within the user's constraints, not an invented weighted score. Do not mistake lack of detected regression for proven equivalence.
 
 Apply the same rule to subtraction through the [subtractive-treatment contract](specs/harness-outcome-evaluation/spec.md#requirement-subtractive-treatments-prove-useful-effects-and-retained-behavior). Include changed discovery/setup, manual fallback and recovery costs; measure actual context consumption separately from invocation. A proposed maintenance-only benefit without an efficiency effect needs a separately predeclared user-agreed basis, not a post-hoc exemption for fewer lines. Freeze any explicitly approved retirement of product scope before the comparison, keep retained task acceptance common to both arms, and exercise affected consumer and restoration paths independently of the optimizing executor.
 
@@ -397,6 +435,18 @@ Serialize model work on shared local inference hardware during comparisons. Ever
 ### 10. Reuse installation and publication boundaries
 
 Experimental advancement operates on isolated runtimes and the agreed source scope. Candidate code enters the accepted mainline only after supported benefit and combined-tree checks; preparation, planning and branch retention do not imply a merge. Live activation is a separately identifiable action using established authority and existing lifecycle checks. Rejection keeps the mainline unchanged and verifies the accepted runtime is restored, so routine testing and rejection use neither revert commits nor manual code cleanup. Preserve useful rejected/deferred commits and evidence. Reclaim a worktree only after its work is preserved and it has no active consumers, using the normal non-forced Git lifecycle; do not reset another task's tree or delete unmerged work. A candidate that changes the controller or evaluator runs beneath an unchanged external supervisor/oracle and cannot replace its own running control rules.
+
+Retention is not delivery: an inactive branch/patch preserves the negative
+result, while accepted source, selected instructions/configuration and the
+active installation must contain no unadopted candidate effects. Verify those
+actual identities and the affected baseline user path; a rejection label or
+cleanup command exit is not restoration evidence. If an experimental effect
+has escaped its owned isolation, remove/revert only that exact introduced delta
+through the existing source/install owner with preserved recovery inputs. Do not
+reset unrelated edits or delete accepted capabilities to make cleanup pass.
+Unknown or failed restoration remains a resource blocker, preserving both the
+original failure and the distinct recovery error. Reclaim inactive candidate
+storage only through existing retention after useful evidence is preserved.
 
 For approved subtraction, these owners must also verify the intended capability was actually removed from the selected scope, unrelated capabilities remain available and the documented restoration works. Approved source integration does not imply installed retirement unless that stage was expressly covered. Preserve still-needed knowledge, links and evidence in their owners before consolidating or retiring documents and skills.
 
