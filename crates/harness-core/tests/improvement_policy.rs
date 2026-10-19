@@ -2,6 +2,7 @@
 //! consumes the authoritative outcome accounting
 //! (`outcome_report::summarize_attempts`); no case substitutes a candidate
 //! claim, a synthetic statistic or a post-hoc threshold.
+use harness_core::benefit_gate::DecisionBasis;
 use harness_core::improvement_policy::{
     AnalysisMethod, BASELINE_REUSE_CLAUSE, BaselineReusePlan, Basis, ClaimScope, ComparisonPolicy,
     ConjunctionPolicy, DeclaredComparison, EffectPath, ExperimentMethod, ExperimentSelection,
@@ -951,6 +952,367 @@ fn trade_offs_stopping_and_repeated_selection_need_predeclared_rules() {
             .any(|reason| reason.contains("corroboration")),
         "{:?}",
         evaluation.reasons
+    );
+}
+
+#[test]
+fn engineering_judgment_adopts_equal_or_slower_accepted_outcomes_without_a_savings_claim() {
+    let mut judgment = policy();
+    judgment.basis = Basis::EngineeringJudgment {
+        basis: "reflection-pilot:lead-judgment-2026-10-16".into(),
+    };
+    judgment.meaningful_effect_percent = None;
+    let declared = declare(&judgment);
+
+    for (case, candidate_seconds) in [("case-equal", 100.0), ("case-slower", 115.0)] {
+        let baseline = attempt(
+            "bj",
+            "baseline",
+            case,
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        );
+        let candidate = attempt(
+            "cj",
+            "candidate",
+            case,
+            200.0,
+            candidate_seconds,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        );
+        let report = summarize(&[baseline, candidate], &judgment);
+        let evaluation = evaluate(&declared, &report).unwrap();
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::Adopt,
+            "{case}: {:?}",
+            evaluation.reasons
+        );
+        assert_eq!(evaluation.baseline_seconds, Some(100.0), "{case}");
+        assert_eq!(
+            evaluation.candidate_seconds,
+            Some(candidate_seconds),
+            "{case}: the observed cost stays recorded"
+        );
+        assert!(
+            !evaluation.trade_off_used,
+            "{case}: no numeric exchange is invented"
+        );
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("reflection-pilot:lead-judgment-2026-10-16")),
+            "{case}: {:?}",
+            evaluation.reasons
+        );
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("retained as actual cost")),
+            "{case}: {:?}",
+            evaluation.reasons
+        );
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("rather than a numeric saving")),
+            "{case}: {:?}",
+            evaluation.reasons
+        );
+        assert!(
+            !evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("positive measured efficiency")),
+            "{case}: a judgment is not an efficiency claim: {:?}",
+            evaluation.reasons
+        );
+        let draft = evaluation
+            .decision_draft("sample-task", "exp-1", "base-sha", "cand-sha", "acceptance")
+            .unwrap();
+        assert_eq!(
+            draft.basis,
+            DecisionBasis::EngineeringJudgment {
+                basis: "reflection-pilot:lead-judgment-2026-10-16".into()
+            },
+            "{case}"
+        );
+        let text = draft.record().unwrap();
+        assert!(
+            text.contains(
+                "basis=engineering-judgment basis_ref=reflection-pilot:lead-judgment-2026-10-16"
+            ),
+            "{case}: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "baseline_seconds=100.000 candidate_seconds={candidate_seconds:.3}"
+            )),
+            "{case}: {text}"
+        );
+    }
+}
+
+#[test]
+fn engineering_judgment_retains_a_measured_token_cost_increase() {
+    let mut judgment = with_binding(Mechanism::None);
+    judgment.basis = Basis::EngineeringJudgment {
+        basis: "reflection-pilot:lead-token-cost".into(),
+    };
+    judgment.meaningful_effect_percent = None;
+    let declared = declare(&judgment);
+
+    let mut baseline = attempt(
+        "bt",
+        "baseline",
+        "case-token",
+        0.0,
+        100.0,
+        true,
+        Some(4),
+        Some(6),
+        true,
+    );
+    let mut candidate = attempt(
+        "ct",
+        "candidate",
+        "case-token",
+        100.0,
+        115.0,
+        true,
+        Some(4),
+        Some(6),
+        true,
+    );
+    bounded(&mut baseline, 100.0, 100.0);
+    bounded(&mut candidate, 115.0, 115.0);
+    baseline["infrastructure"]["usage"] = json!({
+        "incomplete": false,
+        "raw": {"total_tokens": 125},
+        "adjusted": {"total_tokens": 125},
+        "excluded": {"total_tokens": 0},
+    });
+    candidate["infrastructure"]["usage"] = json!({
+        "incomplete": false,
+        "raw": {"total_tokens": 175},
+        "adjusted": {"total_tokens": 175},
+        "excluded": {"total_tokens": 0},
+    });
+
+    let report = summarize(&[baseline, candidate], &judgment);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("recorded native token usage is retained")
+                && reason.contains("+40.000%")
+        }),
+        "the measured token cost increase stays recorded: {:?}",
+        evaluation.reasons
+    );
+    assert!(!evaluation.trade_off_used);
+}
+
+#[test]
+fn engineering_judgment_keeps_acceptance_and_coverage_gates() {
+    let mut judgment = policy();
+    judgment.basis = Basis::EngineeringJudgment {
+        basis: "reflection-pilot:lead-2".into(),
+    };
+    judgment.meaningful_effect_percent = None;
+    let declared = declare(&judgment);
+
+    let rejected = summarize(
+        &[
+            attempt(
+                "bq",
+                "baseline",
+                "case-q",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "cq",
+                "candidate",
+                "case-q",
+                200.0,
+                110.0,
+                false,
+                Some(4),
+                Some(6),
+                true,
+            ),
+        ],
+        &judgment,
+    );
+    let evaluation = evaluate(&declared, &rejected).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("independent acceptance failed")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .decision_draft("sample-task", "exp-1", "base-sha", "cand-sha", "acceptance")
+            .is_err(),
+        "an adverse result without measured arm totals is not fabricated into a decision record"
+    );
+
+    let incomplete = summarize(
+        &[
+            attempt(
+                "bi", "baseline", "case-i", 0.0, 100.0, true, None, None, true,
+            ),
+            attempt(
+                "ci",
+                "candidate",
+                "case-i",
+                200.0,
+                100.0,
+                true,
+                None,
+                None,
+                true,
+            ),
+        ],
+        &judgment,
+    );
+    let evaluation = evaluate(&declared, &incomplete).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation.reasons.iter().any(|reason| {
+            reason.contains("comparison evidence is incomplete")
+                || reason.contains("declared metric coverage is incomplete")
+        }),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn engineering_judgment_declaration_requires_a_recordable_reference_and_no_numeric_threshold() {
+    let mut empty = policy();
+    empty.basis = Basis::EngineeringJudgment {
+        basis: String::new(),
+    };
+    empty.meaningful_effect_percent = None;
+    assert!(
+        empty
+            .declare()
+            .unwrap_err()
+            .to_string()
+            .contains("single bounded reference token"),
+        "an empty judgment basis is refused"
+    );
+
+    let mut spaced = policy();
+    spaced.basis = Basis::EngineeringJudgment {
+        basis: "lead reason with spaces".into(),
+    };
+    spaced.meaningful_effect_percent = None;
+    assert!(
+        spaced
+            .declare()
+            .unwrap_err()
+            .to_string()
+            .contains("single bounded reference token"),
+        "free prose is not a recordable basis reference"
+    );
+
+    let mut long = policy();
+    long.basis = Basis::EngineeringJudgment {
+        basis: "a".repeat(161),
+    };
+    long.meaningful_effect_percent = None;
+    assert!(
+        long.declare()
+            .unwrap_err()
+            .to_string()
+            .contains("single bounded reference token"),
+        "an overlong basis reference is refused"
+    );
+
+    let mut numeric = policy();
+    numeric.basis = Basis::EngineeringJudgment {
+        basis: "reflection:lead-1".into(),
+    };
+    assert!(
+        numeric
+            .declare()
+            .unwrap_err()
+            .to_string()
+            .contains("does not declare a numeric savings threshold"),
+        "engineering judgment is not a numeric efficiency threshold"
+    );
+
+    let mut traded = policy();
+    traded.basis = Basis::EngineeringJudgment {
+        basis: "reflection:lead-1".into(),
+    };
+    traded.meaningful_effect_percent = None;
+    traded.trade_off = Some(TradeOff {
+        basis: "predeclared exchange".into(),
+        allowed_regression_percent: 10.0,
+    });
+    assert!(
+        traded
+            .declare()
+            .unwrap_err()
+            .to_string()
+            .contains("does not use a numeric trade-off"),
+        "engineering judgment judges actual cost rather than a numeric allowance"
+    );
+
+    let mut conjunctive = policy();
+    conjunctive.basis = Basis::EngineeringJudgment {
+        basis: "reflection:lead-1".into(),
+    };
+    conjunctive.meaningful_effect_percent = None;
+    conjunctive.conjunction = Some(ConjunctionPolicy {
+        require_quality_improvement: false,
+        minimum_time_reduction_percent: 5.0,
+        minimum_token_reduction_percent: 5.0,
+    });
+    assert!(
+        conjunctive
+            .declare()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot also declare a conjunctive numeric savings rule"),
+        "engineering judgment does not become a mandatory savings rule through a conjunction"
     );
 }
 

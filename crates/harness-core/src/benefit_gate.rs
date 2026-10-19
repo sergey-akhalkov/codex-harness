@@ -15,19 +15,23 @@
 //! contradictory or malformed ones - so a newer record is never silently
 //! skipped in favor of an older adoption. [`assess`] classifies the newest
 //! attributable record; [`default_allowed`] is true only for an adoption whose
-//! recorded comparison is complete, arithmetically consistent, within its
-//! declared tolerance and records a positive effect: an improved quality
-//! outcome or a reduced candidate time. A record that stays within tolerance
-//! only because quality is unchanged and the candidate is not faster - still
-//! slower, or exactly at baseline - is a consistent record, not a demonstrated
-//! improvement, so it cannot authorize a default.
+//! recorded comparison is complete and arithmetically consistent. An efficiency
+//! adoption additionally requires a positive effect: an improved quality outcome
+//! or a reduced candidate time. A record that stays within tolerance only because
+//! quality is unchanged and the candidate is not faster - still slower, or
+//! exactly at baseline - is a consistent record, not a demonstrated improvement.
+//! An explicit `engineering-judgment` record opts into a different, predeclared
+//! adoption basis: it keeps the measured time/token cost as actual cost (equal or
+//! slower included), requires its bounded basis reference and still refuses
+//! quality regression, missing bindings or decisive uncertainty.
 //!
 //! A `benefit-gate v2` decision binds the verdict to the experiment identity
 //! and its exact revisions, the acceptance evidence, measured metric coverage,
-//! the decision scope and the reason; a v2 record missing or contradicting any
-//! of those bindings is retained and reported but can never authorize an
-//! adoption. These checks validate what the record says; they are not
-//! independent execution and not proof of the underlying experiment.
+//! the decision scope, the reason and - for an opt-in engineering judgment - the
+//! predeclared basis reference; a v2 record missing or contradicting any of
+//! those bindings is retained and reported but can never authorize an adoption.
+//! These checks validate what the record says; they are not independent
+//! execution and not proof of the underlying experiment.
 
 use crate::board_cli::json_ok_actor;
 use crate::board_feedback;
@@ -40,6 +44,9 @@ pub const GATE_PREFIX_V2: &str = "benefit-gate v2";
 /// The actor recorded on native board comments written by this module.
 const ACTOR: &str = "hypothesis-loop";
 const MAX_DETAIL: usize = 512;
+/// The predeclared basis reference is a single `key=value` token, so it is
+/// bounded like the other evidence references rather than carrying prose.
+pub(crate) const MAX_BASIS_REFERENCE: usize = 160;
 
 /// Quality measured by the recorded comparison, independent of the timing
 /// verdict.
@@ -99,6 +106,42 @@ impl DecisionOutcome {
     }
 }
 
+/// The explicit adoption basis a decision draft records. An absent `basis`
+/// field on a v2 record keeps the historical efficiency reading. Only the
+/// engineering-judgment basis permits an adoption without a numeric savings
+/// effect; it retains the measured cost and requires the predeclared
+/// lasting-benefit reference. Legacy maintenance decisions keep the historical
+/// unmarked record shape and their strict numeric semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DecisionBasis {
+    #[default]
+    Efficiency,
+    Maintenance {
+        basis: String,
+    },
+    EngineeringJudgment {
+        basis: String,
+    },
+}
+
+impl DecisionBasis {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Efficiency => "efficiency",
+            Self::Maintenance { .. } => "maintenance",
+            Self::EngineeringJudgment { .. } => "engineering-judgment",
+        }
+    }
+
+    /// The predeclared reference recorded for a non-efficiency basis.
+    pub fn reference(&self) -> Option<&str> {
+        match self {
+            Self::Efficiency => None,
+            Self::Maintenance { basis } | Self::EngineeringJudgment { basis } => Some(basis),
+        }
+    }
+}
+
 /// One parsed `benefit-gate v1` board comment with every documented
 /// comparison field retained as recorded. A comment that names no `item`
 /// cannot be attributed to an item and is skipped; everything else is
@@ -134,6 +177,12 @@ pub struct GateRecord {
     pub scope: Option<String>,
     /// v2 binding: the recorded decision reason.
     pub reason: Option<String>,
+    /// v2 binding: the explicit adoption basis. `None` keeps the historical
+    /// efficiency reading for records written before this field existed.
+    pub basis: Option<String>,
+    /// v2 binding: the predeclared reference for a maintenance or
+    /// engineering-judgment basis.
+    pub basis_ref: Option<String>,
 }
 
 impl GateRecord {
@@ -141,6 +190,45 @@ impl GateRecord {
     pub fn quality_outcome(&self) -> Option<QualityOutcome> {
         QualityOutcome::parse(self.quality.as_deref()?)
     }
+
+    /// The recorded adoption basis. A record without the field keeps the
+    /// historical efficiency meaning; a non-efficiency kind without its
+    /// predeclared reference is incomplete and cannot read as a decision.
+    fn recorded_basis(&self) -> Result<RecordedBasis<'_>, Limitation> {
+        // The explicit basis field is a v2 binding. A v1 record keeps its
+        // historical efficiency reading even if a writer left a basis-looking
+        // field in it: an older record cannot become an engineering-judgment
+        // adoption by relabelling.
+        if self.version < 2 {
+            return Ok(RecordedBasis::Efficiency);
+        }
+        match self.basis.as_deref() {
+            None | Some("efficiency") => Ok(RecordedBasis::Efficiency),
+            Some("maintenance") => self
+                .basis_ref
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(RecordedBasis::Maintenance)
+                .ok_or(Limitation::BasisReference),
+            Some("engineering-judgment") => self
+                .basis_ref
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(RecordedBasis::EngineeringJudgment)
+                .ok_or(Limitation::BasisReference),
+            Some(_) => Err(Limitation::BasisUnrecognized),
+        }
+    }
+}
+
+/// The recognized basis of one retained record. Efficiency is the default so
+/// every record written before the explicit field existed keeps its strict
+/// numeric meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedBasis<'a> {
+    Efficiency,
+    Maintenance(&'a str),
+    EngineeringJudgment(&'a str),
 }
 
 /// How the newest attributable record for an item reads.
@@ -186,6 +274,10 @@ pub enum Limitation {
     CandidateArm,
     ArmsNotDistinct,
     Accounting,
+    BasisUnrecognized,
+    BasisReference,
+    BasisNotAdoptable,
+    BasisReinterpreted,
     ToleratedRegressionNotBenefit,
     NoPositiveEffect,
 }
@@ -222,6 +314,14 @@ impl Limitation {
             Self::CandidateArm => "candidate arm missing",
             Self::ArmsNotDistinct => "baseline and candidate arms are not distinct",
             Self::Accounting => "accounting basis missing",
+            Self::BasisUnrecognized => {
+                "adoption basis is not efficiency, maintenance or engineering-judgment"
+            }
+            Self::BasisReference => "recorded basis reference missing",
+            Self::BasisNotAdoptable => "maintenance basis cannot authorize an adoption",
+            Self::BasisReinterpreted => {
+                "an engineering-judgment adoption cannot reinterpret an earlier record for the same experiment"
+            }
             Self::ToleratedRegressionNotBenefit => {
                 "candidate slower within tolerance: nonregression is not a positive effect"
             }
@@ -276,6 +376,8 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
             let mut coverage = None;
             let mut scope = None;
             let mut reason = None;
+            let mut basis = None;
+            let mut basis_ref = None;
             for part in head.split_whitespace() {
                 let Some((key, value)) = part.split_once('=') else {
                     continue;
@@ -298,6 +400,8 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
                     "coverage" => coverage = Some(value.to_owned()),
                     "scope" => scope = Some(value.to_owned()),
                     "reason" => reason = Some(value.to_owned()),
+                    "basis" => basis = Some(value.to_owned()),
+                    "basis_ref" => basis_ref = Some(value.to_owned()),
                     _ => {}
                 }
             }
@@ -321,6 +425,8 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
                 coverage,
                 scope,
                 reason,
+                basis,
+                basis_ref,
             })
         })
         .collect()
@@ -329,9 +435,30 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
 /// The assessment of the newest record attributable to the item, or `None`
 /// when no retained record names it.
 pub fn assess<'a>(records: &'a [GateRecord], item: &str) -> Option<Assessment<'a>> {
-    let latest = records.iter().rfind(|record| record.item == item)?;
+    let latest_index = records.iter().rposition(|record| record.item == item)?;
+    let latest = &records[latest_index];
     let recorded = records.iter().filter(|record| record.item == item).count();
-    let (verdict, limitations) = classify(latest);
+    let (mut verdict, mut limitations) = classify(latest);
+    // An explicit engineering-judgment adoption is a new decision basis, not a
+    // reinterpretation of an already evaluated experiment. Any earlier record
+    // for the same experiment under a different or absent basis keeps its
+    // strict meaning, so the judgment cannot rewrite it. A repeated identical
+    // judgment record remains idempotent because its basis compares equal.
+    let latest_basis = latest.recorded_basis();
+    if verdict == Verdict::Consistent
+        && matches!(latest_basis, Ok(RecordedBasis::EngineeringJudgment(_)))
+    {
+        let reinterpreted = records.iter().enumerate().any(|(index, record)| {
+            index != latest_index
+                && record.item == item
+                && record.experiment == latest.experiment
+                && record.recorded_basis() != latest_basis
+        });
+        if reinterpreted {
+            verdict = Verdict::Unsupported;
+            limitations.push(Limitation::BasisReinterpreted);
+        }
+    }
     Some(Assessment {
         latest,
         recorded,
@@ -375,6 +502,13 @@ fn classify(record: &GateRecord) -> (Verdict, Vec<Limitation>) {
     } else {
         Vec::new()
     };
+    let basis = match record.recorded_basis() {
+        Ok(basis) => Some(basis),
+        Err(limitation) => {
+            limitations.push(limitation);
+            None
+        }
+    };
     if outcome != "adopt" {
         return if limitations.is_empty() {
             (Verdict::NonAdoption, limitations)
@@ -392,6 +526,14 @@ fn classify(record: &GateRecord) -> (Verdict, Vec<Limitation>) {
         } else {
             Limitation::QualityAbsent
         }),
+    }
+
+    // Only the explicit engineering-judgment basis may adopt equal or slower
+    // independently accepted evidence. A legacy maintained record that names
+    // the maintenance basis is retained but never reads as an adoption; the
+    // historical unmarked maintenance decision keeps its strict numeric shape.
+    if matches!(basis, Some(RecordedBasis::Maintenance(_))) {
+        limitations.push(Limitation::BasisNotAdoptable);
     }
 
     if record
@@ -425,7 +567,9 @@ fn classify(record: &GateRecord) -> (Verdict, Vec<Limitation>) {
         let computed = (candidate_seconds - baseline_seconds) / baseline_seconds * 100.0;
         if (computed - regression).abs() > ARITHMETIC_ALLOWANCE {
             limitations.push(Limitation::RegressionArithmetic);
-        } else if tolerance.is_some_and(|tolerance| computed > tolerance) {
+        } else if tolerance.is_some_and(|tolerance| computed > tolerance)
+            && !matches!(basis, Some(RecordedBasis::EngineeringJudgment(_)))
+        {
             limitations.push(Limitation::RegressionBeyondTolerance);
         }
     }
@@ -458,6 +602,7 @@ fn classify(record: &GateRecord) -> (Verdict, Vec<Limitation>) {
     // limitation already denies the record, so an unsupported record keeps its
     // primary reasons instead of collecting a redundant trailing phrase.
     if limitations.is_empty()
+        && !matches!(basis, Some(RecordedBasis::EngineeringJudgment(_)))
         && let (Some(baseline_seconds), Some(candidate_seconds), Some(_)) =
             (baseline_seconds, candidate_seconds, regression)
     {
@@ -529,6 +674,10 @@ pub struct DecisionDraft {
     pub experiment: String,
     pub outcome: DecisionOutcome,
     pub quality: QualityOutcome,
+    /// The explicit adoption basis. `Efficiency` and the legacy maintenance
+    /// view keep the historical unmarked record shape; only an engineering
+    /// judgment adds `basis`/`basis_ref` to the record.
+    pub basis: DecisionBasis,
     pub matched: u64,
     pub tolerance_percent: f64,
     pub baseline_seconds: f64,
@@ -609,6 +758,16 @@ impl DecisionDraft {
             self.baseline_seconds,
             self.candidate_seconds,
         );
+        if let DecisionBasis::EngineeringJudgment { basis } = &self.basis {
+            let basis_ref = require_token(
+                "engineering-judgment basis reference",
+                basis,
+                MAX_BASIS_REFERENCE,
+            )?;
+            text.push_str(&format!(
+                " basis=engineering-judgment basis_ref={basis_ref}"
+            ));
+        }
         if let Some(detail) = &self.detail {
             let detail = require_line("detail", detail, MAX_DETAIL)?;
             text.push_str(&format!(" detail={detail}"));
@@ -631,7 +790,12 @@ pub enum Publication {
 ///
 /// - The record must satisfy its own claimed outcome: an `adopt` whose
 ///   comparison is incomplete, contradictory or shows no positive effect is
-///   refused, and so is a `reject`/`inconclusive` missing its bindings.
+///   refused, and so is a `reject`/`inconclusive` missing its bindings. An
+///   explicit engineering-judgment adoption is exempt only from the positive
+///   numeric effect: it still needs complete, consistent evidence and its
+///   predeclared basis reference.
+/// - A new engineering-judgment record cannot reinterpret an earlier record
+///   for the same experiment that was decided on a different or absent basis.
 /// - The item must be an existing hypothesis card; the decision is never
 ///   inferred from an evaluator verdict and never written to another tracker.
 /// - Publication is idempotent: retrying the identical decision confirms the
@@ -674,6 +838,22 @@ pub fn publish_decision(
     let comments = board_feedback::list_comments(bd, project, &draft.item)?;
     if comments.iter().any(|comment| head_of(comment) == head) {
         return Ok(Publication::Confirmed { text });
+    }
+    if draft.outcome == DecisionOutcome::Adopt
+        && let DecisionBasis::EngineeringJudgment { basis } = &draft.basis
+    {
+        let existing = parse_gate_comments(&comments);
+        let reinterpreted = existing.iter().any(|record| {
+            record.item == draft.item
+                && record.experiment.as_deref() == Some(draft.experiment.as_str())
+                && record.recorded_basis().ok()
+                    != Some(RecordedBasis::EngineeringJudgment(basis.as_str()))
+        });
+        if reinterpreted {
+            return Err(board_hypothesis::invalid(
+                Limitation::BasisReinterpreted.as_str(),
+            ));
+        }
     }
     json_ok_actor(
         bd,
@@ -1254,6 +1434,248 @@ mod tests {
         text
     }
 
+    /// The same complete v2 record declared under the explicit engineering
+    /// judgment basis, with an actually slower candidate whose measured cost
+    /// is retained rather than treated as a savings claim.
+    fn judgment_v2(item: &str) -> String {
+        v2_variant(
+            item,
+            &[
+                (
+                    "outcome=adopt",
+                    "basis=engineering-judgment basis_ref=reflection:lead-1 outcome=adopt",
+                ),
+                ("candidate_seconds=99.0", "candidate_seconds=115.0"),
+                ("regression_percent=-1.0", "regression_percent=15.0"),
+            ],
+        )
+    }
+
+    #[test]
+    fn engineering_judgment_retains_cost_and_repeated_records_are_idempotent() {
+        let records = parse_gate_comments(&[judgment_v2("item-a")]);
+        let assessment = assess(&records, "item-a").expect("attributable");
+        assert_eq!(assessment.verdict, Verdict::Consistent);
+        assert!(
+            assessment.limitations.is_empty(),
+            "{:?}",
+            assessment.limitations
+        );
+        assert_eq!(
+            assessment.latest.basis.as_deref(),
+            Some("engineering-judgment")
+        );
+        assert_eq!(
+            assessment.latest.basis_ref.as_deref(),
+            Some("reflection:lead-1")
+        );
+        assert_eq!(
+            assessment.latest.candidate_seconds.as_deref(),
+            Some("115.0"),
+            "the measured added cost stays recorded"
+        );
+        assert!(default_allowed(&records, "item-a"));
+
+        let repeated = parse_gate_comments(&[judgment_v2("item-a"), judgment_v2("item-a")]);
+        let assessment = assess(&repeated, "item-a").expect("attributable");
+        assert_eq!(assessment.verdict, Verdict::Consistent);
+        assert!(
+            assessment.limitations.is_empty(),
+            "{:?}",
+            assessment.limitations
+        );
+        assert_eq!(assessment.recorded, 2);
+    }
+
+    #[test]
+    fn engineering_judgment_requires_its_reference_and_complete_evidence() {
+        let without_reference = v2_variant(
+            "item-a",
+            &[
+                ("outcome=adopt", "basis=engineering-judgment outcome=adopt"),
+                ("candidate_seconds=99.0", "candidate_seconds=115.0"),
+                ("regression_percent=-1.0", "regression_percent=15.0"),
+            ],
+        );
+        let records = parse_gate_comments(&[without_reference]);
+        assert!(
+            limitations_of(&records, "item-a").contains(&Limitation::BasisReference),
+            "{:?}",
+            limitations_of(&records, "item-a")
+        );
+
+        let unknown = v2_variant(
+            "item-a",
+            &[(
+                "outcome=adopt",
+                "basis=judgment basis_ref=reflection:lead-1 outcome=adopt",
+            )],
+        );
+        let records = parse_gate_comments(&[unknown]);
+        assert!(limitations_of(&records, "item-a").contains(&Limitation::BasisUnrecognized));
+
+        let maintenance = v2_variant(
+            "item-a",
+            &[(
+                "outcome=adopt",
+                "basis=maintenance basis_ref=legacy-user-agreement outcome=adopt",
+            )],
+        );
+        let records = parse_gate_comments(&[maintenance]);
+        assert!(limitations_of(&records, "item-a").contains(&Limitation::BasisNotAdoptable));
+
+        // The engineering-judgment basis waives only the positive numeric
+        // effect; quality remains a hard gate even when the added time is
+        // retained as judged actual cost.
+        let regressed = v2_variant(
+            &judgment_v2("item-a"),
+            &[("quality=unchanged", "quality=regressed")],
+        );
+        let records = parse_gate_comments(&[regressed]);
+        assert_eq!(
+            limitations_of(&records, "item-a"),
+            vec![Limitation::QualityRegressed],
+            "a quality regression is refused, not waived by judgement"
+        );
+
+        let unmeasurable = v2_variant(
+            &judgment_v2("item-a"),
+            &[("quality=unchanged", "quality=unmeasurable")],
+        );
+        let records = parse_gate_comments(&[unmeasurable]);
+        assert_eq!(
+            limitations_of(&records, "item-a"),
+            vec![Limitation::QualityUnmeasurable]
+        );
+
+        let unbound = v2_variant(&judgment_v2("item-a"), &[("acceptance=evidence-9 ", "")]);
+        let records = parse_gate_comments(&[unbound]);
+        assert!(limitations_of(&records, "item-a").contains(&Limitation::Acceptance));
+
+        let same_revision = v2_variant(
+            &judgment_v2("item-a"),
+            &[("revisions=base123..cand456", "revisions=base123..base123")],
+        );
+        let records = parse_gate_comments(&[same_revision]);
+        assert!(limitations_of(&records, "item-a").contains(&Limitation::RevisionsNotDistinct));
+    }
+
+    #[test]
+    fn basis_less_equal_or_slower_records_keep_strict_semantics() {
+        let equal = v2_variant(
+            "item-a",
+            &[
+                ("candidate_seconds=99.0", "candidate_seconds=100.0"),
+                ("regression_percent=-1.0", "regression_percent=0.0"),
+            ],
+        );
+        let records = parse_gate_comments(&[equal]);
+        assert_eq!(
+            limitations_of(&records, "item-a"),
+            vec![Limitation::NoPositiveEffect]
+        );
+
+        let slower = v2_variant(
+            "item-a",
+            &[
+                ("candidate_seconds=99.0", "candidate_seconds=104.0"),
+                ("regression_percent=-1.0", "regression_percent=4.0"),
+            ],
+        );
+        let records = parse_gate_comments(&[slower]);
+        assert_eq!(
+            limitations_of(&records, "item-a"),
+            vec![Limitation::ToleratedRegressionNotBenefit]
+        );
+    }
+
+    #[test]
+    fn engineering_judgment_cannot_reinterpret_an_earlier_strict_experiment() {
+        let strict = v2_comment("item-a");
+        let judgment = judgment_v2("item-a");
+        let records = parse_gate_comments(&[strict, judgment.clone()]);
+        let assessment = assess(&records, "item-a").expect("attributable");
+        assert_eq!(assessment.verdict, Verdict::Unsupported);
+        assert_eq!(assessment.limitations, vec![Limitation::BasisReinterpreted]);
+        assert!(!default_allowed(&records, "item-a"));
+
+        // A judgment under a different predeclared reference is also a
+        // different basis, not a continuation of the first judgment.
+        let other_reference = v2_variant(
+            &judgment,
+            &[("basis_ref=reflection:lead-1", "basis_ref=reflection:lead-2")],
+        );
+        let records = parse_gate_comments(&[judgment, other_reference]);
+        let assessment = assess(&records, "item-a").expect("attributable");
+        assert_eq!(assessment.verdict, Verdict::Unsupported);
+        assert_eq!(assessment.limitations, vec![Limitation::BasisReinterpreted]);
+    }
+
+    #[test]
+    fn judgment_decisions_round_trip_with_their_declared_basis() {
+        let mut draft = publication();
+        draft.basis = DecisionBasis::EngineeringJudgment {
+            basis: "reflection:lead-1".to_owned(),
+        };
+        draft.candidate_seconds = 115.0;
+        let text = draft.record().expect("complete judgment decision");
+        assert!(
+            text.contains("basis=engineering-judgment basis_ref=reflection:lead-1"),
+            "{text}"
+        );
+        let records = parse_gate_comments(std::slice::from_ref(&text));
+        let assessment = assess(&records, "codex-harness-pvr.5").expect("attributable");
+        assert_eq!(assessment.verdict, Verdict::Consistent);
+        assert!(
+            assessment.limitations.is_empty(),
+            "{:?}",
+            assessment.limitations
+        );
+        assert_eq!(
+            assessment.latest.basis.as_deref(),
+            Some("engineering-judgment")
+        );
+        assert_eq!(
+            assessment.latest.basis_ref.as_deref(),
+            Some("reflection:lead-1")
+        );
+
+        let mut prose = draft.clone();
+        prose.basis = DecisionBasis::EngineeringJudgment {
+            basis: "lead reason with spaces".to_owned(),
+        };
+        assert!(
+            prose
+                .record()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported characters"),
+            "an unrecordable basis is refused instead of sanitized"
+        );
+
+        let mut empty = draft;
+        empty.basis = DecisionBasis::EngineeringJudgment {
+            basis: String::new(),
+        };
+        assert!(empty.record().unwrap_err().to_string().contains("required"));
+
+        // The legacy maintenance view keeps the historical unmarked record
+        // shape and its strict numeric reading.
+        let mut maintenance = publication();
+        maintenance.basis = DecisionBasis::Maintenance {
+            basis: "legacy-user-agreement".to_owned(),
+        };
+        let text = maintenance.record().expect("legacy numeric decision");
+        assert!(!text.contains("basis="), "{text}");
+        let records = parse_gate_comments(std::slice::from_ref(&text));
+        assert_eq!(
+            assess(&records, "codex-harness-pvr.5")
+                .expect("attributable")
+                .verdict,
+            Verdict::Consistent
+        );
+    }
+
     #[test]
     fn v2_bindings_are_required_before_any_decision_reads_as_complete() {
         let complete = parse_gate_comments(&[v2_comment("item-a")]);
@@ -1349,6 +1771,7 @@ mod tests {
             experiment: "exp-1".to_owned(),
             outcome: DecisionOutcome::Adopt,
             quality: QualityOutcome::Unchanged,
+            basis: DecisionBasis::Efficiency,
             matched: 2,
             tolerance_percent: 10.0,
             baseline_seconds: 100.0,

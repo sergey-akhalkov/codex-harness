@@ -14,6 +14,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const JUDGMENT_REASON: &str = "lasting-benefit:lower-future-review-burden";
+const JUDGMENT_ACCOUNTING: &str = "check+coordination+rework";
+
 fn manager() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
 }
@@ -2377,6 +2380,43 @@ fn decision_arguments(
     args
 }
 
+/// Publishes the same evidence-bound adoption under the explicit
+/// engineering-judgment basis. The candidate is slower than the baseline:
+/// the measured added cost must stay in the record rather than being hidden
+/// behind a fabricated saving.
+fn judgment_decision(
+    board: &Board,
+    item: &str,
+    experiment: &str,
+    basis_ref: Option<&str>,
+) -> std::process::Output {
+    let mut args = decision_arguments(item, experiment, "adopt", "unchanged", "115", false, None);
+    let reason = args
+        .iter()
+        .position(|value| value == "--reason")
+        .expect("--reason is part of every decision");
+    args[reason + 1] = JUDGMENT_REASON.to_owned();
+    let accounting = args
+        .iter()
+        .position(|value| value == "--accounting")
+        .expect("--accounting is part of every decision");
+    args[accounting + 1] = JUDGMENT_ACCOUNTING.to_owned();
+    let detail = args
+        .iter()
+        .position(|value| value == "--detail")
+        .expect("--detail is part of every decision");
+    args[detail + 1] =
+        "lead judged retained added cost against lower future review burden".to_owned();
+    args.push("--basis".to_owned());
+    args.push("engineering-judgment".to_owned());
+    if let Some(reference) = basis_ref {
+        args.push("--basis-ref".to_owned());
+        args.push(reference.to_owned());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    board.feedback(&args)
+}
+
 /// Records one scoped user removal decision through the real entry point.
 fn removal_decision(
     board: &Board,
@@ -2720,6 +2760,229 @@ fn hypothesis_decision_publication_is_idempotent_and_evidence_bound() {
         board.comment_texts(&h).len(),
         before + 1,
         "refused publications write nothing"
+    );
+    assert_no_votes(&board, &h);
+    board.drop();
+}
+
+#[test]
+fn engineering_judgment_publication_retains_cost_and_refuses_relabelling() {
+    let board = Board::new("judgment-decision");
+    let h = admit(&board, "m-judgment", "c-synthetic", "basis-1");
+    let before = board.comment_texts(&h).len();
+
+    let published = judgment_decision(
+        &board,
+        &h,
+        "exp-judgment",
+        Some("reflection:lead-judgment-1"),
+    );
+    let text = output_text(&published);
+    assert!(published.status.success(), "{text}");
+    assert!(text.contains("outcome=adopt publication=written"), "{text}");
+    assert_eq!(board.comment_texts(&h).len(), before + 1);
+    let decision_comment = board
+        .comment_texts(&h)
+        .into_iter()
+        .find(|comment| comment.starts_with("benefit-gate v2"))
+        .expect("the published judgment decision");
+    assert!(
+        decision_comment
+            .contains("basis=engineering-judgment basis_ref=reflection:lead-judgment-1"),
+        "{decision_comment}"
+    );
+    assert!(
+        decision_comment.contains(
+            "baseline_seconds=100.000 candidate_seconds=115.000 regression_percent=15.000"
+        ),
+        "the observed added cost stays recorded: {decision_comment}"
+    );
+    assert!(
+        decision_comment.contains(&format!(
+            "reason={JUDGMENT_REASON} outcome=adopt quality=unchanged"
+        )),
+        "the scoped lasting-benefit reason stays recorded: {decision_comment}"
+    );
+    assert!(
+        decision_comment.contains(&format!("accounting={JUDGMENT_ACCOUNTING}")),
+        "the full-cost accounting stays recorded: {decision_comment}"
+    );
+    assert!(
+        decision_comment
+            .contains("detail=lead judged retained added cost against lower future review burden"),
+        "the lead's bounded cost/benefit judgment stays recorded: {decision_comment}"
+    );
+
+    let ledger = board.feedback(&["ledger", "--item", &h]);
+    let text = output_text(&ledger);
+    assert!(ledger.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "supported=yes (recorded engineering-judgment adoption retains measured cost and its declared basis) default=adopted"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {h}: binding: experiment=exp-judgment revisions=base001..cand002 acceptance=evidence-9 coverage=time+rounds scope=task:synthetic reason={JUDGMENT_REASON} basis=engineering-judgment basis_ref=reflection:lead-judgment-1"
+        )),
+        "{text}"
+    );
+
+    // A retried publication confirms the identical record without a second
+    // comment or a second experiment count.
+    let retry = judgment_decision(
+        &board,
+        &h,
+        "exp-judgment",
+        Some("reflection:lead-judgment-1"),
+    );
+    let text = output_text(&retry);
+    assert!(retry.status.success(), "{text}");
+    assert!(text.contains("publication=already-recorded"), "{text}");
+    assert_eq!(board.comment_texts(&h).len(), before + 1);
+
+    // The judgment basis needs its predeclared reference, and the reference
+    // is only meaningful with the judgment basis.
+    let missing_reference = judgment_decision(&board, &h, "exp-missing-ref", None);
+    let text = output_text(&missing_reference);
+    assert!(!missing_reference.status.success(), "{text}");
+    assert!(text.contains("requires --basis-ref"), "{text}");
+
+    let mut inert_args = decision_arguments(
+        &h,
+        "exp-inert-basis",
+        "adopt",
+        "unchanged",
+        "96",
+        false,
+        None,
+    );
+    inert_args.push("--basis-ref".to_owned());
+    inert_args.push("reflection:lead-judgment-1".to_owned());
+    let args: Vec<&str> = inert_args.iter().map(String::as_str).collect();
+    let inert = board.feedback(&args);
+    let text = output_text(&inert);
+    assert!(!inert.status.success(), "{text}");
+    assert!(
+        text.contains("--basis-ref requires --basis engineering-judgment"),
+        "{text}"
+    );
+
+    // The legacy maintenance basis stays a policy-level strict meaning, not a
+    // public override of an adoption.
+    let mut legacy_args = decision_arguments(
+        &h,
+        "exp-legacy-basis",
+        "adopt",
+        "unchanged",
+        "96",
+        false,
+        None,
+    );
+    legacy_args.push("--basis".to_owned());
+    legacy_args.push("maintenance".to_owned());
+    let args: Vec<&str> = legacy_args.iter().map(String::as_str).collect();
+    let legacy = board.feedback(&args);
+    let text = output_text(&legacy);
+    assert!(!legacy.status.success(), "{text}");
+    assert!(text.contains("not an opt-in adoption basis"), "{text}");
+
+    let mut unknown_basis = decision_arguments(
+        &h,
+        "exp-unknown-basis",
+        "adopt",
+        "unchanged",
+        "96",
+        false,
+        None,
+    );
+    unknown_basis.push("--basis".to_owned());
+    unknown_basis.push("judgment".to_owned());
+    let args: Vec<&str> = unknown_basis.iter().map(String::as_str).collect();
+    let unknown = board.feedback(&args);
+    let text = output_text(&unknown);
+    assert!(!unknown.status.success(), "{text}");
+    assert!(
+        text.contains("--basis is efficiency or engineering-judgment"),
+        "{text}"
+    );
+
+    let invalid_reference = judgment_decision(&board, &h, "exp-invalid-ref", Some("lead reason"));
+    let text = output_text(&invalid_reference);
+    assert!(!invalid_reference.status.success(), "{text}");
+    assert!(text.contains("unsupported characters"), "{text}");
+
+    // Quality regression and critical defects are never waived by judgment.
+    let mut regressed_args = decision_arguments(
+        &h,
+        "exp-quality-regression",
+        "adopt",
+        "regressed",
+        "115",
+        false,
+        None,
+    );
+    regressed_args.push("--basis".to_owned());
+    regressed_args.push("engineering-judgment".to_owned());
+    regressed_args.push("--basis-ref".to_owned());
+    regressed_args.push("reflection:lead-judgment-1".to_owned());
+    let args: Vec<&str> = regressed_args.iter().map(String::as_str).collect();
+    let regressed = board.feedback(&args);
+    let text = output_text(&regressed);
+    assert!(!regressed.status.success(), "{text}");
+    assert!(text.contains("quality regressed"), "{text}");
+
+    // Basis-less equal or slower evidence keeps the strict no-adoption
+    // reading; judgment is an explicit declaration, never a fallback.
+    let basis_less = decision(
+        &board,
+        &h,
+        "exp-strict-slower",
+        "adopt",
+        "unchanged",
+        "115",
+        false,
+        None,
+    );
+    let text = output_text(&basis_less);
+    assert!(!basis_less.status.success(), "{text}");
+    assert!(
+        text.contains("candidate slower within tolerance")
+            || text.contains("is not supported by its own comparison"),
+        "{text}"
+    );
+
+    // An experiment already decided on the strict basis cannot be
+    // reinterpreted as an engineering-judgment adoption.
+    let strict = decision(
+        &board,
+        &h,
+        "exp-reinterpret",
+        "adopt",
+        "unchanged",
+        "96",
+        false,
+        None,
+    );
+    assert!(strict.status.success(), "{}", output_text(&strict));
+    let reinterpret = judgment_decision(
+        &board,
+        &h,
+        "exp-reinterpret",
+        Some("reflection:lead-judgment-2"),
+    );
+    let text = output_text(&reinterpret);
+    assert!(!reinterpret.status.success(), "{text}");
+    assert!(
+        text.contains("cannot reinterpret an earlier record"),
+        "{text}"
+    );
+
+    assert_eq!(
+        board.comment_texts(&h).len(),
+        before + 2,
+        "only the judgment decision and the strict decision were written"
     );
     assert_no_votes(&board, &h);
     board.drop();

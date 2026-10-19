@@ -68,7 +68,7 @@
 //! observed difference that exists only in the excluded external waiting is
 //! neither a measured gain nor a measured regression.
 
-use crate::benefit_gate::{DecisionDraft, DecisionOutcome, QualityOutcome};
+use crate::benefit_gate::{DecisionBasis, DecisionDraft, DecisionOutcome, QualityOutcome};
 use crate::outcome_report::{
     CORROBORATION_SCHEMA, CorroborationSection, CorroborationState, corroboration_digest,
 };
@@ -1472,11 +1472,15 @@ impl Objective {
 /// What a comparison result may claim. The default efficiency policy requires
 /// a meaningful measured effect; a maintenance-only claim needs its own
 /// predeclared, prior-agreed basis and never becomes an efficiency result.
+/// An engineering-judgment claim is a separate explicit opt-in: it requires
+/// no numeric savings, keeps the measured cost, and leaves the lasting-benefit
+/// judgment to the lead's recorded reason.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum Basis {
     Efficiency,
     Maintenance { basis: String },
+    EngineeringJudgment { basis: String },
 }
 
 impl Basis {
@@ -1484,6 +1488,7 @@ impl Basis {
         match self {
             Self::Efficiency => "efficiency",
             Self::Maintenance { .. } => "maintenance",
+            Self::EngineeringJudgment { .. } => "engineering-judgment",
         }
     }
 
@@ -1491,6 +1496,17 @@ impl Basis {
         match self {
             Self::Efficiency => None,
             Self::Maintenance { basis } => Some(basis),
+            Self::EngineeringJudgment { .. } => None,
+        }
+    }
+
+    /// The predeclared engineering-judgment basis reference, when the policy
+    /// explicitly chooses that basis. `None` keeps the strict efficiency and
+    /// maintenance meanings for every serialized policy that predates it.
+    pub fn engineering_judgment_basis(&self) -> Option<&str> {
+        match self {
+            Self::EngineeringJudgment { basis } => Some(basis),
+            _ => None,
         }
     }
 
@@ -1502,6 +1518,22 @@ impl Basis {
         match self {
             Self::Efficiency => "efficiency".to_owned(),
             Self::Maintenance { basis } => format!("maintenance: {basis}"),
+            Self::EngineeringJudgment { basis } => format!("engineering-judgment: {basis}"),
+        }
+    }
+
+    /// The decision-owner view of the same declaration. Efficiency keeps the
+    /// historical unmarked record shape; the other bases stay distinguishable
+    /// so a strict result is never relabelled after the fact.
+    pub fn decision_basis(&self) -> DecisionBasis {
+        match self {
+            Self::Efficiency => DecisionBasis::Efficiency,
+            Self::Maintenance { basis } => DecisionBasis::Maintenance {
+                basis: basis.clone(),
+            },
+            Self::EngineeringJudgment { basis } => DecisionBasis::EngineeringJudgment {
+                basis: basis.clone(),
+            },
         }
     }
 }
@@ -1636,9 +1668,9 @@ impl ComparisonPolicy {
     pub fn declaration(&self) -> Value {
         let declared_effect = match self.objective {
             Objective::Quality => self.meaningful_effect_percent,
-            // A maintenance basis declares no efficiency threshold; the
-            // accounting still needs an explicit zero so its evidence remains
-            // complete rather than ambiguous.
+            // Maintenance and engineering-judgment bases declare no
+            // efficiency threshold; the accounting still needs an explicit
+            // zero so its evidence remains complete rather than ambiguous.
             _ => Some(self.meaningful_effect_percent.unwrap_or(0.0)),
         };
         let mut value = json!({
@@ -1712,6 +1744,39 @@ impl ComparisonPolicy {
                     ));
                 }
             }
+            Basis::EngineeringJudgment { basis } => {
+                // The basis is recorded verbatim as a board reference, so it
+                // must be a single bounded token rather than prose: an
+                // unrecordable declaration is refused here instead of being
+                // sanitized into a different reference later.
+                let reference_recordable = basis.trim() == basis
+                    && crate::board_hypothesis::require_token(
+                        "engineering-judgment basis reference",
+                        basis,
+                        crate::benefit_gate::MAX_BASIS_REFERENCE,
+                    )
+                    .is_ok();
+                if !reference_recordable {
+                    return Err(invalid(
+                        "an engineering-judgment basis must be a single bounded reference token naming the predeclared lasting-benefit judgment, before results",
+                    ));
+                }
+                if self.meaningful_effect_percent.is_some() {
+                    return Err(invalid(
+                        "an engineering-judgment basis does not declare a numeric savings threshold; use the efficiency basis for a measured effect",
+                    ));
+                }
+                if self.trade_off.is_some() {
+                    return Err(invalid(
+                        "an engineering-judgment basis judges the retained actual cost; it does not use a numeric trade-off allowance",
+                    ));
+                }
+                if self.conjunction.is_some() {
+                    return Err(invalid(
+                        "an engineering-judgment basis cannot also declare a conjunctive numeric savings rule; choose one adoption basis",
+                    ));
+                }
+            }
         }
         if let Some(effect) = self.meaningful_effect_percent
             && (!effect.is_finite() || effect < 0.0)
@@ -1767,9 +1832,9 @@ impl ComparisonPolicy {
                     "a conjunction comparison decides the quality objective; its time and token margins are additional required members over the same observed unit set",
                 ));
             }
-            if self.basis.maintenance_basis().is_some() {
+            if !matches!(&self.basis, Basis::Efficiency) {
                 return Err(invalid(
-                    "a conjunction comparison requires the efficiency basis; a maintenance declaration cannot carry required savings margins",
+                    "a conjunction comparison requires the efficiency basis; another basis cannot carry required savings margins",
                 ));
             }
             // An explicit `false` is the noninferiority mode. The field stays
@@ -3008,7 +3073,7 @@ fn conjunction_observation(
             }
             match declared.get("basis").and_then(Value::as_str) {
                 Some(basis) if basis == policy.basis.declaration_text() => {}
-                None if policy.basis.maintenance_basis().is_none() => {}
+                None if matches!(&policy.basis, Basis::Efficiency) => {}
                 _ => drift.push(format!(
                     "unit {unit}: the recorded basis is missing or differs from the predeclared {} basis",
                     policy.basis.as_str()
@@ -3265,13 +3330,14 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             (None, None) => {}
             _ => drift.push(format!("unit {name}: declared meaningful effect differs")),
         }
-        // A maintenance-only result is adopted only under the basis recorded
-        // before results. Evidence recorded without it (or with another
-        // basis) cannot become a post-hoc maintenance exemption; evidence
-        // from before this field existed keeps the default efficiency reading.
+        // A maintenance-only or engineering-judgment result is adopted only
+        // under the basis recorded before results. Evidence recorded without
+        // it (or with another basis) cannot become a post-hoc exemption;
+        // evidence from before this field existed keeps the default
+        // efficiency reading.
         match declared_value.get("basis").and_then(Value::as_str) {
             Some(basis) if basis == policy.basis.declaration_text() => {}
-            None if policy.basis.maintenance_basis().is_none() => {}
+            None if matches!(&policy.basis, Basis::Efficiency) => {}
             _ => drift.push(format!(
                 "unit {name}: the recorded basis is missing or differs from the predeclared {} basis",
                 policy.basis.as_str()
@@ -3844,6 +3910,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
 
     let mut corroboration: Option<CorroborationSection> = None;
     let mut attribution: Option<AttributionEvidence> = None;
+    let judgment = policy.basis.engineering_judgment_basis().map(str::to_owned);
     // Set only when the recorded effect below the declared threshold decides
     // the rejection. A queue-only difference may explain that rejection, so
     // the infrastructure gate revisits it; acceptance, trade-off and
@@ -3923,6 +3990,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 !subtractive.retained_checks
                     || subtractive.applicability != "exercised"
                     || (!subtractive.repayment
+                        && judgment.is_none()
                         && policy.basis.maintenance_basis().is_none()
                         && policy.objective != Objective::Quality)
             })
@@ -3976,6 +4044,78 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             ));
         } else if let Some(conjunction) = &policy.conjunction {
             decision = conjunction_verdict(policy, conjunction, &facts, &mut reasons);
+        } else if let Some(judgment_basis) = judgment.as_deref() {
+            // The engineering-judgment basis is an explicit, predeclared
+            // opt-in. It replaces the numeric savings threshold and the
+            // per-dimension trade-off exchange; the acceptance, quality,
+            // evidence-completeness and coverage gates above still apply.
+            // Measured time and token values are retained exactly as
+            // recorded, and the lead's recorded reason judges that cost
+            // against the declared lasting benefit.
+            let consumed = consume_corroboration(policy, report, facts.len(), &mut reasons)?;
+            let sufficient_units = facts.len() >= required_units || consumed.supports;
+            corroboration = consumed.evidence;
+            if !sufficient_units {
+                // consume_corroboration recorded the exact reasons.
+            } else if facts.len() < required_units {
+                reasons.push(format!(
+                    "the declared engineering-judgment scope needs {required_units} measured independent unit(s), but only {} measured unit(s) are recorded while the remainder is selected corroboration; the adoption stays inconclusive for the broader scope",
+                    facts.len()
+                ));
+            } else if let (Some(baseline_total), Some(candidate_total)) =
+                (baseline_seconds, candidate_seconds)
+            {
+                let regression = (candidate_total - baseline_total) / baseline_total * 100.0;
+                // The acceptance and quality gates above already refuse a
+                // regressed or unmeasurable outcome, so only a preserved or
+                // improved quality can reach this judgement.
+                let quality_text = if quality == Quality::Improved {
+                    "improved"
+                } else {
+                    "unchanged"
+                };
+                reasons.push(format!(
+                    "adopted under the predeclared engineering-judgment basis: {judgment_basis}; measured total time {baseline_total:.3}s -> {candidate_total:.3}s ({regression:+.3}%), retained as actual cost and judged rather than treated as a measured savings claim"
+                ));
+                reasons.push(format!(
+                    "the recorded {} matched unit(s) are independently accepted on both arms; this adoption rests on the declared engineering judgment rather than a numeric saving, and quality is {quality_text} with no acceptance regression",
+                    facts.len()
+                ));
+                reasons.push(format!(
+                    "declared full cost includes implementation {:.3}s, evaluation {:.3}s and maintenance {:.3}s/task over the declared {:.1}-task horizon; the lead's recorded reason judges that cost against the lasting benefit",
+                    policy.overhead.implementation_seconds,
+                    policy.overhead.evaluation_seconds,
+                    policy.overhead.maintenance_seconds_per_task,
+                    policy.horizon_tasks
+                ));
+                if facts.iter().all(|fact| fact.usage_measured) {
+                    let worst_tokens = facts
+                        .iter()
+                        .filter_map(|fact| fact.token_regression)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if worst_tokens.is_finite() {
+                        reasons.push(format!(
+                            "recorded native token usage is retained (worst measured change {worst_tokens:+.3}%); the judgment does not assert a token saving"
+                        ));
+                    } else {
+                        reasons.push(
+                            "native token usage is measured but carries no per-unit change; no token saving is asserted"
+                                .to_owned(),
+                        );
+                    }
+                } else {
+                    reasons.push(
+                        "native token usage is not fully measured and remains unknown; no token saving is asserted"
+                            .to_owned(),
+                    );
+                }
+                decision = PolicyDecision::Adopt;
+            } else {
+                reasons.push(
+                    "the engineering-judgment adoption lacks matched total arm seconds; the measured cost cannot be retained"
+                        .to_owned(),
+                );
+            }
         } else if policy.objective == Objective::Time && worst_time > policy.tolerance_percent {
             // A favourable subset never offsets a materially regressed primary
             // metric in the same declared task mix; the aggregate claim would
@@ -5245,6 +5385,19 @@ impl PolicyEvaluation {
                 "a maintenance-basis adoption is not an efficiency benefit decision; record the predeclared basis through the decision owner",
             ));
         }
+        if let Basis::EngineeringJudgment { basis } = &self.basis
+            && (basis.trim() != basis
+                || crate::board_hypothesis::require_token(
+                    "engineering-judgment basis reference",
+                    basis,
+                    crate::benefit_gate::MAX_BASIS_REFERENCE,
+                )
+                .is_err())
+        {
+            return Err(invalid(
+                "the engineering-judgment basis is not a recordable board reference; redeclare it as a single bounded token",
+            ));
+        }
         let reason_text = self.reason_text();
         let record_token = token_text(&reason_text, 160);
         let detail = (!reason_text.is_empty()
@@ -5256,6 +5409,7 @@ impl PolicyEvaluation {
             experiment: experiment.to_owned(),
             outcome: self.decision.gate(),
             quality: self.quality.gate(),
+            basis: self.basis.decision_basis(),
             matched: self.matched,
             tolerance_percent: self.tolerance_percent,
             baseline_seconds,

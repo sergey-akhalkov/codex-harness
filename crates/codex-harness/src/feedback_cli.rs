@@ -486,7 +486,11 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
             let (supported, phrase, status) = match assessment.verdict {
                 benefit_gate::Verdict::Consistent => (
                     "yes",
-                    "recorded comparison consistent within its declared tolerance",
+                    if latest.basis.as_deref() == Some("engineering-judgment") {
+                        "recorded engineering-judgment adoption retains measured cost and its declared basis"
+                    } else {
+                        "recorded comparison consistent within its declared tolerance"
+                    },
                     "adopted",
                 ),
                 benefit_gate::Verdict::Unsupported => (
@@ -553,6 +557,8 @@ fn binding_text(record: &benefit_gate::GateRecord) -> String {
         ("coverage", record.coverage.as_deref()),
         ("scope", record.scope.as_deref()),
         ("reason", record.reason.as_deref()),
+        ("basis", record.basis.as_deref()),
+        ("basis_ref", record.basis_ref.as_deref()),
     ]
     .into_iter()
     .filter_map(|(name, value)| {
@@ -1087,6 +1093,8 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         "--experiment",
         "--outcome",
         "--quality",
+        "--basis",
+        "--basis-ref",
         "--matched",
         "--tolerance-percent",
         "--baseline-seconds",
@@ -1109,6 +1117,34 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         .ok_or_else(|| invalid("--outcome is adopt, reject or inconclusive"))?;
     let quality = benefit_gate::QualityOutcome::parse(options.required("--quality")?)
         .ok_or_else(|| invalid("--quality is unchanged, improved, regressed or unmeasurable"))?;
+    let basis = match options.get("--basis").unwrap_or("efficiency") {
+        "efficiency" => {
+            if options.get("--basis-ref").is_some() {
+                return Err(invalid("--basis-ref requires --basis engineering-judgment"));
+            }
+            benefit_gate::DecisionBasis::Efficiency
+        }
+        "engineering-judgment" => {
+            let reference = options.get("--basis-ref").ok_or_else(|| {
+                invalid(
+                    "--basis engineering-judgment requires --basis-ref with the predeclared lasting-benefit reference",
+                )
+            })?;
+            benefit_gate::DecisionBasis::EngineeringJudgment {
+                basis: reference.to_owned(),
+            }
+        }
+        "maintenance" => {
+            return Err(invalid(
+                "--basis maintenance is not an opt-in adoption basis; use --basis engineering-judgment with --basis-ref",
+            ));
+        }
+        other => {
+            return Err(invalid(&format!(
+                "--basis is efficiency or engineering-judgment, not {other}"
+            )));
+        }
+    };
     let close = match options.get("--close") {
         None | Some("no") => false,
         Some("yes") => true,
@@ -1119,6 +1155,7 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         experiment: options.required("--experiment")?.to_owned(),
         outcome,
         quality,
+        basis,
         matched: count("--matched", options.required("--matched")?)?,
         tolerance_percent: number(
             "--tolerance-percent",

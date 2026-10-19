@@ -8,7 +8,7 @@
 //! ambient account state, model call or live installation is touched.
 
 use harness_core::benefit_gate::{
-    DecisionDraft, DecisionOutcome, Publication, QualityOutcome, publish_decision,
+    DecisionBasis, DecisionDraft, DecisionOutcome, Publication, QualityOutcome, publish_decision,
 };
 use harness_core::board_feedback;
 use harness_core::board_hypothesis::{
@@ -1116,6 +1116,7 @@ fn publication_is_idempotent_and_a_newer_conflicting_decision_blocks_integration
         experiment: scenario.experiment.clone(),
         outcome: DecisionOutcome::Adopt,
         quality: QualityOutcome::Unchanged,
+        basis: DecisionBasis::Efficiency,
         matched: 1,
         tolerance_percent: 5.0,
         baseline_seconds: 100.0,
