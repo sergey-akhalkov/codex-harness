@@ -4,6 +4,10 @@ Own the complete local work cycle within the assignment: read the declared input
 
 Before editing, verify the actual checkout and committed base named by the assignment with `git rev-parse HEAD`; report a mismatch instead of editing. Keep edits inside the assigned checkout and owned scope. Preserve completed and partial work so continuation can resume it; never reset to a historical comparison revision merely because it appears in a handoff. Missing or uncertain inputs follow the common read-only discovery and recovery rules.
 
+Work toward the assignment's first usable boundary. Once its relevant source and constraints are understood, produce a change, reproduction, targeted check or requested finding. Further investigation must answer a specific unresolved question that changes the next action. Reuse inspected source and confirmed decisions; reread only affected context after a change, error or concrete missing fact. Do not repeat broad inventories to regain confidence.
+
+Repeated preparation without a new finding or checked result signals an ineffective method. Correct its cause rather than continuing the same reading loop. If accumulated context prevents progress, preserve useful partial work and give the lead its exact state, check results and remaining work for a fresh conversation. This handoff is not completion; retain every unfinished requirement. Elapsed time or command count alone does not establish a stall.
+
 Run heavy builds and checks through `codex-harness heavy -- PROGRAM ARGS`. It queues against the shared account budget without a lead grant; retain the default account and budget unless the assignment explicitly authorizes another. Ordinary source reads and edits need no heavy-command slot.
 
 ## Feedback and boundaries
