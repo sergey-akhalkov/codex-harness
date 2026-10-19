@@ -8,7 +8,11 @@ use improvement_comparison_common::*;
 
 use harness_core::build_identity;
 use serde_json::{Value, json};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// One successful model-free measured pair through the ordinary control-backed
 /// dispatch route: real visible dispatch, native frontend attachment, the
@@ -246,6 +250,27 @@ fn baseline_qualification_refuses_incomplete_action_coverage() {
         true,
         Some(SemanticReviewCase::Accept),
         ActionCapture::ExecutorDetailRemoved,
+        RetainedOracleCase::Ordinary,
+    );
+}
+
+#[test]
+fn baseline_unstarted_oracle_is_incomplete_and_retries_once() {
+    baseline_workflow_case_with(
+        true,
+        None,
+        ActionCapture::Complete,
+        RetainedOracleCase::HeldUnstarted,
+    );
+}
+
+#[test]
+fn baseline_legacy_false_row_is_preserved_and_recovered() {
+    baseline_workflow_case_with(
+        true,
+        None,
+        ActionCapture::Complete,
+        RetainedOracleCase::LegacyFalseRow,
     );
 }
 
@@ -263,6 +288,13 @@ enum ActionCapture {
     ExecutorDetailRemoved,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedOracleCase {
+    Ordinary,
+    HeldUnstarted,
+    LegacyFalseRow,
+}
+
 fn baseline_workflow_case(
     independent_acceptance_passes: bool,
     review_case: Option<SemanticReviewCase>,
@@ -271,6 +303,7 @@ fn baseline_workflow_case(
         independent_acceptance_passes,
         review_case,
         ActionCapture::Complete,
+        RetainedOracleCase::Ordinary,
     );
 }
 
@@ -278,9 +311,18 @@ fn baseline_workflow_case_with(
     independent_acceptance_passes: bool,
     review_case: Option<SemanticReviewCase>,
     action_capture: ActionCapture,
+    retained_oracle_case: RetainedOracleCase,
 ) {
     let _serial = INSTALL.lock().unwrap();
-    let fixture = Fixture::new("qualification-native-frame");
+    let mut fixture = Fixture::new("qualification-native-frame");
+    if retained_oracle_case == RetainedOracleCase::HeldUnstarted {
+        let mut request: Value =
+            serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+        request["timeout_seconds"] = json!(5);
+        let bytes = serde_json::to_vec(&request).unwrap();
+        fs::write(&fixture.request, &bytes).unwrap();
+        fixture.request_sha256 = build_identity::hash_bytes(&bytes);
+    }
     let launcher = std::path::PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
     fixture_build(
         &fixture.state,
@@ -944,6 +986,17 @@ fn baseline_workflow_case_with(
         }
     }
     fs::remove_file(&preserved).unwrap();
+    match retained_oracle_case {
+        RetainedOracleCase::Ordinary => {}
+        RetainedOracleCase::HeldUnstarted => {
+            run_held_unstarted_case(&fixture, expected_attempts);
+            return;
+        }
+        RetainedOracleCase::LegacyFalseRow => {
+            run_legacy_false_row_case(&fixture, expected_attempts);
+            return;
+        }
+    }
     let settled = fixture.resume();
     assert!(settled.status.success(), "{}", text(&settled));
     let cursor = fixture.cursor();
@@ -1008,6 +1061,36 @@ fn baseline_workflow_case_with(
     let oracle_path =
         std::path::PathBuf::from(cursor["baseline_qualification"]["oracle"].as_str().unwrap());
     let oracle_bytes = fs::read(&oracle_path).unwrap();
+    let oracle_record: Value = serde_json::from_slice(&oracle_bytes).unwrap();
+    assert_eq!(oracle_record["checker_executed"], true, "{oracle_record}");
+    if !independent_acceptance_passes {
+        assert_eq!(oracle_record["passed"], false, "{oracle_record}");
+        assert!(
+            !oracle_record["runs"].as_array().unwrap().is_empty(),
+            "the genuine failing checker executed a worker: {oracle_record}"
+        );
+        assert!(
+            !row["interventions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|intervention| intervention["kind"] == "independent-check-unstarted"),
+            "a genuine failing checker is final, not an unstarted admission: {row}"
+        );
+        assert!(
+            !fixture
+                .run
+                .join("baseline-qualification/oracle-retry-1.json")
+                .exists(),
+            "an executed failing checker is never retried"
+        );
+        assert!(
+            cursor["baseline_qualification"]["unstarted_oracles"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "an executed failing checker leaves no unstarted evidence: {cursor}"
+        );
+    }
     let report =
         std::path::PathBuf::from(cursor["baseline_qualification"]["report"].as_str().unwrap());
     assert_eq!(
@@ -1021,7 +1104,7 @@ fn baseline_workflow_case_with(
         expected_attempts
     );
     assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
-    assert_eq!(fs::read(oracle_path).unwrap(), oracle_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
     if let Some(case) = review_case {
         let reviewer_attempts: Vec<&Value> = cursor["attempts"]
             .as_array()
@@ -1050,6 +1133,581 @@ fn baseline_workflow_case_with(
             row_path.display()
         );
     }
+    if review_case == Some(SemanticReviewCase::Accept) && independent_acceptance_passes {
+        let (_, criteria, _, _) = reviewer.as_ref().unwrap();
+        let criteria_bytes = fs::read(criteria).unwrap();
+        fs::write(criteria, b"changed acceptance criteria\n").unwrap();
+        let changed = fixture.resume();
+        let output = text(&changed);
+        assert!(!changed.status.success(), "{output}");
+        assert!(output.contains("semantic review criteria"), "{output}");
+        assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+        assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+        fs::write(criteria, criteria_bytes).unwrap();
+        let settled = fixture.resume();
+        assert!(settled.status.success(), "{}", text(&settled));
+        assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+        assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    }
+    let stopped = fixture.stop();
+    assert!(stopped.status.success(), "{}", text(&stopped));
+}
+
+fn resume_with_isolated_heavy(fixture: &Fixture, heavy: &Path, cpu: &Path) -> std::process::Output {
+    let heavy = heavy.display().to_string();
+    let cpu = cpu.display().to_string();
+    fixture.improve_with_env(
+        &["resume", "--run", fixture.run.to_str().unwrap()],
+        &[
+            ("CODEX_HARNESS_HEAVY_ACCOUNT", heavy.as_str()),
+            ("CODEX_HARNESS_CPU_ACCOUNT", cpu.as_str()),
+        ],
+    )
+}
+
+/// Occupy the only slot of an isolated heavy account with the native hold
+/// fixture. The returned process owns the slot until it is killed.
+fn hold_isolated_heavy(fixture: &Fixture, name: &str) -> std::process::Child {
+    let account = fixture.root.join(name);
+    harness_core::heavy_command::prepare(&account).unwrap();
+    let mut budget = harness_core::heavy_command::Budget::read(&account).unwrap();
+    budget.max_concurrent_trees = 1;
+    harness_core::heavy_command::Budget::write(&account, &budget).unwrap();
+    let started = fixture.root.join(format!("{name}-started.txt"));
+    let launch = env!("CARGO_BIN_EXE_harness-launch-fixture");
+    let child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--attempt")
+        .arg(name)
+        .arg("--")
+        .arg(launch)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "180000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &started)
+        .spawn()
+        .expect("the isolated heavy holder starts");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the isolated heavy holder did not acquire its slot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child
+}
+
+/// A held admission proves the checker never started. The first explicit
+/// resume must record incomplete evidence, not task rejection; releasing the
+/// slot lets exactly one later explicit resume run the checker and settle a
+/// genuinely verified row that keeps the original failure and workflow costs.
+fn run_held_unstarted_case(fixture: &Fixture, expected_attempts: usize) {
+    let account = fixture.root.join("unstarted-heavy-account");
+    let cpu = fixture.root.join("unstarted-cpu-account");
+    let mut holder = hold_isolated_heavy(fixture, "unstarted-heavy-account");
+    let held = resume_with_isolated_heavy(fixture, &account, &cpu);
+    let output = text(&held);
+    assert!(!held.status.success(), "{output}");
+    assert!(output.contains("proven never to start"), "{output}");
+    assert!(
+        output.contains("incomplete, not a task-quality rejection"),
+        "{output}"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["phase"], "baseline-qualification", "{cursor}");
+    let qualification = &cursor["baseline_qualification"];
+    assert!(qualification["accepted"].is_null(), "{cursor}");
+    assert!(qualification["row"].is_null(), "{cursor}");
+    assert!(qualification["oracle"].is_null(), "{cursor}");
+    assert!(
+        qualification["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("incomplete"),
+        "{cursor}"
+    );
+    let unstarted = &qualification["unstarted_oracles"][0];
+    assert_eq!(unstarted["attempt"], 1, "{cursor}");
+    assert_eq!(unstarted["stage"], "admission-wait", "{cursor}");
+    assert_eq!(unstarted["legacy"], false, "{cursor}");
+    let elapsed = unstarted["elapsed_seconds"]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<f64>()
+        .expect("the retained admission elapsed time is numeric");
+    assert!((5.0..6.5).contains(&elapsed), "{cursor}");
+    assert!(
+        unstarted["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no worker started"),
+        "{cursor}"
+    );
+    assert!(
+        unstarted["replacement"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("oracle-retry-1.json"),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        expected_attempts,
+        "an unstarted checker dispatches no model turn: {cursor}"
+    );
+    let retained_oracle = PathBuf::from(unstarted["oracle"].as_str().unwrap());
+    let retained_started = PathBuf::from(unstarted["started"].as_str().unwrap());
+    let retained_failure = PathBuf::from(unstarted["failure"].as_str().unwrap());
+    assert_eq!(
+        build_identity::hash_file(&retained_oracle).unwrap(),
+        unstarted["oracle_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        build_identity::hash_file(&retained_started).unwrap(),
+        unstarted["started_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        build_identity::hash_file(&retained_failure).unwrap(),
+        unstarted["failure_sha256"].as_str().unwrap()
+    );
+    let failure: Value = serde_json::from_slice(&fs::read(&retained_failure).unwrap()).unwrap();
+    assert_eq!(failure["stage"], "admission-wait", "{failure}");
+    assert_eq!(failure["spawned"], false, "{failure}");
+    assert!(failure["admission"].is_object(), "{failure}");
+    assert!(
+        failure["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no worker started"),
+        "{failure}"
+    );
+    let original_oracle = PathBuf::from(
+        qualification["unstarted_oracles"][0]["oracle"]
+            .as_str()
+            .unwrap(),
+    );
+    let original_oracle_bytes = fs::read(&original_oracle).unwrap();
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-1.json")
+            .exists()
+    );
+
+    // A recovery interrupted after persisting the retry intent leaves the
+    // checker start unknown. The explicit resume must refuse replay and keep
+    // the original incomplete receipts and attempt count exactly as retained.
+    let before_interruption = fixture.cursor();
+    let retry_path = PathBuf::from(unstarted["replacement"].as_str().unwrap());
+    let mut interrupted = before_interruption.clone();
+    interrupted["baseline_qualification"]["oracle"] = json!(retry_path.to_string_lossy());
+    fixture.write_cursor(&interrupted);
+    let refused = resume_with_isolated_heavy(fixture, &account, &cpu);
+    let output = text(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("result is unknown"), "{output}");
+    let after_interruption = fixture.cursor();
+    assert_eq!(
+        after_interruption["phase"], "baseline-qualification",
+        "{after_interruption}"
+    );
+    assert_eq!(
+        PathBuf::from(
+            after_interruption["baseline_qualification"]["oracle"]
+                .as_str()
+                .unwrap()
+        ),
+        retry_path,
+        "the refusal preserves the persisted submission intent: {after_interruption}"
+    );
+    assert_eq!(
+        after_interruption["baseline_qualification"]["unstarted_oracles"],
+        before_interruption["baseline_qualification"]["unstarted_oracles"],
+        "the interrupted recovery preserves every prior receipt: {after_interruption}"
+    );
+    assert_eq!(
+        after_interruption["attempts"], before_interruption["attempts"],
+        "an unknown checker start dispatches no model turn: {after_interruption}"
+    );
+    assert!(
+        !retry_path.exists(),
+        "an unknown checker start is never duplicated: {}",
+        retry_path.display()
+    );
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+    let mut restored = after_interruption;
+    restored["baseline_qualification"]["oracle"] = Value::Null;
+    fixture.write_cursor(&restored);
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let resumed = resume_with_isolated_heavy(fixture, &account, &cpu);
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["phase"], "baseline-qualification-recorded",
+        "{cursor}"
+    );
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(qualification["accepted"], true, "{cursor}");
+    assert!(qualification["condition"].is_null(), "{cursor}");
+    assert_eq!(
+        qualification["unstarted_oracles"].as_array().unwrap().len(),
+        1,
+        "the original admission failure stays retained: {cursor}"
+    );
+    assert_eq!(fs::read(&original_oracle).unwrap(), original_oracle_bytes);
+    let oracle_path = PathBuf::from(qualification["oracle"].as_str().unwrap());
+    assert!(
+        oracle_path.ends_with("oracle-retry-1.json"),
+        "the later explicit resume uses one free retry name: {cursor}"
+    );
+    let oracle: Value = serde_json::from_slice(&fs::read(&oracle_path).unwrap()).unwrap();
+    assert_eq!(oracle["checker_executed"], true, "{oracle}");
+    assert_eq!(oracle["passed"], true, "{oracle}");
+    let row_path = PathBuf::from(qualification["row"].as_str().unwrap());
+    let row: Value = serde_json::from_slice(&fs::read(&row_path).unwrap()).unwrap();
+    assert_eq!(row["accepted"], true, "{row}");
+    assert_eq!(row["checks"][0]["passed"], true, "{row}");
+    assert_eq!(
+        row["checks"][0]["evidence_sha256"],
+        build_identity::hash_file(&oracle_path).unwrap(),
+        "the replacement row hashes its actual new oracle record: {row}"
+    );
+    assert_eq!(
+        PathBuf::from(row["checks"][0]["evidence"].as_str().unwrap()),
+        oracle_path
+    );
+    assert!(
+        row["interventions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |intervention| intervention["kind"] == "independent-check-unstarted"
+                    && intervention["attempt"] == 1
+            ),
+        "the settled row retains the original admission failure: {row}"
+    );
+    assert_eq!(row["usage"]["response_count"], 5, "{row}");
+    assert_eq!(row["usage"]["total_tokens"], 600, "{row}");
+    assert_eq!(row["native_runs"].as_array().unwrap().len(), 2, "{row}");
+
+    let row_bytes = fs::read(&row_path).unwrap();
+    let oracle_bytes = fs::read(&oracle_path).unwrap();
+    let evidence_state = qualification["unstarted_oracles"].clone();
+    let attempts_state = cursor["attempts"].clone();
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    assert_eq!(
+        fixture.cursor()["baseline_qualification"]["unstarted_oracles"],
+        evidence_state
+    );
+    assert_eq!(fixture.cursor()["attempts"], attempts_state);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+
+    // Changed frozen identities refuse before a new checker effect. The row
+    // and the executed oracle stay exactly as settled.
+    let report = PathBuf::from(qualification["report"].as_str().unwrap());
+    let report_bytes = fs::read(&report).unwrap();
+    fs::write(&report, b"changed outside this run\n").unwrap();
+    let changed = fixture.resume();
+    let output = text(&changed);
+    assert!(!changed.status.success(), "{output}");
+    assert!(
+        output.contains("owned qualification report changed"),
+        "{output}"
+    );
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+    fs::write(&report, report_bytes).unwrap();
+
+    let request_bytes = fs::read(&fixture.request).unwrap();
+    let mut changed_request = request_bytes.clone();
+    changed_request.push(b' ');
+    fs::write(&fixture.request, &changed_request).unwrap();
+    let changed = fixture.resume();
+    let output = text(&changed);
+    assert!(!changed.status.success(), "{output}");
+    assert!(
+        output.contains("frozen acceptance request changed"),
+        "{output}"
+    );
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    fs::write(&fixture.request, &request_bytes).unwrap();
+
+    let run_spec = fixture.run.join("spec.json");
+    let spec_bytes = fs::read(&run_spec).unwrap();
+    let mut changed_spec: Value = serde_json::from_slice(&spec_bytes).unwrap();
+    changed_spec["baseline_qualification"]["task"]["revision"] = json!("0".repeat(40));
+    fs::write(&run_spec, serde_json::to_vec_pretty(&changed_spec).unwrap()).unwrap();
+    let changed = fixture.resume();
+    let output = text(&changed);
+    assert!(!changed.status.success(), "{output}");
+    assert!(
+        output.contains("run inputs changed since start"),
+        "{output}"
+    );
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    fs::write(&run_spec, &spec_bytes).unwrap();
+
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    let stopped = fixture.stop();
+    assert!(stopped.status.success(), "{}", text(&stopped));
+}
+
+/// A legacy record settled by the old owner claims an executed check but has
+/// the exact pre-spawn admission message and no worker run. Recovery must
+/// preserve the mistaken row byte-for-byte, retain its admission evidence,
+/// run one new checker and write a row that hashes the new oracle record.
+fn run_legacy_false_row_case(fixture: &Fixture, expected_attempts: usize) {
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    let cursor = fixture.cursor();
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(qualification["accepted"], true, "{cursor}");
+    let row_path = PathBuf::from(qualification["row"].as_str().unwrap());
+    let oracle_path = PathBuf::from(qualification["oracle"].as_str().unwrap());
+    let row: Value = serde_json::from_slice(&fs::read(&row_path).unwrap()).unwrap();
+    let genuine: Value = serde_json::from_slice(&fs::read(&oracle_path).unwrap()).unwrap();
+    assert_eq!(genuine["checker_executed"], true);
+    assert_eq!(genuine["passed"], true);
+
+    // A false record with no positive pre-spawn admission proof is ambiguous.
+    // It must refuse replay before the mistaken legacy row is involved, leaving
+    // the genuine row and the ambiguous record bytes untouched.
+    let ambiguous_evidence = fixture.root.join("ambiguous-oracle-evidence");
+    fs::create_dir_all(&ambiguous_evidence).unwrap();
+    let ambiguous_path = ambiguous_evidence.join("oracle.json");
+    let ambiguous = json!({
+        "schema":1, "id":"outcome", "kind":"real-task", "executed":true,
+        "checker_executed":false, "passed":false, "exit_code":1, "model_calls":0,
+        "checker_route":"shared-heavy-command",
+        "started_at": genuine["started_at"], "ended_at": genuine["ended_at"],
+        "evidence": ambiguous_path,
+        "acceptance_request_sha256": genuine["acceptance_request_sha256"],
+        "task_contract_sha256": genuine["task_contract_sha256"],
+        "oracle_program_sha256": genuine["oracle_program_sha256"],
+        "oracle_inputs": genuine["oracle_inputs"],
+        "failure":"independent checker did not complete; inspect retained failure.json",
+        "runs": [],
+    });
+    let mut ambiguous_started = ambiguous.clone();
+    ambiguous_started["ended_at"] = Value::Null;
+    ambiguous_started.as_object_mut().unwrap().remove("failure");
+    ambiguous_started.as_object_mut().unwrap().remove("runs");
+    fs::write(&ambiguous_path, serde_json::to_vec(&ambiguous).unwrap()).unwrap();
+    fs::write(
+        ambiguous_evidence.join("oracle-started.json"),
+        serde_json::to_vec(&ambiguous_started).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        ambiguous_evidence.join("failure.json"),
+        serde_json::to_vec(&json!({
+            "kind":"Other",
+            "message":"the checker start and exit are unknown after an interrupted recovery; elapsed 1.0s",
+            "raw_os_error":null,
+            "acceptance_request_sha256": genuine["acceptance_request_sha256"],
+            "task_contract_sha256": genuine["task_contract_sha256"],
+            "oracle_program_sha256": genuine["oracle_program_sha256"],
+            "oracle_inputs": genuine["oracle_inputs"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ambiguous_bytes = serde_json::to_vec(&ambiguous).unwrap();
+    fs::write(&oracle_path, &ambiguous_bytes).unwrap();
+    let genuine_row_bytes = fs::read(&row_path).unwrap();
+    let before_ambiguity = fixture.cursor();
+    let refused = fixture.resume();
+    let output = text(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("start is unknown"), "{output}");
+    assert!(output.contains("must not be replayed"), "{output}");
+    assert_eq!(fs::read(&oracle_path).unwrap(), ambiguous_bytes);
+    assert_eq!(fs::read(&row_path).unwrap(), genuine_row_bytes);
+    assert_eq!(
+        fixture.cursor()["baseline_qualification"]["accepted"],
+        before_ambiguity["baseline_qualification"]["accepted"],
+        "an ambiguous start is not reclassified: {output}"
+    );
+    assert_eq!(fixture.cursor()["attempts"], before_ambiguity["attempts"]);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-1.json")
+            .exists()
+    );
+
+    let evidence = fixture.root.join("legacy-oracle-evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    let original_evidence = evidence.join("oracle.json");
+    let unstarted = json!({
+        "schema":1, "id":"outcome", "kind":"real-task", "executed":true,
+        "checker_executed":false, "passed":false, "exit_code":1, "model_calls":0,
+        "checker_route":"shared-heavy-command",
+        "started_at": genuine["started_at"],
+        "ended_at": genuine["ended_at"],
+        "evidence": original_evidence,
+        "task_contract_sha256": genuine["task_contract_sha256"],
+        "oracle_program_sha256": genuine["oracle_program_sha256"],
+        "oracle_inputs": genuine["oracle_inputs"],
+        "failure":"independent checker did not complete; inspect retained failure.json",
+        "runs": [],
+    });
+    let mut started = unstarted.clone();
+    started["ended_at"] = Value::Null;
+    started.as_object_mut().unwrap().remove("failure");
+    started.as_object_mut().unwrap().remove("runs");
+    let failure = json!({
+        "kind":"Other",
+        "message":"the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed 60.0s",
+        "raw_os_error": null,
+    });
+    fs::write(&original_evidence, serde_json::to_vec(&unstarted).unwrap()).unwrap();
+    fs::write(
+        evidence.join("oracle-started.json"),
+        serde_json::to_vec(&started).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        evidence.join("failure.json"),
+        serde_json::to_vec(&failure).unwrap(),
+    )
+    .unwrap();
+    let false_bytes = serde_json::to_vec(&unstarted).unwrap();
+    fs::write(&oracle_path, &false_bytes).unwrap();
+    let false_sha256 = build_identity::hash_bytes(&false_bytes);
+
+    let mut legacy_row = row.clone();
+    legacy_row["accepted"] = json!(false);
+    legacy_row["checks"][0]["passed"] = json!(false);
+    legacy_row["checks"][0]["evidence"] = json!(oracle_path.to_string_lossy());
+    legacy_row["checks"][0]["evidence_sha256"] = json!(false_sha256);
+    let legacy_row_bytes = serde_json::to_vec_pretty(&legacy_row).unwrap();
+    fs::write(&row_path, &legacy_row_bytes).unwrap();
+
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("baseline-qualification-recorded");
+    cursor["baseline_qualification"]["accepted"] = json!(false);
+    cursor["baseline_qualification"]["condition"] = Value::Null;
+    cursor["baseline_qualification"]["oracle"] = json!(oracle_path.to_string_lossy());
+    cursor["baseline_qualification"]["row"] = json!(row_path.to_string_lossy());
+    fixture.write_cursor(&cursor);
+
+    let recovered = fixture.resume();
+    assert!(recovered.status.success(), "{}", text(&recovered));
+    let cursor = fixture.cursor();
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(
+        cursor["phase"], "baseline-qualification-recorded",
+        "{cursor}"
+    );
+    assert_eq!(qualification["accepted"], true, "{cursor}");
+    assert!(qualification["condition"].is_null(), "{cursor}");
+    let preserved = PathBuf::from(qualification["row_unstarted"].as_str().unwrap());
+    assert_eq!(fs::read(&preserved).unwrap(), legacy_row_bytes);
+    assert_eq!(
+        qualification["row_unstarted_sha256"],
+        build_identity::hash_bytes(&legacy_row_bytes)
+    );
+    let unstarted = &qualification["unstarted_oracles"][0];
+    assert_eq!(unstarted["attempt"], 1, "{cursor}");
+    assert_eq!(unstarted["legacy"], true, "{cursor}");
+    assert_eq!(unstarted["stage"], "admission-wait", "{cursor}");
+    assert_eq!(unstarted["elapsed_seconds"], "60.0", "{cursor}");
+    assert_eq!(
+        unstarted["message"],
+        "the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed 60.0s",
+        "{cursor}"
+    );
+    assert_eq!(
+        unstarted["superseded_row_sha256"],
+        build_identity::hash_bytes(&legacy_row_bytes)
+    );
+    assert_eq!(
+        PathBuf::from(unstarted["superseded_row"].as_str().unwrap()),
+        preserved
+    );
+    let new_oracle = PathBuf::from(qualification["oracle"].as_str().unwrap());
+    assert!(new_oracle.ends_with("oracle-retry-1.json"), "{cursor}");
+    let new_record: Value = serde_json::from_slice(&fs::read(&new_oracle).unwrap()).unwrap();
+    assert_eq!(new_record["checker_executed"], true, "{new_record}");
+    assert_eq!(new_record["passed"], true, "{new_record}");
+    let new_row_path = PathBuf::from(qualification["row"].as_str().unwrap());
+    let new_row: Value = serde_json::from_slice(&fs::read(&new_row_path).unwrap()).unwrap();
+    assert_eq!(new_row["accepted"], true, "{new_row}");
+    assert_eq!(new_row["checks"][0]["passed"], true, "{new_row}");
+    assert_eq!(
+        new_row["checks"][0]["evidence_sha256"],
+        build_identity::hash_file(&new_oracle).unwrap(),
+        "the replacement row binds its actual new record: {new_row}"
+    );
+    assert_eq!(new_row["usage"], legacy_row["usage"], "{new_row}");
+    assert_eq!(
+        new_row["native_runs"], legacy_row["native_runs"],
+        "{new_row}"
+    );
+    assert!(
+        new_row["interventions"].as_array().unwrap().iter().any(
+            |intervention| intervention["kind"] == "independent-check-unstarted"
+                && intervention["attempt"] == 1
+                && intervention["legacy"] == true
+        ),
+        "{new_row}"
+    );
+    assert_eq!(fs::read(&oracle_path).unwrap(), false_bytes);
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        expected_attempts
+    );
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+
+    let new_row_bytes = fs::read(&new_row_path).unwrap();
+    let new_oracle_bytes = fs::read(&new_oracle).unwrap();
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    assert_eq!(fs::read(&new_row_path).unwrap(), new_row_bytes);
+    assert_eq!(fs::read(&new_oracle).unwrap(), new_oracle_bytes);
+    assert_eq!(fs::read(&preserved).unwrap(), legacy_row_bytes);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
     let stopped = fixture.stop();
     assert!(stopped.status.success(), "{}", text(&stopped));
 }

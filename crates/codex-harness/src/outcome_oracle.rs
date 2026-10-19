@@ -538,6 +538,97 @@ pub(super) fn run_program(
 /// writer exits before the observer reacts; the verdict uses the observed
 /// facts, not only the stop reason, and keeps the original native exit
 /// recorded beside the limit cause.
+///
+/// A failed invocation returns the strongest fact this owner can prove about
+/// whether the checker process could have started. Only a failed account-slot
+/// acquisition is reported as a pre-spawn admission failure; every failure
+/// after admission is ambiguous because a suspended envelope may already exist.
+#[derive(Debug)]
+pub(super) struct AdmittedFailure {
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    message: String,
+    stage: &'static str,
+    spawned: Option<bool>,
+    elapsed_seconds: f64,
+    admission: Option<Value>,
+}
+
+impl AdmittedFailure {
+    fn preparation(error: io::Error, elapsed: Duration) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            message: error.to_string(),
+            stage: "preparation",
+            spawned: Some(false),
+            elapsed_seconds: elapsed.as_secs_f64(),
+            admission: None,
+        }
+    }
+
+    fn admission_failure(
+        error: io::Error,
+        message: String,
+        elapsed: Duration,
+        admission: Value,
+    ) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            message,
+            stage: "admission-wait",
+            spawned: Some(false),
+            elapsed_seconds: elapsed.as_secs_f64(),
+            admission: Some(admission),
+        }
+    }
+
+    fn execution(error: io::Error, message: String, elapsed: Duration) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            message,
+            stage: "execution",
+            spawned: None,
+            elapsed_seconds: elapsed.as_secs_f64(),
+            admission: None,
+        }
+    }
+
+    pub(super) fn kind(&self) -> io::ErrorKind {
+        self.kind
+    }
+
+    pub(super) fn raw_os_error(&self) -> Option<i32> {
+        self.raw_os_error
+    }
+
+    pub(super) fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    pub(super) fn spawned(&self) -> Option<bool> {
+        self.spawned
+    }
+
+    pub(super) fn elapsed_seconds(&self) -> f64 {
+        self.elapsed_seconds
+    }
+
+    pub(super) fn admission(&self) -> Option<&Value> {
+        self.admission.as_ref()
+    }
+}
+
+impl std::fmt::Display for AdmittedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AdmittedFailure {}
+
 #[cfg(windows)]
 pub(super) fn run_admitted_program(
     workspace: &Path,
@@ -547,21 +638,27 @@ pub(super) fn run_admitted_program(
     args: &[&str],
     timeout: u64,
     runs: &mut Vec<Value>,
-) -> io::Result<Value> {
+) -> Result<Value, AdmittedFailure> {
     use std::sync::atomic::AtomicBool;
 
     const CLEANUP: Duration = Duration::from_secs(10);
     const POLL: Duration = Duration::from_millis(50);
 
+    let prep_started = Instant::now();
     let root = evidence.join(label);
-    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&root)
+        .map_err(|error| AdmittedFailure::preparation(error, prep_started.elapsed()))?;
     let declared = Duration::from_secs(timeout);
-    let mut stdout = start_admitted_capture(root.join("stdout.txt"), declared)?;
-    let mut stderr = start_admitted_capture(root.join("stderr.txt"), declared)?;
+    let mut stdout = start_admitted_capture(root.join("stdout.txt"), declared)
+        .map_err(|error| AdmittedFailure::preparation(error, prep_started.elapsed()))?;
+    let mut stderr = start_admitted_capture(root.join("stderr.txt"), declared)
+        .map_err(|error| AdmittedFailure::preparation(error, prep_started.elapsed()))?;
     let program = exe.to_owned();
     let arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let account = heavy_command::account_dir(None)?;
-    let budget = heavy_command::Budget::read(&account)?;
+    let account = heavy_command::account_dir(None)
+        .map_err(|error| AdmittedFailure::preparation(error, prep_started.elapsed()))?;
+    let budget = heavy_command::Budget::read(&account)
+        .map_err(|error| AdmittedFailure::preparation(error, prep_started.elapsed()))?;
     let started = Instant::now();
     let cancellation = Cancellation::default();
     let stop = Arc::new(AtomicBool::new(false));
@@ -610,10 +707,20 @@ pub(super) fn run_admitted_program(
                 } else {
                     "the shared heavy-command slot could not be acquired"
                 };
-                return Err(io::Error::other(format!(
-                    "{cause}: {error}; elapsed {:.1}s",
-                    started.elapsed().as_secs_f64()
-                )));
+                let elapsed = started.elapsed();
+                let message = format!("{cause}: {error}; elapsed {:.1}s", elapsed.as_secs_f64());
+                let admission = json!({
+                    "route": "shared-heavy-command",
+                    "account": account.to_string_lossy(),
+                    "label": label_text,
+                    "max_concurrent_trees": budget.max_concurrent_trees,
+                    "queue_wait_seconds": budget.queue_wait_seconds,
+                    "machine_deadline_seconds": budget.deadline_seconds,
+                    "declared_deadline_seconds": timeout,
+                });
+                return Err(AdmittedFailure::admission_failure(
+                    error, message, elapsed, admission,
+                ));
             }
         };
     let payload = (|| -> io::Result<harness_core::process::Outcome> {
@@ -642,10 +749,11 @@ pub(super) fn run_admitted_program(
     let stdout_summary = finish_admitted_capture(stdout);
     let stderr_summary = finish_admitted_capture(stderr);
     let outcome = payload.map_err(|error| {
-        io::Error::other(format!(
+        let message = format!(
             "the admitted checker could not be started or cleaned: {error}; elapsed {:.1}s",
             elapsed.as_secs_f64()
-        ))
+        );
+        AdmittedFailure::execution(error, message, elapsed)
     })?;
     let native_status = match outcome.reason {
         StopReason::Exited => "exited",
@@ -711,11 +819,14 @@ pub(super) fn run_admitted_program(
     args: &[&str],
     timeout: u64,
     runs: &mut Vec<Value>,
-) -> io::Result<Value> {
+) -> Result<Value, AdmittedFailure> {
     let _ = (workspace, evidence, label, exe, args, timeout, runs);
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the admitted real-task route requires Windows Job Objects",
+    Err(AdmittedFailure::preparation(
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the admitted real-task route requires Windows Job Objects",
+        ),
+        Duration::ZERO,
     ))
 }
 

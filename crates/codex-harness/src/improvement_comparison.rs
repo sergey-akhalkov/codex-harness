@@ -2667,6 +2667,7 @@ pub(super) fn validate_committed_solution(
     })
 }
 
+#[derive(Debug)]
 pub(super) struct Acceptance {
     pub(super) passed: bool,
     pub(super) record_path: PathBuf,
@@ -2674,6 +2675,265 @@ pub(super) struct Acceptance {
     pub(super) ended_at: f64,
     /// The solution was materialized in an owned fresh source-only workspace.
     pub(super) workspace_preparation: String,
+}
+
+/// Proven evidence that one checker invocation failed before any process could
+/// start. The record, its pre-start receipt and its failure are retained
+/// separately so a later explicit resume can add one new attempt without
+/// losing the original admission failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct UnstartedAcceptance {
+    pub(super) record_path: PathBuf,
+    pub(super) record_sha256: String,
+    pub(super) started_path: PathBuf,
+    pub(super) started_sha256: String,
+    pub(super) failure_path: PathBuf,
+    pub(super) failure_sha256: String,
+    pub(super) started_at: String,
+    pub(super) ended_at: String,
+    pub(super) elapsed_seconds: String,
+    pub(super) stage: String,
+    pub(super) message: String,
+    pub(super) legacy: bool,
+    pub(super) request_sha256: Option<String>,
+}
+
+/// The two outcomes the retained checker record can prove. An executed checker
+/// stays final even when it failed; an unstarted checker is incomplete and is
+/// never a task-quality rejection.
+#[derive(Debug)]
+pub(super) enum OracleOutcome {
+    Executed(Acceptance),
+    Unstarted(UnstartedAcceptance),
+}
+
+impl Acceptance {
+    fn executed(record: &Value, record_path: &Path) -> Result<Self, String> {
+        if record["runs"].as_array().is_none_or(|runs| runs.is_empty()) {
+            return Err(
+                "the retained oracle claims an executed checker without a completed worker run; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                    .to_owned(),
+            );
+        }
+        let started_at = record["started_at"]
+            .as_f64()
+            .ok_or_else(|| "the retained oracle start time is missing".to_owned())?;
+        let ended_at = record["ended_at"]
+            .as_f64()
+            .ok_or_else(|| "the retained oracle end time is missing".to_owned())?;
+        if ended_at < started_at {
+            return Err("the retained oracle ended before it started".to_owned());
+        }
+        Ok(Self {
+            passed: record["checker_executed"] == true && record["passed"] == true,
+            record_path: record_path.to_path_buf(),
+            started_at,
+            ended_at,
+            workspace_preparation: "source-only-fresh-workspace".to_owned(),
+        })
+    }
+}
+
+fn oracle_evidence(path: &Path) -> Result<Value, String> {
+    read_json(path, MAX_RUN_SPEC_BYTES).map_err(|error| {
+        format!(
+            "retained oracle evidence {} is unreadable: {error}",
+            path.display()
+        )
+    })
+}
+
+fn same_field(record: &Value, evidence: &Value, field: &str) -> bool {
+    record.get(field).is_some() && record.get(field) == evidence.get(field)
+}
+
+fn legacy_pre_spawn_admission(message: &str) -> bool {
+    let cause = message.starts_with(
+        "the declared deadline expired while waiting for the shared heavy-command slot:",
+    ) || message.starts_with("the shared heavy-command slot could not be acquired:");
+    cause && message.contains("no worker started")
+}
+
+fn legacy_elapsed(message: &str) -> Option<String> {
+    let start = message.rfind("elapsed ")? + "elapsed ".len();
+    let tail = &message[start..];
+    let end = tail.find('s')?;
+    Some(tail[..end].to_owned())
+}
+
+/// Classify one retained real-task oracle record. `checker_executed=true` is
+/// final, including a genuine failing verdict. A false value is unstarted only
+/// when the pre-start receipt binds this exact invocation and the failure owner
+/// proves the account admission wait failed before any process was created.
+/// Every other false record is ambiguous and refuses replay.
+pub(super) fn classify_oracle_record(
+    record: &Value,
+    record_path: &Path,
+    request_sha256: &str,
+) -> Result<OracleOutcome, String> {
+    if record["kind"] != "real-task" || record["executed"] != true {
+        return Err(format!(
+            "the acceptance entry point did not execute the frozen checker ({}); no result enters the comparison",
+            record["failure"]
+                .as_str()
+                .unwrap_or("no failure cause recorded")
+        ));
+    }
+    if record["checker_executed"] == true {
+        return Acceptance::executed(record, record_path).map(OracleOutcome::Executed);
+    }
+    if record["checker_executed"] != false {
+        return Err(
+            "the retained oracle does not state whether the checker executed; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                .to_owned(),
+        );
+    }
+    if record["passed"] != false
+        || record["model_calls"] != 0
+        || record["runs"]
+            .as_array()
+            .is_none_or(|runs| !runs.is_empty())
+    {
+        return Err(
+            "the retained oracle has no completed checker run but still claims a verdict or usage; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                .to_owned(),
+        );
+    }
+    if record["checker_route"].as_str() != Some("shared-heavy-command") {
+        return Err(
+            "the retained oracle names no shared-heavy-command route; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                .to_owned(),
+        );
+    }
+    if record["failure"]
+        .as_str()
+        .is_none_or(|failure| failure.is_empty())
+    {
+        return Err(
+            "the retained oracle records no failure cause for the missing checker run; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let started_at = record["started_at"]
+        .as_f64()
+        .ok_or_else(|| "the retained oracle start time is missing".to_owned())?;
+    let ended_at = record["ended_at"]
+        .as_f64()
+        .ok_or_else(|| "the retained oracle end time is missing".to_owned())?;
+    if ended_at < started_at {
+        return Err("the retained oracle ended before it started".to_owned());
+    }
+    let evidence_path = record["evidence"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| "the retained oracle names no original evidence record".to_owned())?;
+    if evidence_path.file_name().and_then(|name| name.to_str()) != Some("oracle.json") {
+        return Err("the retained oracle original evidence has an unexpected shape".to_owned());
+    }
+    let original = oracle_evidence(&evidence_path)?;
+    if &original != record {
+        return Err(
+            "the retained oracle record does not match its original evidence bytes; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let directory = evidence_path
+        .parent()
+        .ok_or_else(|| "the retained oracle original evidence has no parent".to_owned())?;
+    let started_path = directory.join("oracle-started.json");
+    let failure_path = directory.join("failure.json");
+    let started = oracle_evidence(&started_path)?;
+    let failure = oracle_evidence(&failure_path)?;
+    if started["kind"] != "real-task"
+        || started["executed"] != true
+        || started["checker_executed"] != false
+        || started["passed"] != false
+        || started["started_at"] != record["started_at"]
+        || started["ended_at"] != Value::Null
+        || started.get("failure").is_some()
+        || started.get("runs").is_some_and(|runs| runs != &json!([]))
+        || started["evidence"] != record["evidence"]
+        || !same_field(record, &started, "task_contract_sha256")
+        || !same_field(record, &started, "oracle_program_sha256")
+        || !same_field(record, &started, "oracle_inputs")
+    {
+        return Err(
+            "the pre-start oracle receipt does not bind this exact invocation; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let record_request = record["acceptance_request_sha256"].as_str();
+    let started_request = started["acceptance_request_sha256"].as_str();
+    let failure_request = failure["acceptance_request_sha256"].as_str();
+    if record_request.is_some_and(|value| value != request_sha256)
+        || started_request.is_some_and(|value| value != request_sha256)
+        || failure_request.is_some_and(|value| value != request_sha256)
+        || (record_request.is_some()
+            && started_request.is_some()
+            && record_request != started_request)
+        || (record_request.is_some()
+            && failure_request.is_some()
+            && record_request != failure_request)
+    {
+        return Err(
+            "the retained pre-start evidence binds a different acceptance request; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let message = failure["message"]
+        .as_str()
+        .ok_or_else(|| "the retained admission failure has no message".to_owned())?;
+    if message.is_empty() {
+        return Err("the retained admission failure has an empty message".to_owned());
+    }
+    let structured_binding =
+        record_request.is_some() && started_request.is_some() && failure_request.is_some();
+    let (stage, legacy, elapsed_seconds) = if failure["stage"].as_str() == Some("admission-wait")
+        && failure["spawned"].as_bool() == Some(false)
+        && failure["admission"].is_object()
+        && structured_binding
+        && same_field(record, &failure, "task_contract_sha256")
+        && same_field(record, &failure, "oracle_program_sha256")
+        && same_field(record, &failure, "oracle_inputs")
+    {
+        let elapsed = failure["elapsed_seconds"]
+            .as_f64()
+            .map(|value| value.to_string())
+            .or_else(|| legacy_elapsed(message))
+            .ok_or_else(|| "the retained admission failure has no elapsed time".to_owned())?;
+        ("admission-wait".to_owned(), false, elapsed)
+    } else if failure.get("stage").is_none()
+        && failure.get("spawned").is_none()
+        && legacy_pre_spawn_admission(message)
+    {
+        let elapsed = legacy_elapsed(message).ok_or_else(|| {
+            "the retained legacy admission failure has no elapsed time".to_owned()
+        })?;
+        ("admission-wait".to_owned(), true, elapsed)
+    } else {
+        return Err(
+            "the retained oracle has no proven pre-spawn admission failure; its start is unknown and the attempt is incomplete, not a task-quality rejection and must not be replayed"
+                .to_owned(),
+        );
+    };
+    Ok(OracleOutcome::Unstarted(UnstartedAcceptance {
+        record_path: record_path.to_path_buf(),
+        record_sha256: build_identity::hash_file(record_path)
+            .map_err(|error| format!("the retained oracle record is unreadable: {error}"))?,
+        started_path: started_path.clone(),
+        started_sha256: build_identity::hash_file(&started_path)
+            .map_err(|error| format!("the pre-start oracle receipt is unreadable: {error}"))?,
+        failure_path: failure_path.clone(),
+        failure_sha256: build_identity::hash_file(&failure_path)
+            .map_err(|error| format!("the retained admission failure is unreadable: {error}"))?,
+        started_at: record["started_at"].to_string(),
+        ended_at: record["ended_at"].to_string(),
+        elapsed_seconds,
+        stage,
+        message: message.to_owned(),
+        legacy,
+        request_sha256: record_request.map(str::to_owned),
+    }))
 }
 
 /// The frozen identity of the supervisor process that owns one comparison
@@ -2802,14 +3062,21 @@ fn run_oracle(
         format!("the unchanged supervisor is required to evaluate this candidate: {reason}")
     })?;
     let record_path = run.store.comparison_arm_dir(arm).join("oracle.json");
-    execute_oracle(
+    match execute_oracle(
         &comparison.acceptance.request,
         &comparison.acceptance.request_sha256,
         &workspace,
         &solution.checkout,
         &solution.revision,
         &record_path,
-    )
+    )? {
+        OracleOutcome::Executed(acceptance) => Ok(acceptance),
+        OracleOutcome::Unstarted(unstarted) => Err(format!(
+            "the independent checker was proven never to start ({} at {}); the attempt is incomplete, not a rejected candidate, and is retained with its admission failure",
+            unstarted.stage,
+            unstarted.record_path.display()
+        )),
+    }
 }
 
 /// Materialize one committed revision into the frozen acceptance workspace
@@ -2824,7 +3091,7 @@ pub(super) fn execute_oracle(
     checkout: &Path,
     revision: &str,
     record_path: &Path,
-) -> Result<Acceptance, String> {
+) -> Result<OracleOutcome, String> {
     let checkout = checkout.to_string_lossy().into_owned();
     git(
         workspace,
@@ -2858,24 +3125,17 @@ pub(super) fn execute_oracle(
     let record: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!("the acceptance entry point returned no readable record: {error}")
     })?;
-    if record["kind"] != "real-task" || record["executed"] != true {
-        return Err(format!(
-            "the acceptance entry point did not execute the frozen checker ({}); no result enters the comparison",
-            record["failure"]
-                .as_str()
-                .unwrap_or("no failure cause recorded")
-        ));
-    }
     write_json_atomic(record_path, &record)
         .map_err(|error| format!("the acceptance record could not be retained: {error}"))?;
-    let passed = record["passed"] == true && record["checker_executed"] == true;
-    Ok(Acceptance {
-        passed,
-        record_path: record_path.to_path_buf(),
-        started_at,
-        ended_at,
-        workspace_preparation,
-    })
+    match classify_oracle_record(&record, record_path, request_sha256)? {
+        OracleOutcome::Executed(mut acceptance) => {
+            acceptance.started_at = started_at;
+            acceptance.ended_at = ended_at;
+            acceptance.workspace_preparation = workspace_preparation;
+            Ok(OracleOutcome::Executed(acceptance))
+        }
+        unstarted => Ok(unstarted),
+    }
 }
 
 /// The declared subtractive treatment of a measured comparison: the frozen
@@ -5714,4 +5974,272 @@ fn publish_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
         evaluation.coverage
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod oracle_classification_tests {
+    use super::*;
+
+    const REQUEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const CONTRACT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const PROGRAM: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn base_record() -> Value {
+        json!({
+            "schema": 1, "id": "outcome", "kind": "real-task", "executed": true,
+            "checker_executed": false, "passed": false, "exit_code": 1,
+            "model_calls": 0, "checker_route": "shared-heavy-command",
+            "started_at": 100.0, "ended_at": 130.0,
+            "evidence": "placeholder",
+            "acceptance_request_sha256": REQUEST,
+            "task_contract_sha256": CONTRACT,
+            "oracle_program_sha256": PROGRAM,
+            "oracle_inputs": {"input.txt": CONTRACT},
+            "failure": "independent checker did not complete; inspect retained failure.json",
+            "runs": [],
+        })
+    }
+
+    fn structured_failure(record: &Value, elapsed: f64) -> Value {
+        json!({
+            "kind": "Other",
+            "message": format!(
+                "the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed {elapsed:.1}s"
+            ),
+            "raw_os_error": null,
+            "stage": "admission-wait",
+            "spawned": false,
+            "elapsed_seconds": elapsed,
+            "acceptance_request_sha256": record["acceptance_request_sha256"],
+            "task_contract_sha256": record["task_contract_sha256"],
+            "oracle_program_sha256": record["oracle_program_sha256"],
+            "oracle_inputs": record["oracle_inputs"],
+            "admission": {"route": "shared-heavy-command"},
+        })
+    }
+
+    fn legacy_failure() -> Value {
+        json!({
+            "kind": "Other",
+            "message": "the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed 60.0s",
+            "raw_os_error": null,
+        })
+    }
+
+    /// Write the exact invocation evidence beside a retained copy of the
+    /// oracle record. The caller mutates the pre-start receipt to exercise a
+    /// binding mismatch; the failure is written as supplied.
+    fn write_case(
+        mut record: Value,
+        patch_started: impl FnOnce(&mut Value),
+        failure: Value,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join("evidence");
+        fs::create_dir_all(&evidence).unwrap();
+        let oracle_path = evidence.join("oracle.json");
+        record["evidence"] = json!(oracle_path.to_string_lossy());
+        let mut started = record.clone();
+        started["ended_at"] = Value::Null;
+        started.as_object_mut().unwrap().remove("failure");
+        started.as_object_mut().unwrap().remove("runs");
+        patch_started(&mut started);
+        fs::write(&oracle_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::write(
+            evidence.join("oracle-started.json"),
+            serde_json::to_vec(&started).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            evidence.join("failure.json"),
+            serde_json::to_vec(&failure).unwrap(),
+        )
+        .unwrap();
+        let retained = root.path().join("retained-oracle.json");
+        fs::write(&retained, serde_json::to_vec(&record).unwrap()).unwrap();
+        (root, retained)
+    }
+
+    #[test]
+    fn an_executed_failing_checker_is_final() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oracle.json");
+        let record = json!({
+            "kind": "real-task", "executed": true, "checker_executed": true,
+            "passed": false, "started_at": 10.0, "ended_at": 20.0,
+            "runs": [{"status": "exited", "exit_code": 1}],
+        });
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        match classify_oracle_record(&record, &path, REQUEST).unwrap() {
+            OracleOutcome::Executed(acceptance) => assert!(!acceptance.passed),
+            OracleOutcome::Unstarted(_) => panic!("an executed failure is final"),
+        }
+    }
+
+    #[test]
+    fn an_executed_claim_without_its_worker_run_is_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oracle.json");
+        let record = json!({
+            "kind": "real-task", "executed": true, "checker_executed": true,
+            "passed": false, "started_at": 10.0, "ended_at": 20.0, "runs": [],
+        });
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = classify_oracle_record(&record, &path, REQUEST).unwrap_err();
+        assert!(error.contains("without a completed worker run"), "{error}");
+    }
+
+    #[test]
+    fn a_preparation_failure_is_ambiguous() {
+        let record = base_record();
+        let failure = json!({
+            "kind": "Other",
+            "message": "the admitted checker could not be prepared: access denied; elapsed 0.1s",
+            "raw_os_error": null,
+            "stage": "preparation",
+            "spawned": false,
+            "elapsed_seconds": 0.1,
+            "acceptance_request_sha256": record["acceptance_request_sha256"],
+            "task_contract_sha256": record["task_contract_sha256"],
+            "oracle_program_sha256": record["oracle_program_sha256"],
+            "oracle_inputs": record["oracle_inputs"],
+        });
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        let error = classify_oracle_record(&retained_record, &retained, REQUEST).unwrap_err();
+        assert!(
+            error.contains("no proven pre-spawn admission failure"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_structured_admission_failure_is_proven_unstarted() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        match classify_oracle_record(&retained_record, &retained, REQUEST).unwrap() {
+            OracleOutcome::Unstarted(unstarted) => {
+                assert!(!unstarted.legacy);
+                assert_eq!(unstarted.stage, "admission-wait");
+                assert_eq!(unstarted.elapsed_seconds.parse::<f64>().unwrap(), 2.0);
+            }
+            OracleOutcome::Executed(_) => panic!("admission never executed the checker"),
+        }
+    }
+
+    #[test]
+    fn an_execution_failure_is_ambiguous() {
+        let record = base_record();
+        let failure = json!({
+            "kind": "Other",
+            "message": "the admitted checker could not be started or cleaned: access denied; elapsed 1.0s",
+            "raw_os_error": null,
+            "stage": "execution",
+            "spawned": null,
+            "elapsed_seconds": 1.0,
+            "acceptance_request_sha256": record["acceptance_request_sha256"],
+            "task_contract_sha256": record["task_contract_sha256"],
+            "oracle_program_sha256": record["oracle_program_sha256"],
+            "oracle_inputs": record["oracle_inputs"],
+        });
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        let error = classify_oracle_record(&retained_record, &retained, REQUEST).unwrap_err();
+        assert!(
+            error.contains("no proven pre-spawn admission failure"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_generic_false_record_is_ambiguous() {
+        let record = base_record();
+        let failure = json!({
+            "kind": "Other",
+            "message": "the checker failed",
+            "raw_os_error": null,
+        });
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn the_legacy_pre_spawn_message_is_proven_unstarted() {
+        let mut record = base_record();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("acceptance_request_sha256");
+        let (_root, retained) = write_case(
+            record,
+            |started| {
+                started
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("acceptance_request_sha256");
+            },
+            legacy_failure(),
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        match classify_oracle_record(&retained_record, &retained, REQUEST).unwrap() {
+            OracleOutcome::Unstarted(unstarted) => {
+                assert!(unstarted.legacy);
+                assert_eq!(unstarted.stage, "admission-wait");
+                assert_eq!(unstarted.elapsed_seconds, "60.0");
+            }
+            OracleOutcome::Executed(_) => panic!("the legacy admission never executed the checker"),
+        }
+    }
+
+    #[test]
+    fn a_mismatched_pre_start_receipt_is_ambiguous() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(
+            record,
+            |started| started["task_contract_sha256"] = json!("0".repeat(64)),
+            failure,
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn a_mismatched_request_binding_is_ambiguous() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(
+            record,
+            |started| started["acceptance_request_sha256"] = json!("0".repeat(64)),
+            failure,
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn a_false_record_with_usage_is_ambiguous() {
+        let mut record = base_record();
+        record["runs"] = json!([{"exit_code": 1}]);
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn a_started_receipt_with_an_end_time_is_ambiguous() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(
+            record,
+            |started| started["ended_at"] = json!(120.0),
+            failure,
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
 }

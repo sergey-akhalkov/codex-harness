@@ -2852,6 +2852,50 @@ impl QualificationBindingIdentity {
     }
 }
 
+/// The exact retained proof of one independent checker attempt that failed
+/// before any process could start. The paths point at run-owned copies; the
+/// original evidence remains untouched. The values are stored as the exact
+/// JSON representations so the record and the later accounting row agree.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UnstartedOracleEvidence {
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub oracle: PathBuf,
+    #[serde(default)]
+    pub oracle_sha256: String,
+    #[serde(default)]
+    pub started: PathBuf,
+    #[serde(default)]
+    pub started_sha256: String,
+    #[serde(default)]
+    pub failure: PathBuf,
+    #[serde(default)]
+    pub failure_sha256: String,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub ended_at: String,
+    #[serde(default)]
+    pub elapsed_seconds: String,
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub legacy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_row: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_row_sha256: Option<String>,
+    /// The oracle path reserved for the next explicit attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BaselineQualificationState {
@@ -2914,6 +2958,16 @@ pub struct BaselineQualificationState {
     /// The retained real-task oracle record.
     #[serde(default)]
     pub oracle: Option<PathBuf>,
+    /// Every checker attempt proven never to have started, in order. They
+    /// remain incomplete evidence and are never a task-quality rejection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unstarted_oracles: Vec<UnstartedOracleEvidence>,
+    /// The exact superseded accounting row retained before a proven-unstarted
+    /// check was retried. It is never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_unstarted: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_unstarted_sha256: Option<String>,
     #[serde(default)]
     pub accepted: Option<bool>,
     /// The retained accounting row of this qualification unit.

@@ -125,14 +125,19 @@ pub(super) fn run(request_path: &Path, bytes: &[u8]) -> io::Result<i32> {
         .map(|argument| argument.replace("{workspace}", &workspace.to_string_lossy()))
         .collect();
     let references: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let request_sha256 = build_identity::hash_bytes(bytes);
+    let task_contract_sha256 = request.task_contract_sha256.clone();
+    let oracle_program_sha256 = request.oracle.program_sha256.clone();
+    let oracle_inputs = request.oracle.inputs.clone();
     let mut record = json!({
         "schema":1, "id":"outcome", "kind":"real-task", "executed":true,
         "checker_executed":false, "passed":false, "exit_code":1, "model_calls":0,
         "checker_route":"shared-heavy-command",
         "started_at":now(), "ended_at":null, "evidence":evidence.join("oracle.json"),
-        "task_contract_sha256":request.task_contract_sha256,
-        "oracle_program_sha256":request.oracle.program_sha256,
-        "oracle_inputs":request.oracle.inputs,
+        "acceptance_request_sha256":request_sha256.clone(),
+        "task_contract_sha256":task_contract_sha256.clone(),
+        "oracle_program_sha256":oracle_program_sha256.clone(),
+        "oracle_inputs":oracle_inputs.clone(),
     });
     write_new(&evidence.join("oracle-started.json"), &record)?;
     let mut runs = Vec::new();
@@ -155,6 +160,13 @@ pub(super) fn run(request_path: &Path, bytes: &[u8]) -> io::Result<i32> {
                 &json!({
                     "kind":format!("{:?}",error.kind()), "message":error.to_string(),
                     "raw_os_error":error.raw_os_error(),
+                    "stage":error.stage(), "spawned":error.spawned(),
+                    "elapsed_seconds":error.elapsed_seconds(),
+                    "acceptance_request_sha256":request_sha256,
+                    "task_contract_sha256":task_contract_sha256,
+                    "oracle_program_sha256":oracle_program_sha256,
+                    "oracle_inputs":oracle_inputs,
+                    "admission":error.admission(),
                 }),
             )?;
             record["failure"] =

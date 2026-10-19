@@ -10,13 +10,13 @@ use harness_core::improvement_experiment::{ArmBinding, prepare_home, prepare_var
 use harness_core::improvement_loop::{
     BaselineQualificationInputs, BaselineQualificationState, QualificationAdoptionOrigin,
     QualificationBindingIdentity, QualificationRuntimeRole, SemanticReviewState,
-    WorkflowParticipant, validate_adoption_origin,
+    UnstartedOracleEvidence, WorkflowParticipant, validate_adoption_origin,
 };
 use harness_core::improvement_runtime::{self, AdoptionClaimStatus, ArmRequest, ArmRuntime};
 use harness_core::task_worktree::{self, FrozenCopy};
 use serde_json::Value;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::Command;
 
 const ACTION_EVIDENCE_SCHEMA: u32 = 1;
@@ -3638,80 +3638,32 @@ fn finalize(
         ));
     }
     let semantic = retained_semantic_acceptance(run, inputs, state, &solution)?;
-    let oracle_path = run.store.root().join("baseline-qualification/oracle.json");
-    let acceptance = if state.oracle.is_some() {
-        Some(load_retained_acceptance(&oracle_path, &inputs.acceptance)?)
-    } else {
-        None
+    if !build_identity::hash_file(&inputs.acceptance.request)?
+        .eq_ignore_ascii_case(&inputs.acceptance.request_sha256)
+    {
+        return Err(invalid(
+            "the frozen acceptance request changed; preserve the run and restore its exact bytes before any checker effect",
+        ));
+    }
+    let mut outcome = match state.oracle.as_deref() {
+        Some(path) => Some(load_retained_acceptance(path, &inputs.acceptance)?),
+        None => None,
     };
-    if let Some(row_path) = &state.row {
-        let row: Value = read_json(row_path, MAX_RUN_SPEC_BYTES)?;
-        let retained = acceptance
-            .as_ref()
-            .ok_or_else(|| invalid("recorded accounting row has no independent check"))?;
-        let oracle_sha256 = build_identity::hash_file(&retained.record_path)?;
-        if row["checks"][0]["id"].as_str() != Some("independent-acceptance")
-            || row["checks"][0]["evidence_sha256"].as_str() != Some(oracle_sha256.as_str())
-            || row["checks"][0]["passed"].as_bool() != Some(retained.passed)
-        {
-            return Err(invalid(
-                "the retained independent acceptance record changed; its result cannot be reused",
-            ));
-        }
-        let accepted = state.workflow.lead_accepted == Some(true)
-            && retained.passed
-            && semantic
-                .as_ref()
-                .is_none_or(|review| review.kind == "accept");
-        if row["accepted"].as_bool() != Some(accepted) {
-            return Err(invalid(
-                "the retained accounting row's acceptance no longer matches the declared evidence; preserve it and reconcile instead of rewriting",
-            ));
-        }
-        match &semantic {
-            Some(review) => {
-                let check = row["checks"]
-                    .as_array()
-                    .and_then(|checks| {
-                        checks
-                            .iter()
-                            .find(|check| check["id"] == "independent-semantic-review")
-                    })
-                    .ok_or_else(|| {
-                        invalid(
-                            "the retained accounting row has no independent semantic review check; preserve it and reconcile",
-                        )
-                    })?;
-                if check["executed"] != true
-                    || check["passed"].as_bool() != Some(review.kind == "accept")
-                    || check["evidence_sha256"].as_str() != Some(review.sha256.as_str())
-                {
-                    return Err(invalid(
-                        "the retained semantic review evidence changed; its judgment cannot be reused",
-                    ));
-                }
+    if let Some(row_path) = state.row.clone() {
+        match outcome.as_ref() {
+            Some(accounting::OracleOutcome::Executed(retained)) => {
+                return settle_recorded_row(run, inputs, state, &row_path, retained, &semantic);
+            }
+            Some(accounting::OracleOutcome::Unstarted(unstarted)) => {
+                recover_unstarted_row(
+                    run, inputs, state, &solution, &row_path, unstarted, &semantic, runtime,
+                )?;
+                outcome = None;
             }
             None => {
-                if row["checks"].as_array().is_some_and(|checks| {
-                    checks
-                        .iter()
-                        .any(|check| check["id"] == "independent-semantic-review")
-                }) {
-                    return Err(invalid(
-                        "the retained accounting row claims a semantic review that is no longer declared; preserve it and reconcile",
-                    ));
-                }
+                return Err(invalid("recorded accounting row has no independent check"));
             }
         }
-        state.accepted = Some(accepted);
-        run.cursor.phase = Phase::BaselineQualificationRecorded;
-        persist(run, state)?;
-        let mut notes = vec![format!(
-            "ordinary baseline result retained at {}; no comparison policy or candidate has been qualified",
-            row_path.display()
-        )];
-        notes.extend(settle_adoption_claims(run, AdoptionClaimStatus::Completed)?);
-        return Ok(notes);
     }
 
     // Each exact participant session contributes native usage once even when
@@ -3860,37 +3812,81 @@ fn finalize(
     all_paths.dedup();
     let usage = accounting::usage_totals(&all_paths)
         .ok_or_else(|| invalid("aggregate native usage is incomplete or conflicting"))?;
-    let acceptance = match acceptance {
-        Some(acceptance) => acceptance,
-        None => {
-            let workspace = state.task_workspace.as_deref().unwrap();
-            let head = accounting::git(workspace, &["rev-parse", "HEAD"]).map_err(invalid)?;
-            let changes = accounting::git(
-                workspace,
-                &[
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                    "--ignored=matching",
-                ],
-            )
-            .map_err(invalid)?;
-            if Some(head.trim()) != state.task_base.as_deref() || !changes.is_empty() {
-                return Err(invalid(
-                    "the owned oracle workspace changed before acceptance; preserve its work before retrying, no check was submitted",
-                ));
+    for evidence in &state.unstarted_oracles {
+        interventions.push(unstarted_intervention(evidence));
+    }
+    // One explicit resume may make one new checker attempt. A record loaded
+    // from an earlier resume is retained and then replaced; a record produced
+    // by this invocation is retained and returned as incomplete so continuous
+    // supervision cannot spin on an unchanged admission failure.
+    let mut attempted = false;
+    let acceptance = loop {
+        match outcome.take() {
+            Some(accounting::OracleOutcome::Executed(acceptance)) => break acceptance,
+            Some(accounting::OracleOutcome::Unstarted(unstarted)) => {
+                let entry = retain_unstarted_acceptance(run, state, &unstarted, None)?;
+                state.oracle = None;
+                state.accepted = None;
+                state.condition = Some(incomplete_condition(&entry));
+                persist(run, state)?;
+                if attempted {
+                    return Err(invalid(incomplete_condition(&entry)));
+                }
             }
-            state.oracle = Some(oracle_path.clone());
-            persist(run, state)?;
-            accounting::execute_oracle(
-                &inputs.acceptance.request,
-                &inputs.acceptance.request_sha256,
-                state.task_workspace.as_deref().unwrap(),
-                &solution.checkout,
-                &solution.revision,
-                &oracle_path,
-            )
-            .map_err(invalid)?
+            None => {
+                if let Some(record) = unaccounted_oracle_records(run, state)?.into_iter().next() {
+                    state.oracle = Some(record.clone());
+                    persist(run, state)?;
+                    outcome = Some(load_retained_acceptance(&record, &inputs.acceptance)?);
+                    continue;
+                }
+                let workspace = state
+                    .task_workspace
+                    .as_deref()
+                    .ok_or_else(|| invalid("the frozen acceptance workspace is not prepared"))?;
+                let head = accounting::git(workspace, &["rev-parse", "HEAD"]).map_err(invalid)?;
+                let changes = accounting::git(
+                    workspace,
+                    &[
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                        "--ignored=matching",
+                    ],
+                )
+                .map_err(invalid)?;
+                // A proven-unstarted attempt still materializes the exact
+                // committed solution before admission. Re-entering that same
+                // clean revision is safe; any other revision or worktree
+                // change stays refused before a new checker effect.
+                let at_frozen_state = Some(head.trim()) == state.task_base.as_deref()
+                    || head.trim() == solution.revision.as_str();
+                if !at_frozen_state {
+                    return Err(invalid(
+                        "the owned oracle workspace changed to an unexpected revision before acceptance; preserve its work before retrying, no check was submitted",
+                    ));
+                }
+                if !changes.is_empty() {
+                    return Err(invalid(
+                        "the owned oracle workspace changed by uncommitted files before acceptance; preserve its work before retrying, no check was submitted",
+                    ));
+                }
+                let oracle_path = next_free_oracle_path(run)?;
+                state.oracle = Some(oracle_path.clone());
+                persist(run, state)?;
+                attempted = true;
+                outcome = Some(
+                    accounting::execute_oracle(
+                        &inputs.acceptance.request,
+                        &inputs.acceptance.request_sha256,
+                        workspace,
+                        &solution.checkout,
+                        &solution.revision,
+                        &oracle_path,
+                    )
+                    .map_err(invalid)?,
+                );
+            }
         }
     };
     let accepted = state.workflow.lead_accepted == Some(true)
@@ -3902,8 +3898,8 @@ fn finalize(
         "id":"independent-acceptance", "round":0, "required":true,
         "executed":true, "passed":acceptance.passed,
         "started_at":acceptance.started_at, "ended_at":acceptance.ended_at,
-        "evidence":acceptance.record_path,
-        "evidence_sha256":build_identity::hash_file(&oracle_path)?,
+        "evidence":acceptance.record_path.clone(),
+        "evidence_sha256":build_identity::hash_file(&acceptance.record_path)?,
     })];
     if let Some(review) = &semantic {
         checks.push(json!({
@@ -3943,6 +3939,7 @@ fn finalize(
     write_json_atomic(&row_path, &row)?;
     state.accepted = Some(accepted);
     state.row = Some(row_path.clone());
+    state.condition = None;
     run.cursor.phase = Phase::BaselineQualificationRecorded;
     run.cursor.effect(
         EffectKind::BaselineQualificationRecorded,
@@ -3961,10 +3958,460 @@ fn finalize(
     Ok(notes)
 }
 
+fn same_digest(value: &Value, expected: &str) -> bool {
+    value
+        .as_str()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn verify_semantic_row_check(row: &Value, semantic: &Option<SemanticAcceptance>) -> io::Result<()> {
+    match semantic {
+        Some(review) => {
+            let check = row["checks"]
+                .as_array()
+                .and_then(|checks| {
+                    checks
+                        .iter()
+                        .find(|check| check["id"] == "independent-semantic-review")
+                })
+                .ok_or_else(|| {
+                    invalid(
+                        "the retained accounting row has no independent semantic review check; preserve it and reconcile",
+                    )
+                })?;
+            if check["executed"] != true
+                || check["passed"].as_bool() != Some(review.kind == "accept")
+                || !same_digest(&check["evidence_sha256"], &review.sha256)
+            {
+                return Err(invalid(
+                    "the retained semantic review evidence changed; its judgment cannot be reused",
+                ));
+            }
+        }
+        None => {
+            if row["checks"].as_array().is_some_and(|checks| {
+                checks
+                    .iter()
+                    .any(|check| check["id"] == "independent-semantic-review")
+            }) {
+                return Err(invalid(
+                    "the retained accounting row claims a semantic review that is no longer declared; preserve it and reconcile",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn settle_recorded_row(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    row_path: &Path,
+    retained: &super::improvement_comparison::Acceptance,
+    semantic: &Option<SemanticAcceptance>,
+) -> io::Result<Vec<String>> {
+    let row: Value = read_json(row_path, MAX_RUN_SPEC_BYTES)?;
+    let oracle_sha256 = build_identity::hash_file(&retained.record_path)?;
+    let check = &row["checks"][0];
+    if check["id"].as_str() != Some("independent-acceptance")
+        || !same_digest(&check["evidence_sha256"], &oracle_sha256)
+        || check["passed"].as_bool() != Some(retained.passed)
+    {
+        return Err(invalid(
+            "the retained independent acceptance record changed; its result cannot be reused",
+        ));
+    }
+    if row["matched"]["acceptance_request_sha256"]
+        .as_str()
+        .is_none_or(|value| !value.eq_ignore_ascii_case(&inputs.acceptance.request_sha256))
+    {
+        return Err(invalid(
+            "the retained accounting row binds a different acceptance request; preserve it and reconcile",
+        ));
+    }
+    let accepted = state.workflow.lead_accepted == Some(true)
+        && retained.passed
+        && semantic
+            .as_ref()
+            .is_none_or(|review| review.kind == "accept");
+    if row["accepted"].as_bool() != Some(accepted) {
+        return Err(invalid(
+            "the retained accounting row's acceptance no longer matches the declared evidence; preserve it and reconcile instead of rewriting",
+        ));
+    }
+    verify_semantic_row_check(&row, semantic)?;
+    state.accepted = Some(accepted);
+    state.condition = None;
+    run.cursor.phase = Phase::BaselineQualificationRecorded;
+    persist(run, state)?;
+    let mut notes = vec![format!(
+        "ordinary baseline result retained at {}; no comparison policy or candidate has been qualified",
+        row_path.display()
+    )];
+    notes.extend(settle_adoption_claims(run, AdoptionClaimStatus::Completed)?);
+    Ok(notes)
+}
+
+/// Preserve the mistaken row byte-for-byte, retain the admitted-but-unstarted
+/// evidence, and clear the false settled state before one new attempt is made.
+/// The original row is never rewritten, and a second recovery must find the
+/// exact same bytes.
+fn recover_unstarted_row(
+    run: &mut Run,
+    inputs: &BaselineQualificationInputs,
+    state: &mut BaselineQualificationState,
+    solution: &super::improvement_comparison::Solution,
+    row_path: &Path,
+    unstarted: &super::improvement_comparison::UnstartedAcceptance,
+    semantic: &Option<SemanticAcceptance>,
+    runtime: &ArmRuntime,
+) -> io::Result<()> {
+    let row_bytes = fs::read(row_path)?;
+    if row_bytes.len() as u64 > MAX_RUN_SPEC_BYTES {
+        return Err(invalid(
+            "the retained accounting row exceeds its owner's bound",
+        ));
+    }
+    let row: Value = serde_json::from_slice(&row_bytes).map_err(|error| {
+        invalid(format!(
+            "the retained accounting row is not valid JSON: {error}"
+        ))
+    })?;
+    if row["accepted"].as_bool() != Some(false) {
+        return Err(invalid(
+            "the retained accounting row does not retain the original false acceptance; preserve it and reconcile",
+        ));
+    }
+    let check = &row["checks"][0];
+    if check["id"].as_str() != Some("independent-acceptance")
+        || check["executed"] != true
+        || check["passed"].as_bool() != Some(false)
+        || !same_digest(&check["evidence_sha256"], &unstarted.record_sha256)
+    {
+        return Err(invalid(
+            "the retained accounting row does not bind the exact unstarted oracle record; preserve it and reconcile",
+        ));
+    }
+    if row["matched"]["acceptance_request_sha256"]
+        .as_str()
+        .is_none_or(|value| !value.eq_ignore_ascii_case(&inputs.acceptance.request_sha256))
+        || row["matched"]["task_source_revision"].as_str() != Some(inputs.task.revision.as_str())
+        || row["matched"]["task_base"].as_str() != state.task_base.as_deref()
+        || row["matched"]["task_prompt_sha256"].as_str() != Some(inputs.task_prompt.sha256.as_str())
+        || row["matched"]["runtime_source_sha256"].as_str()
+            != Some(runtime.variant.source_sha256.as_str())
+        || row["matched"]["capacity"].as_u64() != Some(state.capacity as u64)
+    {
+        return Err(invalid(
+            "the retained accounting row binds different frozen task, runtime or acceptance identities; preserve it and reconcile",
+        ));
+    }
+    if row["solution_revision"].as_str() != Some(solution.revision.as_str())
+        || row["report_sha256"].as_str() != state.report_sha256.as_deref()
+    {
+        return Err(invalid(
+            "the retained accounting row binds a different source revision or executor report; preserve it and reconcile",
+        ));
+    }
+    let expected_workflow = serde_json::to_value(&state.workflow)?;
+    if row["workflow"] != expected_workflow {
+        return Err(invalid(
+            "the retained accounting row binds a different workflow; preserve it and reconcile",
+        ));
+    }
+    verify_semantic_row_check(&row, semantic)?;
+
+    let preserved = run
+        .store
+        .root()
+        .join("baseline-qualification/row-unstarted.json");
+    retain_exact_bytes(&preserved, &row_bytes)?;
+    let row_sha256 = build_identity::hash_bytes(&row_bytes);
+    if let Some(existing) = &state.row_unstarted {
+        if !same_retained_place(existing, &preserved)? {
+            return Err(invalid(
+                "a different superseded accounting row is already retained; preserve it and reconcile",
+            ));
+        }
+    }
+    if let Some(existing) = &state.row_unstarted_sha256 {
+        if !existing.eq_ignore_ascii_case(&row_sha256) {
+            return Err(invalid(
+                "the retained superseded accounting row changed; preserve it and reconcile",
+            ));
+        }
+    }
+    state.row_unstarted = Some(preserved.clone());
+    state.row_unstarted_sha256 = Some(row_sha256.clone());
+    let entry = retain_unstarted_acceptance(
+        run,
+        state,
+        unstarted,
+        Some((preserved.as_path(), row_sha256.as_str())),
+    )?;
+    state.row = None;
+    state.accepted = None;
+    state.oracle = None;
+    state.condition = Some(incomplete_condition(&entry));
+    persist(run, state)
+}
+
+fn retain_unstarted_acceptance(
+    run: &Run,
+    state: &mut BaselineQualificationState,
+    unstarted: &super::improvement_comparison::UnstartedAcceptance,
+    superseded: Option<(&Path, &str)>,
+) -> io::Result<UnstartedOracleEvidence> {
+    if let Some(existing) = state.unstarted_oracles.iter_mut().find(|entry| {
+        entry
+            .oracle_sha256
+            .eq_ignore_ascii_case(&unstarted.record_sha256)
+            && entry
+                .started_sha256
+                .eq_ignore_ascii_case(&unstarted.started_sha256)
+            && entry
+                .failure_sha256
+                .eq_ignore_ascii_case(&unstarted.failure_sha256)
+    }) {
+        retain_exact_copy(
+            &unstarted.record_path,
+            &existing.oracle,
+            &existing.oracle_sha256,
+        )?;
+        retain_exact_copy(
+            &unstarted.started_path,
+            &existing.started,
+            &existing.started_sha256,
+        )?;
+        retain_exact_copy(
+            &unstarted.failure_path,
+            &existing.failure,
+            &existing.failure_sha256,
+        )?;
+        if let Some((row, row_sha256)) = superseded {
+            if let Some(retained) = &existing.superseded_row {
+                if !same_retained_place(retained, row)? {
+                    return Err(invalid(
+                        "a different superseded accounting row is already recorded for this unstarted check; preserve it and reconcile",
+                    ));
+                }
+            } else {
+                existing.superseded_row = Some(row.to_path_buf());
+            }
+            if let Some(retained) = &existing.superseded_row_sha256 {
+                if !retained.eq_ignore_ascii_case(row_sha256) {
+                    return Err(invalid(
+                        "the recorded superseded accounting row digest changed; preserve it and reconcile",
+                    ));
+                }
+            } else {
+                existing.superseded_row_sha256 = Some(row_sha256.to_owned());
+            }
+        }
+        return Ok(existing.clone());
+    }
+
+    let attempt = state.unstarted_oracles.len() as u32 + 1;
+    let directory = run
+        .store
+        .root()
+        .join(format!("baseline-qualification/recovery/attempt-{attempt}"));
+    let oracle = directory.join("oracle.json");
+    let started = directory.join("oracle-started.json");
+    let failure = directory.join("failure.json");
+    retain_exact_copy(&unstarted.record_path, &oracle, &unstarted.record_sha256)?;
+    retain_exact_copy(&unstarted.started_path, &started, &unstarted.started_sha256)?;
+    retain_exact_copy(&unstarted.failure_path, &failure, &unstarted.failure_sha256)?;
+    let entry = UnstartedOracleEvidence {
+        attempt,
+        oracle,
+        oracle_sha256: unstarted.record_sha256.clone(),
+        started,
+        started_sha256: unstarted.started_sha256.clone(),
+        failure,
+        failure_sha256: unstarted.failure_sha256.clone(),
+        started_at: unstarted.started_at.clone(),
+        ended_at: unstarted.ended_at.clone(),
+        elapsed_seconds: unstarted.elapsed_seconds.clone(),
+        stage: unstarted.stage.clone(),
+        message: unstarted.message.clone(),
+        legacy: unstarted.legacy,
+        request_sha256: unstarted.request_sha256.clone(),
+        superseded_row: superseded.map(|(row, _)| row.to_path_buf()),
+        superseded_row_sha256: superseded.map(|(_, sha)| sha.to_owned()),
+        replacement: Some(next_free_oracle_path(run)?),
+    };
+    state.unstarted_oracles.push(entry.clone());
+    Ok(entry)
+}
+
+fn retain_exact_copy(source: &Path, target: &Path, expected_sha256: &str) -> io::Result<()> {
+    let bytes = fs::read(source)?;
+    let actual = build_identity::hash_bytes(&bytes);
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        return Err(invalid(
+            "the retained unstarted evidence changed; preserve it and reconcile instead of replacing it",
+        ));
+    }
+    retain_exact_bytes(target, &bytes)
+}
+
+fn retain_exact_bytes(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    if target.exists() {
+        if fs::read(target)? != bytes {
+            return Err(invalid(format!(
+                "retained evidence {} changed; preserve it and reconcile instead of rewriting",
+                target.display()
+            )));
+        }
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| invalid("retained evidence path has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let (temp, mut file) = {
+        let mut sequence = 0u32;
+        loop {
+            let candidate =
+                target.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    sequence = sequence.checked_add(1).ok_or_else(|| {
+                        invalid(format!(
+                            "the retained evidence {} could not find a free staging name",
+                            target.display()
+                        ))
+                    })?;
+                }
+                Err(error) => {
+                    return Err(invalid(format!(
+                        "the retained evidence {} could not be staged: {error}",
+                        target.display()
+                    )));
+                }
+            }
+        }
+    };
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::hard_link(&temp, target)?;
+    fs::remove_file(&temp)?;
+    Ok(())
+}
+
+fn incomplete_condition(evidence: &UnstartedOracleEvidence) -> String {
+    format!(
+        "independent checker attempt {} was proven never to start ({}: {}); its exact evidence is retained at {}, and this qualification is incomplete, not a task-quality rejection; an explicit later resume may retry after the admission cause is removed",
+        evidence.attempt,
+        evidence.stage,
+        evidence.message,
+        evidence.failure.display()
+    )
+}
+
+fn unstarted_intervention(evidence: &UnstartedOracleEvidence) -> Value {
+    json!({
+        "kind":"independent-check-unstarted",
+        "attempt":evidence.attempt,
+        "stage":evidence.stage,
+        "legacy":evidence.legacy,
+        "message":evidence.message,
+        "oracle":evidence.oracle,
+        "oracle_sha256":evidence.oracle_sha256,
+        "started":evidence.started,
+        "started_sha256":evidence.started_sha256,
+        "failure":evidence.failure,
+        "failure_sha256":evidence.failure_sha256,
+        "started_at":evidence.started_at,
+        "ended_at":evidence.ended_at,
+        "elapsed_seconds":evidence.elapsed_seconds,
+        "superseded_row":evidence.superseded_row,
+        "superseded_row_sha256":evidence.superseded_row_sha256,
+        "replacement":evidence.replacement,
+    })
+}
+
+fn oracle_record_name(name: &str) -> bool {
+    name == "oracle.json" || (name.starts_with("oracle-retry-") && name.ends_with(".json"))
+}
+
+fn unaccounted_oracle_records(
+    run: &Run,
+    state: &BaselineQualificationState,
+) -> io::Result<Vec<PathBuf>> {
+    let directory = run.store.root().join("baseline-qualification");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !path.is_file() || !oracle_record_name(name) {
+            continue;
+        }
+        if let Some(current) = state.oracle.as_deref() {
+            if same_retained_place(current, &path)? {
+                continue;
+            }
+        }
+        let digest = build_identity::hash_file(&path)?;
+        if state
+            .unstarted_oracles
+            .iter()
+            .any(|evidence| evidence.oracle_sha256.eq_ignore_ascii_case(&digest))
+        {
+            continue;
+        }
+        records.push(path);
+    }
+    records.sort();
+    Ok(records)
+}
+
+fn next_free_oracle_path(run: &Run) -> io::Result<PathBuf> {
+    let directory = run.store.root().join("baseline-qualification");
+    let primary = directory.join("oracle.json");
+    if !primary.exists() {
+        return Ok(primary);
+    }
+    let mut highest = 0u32;
+    if directory.is_dir() {
+        for entry in fs::read_dir(&directory)? {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(number) = name
+                .strip_prefix("oracle-retry-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|number| number.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            highest = highest.max(number);
+        }
+    }
+    let next = highest
+        .checked_add(1)
+        .ok_or_else(|| invalid("the oracle retry attempt number is exhausted"))?;
+    Ok(directory.join(format!("oracle-retry-{next}.json")))
+}
+
 fn load_retained_acceptance(
     oracle_path: &Path,
     inputs: &harness_core::improvement_loop::AcceptanceInputs,
-) -> io::Result<super::improvement_comparison::Acceptance> {
+) -> io::Result<super::improvement_comparison::OracleOutcome> {
     use super::improvement_comparison as accounting;
     if !oracle_path.is_file() {
         return Err(invalid(
@@ -3983,17 +4430,8 @@ fn load_retained_acceptance(
             "retained independent acceptance does not bind the frozen checker and task contract",
         ));
     }
-    Ok(accounting::Acceptance {
-        passed: record["passed"] == true && record["checker_executed"] == true,
-        record_path: oracle_path.to_path_buf(),
-        started_at: record["started_at"]
-            .as_f64()
-            .ok_or_else(|| invalid("oracle start time is missing"))?,
-        ended_at: record["ended_at"]
-            .as_f64()
-            .ok_or_else(|| invalid("oracle end time is missing"))?,
-        workspace_preparation: "source-only-fresh-workspace".to_owned(),
-    })
+    accounting::classify_oracle_record(&record, oracle_path, &inputs.request_sha256)
+        .map_err(invalid)
 }
 
 struct SemanticAcceptance {
