@@ -1167,6 +1167,25 @@ lost, mismatched, live, truncated or otherwise partial stream remains an
 explicit gap or refusal before any reviewer dispatch. `--resume` reuses the
 frozen declaration, packet and captured evidence.
 
+To keep an already prepared reviewer's homes, declare optional
+`reviewer_runtime` as the exact prior native `ArmRuntime` file identity
+(`path` and `sha256`). Preparation updates those same homes to the explicitly
+requested build through the existing installation owner and writes a new
+runtime receipt under the new review directory. It preserves native hook
+approval and unrelated settings; it never edits the prior receipt or cursor.
+The frozen `semantic_review.runtime.native_config` remains required, and the
+installed configuration must also satisfy the native read-only reviewer
+contract. Refresh preserves the installed configuration rather than copying
+the frozen file over it. The ordinary and reviewer homes must stay separate.
+Qualification's `runtime.reuse` is a different, immutable adoption contract
+and is refused here instead of silently selecting a fresh home.
+
+An interrupted recorded refresh can resume before the first reviewer dispatch,
+including when the native update completed before the new receipt was saved.
+A missing receipt after preparation or dispatch remains a refusal; it never
+authorizes another installation or a repeated review. Keep the prior runtime,
+the frozen declaration and the new review directory for recovery.
+
 `start` validates the strict schema-1 run inputs (project, board, OpenSpec
 change, base revision, writable scope, runner profile, evidence root, oracle,
 publication scope and any removal scope, plus the declared local runner,

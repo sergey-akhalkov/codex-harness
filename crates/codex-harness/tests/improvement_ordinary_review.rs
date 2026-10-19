@@ -229,6 +229,168 @@ fn ordinary_setup_with(name: &str, mode: ActionEvidenceMode) -> OrdinarySetup {
     }
 }
 
+fn use_prepared_reviewer(setup: &mut OrdinarySetup) -> (PathBuf, Vec<u8>) {
+    assert_prepared(setup);
+    let previous = setup.review.join("reviewer/runtime.json");
+    let bytes = fs::read(&previous).unwrap();
+    let mut declaration: Value =
+        serde_json::from_slice(&fs::read(&setup.declaration).unwrap()).unwrap();
+    declaration["reviewer_runtime"] = json!({
+        "path": previous,
+        "sha256": build_identity::hash_bytes(&bytes),
+    });
+    setup.review = setup.fixture.root.join("ordinary-refreshed-review");
+    setup.declaration = setup.fixture.root.join("ordinary-refreshed-review.json");
+    fs::write(
+        &setup.declaration,
+        serde_json::to_vec_pretty(&declaration).unwrap(),
+    )
+    .unwrap();
+    (previous, bytes)
+}
+
+#[test]
+fn existing_reviewer_refresh_preserves_homes_and_accepts_once() {
+    let _guard = INSTALL.lock().unwrap();
+    let mut setup = ordinary_setup("ordinary-review-refresh");
+    let original_state = setup.review.join("state.json");
+    let (previous, previous_bytes) = use_prepared_reviewer(&mut setup);
+    let original_state_bytes = fs::read(&original_state).unwrap();
+    let old: Value = serde_json::from_slice(&previous_bytes).unwrap();
+    let launcher = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+    fixture_build(
+        &setup.fixture.state,
+        "refreshed-build",
+        &setup.fixture.proj,
+        &launcher,
+        "refreshed",
+    );
+    let requested_build = setup.fixture.state.join("builds/refreshed-build");
+    let mut declaration: Value =
+        serde_json::from_slice(&fs::read(&setup.declaration).unwrap()).unwrap();
+    declaration["semantic_review"]["runtime"]["build"] = json!(requested_build);
+    fs::write(
+        &setup.declaration,
+        serde_json::to_vec_pretty(&declaration).unwrap(),
+    )
+    .unwrap();
+
+    assert_prepared(&setup);
+    let receipt = setup.review.join("reviewer/runtime.json");
+    let runtime_bytes = fs::read(&receipt).unwrap();
+    let current: Value = serde_json::from_slice(&runtime_bytes).unwrap();
+    for name in ["home", "userHome", "dependencyUserHome"] {
+        assert_eq!(current[name], old[name], "the {name} must be preserved");
+    }
+    assert_eq!(
+        PathBuf::from(current["variant"]["build"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        requested_build.canonicalize().unwrap(),
+    );
+    assert!(!setup.review.join("reviewer/home").exists());
+    assert_eq!(fs::read(&previous).unwrap(), previous_bytes);
+    assert_eq!(fs::read(&original_state).unwrap(), original_state_bytes);
+    assert_prepared(&setup);
+    assert_eq!(fs::read(&receipt).unwrap(), runtime_bytes);
+
+    let (_, completed) = dispatch_review(
+        &setup,
+        &accepted_judgment(),
+        "refreshed-accepted",
+        "semantic-review-1",
+    );
+    assert_eq!(completed["observation"]["state"], "completed");
+    let settled = setup.resume(&accepted_judgment(), "refreshed-settle");
+    assert!(settled.status.success(), "{}", text(&settled));
+    assert!(text(&settled).contains("ordinary review accepted"));
+    assert_review_settled(&setup, "ordinary review accepted");
+    assert_eq!(review_attempts(&setup).len(), 1);
+    assert_eq!(fs::read(&previous).unwrap(), previous_bytes);
+}
+
+#[test]
+fn recorded_reviewer_refresh_intent_recovers_without_replacing_established_runtime() {
+    let _guard = INSTALL.lock().unwrap();
+    let mut setup = ordinary_setup("ordinary-review-refresh-recovery");
+    let (previous, previous_bytes) = use_prepared_reviewer(&mut setup);
+    assert_prepared(&setup);
+    let receipt = setup.review.join("reviewer/runtime.json");
+    let mut state = review_state(&setup);
+    state["semantic_review"] =
+        serde_json::to_value(harness_core::improvement_loop::SemanticReviewState {
+            runtime: Some(receipt.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    fs::write(
+        setup.review.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    // Reproduce a completed native update followed by loss of the caller's
+    // receipt write, before packet creation or any model dispatch.
+    fs::remove_file(&receipt).unwrap();
+    fs::remove_dir_all(setup.review.join("packet")).unwrap();
+    let (_, completed) = dispatch_review(
+        &setup,
+        &accepted_judgment(),
+        "refresh-recovered",
+        "semantic-review-1",
+    );
+    assert_eq!(completed["observation"]["state"], "completed");
+    let settled = setup.resume(&accepted_judgment(), "refresh-recovered-settle");
+    assert!(settled.status.success(), "{}", text(&settled));
+    assert!(text(&settled).contains("ordinary review accepted"));
+    assert_eq!(review_attempts(&setup).len(), 1);
+    assert_eq!(fs::read(&previous).unwrap(), previous_bytes);
+
+    // Once a reviewer has used the prepared runtime, deleting its receipt
+    // must not reauthorize a refresh or replay the review.
+    fs::remove_file(&receipt).unwrap();
+    let refused = setup.resume(&accepted_judgment(), "missing-established-runtime");
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(!receipt.exists());
+    assert_eq!(review_attempts(&setup).len(), 1);
+}
+
+#[test]
+fn reviewer_refresh_refuses_changed_input_and_writable_native_authority() {
+    let _guard = INSTALL.lock().unwrap();
+    let mut setup = ordinary_setup("ordinary-review-refresh-refusal");
+    let (previous, previous_bytes) = use_prepared_reviewer(&mut setup);
+    let original: Value = serde_json::from_slice(&fs::read(&setup.declaration).unwrap()).unwrap();
+    let mut changed = original.clone();
+    changed["reviewer_runtime"]["sha256"] = json!("0".repeat(64));
+    fs::write(
+        &setup.declaration,
+        serde_json::to_vec_pretty(&changed).unwrap(),
+    )
+    .unwrap();
+    let refused = setup.prepare();
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(!setup.review.join("reviewer").exists());
+
+    let old: Value = serde_json::from_slice(&previous_bytes).unwrap();
+    let config = PathBuf::from(old["configuration"]["path"].as_str().unwrap());
+    let bytes = fs::read_to_string(&config).unwrap();
+    assert!(bytes.contains("read-only"));
+    let writable = bytes.replace("read-only", "danger-full-access");
+    fs::write(&config, &writable).unwrap();
+    setup.review = setup.fixture.root.join("ordinary-refresh-writable-refused");
+    fs::write(
+        &setup.declaration,
+        serde_json::to_vec_pretty(&original).unwrap(),
+    )
+    .unwrap();
+    let refused = setup.prepare();
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(text(&refused).contains("read-only"), "{}", text(&refused));
+    assert!(!setup.review.join("reviewer").exists());
+    assert_eq!(fs::read_to_string(&config).unwrap(), writable);
+    assert_eq!(fs::read(&previous).unwrap(), previous_bytes);
+}
+
 #[test]
 fn retained_ordinary_completion_prepares_once_without_model_dispatch() {
     let _guard = INSTALL.lock().unwrap();

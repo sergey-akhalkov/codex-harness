@@ -45,6 +45,10 @@ struct OrdinaryReviewDeclaration {
     lead_session: Option<String>,
     action_evidence_root: PathBuf,
     semantic_review: SemanticReviewInputs,
+    /// Refresh this explicitly retained native runtime in its existing homes.
+    /// The new receipt belongs to this review; historical evidence is immutable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewer_runtime: Option<FileIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -611,16 +615,24 @@ fn resume(review: &Path, declaration_path: Option<PathBuf>) -> io::Result<i32> {
 
     let reviewer_root = review_root.join("reviewer");
     let runtime_path = reviewer_root.join("runtime.json");
-    read_bounded_file(
-        &runtime_path,
-        "retained ordinary reviewer runtime receipt",
-    )
-    .map_err(|error| {
-        invalid(format!(
-            "the ordinary reviewer runtime receipt is missing or changed at {}; run improve review --prepare again before resuming: {error}",
-            runtime_path.display()
-        ))
-    })?;
+    let refresh_pending = declaration.reviewer_runtime.is_some()
+        && state.cursor.attempts.is_empty()
+        && state.semantic_review.as_ref().is_some_and(|review| {
+            review.runtime.as_ref() == Some(&runtime_path)
+                && review.home.is_none()
+                && review.binding.is_none()
+        });
+    let receipt = read_bounded_file(&runtime_path, "retained ordinary reviewer runtime receipt");
+    if !refresh_pending
+        || !matches!(&receipt, Err(error) if error.kind() == io::ErrorKind::NotFound)
+    {
+        receipt.map_err(|error| {
+            invalid(format!(
+                "the ordinary reviewer runtime receipt is missing or changed at {}; run improve review --prepare again before resuming: {error}",
+                runtime_path.display()
+            ))
+        })?;
+    }
     if state.semantic_review.is_none() {
         return Err(invalid(
             "the ordinary review has no prepared reviewer state; run improve review --prepare before resuming",
@@ -636,10 +648,9 @@ fn resume(review: &Path, declaration_path: Option<PathBuf>) -> io::Result<i32> {
         state,
         subject,
     );
-    // Resume may load the retained runtime, but it must never install a
-    // replacement after preparation. The receipt check above makes the shared
-    // loader take its existing-runtime branch; every declaration, completion,
-    // criteria and runtime binding is validated before this point.
+    // Only an explicitly recorded refresh intent may finish the same native
+    // operation before any reviewer dispatch. A missing established receipt
+    // never authorizes a replacement. All frozen inputs are checked above.
     prepare_reviewer(&mut host, &declaration)?;
     host.persist()?;
 
@@ -737,12 +748,55 @@ fn review_subject(
     })
 }
 
+/// Read the exact prior native receipt without treating an old runtime as
+/// unchanged or reconstructing a qualification run.
+fn declared_reviewer_runtime(
+    declaration: &OrdinaryReviewDeclaration,
+) -> io::Result<Option<improvement_runtime::ArmRuntime>> {
+    let Some(identity) = &declaration.reviewer_runtime else {
+        return Ok(None);
+    };
+    let bytes = read_bounded_file(&identity.path, "declared prior reviewer runtime")?;
+    if build_identity::hash_bytes(&bytes) != identity.sha256 {
+        return Err(invalid(
+            "the declared prior reviewer runtime changed; preserve its exact receipt instead of selecting another home",
+        ));
+    }
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        invalid(format!(
+            "the declared prior reviewer runtime is not a native runtime receipt: {error}"
+        ))
+    })
+}
+
+/// Apply the same declared native reviewer authority to the configuration
+/// actually installed in a retained home. Refresh preserves that configuration;
+/// it does not silently replace it with the frozen input file.
+fn validate_installed_reviewer_config(
+    declaration: &OrdinaryReviewDeclaration,
+    runtime: &improvement_runtime::ArmRuntime,
+) -> io::Result<()> {
+    let configuration = runtime.configuration.as_ref().ok_or_else(|| {
+        invalid("the retained reviewer has no native configuration; preserve its home and restore the declared read-only reviewer configuration")
+    })?;
+    let bytes = read_bounded_file(&configuration.path, "installed reviewer configuration")?;
+    let mut installed = declaration.semantic_review.clone();
+    installed.runtime.native_config = Some(FileIdentity {
+        path: configuration.path.clone(),
+        sha256: build_identity::hash_bytes(&bytes),
+    });
+    installed.validate().map_err(|error| {
+        invalid(format!("the installed reviewer configuration does not meet its declared native authority: {error}"))
+    })
+}
+
 fn prepare_reviewer(
     host: &mut OrdinaryReviewHost,
     declaration: &OrdinaryReviewDeclaration,
 ) -> io::Result<()> {
     let runtime_path = host.reviewer_root.join("runtime.json");
-    let mut review = host.state.semantic_review.take().unwrap_or_default();
+    let previous = declared_reviewer_runtime(declaration)?;
+    let mut review = host.state.semantic_review.clone().unwrap_or_default();
     if let Some(recorded) = &review.runtime
         && recorded != &runtime_path
     {
@@ -754,15 +808,73 @@ fn prepare_reviewer(
         declaration.task.source.clone(),
         declaration.task_prompt.path.clone(),
         declaration.semantic_review.criteria.path.clone(),
+        declaration.completion.codex_home.clone(),
     ];
     if let Some(config) = &declaration.semantic_review.runtime.native_config {
         protected.push(config.path.clone());
     }
-    let reviewer = load_or_install_reviewer_runtime(
-        &host.reviewer_root,
-        &declaration.semantic_review,
-        protected,
-    )?;
+    if let Some(identity) = &declaration.reviewer_runtime {
+        protected.push(identity.path.clone());
+    }
+    let reviewer = if let Some(previous) = &previous
+        && !runtime_path.exists()
+    {
+        improvement_runtime::verify_adoption_placement(previous, &protected)?;
+        validate_installed_reviewer_config(declaration, previous)?;
+        let inputs = &declaration.semantic_review.runtime;
+        let variant = super::prepare_variant(
+            &inputs.state,
+            harness_core::improvement_experiment::Arm::Baseline,
+            &inputs.label,
+            &inputs.build,
+        )?;
+        // Persist the exact declared operation before its installation effects.
+        // A missing fresh receipt can then be recovered without authorizing a
+        // replacement after a reviewer has already started.
+        review.runtime = Some(runtime_path.clone());
+        host.state.semantic_review = Some(review.clone());
+        host.persist()?;
+        let refreshed = improvement_runtime::refresh_arm(
+            previous,
+            &improvement_runtime::ArmRequest {
+                variant,
+                home: previous.home.clone(),
+                user_home: previous.user_home.clone(),
+                dependency_user_home: previous.dependency_user_home.clone(),
+                upstream: inputs.upstream.clone(),
+                timeout: std::time::Duration::from_secs(300),
+                client: inputs.client.clone(),
+                private_inputs: inputs.private_inputs.clone(),
+                protected,
+            },
+        )?;
+        fs::create_dir_all(&host.reviewer_root)?;
+        super::write_json_atomic(&runtime_path, &refreshed)?;
+        refreshed
+    } else {
+        load_or_install_reviewer_runtime(
+            &host.reviewer_root,
+            &declaration.semantic_review,
+            protected,
+        )?
+    };
+    if let Some(previous) = &previous {
+        for (name, recorded, actual) in [
+            ("home", &previous.home, &reviewer.home),
+            ("user home", &previous.user_home, &reviewer.user_home),
+            (
+                "dependency home",
+                &previous.dependency_user_home,
+                &reviewer.dependency_user_home,
+            ),
+        ] {
+            if !same_retained_place(recorded, actual)? {
+                return Err(invalid(format!(
+                    "the ordinary reviewer {name} changed from its explicitly declared prior runtime; preserve the owned homes",
+                )));
+            }
+        }
+    }
     if let Some(recorded) = &review.home
         && !same_retained_place(recorded, &reviewer.home)?
     {
@@ -770,6 +882,7 @@ fn prepare_reviewer(
             "the retained ordinary reviewer home changed; preserve the installed home instead of selecting a fallback",
         ));
     }
+    validate_installed_reviewer_config(declaration, &reviewer)?;
     let binding = QualificationBindingIdentity::of(&harness_core::orchestration_config::binding(
         &reviewer.home,
         &declaration.semantic_review.profile,
@@ -819,6 +932,20 @@ fn validate_declaration(declaration: &OrdinaryReviewDeclaration) -> io::Result<(
     }
     declaration.task.validate()?;
     declaration.semantic_review.validate()?;
+    if declaration.semantic_review.runtime.reuse.is_some() {
+        return Err(invalid(
+            "ordinary review does not adopt qualification cursors; declare reviewer_runtime with the exact prior native runtime receipt to preserve its homes",
+        ));
+    }
+    if let Some(identity) = &declaration.reviewer_runtime
+        && (!identity.path.is_absolute()
+            || identity.sha256.len() != 64
+            || !identity.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(invalid(
+            "reviewer_runtime must identify an absolute prior native receipt with its SHA256",
+        ));
+    }
     if !declaration.task_prompt.path.is_absolute()
         || !declaration.task_prompt.path.is_file()
         || fs::metadata(&declaration.task_prompt.path)?.len() > MAX_RUN_SPEC_BYTES
