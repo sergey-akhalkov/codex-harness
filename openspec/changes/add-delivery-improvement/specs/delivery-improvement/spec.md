@@ -212,7 +212,7 @@ Only the real lead SHALL admit, reject or defer recommendations and create/updat
 
 ### Requirement: Improvements receive proportionate execution opportunities
 
-A ready accepted improvement SHALL receive a suitable allocation opportunity or a concrete higher-priority conflict/blocker and return condition. Main work SHALL NOT wait for reflection. One ordinary improvement implementation SHALL run at a time within existing capacity; urgent correctness/integrity work SHALL retain existing handling. Cheaper-than-handoff corrections can be completed directly.
+A ready accepted improvement SHALL receive a suitable allocation opportunity or a concrete higher-priority conflict/blocker and return condition. Ordinary acceptance and delivery SHALL NOT wait for reflection or improvement implementation. One ordinary improvement implementation SHALL run at a time within existing capacity; urgent correctness/integrity work SHALL retain existing handling. Cheaper-than-handoff corrections can be completed directly.
 
 #### Scenario: Suitable capacity becomes available
 - **WHEN** a ready improvement has no higher-priority conflict
@@ -263,7 +263,7 @@ Correctness SHALL be verified through the real affected entry point. Benefit SHA
 - **THEN** the declared horizon includes relevant work after the trigger, counts complete seed/reflection/improvement costs and does not credit reflection for the source task's earlier success
 
 #### Scenario: The experiment is not qualified
-- **WHEN** baseline evidence, frozen identities, meaningful thresholds or stopping conditions are missing
+- **WHEN** baseline evidence, frozen identities, the benefit mechanism and relevant use to examine, quality acceptance and horizon, complete cost coverage or stopping conditions are missing
 - **THEN** candidate model dispatch, evaluation and adoption are held; planning validity or working transport cannot substitute
 
 #### Scenario: Isolated implementation proceeds during qualification
@@ -306,10 +306,22 @@ Global delivery SHALL include both skills, purpose metadata, event trigger, nati
 - **WHEN** an owned installation or activation cannot complete
 - **THEN** prior accepted behavior can be restored without erasing boards, retained results, unrelated settings or unfinished executor work
 
-### Requirement: Adoption preserves quality and improves both costs
+### Requirement: Adoption preserves quality and lowers the cost of future work
 
-Adoption of automatic reflection SHALL require quality no worse than the control, no P0/P1 regression, and both predeclared useful time and native-token cost reductions. Margins and the quality horizon SHALL be frozen before candidate model dispatch. One unit's success SHALL NOT offset another unit's quality regression; missing or verdict-changing evidence SHALL remain inconclusive.
+Adoption SHALL require quality no worse than the control, no P0/P1 regression and a grounded lead judgment that lasting benefit justifies full costs and risks. The objective SHALL be cheaper future changes and maintenance with timely useful delivery. Benefits SHALL NOT be limited to a checklist or mandatory savings. One unit's success SHALL NOT offset another's quality regression; decision-changing uncertainty SHALL remain inconclusive.
 
 #### Scenario: The control already accepts every task
 - **WHEN** both arms independently satisfy every task and neither has a quality regression within the frozen horizon
-- **THEN** equal success satisfies the quality condition, while adoption still requires both predeclared useful cost reductions and all other evidence gates
+- **THEN** equal success satisfies the quality condition, while adoption still requires a concrete justified benefit and all other applicable acceptance checks
+
+#### Scenario: Maintenance improves without immediate savings
+- **WHEN** real use and checks support easier future changes or maintenance while time or token use does not decrease
+- **THEN** the lead can accept the change with its concrete benefit, full costs, trade-offs and forecast limits recorded in the existing decision owner, without a numeric savings prerequisite, score or assertion of confidence substituting for grounded judgment
+
+#### Scenario: An improvement adds more burden than value
+- **WHEN** added machinery, context burden, operating friction or delayed useful delivery outweighs the supported benefit
+- **THEN** the lead rejects or simplifies the change despite passing functional checks, retaining evidence and restoring accepted behavior on rejection
+
+#### Scenario: Improvements proceed alongside ordinary delivery
+- **WHEN** reflection and improvement implementation have available capacity and no blocking dependency on ordinary work
+- **THEN** they can proceed in parallel without gating ordinary acceptance or delivery; accounting retains all participant costs, counts overlapping elapsed spans once and distinguishes actual interference from background duration

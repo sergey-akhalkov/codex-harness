@@ -106,7 +106,7 @@ An installed command SHALL expose feedback recording, agent-selected triage, led
 
 ### Requirement: Verified improvement admission has an explicit basis
 
-While `delivery-improvement` is active, the lead SHALL be able to admit a bounded correction from one attributable observation without waiting for votes. Admission SHALL record the active mandate, evidence, diagnosed cause, owned remedy, expected relevant use and acceptance check on the existing item. It SHALL retain required specification and evaluation gates. A hypothesis or role-generated assertion alone SHALL NOT qualify.
+While `delivery-improvement` is active, the lead SHALL be able to admit a bounded correction from one attributable observation without votes. The existing item SHALL record mandate, evidence, cause, owned remedy, relevant use and acceptance, retaining specification and evaluation gates. Grounded judgment SHALL weigh lasting benefit against full costs and recurring burden without mandatory savings or a closed benefit checklist. An assertion alone SHALL NOT qualify.
 
 #### Scenario: A single reproduced failure has a bounded remedy
 - **WHEN** the lead verifies a recurring preparation defect, identifies its owning tool and accepts an in-scope checkable correction
@@ -123,6 +123,10 @@ While `delivery-improvement` is active, the lead SHALL be able to admit a bounde
 #### Scenario: Ordinary optimization has an uncertain opportunity to repay
 - **WHEN** a proposed optimization lacks credible relevant reuse or its expected benefit does not justify investigation, implementation, verification and displaced delivery
 - **THEN** the lead records a bounded rejection or deferral on the existing item rather than assigning work merely to justify reflection; urgent correctness and integrity work retains its existing consequence path
+
+#### Scenario: One observation supports a lasting improvement
+- **WHEN** current evidence supports a bounded correction that reduces future change or maintenance cost while preserving quality and timely useful delivery
+- **THEN** the lead can admit it with a concise reason and material trade-offs even without time/token savings, without a new score or repeated-proof quota
 
 
 ### Requirement: Improvement purpose survives task creation and delegation

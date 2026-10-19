@@ -7,8 +7,8 @@ All tasks remain subject to actual checks and the preserved evaluation gate. The
 - [x] 1.1 Verify the delivered role resolver and shared pool/admission contracts needed by reflection, and remove the withdrawn observer's active code/role/skill selection while preserving private recovery evidence. Check actual installed revision, focused native role/admission behavior and absence of the observer from delivered selection.
   - The installed role/pool source identities match the checked checkout. Role checks passed 8/8; the native CLI pool/concurrency check passed, including refusal despite free directory capacity. Installed selection retains the two ordinary roles and no withdrawn observer module or skill; recovery inputs remain inactive. This establishes the existing foundations, not delivery of reflection admission or the new chain.
 - [ ] 1.2 Exercise native executor/lead forks, stable source boundaries, read-only tool authority, inherited-goal suppression, actual role/model binding, visible surfaces and automatic delivery to the actual main session. Exercise beads journal setup, closure identity, source/retention gaps and restart with an owned native board. Document verified capabilities and close required session-owner gaps before dependent model use.
-- [ ] 1.3 Requalify the design's three real-task pairs and three-use preventive sequence for post-acceptance effects. Freeze accepted seed/subsequent task inputs, independent acceptance, control observations, model/effort, capacity, balanced order, practical time/token margins, quality horizon, uncertainty and stopping before candidate model dispatch. Verify missing criteria refuse dispatch; retain all adverse/no-benefit cases and complete costs.
-  - Declare quality noninferiority, no P0/P1 regression and both useful cost reductions. Update the native conjunction owner and verify equal fully successful arms, per-unit regression refusal, missing evidence and both margin failures; retain strict behavior for experiments that explicitly require quality improvement.
+- [ ] 1.3 Requalify the design's three real-task pairs and three-use preventive sequence for post-acceptance effects. Freeze accepted seed/subsequent task inputs, independent acceptance, control observations, model/effort, capacity, balanced order, concrete benefit mechanism and relevant use, quality horizon, uncertainty and stopping before candidate model dispatch. Verify missing criteria refuse dispatch; retain all adverse/no-benefit cases and complete costs.
+  - Declare quality noninferiority and no P0/P1 regression. Reuse the existing outcome/maintenance decision owners for grounded engineering judgment about cheaper future changes and maintenance, without mandatory time/token savings or a closed benefit checklist. Verify equal successful arms, supported benefit without immediate savings, rejection when added burden outweighs value, per-unit quality regression and decision-changing unknowns. Preserve explicitly strict policies of other experiments.
 
 ## 2. Deliver the first complete installed reflection chain
 
@@ -35,7 +35,7 @@ All tasks remain subject to actual checks and the preserved evaluation gate. The
 ## 4. Accept shared delivery and measured outcomes
 
 - [ ] 4.1 Extend real installed acceptance to a shared-kit remedy and a role/skill guidance change. Verify public-safe committed-base assignment, required evaluation/specification, actual new-session consumption and safe handling of active sessions; verify normal acceptance of improvements while their closures produce no recursive reflection.
-- [ ] 4.2 Run every frozen task 1.3 unit through real entry points and agents. Apply quality noninferiority, no P0/P1 regression and both predeclared useful time/token reductions to full seed/reflection/improvement/subsequent-work costs and observed reuse. Retain adverse/inconclusive outcomes; verify rejection restores accepted source/runtime selection without losing inactive patches or evidence.
+- [ ] 4.2 Run every frozen task 1.3 unit through real entry points and agents. Apply quality noninferiority, no P0/P1 regression and grounded judgment of lasting benefit against full seed/reflection/improvement/subsequent-work costs, ongoing burden, risks and observed reuse. Record concrete reasons, trade-offs and forecast limits in the existing decision owner, without mandatory savings percentages. Retain adverse/inconclusive outcomes; verify rejection restores accepted source/runtime selection without losing inactive patches or evidence.
 - [ ] 4.3 Complete update/disconnect/rollback and continuation outside the kit, preserving boards, journal users/settings, pending stage results, original executor slots and unrelated configuration. Verify ordinary feedback and lead/executor behavior with the mode disabled and actual role/model identities when enabled; reuse still-applicable checks.
 - [ ] 4.4 Reconcile docs/project-decisions.md, docs/agent-delegation.md, docs/rust-native.md, docs/installation.md and affected owned skills. Map every scenario in both deltas to applicable evidence, run strict OpenSpec validation and harness-source-check, and keep all unmet implementation/acceptance tasks unchecked.
 
@@ -61,7 +61,7 @@ repository.
 - `FEEDBACK25` - `crates/harness-core/src/board_feedback.rs` 25/25 at `70e3d502`.
 - `FEEDBACK28` - `crates/codex-harness/tests/feedback_cli.rs` 28/28 applicable at `70e3d502`; one pre-existing ignored OpenSpec archive case remains excluded.
 - `SEMANTIC` - six synthetic reviewer-calibration cases only; no real panel, reflection judgment or benefit claim.
-- `QUALITY` - explicit quality noninferiority at `ff649f6`: focused core cases 6/6 and native comparison cases 3/3. Equal accepted outcomes require both useful cost margins; strict mode, per-unit acceptance loss, critical cost regression, missing evidence, attribution bounds and malformed mode refusal remain covered. These are policy checks, not real benefit evidence.
+- `QUALITY` - explicit quality noninferiority at `ff649f6`: focused core cases 6/6 and native comparison cases 3/3. These exercised the earlier policy with both useful cost margins, strict mode, per-unit acceptance loss, critical cost regression, missing evidence, attribution bounds and malformed mode refusal. They do not verify the revised engineering-judgment basis or establish real benefit; affected acceptance remains `G7`.
 - `EVENTS` - duplicate activation and no-new-outcome native cases at `5ff8b9d`; final-looking text without native completion at `30652d4`. Same-reporter recording/triage at `8545dfe`, supplemented by two actual feedback episodes in one unchanged executor session; private receipts retain the session and episode identities.
 - `RECOVERY` - visibility restoration component at `3b1937c`, accepted adapter at `c71935b`, and ordinary `delivery-improvement process` recovery at `2c1f705` (1/1). These cases terminate the manager after submission.
 - `FRONTEND` - `visibility::native_normal_process_frontend_only_visibility_loss_recovers_exact_accepted_turn_without_request` passed 1/1 at `18aadf2`. The test follows the stage-runner process tree, closes only its frontend, retains the live manager and verifies a distinct restored frontend, exact submitted fork/turn, unchanged accepted work/costs and single return. Model responses and frontend are fixtures; no real-model or installed-use claim.
@@ -175,9 +175,12 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `D55 Improvement completion does not recurse` - `ASSIGN29` purpose tests and `CORE10::initial_reports_rejections_and_nonordinary_lineage_never_trigger` `[exec]`; the real installed event path is part of `G2`.
 - `D56 Update or activation fails` - `PRESERVE` exercises failed update/activation and disconnect/reconnect with pending results, task/slot/configuration preservation and one remaining lead stage; `FORK24::native_journal_recovery_is_explicit_and_preserves_retained_work` covers journal recovery `[exec+installed]`. Real deployed use and partial improvements remain `G2/G6`.
 
-**Adoption preserves quality and improves both costs**
+**Adoption preserves quality and lowers the cost of future work**
 
-- `D57 The control already accepts every task` - `QUALITY` exercises explicit noninferiority with equal successful arms and both useful cost margins; the real matched comparison remains `G7` `[exec+gap]`.
+- `D57 The control already accepts every task` - `QUALITY` exercises explicit noninferiority with equal successful arms under the previous numeric policy; the revised judgment basis and real matched comparison remain `G7` `[exec+gap]`.
+- `D58 Maintenance improves without immediate savings` - revised adoption basis and real consumption remain `G7` `[gap]`.
+- `D59 An improvement adds more burden than value` - revised adoption judgment and restoration remain `G7` `[gap]`.
+- `D60 Improvements proceed alongside ordinary delivery` - real nonblocking scheduling and attribution of actual interference remain `G3/G7` `[gap]`.
 
 **Feedback triage, routing and admission**
 
@@ -207,6 +210,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `F24 Ordinary optimization has an uncertain opportunity to repay` - `FEEDBACK28::hypothesis_search_reuses_prior_conclusions_and_never_duplicates_cards`, `ledger_keeps_unknown_and_stale_pacing_evidence_honest` `[exec]`; the real-lead benefit judgment remains `G3/G7`.
 - `F25 The real lead delegates a synthesized remedy` - `ASSIGN29::improvement_descendants_keep_purpose_across_subdivision_rename_retry_and_resume`, `accept_improvement_work_never_auto_triggers_reflection` `[exec]`; real lead delegation and creation remain `G2/G3`.
 - `F26 A reflection result is retried` - `FEEDBACK28::derived_provenance_survives_merge_and_partial_retry`, `derived_copy_recovers_an_interrupted_merge_without_duplicates` `[exec]`.
+- `F27 One observation supports a lasting improvement` - real lead judgment under the revised benefit basis remains `G1/G7` `[gap]`.
 
 ### Remaining acceptance gaps
 
@@ -216,7 +220,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `G4` Native lead-succession gap closed by `SUCCESSION`, including the missing-registry/live-owner counterexample and completed-source validation (`D52`). Task 3.5 remains open for its other required cases; real installed/model-backed consumption remains `G2`.
 - `G5` Native frontend-only recovery gap closed by `FRONTEND`; the earlier failure at `ff649f6` was a direct-child test lookup that missed the stage runner's frontend. `RECOVERY` separately covers manager loss. Tasks 3.2 and 3.5 remain open for their other required cases; real installed/model-backed consumption remains `G2`.
 - `G6` Installed model-free in-flight disable/failed-update/failed-activation/disconnect preservation is exercised (`PRESERVE`). Real partial-improvement and deployed continuation acceptance, including rollback, remain open (`D53,D56`); tasks 3.5 and 4.3 are not complete.
-- `G7` Frozen real comparison, matched quality/time/token benefit gate, real panel, post-acceptance horizon, adverse/inconclusive retention and baseline restoration (`D46,D47,D50,F24`). Tasks 1.3 and 4.2 remain open; candidate remains inactive.
+- `G7` Frozen real comparison, quality noninferiority and grounded lasting-benefit judgment with complete costs, real panel, post-acceptance horizon, adverse/inconclusive retention and baseline restoration (`D46,D47,D50,D57,D58,D59,F24`). Tasks 1.3 and 4.2 remain open; candidate remains inactive.
 - `G8` Actual new-session loading/consumption of both reflection skills and any later guidance revision (`D43,D44`). Tasks 2.6 and 4.1 remain open.
 - `G9` Native permitted retrieval is exercised (`READ`); real-model selection and interpretation of relevant operation/check detail for an unclear cause remain unverified (`D21`). Task 3.8 remains open.
 - Optional multi-outcome shared synthesis (`D16`) is permissive, not an additional acceptance gate. The previously missing `D2,D30,D31,F1` component checks are now covered by `EVENTS`.

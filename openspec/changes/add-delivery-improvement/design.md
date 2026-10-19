@@ -56,6 +56,12 @@ Use existing shared admission for each active reflection stage. A waiting event/
 
 Healthy executors are not preempted. Pending reflection waits for ordinary available capacity, without delaying launch of more consequential user work. Keep one ordinary improvement implementation in flight within existing capacity; this is neither a fixed project limit nor a reserved lane. Current correctness/integrity blockers retain ordinary urgent handling.
 
+Reflection and improvement implementation may proceed in parallel with ordinary
+delivery when resources and dependencies allow. Neither is a gate on ordinary
+task acceptance or release. Background duration alone is not displaced delivery;
+record actual contention, lead distraction or integration conflicts, and count
+overlapping wall-clock spans once while retaining all participant costs.
+
 Install finite per-job investigation/turn/context limits and cumulative allowances per authorized work binding. Include source fork context, both reflection stages, failed/no-finding runs, reads and retries; expose recorded usage separately from reservations or estimates. Arrival, resume, a new fork or repeated closure cannot reset cost accounting. Overrun or unknown usage is visible; no further overspend is silently admitted. No finding is a normal completed outcome, not a reason to retry or manufacture work.
 
 ### 6. The real lead owns decisions and implementation
@@ -109,25 +115,40 @@ failures, no-finding turns, retrieval, implementation, checks, coordination,
 restoration and displaced delivery. Neither a faster unrelated task nor a
 replay of fixed responses substitutes for this agent-behavior comparison.
 
-Primary outcomes are independently accepted task success rate, later P0/P1
-rework within the frozen observation horizon, total time through acceptance and
-native recorded token usage. Finding counts and admission latency are diagnostic
-metrics only. Freeze metric coverage, the horizon, practical effect thresholds
-and any uncertainty/repetition rule in the existing comparison policy from the
-baseline measurements before reflection candidate model dispatch or evaluation;
-an unset threshold is a blocked experiment, not zero. Declare the owner's
-conjunction with quality noninferiority: quality must be no worse than the
-control, with no P0/P1 or other critical regression, and both time and token
-cost must improve by their declared useful margins. An unchanged independent
-success rate is allowed, including when both arms accept every task; it is not
-itself a benefit. A failed candidate outcome cannot be offset by another unit's
-success. Do not add time and tokens into an invented score. Missing counters,
-a verdict-changing bound or absent relevant reuse cannot be reported as
-supported addition benefit. Preserve strict quality-improvement behavior for
-other experiments that explicitly declare it; do not rewrite their policies.
+The objective is to reduce the full cost of future changes and maintenance while
+delivering useful results promptly. Before candidate model dispatch, declare the
+concrete benefit to examine, its mechanism and relevant use, independent quality
+acceptance, observation horizon, complete cost coverage and bounded stopping
+conditions in the existing evaluation owner. No mandatory percentage savings,
+weighted score or closed list of benefits replaces the lead's engineering judgment.
+Reuse the existing maintenance-basis and outcome evidence owners where applicable;
+do not build another evaluation framework.
 
-Stop after the declared panel. Reject when quality regresses or complete evidence
-fails the frozen benefit gate; classify insufficient attribution as inconclusive.
+Quality must be no worse than the control, with no P0/P1 or other critical
+regression. Equal independent task success is allowed, including when both arms
+accept every task; equality alone is not benefit. A failed candidate outcome cannot
+be offset by another unit's success. Retain accepted task outcomes, later rework,
+total time through acceptance and native recorded token usage as separate evidence.
+Missing usage remains unknown and forbids a savings claim, rather than becoming
+zero or automatically defeating a separately supported maintenance benefit. Any
+unknown that could reverse the adoption judgment leaves it inconclusive.
+
+Judge the concrete effect on affected users and likely future work against the
+cost of implementation, checks, coordination, deployment, recovery, ongoing
+maintenance and displaced useful delivery. Simpler interfaces, fewer incidents,
+less context burden, easier diagnosis or replacement are possible benefits, not
+an exhaustive checklist. More code, instructions, tools or architectural machinery
+must justify their recurring cost; polishing without useful delivery is a cost
+too. Prefer the smallest effective correction, including no change. Real use and
+checks must support the benefit mechanism, while expected long-term effects remain
+explicit forecasts. Record a concise reason and material trade-offs in the existing
+decision owner; do not demand repeated signals or numeric proof when available
+facts suffice. Other experiments retain their explicitly frozen strict policies.
+
+Stop after the declared panel. Reject when quality regresses or the concrete
+benefit does not justify complete costs and risks; classify decision-changing
+uncertainty as inconclusive. Lack of immediate time or token savings alone is not
+rejection, and passing correctness alone is not benefit.
 A further trial needs a named new decision-changing observation and its own
 predeclared scope, not repeated sampling until favorable. Keep unsuccessful
 reflection code/guidance out of accepted source and installation; restore verified

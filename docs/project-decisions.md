@@ -134,16 +134,37 @@ a separate transcript feed. This is the selected design, not a delivery claim;
 the active [change](../openspec/changes/add-delivery-improvement/proposal.md)
 owns implementation and acceptance.
 
-**2026-10-19, confirmed:** adoption of post-acceptance self-reflection requires
-quality no worse than the control, no P0/P1 regression, and useful reductions
-in both total time through acceptance and native recorded token cost. Equal
-independent task success is allowed; it is not itself evidence of benefit.
-This replaces the strict quality-improvement condition for this change, so a
-fully successful control does not make adoption impossible. Freeze both useful
-margins, the observation horizon and complete cost coverage before candidate
-model dispatch. Keep every adverse or inconclusive result and the rejection
-and baseline-restoration rules. Existing experiments that explicitly require
-strict quality improvement retain that requirement.
+**2026-10-19, revised:** the purpose of post-acceptance self-reflection is to
+reduce the full cost of future changes and maintenance while preserving quality
+and timely delivery of useful results. Adoption is the lead's reasoned engineering
+judgment about concrete lasting benefit, not a mandatory percentage reduction in
+time or tokens, a closed checklist or a weighted score. Equal independent task
+success is allowed but is not itself benefit; quality must remain no worse than
+the control, with no P0/P1 regression.
+
+Consider the affected users and likely future changes, the mechanism and expected
+reuse of the benefit, and the complete cost and risk of introducing and keeping
+the change. Simpler code or interfaces, easier diagnosis and recovery, fewer
+incidents, lower context burden and easier replacement can justify adoption
+without immediate time or token savings; these are examples, not an exhaustive
+set. More code, tools, instructions or architectural machinery must earn their
+ongoing cost. Endless polishing that delays useful delivery is also a cost.
+Prefer the smallest effective correction, including doing nothing when that is
+better. Reflection and improvement implementation may run alongside ordinary
+work within available capacity; neither becomes a prerequisite for accepting
+or delivering ordinary work. Parallel duration is not itself a delivery delay:
+count actual contention, lead distraction, integration conflicts and ongoing
+burden, without adding overlapping elapsed spans twice. Distinguish observed
+effects from forecasts and uncertainty; confidence
+in long-term value is not a claim that the future has been proved.
+
+Before candidate model dispatch, declare the concrete benefit to examine, relevant
+use and quality horizon, complete cost coverage and bounded stopping conditions.
+Retain real acceptance, all adverse or inconclusive observations and verified
+baseline restoration on rejection. Record the adoption reason and material
+trade-offs in the existing decision owner, without new paperwork or proof quotas.
+This supersedes mandatory dual savings and strict quality improvement for this
+change; it does not rewrite frozen policies of other experiments.
 
 One clear, attributable bottleneck should produce a bounded correction promptly. Do not
 wait for repeated episodes, votes or statistical proof when the available facts
