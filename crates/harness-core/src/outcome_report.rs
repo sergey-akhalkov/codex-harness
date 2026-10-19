@@ -434,37 +434,44 @@ enum AggregateUsageCheck {
 }
 
 /// Compare the producer's aggregate with the per-participant usage. A missing
-/// per-run field keeps the aggregate unverified instead of becoming zero; a
-/// different recorded value is a contradiction and must not be normalized as
+/// per-run field keeps that counter unverified instead of becoming zero; any
+/// fully known counter that disagrees with its aggregate is a contradiction,
+/// even when another counter is incomplete, and must not be normalized as
 /// measured usage.
 fn aggregate_usage_check(aggregate: &Value, runs: &[Value]) -> AggregateUsageCheck {
     let Some(aggregate) = aggregate.as_object() else {
         return AggregateUsageCheck::Mismatch;
     };
     let mut checked = false;
+    let mut complete = true;
     for key in USAGE_COUNTERS {
         let Some(recorded) = aggregate.get(*key) else {
             continue;
         };
+        checked = true;
         let Some(recorded) = recorded.as_u64() else {
             return AggregateUsageCheck::Mismatch;
         };
         let mut total = 0_u64;
+        let mut counter_complete = true;
         for run in runs {
             let Some(value) = run.get(*key).and_then(Value::as_u64) else {
-                return AggregateUsageCheck::Incomplete;
+                counter_complete = false;
+                break;
             };
             let Some(sum) = total.checked_add(value) else {
                 return AggregateUsageCheck::Mismatch;
             };
             total = sum;
         }
-        if total != recorded {
+        if counter_complete && total != recorded {
             return AggregateUsageCheck::Mismatch;
         }
-        checked = true;
+        if !counter_complete {
+            complete = false;
+        }
     }
-    if checked {
+    if checked && complete {
         AggregateUsageCheck::Verified
     } else {
         AggregateUsageCheck::Incomplete
@@ -3938,6 +3945,27 @@ mod tests {
                 .unwrap()
                 .contains(&json!("usage_cached_input_exceeds_input"))
         );
+    }
+
+    #[test]
+    fn aggregate_mismatch_takes_precedence_over_incomplete_fields() {
+        let runs = vec![
+            json!({"total_tokens": 10}),
+            json!({"total_tokens": 10}),
+            json!({"total_tokens": 10}),
+        ];
+
+        let incomplete = json!({"input_tokens": 100, "total_tokens": 30});
+        assert!(matches!(
+            aggregate_usage_check(&incomplete, &runs),
+            AggregateUsageCheck::Incomplete
+        ));
+
+        let contradictory = json!({"input_tokens": 100, "total_tokens": 999});
+        assert!(matches!(
+            aggregate_usage_check(&contradictory, &runs),
+            AggregateUsageCheck::Mismatch
+        ));
     }
 
     #[test]

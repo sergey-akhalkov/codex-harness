@@ -1380,4 +1380,44 @@ fn native_qualification_wrapper_is_consumed_without_losing_checks_or_usage() {
             .unwrap()
             .contains(&json!("usage_aggregate_mismatch"))
     );
+
+    // A missing per-run counter must not hide a contradiction in another
+    // fully known counter.
+    let incomplete_runs = vec![
+        json!({"session":"session-c","status":"completed","usage":{"total_tokens":10}}),
+        json!({"session":"session-d","status":"completed","usage":{"total_tokens":10}}),
+        json!({"session":"session-e","status":"completed","usage":{"total_tokens":10}}),
+    ];
+    let row = qualification_row(
+        "native-d",
+        true,
+        true,
+        incomplete_runs,
+        json!({"input_tokens":100,"total_tokens":999}),
+    );
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[row]})).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let usage = &report["attempts"][0]["usage"];
+    assert_eq!(usage["status"], "unknown", "{report}");
+    assert_eq!(usage["runs"].as_array().unwrap().len(), 3);
+    assert_eq!(usage["recorded_aggregate"]["total_tokens"], 999);
+    assert_eq!(usage["aggregate_verified"], false);
+    assert!(
+        usage["contradictions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("usage_aggregate_mismatch"))
+    );
+    assert!(
+        report["attempts"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("usage_aggregate_mismatch"))
+    );
 }
