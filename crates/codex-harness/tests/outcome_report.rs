@@ -1197,3 +1197,187 @@ fn the_retained_trace_identity_refuses_missing_or_changed_bytes() {
     let reason = RetainedTrace::capture(&trace_path).unwrap_err().to_string();
     assert!(reason.contains("missing or unreadable"), "{reason}");
 }
+
+fn qualification_run(
+    session: &str,
+    input: u64,
+    cached: u64,
+    output: u64,
+    reasoning: u64,
+    responses: u64,
+) -> Value {
+    json!({
+        "session": session,
+        "status": "completed",
+        "started_at": 0.0,
+        "ended_at": 2.0,
+        "usage": {
+            "input_tokens": input,
+            "cached_input_tokens": cached,
+            "output_tokens": output,
+            "reasoning_output_tokens": reasoning,
+            "total_tokens": input + output,
+            "response_count": responses,
+        },
+    })
+}
+
+fn qualification_aggregate(runs: &[Value]) -> Value {
+    let mut aggregate = serde_json::Map::new();
+    for key in [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "response_count",
+    ] {
+        let total = runs.iter().try_fold(0_u64, |total, run| {
+            total.checked_add(run["usage"][key].as_u64()?)
+        });
+        if let Some(total) = total {
+            aggregate.insert(key.to_owned(), json!(total));
+        }
+    }
+    Value::Object(aggregate)
+}
+
+fn qualification_row(
+    id: &str,
+    accepted: bool,
+    review_passed: bool,
+    runs: Vec<Value>,
+    aggregate: Value,
+) -> Value {
+    json!({
+        "attempt_id": id,
+        "case_id": "native-control",
+        "unit": "run/native-control",
+        "qualification_scope": "ordinary control observation; no comparison margins, reflection qualification or benefit verdict",
+        "arm": "baseline",
+        "started_at": 0.0,
+        "execution_started_at": 0.0,
+        "ended_at": 3.0,
+        "accepted": accepted,
+        "native_runs": runs,
+        "usage": aggregate,
+        "checks": [
+            {"id":"independent-acceptance","round":0,"required":true,"executed":true,"passed":true,"started_at":2.0,"ended_at":3.0,"evidence":"private/acceptance","evidence_sha256":"aaaa"},
+            {"id":"independent-semantic-review","round":0,"required":true,"executed":true,"passed":review_passed,"evidence":"private/review","evidence_sha256":"bbbb"}
+        ],
+        "children": [],
+        "interventions": [],
+        "retry_of": null
+    })
+}
+
+#[test]
+fn native_qualification_wrapper_is_consumed_without_losing_checks_or_usage() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("native-qualification.json");
+    let runs = vec![
+        qualification_run("session-a", 100, 40, 20, 10, 2),
+        qualification_run("session-b", 50, 10, 5, 2, 1),
+    ];
+    let aggregate = qualification_aggregate(&runs);
+    let accepted = qualification_row("native-a", true, true, runs.clone(), aggregate.clone());
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[accepted]})).unwrap(),
+    )
+    .unwrap();
+    let original = fs::read(&input).unwrap();
+
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let attempt = &report["attempts"][0];
+    assert_eq!(attempt["status"], "accepted", "{report}");
+    assert_eq!(attempt["correct"], true, "{report}");
+    assert_eq!(attempt["accepted"], true, "{report}");
+    assert_eq!(attempt["usage"]["status"], "per_run", "{report}");
+    assert_eq!(attempt["usage"]["runs"].as_array().unwrap().len(), 2);
+    let total: u64 = attempt["usage"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["total_tokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 175);
+    assert_eq!(attempt["usage"]["aggregate_verified"], true);
+    assert!(attempt["usage"].get("recorded_aggregate").is_none());
+    assert!(
+        attempt["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check.get("exit_code").is_none())
+    );
+    assert!(
+        attempt["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("no_opposite_arm"))
+    );
+    assert!(report["comparisons"].as_array().unwrap().is_empty());
+    assert_eq!(report["benefit_status"], "not_evaluated");
+    assert_eq!(fs::read(&input).unwrap(), original);
+
+    // The normalized report remains consumable by the same CLI.
+    fs::write(&input, &output.stdout).unwrap();
+    let second = run(&input, false);
+    assert!(second.status.success());
+    let normalized: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(normalized["attempts"][0]["status"], "accepted");
+    assert_eq!(normalized["attempts"][0]["usage"]["status"], "per_run");
+    assert_eq!(
+        normalized["attempts"][0]["usage"]["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // An explicit failed acceptance stays failed and retains the failed check.
+    let failed = qualification_row("native-b", false, false, runs.clone(), aggregate.clone());
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[failed]})).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["attempts"][0]["status"], "failed", "{report}");
+    assert_eq!(report["attempts"][0]["correct"], false);
+    assert_eq!(report["attempts"][0]["accepted"], false);
+    assert_eq!(report["attempts"][0]["checks"][1]["passed"], false);
+
+    // A contradictory aggregate is retained but not presented as measured.
+    let mut contradictory = aggregate;
+    contradictory["total_tokens"] = json!(999);
+    let row = qualification_row("native-c", true, true, runs, contradictory);
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[row]})).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["attempts"][0]["usage"]["status"], "unknown");
+    assert_eq!(
+        report["attempts"][0]["usage"]["recorded_aggregate"]["total_tokens"],
+        999
+    );
+    assert!(
+        report["attempts"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("usage_aggregate_mismatch"))
+    );
+}

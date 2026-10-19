@@ -406,6 +406,96 @@ fn execution_start(row: &Value) -> &Value {
         .unwrap_or(&row["started_at"])
 }
 
+/// A row produced by the native baseline-qualification owner. That producer
+/// records immutable check evidence identities and per-participant usage next
+/// to an aggregate, but it does not invent process exit codes. The marker
+/// keeps the older report shapes unchanged.
+fn native_qualification_row(row: &Value) -> bool {
+    text(row, "qualification_scope").is_some()
+}
+
+/// Counts retained by the native usage reader. The aggregate and the
+/// per-participant entries use the same names so a repeated aggregate can be
+/// checked against, not added to, the per-run values.
+const USAGE_COUNTERS: &[&str] = &[
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "response_count",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggregateUsageCheck {
+    Verified,
+    Incomplete,
+    Mismatch,
+}
+
+/// Compare the producer's aggregate with the per-participant usage. A missing
+/// per-run field keeps the aggregate unverified instead of becoming zero; a
+/// different recorded value is a contradiction and must not be normalized as
+/// measured usage.
+fn aggregate_usage_check(aggregate: &Value, runs: &[Value]) -> AggregateUsageCheck {
+    let Some(aggregate) = aggregate.as_object() else {
+        return AggregateUsageCheck::Mismatch;
+    };
+    let mut checked = false;
+    for key in USAGE_COUNTERS {
+        let Some(recorded) = aggregate.get(*key) else {
+            continue;
+        };
+        let Some(recorded) = recorded.as_u64() else {
+            return AggregateUsageCheck::Mismatch;
+        };
+        let mut total = 0_u64;
+        for run in runs {
+            let Some(value) = run.get(*key).and_then(Value::as_u64) else {
+                return AggregateUsageCheck::Incomplete;
+            };
+            let Some(sum) = total.checked_add(value) else {
+                return AggregateUsageCheck::Mismatch;
+            };
+            total = sum;
+        }
+        if total != recorded {
+            return AggregateUsageCheck::Mismatch;
+        }
+        checked = true;
+    }
+    if checked {
+        AggregateUsageCheck::Verified
+    } else {
+        AggregateUsageCheck::Incomplete
+    }
+}
+
+fn cached_usage_is_subset(usage: &Value) -> bool {
+    match (
+        usage.get("cached_input_tokens").and_then(Value::as_u64),
+        usage.get("input_tokens").and_then(Value::as_u64),
+    ) {
+        (Some(cached), Some(input)) => cached <= input,
+        _ => true,
+    }
+}
+
+/// Acceptance evidence is complete when the final required check ran and
+/// retained an identity. Process checks keep the existing integer exit-code
+/// and end-time requirement. The native qualification producer instead
+/// retains the immutable evidence digest and may omit a process exit code and
+/// the reviewer check's timing; neither omission is turned into a value.
+fn check_complete(check: &Value, qualification_row: bool) -> bool {
+    if check["executed"] != true || !truth(&check["evidence"]) {
+        return false;
+    }
+    match check.get("exit_code") {
+        Some(value) => (value.is_i64() || value.is_u64()) && number(&check["ended_at"]).is_some(),
+        None => qualification_row && text(check, "evidence_sha256").is_some(),
+    }
+}
+
 /// Normalize the optional `reuse` record of a retained baseline attempt.
 ///
 /// A baseline result may be retained evidence from an earlier execution that
@@ -640,15 +730,15 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
         .iter()
         .filter_map(|c| c["id"].as_str())
         .collect();
+    let qualification_row = native_qualification_row(record);
     let complete = !final_checks.is_empty()
         && expected.iter().all(|id| actual.contains(id.as_str()))
-        && final_checks.iter().all(|c| {
-            c["executed"] == true
-                && (c["exit_code"].is_i64() || c["exit_code"].is_u64())
-                && truth(&c["evidence"])
-                && number(&c["ended_at"]).is_some()
-        });
-    let correct = complete
+        && final_checks
+            .iter()
+            .all(|check| check_complete(check, qualification_row));
+    let acceptance_failed = record.get("accepted").and_then(Value::as_bool) == Some(false);
+    let correct = !acceptance_failed
+        && complete
         && final_checks.iter().all(|c| c["passed"] == true)
         && native.last().is_some_and(|n| n["status"] == "completed");
     for run in native {
@@ -657,9 +747,10 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     row["correct"] = correct.into();
     let status = if correct {
         "accepted"
-    } else if final_checks
-        .iter()
-        .any(|c| truth(&c["executed"]) && c["passed"] == false)
+    } else if acceptance_failed
+        || final_checks
+            .iter()
+            .any(|c| truth(&c["executed"]) && c["passed"] == false)
     {
         "failed"
     } else {
@@ -1552,13 +1643,43 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
         } else {
             Value::Null
         };
+        let qualification_row = native_qualification_row(&rows[index]);
         let mut usage = Vec::new();
         let mut unknown_runs = 0usize;
+        let mut repeated_sessions = 0usize;
+        let mut usage_conflicts = BTreeSet::new();
+        let mut seen_sessions: BTreeMap<String, Value> = BTreeMap::new();
         for run in array(&rows[index], "native_runs")? {
-            if truth(&run["usage"]) {
-                usage.push(run["usage"].clone());
+            let recorded = run.get("usage").filter(|value| truth(value)).cloned();
+            if qualification_row {
+                if let Some(session) = text(run, "session") {
+                    if let Some(previous) = seen_sessions.get(session) {
+                        if previous == recorded.as_ref().unwrap_or(&Value::Null) {
+                            repeated_sessions += 1;
+                        } else {
+                            usage_conflicts.insert("usage_repeated_session_conflict".to_owned());
+                        }
+                        continue;
+                    }
+                    seen_sessions
+                        .insert(session.to_owned(), recorded.clone().unwrap_or(Value::Null));
+                }
+                if recorded
+                    .as_ref()
+                    .and_then(|value| value.get("total_tokens"))
+                    .and_then(Value::as_u64)
+                    .is_none()
+                {
+                    unknown_runs += 1;
+                }
+                if let Some(recorded) = recorded {
+                    usage.push(recorded);
+                }
             } else {
-                unknown_runs += 1;
+                match recorded {
+                    Some(recorded) => usage.push(recorded),
+                    None => unknown_runs += 1,
+                }
             }
         }
         let mut workers = Vec::new();
@@ -1579,7 +1700,68 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 }));
             }
         }
-        if !truth(&rows[index]["usage"]) {
+        let recorded_usage = rows[index]["usage"].clone();
+        let flat_aggregate = recorded_usage.as_object().filter(|object| {
+            !object.contains_key("status")
+                && !object.contains_key("runs")
+                && !object.contains_key("workers")
+        });
+        if qualification_row && flat_aggregate.is_some() {
+            let aggregate = Value::Object(flat_aggregate.cloned().unwrap_or_default());
+            let aggregate_check = aggregate_usage_check(&recorded_usage, &usage);
+            if aggregate_check == AggregateUsageCheck::Mismatch {
+                usage_conflicts.insert("usage_aggregate_mismatch".to_owned());
+            }
+            if !cached_usage_is_subset(&recorded_usage)
+                || usage.iter().any(|run| !cached_usage_is_subset(run))
+            {
+                usage_conflicts.insert("usage_cached_input_exceeds_input".to_owned());
+            }
+            let mut summary = if usage.is_empty() {
+                usage_conflicts.insert("usage_per_run_missing".to_owned());
+                json!({
+                    "status": "unknown",
+                    "total_tokens": null,
+                    "recorded_aggregate": aggregate,
+                })
+            } else if usage_conflicts.is_empty() {
+                let mut summary = json!({"status":"per_run", "runs":usage});
+                if unknown_runs > 0 {
+                    summary["unknown_runs"] = json!(unknown_runs);
+                    summary["recorded_aggregate"] = aggregate;
+                    summary["aggregate_verified"] = json!(false);
+                } else {
+                    summary["aggregate_verified"] =
+                        json!(aggregate_check == AggregateUsageCheck::Verified);
+                    if aggregate_check != AggregateUsageCheck::Verified {
+                        summary["recorded_aggregate"] = aggregate;
+                    }
+                }
+                summary
+            } else {
+                json!({
+                    "status": "unknown",
+                    "total_tokens": null,
+                    "runs": usage,
+                    "recorded_aggregate": aggregate,
+                    "aggregate_verified": false,
+                })
+            };
+            if repeated_sessions > 0 && summary.get("deduplicated_sessions").is_none() {
+                summary["deduplicated_sessions"] = json!(repeated_sessions);
+            }
+            if !usage_conflicts.is_empty() {
+                summary["contradictions"] = json!(usage_conflicts.iter().collect::<Vec<_>>());
+                reasons.extend(usage_conflicts.iter().cloned());
+            }
+            if !workers.is_empty() {
+                summary["workers"] = json!(workers);
+            }
+            if inherited_children > 0 {
+                summary["inherited_children"] = json!(inherited_children);
+            }
+            rows[index]["usage"] = summary;
+        } else if !truth(&rows[index]["usage"]) {
             let mut summary = if usage.is_empty() && workers.is_empty() {
                 json!({"status":"unknown", "total_tokens":null})
             } else {
@@ -3582,6 +3764,280 @@ mod tests {
         assert!(
             !blind.join("\n").contains("candidate | m | failed"),
             "a blind head/tail view loses the middle diagnostic"
+        );
+    }
+
+    fn native_run(
+        session: &str,
+        input: u64,
+        cached: u64,
+        output: u64,
+        reasoning: u64,
+        responses: u64,
+    ) -> Value {
+        json!({
+            "session": session,
+            "status": "completed",
+            "started_at": 0.0,
+            "ended_at": 2.0,
+            "usage": {
+                "input_tokens": input,
+                "cached_input_tokens": cached,
+                "output_tokens": output,
+                "reasoning_output_tokens": reasoning,
+                "total_tokens": input + output,
+                "response_count": responses,
+            },
+        })
+    }
+
+    fn native_aggregate(runs: &[Value]) -> Value {
+        let mut aggregate = serde_json::Map::new();
+        for key in USAGE_COUNTERS {
+            let total = runs.iter().try_fold(0_u64, |total, run| {
+                total.checked_add(run["usage"][*key].as_u64()?)
+            });
+            if let Some(total) = total {
+                aggregate.insert((*key).to_owned(), json!(total));
+            }
+        }
+        Value::Object(aggregate)
+    }
+
+    fn native_qualification_attempt(
+        id: &str,
+        accepted: bool,
+        review_passed: bool,
+        runs: Vec<Value>,
+        aggregate: Value,
+    ) -> Value {
+        json!({
+            "attempt_id": id,
+            "case_id": "native-control",
+            "unit": "run/native-control",
+            "qualification_scope": "ordinary control observation; no comparison margins, reflection qualification or benefit verdict",
+            "arm": "baseline",
+            "started_at": 0.0,
+            "execution_started_at": 0.0,
+            "ended_at": 3.0,
+            "accepted": accepted,
+            "native_runs": runs,
+            "usage": aggregate,
+            "checks": [
+                {"id":"independent-acceptance","round":0,"required":true,"executed":true,"passed":true,"started_at":2.0,"ended_at":3.0,"evidence":"private/acceptance","evidence_sha256":"aaaa"},
+                {"id":"independent-semantic-review","round":0,"required":true,"executed":true,"passed":review_passed,"evidence":"private/review","evidence_sha256":"bbbb"}
+            ],
+            "children": [],
+            "interventions": [],
+            "retry_of": null
+        })
+    }
+
+    #[test]
+    fn native_qualification_usage_and_evidence_digests_are_consumed_once() {
+        let runs = vec![
+            native_run("session-a", 100, 40, 20, 10, 2),
+            native_run("session-b", 50, 10, 5, 2, 1),
+        ];
+        let aggregate = native_aggregate(&runs);
+        let row = native_qualification_attempt("native-a", true, true, runs, aggregate);
+        let report = summarize_attempts(&[row]).unwrap();
+        let attempt = &report["attempts"][0];
+        assert_eq!(attempt["status"], "accepted");
+        assert_eq!(attempt["correct"], true);
+        assert_eq!(attempt["accepted"], true);
+        assert_eq!(attempt["usage"]["status"], "per_run");
+        assert_eq!(attempt["usage"]["runs"].as_array().unwrap().len(), 2);
+        let total: u64 = attempt["usage"]["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["total_tokens"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total, 175);
+        assert_eq!(attempt["usage"]["aggregate_verified"], true);
+        assert!(attempt["usage"].get("recorded_aggregate").is_none());
+        assert!(attempt["usage"].get("total_tokens").is_none());
+        for check in attempt["checks"].as_array().unwrap() {
+            assert!(check.get("exit_code").is_none());
+        }
+        let reasons = attempt["excluded_reasons"].as_array().unwrap();
+        assert!(reasons.contains(&json!("incomplete_timing")));
+        assert!(reasons.contains(&json!("no_opposite_arm")));
+        assert!(!reasons.contains(&json!("outcome_incomplete")));
+        assert!(report["comparisons"].as_array().unwrap().is_empty());
+        assert_eq!(report["benefit_status"], "not_evaluated");
+        assert_eq!(attempt["elapsed_seconds"], Value::Null);
+    }
+
+    #[test]
+    fn native_qualification_failure_and_contradictory_usage_stay_unmeasured() {
+        let runs = vec![
+            native_run("session-a", 100, 40, 20, 10, 2),
+            native_run("session-b", 50, 10, 5, 2, 1),
+        ];
+        let aggregate = native_aggregate(&runs);
+
+        let failed = native_qualification_attempt(
+            "native-failed",
+            false,
+            false,
+            runs.clone(),
+            aggregate.clone(),
+        );
+        let report = summarize_attempts(&[failed]).unwrap();
+        let attempt = &report["attempts"][0];
+        assert_eq!(attempt["status"], "failed");
+        assert_eq!(attempt["correct"], false);
+        assert_eq!(attempt["accepted"], false);
+        assert_eq!(attempt["checks"][1]["passed"], false);
+        assert_eq!(attempt["usage"]["status"], "per_run");
+        assert!(
+            attempt["excluded_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("outcome_failed"))
+        );
+
+        let mut contradictory = aggregate.clone();
+        contradictory["total_tokens"] = json!(999);
+        let row = native_qualification_attempt(
+            "native-contradiction",
+            true,
+            true,
+            runs.clone(),
+            contradictory,
+        );
+        let report = summarize_attempts(&[row]).unwrap();
+        let usage = &report["attempts"][0]["usage"];
+        assert_eq!(usage["status"], "unknown");
+        assert_eq!(usage["total_tokens"], Value::Null);
+        assert_eq!(usage["recorded_aggregate"]["total_tokens"], 999);
+        assert!(
+            usage["contradictions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("usage_aggregate_mismatch"))
+        );
+        assert!(
+            report["attempts"][0]["excluded_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("usage_aggregate_mismatch"))
+        );
+
+        let mut cached = aggregate;
+        cached["cached_input_tokens"] = json!(999);
+        let row = native_qualification_attempt("native-cached", true, true, runs, cached);
+        let report = summarize_attempts(&[row]).unwrap();
+        let usage = &report["attempts"][0]["usage"];
+        assert_eq!(usage["status"], "unknown");
+        assert!(
+            usage["contradictions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("usage_cached_input_exceeds_input"))
+        );
+    }
+
+    #[test]
+    fn native_qualification_missing_and_repeated_session_usage_are_not_double_counted() {
+        let first = native_run("session-a", 100, 40, 20, 10, 2);
+        let second = native_run("session-b", 50, 10, 5, 2, 1);
+        let known_aggregate = native_aggregate(std::slice::from_ref(&first));
+
+        let mut missing = first.clone();
+        missing.as_object_mut().unwrap().remove("usage");
+        missing["session"] = json!("session-b");
+        let row = native_qualification_attempt(
+            "native-missing",
+            true,
+            true,
+            vec![first.clone(), missing],
+            known_aggregate.clone(),
+        );
+        let report = summarize_attempts(&[row]).unwrap();
+        let usage = &report["attempts"][0]["usage"];
+        assert_eq!(usage["status"], "per_run");
+        assert_eq!(usage["unknown_runs"], 1);
+        assert_eq!(usage["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(usage["recorded_aggregate"]["total_tokens"], 120);
+        assert_eq!(usage["aggregate_verified"], false);
+
+        let mut all_missing = first.clone();
+        all_missing.as_object_mut().unwrap().remove("usage");
+        all_missing["session"] = json!("session-b");
+        let row = native_qualification_attempt(
+            "native-no-runs",
+            true,
+            true,
+            vec![all_missing],
+            known_aggregate,
+        );
+        let report = summarize_attempts(&[row]).unwrap();
+        let usage = &report["attempts"][0]["usage"];
+        assert_eq!(usage["status"], "unknown");
+        assert!(
+            usage["contradictions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("usage_per_run_missing"))
+        );
+        assert_eq!(usage["recorded_aggregate"]["total_tokens"], 120);
+
+        let aggregate = native_aggregate(&[first.clone(), second.clone()]);
+        let row = native_qualification_attempt(
+            "native-repeated",
+            true,
+            true,
+            vec![first.clone(), second.clone(), second.clone()],
+            aggregate.clone(),
+        );
+        let report = summarize_attempts(&[row]).unwrap();
+        let usage = &report["attempts"][0]["usage"];
+        assert_eq!(usage["status"], "per_run");
+        assert_eq!(usage["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(usage["deduplicated_sessions"], 1);
+        assert_eq!(usage["aggregate_verified"], true);
+
+        let mut different = second.clone();
+        different["usage"]["total_tokens"] = json!(999);
+        let row = native_qualification_attempt(
+            "native-session-conflict",
+            true,
+            true,
+            vec![first, second, different],
+            aggregate,
+        );
+        let report = summarize_attempts(&[row]).unwrap();
+        let usage = &report["attempts"][0]["usage"];
+        assert_eq!(usage["status"], "unknown");
+        assert!(
+            usage["contradictions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("usage_repeated_session_conflict"))
+        );
+    }
+
+    #[test]
+    fn legacy_flat_usage_and_explicit_rejection_keep_their_existing_meaning() {
+        let mut row = attempt("legacy", "baseline", 0.0, 10.0);
+        row["usage"] = json!({"input_tokens": 5, "output_tokens": 2, "total_tokens": 7});
+        let report = summarize_attempts(&[row.clone()]).unwrap();
+        let usage = &report["attempts"][0]["usage"];
+        assert!(usage.get("status").is_none());
+        assert_eq!(usage["total_tokens"], 7);
+
+        row["accepted"] = json!(false);
+        let report = summarize_attempts(&[row]).unwrap();
+        assert_eq!(report["attempts"][0]["status"], "failed");
+        assert_eq!(report["attempts"][0]["correct"], false);
+        assert!(
+            report["attempts"][0]["excluded_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("outcome_failed"))
         );
     }
 }
