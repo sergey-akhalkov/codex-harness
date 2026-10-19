@@ -795,6 +795,327 @@ fn token_cost_limitations(record: &GateRecord) -> Vec<Limitation> {
     limitations
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CumulativeProblem {
+    AmbiguousHistory,
+    MissingHistory,
+    UnconnectedHistory,
+    StaleBaseline,
+    StaleRepeat,
+    RepeatedCost,
+    BaselineChanged,
+    Inconsistent,
+    OutOfRange,
+}
+
+impl CumulativeProblem {
+    fn limitation(self) -> Limitation {
+        match self {
+            Self::AmbiguousHistory | Self::MissingHistory | Self::UnconnectedHistory => {
+                Limitation::CumulativeHistory
+            }
+            Self::StaleBaseline => Limitation::CumulativeBaseline,
+            Self::BaselineChanged => Limitation::CumulativeBaselineChanged,
+            Self::StaleRepeat | Self::RepeatedCost | Self::Inconsistent | Self::OutOfRange => {
+                Limitation::TokenCostInconsistent
+            }
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::AmbiguousHistory => {
+                "the retained engineering-judgment history has multiple connected candidates; the retained baseline is ambiguous"
+            }
+            Self::MissingHistory => {
+                "an earlier adopted engineering-judgment change has no usable cumulative token cost; it cannot be treated as zero"
+            }
+            Self::UnconnectedHistory => {
+                "the local comparison is not connected to the retained same-scope engineering-judgment history; a different card or reflection is not a fresh budget"
+            }
+            Self::StaleBaseline => {
+                "the local comparison does not start from the latest retained candidate revision; the retained baseline is stale"
+            }
+            Self::StaleRepeat => {
+                "the experiment has an earlier retained adoption that is no longer the latest; a repeat would be stale"
+            }
+            Self::RepeatedCost => {
+                "a repeated experiment must retain its exact revisions and measured local token cost"
+            }
+            Self::BaselineChanged => {
+                "cumulative token cost is bound to a different retained baseline than the earlier adopted change"
+            }
+            Self::Inconsistent => {
+                "complete token cost is inconsistent with the connected retained adoption"
+            }
+            Self::OutOfRange => "the accumulated candidate token cost is out of range",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JudgmentPoint<'a> {
+    record: &'a GateRecord,
+    baseline_revision: &'a str,
+    candidate_revision: &'a str,
+    baseline_tokens: u64,
+    candidate_tokens: u64,
+    cumulative_baseline_tokens: u64,
+    cumulative_candidate_tokens: u64,
+    identity: &'a str,
+    index: usize,
+}
+
+impl<'a> JudgmentPoint<'a> {
+    fn parse(record: &'a GateRecord, index: usize) -> Result<Self, CumulativeProblem> {
+        let (baseline_revision, candidate_revision) = record
+            .revisions
+            .as_deref()
+            .and_then(|revisions| revisions.split_once(".."))
+            .ok_or(CumulativeProblem::MissingHistory)?;
+        let baseline_tokens = positive_tokens(record.baseline_tokens.as_deref())
+            .ok_or(CumulativeProblem::MissingHistory)?;
+        let candidate_tokens = nonnegative_tokens(record.candidate_tokens.as_deref())
+            .ok_or(CumulativeProblem::MissingHistory)?;
+        let cumulative_baseline_tokens =
+            nonnegative_tokens(record.cumulative_baseline_tokens.as_deref())
+                .ok_or(CumulativeProblem::MissingHistory)?;
+        let cumulative_candidate_tokens =
+            nonnegative_tokens(record.cumulative_candidate_tokens.as_deref())
+                .ok_or(CumulativeProblem::MissingHistory)?;
+        let identity = record
+            .cumulative_baseline
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or(CumulativeProblem::MissingHistory)?;
+        Ok(Self {
+            record,
+            baseline_revision,
+            candidate_revision,
+            baseline_tokens,
+            candidate_tokens,
+            cumulative_baseline_tokens,
+            cumulative_candidate_tokens,
+            identity,
+            index,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CumulativeTotals {
+    baseline: u64,
+    candidate: u64,
+    identity: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CumulativeComparison<'a> {
+    item: &'a str,
+    experiment: &'a str,
+    scope: &'a str,
+    baseline_revision: &'a str,
+    candidate_revision: &'a str,
+    baseline_tokens: u64,
+    candidate_tokens: u64,
+}
+
+fn is_judgment_adoption(record: &GateRecord) -> bool {
+    record.outcome.as_deref() == Some("adopt")
+        && matches!(
+            record.recorded_basis(),
+            Ok(RecordedBasis::EngineeringJudgment(_))
+        )
+}
+
+/// Orders the retained adoptions connected to an anchor by their exact
+/// baseline/candidate revision edges. Card-list order is irrelevant: a record
+/// whose candidate produced the next record's baseline is its predecessor.
+fn connected_lineage(
+    points: &[JudgmentPoint<'_>],
+    anchor: JudgmentPoint<'_>,
+) -> Result<Vec<usize>, CumulativeProblem> {
+    let mut lineage = vec![anchor.index];
+    loop {
+        let current_index = *lineage.last().expect("lineage is non-empty");
+        let current = points
+            .iter()
+            .find(|point| point.index == current_index)
+            .expect("lineage indices come from points");
+        let predecessors: Vec<JudgmentPoint<'_>> = points
+            .iter()
+            .filter(|point| {
+                !lineage.contains(&point.index)
+                    && point.candidate_revision == current.baseline_revision
+            })
+            .copied()
+            .collect();
+        match predecessors.as_slice() {
+            [] => break,
+            [previous] => lineage.push(previous.index),
+            _ => return Err(CumulativeProblem::AmbiguousHistory),
+        }
+    }
+    lineage.reverse();
+    Ok(lineage)
+}
+
+fn validate_lineage(
+    points: &[JudgmentPoint<'_>],
+    lineage: &[usize],
+) -> Result<CumulativeTotals, CumulativeProblem> {
+    let first_index = lineage.first().ok_or(CumulativeProblem::MissingHistory)?;
+    let first = points
+        .iter()
+        .find(|point| point.index == *first_index)
+        .ok_or(CumulativeProblem::MissingHistory)?;
+    if first.baseline_revision != first.identity {
+        return Err(CumulativeProblem::BaselineChanged);
+    }
+    if first.cumulative_baseline_tokens != first.baseline_tokens
+        || first.cumulative_candidate_tokens != first.candidate_tokens
+    {
+        return Err(CumulativeProblem::Inconsistent);
+    }
+    let mut previous = first;
+    for index in lineage.iter().skip(1) {
+        let current = points
+            .iter()
+            .find(|point| point.index == *index)
+            .ok_or(CumulativeProblem::MissingHistory)?;
+        if current.identity != first.identity
+            || current.cumulative_baseline_tokens != previous.cumulative_baseline_tokens
+        {
+            return Err(CumulativeProblem::BaselineChanged);
+        }
+        if current.baseline_revision != previous.candidate_revision
+            || current.baseline_tokens != previous.candidate_tokens
+        {
+            return Err(CumulativeProblem::Inconsistent);
+        }
+        let delta = i128::from(current.candidate_tokens) - i128::from(current.baseline_tokens);
+        let expected = i128::from(previous.cumulative_candidate_tokens) + delta;
+        if expected < 0 || expected > i128::from(u64::MAX) {
+            return Err(CumulativeProblem::OutOfRange);
+        }
+        if expected != i128::from(current.cumulative_candidate_tokens) {
+            return Err(CumulativeProblem::Inconsistent);
+        }
+        previous = current;
+    }
+    Ok(CumulativeTotals {
+        baseline: first.cumulative_baseline_tokens,
+        candidate: previous.cumulative_candidate_tokens,
+        identity: first.identity.to_owned(),
+    })
+}
+
+/// Calculates one new cumulative point from the adopted histories in the same
+/// scope. The connected revision lineage supplies the retained baseline and
+/// prior cost; a different scope is excluded, while an unconnected same-scope
+/// lineage refuses instead of starting at zero. A repeated item/experiment
+/// retains its exact earlier totals and is the only accepted non-extension.
+fn cumulative_totals(
+    records: &[GateRecord],
+    comparison: CumulativeComparison<'_>,
+) -> Result<CumulativeTotals, CumulativeProblem> {
+    let CumulativeComparison {
+        item,
+        experiment,
+        scope,
+        baseline_revision,
+        candidate_revision,
+        baseline_tokens,
+        candidate_tokens,
+    } = comparison;
+    let mut points = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        if !is_judgment_adoption(record) {
+            continue;
+        }
+        if record.item == item && record.scope.as_deref().is_none() {
+            return Err(CumulativeProblem::MissingHistory);
+        }
+        if record.scope.as_deref() != Some(scope) {
+            continue;
+        }
+        points.push(JudgmentPoint::parse(record, index)?);
+    }
+
+    let latest_own = points
+        .iter()
+        .rev()
+        .find(|point| point.record.item == item)
+        .copied();
+    let previous_same = points
+        .iter()
+        .rev()
+        .find(|point| {
+            point.record.item == item && point.record.experiment.as_deref() == Some(experiment)
+        })
+        .copied();
+    if let Some(previous) = previous_same {
+        if latest_own.map(|point| point.index) != Some(previous.index) {
+            return Err(CumulativeProblem::StaleRepeat);
+        }
+        if previous.baseline_revision != baseline_revision
+            || previous.candidate_revision != candidate_revision
+            || previous.baseline_tokens != baseline_tokens
+            || previous.candidate_tokens != candidate_tokens
+        {
+            return Err(CumulativeProblem::RepeatedCost);
+        }
+        let lineage = connected_lineage(&points, previous)?;
+        return validate_lineage(&points, &lineage);
+    }
+
+    if let Some(latest) = latest_own
+        && (latest.candidate_revision != baseline_revision
+            || latest.candidate_tokens != baseline_tokens)
+    {
+        return Err(CumulativeProblem::StaleBaseline);
+    }
+
+    let anchor = if let Some(latest) = latest_own {
+        Some(latest)
+    } else {
+        let mut candidates = points
+            .iter()
+            .filter(|point| point.candidate_revision == baseline_revision)
+            .copied();
+        let first = candidates.next();
+        if candidates.next().is_some() {
+            return Err(CumulativeProblem::AmbiguousHistory);
+        }
+        first
+    };
+    let Some(anchor) = anchor else {
+        if !points.is_empty() {
+            return Err(CumulativeProblem::UnconnectedHistory);
+        }
+        return Ok(CumulativeTotals {
+            baseline: baseline_tokens,
+            candidate: candidate_tokens,
+            identity: baseline_revision.to_owned(),
+        });
+    };
+    if anchor.candidate_tokens != baseline_tokens {
+        return Err(CumulativeProblem::StaleBaseline);
+    }
+    let lineage = connected_lineage(&points, anchor)?;
+    let totals = validate_lineage(&points, &lineage)?;
+    let delta = i128::from(candidate_tokens) - i128::from(baseline_tokens);
+    let candidate = i128::from(totals.candidate) + delta;
+    if candidate < 0 || candidate > i128::from(u64::MAX) {
+        return Err(CumulativeProblem::OutOfRange);
+    }
+    Ok(CumulativeTotals {
+        baseline: totals.baseline,
+        candidate: candidate as u64,
+        identity: totals.identity,
+    })
+}
+
 /// Fills the missing cumulative token fields for one engineering-judgment
 /// draft from the retained adopted history. The local comparison remains
 /// caller-measured; this owner derives the retained baseline identity and
@@ -814,126 +1135,19 @@ fn derive_cumulative_cost(
     if baseline == 0 {
         return Ok(derived);
     }
-    let prior: Vec<&GateRecord> = records
-        .iter()
-        .filter(|record| {
-            record.item == draft.item
-                && record.outcome.as_deref() == Some("adopt")
-                && matches!(
-                    record.recorded_basis(),
-                    Ok(RecordedBasis::EngineeringJudgment(_))
-                )
-        })
-        .collect();
-    let previous_same = prior
-        .iter()
-        .rev()
-        .find(|record| record.experiment.as_deref() == Some(draft.experiment.as_str()))
-        .copied();
-    let (cumulative_baseline, cumulative_candidate, identity) = if let Some(previous) =
-        previous_same
-    {
-        if prior
-            .last()
-            .is_some_and(|latest| latest.experiment.as_deref() != Some(draft.experiment.as_str()))
-        {
-            return Err(board_hypothesis::invalid(
-                "the experiment has an earlier retained adoption that is no longer the latest; a repeat would be stale",
-            ));
-        }
-        let previous_revisions = previous.revisions.as_deref();
-        let same_revisions = previous_revisions
-            .and_then(|revisions| revisions.split_once(".."))
-            .is_some_and(|(previous_baseline, previous_candidate)| {
-                previous_baseline == draft.baseline_revision
-                    && previous_candidate == draft.candidate_revision
-            });
-        if !same_revisions
-            || positive_tokens(previous.baseline_tokens.as_deref()) != Some(baseline)
-            || nonnegative_tokens(previous.candidate_tokens.as_deref()) != Some(candidate)
-        {
-            return Err(board_hypothesis::invalid(
-                "a repeated experiment must retain its exact revisions and measured local token cost",
-            ));
-        }
-        let (cumulative_baseline, cumulative_candidate) = (
-            nonnegative_tokens(previous.cumulative_baseline_tokens.as_deref()),
-            nonnegative_tokens(previous.cumulative_candidate_tokens.as_deref()),
-        );
-        let (Some(cumulative_baseline), Some(cumulative_candidate)) =
-            (cumulative_baseline, cumulative_candidate)
-        else {
-            return Err(board_hypothesis::invalid(
-                "the repeated experiment's retained cumulative token cost is missing",
-            ));
-        };
-        let identity = previous
-            .cumulative_baseline
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                board_hypothesis::invalid(
-                    "the repeated experiment's retained cumulative baseline is missing",
-                )
-            })?;
-        (
-            cumulative_baseline,
-            cumulative_candidate,
-            identity.to_owned(),
-        )
-    } else if let Some(previous) = prior.last().copied() {
-        let (Some(previous_baseline), Some(_previous_candidate)) = (
-            nonnegative_tokens(previous.cumulative_baseline_tokens.as_deref()),
-            nonnegative_tokens(previous.cumulative_candidate_tokens.as_deref()),
-        ) else {
-            return Err(board_hypothesis::invalid(
-                "the latest retained engineering-judgment adoption has no usable cumulative token cost",
-            ));
-        };
-        let identity = previous
-            .cumulative_baseline
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                board_hypothesis::invalid(
-                    "the latest retained engineering-judgment adoption has no cumulative baseline identity",
-                )
-            })?;
-        let expected_baseline_revision = previous
-            .revisions
-            .as_deref()
-            .and_then(|revisions| revisions.split_once("..").map(|(_, candidate)| candidate));
-        if expected_baseline_revision != Some(draft.baseline_revision.as_str()) {
-            return Err(board_hypothesis::invalid(
-                "the local comparison does not start from the latest retained candidate revision; the retained baseline is stale",
-            ));
-        }
-        let previous_candidate =
-            positive_tokens(previous.candidate_tokens.as_deref()).ok_or_else(|| {
-                board_hypothesis::invalid(
-                    "the latest retained adoption has no measured local candidate token cost",
-                )
-            })?;
-        if baseline != previous_candidate {
-            return Err(board_hypothesis::invalid(
-                "the local baseline token cost does not equal the latest retained candidate cost; the retained baseline is stale or would be counted twice",
-            ));
-        }
-        let delta = i128::from(candidate) - i128::from(baseline);
-        let expected_candidate = i128::from(previous_candidate) + delta;
-        if expected_candidate < 0 || expected_candidate > i128::from(u64::MAX) {
-            return Err(board_hypothesis::invalid(
-                "the accumulated candidate token cost is out of range",
-            ));
-        }
-        (
-            previous_baseline,
-            expected_candidate as u64,
-            identity.to_owned(),
-        )
-    } else {
-        (baseline, candidate, draft.baseline_revision.clone())
-    };
+    let totals = cumulative_totals(
+        records,
+        CumulativeComparison {
+            item: &draft.item,
+            experiment: &draft.experiment,
+            scope: &draft.scope,
+            baseline_revision: &draft.baseline_revision,
+            candidate_revision: &draft.candidate_revision,
+            baseline_tokens: baseline,
+            candidate_tokens: candidate,
+        },
+    )
+    .map_err(|problem| board_hypothesis::invalid(problem.message()))?;
     let supplied = [
         draft.cumulative_baseline_tokens.is_some(),
         draft.cumulative_candidate_tokens.is_some(),
@@ -945,30 +1159,24 @@ fn derive_cumulative_cost(
                 "explicit cumulative token cost needs both totals and the retained baseline identity",
             ));
         }
-        if draft.cumulative_baseline_tokens != Some(cumulative_baseline)
-            || draft.cumulative_candidate_tokens != Some(cumulative_candidate)
-            || draft.cumulative_baseline.as_deref() != Some(identity.as_str())
+        if draft.cumulative_baseline_tokens != Some(totals.baseline)
+            || draft.cumulative_candidate_tokens != Some(totals.candidate)
+            || draft.cumulative_baseline.as_deref() != Some(totals.identity.as_str())
         {
             return Err(board_hypothesis::invalid(
                 "explicit cumulative token cost conflicts with the totals derived from the retained board history",
             ));
         }
     }
-    derived.cumulative_baseline_tokens = Some(cumulative_baseline);
-    derived.cumulative_candidate_tokens = Some(cumulative_candidate);
-    derived.cumulative_baseline = Some(identity);
+    derived.cumulative_baseline_tokens = Some(totals.baseline);
+    derived.cumulative_candidate_tokens = Some(totals.candidate);
+    derived.cumulative_baseline = Some(totals.identity);
     Ok(derived)
 }
 
-/// The retained-baseline identity and accumulated totals of the latest
-/// explicit engineering-judgment adoption. A first record starts at its local
-/// totals. A later record extends the most recent adopted judgment record for
-/// the same item: its local baseline must be the retained candidate (same
-/// revision and token cost), the cumulative baseline stays the original
-/// baseline and the cumulative candidate grows by the local delta only. A
-/// repeat of the same experiment must retain the earlier cumulative totals
-/// instead of adding again. An earlier adopted record without usable
-/// cumulative evidence is unknown, never zero.
+/// Validates the latest engineering-judgment record with the same connected-
+/// lineage calculation used before publication. A missing or ambiguous
+/// predecessor is unknown, never zero.
 fn cumulative_limitations(records: &[GateRecord], latest_index: usize) -> Vec<Limitation> {
     let Some(latest) = records.get(latest_index) else {
         return Vec::new();
@@ -992,112 +1200,41 @@ fn cumulative_limitations(records: &[GateRecord], latest_index: usize) -> Vec<Li
     else {
         return Vec::new();
     };
-    let prior: Vec<&GateRecord> = records[..latest_index]
-        .iter()
-        .filter(|record| {
-            record.item == latest.item
-                && record.outcome.as_deref() == Some("adopt")
-                && matches!(
-                    record.recorded_basis(),
-                    Ok(RecordedBasis::EngineeringJudgment(_))
-                )
-        })
-        .collect();
-
-    // A repeated record for the same experiment is the same change: it must
-    // retain the earlier cumulative totals and may not add its local totals
-    // again.
-    if let Some(previous) = prior
-        .iter()
-        .rev()
-        .find(|record| record.experiment == latest.experiment)
-        .copied()
-    {
-        let (Some(previous_baseline), Some(previous_candidate)) = (
-            nonnegative_tokens(previous.cumulative_baseline_tokens.as_deref()),
-            nonnegative_tokens(previous.cumulative_candidate_tokens.as_deref()),
-        ) else {
-            return vec![Limitation::CumulativeHistory];
-        };
-        if previous.cumulative_baseline.as_deref() != Some(identity) {
-            return vec![Limitation::CumulativeBaselineChanged];
-        }
-        if cumulative_baseline != previous_baseline || cumulative_candidate != previous_candidate {
-            return vec![Limitation::TokenCostInconsistent];
-        }
-        if positive_tokens(previous.baseline_tokens.as_deref()) != Some(baseline)
-            || nonnegative_tokens(previous.candidate_tokens.as_deref()) != Some(candidate)
-        {
-            return vec![Limitation::TokenCostInconsistent];
-        }
+    let (Some(scope), Some(experiment)) = (latest.scope.as_deref(), latest.experiment.as_deref())
+    else {
         return Vec::new();
-    }
-
-    let extending: Vec<&GateRecord> = prior
-        .into_iter()
-        .filter(|record| record.experiment != latest.experiment)
-        .collect();
-    let Some(previous) = extending.last().copied() else {
-        let mut limitations = Vec::new();
-        let revisions_match = latest.revisions.as_deref().and_then(|revisions| {
-            let (baseline_revision, _) = revisions.split_once("..")?;
-            Some(baseline_revision == identity)
-        });
-        if revisions_match == Some(false) {
-            push_unique(&mut limitations, Limitation::CumulativeBaseline);
-        }
-        if cumulative_baseline != baseline || cumulative_candidate != candidate {
-            push_unique(&mut limitations, Limitation::TokenCostInconsistent);
-        }
-        return limitations;
     };
-    if extending
-        .first()
-        .is_some_and(|first| first.cumulative_baseline.as_deref() != Some(identity))
-        || previous.cumulative_baseline.as_deref() != Some(identity)
-    {
-        return vec![Limitation::CumulativeBaselineChanged];
-    }
-    let (Some(previous_baseline), Some(previous_candidate)) = (
-        nonnegative_tokens(previous.cumulative_baseline_tokens.as_deref()),
-        nonnegative_tokens(previous.cumulative_candidate_tokens.as_deref()),
-    ) else {
-        return vec![Limitation::CumulativeHistory];
-    };
-    if cumulative_baseline < previous_baseline || cumulative_candidate < previous_candidate {
-        return vec![Limitation::CumulativeCostReset];
-    }
-    // The local comparison must start from the retained candidate: the same
-    // revision and the same token cost. Adding a fresh local baseline would
-    // count the retained cost twice.
-    let previous_candidate_revision = previous
+    let Some((baseline_revision, candidate_revision)) = latest
         .revisions
         .as_deref()
-        .and_then(|revisions| revisions.split_once("..").map(|(_, candidate)| candidate));
-    let latest_baseline_revision = latest
-        .revisions
-        .as_deref()
-        .and_then(|revisions| revisions.split_once("..").map(|(baseline, _)| baseline));
-    if previous_candidate_revision.is_none()
-        || previous_candidate_revision != latest_baseline_revision
-    {
-        return vec![Limitation::CumulativeBaseline];
+        .and_then(|revisions| revisions.split_once(".."))
+    else {
+        return Vec::new();
+    };
+    match cumulative_totals(
+        &records[..latest_index],
+        CumulativeComparison {
+            item: &latest.item,
+            experiment,
+            scope,
+            baseline_revision,
+            candidate_revision,
+            baseline_tokens: baseline,
+            candidate_tokens: candidate,
+        },
+    ) {
+        Ok(totals) => {
+            let mut limitations = Vec::new();
+            if totals.identity != identity {
+                push_unique(&mut limitations, Limitation::CumulativeBaselineChanged);
+            }
+            if totals.baseline != cumulative_baseline || totals.candidate != cumulative_candidate {
+                push_unique(&mut limitations, Limitation::TokenCostInconsistent);
+            }
+            limitations
+        }
+        Err(problem) => vec![problem.limitation()],
     }
-    if baseline != previous_candidate {
-        return vec![Limitation::TokenCostInconsistent];
-    }
-    if cumulative_baseline != previous_baseline {
-        return vec![Limitation::TokenCostInconsistent];
-    }
-    let delta = i128::from(candidate) - i128::from(baseline);
-    let expected_candidate = i128::from(previous_candidate) + delta;
-    if expected_candidate < 0 || expected_candidate > i128::from(u64::MAX) {
-        return vec![Limitation::TokenCostInconsistent];
-    }
-    if expected_candidate != i128::from(cumulative_candidate) {
-        return vec![Limitation::TokenCostInconsistent];
-    }
-    Vec::new()
 }
 
 fn classify(record: &GateRecord) -> (Verdict, Vec<Limitation>) {
@@ -1532,7 +1669,19 @@ pub fn publish_decision(
 ) -> io::Result<Publication> {
     board_hypothesis::require_hypothesis_card(bd, project, &draft.item)?;
     let comments = board_feedback::list_comments(bd, project, &draft.item)?;
-    let existing = parse_gate_comments(&comments);
+    let mut existing = parse_gate_comments(&comments);
+    let needs_retained_history = matches!(draft.basis, DecisionBasis::EngineeringJudgment { .. })
+        && draft.baseline_tokens.is_some_and(|tokens| tokens > 0)
+        && draft.candidate_tokens.is_some();
+    if needs_retained_history {
+        for card in board_hypothesis::list_hypothesis_cards(bd, project)? {
+            if card.id == draft.item {
+                continue;
+            }
+            let comments = board_feedback::list_comments(bd, project, &card.id)?;
+            existing.extend(parse_gate_comments(&comments));
+        }
+    }
     let draft = derive_cumulative_cost(draft, &existing)?;
     let text = draft.record()?;
     let head = head_of(&text);

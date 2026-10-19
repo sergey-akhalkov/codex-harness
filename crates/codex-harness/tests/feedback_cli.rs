@@ -3377,6 +3377,7 @@ fn publish_cumulative_counterexample(
     board: &Board,
     item: &str,
     experiment: &str,
+    scope: &str,
     revisions: (&str, &str),
     tokens: (&str, &str),
 ) -> std::process::Output {
@@ -3396,6 +3397,7 @@ fn publish_cumulative_counterexample(
     let mut args = decision_arguments(item, experiment, "adopt", "unchanged", "115", false, None);
     replace_argument(&mut args, "--reason", JUDGMENT_REASON);
     replace_argument(&mut args, "--accounting", JUDGMENT_ACCOUNTING);
+    replace_argument(&mut args, "--scope", scope);
     replace_argument(&mut args, "--baseline-revision", revisions.0);
     replace_argument(&mut args, "--candidate-revision", revisions.1);
     push_argument(&mut args, "--basis", "engineering-judgment");
@@ -3423,6 +3425,7 @@ fn cumulative_judgment_counterexample_accepts_measured_token_reduction() {
         &board,
         &item,
         "exp-first",
+        "task:synthetic",
         ("base001", "cand002"),
         ("1000", "1100"),
     );
@@ -3431,6 +3434,7 @@ fn cumulative_judgment_counterexample_accepts_measured_token_reduction() {
         &board,
         &item,
         "exp-saving",
+        "task:synthetic",
         ("cand002", "cand003"),
         ("1100", "900"),
     );
@@ -3454,18 +3458,48 @@ fn cumulative_judgment_counterexample_retains_baseline_across_hypotheses() {
     let board = Board::new("judgment-cumulative-hypotheses");
     let first_item = admit(&board, "m-first", "c-synthetic", "basis-first");
     let second_item = admit(&board, "m-second", "c-synthetic", "basis-second");
+    let unrelated_item = admit(&board, "m-unrelated", "c-synthetic", "basis-unrelated");
+    let disconnected_item = admit(
+        &board,
+        "m-disconnected",
+        "c-synthetic",
+        "basis-disconnected",
+    );
     let first = publish_cumulative_counterexample(
         &board,
         &first_item,
         "exp-first",
+        "task:synthetic",
         ("base001", "cand002"),
         ("1000", "1100"),
     );
     assert!(first.status.success(), "{}", output_text(&first));
+    bd_json(
+        &board.bd,
+        &board.project,
+        &[
+            "close",
+            &first_item,
+            "--reason",
+            "retained-history",
+            "--json",
+        ],
+    );
+    assert_eq!(board.item(&first_item)["status"], "closed");
+    let unrelated = publish_cumulative_counterexample(
+        &board,
+        &unrelated_item,
+        "exp-unrelated",
+        "task:unrelated",
+        ("base900", "cand901"),
+        ("5000", "4500"),
+    );
+    assert!(unrelated.status.success(), "{}", output_text(&unrelated));
     let second = publish_cumulative_counterexample(
         &board,
         &second_item,
         "exp-second",
+        "task:synthetic",
         ("cand002", "cand003"),
         ("1100", "1300"),
     );
@@ -3477,8 +3511,23 @@ fn cumulative_judgment_counterexample_retains_baseline_across_hypotheses() {
         .expect("second publication");
     assert!(retained.contains("cumulative_baseline_tokens=1000 cumulative_candidate_tokens=1300 cumulative_baseline=base001"),
         "a new hypothesis in the same scope must not erase retained spending: {retained}");
+    let before = board.comment_texts(&disconnected_item).len();
+    let disconnected = publish_cumulative_counterexample(
+        &board,
+        &disconnected_item,
+        "exp-disconnected",
+        "task:synthetic",
+        ("base900", "cand901"),
+        ("5000", "4500"),
+    );
+    let text = output_text(&disconnected);
+    assert!(!disconnected.status.success(), "{text}");
+    assert!(text.contains("not a fresh budget"), "{text}");
+    assert_eq!(board.comment_texts(&disconnected_item).len(), before);
     assert_no_votes(&board, &first_item);
     assert_no_votes(&board, &second_item);
+    assert_no_votes(&board, &unrelated_item);
+    assert_no_votes(&board, &disconnected_item);
     board.drop();
 }
 
