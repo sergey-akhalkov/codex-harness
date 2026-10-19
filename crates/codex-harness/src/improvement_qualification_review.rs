@@ -92,7 +92,7 @@ pub(super) struct ReviewActions {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReviewParticipant {
+pub(crate) struct ReviewParticipant {
     /// The exact qualification attempt identity. It makes repeated turns in
     /// one native session distinguishable.
     #[serde(default)]
@@ -107,7 +107,7 @@ pub(super) struct ReviewParticipant {
 /// detail stream. Opaque reasoning and compaction items are never included.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReviewAction {
+pub(crate) struct ReviewAction {
     pub attempt: String,
     pub role: String,
     pub session: String,
@@ -145,7 +145,7 @@ pub(super) struct ReviewAction {
 /// The exact coverage state of one participant attempt's raw action stream.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReviewActionCoverage {
+pub(crate) struct ReviewActionCoverage {
     pub attempt: String,
     pub role: String,
     pub session: String,
