@@ -63,7 +63,8 @@ repository.
 - `SEMANTIC` - six synthetic reviewer-calibration cases only; no real panel, reflection judgment or benefit claim.
 - `QUALITY` - explicit quality noninferiority at `ff649f6`: focused core cases 6/6 and native comparison cases 3/3. Equal accepted outcomes require both useful cost margins; strict mode, per-unit acceptance loss, critical cost regression, missing evidence, attribution bounds and malformed mode refusal remain covered. These are policy checks, not real benefit evidence.
 - `EVENTS` - duplicate activation and no-new-outcome native cases at `5ff8b9d`; final-looking text without native completion at `30652d4`. Same-reporter recording/triage at `8545dfe`, supplemented by two actual feedback episodes in one unchanged executor session; private receipts retain the session and episode identities.
-- `RECOVERY` - visibility restoration component at `3b1937c`, accepted adapter at `c71935b`, and ordinary `delivery-improvement process` recovery at `2c1f705` (1/1). These cases terminate the manager after submission; frontend-only closure is still a distinct open gap.
+- `RECOVERY` - visibility restoration component at `3b1937c`, accepted adapter at `c71935b`, and ordinary `delivery-improvement process` recovery at `2c1f705` (1/1). These cases terminate the manager after submission.
+- `FRONTEND` - `visibility::native_normal_process_frontend_only_visibility_loss_recovers_exact_accepted_turn_without_request` passed 1/1 at `18aadf2`. The test follows the stage-runner process tree, closes only its frontend, retains the live manager and verifies a distinct restored frontend, exact submitted fork/turn, unchanged accepted work/costs and single return. Model responses and frontend are fixtures; no real-model or installed-use claim.
 - `PRESERVE` - installed in-flight disable/failed-update/failed-activation/disconnect preservation at `6f4d728`, with the pre-dispatch stop-race correction at `fb2c023`; both installed cases passed together in the retained recovery-consumer check.
 - `READ` - `lead_message_native::self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead` passed with native permitted file reading and refused writes. This establishes tool access, not real-model selection or interpretation of a diagnostic.
 - `SRC` - source inspection only; not an executed check.
@@ -121,7 +122,7 @@ run under qualification; `gap` unmet or unverified acceptance.
 **Reflection is visible and shares capacity**
 
 - `D26 Capacity is occupied` - `ADMIT`, `FORK24::occupied_shared_capacity_keeps_the_closure_pending_then_freed_capacity_runs_it` `[exec]`.
-- `D27 A reflection surface closes` - `RECOVERY::native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_request` restores the submitted turn through the ordinary owner after manager termination, with one executor result, lead stage and delivery. Frontend-only loss records a different state and remains `G5` `[exec+gap]`.
+- `D27 A reflection surface closes` - `RECOVERY::native_normal_process_visibility_loss_recovers_exact_accepted_turn_without_request` restores the submitted turn through the ordinary owner after manager termination, with one executor result, lead stage and delivery. `FRONTEND` additionally proves frontend-only loss and restoration under the same live manager `[exec]`.
 
 **Finite cumulative costs**
 
@@ -212,14 +213,14 @@ run under qualification; `gap` unmet or unverified acceptance.
 - `G2` Real installed vertical slice and global delivery: accepted ordinary work through real executor reflection, lead synthesis, real-lead decision, applied/consumed improvement, plus disabled-mode ordinary use and the globally delivered feedback command (`D1,D3,D37,D43,D54,D55,D56,F16,F25`). Tasks 2.6, 2.7 and 4.1 remain open.
 - `G3` Real-lead scheduling, priority, one-improvement-in-flight and bounded deferral/rejection behavior (`D39,D40,D42,F24,F25`). Task 3.4 remains open.
 - `G4` Lead succession is not implemented as a supported cross-session transfer: `lifecycle.rs` refuses a different lead on `enable`, `recover` requires the retained lead, and core rebinding refuses in-flight/unknown stages (`D52`). Task 3.5 remains open; this is a concrete requirement/implementation mismatch.
-- `G5` Manager-loss recovery restores visibility and the exact submitted turn through the ordinary owner (`RECOVERY`). The existing frontend-only test failed at `ff649f6` while locating the frontend; its direct-child lookup does not yet establish whether attachment or recovery failed through the stage runner. That distinct recovery check remains open (`D27`). Tasks 3.2 and 3.5 remain open.
+- `G5` Native frontend-only recovery gap closed by `FRONTEND`; the earlier failure at `ff649f6` was a direct-child test lookup that missed the stage runner's frontend. `RECOVERY` separately covers manager loss. Tasks 3.2 and 3.5 remain open for their other required cases; real installed/model-backed consumption remains `G2`.
 - `G6` Installed model-free in-flight disable/failed-update/failed-activation/disconnect preservation is exercised (`PRESERVE`). Real partial-improvement and deployed continuation acceptance, including rollback, remain open (`D53,D56`); tasks 3.5 and 4.3 are not complete.
 - `G7` Frozen real comparison, matched quality/time/token benefit gate, real panel, post-acceptance horizon, adverse/inconclusive retention and baseline restoration (`D46,D47,D50,F24`). Tasks 1.3 and 4.2 remain open; candidate remains inactive.
 - `G8` Actual new-session loading/consumption of both reflection skills and any later guidance revision (`D43,D44`). Tasks 2.6 and 4.1 remain open.
 - `G9` Native permitted retrieval is exercised (`READ`); real-model selection and interpretation of relevant operation/check detail for an unclear cause remain unverified (`D21`). Task 3.8 remains open.
 - Optional multi-outcome shared synthesis (`D16`) is permissive, not an additional acceptance gate. The previously missing `D2,D30,D31,F1` component checks are now covered by `EVENTS`.
 
-Task 4.4 remains unchecked because `G1-G9` are unmet or unverified. Docs
+Task 4.4 remains unchecked because `G1-G4` and `G6-G9` are unmet or unverified. Docs
 `project-decisions.md`, `agent-delegation.md` and `installation.md` already
 describe the candidate as inactive/not delivered; no stale operation claim was
 found. Strict OpenSpec validation passed, and the checkout-built
