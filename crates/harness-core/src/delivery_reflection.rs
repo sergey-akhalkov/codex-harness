@@ -37,6 +37,10 @@ pub const MAX_RECONCILE_RECORDS: usize = 64;
 pub const MAX_POLL_REFUSALS: usize = 64;
 const MAX_HEAD_PROBES: usize = 32;
 
+fn reflection_enabled_by_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Purpose {
@@ -125,6 +129,12 @@ pub struct AcceptanceBinding {
     /// stage waits for its completion before forking.
     #[serde(default)]
     pub lead_turn: Option<String>,
+    /// Effective configuration permission when this acceptance was recorded.
+    /// Historical metadata without this field remains eligible; a new closure
+    /// accepted while permission is false can never become reflection work by a
+    /// later re-enable. The snapshot is deliberately outside `acceptance_id`.
+    #[serde(default = "reflection_enabled_by_default")]
+    pub self_reflection_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -167,6 +177,7 @@ impl AcceptanceBinding {
             executor_session: None,
             executor_turn: None,
             lead_turn: None,
+            self_reflection_enabled: reflection_enabled_by_default(),
         }
     }
 
@@ -183,6 +194,11 @@ impl AcceptanceBinding {
         self.executor_session = executor_session;
         self.executor_turn = executor_turn;
         self.lead_turn = lead_turn;
+        self
+    }
+
+    pub fn with_self_reflection_enabled(mut self, enabled: bool) -> Self {
+        self.self_reflection_enabled = enabled;
         self
     }
 
@@ -852,6 +868,7 @@ pub enum RefusalCode {
     MissingPurpose,
     UnknownPurpose,
     NonTriggerPurpose,
+    ReflectionDisabledAtAcceptance,
     MissingAcceptance,
     InvalidAcceptance,
     OutcomeNotAccepted,
@@ -2173,6 +2190,13 @@ impl ReflectionController {
                 ),
             )));
         }
+        if !binding.self_reflection_enabled {
+            return Ok(EvaluatedEvent::Refused(refusal(
+                event,
+                RefusalCode::ReflectionDisabledAtAcceptance,
+                "the acceptance was recorded while self_reflection_enabled = false; a later re-enable does not make this closure eligible",
+            )));
+        }
         let acceptance_id = match binding.acceptance_id() {
             Ok(id) => id,
             Err(error) => {
@@ -2207,13 +2231,26 @@ impl ReflectionController {
         let current_binding = current
             .get(ACCEPTANCE_METADATA)
             .and_then(|raw| serde_json::from_str::<AcceptanceBinding>(raw).ok())
-            .and_then(|binding| binding.normalized().ok())
+            .and_then(|binding| binding.normalized().ok());
+        let current_acceptance = current_binding
+            .as_ref()
             .and_then(|binding| binding.acceptance_id().ok());
-        if current_binding.as_deref() != Some(acceptance_id.as_str()) {
+        if current_acceptance.as_deref() != Some(acceptance_id.as_str()) {
             return Ok(EvaluatedEvent::Refused(refusal(
                 event,
                 RefusalCode::TaskDrift,
                 "the task's current acceptance metadata differs from the close event",
+            )));
+        }
+        if current_binding
+            .as_ref()
+            .map(|binding| binding.self_reflection_enabled)
+            != Some(binding.self_reflection_enabled)
+        {
+            return Ok(EvaluatedEvent::Refused(refusal(
+                event,
+                RefusalCode::TaskDrift,
+                "the task's current self-reflection permission snapshot differs from the close event",
             )));
         }
         if current.get(PURPOSE_METADATA).map(String::as_str) != Some(purpose.as_str()) {

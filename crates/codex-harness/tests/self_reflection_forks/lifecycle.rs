@@ -2,7 +2,7 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    DeliveryState, LifecycleStatus, ReflectionController, StageState,
+    DeliveryState, LifecycleStatus, ReflectionController, RefusalCode, StageState,
 };
 
 pub(super) fn install_fixture(workspace: &Workspace) {
@@ -674,7 +674,7 @@ fn prepare_ordinary_acceptance(
     manager: &Path,
     source: &Path,
     disable_before_accept: bool,
-) -> (ReflectionController, String, String, String) {
+) -> (ReflectionController, String, String, String, Value) {
     use harness_core::{
         board_cli,
         delivery_reflection::{Purpose, board_source_identity},
@@ -768,13 +768,51 @@ fn prepare_ordinary_acceptance(
     };
     let accepted = accept();
     assert_eq!(accepted["duplicate"], false);
-    assert_eq!(accepted["reflection"]["automaticTrigger"], true);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["purpose"], "ordinary", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    for field in [
+        "acceptanceId",
+        "run",
+        "assignment",
+        "result",
+        "resultLocator",
+        "revision",
+        "executorSession",
+        "executorTurn",
+        "leadSession",
+        "leadTurn",
+    ] {
+        assert!(
+            accepted[field]
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty()),
+            "acceptance receipt lost {field}: {accepted}"
+        );
+    }
+    let expected_permission = !disable_before_accept;
+    assert_eq!(
+        accepted["reflection"]["selfReflectionEnabled"], expected_permission,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], expected_permission,
+        "{accepted}"
+    );
     assert_eq!(accepted["leadTurn"], LEAD_SOURCE_TURN);
     assert_eq!(accepted["executorTurn"], EXECUTOR_SOURCE_TURN);
     let acceptance = accepted["acceptanceId"].as_str().unwrap();
     let repeated = accept();
     assert_eq!(repeated["duplicate"], true);
     assert_eq!(repeated["acceptanceId"], acceptance);
+    assert_eq!(
+        repeated["reflection"]["selfReflectionEnabled"], expected_permission,
+        "{repeated}"
+    );
+    assert_eq!(
+        repeated["reflection"]["automaticTrigger"], expected_permission,
+        "{repeated}"
+    );
     assert_eq!(request_counts(workspace), (0, 0, 0, 0));
 
     (
@@ -782,6 +820,7 @@ fn prepare_ordinary_acceptance(
         task,
         acceptance.to_owned(),
         retained.result.unwrap().sha256,
+        accepted,
     )
 }
 
@@ -790,7 +829,7 @@ fn normal_acceptance_with_source(
     manager: &Path,
     source: &Path,
 ) -> (String, String) {
-    let (controller, task, acceptance, retained_result) =
+    let (controller, task, acceptance, retained_result, _accepted) =
         prepare_ordinary_acceptance(workspace, manager, source, false);
     let acceptance = acceptance.as_str();
 
@@ -858,9 +897,11 @@ fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
     let workspace = Workspace::new("gate-ordinary-acceptance", LeadMode::Delivered);
     install_fixture(&workspace);
     let source = source_fixture(&workspace, "ordinary-acceptance", true);
-    let (controller, task, acceptance, _result) =
+    let (controller, task, acceptance, _result, accepted) =
         prepare_ordinary_acceptance(&workspace, &manager(), &source, true);
     assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert_eq!(accepted["reflection"]["selfReflectionEnabled"], false);
+    assert_eq!(accepted["reflection"]["automaticTrigger"], false);
 
     let status = success(command_with_source(
         &workspace,
@@ -871,6 +912,26 @@ fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
     ));
     assert_eq!(status["selfReflectionEnabled"], false, "{status}");
     assert_eq!(status["modelWork"], "stopped", "{status}");
+
+    // Re-enable before the first poll. The acceptance itself was recorded while
+    // permission was false, so later permission must not make that closure
+    // eligible for reflection.
+    set_source_enabled(&source, true);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 0, "{poll:?}");
+    assert_eq!(poll.model_calls, 0, "{poll:?}");
+    assert!(poll.recovery.is_none(), "{poll:?}");
+    assert!(
+        poll.refusals
+            .iter()
+            .any(|refusal| refusal.code == RefusalCode::ReflectionDisabledAtAcceptance),
+        "the disabled-period acceptance was not explicitly refused: {poll:?}"
+    );
+    assert!(
+        controller.record(&acceptance).unwrap().is_none(),
+        "a closure accepted while reflection was disabled became a reflection record"
+    );
+
     let processed = success(command_with_source(
         &workspace,
         &source,

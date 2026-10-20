@@ -97,10 +97,16 @@ Each new stage re-reads the effective source configuration. A host that is
 already running therefore observes an on-to-off change without restart. A stage
 already executing may finish and retain its result; the coordinator checks
 again before the dependent lead stage. The existing controller owns the lock,
-checkpoint, recovery and retained records. A disabled poll advances the normal
-board-event boundary without admitting events, so later re-enable does not
-sweep closures from the disabled interval or duplicate retained work. Status
-reports the effective value, the source path and why model work is stopped.
+checkpoint, recovery and retained records. The normal acceptance owner reads the
+effective permission before closing the board task and records it in the
+acceptance binding and public receipt. Accepting while false therefore succeeds
+but creates an ineligible closure; the existing event evaluator refuses it with
+an explicit `ReflectionDisabledAtAcceptance` code even if the flag returns to
+true before the first poll. Closures otherwise observed during the disabled
+interval advance the normal event boundary without admission. Neither path
+sweeps the disabled interval after re-enable or duplicates retained work.
+Status reports the effective value, the source path and why model work is
+stopped.
 
 ### Parallel candidate implementation and predeclared evaluation
 

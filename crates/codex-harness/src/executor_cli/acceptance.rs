@@ -12,6 +12,7 @@ use harness_core::{
     delivery_reflection::{
         self, ACCEPTANCE_METADATA, AcceptanceBinding, BindingStatus, Purpose, ReflectionController,
     },
+    orchestration_config,
     task_worktree::{self, RetainedCompletion},
 };
 use serde_json::json;
@@ -162,6 +163,7 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
             request.task
         )));
     }
+    let self_reflection_enabled = orchestration_config::load(&source)?.self_reflection_enabled;
 
     // Dispatch preparation publishes its claim and startup reservation under
     // the pool-wide admission lock; assignment binding and the run receipt
@@ -219,7 +221,8 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         Some(executor_session.clone()),
         Some(executor_turn.clone()),
         Some(lead.turn.clone()),
-    );
+    )
+    .with_self_reflection_enabled(self_reflection_enabled);
     let metadata = delivery_reflection::acceptance_metadata(&binding)?;
     let closed = board_cli::close_accepted(
         &bd,
@@ -253,9 +256,17 @@ fn receipt(
     let exact = accepted.executor_session.is_some()
         && accepted.executor_turn.is_some()
         && accepted.binding.lead_turn.is_some();
-    let automatic_trigger =
-        reflection.status == BindingStatus::Active && purpose.triggers_reflection() && exact;
-    let detail = if purpose.triggers_reflection() && !exact {
+    let self_reflection_enabled = accepted.binding.self_reflection_enabled;
+    let automatic_trigger = reflection.status == BindingStatus::Active
+        && purpose.triggers_reflection()
+        && exact
+        && self_reflection_enabled;
+    let detail = if !self_reflection_enabled {
+        format!(
+            "{}; self_reflection_enabled = false at acceptance, so this accepted closure is not eligible for automatic reflection",
+            reflection.detail
+        )
+    } else if purpose.triggers_reflection() && !exact {
         format!(
             "{}; the accepted record has no exact executor session, completed executor turn and accepting lead turn, so automatic reflection is ineligible",
             reflection.detail
@@ -295,6 +306,7 @@ fn receipt(
             "detail": detail,
             "bindingId": reflection.binding_id,
             "revision": reflection.revision,
+            "selfReflectionEnabled": self_reflection_enabled,
             "automaticTrigger": automatic_trigger,
         },
         "modelCalls": 0,

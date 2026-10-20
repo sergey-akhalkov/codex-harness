@@ -24,7 +24,7 @@ Installed activation SHALL enable the two-stage reflection chain for the current
 
 ### Requirement: Configuration permission gates new reflection model work
 
-The installed configuration SHALL define a boolean `self_reflection_enabled` permission that defaults to true. True SHALL permit only an explicitly activated lifecycle and SHALL NOT activate a project. False SHALL prevent new executor and lead reflection model calls while ordinary lead, executor, acceptance and feedback work remains available. The effective value SHALL be re-read before each new stage and SHALL preserve retained work and disabled-period event boundaries.
+The installed configuration SHALL define `self_reflection_enabled`, a boolean permission that defaults to true. True SHALL permit only an explicitly activated lifecycle and SHALL NOT activate a project. False SHALL prevent new executor and lead reflection model calls while ordinary lead, executor, acceptance and feedback work remains available. Each new stage SHALL re-read the effective value. Retained work, pending identities, usage, recovery and event boundaries SHALL be preserved.
 
 #### Scenario: The permission is omitted
 - **WHEN** an existing or new configuration omits `self_reflection_enabled`
@@ -38,10 +38,6 @@ The installed configuration SHALL define a boolean `self_reflection_enabled` per
 - **WHEN** a host has retained an executor reflection and the flag changes from true to false before the lead stage
 - **THEN** the executor result, identity, usage and pending lead stage remain retained, no lead model call starts, and a later true value resumes the retained lead stage without repeating the executor
 
-#### Scenario: Closures occur while disabled
-- **WHEN** an ordinary accepted closure is committed while the flag is false and the flag later returns to true
-- **THEN** the disabled interval was checkpointed without admission, no reflection record or model call is created for that closure, and retained pre-disable work is not duplicated
-
 #### Scenario: Status explains stopped model work
 - **WHEN** the caller reads status while the flag is false or the lifecycle is not active
 - **THEN** the result names the effective flag, configuration path and concrete reason no new model work may start
@@ -49,6 +45,22 @@ The installed configuration SHALL define a boolean `self_reflection_enabled` per
 #### Scenario: The permission has an invalid type
 - **WHEN** the configuration supplies a string, integer or other non-boolean value
 - **THEN** configuration loading fails before model work or lifecycle mutation
+
+### Requirement: Acceptance snapshots the reflection permission
+
+Ordinary acceptance SHALL remain successful while the permission is false and SHALL snapshot the effective value in its acceptance binding and public receipt. The receipt SHALL report `selfReflectionEnabled: false` and `automaticTrigger: false`. Such a closure SHALL remain ineligible for reflection after a later true value without requiring an observing poll during the disabled interval. Retained pre-disable work SHALL not be duplicated or swept.
+
+#### Scenario: An ordinary closure is accepted while model work is disabled
+- **WHEN** an ordinary executor result is accepted while `self_reflection_enabled` is false
+- **THEN** acceptance succeeds with its normal purpose, provenance, results and usage, the public receipt reports the permission as false with `automaticTrigger` false, and no reflection model call starts
+
+#### Scenario: The flag returns before a disabled-period closure is observed
+- **WHEN** an ordinary closure was accepted while `self_reflection_enabled` was false and the flag becomes true before its first event poll
+- **THEN** the existing event evaluator records no reflection record or model call for that closure, reports its disabled-at-acceptance refusal, and does not sweep retained pre-disable work
+
+#### Scenario: Closures occur while disabled
+- **WHEN** ordinary accepted closures occur while the flag is false, whether observed during the disabled interval or accepted under false and re-enabled before their first poll
+- **THEN** no reflection record or model call is created for those closures and retained pre-disable work is not duplicated or swept after re-enable
 
 ### Requirement: Accepted ordinary work is the automatic trigger
 

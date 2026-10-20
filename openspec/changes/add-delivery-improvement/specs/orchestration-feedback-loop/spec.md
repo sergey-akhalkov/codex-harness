@@ -20,7 +20,7 @@ Lead and executor feedback about the work, the orchestration, instructions, tool
 
 #### Scenario: Feedback work continues while reflection is disabled
 - **WHEN** `self_reflection_enabled` is false and a lead records, triages or accepts ordinary work
-- **THEN** those feedback and acceptance operations remain available and start no executor- or lead-reflection model call
+- **THEN** those feedback and acceptance operations remain available, start no executor- or lead-reflection model call, and a closure accepted while false remains ineligible if the value is re-enabled before its first event observation
 
 ### Requirement: Observations are routed by kind
 

@@ -137,6 +137,9 @@ activation: a project still requires an explicit `delivery-improvement enable`.
 An omitted key is true for compatibility. Set it to `false` to stop new
 reflection stages while ordinary lead, executor and acceptance work continues;
 retained results and pending work are preserved.
+An ordinary acceptance made while the value is false still succeeds, records
+that permission in its acceptance metadata and receipt, and remains ineligible
+for reflection if the value is re-enabled before the next poll.
 
 For a first installation, when `codex-harness` is not yet on PATH, bootstrap
 the manager with Cargo's ordinary development profile and let **deploy**
