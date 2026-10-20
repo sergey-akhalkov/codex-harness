@@ -137,8 +137,9 @@ activation: a project still requires an explicit `delivery-improvement enable`.
 An omitted key is true for compatibility. Set it to `false` to stop new
 reflection stages while ordinary lead, executor and acceptance work continues;
 retained results and pending work are preserved.
-Without `--source`, ordinary acceptance reads this installed kit configuration
-while preserving the consumer project as pool provenance. Default-true bindings
+Ordinary acceptance uses the installed kit configuration when its source is a
+consumer project, with or without an explicit `--source`. A selected kit supplies
+its own configuration; consumer pool provenance remains unchanged. Default-true bindings
 omit the field from the legacy-compatible acceptance metadata; false is
 explicit. An acceptance made while false still succeeds, records that
 permission in its receipt, and remains ineligible for reflection if the value is

@@ -674,7 +674,7 @@ fn prepare_ordinary_acceptance(
     manager: &Path,
     source: &Path,
     disable_before_accept: bool,
-    pass_source_to_accept: bool,
+    accept_source: Option<&Path>,
 ) -> (ReflectionController, String, String, String, Value) {
     use harness_core::{
         board_cli,
@@ -719,11 +719,7 @@ fn prepare_ordinary_acceptance(
         "Synthetic accepted executor result with completed checks.",
     )
     .unwrap();
-    let pool_source = if pass_source_to_accept {
-        source
-    } else {
-        &workspace.checkout
-    };
+    let pool_source = accept_source.unwrap_or(&workspace.checkout);
     let pool = task_worktree::pool_state_dir(&workspace.home, pool_source).unwrap();
     fs::create_dir_all(&pool).unwrap();
     let retained = task_worktree::retain_completion(
@@ -759,8 +755,8 @@ fn prepare_ordinary_acceptance(
         command
             .args(["executor", "accept", &task, "--project"])
             .arg(&workspace.checkout);
-        if pass_source_to_accept {
-            command.arg("--source").arg(source);
+        if let Some(accept_source) = accept_source {
+            command.arg("--source").arg(accept_source);
         }
         let output = command
             .arg("--codex-home")
@@ -839,7 +835,7 @@ fn normal_acceptance_with_source(
     source: &Path,
 ) -> (String, String) {
     let (controller, task, acceptance, retained_result, _accepted) =
-        prepare_ordinary_acceptance(workspace, manager, source, false, true);
+        prepare_ordinary_acceptance(workspace, manager, source, false, Some(source));
     let acceptance = acceptance.as_str();
 
     let spec = process_spec_from_source(workspace, manager, source, LEAD_THREAD, "_serve");
@@ -907,7 +903,7 @@ fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
     install_fixture(&workspace);
     let source = source_fixture(&workspace, "ordinary-acceptance", true);
     let (controller, task, acceptance, _result, accepted) =
-        prepare_ordinary_acceptance(&workspace, &manager(), &source, true, true);
+        prepare_ordinary_acceptance(&workspace, &manager(), &source, true, Some(&source));
     assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
     assert_eq!(accepted["reflection"]["selfReflectionEnabled"], false);
     assert_eq!(accepted["reflection"]["automaticTrigger"], false);
@@ -970,66 +966,80 @@ fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
 
 #[test]
 fn ordinary_acceptance_reads_the_installed_kit_permission_without_consumer_config() {
-    let workspace = Workspace::new("gate-installed-acceptance", LeadMode::Delivered);
-    install_fixture(&workspace);
-    let source = source_fixture(&workspace, "installed-acceptance", true);
-    fs::write(
-        workspace.home.join("harness/installation.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schemaVersion": 2,
-            "settings": {"sourceRoot": source},
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        !workspace
-            .checkout
-            .join("global/orchestration.toml")
-            .exists(),
-        "the consumer fixture must not supply kit configuration"
-    );
+    for explicit_consumer in [false, true] {
+        let workspace = Workspace::new(
+            if explicit_consumer {
+                "gate-installed-explicit"
+            } else {
+                "gate-installed-implicit"
+            },
+            LeadMode::Delivered,
+        );
+        install_fixture(&workspace);
+        let source = source_fixture(&workspace, "installed-acceptance", true);
+        fs::write(
+            workspace.home.join("harness/installation.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 2,
+                "settings": {"sourceRoot": source},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !workspace
+                .checkout
+                .join("global/orchestration.toml")
+                .exists(),
+            "the consumer fixture must not supply kit configuration"
+        );
 
-    let (controller, _task, acceptance, _result, accepted) =
-        prepare_ordinary_acceptance(&workspace, &manager(), &source, true, false);
-    assert_eq!(accepted["status"], "accepted", "{accepted}");
-    assert_eq!(accepted["purpose"], "ordinary", "{accepted}");
-    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
-    assert_eq!(
-        accepted["reflection"]["selfReflectionEnabled"], false,
-        "{accepted}"
-    );
-    assert_eq!(
-        accepted["reflection"]["automaticTrigger"], false,
-        "{accepted}"
-    );
+        let (controller, _task, acceptance, _result, accepted) = prepare_ordinary_acceptance(
+            &workspace,
+            &manager(),
+            &source,
+            true,
+            explicit_consumer.then_some(workspace.checkout.as_path()),
+        );
+        assert_eq!(accepted["status"], "accepted", "{accepted}");
+        assert_eq!(accepted["purpose"], "ordinary", "{accepted}");
+        assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+        assert_eq!(
+            accepted["reflection"]["selfReflectionEnabled"], false,
+            "{accepted}"
+        );
+        assert_eq!(
+            accepted["reflection"]["automaticTrigger"], false,
+            "{accepted}"
+        );
 
-    set_source_enabled(&source, true);
-    let poll = controller.poll().unwrap();
-    assert_eq!(poll.accepted, 0, "{poll:?}");
-    assert_eq!(poll.model_calls, 0, "{poll:?}");
-    assert!(
-        poll.ignored >= 1,
-        "the installed-kit disabled acceptance was not ignored: {poll:?}"
-    );
-    assert!(
-        poll.refusals.is_empty(),
-        "the installed-kit disabled acceptance added a refusal: {poll:?}"
-    );
-    assert!(
-        controller.record(&acceptance).unwrap().is_none(),
-        "re-enabling the installed kit scheduled the disabled-period acceptance"
-    );
+        set_source_enabled(&source, true);
+        let poll = controller.poll().unwrap();
+        assert_eq!(poll.accepted, 0, "{poll:?}");
+        assert_eq!(poll.model_calls, 0, "{poll:?}");
+        assert!(
+            poll.ignored >= 1,
+            "the installed-kit disabled acceptance was not ignored: {poll:?}"
+        );
+        assert!(
+            poll.refusals.is_empty(),
+            "the installed-kit disabled acceptance added a refusal: {poll:?}"
+        );
+        assert!(
+            controller.record(&acceptance).unwrap().is_none(),
+            "re-enabling the installed kit scheduled the disabled-period acceptance"
+        );
 
-    let processed = success(command_with_source(
-        &workspace,
-        &source,
-        "process",
-        Some(LEAD_THREAD),
-        &[],
-    ));
-    assert_eq!(processed["retained"], 0, "{processed}");
-    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+        let processed = success(command_with_source(
+            &workspace,
+            &source,
+            "process",
+            Some(LEAD_THREAD),
+            &[],
+        ));
+        assert_eq!(processed["retained"], 0, "{processed}");
+        assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    }
 }
 
 #[test]

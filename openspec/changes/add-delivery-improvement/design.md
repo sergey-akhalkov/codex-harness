@@ -98,11 +98,11 @@ already running therefore observes an on-to-off change without restart. A stage
 already executing may finish and retain its result; the coordinator checks
 again before the dependent lead stage. The existing controller owns the lock,
 checkpoint, recovery and retained records. The normal acceptance owner resolves
-the effective permission before closing the board task. An explicit `--source`
-keeps its current meaning; otherwise a recognized kit checkout uses its own
-configuration and a consumer without one uses the installed kit source recorded
-by the normal installation. The project remains the pool-provenance source and
-is not silently retargeted to the kit. The permission is recorded in the
+the effective permission before closing the board task. The selected source
+keeps its pool-provenance meaning, whether explicit or the default project.
+A recognized kit checkout supplies its configuration; an ordinary consumer
+uses the kit source recorded by the normal installation. Pool provenance is
+not silently retargeted to the kit. The permission is recorded in the
 acceptance binding and public receipt. Default-true bindings omit the field on
 serialization so retained acceptance metadata keeps the legacy shape; false is
 explicit. Accepting while false therefore succeeds but creates an ineligible
