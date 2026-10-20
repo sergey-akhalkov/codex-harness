@@ -18,6 +18,8 @@ const REVIEW_SESSION: &str = "12345678-1234-4234-8234-123456789024";
 const REVIEW_ID: &str = "ordinary-review-fixture";
 const RUN: &str = "ordinary-review-source";
 const TURN: &str = "ordinary-source-turn";
+/// The consumer board's Dolt revision is provenance, not a Git object.
+const BOARD_REVISION: &str = "dolt-revision-7b1e-not-a-git-object";
 
 struct OrdinarySetup {
     fixture: Fixture,
@@ -74,6 +76,13 @@ fn native_ordinary_setup(name: &str) -> OrdinarySetup {
     ordinary_setup_with(name, ActionEvidenceMode::NativePool)
 }
 
+fn later_workload_revision(fixture: &Fixture) -> String {
+    fs::write(fixture.wl.join("later-revision.txt"), "later revision\n").unwrap();
+    git(&fixture.wl, &["add", "later-revision.txt"]);
+    git(&fixture.wl, &["commit", "-qm", "later revision"]);
+    git_output(&fixture.wl, &["rev-parse", "HEAD"])
+}
+
 fn ordinary_setup_with(name: &str, mode: ActionEvidenceMode) -> OrdinarySetup {
     let fixture = Fixture::new(name);
     let launcher = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
@@ -111,7 +120,14 @@ fn ordinary_setup_with(name: &str, mode: ActionEvidenceMode) -> OrdinarySetup {
         database: "ordinary-review-fixture".into(),
         repo_root: fixture.wl.to_string_lossy().into_owned(),
         branch: git_output(&fixture.wl, &["branch", "--show-current"]),
-        commit: fixture.workload_revision.clone(),
+        commit: BOARD_REVISION.into(),
+    };
+    let assignment = SlotAssignmentBinding {
+        source,
+        issue: "ordinary-task".into(),
+        assignment_sha256: assignment_sha256.clone(),
+        purpose: Some(Purpose::Ordinary.as_str().into()),
+        purpose_source: "board".into(),
     };
     let state_dir = task_worktree::pool_state_dir(&fixture.home, &fixture.wl).unwrap();
     let completion = task_worktree::retain_completion(
@@ -123,13 +139,7 @@ fn ordinary_setup_with(name: &str, mode: ActionEvidenceMode) -> OrdinarySetup {
             checkout: fixture.wl.clone(),
             task: Some("ordinary-task".into()),
             handle: Some("ordinary-task-handle".into()),
-            assignment: Some(SlotAssignmentBinding {
-                source,
-                issue: "ordinary-task".into(),
-                assignment_sha256: assignment_sha256.clone(),
-                purpose: Some(Purpose::Ordinary.as_str().into()),
-                purpose_source: "board".into(),
-            }),
+            assignment: Some(assignment.clone()),
             submitted_assignment: Some(AssignmentSubmission::structured(assignment_sha256)),
             role: Some("executor".into()),
             state: "completed".into(),
@@ -157,6 +167,35 @@ fn ordinary_setup_with(name: &str, mode: ActionEvidenceMode) -> OrdinarySetup {
         }}}),
         json!({"method":"turn/completed","params":{"turn":{"id":TURN,"status":"completed"}}})
     );
+    fs::create_dir_all(&state_dir).unwrap();
+    let detail = state_dir.join("stream-1.jsonl");
+    fs::write(&detail, &events).unwrap();
+    fs::write(
+        state_dir.join("spawn-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "slot": {
+                "index": 1,
+                "path": fixture.wl,
+                "source": fixture.wl,
+                "owner": "ordinary-review-fixture",
+                "base": fixture.workload_revision,
+                "remote": "origin",
+                "branch": Value::Null,
+                "task": "ordinary-task",
+                "handle": "ordinary-task-handle",
+                "assignment": serde_json::to_value(&assignment).unwrap()
+            },
+            "originatingLead":{"runGeneration":RUN},
+            "observation":{
+                "schema":1,"coverage":"native","state":"completed","exitCode":0,
+                "session":EXECUTOR_SESSION,"turn":TURN,"events":2,"messages":0,
+                "toolCalls":1,"rounds":1,"malformed":0,
+                "detail":detail,"result":retained_result.clone(),"updatedMs":0
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     match mode {
         ActionEvidenceMode::RetainedSidecars => {
             let raw_path = actions.join(format!("{RUN}.jsonl"));
@@ -175,26 +214,7 @@ fn ordinary_setup_with(name: &str, mode: ActionEvidenceMode) -> OrdinarySetup {
             )
             .unwrap();
         }
-        ActionEvidenceMode::NativePool => {
-            fs::create_dir_all(&state_dir).unwrap();
-            let detail = state_dir.join("stream-1.jsonl");
-            fs::write(&detail, &events).unwrap();
-            fs::write(
-                state_dir.join("spawn-1.json"),
-                serde_json::to_vec_pretty(&json!({
-                    "slot":{"index":1,"owner":"ordinary-review-fixture"},
-                    "originatingLead":{"runGeneration":RUN},
-                    "observation":{
-                        "schema":1,"coverage":"native","state":"completed","exitCode":0,
-                        "session":EXECUTOR_SESSION,"turn":TURN,"events":2,"messages":0,
-                        "toolCalls":1,"rounds":1,"malformed":0,
-                        "detail":detail,"result":retained_result.clone(),"updatedMs":0
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
+        ActionEvidenceMode::NativePool => {}
     }
 
     let declaration = fixture.root.join("ordinary-review.json");
@@ -394,133 +414,20 @@ fn reviewer_refresh_refuses_changed_input_and_writable_native_authority() {
 #[test]
 fn retained_ordinary_completion_prepares_once_without_model_dispatch() {
     let _guard = INSTALL.lock().unwrap();
-    let fixture = Fixture::new("ordinary-review-entry");
-    let launcher = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
-    fixture_build(
-        &fixture.state,
-        "h-build",
-        &fixture.proj,
-        &launcher,
-        "baseline",
+    let setup = ordinary_setup("ordinary-review-entry");
+    let manifest: Value = serde_json::from_slice(&fs::read(&setup.manifest).unwrap()).unwrap();
+    assert_eq!(manifest["assignment"]["source"]["commit"], BOARD_REVISION);
+    assert_ne!(
+        manifest["assignment"]["source"]["commit"],
+        json!(setup.fixture.workload_revision)
     );
-    let prompt = fixture.root.join("ordinary-task.txt");
-    let criteria = fixture.root.join("ordinary-criteria.txt");
-    let config = fixture.root.join("ordinary-reviewer.toml");
-    let result = fixture.root.join("ordinary-result.txt");
-    fs::write(
-        &prompt,
-        "Inspect the frozen solution.txt and report its current state.\n",
-    )
-    .unwrap();
-    fs::write(
-        &criteria,
-        "The report must accurately describe the frozen solution.txt.\n",
-    )
-    .unwrap();
-    fs::write(&result, "Completed the requested inspection.\n").unwrap();
-    fs::write(
-        &config,
-        "sandbox_mode = 'read-only'\napproval_policy = 'never'\nmodel = 'gpt-6-astra'\nmodel_provider = 'openai'\nmodel_reasoning_effort = 'xhigh'\n[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
-    )
-    .unwrap();
-    let assignment_sha256 = build_identity::hash_bytes(b"ordinary-review-assignment");
-    let source = SourceIdentity {
-        project_id: "ordinary-review-fixture".into(),
-        beads_dir: fixture.wl.join(".beads").to_string_lossy().into_owned(),
-        database: "ordinary-review-fixture".into(),
-        repo_root: fixture.wl.to_string_lossy().into_owned(),
-        branch: git_output(&fixture.wl, &["branch", "--show-current"]),
-        commit: fixture.workload_revision.clone(),
-    };
-    let state_dir = task_worktree::pool_state_dir(&fixture.home, &fixture.wl).unwrap();
-    let completion = task_worktree::retain_completion(
-        &state_dir,
-        &CompletionFacts {
-            run_generation: RUN.into(),
-            slot: 1,
-            owner: "ordinary-review-fixture".into(),
-            checkout: fixture.wl.clone(),
-            task: Some("ordinary-task".into()),
-            handle: Some("ordinary-task-handle".into()),
-            assignment: Some(SlotAssignmentBinding {
-                source,
-                issue: "ordinary-task".into(),
-                assignment_sha256: assignment_sha256.clone(),
-                purpose: Some(Purpose::Ordinary.as_str().into()),
-                purpose_source: "board".into(),
-            }),
-            submitted_assignment: Some(AssignmentSubmission::structured(assignment_sha256)),
-            role: Some("executor".into()),
-            state: "completed".into(),
-            exit_code: Some(0),
-            session: Some(EXECUTOR_SESSION.into()),
-            turn: Some(TURN.into()),
-            result: Some(result),
-        },
-    )
-    .unwrap();
-    assert!(
-        completion.eligibility.eligible,
-        "{:?}",
-        completion.eligibility
-    );
+    let pool_dir = task_worktree::pool_state_dir(&setup.fixture.home, &setup.fixture.wl).unwrap();
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(pool_dir.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(receipt["slot"]["base"], setup.fixture.workload_revision);
 
-    // These are already retained action facts. Review must not rediscover a
-    // mutable pool stream or start the original executor to obtain them.
-    let actions = fixture.root.join("retained-actions");
-    fs::create_dir(&actions).unwrap();
-    let raw = format!(
-        "{}\n{}\n",
-        json!({"method":"item/completed","params":{"turnId":TURN,"item":{
-            "id":"command-1","type":"commandExecution","command":"git status --short",
-            "status":"completed","exitCode":0,"aggregatedOutput":""
-        }}}),
-        json!({"method":"turn/completed","params":{"turn":{"id":TURN,"status":"completed"}}})
-    );
-    let raw_path = actions.join(format!("{RUN}.jsonl"));
-    fs::write(&raw_path, &raw).unwrap();
-    fs::write(
-        actions.join(format!("{RUN}.json")),
-        serde_json::to_vec_pretty(&json!({
-            "schema":1,"attempt":RUN,"role":"executor","session":EXECUTOR_SESSION,
-            "source":raw_path,"captured":true,"source_bytes":raw.len(),
-            "retained_bytes":raw.len(),"source_sha256":build_identity::hash_bytes(raw.as_bytes()),
-            "truncated":false,"observed_events":2,"observed_malformed":0,
-            "observed_rounds":1,"observed_turn":TURN,"note":null
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let declaration = fixture.root.join("ordinary-review.json");
-    let review = fixture.root.join("ordinary-review");
-    let input = json!({
-        "schema":1,"review":"ordinary-review-fixture",
-        "task":{"source":fixture.wl,"revision":fixture.workload_revision,
-            "name":"ordinary-task","read_only":true,"writable_scope":[]},
-        "task_prompt":{"path":prompt,"sha256":build_identity::hash_file(&prompt).unwrap()},
-        "completion":{"codex_home":fixture.home,"run_generation":RUN,"executor_profile":"ds"},
-        "lead_session":null,"action_evidence_root":actions,
-        "semantic_review":{
-            "schema":1,"runtime":{"state":fixture.state,"build":fixture.state.join("builds/h-build"),
-                "label":"ordinary-review-runtime","upstream":fixture.upstream,
-                "native_config":{"path":config,"sha256":build_identity::hash_file(&config).unwrap()},
-                "private_inputs":[]},
-            "profile":"ds","criteria":{"path":criteria,"sha256":build_identity::hash_file(&criteria).unwrap()},
-            "sources":["solution.txt"],"max_corrections":1
-        }
-    });
-    let input_bytes = serde_json::to_vec_pretty(&input).unwrap();
-    fs::write(&declaration, &input_bytes).unwrap();
-    let args = [
-        "review",
-        "--prepare",
-        "--review",
-        review.to_str().unwrap(),
-        "--declaration",
-        declaration.to_str().unwrap(),
-    ];
-    let first = fixture.improve(&args);
+    let input_bytes = fs::read(&setup.declaration).unwrap();
+    let first = setup.prepare();
     assert!(
         first.status.success(),
         "stdout={}\nstderr={}",
@@ -529,20 +436,76 @@ fn retained_ordinary_completion_prepares_once_without_model_dispatch() {
     );
     assert!(String::from_utf8_lossy(&first.stdout).contains("improve review --resume --review"));
     assert_eq!(
-        fs::read(review.join("declaration.json")).unwrap(),
+        fs::read(setup.review.join("declaration.json")).unwrap(),
         input_bytes
     );
-    let state_bytes = fs::read(review.join("state.json")).unwrap();
+    let state_bytes = fs::read(setup.review.join("state.json")).unwrap();
     let state: Value = serde_json::from_slice(&state_bytes).unwrap();
     assert!(state["cursor"]["attempts"].as_array().unwrap().is_empty());
-    let repeated = fixture.improve(&args);
+    assert_eq!(
+        state["completion"]["base_revision"],
+        setup.fixture.workload_revision
+    );
+    let repeated = setup.prepare();
     assert!(
         repeated.status.success(),
         "{}",
         String::from_utf8_lossy(&repeated.stderr)
     );
-    assert_eq!(fs::read(review.join("state.json")).unwrap(), state_bytes);
-    assert_eq!(fs::read(&declaration).unwrap(), input_bytes);
+    assert_eq!(
+        fs::read(setup.review.join("state.json")).unwrap(),
+        state_bytes
+    );
+    assert_eq!(fs::read(&setup.declaration).unwrap(), input_bytes);
+}
+
+#[test]
+fn declared_git_base_must_match_exact_dispatch_base() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-declared-base-drift");
+    let later = later_workload_revision(&setup.fixture);
+    let mut declaration: Value =
+        serde_json::from_slice(&fs::read(&setup.declaration).unwrap()).unwrap();
+    declaration["task"]["revision"] = json!(later);
+    fs::write(
+        &setup.declaration,
+        serde_json::to_vec_pretty(&declaration).unwrap(),
+    )
+    .unwrap();
+
+    let refused = setup.prepare();
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("dispatch Git base differs from the declared task revision"),
+        "{}",
+        text(&refused)
+    );
+    assert!(!setup.review.join("state.json").exists());
+    assert!(!setup.review.join("packet").exists());
+    assert!(!setup.review.join("reviewer").exists());
+}
+
+#[test]
+fn dispatch_git_base_must_match_declared_task_revision() {
+    let _guard = INSTALL.lock().unwrap();
+    let setup = ordinary_setup("ordinary-review-dispatch-base-drift");
+    let later = later_workload_revision(&setup.fixture);
+    let pool_dir = task_worktree::pool_state_dir(&setup.fixture.home, &setup.fixture.wl).unwrap();
+    let receipt = pool_dir.join("spawn-1.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    value["slot"]["base"] = json!(later);
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    let refused = setup.prepare();
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("dispatch Git base differs from the declared task revision"),
+        "{}",
+        text(&refused)
+    );
+    assert!(!setup.review.join("state.json").exists());
+    assert!(!setup.review.join("packet").exists());
+    assert!(!setup.review.join("reviewer").exists());
 }
 
 fn assert_no_attempts(setup: &OrdinarySetup) {
@@ -914,6 +877,22 @@ fn native_capture_refuses_mismatched_receipt_before_review_effects() {
     );
     assert!(!turn.review.join("state.json").exists());
     assert!(!turn.actions.join(format!("{RUN}.json")).exists());
+
+    let owner = native_ordinary_setup("ordinary-review-native-wrong-owner");
+    let pool_dir = task_worktree::pool_state_dir(&owner.fixture.home, &owner.fixture.wl).unwrap();
+    let receipt = pool_dir.join("spawn-1.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    value["slot"]["owner"] = json!("later-owner");
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let refused = owner.prepare();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("does not bind run generation"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!owner.review.join("state.json").exists());
+    assert!(!owner.actions.join(format!("{RUN}.json")).exists());
 
     let lost = native_ordinary_setup("ordinary-review-native-lost-receipt");
     let pool_dir = task_worktree::pool_state_dir(&lost.fixture.home, &lost.fixture.wl).unwrap();

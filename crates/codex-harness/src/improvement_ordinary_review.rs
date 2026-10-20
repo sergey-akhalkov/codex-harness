@@ -18,6 +18,7 @@ use harness_core::{
     task_worktree::{self, AssignmentSubmission, CompletionResult, RetainedCompletion},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     ffi::OsString,
     fs, io,
@@ -30,7 +31,7 @@ use super::{
     ReviewSubject, action_evidence_from, advance_semantic_review_host, ensure_review_packet,
     load_or_install_reviewer_runtime, retained_judgment, same_retained_place, write_bytes_atomic,
 };
-use crate::executor_cli::{ConversationState, pool_evidence_paths, receipt_view};
+use crate::executor_cli::pool_evidence_paths;
 
 const ORDINARY_REVIEW_SCHEMA: u32 = 1;
 
@@ -413,6 +414,190 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
+/// Verify the exact native receipt that recorded this completion before the
+/// recorded pool slot can be reused. Identity, lifecycle and the slot binding
+/// come from one bounded read, so no field is compared across file revisions.
+/// Its `slot.base` is the committed Git base; the board revision in
+/// `assignment.source` is never resolved as Git. Later preparation uses the
+/// frozen review state and does not reread a slot that may now hold another run.
+fn verified_dispatch_receipt(
+    declaration: &OrdinaryReviewDeclaration,
+    completion: &RetainedCompletion,
+) -> io::Result<(PathBuf, PathBuf, String)> {
+    let session = completion
+        .session
+        .as_deref()
+        .filter(|session| !session.trim().is_empty())
+        .ok_or_else(|| invalid("the retained ordinary completion has no executor session"))?;
+    let turn = completion
+        .turn
+        .as_deref()
+        .filter(|turn| !turn.trim().is_empty())
+        .ok_or_else(|| invalid("the retained ordinary completion has no completed turn"))?;
+    let (receipt, detail) = pool_evidence_paths(
+        &declaration.completion.codex_home,
+        &declaration.task.source,
+        completion.slot,
+    )?;
+    let raw = match read_bounded_file(&receipt, "ordinary dispatch receipt") {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(format!(
+                "the native dispatch receipt {} for run generation {} is not completed: the receipt is missing; preserve the retained completion instead of reading a reused, lost or live pool slot",
+                receipt.display(),
+                completion.run_generation
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let receipt_value: Value = serde_json::from_slice(&raw).map_err(|error| {
+        invalid(format!(
+            "the native dispatch receipt {} is not valid JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    let slot = receipt_value
+        .get("slot")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the native dispatch receipt {} records no slot binding for run generation {}",
+                receipt.display(),
+                completion.run_generation
+            ))
+        })?;
+    let observation = receipt_value
+        .get("observation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the native dispatch receipt {} records no completed observation for run generation {}; preserve the retained completion instead of reading a reused, lost or live pool slot",
+                receipt.display(),
+                completion.run_generation
+            ))
+        })?;
+    if observation.get("coverage").and_then(Value::as_str) != Some("native")
+        || observation.get("state").and_then(Value::as_str) != Some("completed")
+        || observation.get("exitCode").and_then(Value::as_i64) != Some(0)
+    {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} for run generation {} is not completed native evidence; preserve the retained completion instead of reading a reused, lost or live pool slot",
+            receipt.display(),
+            completion.run_generation
+        )));
+    }
+    let generation = receipt_value
+        .get("originatingLead")
+        .and_then(|lead| lead.get("runGeneration"))
+        .and_then(Value::as_str);
+    let slot_index = slot
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok());
+    let receipt_owner = slot.get("owner").and_then(Value::as_str);
+    let receipt_session = observation.get("session").and_then(Value::as_str);
+    let receipt_turn = observation.get("turn").and_then(Value::as_str);
+    if generation != Some(completion.run_generation.as_str())
+        || slot_index != Some(completion.slot)
+        || receipt_owner != Some(completion.owner.as_str())
+        || receipt_session != Some(session)
+        || receipt_turn != Some(turn)
+    {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} does not bind run generation {}, slot {}, owner {}, session {} and turn {}; preserve the retained completion instead of capturing a later pool occupant",
+            receipt.display(),
+            completion.run_generation,
+            completion.slot,
+            completion.owner,
+            session,
+            turn
+        )));
+    }
+    let slot_path = slot
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the native dispatch receipt {} records no checkout for run generation {}",
+                receipt.display(),
+                completion.run_generation
+            ))
+        })?;
+    if slot_path != completion.checkout {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} binds checkout {}, not the retained completion checkout {}; preserve the retained completion instead of accepting a later slot occupant",
+            receipt.display(),
+            slot_path.display(),
+            completion.checkout.display()
+        )));
+    }
+    let slot_task = slot
+        .get("task")
+        .and_then(Value::as_str)
+        .filter(|task| !task.is_empty());
+    if completion.task.as_deref() != slot_task {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} does not bind task {:?} of run generation {}; preserve the retained completion instead of accepting a reused slot",
+            receipt.display(),
+            completion.task,
+            completion.run_generation
+        )));
+    }
+    let slot_handle = slot
+        .get("handle")
+        .and_then(Value::as_str)
+        .filter(|handle| !handle.is_empty());
+    if completion.handle.as_deref() != slot_handle {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} does not bind handle {:?} of run generation {}; preserve the retained completion instead of accepting a reused slot",
+            receipt.display(),
+            completion.handle,
+            completion.run_generation
+        )));
+    }
+    let retained_assignment = completion.assignment.as_ref().ok_or_else(|| {
+        invalid("the retained ordinary completion has no structured assignment binding")
+    })?;
+    let slot_assignment = slot
+        .get("assignment")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| {
+            invalid(format!(
+                "the native dispatch receipt {} records no board assignment for run generation {}",
+                receipt.display(),
+                completion.run_generation
+            ))
+        })?;
+    let slot_assignment: task_worktree::SlotAssignmentBinding =
+        serde_json::from_value(slot_assignment.clone()).map_err(|error| {
+            invalid(format!(
+                "the native dispatch receipt {} has an unreadable board assignment: {error}",
+                receipt.display()
+            ))
+        })?;
+    if &slot_assignment != retained_assignment {
+        return Err(invalid(format!(
+            "the native dispatch receipt {} does not bind the retained board assignment {} for run generation {}; preserve the retained completion instead of accepting a reused slot",
+            receipt.display(),
+            retained_assignment.issue,
+            completion.run_generation
+        )));
+    }
+    let dispatch_base = slot
+        .get("base")
+        .and_then(Value::as_str)
+        .filter(|base| !base.trim().is_empty())
+        .ok_or_else(|| {
+            invalid(format!(
+                "the native dispatch receipt {} records no committed Git base for run generation {}; preserve the retained completion instead of guessing its base",
+                receipt.display(),
+                completion.run_generation
+            ))
+        })?;
+    Ok((receipt, detail, dispatch_base.to_owned()))
+}
+
 /// Capture one completed ordinary executor turn's visible action stream into
 /// the ordinary-owned evidence root before the recorded pool slot can be
 /// reused. First preparation reuses the shared qualification capture
@@ -435,42 +620,7 @@ fn capture_ordinary_action_stream(
         .as_deref()
         .filter(|session| !session.trim().is_empty())
         .ok_or_else(|| invalid("the retained ordinary completion has no executor session"))?;
-    let turn = completion
-        .turn
-        .as_deref()
-        .filter(|turn| !turn.trim().is_empty())
-        .ok_or_else(|| invalid("the retained ordinary completion has no completed turn"))?;
-    let (receipt, detail) = pool_evidence_paths(
-        &declaration.completion.codex_home,
-        &declaration.task.source,
-        completion.slot,
-    )?;
-    let view = receipt_view(&receipt)?;
-    if view.state != ConversationState::Completed {
-        return Err(invalid(format!(
-            "the native dispatch receipt {} for run generation {} is not completed ({:?}); preserve the retained completion instead of reading a reused, lost or live pool slot",
-            receipt.display(),
-            completion.run_generation,
-            view.state
-        )));
-    }
-    let identity = &view.identity;
-    if identity.generation.as_deref() != Some(completion.run_generation.as_str())
-        || identity.slot != Some(completion.slot)
-        || identity.owner.as_deref() != Some(completion.owner.as_str())
-        || identity.session.as_deref() != Some(session)
-        || identity.turn.as_deref() != Some(turn)
-    {
-        return Err(invalid(format!(
-            "the native dispatch receipt {} does not bind run generation {}, slot {}, owner {}, session {} and turn {}; preserve the retained completion instead of capturing a later pool occupant",
-            receipt.display(),
-            completion.run_generation,
-            completion.slot,
-            completion.owner,
-            session,
-            turn
-        )));
-    }
+    let (receipt, detail, _base) = verified_dispatch_receipt(declaration, completion)?;
     let observation = super::super::improvement_comparison::retained_observation_at(&receipt);
     super::retain_action_stream_at(
         &sidecar,
@@ -517,10 +667,19 @@ fn prepare(review: &Path, declaration_path: &Path) -> io::Result<()> {
             declaration.task.source.display()
         ))
     })?;
-    let binding = validate_completion(&declaration, &completion)?;
+    let retained_state = load_state(&state_path)?;
+    // The native receipt is the only source of the dispatch's Git base; the
+    // board revision in the assignment is intentionally not a Git object.
+    // Reuse the frozen binding after the first preparation instead of reading
+    // a slot whose index may already belong to a later dispatch.
+    let exact_dispatch_base = if retained_state.is_some() {
+        None
+    } else {
+        Some(verified_dispatch_receipt(&declaration, &completion)?.2)
+    };
+    let binding = validate_completion(&declaration, &completion, exact_dispatch_base.as_deref())?;
     let subject = review_subject(&declaration, &binding)?;
 
-    let retained_state = load_state(&state_path)?;
     let previously_prepared = retained_state.is_some();
     let state = match retained_state {
         Some(state) => state,
@@ -609,7 +768,7 @@ fn resume(review: &Path, declaration_path: Option<PathBuf>) -> io::Result<i32> {
             declaration.completion.run_generation
         ))
     })?;
-    let binding = validate_completion(&declaration, &completion)?;
+    let binding = validate_completion(&declaration, &completion, None)?;
     let subject = review_subject(&declaration, &binding)?;
     validate_state(&state, &declaration_sha256, &binding, &declaration.review)?;
 
@@ -988,6 +1147,7 @@ fn validate_declaration(declaration: &OrdinaryReviewDeclaration) -> io::Result<(
 fn validate_completion(
     declaration: &OrdinaryReviewDeclaration,
     completion: &RetainedCompletion,
+    exact_dispatch_base: Option<&str>,
 ) -> io::Result<OrdinaryCompletionBinding> {
     if !completion.eligibility.eligible {
         return Err(invalid(format!(
@@ -1076,11 +1236,13 @@ fn validate_completion(
         ));
     }
     let base_revision = resolve_commit(&declaration.task.source, &declaration.task.revision)?;
-    let assignment_base = resolve_commit(&declaration.task.source, &assignment.source.commit)?;
-    if base_revision != assignment_base {
-        return Err(invalid(
-            "the retained assignment base differs from the declared task revision",
-        ));
+    if let Some(dispatch_base) = exact_dispatch_base {
+        let dispatch_base = resolve_commit(&declaration.task.source, dispatch_base)?;
+        if dispatch_base != base_revision {
+            return Err(invalid(
+                "the retained dispatch Git base differs from the declared task revision",
+            ));
+        }
     }
     let submission_revision = resolve_commit(&declaration.task.source, &source_revision)?;
     accounting::git(
