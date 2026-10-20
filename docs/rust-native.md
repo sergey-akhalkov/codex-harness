@@ -767,6 +767,40 @@ failure or interruption. Model-free fixtures cover dispatch, resume, role mismat
 stopping and child failure; measured workflow composition and real-agent equivalence
 require their own acceptance before this route can supply comparison evidence.
 
+### Managed lead host lifetime
+
+`codex-harness lead start` is persistent by default: its native frontend owns
+the lifetime, and the app-server stays addressable between turns for automatic
+reflection delivery. A finite assignment uses the same command with `--once`
+and exactly one of `--exec PROMPT` or `--exec-file FILE`:
+
+```powershell
+codex-harness lead start --source CHECKOUT --codex-home DIRECTORY --exec PROMPT --once
+```
+
+The prompt is submitted only after attachment. The finite host records the
+turn identity returned by that submission and observes that exact turn's
+terminal event; a resumed thread's history and an idle thread are not a new
+result. A completed turn with a nonempty final assistant message is printed,
+then the existing cleanup owner closes the frontend, retires the endpoint and
+ends the app-server this host owns. Failure, interruption, a protocol defect,
+empty or missing output, or a cleanup error exits nonzero; retained partial
+output is labeled as non-success. A missing `--once` prompt is refused before
+any process or endpoint starts.
+
+The model-free `executor_control` fixture covers the exact completed and failed
+turns, the missing-prompt refusal, retained output and owned-resource cleanup.
+It also confirms that the default path stays addressable after a completed turn
+until its frontend ends. Fixture success exercises the native app-server
+protocol and process ownership, not a real model turn or a globally installed
+finite session; those require separate installed acceptance.
+
+```powershell
+codex-harness heavy -- cargo test -p codex-harness --test executor_control a_finite_managed_lead_closes_its_owned_surface_and_endpoint_after_the_assigned_turn --locked -- --nocapture --test-threads=1
+codex-harness heavy -- cargo test -p codex-harness --test executor_control a_finite_managed_lead_reports_a_failed_assigned_turn_and_retires_its_owned_state --locked -- --nocapture --test-threads=1
+codex-harness heavy -- cargo test -p codex-harness --test executor_control the_default_managed_lead_stays_addressable_after_a_turn_until_its_frontend_ends --locked -- --nocapture --test-threads=1
+```
+
 ### Native worktree tool suppression
 
 The native TUI hosts a dynamic `codex_worktrees` tool server into sessions

@@ -1278,6 +1278,9 @@ pub struct Conversation {
     /// The turn whose terminal status can finish this run. Assignment
     /// submission and later accepted input update it. A historical turn cannot.
     turn: Option<TurnStart>,
+    /// The exact turn whose terminal outcome was committed. A historical
+    /// completion never sets it, and new assignment clears it.
+    terminal_turn: Option<String>,
     /// Turns whose terminal status was already observed. A replay cannot finish
     /// this run.
     settled_turns: BTreeSet<String>,
@@ -1583,6 +1586,7 @@ impl Conversation {
             defect: None,
             failure: None,
             turn: None,
+            terminal_turn: None,
             settled_turns: BTreeSet::new(),
             closure_begun: false,
             pending_terminal: None,
@@ -1677,6 +1681,7 @@ impl Conversation {
             defect: None,
             failure: None,
             turn: None,
+            terminal_turn: None,
             settled_turns: BTreeSet::new(),
             closure_begun: false,
             pending_terminal: None,
@@ -1722,6 +1727,19 @@ impl Conversation {
     /// The lifecycle state the conversation has reached so far.
     pub fn lifecycle(&self) -> Option<Lifecycle> {
         self.lifecycle
+    }
+
+    /// The terminal outcome committed for exactly `turn_id`, if any.
+    ///
+    /// This is stronger than reading the thread-wide lifecycle: a historical
+    /// turn, a frontend exit or an unrelated thread state cannot answer for
+    /// the turn a finite host assigned.
+    pub fn turn_outcome(&self, turn_id: &str) -> Option<Lifecycle> {
+        if self.terminal_turn.as_deref() != Some(turn_id) {
+            return None;
+        }
+        self.lifecycle
+            .filter(|state| state.is_terminal() || *state == Lifecycle::Defect)
     }
 
     /// The first protocol deviation observed. A run with a recorded deviation
@@ -1781,6 +1799,7 @@ impl Conversation {
         };
         if !self.closure_begun {
             self.pending_terminal = None;
+            self.terminal_turn = None;
             self.turn = Some(turn.clone());
         }
         Ok(turn)
@@ -2041,9 +2060,24 @@ impl Conversation {
     /// The final assistant message of the accepted turn, taken from the thread
     /// items rather than from any transport acknowledgement or an older turn.
     pub fn final_message(&mut self) -> io::Result<FinalMessage> {
+        let turn_id = self.turn.as_ref().map(|turn| turn.turn_id.clone());
+        match turn_id.as_deref() {
+            Some(turn_id) => self.final_message_for_turn(turn_id),
+            None => {
+                let thread = self.thread_state()?;
+                Ok(final_message_for(&thread, None))
+            }
+        }
+    }
+
+    /// The final assistant message of exactly `turn_id`.
+    ///
+    /// A caller that assigned one new turn must read that turn, not whatever
+    /// turn this conversation accepted last: a resumed thread's completed
+    /// history is not the new result.
+    pub fn final_message_for_turn(&mut self, turn_id: &str) -> io::Result<FinalMessage> {
         let thread = self.thread_state()?;
-        let turn_id = self.turn.as_ref().map(|turn| turn.turn_id.as_str());
-        Ok(final_message_for(&thread, turn_id))
+        Ok(final_message_for(&thread, Some(turn_id)))
     }
 
     fn initialize(&mut self) -> io::Result<()> {
@@ -2213,6 +2247,7 @@ impl Conversation {
                     Some("systemError") => {
                         let message = "the native thread reported a system error".to_owned();
                         self.failure = Some(message.clone());
+                        self.terminal_turn = self.turn.as_ref().map(|turn| turn.turn_id.clone());
                         (self.set(Lifecycle::Failed), Some(message))
                     }
                     Some(other) => (
@@ -2388,6 +2423,7 @@ impl Conversation {
 
     fn accept_observed_turn(&mut self, id: &str) {
         self.pending_terminal = None;
+        self.terminal_turn = None;
         if !self.closure_begun
             && self
                 .lifecycle
@@ -2425,6 +2461,7 @@ impl Conversation {
             }
         }
         self.lifecycle = Some(state);
+        self.terminal_turn = self.turn.as_ref().map(|turn| turn.turn_id.clone());
         self.closure_begun = true;
         if let Some(receipt) = self.receipt.clone() {
             let _ = mark_input_closure(&receipt);

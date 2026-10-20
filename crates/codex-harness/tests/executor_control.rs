@@ -11,6 +11,8 @@
 #![cfg(windows)]
 #[path = "fixtures/cache_usage.rs"]
 mod cache_usage;
+#[path = "fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
 // This standalone fixture compilation includes the whole production control
 // owner, but exercises only its conversation driver: the originating-lead
 // helpers belong to the binary's own dispatch paths and are unused here.
@@ -23,7 +25,8 @@ use executor_control::{
     FinalMessage, Lifecycle, MAX_EVENTS_PER_PUMP, app_server_spec, endpoint_process_live,
 };
 use harness_core::{
-    console::{ConsoleSession, ConsoleSpec},
+    build_identity,
+    console::{ConsoleOutcome, ConsoleSession, ConsoleSpec},
     orchestration_config::ProfileBinding,
     process::{Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity},
     process_service::{self, ServiceProcess},
@@ -31,7 +34,7 @@ use harness_core::{
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -44,6 +47,7 @@ const TOKEN: &str = "9f0c1d2e3a4b5c6d7e8f90123456789abcdef0123456789abcdef012345
 const OTHER_TOKEN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
 const TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f2401";
+const SECOND_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f2402";
 const FINAL: &str = "CONTROL_FIXTURE_FINAL_MESSAGE";
 const MODEL: &str = "deepseek-v4-flash";
 const PROVIDER: &str = "deepseek-fixture";
@@ -56,7 +60,7 @@ const WAIT: Duration = Duration::from_secs(10);
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
 
-use control_endpoint::{Answer, Bearer, Server};
+use control_endpoint::{Answer, Bearer, Server, Wire};
 
 // ----------------------------------------------------------------- fixtures
 
@@ -968,6 +972,96 @@ fn a_notification_alone_does_not_keep_the_turn_open() {
             .any(|event| event.lifecycle == Some(Lifecycle::Completed))
     );
     let _ = (root, server, job);
+}
+
+#[test]
+fn only_the_exact_assigned_turn_can_finish_a_finite_session() {
+    let mut fixture = fixture();
+    fixture.server.answer_sequence(
+        "turn/start",
+        vec![
+            Answer::Result(json!({"turn": {"id": TURN, "status": "inProgress"}})),
+            Answer::Result(json!({"turn": {"id": SECOND_TURN, "status": "inProgress"}})),
+        ],
+    );
+    let mut conversation = fixture.start().expect("the canned endpoint must answer");
+    let first = conversation.assign("first prompt").unwrap();
+    let second = conversation.assign("second prompt").unwrap();
+    assert_eq!(first.turn_id, TURN);
+    assert_eq!(second.turn_id, SECOND_TURN);
+    // The first turn's completion is history once the second assignment was
+    // accepted: it may settle that old turn, but it cannot finish this run.
+    fixture.server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 1);
+    assert_eq!(conversation.turn_outcome(TURN), None);
+    assert_eq!(conversation.turn_outcome(SECOND_TURN), None);
+    // Only the exact new turn's terminal result answers this assignment.
+    fixture.server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": SECOND_TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 1);
+    assert_eq!(
+        conversation.turn_outcome(SECOND_TURN),
+        Some(Lifecycle::Completed)
+    );
+    assert_eq!(conversation.turn_outcome(TURN), None);
+    drop(conversation);
+    fixture.terminate();
+}
+
+#[test]
+fn the_final_message_is_read_from_the_exact_assigned_turn_not_history() {
+    const NEW_FINAL: &str = "CONTROL_FIXTURE_NEW_FINAL_MESSAGE";
+    let mut fixture = fixture();
+    fixture.server.answer_sequence(
+        "turn/start",
+        vec![
+            Answer::Result(json!({"turn": {"id": TURN, "status": "inProgress"}})),
+            Answer::Result(json!({"turn": {"id": SECOND_TURN, "status": "inProgress"}})),
+        ],
+    );
+    fixture.server.answer(
+        "thread/read",
+        Answer::Result(json!({"thread": {
+            "id": THREAD,
+            "status": {"type": "idle"},
+            "turns": [
+                {
+                    "id": TURN,
+                    "status": "completed",
+                    "items": [{"id": "old", "type": "agentMessage", "text": FINAL}]
+                },
+                {
+                    "id": SECOND_TURN,
+                    "status": "completed",
+                    "items": [{"id": "new", "type": "agentMessage", "text": NEW_FINAL}]
+                }
+            ]
+        }})),
+    );
+    let mut conversation = fixture.start().expect("the canned endpoint must answer");
+    let first = conversation.assign("historical prompt").unwrap();
+    let second = conversation.assign("new prompt").unwrap();
+    assert_eq!(first.turn_id, TURN);
+    assert_eq!(second.turn_id, SECOND_TURN);
+    // A resumed native thread still carries its completed history. The finite
+    // assignment reads its exact new turn, never the latest completed one.
+    assert_eq!(
+        conversation
+            .final_message_for_turn(&second.turn_id)
+            .expect("the exact turn is readable"),
+        FinalMessage::Present(NEW_FINAL.to_owned())
+    );
+    assert_eq!(
+        conversation.final_message().unwrap(),
+        FinalMessage::Present(NEW_FINAL.to_owned())
+    );
+    drop(conversation);
+    fixture.terminate();
 }
 
 #[test]
@@ -3562,4 +3656,370 @@ fn active_turn_names_the_latest_in_progress_turn_or_none() {
     );
     assert_eq!(executor_control::active_turn(&json!({"turns": []})), None);
     assert_eq!(executor_control::active_turn(&json!({})), None);
+}
+// ------------------------------------------------ finite managed lead host
+
+/// The thread and turn the owned control fixture serves: a finite lead session
+/// closes when exactly this assigned turn reaches its terminal result.
+const LEAD_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
+const LEAD_FIXTURE_TURN: &str = "fixture-turn-1";
+const LEAD_PROMPT: &str = "Complete the finite managed lead fixture turn.";
+const LEAD_FINAL: &str = "fixture turn completed; the committed solution is in the bound slot";
+
+/// One recorded kit build, Codex home and source checkout that the real
+/// `lead start` entry point can host without a model: the app-server child is
+/// the owned control fixture and the native frontend is the owned double.
+struct ManagedLead {
+    _root: tempfile::TempDir,
+    source: PathBuf,
+    home: PathBuf,
+}
+
+impl ManagedLead {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let source = synthetic_role_build::kit_source(root.path());
+        fs::write(
+            source.join("global/orchestration.toml"),
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"default\"]\nmax_concurrent_executors = 1\n",
+        )
+        .unwrap();
+        let build = synthetic_role_build::recorded_build(root.path(), &source);
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join("harness/bin")).unwrap();
+        synthetic_role_build::register(&home, root.path(), &build);
+        // The role preflight reads the recorded build; the host launches this
+        // exact upstream as its one native frontend.
+        let frontend = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+        let registration_path = home.join("harness/native-launch.json");
+        let mut registration: Value =
+            serde_json::from_slice(&fs::read(&registration_path).unwrap()).unwrap();
+        registration["upstream"]["executable"] = json!(frontend);
+        registration["upstream"]["sha256"] = json!(build_identity::hash_file(&frontend).unwrap());
+        fs::write(
+            &registration_path,
+            serde_json::to_vec_pretty(&registration).unwrap(),
+        )
+        .unwrap();
+        // The installed launcher the host runs as its app-server child. The
+        // child-only fixture mode serves the control protocol.
+        fs::copy(FIXTURE, home.join("harness/bin/codex.exe")).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            format!(
+                "model = \"{MODEL}\"\nmodel_provider = \"{PROVIDER}\"\nmodel_reasoning_effort = \"{EFFORT}\"\n"
+            ),
+        )
+        .unwrap();
+        let title = format!(
+            "CLead (default) - {}",
+            source.file_name().unwrap().to_string_lossy()
+        );
+        fs::write(home.join("frontend-title.txt"), title).unwrap();
+        Self {
+            _root: root,
+            source,
+            home,
+        }
+    }
+
+    /// The documented command in its own console. `--once` is the finite
+    /// assignment; without it the default persistent host stays until the
+    /// frontend ends.
+    fn command(&self, once: bool, control: &str) -> CommandSpec {
+        let mut spec = CommandSpec::new(manager());
+        spec.args = vec![
+            "lead".into(),
+            "start".into(),
+            "--source".into(),
+            self.source.as_os_str().to_owned(),
+            "--codex-home".into(),
+            self.home.as_os_str().to_owned(),
+            "--exec".into(),
+            LEAD_PROMPT.into(),
+        ];
+        if once {
+            spec.args.push("--once".into());
+        }
+        spec.env
+            .insert("CODEX_HOME".into(), Some(self.home.as_os_str().to_owned()));
+        spec.env.insert(
+            "HARNESS_EXECUTOR_FIXTURE_MODE".into(),
+            Some("control-app-server".into()),
+        );
+        spec.env.insert(
+            "HARNESS_IMPROVEMENT_FIXTURE_SESSION".into(),
+            Some(LEAD_THREAD.into()),
+        );
+        // The fixture's own turn is not an executor commit in this kit: leave
+        // the bound slot untouched instead of running its synthetic Git step.
+        spec.env.insert(
+            "HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_TEXT".into(),
+            Some(String::new().into()),
+        );
+        spec.env.insert(
+            "HARNESS_IMPROVEMENT_FIXTURE_CONTROL".into(),
+            Some(control.into()),
+        );
+        for name in [
+            "HARNESS_EXECUTOR_SESSION",
+            "HARNESS_EXECUTOR_RUN",
+            "HARNESS_EXECUTOR_CHILD_FIXTURE_MODE",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "HARNESS_ORIGINATING_LEAD",
+            "HARNESS_LEAD_THREAD",
+            "HARNESS_LEAD_RECIPIENT",
+            "WT_SESSION",
+        ] {
+            spec.env.insert(name.into(), None);
+        }
+        spec
+    }
+
+    fn lead_record_path(&self) -> PathBuf {
+        self.home
+            .join("harness/lead-endpoints")
+            .join(format!("{LEAD_THREAD}.json"))
+    }
+
+    fn transient_path(&self, host_pid: u32) -> PathBuf {
+        self.home
+            .join("harness/lead-endpoints/host")
+            .join(format!("{host_pid}.json"))
+    }
+
+    fn rollout_path(&self) -> PathBuf {
+        self.home
+            .join("sessions/2026/10/01")
+            .join(format!("rollout-{LEAD_THREAD}.jsonl"))
+    }
+
+    /// The exact app-server identity this host recorded for itself. Read while
+    /// the finite host still owns the record; cleanup retires it.
+    fn owned_endpoint(&self, host_pid: u32) -> EndpointProcess {
+        let path = self.transient_path(host_pid);
+        let until = Instant::now() + WAIT;
+        loop {
+            match Endpoint::read(&path) {
+                Ok(endpoint) => {
+                    return endpoint
+                        .process
+                        .expect("the host records the app-server it owns");
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound && Instant::now() < until => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!(
+                    "the finite host never recorded its owned endpoint {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
+fn console_wait(session: ConsoleSession) -> ConsoleOutcome {
+    session
+        .wait(
+            Deadline::after(Duration::from_secs(90)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(10),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_finite_managed_lead_closes_its_owned_surface_and_endpoint_after_the_assigned_turn() {
+    let lead = ManagedLead::new();
+    let session = ConsoleSession::spawn(ConsoleSpec::new(lead.command(true, "complete"))).unwrap();
+    let host_pid = session.identity().pid;
+    let process = lead.owned_endpoint(host_pid);
+    // No test releases the frontend double: the host itself must close the
+    // surface it owns when the exact assigned turn is terminal.
+    let finished = console_wait(session);
+    let transcript = finished.transcript.replace("\r\n", "\n");
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        transcript.contains("lead result:"),
+        "the completed assignment retained no result: {transcript}"
+    );
+    assert!(transcript.contains(LEAD_FINAL), "{transcript}");
+    assert!(
+        transcript.contains(&format!(
+            "assigned-turn {LEAD_FIXTURE_TURN} outcome completed"
+        )),
+        "{transcript}"
+    );
+    assert!(
+        !lead.lead_record_path().exists(),
+        "the published address survived its finite session: {transcript}"
+    );
+    assert!(
+        !lead.transient_path(host_pid).exists(),
+        "the working endpoint survived its finite session: {transcript}"
+    );
+    assert!(
+        !lead
+            .transient_path(host_pid)
+            .with_extension("token")
+            .exists(),
+        "the capability token survived its finite session: {transcript}"
+    );
+    wait_gone(
+        process.pid,
+        process.creation_time,
+        &process.program,
+        "the finite host's owned app-server survived its completed assignment",
+    );
+}
+
+#[test]
+fn a_finite_managed_lead_reports_a_failed_assigned_turn_and_retires_its_owned_state() {
+    let lead = ManagedLead::new();
+    let session = ConsoleSession::spawn(ConsoleSpec::new(lead.command(true, "fail"))).unwrap();
+    let host_pid = session.identity().pid;
+    let process = lead.owned_endpoint(host_pid);
+    let finished = console_wait(session);
+    let transcript = finished.transcript.replace("\r\n", "\n");
+    assert_eq!(finished.outcome.exit_code, 1, "{transcript}");
+    assert!(
+        transcript.contains(&format!(
+            "the assigned turn {LEAD_FIXTURE_TURN} did not complete"
+        )),
+        "{transcript}"
+    );
+    assert!(
+        !transcript.contains("lead result:"),
+        "a failed assigned turn printed a successful result: {transcript}"
+    );
+    assert!(
+        !transcript.contains(LEAD_FINAL),
+        "a failed assigned turn retained a successful final message: {transcript}"
+    );
+    assert!(
+        !lead.lead_record_path().exists(),
+        "the published address survived the failed finite session: {transcript}"
+    );
+    assert!(
+        !lead.transient_path(host_pid).exists(),
+        "the working endpoint survived the failed finite session: {transcript}"
+    );
+    wait_gone(
+        process.pid,
+        process.creation_time,
+        &process.program,
+        "the finite host's app-server survived the failed assignment",
+    );
+}
+
+#[test]
+fn the_default_managed_lead_stays_addressable_after_a_turn_until_its_frontend_ends() {
+    let lead = ManagedLead::new();
+    let session = ConsoleSession::spawn(ConsoleSpec::new(lead.command(false, "complete"))).unwrap();
+    let host_pid = session.identity().pid;
+    let process = lead.owned_endpoint(host_pid);
+    // The fixture writes its native rollout only after it has processed the
+    // assigned turn. Its assistant text lives in the thread record, not that
+    // rollout, so completion is confirmed through the published app-server.
+    let until = Instant::now() + Duration::from_secs(30);
+    while !lead.rollout_path().is_file() {
+        assert!(
+            Instant::now() < until,
+            "the fixture assigned turn did not complete: {}",
+            session.transcript()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let published = Endpoint::read(&lead.lead_record_path())
+        .expect("the persistent host keeps its published address after a turn");
+    let mut wire = Wire::connect(published.port(), published.token()).unwrap();
+    wire.call(
+        1,
+        "initialize",
+        json!({"clientInfo": {"name": "persistent-lead-check", "version": "1"}}),
+    )
+    .unwrap();
+    let read = wire
+        .call(
+            2,
+            "thread/read",
+            json!({"threadId": LEAD_THREAD, "includeTurns": true}),
+        )
+        .unwrap();
+    let turn = &read["result"]["thread"]["turns"][0];
+    assert_eq!(turn["id"], LEAD_FIXTURE_TURN, "{read}");
+    assert_eq!(turn["status"], "completed", "{read}");
+    assert_eq!(turn["items"][0]["text"], LEAD_FINAL, "{read}");
+    assert!(
+        endpoint_process_live(
+            published
+                .process
+                .as_ref()
+                .expect("the published record names its app-server")
+        ),
+        "the persistent address no longer names a live app-server"
+    );
+    let user = process_service::current_user().unwrap();
+    assert!(
+        matches!(
+            ServiceProcess::inspect(session.identity(), &manager(), &user),
+            Ok(Some(_))
+        ),
+        "the default host exited after its assigned turn instead of staying persistent"
+    );
+    // Only the frontend's own end closes the persistent host.
+    fs::write(lead.home.join("frontend-release"), b"release").unwrap();
+    let finished = console_wait(session);
+    let transcript = finished.transcript.replace("\r\n", "\n");
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        transcript.contains("lead session: ended thread"),
+        "{transcript}"
+    );
+    assert!(
+        !lead.lead_record_path().exists(),
+        "the persistent address survived its frontend's exit: {transcript}"
+    );
+    assert!(
+        !lead.transient_path(host_pid).exists(),
+        "the persistent working endpoint survived its frontend's exit: {transcript}"
+    );
+    wait_gone(
+        process.pid,
+        process.creation_time,
+        &process.program,
+        "the persistent host's app-server survived its frontend's exit",
+    );
+}
+
+#[test]
+fn lead_start_once_without_a_prompt_is_refused_before_it_starts_anything() {
+    let lead = ManagedLead::new();
+    let output = Command::new(manager())
+        .args(["lead", "start", "--source"])
+        .arg(&lead.source)
+        .args(["--codex-home"])
+        .arg(&lead.home)
+        .arg("--once")
+        .env("CODEX_HOME", &lead.home)
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .env_remove("HARNESS_LEAD_THREAD")
+        .env_remove("HARNESS_LEAD_RECIPIENT")
+        .env_remove("WT_SESSION")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("--once requires the exact first prompt"),
+        "{text}"
+    );
+    assert!(
+        !lead.home.join("harness/lead-endpoints").exists(),
+        "a refused finite session left endpoint state: {text}"
+    );
 }

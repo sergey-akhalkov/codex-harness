@@ -58,6 +58,7 @@ mod warning;
 
 use control::{
     BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, FinalMessage, Lifecycle,
+    TurnStart,
 };
 use observation::{
     COVERAGE_NATIVE, ControlOutcome, RunObservation, RunTracker, STATE_ACCEPTED, STATE_COMPLETED,
@@ -184,12 +185,14 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
 /// endpoint of its own. `lead message` is the other direction and keeps its
 /// own usage beside it.
 const LEAD_START_USAGE: &str = "\
-codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID] [--exec PROMPT] [--exec-file FILE]
+codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID] [--exec PROMPT] [--exec-file FILE] [--once]
   Host the configured lead profile in this terminal via one native app-server/TUI.
   The exact thread records a kit-local endpoint inherited by executors from its shells;
   lead message reaches it. Resume the exact THREAD_ID after its endpoint ends. Native
   routing and cwd stay unchanged; no daemon or second conversation. PROMPT is
-  submitted only after the frontend attaches.
+  submitted only after the frontend attaches. --once requires that prompt and ends
+  this session after the newly assigned turn is terminal; without it the host stays
+  persistent for later turns and automatic reflection delivery.
 ";
 /// Usage of the bounded lead conversation entries: `dispatch` starts one
 /// fresh pooled lead conversation, and `resume` continues an exact recorded
@@ -309,6 +312,9 @@ struct LeadStart {
     session: Option<String>,
     /// Optional first turn, submitted only after the native frontend attaches.
     prompt: Option<String>,
+    /// Close this finite assignment when that exact first turn is terminal,
+    /// instead of keeping the managed lead host alive for later turns.
+    once: bool,
 }
 
 fn lead_start(args: &[OsString]) -> io::Result<i32> {
@@ -369,11 +375,16 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
     let mut session = None;
     let mut prompt = None;
     let mut prompt_file = None;
+    let mut once = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = arg
             .to_str()
             .ok_or_else(|| invalid(&invalid_lead_option("<not Unicode>")))?;
+        if key == "--once" {
+            once = true;
+            continue;
+        }
         let value = iter
             .next()
             .ok_or_else(|| invalid(&invalid_lead_option(key)))?;
@@ -433,11 +444,17 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
             ));
         }
     };
+    if once && prompt.is_none() {
+        return Err(invalid(
+            "lead start --once requires the exact first prompt: pass --exec PROMPT or --exec-file FILE; without it the managed lead stays persistent until its frontend closes",
+        ));
+    }
     let request = LeadStart {
         source,
         codex_home,
         session,
         prompt,
+        once,
     };
     // An identity that cannot name a registry record is refused before any
     // process, listener or conversation exists.
@@ -454,7 +471,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
 
 fn invalid_lead_option(key: &str) -> String {
     format!(
-        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID, --exec PROMPT and --exec-file FILE only"
+        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID, --exec PROMPT, --exec-file FILE and --once only"
     )
 }
 
@@ -647,20 +664,19 @@ fn host_lead_session(
     };
     let thread = conversation.thread_id().to_owned();
     let (frontend, registry) = expose_lead_conversation(&plan, request, &title, &mut conversation)?;
-    let mut reflection = crate::self_reflection_cli::host::LeadLifecycle::new(
-        &request.codex_home,
-        &request.source,
-        &thread,
-    );
-    if let Some(prompt) = request.prompt.as_deref()
-        && let Err(error) = conversation.assign(prompt)
-    {
-        let _ = frontend.close();
-        let _ = control::retire_lead_endpoint(&request.codex_home, &thread);
-        retire_lead_session_files(&plan);
-        return Err(invalid(&format!(
-            "the managed lead conversation did not accept its first prompt: {error}"
-        )));
+    let mut assigned: Option<TurnStart> = None;
+    if let Some(prompt) = request.prompt.as_deref() {
+        match conversation.assign(prompt) {
+            Ok(turn) => assigned = Some(turn),
+            Err(error) => {
+                let _ = frontend.close();
+                let _ = control::retire_lead_endpoint(&request.codex_home, &thread);
+                retire_lead_session_files(&plan);
+                return Err(invalid(&format!(
+                    "the managed lead conversation did not accept its first prompt: {error}"
+                )));
+            }
+        }
     }
     note_log(
         &plan.paths.log,
@@ -670,31 +686,258 @@ fn host_lead_session(
             registry
         ),
     );
-    // The frontend owns this terminal until it ends. Pumping keeps the
-    // conversation's own transport drained without asking the model anything;
-    // a backend that ends first gets a short grace so the frontend can leave
-    // the terminal surface by itself.
-    let mut failure: Option<String> = None;
-    let mut deadline: Option<Instant> = None;
-    while frontend.is_running()? {
-        if failure.is_none() {
-            if let Err(error) = conversation.pump() {
-                failure = Some(error.to_string());
-                deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
+    if request.once {
+        // A finite assignment is the inverse of the persistent managed lead:
+        // the exact turn submitted above owns this host's lifetime. Nothing
+        // else can finish it - not frontend exit, silence, a historical turn
+        // or a timer. Cleanup below reuses the same frontend, address and
+        // app-server owners as the persistent path.
+        let mut failure: Option<String> = None;
+        let mut final_message: Option<String> = None;
+        if let Some(assigned) = assigned.as_ref() {
+            // Consume delivered records before judging the frontend: a terminal
+            // record and the frontend's departure can become visible in the
+            // same observation. One extra pump after a departure drains records
+            // already buffered for this host; the exit alone never answers for
+            // the turn.
+            let mut drained_after_exit = false;
+            loop {
+                if let Err(error) = conversation.pump() {
+                    failure = Some(format!(
+                        "the assigned turn could not be observed to a terminal result: {error}"
+                    ));
+                    break;
+                }
+                if let Some(state) = conversation.turn_outcome(&assigned.turn_id) {
+                    match state {
+                        Lifecycle::Completed => {}
+                        Lifecycle::Failed => {
+                            failure = Some(
+                                conversation
+                                    .failure()
+                                    .unwrap_or("the assigned turn failed without a message")
+                                    .to_owned(),
+                            );
+                        }
+                        Lifecycle::Interrupted => {
+                            failure = Some(
+                                "the assigned turn was interrupted before it completed".to_owned(),
+                            );
+                        }
+                        Lifecycle::Defect => {
+                            failure = Some(format!(
+                                "the assigned turn's state could not be established: {}",
+                                conversation.defect().unwrap_or(
+                                    "the native control stream reported a protocol deviation"
+                                )
+                            ));
+                        }
+                        Lifecycle::NativeStart | Lifecycle::Running => {}
+                    }
+                    break;
+                }
+                match frontend.is_running() {
+                    Ok(true) => {}
+                    Ok(false) if !drained_after_exit => {
+                        drained_after_exit = true;
+                        continue;
+                    }
+                    Ok(false) => {
+                        failure = Some(
+                            "the native frontend ended before the assigned turn reached a terminal result; this assignment has no completed result"
+                                .to_owned(),
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        failure = Some(format!(
+                            "the native frontend could not be observed while the assigned turn was running: {error}"
+                        ));
+                        break;
+                    }
+                }
+                thread::sleep(control::DEFAULT_POLL);
             }
-        } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
+        } else {
+            failure = Some(
+                "no prompt was assigned to this finite lead session; --once requires the exact first prompt"
+                    .to_owned(),
+            );
         }
-        if failure.is_none()
-            && let Err(error) = reflection.tick()
+        if failure.is_none() {
+            if let Some(assigned) = assigned.as_ref() {
+                // The exact submitted turn is the only result this finite
+                // assignment may report; a resumed thread's history is not.
+                match conversation.final_message_for_turn(&assigned.turn_id) {
+                    Ok(FinalMessage::Present(text)) => final_message = Some(text),
+                    Ok(FinalMessage::Empty) => {
+                        failure = Some(
+                            "the assigned turn completed but wrote an empty final assistant message; an empty completion is not success"
+                                .to_owned(),
+                        );
+                    }
+                    Ok(FinalMessage::Missing) => {
+                        failure = Some(
+                            "the assigned turn completed without a final assistant message; a missing result is not success"
+                                .to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        failure = Some(format!(
+                            "the final output of the assigned turn could not be read: {error}"
+                        ));
+                    }
+                }
+            }
+        } else if let Some(assigned) = assigned.as_ref()
+            && let Ok(FinalMessage::Present(text)) =
+                conversation.final_message_for_turn(&assigned.turn_id)
         {
-            note_log(&plan.paths.log, &format!("reflection lifecycle: {error}"));
+            // Keep any partial output of a failed or interrupted turn separate
+            // from success, but never discard it.
+            final_message = Some(text);
         }
-        thread::sleep(control::DEFAULT_POLL);
+        let (frontend_code, notes) = finish_lead_session(
+            request,
+            &plan,
+            &thread,
+            job,
+            frontend,
+            &conversation,
+            launcher,
+            None,
+        );
+        for note in &notes {
+            println!("lead session note: {note}");
+        }
+        let turn_id = assigned
+            .as_ref()
+            .map(|turn| turn.turn_id.as_str())
+            .unwrap_or("unassigned");
+        match failure {
+            None if notes.is_empty() => {
+                if let Some(text) = final_message {
+                    println!("lead result:\n{text}");
+                }
+                println!(
+                    "lead session: ended thread {thread} profile {profile} assigned-turn {turn_id} outcome completed frontend-exit {}",
+                    frontend_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unrecorded".to_owned())
+                );
+                println!(
+                    "lead endpoint: {} was retired; the app-server child ended and no address of this conversation remains",
+                    registry
+                );
+                Ok(0)
+            }
+            None => {
+                // The turn completed and its output is retained, but this host
+                // could not confirm that it released every owned resource. The
+                // result is not a completed assignment while an address or
+                // child may survive it.
+                if let Some(text) = final_message {
+                    println!("lead result (cleanup unconfirmed):\n{text}");
+                }
+                println!(
+                    "lead session: the assigned turn {turn_id} completed, but this host could not confirm every cleanup step; the retained result is not a completed assignment, and the state named by the cleanup notes above requires repair"
+                );
+                Ok(1)
+            }
+            Some(cause) => {
+                if let Some(text) = final_message {
+                    println!("lead partial result (not a success):\n{text}");
+                }
+                println!(
+                    "lead session: the assigned turn {turn_id} did not complete: {cause}; the native frontend and app-server child were closed and this address was retired"
+                );
+                Ok(1)
+            }
+        }
+    } else {
+        let mut reflection = crate::self_reflection_cli::host::LeadLifecycle::new(
+            &request.codex_home,
+            &request.source,
+            &thread,
+        );
+        // The frontend owns this terminal until it ends. Pumping keeps the
+        // conversation's own transport drained without asking the model anything;
+        // a backend that ends first gets a short grace so the frontend can leave
+        // the terminal surface by itself.
+        let mut failure: Option<String> = None;
+        let mut deadline: Option<Instant> = None;
+        while frontend.is_running()? {
+            if failure.is_none() {
+                if let Err(error) = conversation.pump() {
+                    failure = Some(error.to_string());
+                    deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
+                }
+            } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            if failure.is_none()
+                && let Err(error) = reflection.tick()
+            {
+                note_log(&plan.paths.log, &format!("reflection lifecycle: {error}"));
+            }
+            thread::sleep(control::DEFAULT_POLL);
+        }
+        let (frontend_code, notes) = finish_lead_session(
+            request,
+            &plan,
+            &thread,
+            job,
+            frontend,
+            &conversation,
+            launcher,
+            Some(&mut reflection),
+        );
+        for note in &notes {
+            println!("lead session note: {note}");
+        }
+        match failure {
+            None => {
+                println!(
+                    "lead session: ended thread {thread} profile {profile} frontend-exit {}",
+                    frontend_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unrecorded".to_owned())
+                );
+                println!(
+                    "lead endpoint: {} was retired; the app-server child ended and no address of this conversation remains",
+                    registry
+                );
+                Ok(0)
+            }
+            Some(cause) => {
+                println!(
+                    "lead session: the app-server child ended while the native frontend was attached: {cause}; the conversation and its partial work stay in the native session, and this address was retired"
+                );
+                Ok(1)
+            }
+        }
     }
+}
+
+/// Ends the native frontend, retires this conversation's address and ends the
+/// app-server child this host owns, verifying the child by its recorded
+/// identity. The frontend exit code is read before it is closed; notes stay on
+/// the visible surface and never turn a failed run into a success.
+fn finish_lead_session(
+    request: &LeadStart,
+    plan: &ControlPlan,
+    thread: &str,
+    job: Job,
+    frontend: OwnedFrontend,
+    conversation: &Conversation,
+    launcher: &Path,
+    reflection: Option<&mut crate::self_reflection_cli::host::LeadLifecycle>,
+) -> (Option<u32>, Vec<String>) {
     let frontend_code = frontend.exit_code().ok().flatten();
     let mut notes = Vec::new();
-    if let Err(error) = reflection.stop() {
+    if let Some(reflection) = reflection
+        && let Err(error) = reflection.stop()
+    {
         notes.push(format!("reflection lifecycle cleanup: {error}"));
     }
     if let Err(error) = frontend.close() {
@@ -702,7 +945,7 @@ fn host_lead_session(
     }
     // The address of a session that ended must not outlive it: a later spawn in
     // this thread resolves it before inheriting, and `lead message` refuses it.
-    if let Err(error) = control::retire_lead_endpoint(&request.codex_home, &thread) {
+    if let Err(error) = control::retire_lead_endpoint(&request.codex_home, thread) {
         notes.push(error.to_string());
     }
     for path in [&plan.paths.endpoint, &plan.paths.token] {
@@ -710,33 +953,10 @@ fn host_lead_session(
             notes.push(error.to_string());
         }
     }
-    if let Err(error) = end_owned_child(job, &conversation, launcher) {
+    if let Err(error) = end_owned_child(job, conversation, launcher) {
         notes.push(error.to_string());
     }
-    for note in &notes {
-        println!("lead session note: {note}");
-    }
-    match failure {
-        None => {
-            println!(
-                "lead session: ended thread {thread} profile {profile} frontend-exit {}",
-                frontend_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "unrecorded".to_owned())
-            );
-            println!(
-                "lead endpoint: {} was retired; the app-server child ended and no address of this conversation remains",
-                registry
-            );
-            Ok(0)
-        }
-        Some(cause) => {
-            println!(
-                "lead session: the app-server child ended while the native frontend was attached: {cause}; the conversation and its partial work stay in the native session, and this address was retired"
-            );
-            Ok(1)
-        }
-    }
+    (frontend_code, notes)
 }
 
 /// Names the conversation, attaches its native frontend and publishes the
@@ -8931,6 +9151,7 @@ mod tests {
         for name in ["--source", "--codex-home", "--session", "--exec"] {
             assert!(message.contains(name), "{message}");
         }
+        assert!(message.contains("--once"), "{message}");
         let missing = lead_start(&[OsString::from("--session")]).unwrap_err();
         assert!(
             missing
@@ -8944,6 +9165,8 @@ mod tests {
         assert!(LEAD_START_USAGE.contains("--session THREAD_ID"));
         assert!(LEAD_START_USAGE.contains("--exec PROMPT"));
         assert!(LEAD_START_USAGE.contains("after the frontend attaches"));
+        assert!(LEAD_START_USAGE.contains("--once"));
+        assert!(LEAD_START_USAGE.contains("persistent"));
         assert!(lead_start(&[OsString::from("--help")]).is_ok());
         // The title a managed conversation carries names its profile and the
         // checkout it works in, exactly as an executor title names its owner.
@@ -8962,6 +9185,33 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(request.prompt.as_deref(), Some("first line\nsecond line\n"));
+        assert!(!request.once, "a managed lead stays persistent by default");
+        let once = parse_lead_start(&[
+            OsString::from("--codex-home"),
+            root.path().as_os_str().to_owned(),
+            OsString::from("--exec"),
+            OsString::from("one finite turn"),
+            OsString::from("--once"),
+        ])
+        .unwrap();
+        assert!(once.once);
+        assert_eq!(once.prompt.as_deref(), Some("one finite turn"));
+        // A finite session without the assigned prompt would have no turn to
+        // observe and could only wait forever; it is refused before any
+        // app-server or frontend starts.
+        let missing_prompt = parse_lead_start(&[
+            OsString::from("--codex-home"),
+            root.path().as_os_str().to_owned(),
+            OsString::from("--once"),
+        ])
+        .err()
+        .expect("a finite session requires its exact first prompt");
+        assert!(
+            missing_prompt
+                .to_string()
+                .contains("--once requires the exact first prompt"),
+            "{missing_prompt}"
+        );
         let conflict = parse_lead_start(&[
             OsString::from("--codex-home"),
             root.path().as_os_str().to_owned(),
