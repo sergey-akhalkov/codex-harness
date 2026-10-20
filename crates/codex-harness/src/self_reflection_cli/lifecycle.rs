@@ -733,14 +733,6 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
     if state.lifecycle != LifecycleStatus::Active {
         return idle();
     }
-    if !gate.enabled {
-        // Keep the retained event boundary current without admitting closures
-        // from the disabled interval. No model, stage admission or lifecycle
-        // mutation is involved; re-enabling therefore sees only work retained
-        // before the gate closed.
-        controller.poll_without_admission()?;
-        return idle();
-    }
     let (lead, owner_process) = options.managed_lead()?;
     let checked = controller.check_active_binding(&lead, None)?;
     if !checked.is_active() {
@@ -751,6 +743,15 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
             return idle();
         }
         return Err(invalid(checked.detail));
+    }
+    if !gate.enabled {
+        // The disabled path advances the retained event checkpoint, which is a
+        // lifecycle write. It therefore still requires the managed lead and
+        // active binding above. No model work, stage admission, retained result
+        // or other lifecycle state changes; re-enabling sees only work retained
+        // before the gate closed.
+        controller.poll_without_admission()?;
+        return idle();
     }
     // This is the ordinary current-owner route. Refresh the exact process
     // proof while the registration is available so a later retirement of the

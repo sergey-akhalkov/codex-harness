@@ -384,11 +384,19 @@ remains available. It does not activate a project and does not discard retained
 results, pending-stage identities, usage or recovery. Closures observed during
 the disabled interval advance the existing event checkpoint without admission,
 so enabling later does not replay or sweep them. Each new ordinary acceptance
-records the effective permission at acceptance time. Accepting while false
-still succeeds and reports `selfReflectionEnabled: false` with
+records the effective permission at acceptance time. Without `--source`, it
+reads the recognized kit checkout or the installed kit source recorded by the
+normal installation; the consumer project remains the pool-provenance source
+and is not retargeted. Default-true bindings omit the field on serialization,
+preserving legacy acceptance metadata, while false remains explicit. Accepting
+while false still succeeds and reports `selfReflectionEnabled: false` with
 `automaticTrigger: false`; that closure remains ineligible even if the flag is
 re-enabled before the first poll, so the outcome does not depend on a background
-poll observing the disabled interval. Status reports
+poll observing the disabled interval. The event evaluator consumes it as its
+normal ignored result; no new refusal or persisted-state variant is added.
+While false, `process` still requires the managed lead and active binding
+before advancing the retained checkpoint, and refuses a foreign lead without
+changing checkpoint or records. Status reports
 `selfReflectionEnabled`, `configPath`, `modelWork` and `modelWorkReason`; enable
 refuses before lifecycle mutation while the value is false. The shipped source
 sets `self_reflection_enabled = true`, and an omitted key also defaults to true

@@ -97,14 +97,23 @@ Each new stage re-reads the effective source configuration. A host that is
 already running therefore observes an on-to-off change without restart. A stage
 already executing may finish and retain its result; the coordinator checks
 again before the dependent lead stage. The existing controller owns the lock,
-checkpoint, recovery and retained records. The normal acceptance owner reads the
-effective permission before closing the board task and records it in the
-acceptance binding and public receipt. Accepting while false therefore succeeds
-but creates an ineligible closure; the existing event evaluator refuses it with
-an explicit `ReflectionDisabledAtAcceptance` code even if the flag returns to
-true before the first poll. Closures otherwise observed during the disabled
-interval advance the normal event boundary without admission. Neither path
-sweeps the disabled interval after re-enable or duplicates retained work.
+checkpoint, recovery and retained records. The normal acceptance owner resolves
+the effective permission before closing the board task. An explicit `--source`
+keeps its current meaning; otherwise a recognized kit checkout uses its own
+configuration and a consumer without one uses the installed kit source recorded
+by the normal installation. The project remains the pool-provenance source and
+is not silently retargeted to the kit. The permission is recorded in the
+acceptance binding and public receipt. Default-true bindings omit the field on
+serialization so retained acceptance metadata keeps the legacy shape; false is
+explicit. Accepting while false therefore succeeds but creates an ineligible
+closure; the existing event evaluator skips it as its normal `Ignored` result
+even if the flag returns to true before the first poll. Closures otherwise
+observed during the disabled interval advance the normal event boundary without
+admission. Neither path sweeps the disabled interval after re-enable or
+duplicates retained work, and this adds no refusal or persisted-state
+vocabulary. A disabled `process` still authenticates the managed lead and active
+binding before advancing the retained checkpoint; a foreign lead is refused
+without changing the checkpoint or records.
 Status reports the effective value, the source path and why model work is
 stopped.
 

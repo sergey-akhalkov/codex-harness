@@ -773,9 +773,9 @@ max_events_per_poll = 10
     #[test]
     fn shipped_defaults_materialize_independent_pool_capacity() {
         let config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
-        assert_eq!(config.max_concurrent_executors, 4);
-        assert_eq!(config.worktree_pool_size, Some(4));
-        assert_eq!(worktree_pool_size(&config), 4);
+        assert_eq!(config.max_concurrent_executors, 6);
+        assert_eq!(config.worktree_pool_size, Some(6));
+        assert_eq!(worktree_pool_size(&config), 6);
     }
 
     #[test]

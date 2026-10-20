@@ -41,6 +41,10 @@ fn reflection_enabled_by_default() -> bool {
     true
 }
 
+fn reflection_permission_is_true(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Purpose {
@@ -133,7 +137,10 @@ pub struct AcceptanceBinding {
     /// Historical metadata without this field remains eligible; a new closure
     /// accepted while permission is false can never become reflection work by a
     /// later re-enable. The snapshot is deliberately outside `acceptance_id`.
-    #[serde(default = "reflection_enabled_by_default")]
+    #[serde(
+        default = "reflection_enabled_by_default",
+        skip_serializing_if = "reflection_permission_is_true"
+    )]
     pub self_reflection_enabled: bool,
 }
 
@@ -868,7 +875,6 @@ pub enum RefusalCode {
     MissingPurpose,
     UnknownPurpose,
     NonTriggerPurpose,
-    ReflectionDisabledAtAcceptance,
     MissingAcceptance,
     InvalidAcceptance,
     OutcomeNotAccepted,
@@ -2191,11 +2197,7 @@ impl ReflectionController {
             )));
         }
         if !binding.self_reflection_enabled {
-            return Ok(EvaluatedEvent::Refused(refusal(
-                event,
-                RefusalCode::ReflectionDisabledAtAcceptance,
-                "the acceptance was recorded while self_reflection_enabled = false; a later re-enable does not make this closure eligible",
-            )));
+            return Ok(EvaluatedEvent::Ignored);
         }
         let acceptance_id = match binding.acceptance_id() {
             Ok(id) => id,
@@ -3895,4 +3897,44 @@ fn conflict(message: &str) -> io::Error {
 
 fn recovery_error(message: &str) -> io::Error {
     io::Error::other(format!("reflection recovery required: {message}"))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_true_permission_keeps_legacy_acceptance_shape() {
+        let binding = AcceptanceBinding::new(
+            "task",
+            "run",
+            "assignment",
+            "result",
+            "revision",
+            vec!["executor".to_owned()],
+            "lead",
+            "lead",
+            Purpose::Ordinary,
+        );
+        assert!(binding.self_reflection_enabled);
+        let metadata = acceptance_metadata(&binding).unwrap();
+        let raw = metadata.get(ACCEPTANCE_METADATA).unwrap();
+        assert!(
+            !raw.contains(r#""self_reflection_enabled""#),
+            "default-true permission changed the legacy wire shape: {raw}"
+        );
+        let legacy: AcceptanceBinding = serde_json::from_str(raw).unwrap();
+        assert!(legacy.self_reflection_enabled);
+        assert_eq!(
+            legacy.acceptance_id().unwrap(),
+            binding.acceptance_id().unwrap()
+        );
+
+        let disabled = binding.with_self_reflection_enabled(false);
+        let metadata = acceptance_metadata(&disabled).unwrap();
+        let raw = metadata.get(ACCEPTANCE_METADATA).unwrap();
+        assert!(
+            raw.contains(r#""self_reflection_enabled":false"#),
+            "disabled permission must remain explicit: {raw}"
+        );
+    }
 }

@@ -48,19 +48,35 @@ The installed configuration SHALL define `self_reflection_enabled`, a boolean pe
 
 ### Requirement: Acceptance snapshots the reflection permission
 
-Ordinary acceptance SHALL remain successful while the permission is false and SHALL snapshot the effective value in its acceptance binding and public receipt. The receipt SHALL report `selfReflectionEnabled: false` and `automaticTrigger: false`. Such a closure SHALL remain ineligible for reflection after a later true value without requiring an observing poll during the disabled interval. Retained pre-disable work SHALL not be duplicated or swept.
+Ordinary acceptance SHALL remain successful while permission is false and SHALL snapshot it in the acceptance binding and public receipt. Without `--source`, it SHALL read installed kit configuration while retaining the project as pool provenance. The receipt SHALL report `selfReflectionEnabled: false` and `automaticTrigger: false`. Such a closure SHALL remain ineligible after a later true value without a disabled-interval poll. Retained pre-disable work SHALL not be duplicated or swept.
 
 #### Scenario: An ordinary closure is accepted while model work is disabled
 - **WHEN** an ordinary executor result is accepted while `self_reflection_enabled` is false
 - **THEN** acceptance succeeds with its normal purpose, provenance, results and usage, the public receipt reports the permission as false with `automaticTrigger` false, and no reflection model call starts
 
+#### Scenario: Acceptance omits an explicit source
+- **WHEN** a consumer without its own orchestration configuration runs ordinary acceptance without `--source` and the installed kit records the kit source
+- **THEN** acceptance reads that installed permission, preserves the consumer project in pool provenance, succeeds, and reports the permission snapshot
+
 #### Scenario: The flag returns before a disabled-period closure is observed
 - **WHEN** an ordinary closure was accepted while `self_reflection_enabled` was false and the flag becomes true before its first event poll
-- **THEN** the existing event evaluator records no reflection record or model call for that closure, reports its disabled-at-acceptance refusal, and does not sweep retained pre-disable work
+- **THEN** the existing event evaluator treats it as its ignored result, advances the normal checkpoint, creates no reflection record or model call, and does not sweep retained pre-disable work
 
 #### Scenario: Closures occur while disabled
 - **WHEN** ordinary accepted closures occur while the flag is false, whether observed during the disabled interval or accepted under false and re-enabled before their first poll
 - **THEN** no reflection record or model call is created for those closures and retained pre-disable work is not duplicated or swept after re-enable
+
+### Requirement: Acceptance permission metadata remains compatible
+
+Default-true acceptance permission metadata SHALL omit the field on serialization, and legacy metadata without it SHALL deserialize as true. A false permission SHALL remain explicit in board metadata and the receipt. The event evaluator SHALL treat a false-at-acceptance closure as its existing ignored result, not a new refusal code or persisted-state variant.
+
+#### Scenario: Legacy default-true metadata is read
+- **WHEN** an acceptance binding serializes with permission true, or retained metadata omits the field
+- **THEN** the true binding omits the field and the omitted legacy value deserializes as true
+
+#### Scenario: A false-at-acceptance closure is observed after re-enable
+- **WHEN** the flag returns to true before the first poll of a closure accepted while false
+- **THEN** the closure is ignored at the existing event boundary with no record, model call, new refusal code or persisted-state variant
 
 ### Requirement: Accepted ordinary work is the automatic trigger
 

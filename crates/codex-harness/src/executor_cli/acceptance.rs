@@ -130,7 +130,10 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
     }
     let request = Request::parse(args)?;
     let home = executor_input::codex_home(request.codex_home)?;
-    let source = request.source.unwrap_or_else(|| request.project.clone());
+    let explicit_source = request.source.clone();
+    let source = explicit_source
+        .clone()
+        .unwrap_or_else(|| request.project.clone());
     let bd = crate::feedback_cli::discover_bd_in(&home)?;
 
     let lead = current_lead(&home)?;
@@ -163,7 +166,19 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
             request.task
         )));
     }
-    let self_reflection_enabled = orchestration_config::load(&source)?.self_reflection_enabled;
+    let config_source = if let Some(source) = explicit_source {
+        source
+    } else if source.join("global/roles.toml").is_file() {
+        source.clone()
+    } else {
+        crate::feedback_cli::installed_kit_source_in(&home).ok_or_else(|| {
+            invalid(
+                "ordinary acceptance has no installed kit source; repair the installation before reading self_reflection_enabled",
+            )
+        })?
+    };
+    let self_reflection_enabled =
+        orchestration_config::load(&config_source)?.self_reflection_enabled;
 
     // Dispatch preparation publishes its claim and startup reservation under
     // the pool-wide admission lock; assignment binding and the run receipt

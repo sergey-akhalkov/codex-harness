@@ -2,7 +2,7 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    DeliveryState, LifecycleStatus, ReflectionController, RefusalCode, StageState,
+    DeliveryState, LifecycleStatus, ReflectionController, StageState,
 };
 
 pub(super) fn install_fixture(workspace: &Workspace) {
@@ -674,6 +674,7 @@ fn prepare_ordinary_acceptance(
     manager: &Path,
     source: &Path,
     disable_before_accept: bool,
+    pass_source_to_accept: bool,
 ) -> (ReflectionController, String, String, String, Value) {
     use harness_core::{
         board_cli,
@@ -718,7 +719,12 @@ fn prepare_ordinary_acceptance(
         "Synthetic accepted executor result with completed checks.",
     )
     .unwrap();
-    let pool = task_worktree::pool_state_dir(&workspace.home, source).unwrap();
+    let pool_source = if pass_source_to_accept {
+        source
+    } else {
+        &workspace.checkout
+    };
+    let pool = task_worktree::pool_state_dir(&workspace.home, pool_source).unwrap();
     fs::create_dir_all(&pool).unwrap();
     let retained = task_worktree::retain_completion(
         &pool,
@@ -749,11 +755,14 @@ fn prepare_ordinary_acceptance(
     assert!(retained.eligibility.eligible, "{retained:?}");
 
     let accept = || {
-        let output = Command::new(manager)
+        let mut command = Command::new(manager);
+        command
             .args(["executor", "accept", &task, "--project"])
-            .arg(&workspace.checkout)
-            .arg("--source")
-            .arg(source)
+            .arg(&workspace.checkout);
+        if pass_source_to_accept {
+            command.arg("--source").arg(source);
+        }
+        let output = command
             .arg("--codex-home")
             .arg(&workspace.home)
             .current_dir(&workspace.checkout)
@@ -830,7 +839,7 @@ fn normal_acceptance_with_source(
     source: &Path,
 ) -> (String, String) {
     let (controller, task, acceptance, retained_result, _accepted) =
-        prepare_ordinary_acceptance(workspace, manager, source, false);
+        prepare_ordinary_acceptance(workspace, manager, source, false, true);
     let acceptance = acceptance.as_str();
 
     let spec = process_spec_from_source(workspace, manager, source, LEAD_THREAD, "_serve");
@@ -898,7 +907,7 @@ fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
     install_fixture(&workspace);
     let source = source_fixture(&workspace, "ordinary-acceptance", true);
     let (controller, task, acceptance, _result, accepted) =
-        prepare_ordinary_acceptance(&workspace, &manager(), &source, true);
+        prepare_ordinary_acceptance(&workspace, &manager(), &source, true, true);
     assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
     assert_eq!(accepted["reflection"]["selfReflectionEnabled"], false);
     assert_eq!(accepted["reflection"]["automaticTrigger"], false);
@@ -922,10 +931,12 @@ fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
     assert_eq!(poll.model_calls, 0, "{poll:?}");
     assert!(poll.recovery.is_none(), "{poll:?}");
     assert!(
-        poll.refusals
-            .iter()
-            .any(|refusal| refusal.code == RefusalCode::ReflectionDisabledAtAcceptance),
-        "the disabled-period acceptance was not explicitly refused: {poll:?}"
+        poll.ignored >= 1,
+        "the disabled-period acceptance was not ignored: {poll:?}"
+    );
+    assert!(
+        poll.refusals.is_empty(),
+        "the disabled-period acceptance added a refusal: {poll:?}"
     );
     assert!(
         controller.record(&acceptance).unwrap().is_none(),
@@ -955,6 +966,70 @@ fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
         "accepted closure identity was not retained"
     );
     assert!(!task.trim().is_empty());
+}
+
+#[test]
+fn ordinary_acceptance_reads_the_installed_kit_permission_without_consumer_config() {
+    let workspace = Workspace::new("gate-installed-acceptance", LeadMode::Delivered);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "installed-acceptance", true);
+    fs::write(
+        workspace.home.join("harness/installation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 2,
+            "settings": {"sourceRoot": source},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !workspace
+            .checkout
+            .join("global/orchestration.toml")
+            .exists(),
+        "the consumer fixture must not supply kit configuration"
+    );
+
+    let (controller, _task, acceptance, _result, accepted) =
+        prepare_ordinary_acceptance(&workspace, &manager(), &source, true, false);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["purpose"], "ordinary", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["selfReflectionEnabled"], false,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], false,
+        "{accepted}"
+    );
+
+    set_source_enabled(&source, true);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 0, "{poll:?}");
+    assert_eq!(poll.model_calls, 0, "{poll:?}");
+    assert!(
+        poll.ignored >= 1,
+        "the installed-kit disabled acceptance was not ignored: {poll:?}"
+    );
+    assert!(
+        poll.refusals.is_empty(),
+        "the installed-kit disabled acceptance added a refusal: {poll:?}"
+    );
+    assert!(
+        controller.record(&acceptance).unwrap().is_none(),
+        "re-enabling the installed kit scheduled the disabled-period acceptance"
+    );
+
+    let processed = success(command_with_source(
+        &workspace,
+        &source,
+        "process",
+        Some(LEAD_THREAD),
+        &[],
+    ));
+    assert_eq!(processed["retained"], 0, "{processed}");
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
 }
 
 #[test]
@@ -1045,6 +1120,21 @@ fn foreign_lead_is_refused_and_disabled_processing_keeps_pending_work() {
     assert!(!foreign.status.success());
     assert!(String::from_utf8_lossy(&foreign.stderr).contains("real lead is unavailable"));
     assert_eq!(controller.stored_state().unwrap().unwrap(), before);
+
+    let disabled_source = source_fixture(&workspace, "lifecycle-off-disabled", false);
+    let before_disabled = controller.stored_state().unwrap().unwrap();
+    let disabled_foreign = command_with_source(
+        &workspace,
+        &disabled_source,
+        "process",
+        Some("foreign-lead"),
+        &[],
+    );
+    assert!(!disabled_foreign.status.success());
+    assert!(String::from_utf8_lossy(&disabled_foreign.stderr).contains("real lead is unavailable"));
+    let after_disabled = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after_disabled.checkpoint, before_disabled.checkpoint);
+    assert_eq!(after_disabled.records, before_disabled.records);
     success(command(&workspace, "disable", None));
     success(command(&workspace, "disable", None));
     let off = success(command(&workspace, "process", None));
