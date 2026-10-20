@@ -379,7 +379,7 @@ fn reopen_submitted_unknown(
         &chain.acceptance,
         stage,
         SubmittedAccounting {
-            usage: stage_accounted_usage(&native),
+            usage: stage_usage_delta(&native),
             work: stage_work(&native),
         },
     )?;

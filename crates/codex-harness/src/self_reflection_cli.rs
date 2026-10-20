@@ -801,24 +801,10 @@ pub(crate) fn stage_is_completed(state: &StageState) -> bool {
     state.status == StageStatus::Completed
 }
 
-/// The newly billed token delta of this stage's exact turn. Unknown usage is
-/// recorded as zero tokens beside the retained unknown reason, never replaced
-/// with an estimate.
+/// The recorded token contribution of this exact turn, including an observed
+/// lower bound when completeness is unknown. The separate usage-known signal
+/// keeps missing usage unresolved; an unobserved remainder is never estimated.
 pub(crate) fn stage_usage_delta(state: &StageState) -> UsageDelta {
-    let tokens = if state.usage_known {
-        observed_token_floor(state)
-    } else {
-        0
-    };
-    UsageDelta {
-        turns: u64::from(state.turn_id.is_some()),
-        tokens,
-    }
-}
-
-/// The numeric token contribution already observed for this exact turn,
-/// including a partial lower bound whose completeness is still unknown.
-pub(crate) fn stage_accounted_usage(state: &StageState) -> UsageDelta {
     UsageDelta {
         turns: u64::from(state.turn_id.is_some()),
         tokens: observed_token_floor(state),
@@ -4827,7 +4813,7 @@ stream_max_retries = 0
         assert!(!state.usage_known);
         assert!(!state.work_known);
         assert_eq!(
-            stage_accounted_usage(&state),
+            stage_usage_delta(&state),
             UsageDelta {
                 turns: 1,
                 tokens: 100,
