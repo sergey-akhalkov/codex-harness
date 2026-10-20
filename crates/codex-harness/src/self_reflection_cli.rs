@@ -549,6 +549,7 @@ fn prepare_chain_with_acceptance(
     accepted: Option<harness_core::delivery_reflection::AcceptanceBinding>,
     ownership: Option<(&str, &[String])>,
 ) -> io::Result<(ChainState, harness_core::process::ExclusiveFileLock)> {
+    let accepted_route = accepted.is_some();
     let mut chain = chain_state(request)?;
     chain.accepted_work = accepted.map(|binding| binding.normalized()).transpose()?;
     if let Some(binding) = &chain.accepted_work
@@ -568,6 +569,8 @@ fn prepare_chain_with_acceptance(
     if chain_path.exists() {
         let retained: ChainState = read_json(&chain_path, MAX_REQUEST_BYTES)?;
         if retained != chain {
+            let launcher_transition =
+                verified_launcher_transition(&retained, &chain, accepted_route)?;
             let successor_transition = ownership.is_some_and(|(current_lead, retired)| {
                 retained.accepted_work.is_some()
                     && retained.lead_return.thread != current_lead
@@ -581,22 +584,94 @@ fn prepare_chain_with_acceptance(
                         candidate == chain
                     }
             });
-            if !successor_transition {
+            if !launcher_transition && !successor_transition {
+                let differences = chain_differences(&retained, &chain);
                 return Err(invalid(format!(
-                    "the request drifts from the retained chain at {}; task, run, acceptance, source, accepted references, stage routing, role revision or lead address changed. Retained evidence is preserved; only the current verified successor may move an existing chain's delivery owner, and a new state directory is required for every other identity",
-                    chain_path.display()
+                    "the request drifts from the retained chain at {}; changed identities: {differences}. Retained evidence is preserved; only the current verified successor may move an existing chain's delivery owner, only accepted work may select the verified current installed launcher after a core update, and a new state directory is required for every other identity",
+                    chain_path.display(),
                 )));
             }
-            // The lifecycle already recorded the old lead as retired under its
-            // own lock. Rewrite only this chain's current return address; the
-            // executor/lead artifacts, cumulative usage and delivery attempt
-            // stay in place for exact-stage reuse or retention.
-            write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
+            if successor_transition {
+                // The lifecycle already recorded the old lead as retired under
+                // its own lock. Rewrite only this chain's current return
+                // address; the executor/lead artifacts, cumulative usage and
+                // delivery attempt stay in place for exact-stage reuse or
+                // retention.
+                write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
+            }
         }
     } else {
         write_staged(&chain_path, &serde_json::to_vec_pretty(&chain)?)?;
     }
     Ok((chain, lease))
+}
+
+fn verified_launcher_transition(
+    retained: &ChainState,
+    requested: &ChainState,
+    accepted_route: bool,
+) -> io::Result<bool> {
+    if !accepted_route || retained.accepted_work.is_none() {
+        return Ok(false);
+    }
+    let mut candidate = retained.clone();
+    candidate.launcher = requested.launcher.clone();
+    if candidate != *requested {
+        return Ok(false);
+    }
+    let current = harness_core::core_check::verified_installed_launcher(&requested.codex_home)
+        .map_err(|error| {
+            invalid(format!(
+                "the request launcher is not the verified current installed launcher for {}: {error}",
+                requested.codex_home.display()
+            ))
+        })?;
+    if current != requested.launcher {
+        return Err(invalid(format!(
+            "the request launcher is not the verified current installed launcher for {}",
+            requested.codex_home.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn chain_differences(retained: &ChainState, requested: &ChainState) -> String {
+    let differences: Vec<_> = [
+        ("schema", retained.schema != requested.schema),
+        ("task", retained.task != requested.task),
+        ("run", retained.run != requested.run),
+        ("acceptance", retained.acceptance != requested.acceptance),
+        ("state directory", retained.state_dir != requested.state_dir),
+        ("source", retained.source != requested.source),
+        ("codex home", retained.codex_home != requested.codex_home),
+        ("launcher", retained.launcher != requested.launcher),
+        (
+            "executor source",
+            retained.executor_source != requested.executor_source,
+        ),
+        ("lead source", retained.lead_source != requested.lead_source),
+        (
+            "executor stage",
+            retained.executor_stage != requested.executor_stage,
+        ),
+        ("lead stage", retained.lead_stage != requested.lead_stage),
+        (
+            "lead address",
+            retained.lead_return != requested.lead_return,
+        ),
+        (
+            "bound seconds",
+            retained.bound_seconds != requested.bound_seconds,
+        ),
+        (
+            "accepted references",
+            retained.accepted_work != requested.accepted_work,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, differs)| differs.then_some(name))
+    .collect();
+    differences.join(", ")
 }
 
 /// Refuses before any fork when the exact managed lead return surface is not

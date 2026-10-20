@@ -480,9 +480,17 @@ zero model usage and work, and consumes the next finite attempt. Automatic
 processing never retries this rejection. Transport failures, incomplete
 evidence and already submitted turns do not qualify for this recovery.
 Other unknown outcomes and source/binding drift require
-reconciliation rather than repeated model calls. The independent skill drafts
-remain outside discovery in `.agents/skill-candidates` until evaluation allows
-publication. No comparison benefit is established by the model-free checks.
+reconciliation rather than repeated model calls. An ordinary verified core
+update may retarget the installed `harness/bin/codex.exe` link between the
+rejection and recovery. The accepted `process` route may select that launcher
+in memory only when schema-2 installation ownership, recorded link identities,
+native command targets and build artifact integrity verify for the same
+`CODEX_HOME`; `chain.json` and accepted provenance remain byte-identical. A raw
+request, an arbitrary launcher, or any source, run, role, routing, reference or
+ownership drift still refuses before a fork or accounting change. The
+independent skill drafts remain outside discovery in `.agents/skill-candidates`
+until evaluation allows publication. No comparison benefit is established by
+the model-free checks.
 
 A retained lifecycle can move to a different managed lead after its original
 owner exits. Run this from the live successor conversation:

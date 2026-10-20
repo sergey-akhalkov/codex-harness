@@ -704,8 +704,8 @@ fn assert_usage(stage: &Value, total: u64, cumulative: u64, response: &str, copi
 #[test]
 fn acknowledged_pre_fork_rejection_recovers_one_explicit_attempt_and_preserves_evidence() {
     let workspace = Workspace::new("pre-fork-recovery", LeadMode::Delivered);
+    let installed = reflection_install::InstalledReflection::connect(&workspace);
     let (controller, request, acceptance) = accepted::accepted(&workspace);
-    lifecycle::install_fixture(&workspace);
     let enabled = lifecycle::success(lifecycle::command(&workspace, "enable", Some(LEAD_THREAD)));
     let initial = controller.stored_state().unwrap().unwrap();
     let binding = initial.records.get(&acceptance).unwrap().binding.clone();
@@ -713,7 +713,8 @@ fn acknowledged_pre_fork_rejection_recovers_one_explicit_attempt_and_preserves_e
     assert_eq!(enabled["revision"], initial.binding.revision);
 
     let run_process = |executor_outcome: &str| {
-        let mut spec = lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+        let mut spec =
+            lifecycle::process_spec_from(&workspace, &installed.manager, LEAD_THREAD, "process");
         spec.env.insert(
             "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME".into(),
             Some(executor_outcome.into()),
@@ -839,6 +840,50 @@ fn acknowledged_pre_fork_rejection_recovers_one_explicit_attempt_and_preserves_e
         rejected_record
     );
 
+    let launcher = installed.launcher();
+    let launcher_a = fs::read_link(&launcher).unwrap();
+    let chain_path = state_dir.join("chain.json");
+    let retained_chain = fs::read(&chain_path).unwrap();
+    let launcher_b = installed.update_to_new_build();
+    assert_ne!(launcher_a, launcher_b.join("codex.exe"));
+    assert_eq!(
+        fs::read_link(&launcher).unwrap(),
+        launcher_b.join("codex.exe")
+    );
+    assert_eq!(
+        installed.manager.canonicalize().unwrap(),
+        launcher_b.join("codex-harness.exe").canonicalize().unwrap()
+    );
+    assert_eq!(
+        fs::read(&chain_path).unwrap(),
+        retained_chain,
+        "a core update does not rewrite accepted chain provenance"
+    );
+
+    let pending_counts = request_counts(&workspace);
+    let pending_record = controller.record(&acceptance).unwrap().unwrap();
+    let pending_state = controller.stored_state().unwrap().unwrap();
+    let retained_rejection = fs::read(&executor_path).unwrap();
+    let retained_link = installed.replace_launcher_with(&fixture());
+    let arbitrary = run_process("complete");
+    assert_refused(&arbitrary, "not the verified current installed launcher");
+    assert_eq!(request_counts(&workspace), pending_counts);
+    assert_eq!(fs::read(&executor_path).unwrap(), retained_rejection);
+    assert_eq!(fs::read(&chain_path).unwrap(), retained_chain);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        pending_record
+    );
+    let after_refusal = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after_refusal.checkpoint, pending_state.checkpoint);
+    assert_eq!(after_refusal.binding, pending_state.binding);
+    assert_eq!(after_refusal.records, pending_state.records);
+    installed.restore_launcher(&retained_link);
+    assert_eq!(
+        fs::read_link(&launcher).unwrap(),
+        launcher_b.join("codex.exe")
+    );
+
     let recovered = run_process("complete");
     assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
     let completed = read_json(&executor_path);
@@ -910,6 +955,11 @@ fn acknowledged_pre_fork_rejection_recovers_one_explicit_attempt_and_preserves_e
     assert_eq!(
         fixture_requests(&workspace, "executor-self-reflection", "turn/start").len(),
         1
+    );
+    assert_eq!(
+        fs::read(&chain_path).unwrap(),
+        retained_chain,
+        "continuation preserves the original accepted chain and launcher provenance"
     );
 }
 
@@ -1349,6 +1399,31 @@ fn source_run_and_effective_model_drift_refuse_before_any_fork() {
     );
     assert_refused(&refused, "request drifts from the retained chain");
     assert_eq!(request_counts(&run), before);
+
+    let launcher = Workspace::new("drift-launcher", LeadMode::Delivered);
+    let launcher_request = launcher.request("run-drift-launcher");
+    let finished = run_chain(
+        &launcher,
+        &launcher_request,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let before = request_counts(&launcher);
+    let mut drifted = launcher_request.clone();
+    drifted["launcher"] = json!(frontend_double());
+    let refused = run_chain(
+        &launcher,
+        &drifted,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+    );
+    assert_refused(&refused, "request drifts from the retained chain");
+    assert_eq!(request_counts(&launcher), before);
 
     let model = Workspace::new("drift-model", LeadMode::Delivered);
     let model_request = model.request("run-drift-model");

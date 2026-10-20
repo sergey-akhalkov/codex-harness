@@ -62,34 +62,7 @@ impl InstalledReflection {
         ] {
             fs::create_dir_all(dir).unwrap();
         }
-        for name in build_identity::BINARIES {
-            let from = Path::new(env!("CARGO_BIN_EXE_codex")).with_file_name(name);
-            fs::copy(&from, build.join(name))
-                .unwrap_or_else(|error| panic!("copy {name} from {}: {error}", from.display()));
-        }
-        let record = build_identity::BuildRecord {
-            schema: build_identity::SCHEMA,
-            source_root: source.clone(),
-            source: build_identity::source_identity(&source).unwrap(),
-            rustc: "reflection installed acceptance".into(),
-            cargo: "reflection installed acceptance".into(),
-            target: "x86_64-pc-windows-msvc".into(),
-            profile: "release".into(),
-            binaries: build_identity::BINARIES
-                .iter()
-                .map(|name| {
-                    (
-                        name.to_string(),
-                        build_identity::hash_file(&build.join(name)).unwrap(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>(),
-        };
-        fs::write(
-            build.join("build.json"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        write_build(&source, &build);
 
         let fixture = transport.join("harness-executor-fixture.exe");
         fs::copy(super::fixture(), &fixture).unwrap();
@@ -143,9 +116,13 @@ impl InstalledReflection {
     }
 
     fn request(&self) -> core_install::Request {
+        self.request_at(&self.build)
+    }
+
+    fn request_at(&self, build: &Path) -> core_install::Request {
         core_install::Request {
             source: self.source.clone(),
-            build: self.build.clone(),
+            build: build.to_path_buf(),
             codex_home: self.home.clone(),
             user_home: self.user_home.clone(),
             dependency_user_home: self.dependency_user_home.clone(),
@@ -171,6 +148,36 @@ impl InstalledReflection {
 
     pub(super) fn reconnect(&self) -> core_install::Report {
         self.install(false)
+    }
+
+    pub(super) fn launcher(&self) -> PathBuf {
+        self.home.join("harness/bin/codex.exe")
+    }
+
+    /// Move the owned installed links through the ordinary core update path.
+    pub(super) fn update_to_new_build(&self) -> PathBuf {
+        let build = self._root.path().join("build-updated");
+        write_build(&self.source, &build);
+        let report = core_install::connect(&self.request_at(&build), false).unwrap();
+        assert_eq!(report.status, "connected");
+        build
+    }
+
+    /// Temporarily select a foreign target while preserving the installed
+    /// owner's original link object and NTFS identity for restoration.
+    pub(super) fn replace_launcher_with(&self, target: &Path) -> PathBuf {
+        let launcher = self.launcher();
+        let retained = launcher.with_file_name("codex-owned.exe");
+        assert!(!retained.exists());
+        fs::rename(&launcher, &retained).unwrap();
+        std::os::windows::fs::symlink_file(target, &launcher).unwrap();
+        retained
+    }
+
+    pub(super) fn restore_launcher(&self, retained: &Path) {
+        let launcher = self.launcher();
+        fs::remove_file(&launcher).unwrap();
+        fs::rename(retained, &launcher).unwrap();
     }
 
     pub(super) fn disconnect(&self) -> core_disconnect::Report {
@@ -288,6 +295,38 @@ impl InstalledReflection {
             })
             .collect()
     }
+}
+
+fn write_build(source: &Path, build: &Path) {
+    fs::create_dir_all(build).unwrap();
+    for name in build_identity::BINARIES {
+        let from = Path::new(env!("CARGO_BIN_EXE_codex")).with_file_name(name);
+        fs::copy(&from, build.join(name))
+            .unwrap_or_else(|error| panic!("copy {name} from {}: {error}", from.display()));
+    }
+    let record = build_identity::BuildRecord {
+        schema: build_identity::SCHEMA,
+        source_root: source.to_path_buf(),
+        source: build_identity::source_identity(source).unwrap(),
+        rustc: "reflection installed acceptance".into(),
+        cargo: "reflection installed acceptance".into(),
+        target: "x86_64-pc-windows-msvc".into(),
+        profile: "release".into(),
+        binaries: build_identity::BINARIES
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    build_identity::hash_file(&build.join(name)).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
+    };
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
 }
 
 fn compile_upstream(root: &Path) -> PathBuf {

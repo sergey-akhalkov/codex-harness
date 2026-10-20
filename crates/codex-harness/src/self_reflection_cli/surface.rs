@@ -399,9 +399,21 @@ pub(super) fn execute_stage_runner(request_path: &Path) -> io::Result<i32> {
     // re-verified before the stage body runs.
     let chain_path = request.chain.state_dir.join("chain.json");
     let durable: ChainState = read_json(&chain_path, MAX_REQUEST_BYTES)?;
-    if durable != request.chain {
+    let exact = durable == request.chain;
+    let launcher_transition = if exact {
+        false
+    } else {
+        super::verified_launcher_transition(&durable, &request.chain, true).map_err(|error| {
+            invalid(format!(
+                "the {} foreground stage request cannot select its launcher: {error}; no fork or turn was submitted",
+                request.role
+            ))
+        })?
+    };
+    if !exact && !launcher_transition {
+        let differences = super::chain_differences(&durable, &request.chain);
         return Err(invalid(format!(
-            "the {} foreground stage request drifts from the durable chain at {}; no fork or turn was submitted",
+            "the {} foreground stage request drifts from the durable chain at {}; changed identities: {differences}. Retained evidence is preserved, and only accepted work may select the verified current installed launcher after a core update; no fork or turn was submitted",
             request.role,
             chain_path.display()
         )));
