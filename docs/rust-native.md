@@ -379,12 +379,13 @@ close after the metadata write can share that visible state, so acceptance
 neither rewrites nor guesses. Inspect `bd show TASK` and
 `bd history TASK --events`. If that inspection verifies an interrupted close,
 the actual approving lead can use the existing guarded board commands to finish
-it, then replay validation:
+it, then replay validation. Use the status returned by `bd show` for
+`OBSERVED_STATUS` (it need not be `open`), and pass `--actor LEAD` on each
+command without changing the environment:
 
 ```powershell
-$env:BEADS_ACTOR = "LEAD"
-bd update TASK --assignee LEAD --if-assignee OLD_ASSIGNEE --if-status open --json
-bd close TASK --reason accepted --json
+bd update TASK --assignee LEAD --if-assignee OLD_ASSIGNEE --if-status OBSERVED_STATUS --actor LEAD --json
+bd close TASK --reason accepted --actor LEAD --json
 codex-harness executor accept TASK --run RECORDED_RUN --project CHECKOUT
 ```
 

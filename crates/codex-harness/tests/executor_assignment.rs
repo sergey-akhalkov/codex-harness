@@ -451,6 +451,28 @@ impl AcceptanceFixture {
         fixture
     }
 
+    /// Installs the synthetic kit source needed when acceptance reads the
+    /// permission outside an explicit consumer kit checkout. The fixture owns
+    /// both the source and the installation record; no real home is touched.
+    fn install_kit_source(&self) {
+        let kit = synthetic_role_build::kit_source(&self.spawn.base.root);
+        fs::copy(
+            self.checkout().join("global/orchestration.toml"),
+            kit.join("global/orchestration.toml"),
+        )
+        .unwrap();
+        fs::create_dir_all(self.home().join("harness")).unwrap();
+        fs::write(
+            self.home().join("harness/installation.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 2,
+                "settings": {"sourceRoot": kit},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     fn project(&self) -> &Path {
         &self.spawn.base.source
     }
@@ -2570,6 +2592,7 @@ fn accept_refuses_a_newer_ineligible_completion_even_with_the_old_exact_run() {
 #[test]
 fn accept_refuses_a_stale_result_while_a_newer_correction_is_unresolved() {
     let fixture = AcceptanceFixture::new("accept-unresolved-correction");
+    fixture.install_kit_source();
     let task = fixture.create_task("Corrected task", Some(Purpose::Ordinary));
     fixture.retain(&task, Purpose::Ordinary, "run-completed", "completed", None);
     let before = fixture.show(&task);
