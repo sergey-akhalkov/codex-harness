@@ -22,6 +22,62 @@ Installed activation SHALL enable the two-stage reflection chain for the current
 - **WHEN** ordinary development proceeds without activation
 - **THEN** no automatic reflection runs and ordinary lead, executor and feedback behavior remains available
 
+### Requirement: Configuration permission gates new reflection model work
+
+The installed configuration SHALL define `self_reflection_enabled`, a boolean permission that defaults to true. True SHALL permit only an explicitly activated lifecycle and SHALL NOT activate a project. False SHALL prevent new executor and lead reflection model calls while ordinary lead, executor, acceptance and feedback work remains available. Each new stage SHALL re-read the effective value. Retained work, pending identities, usage, recovery and event boundaries SHALL be preserved.
+
+#### Scenario: The permission is omitted
+- **WHEN** an existing or new configuration omits `self_reflection_enabled`
+- **THEN** it defaults to true and preserves the current explicitly activated behavior without activating a project by itself
+
+#### Scenario: Model work is disabled
+- **WHEN** `self_reflection_enabled` is false
+- **THEN** no new executor or lead reflection model call starts from manual, automatic, continuation or internal dispatch, enable refuses before lifecycle mutation, and ordinary acceptance still completes
+
+#### Scenario: The flag changes between stages
+- **WHEN** a host has retained an executor reflection and the flag changes from true to false before the lead stage
+- **THEN** the executor result, identity, usage and pending lead stage remain retained, no lead model call starts, and a later true value resumes the retained lead stage without repeating the executor
+
+#### Scenario: Status explains stopped model work
+- **WHEN** the caller reads status while the flag is false or the lifecycle is not active
+- **THEN** the result names the effective flag, configuration path and concrete reason no new model work may start
+
+#### Scenario: The permission has an invalid type
+- **WHEN** the configuration supplies a string, integer or other non-boolean value
+- **THEN** configuration loading fails before model work or lifecycle mutation
+
+### Requirement: Acceptance snapshots the reflection permission
+
+Ordinary acceptance SHALL remain successful while permission is false and SHALL snapshot it in the acceptance binding and public receipt. Without `--source`, it SHALL read installed kit configuration while retaining the project as pool provenance. The receipt SHALL report `selfReflectionEnabled: false` and `automaticTrigger: false`. Such a closure SHALL remain ineligible after a later true value without a disabled-interval poll. Retained pre-disable work SHALL not be duplicated or swept.
+
+#### Scenario: An ordinary closure is accepted while model work is disabled
+- **WHEN** an ordinary executor result is accepted while `self_reflection_enabled` is false
+- **THEN** acceptance succeeds with its normal purpose, provenance, results and usage, the public receipt reports the permission as false with `automaticTrigger` false, and no reflection model call starts
+
+#### Scenario: Acceptance omits an explicit source
+- **WHEN** a consumer without its own orchestration configuration runs ordinary acceptance without `--source` and the installed kit records the kit source
+- **THEN** acceptance reads that installed permission, preserves the consumer project in pool provenance, succeeds, and reports the permission snapshot
+
+#### Scenario: The flag returns before a disabled-period closure is observed
+- **WHEN** an ordinary closure was accepted while `self_reflection_enabled` was false and the flag becomes true before its first event poll
+- **THEN** the existing event evaluator treats it as its ignored result, advances the normal checkpoint, creates no reflection record or model call, and does not sweep retained pre-disable work
+
+#### Scenario: Closures occur while disabled
+- **WHEN** ordinary accepted closures occur while the flag is false, whether observed during the disabled interval or accepted under false and re-enabled before their first poll
+- **THEN** no reflection record or model call is created for those closures and retained pre-disable work is not duplicated or swept after re-enable
+
+### Requirement: Acceptance permission metadata remains compatible
+
+Default-true acceptance permission metadata SHALL omit the field on serialization, and legacy metadata without it SHALL deserialize as true. A false permission SHALL remain explicit in board metadata and the receipt. The event evaluator SHALL treat a false-at-acceptance closure as its existing ignored result, not a new refusal code or persisted-state variant.
+
+#### Scenario: Legacy default-true metadata is read
+- **WHEN** an acceptance binding serializes with permission true, or retained metadata omits the field
+- **THEN** the true binding omits the field and the omitted legacy value deserializes as true
+
+#### Scenario: A false-at-acceptance closure is observed after re-enable
+- **WHEN** the flag returns to true before the first poll of a closure accepted while false
+- **THEN** the closure is ignored at the existing event boundary with no record, model call, new refusal code or persisted-state variant
+
 ### Requirement: Accepted ordinary work is the automatic trigger
 
 The system SHALL start executor reflection only after the lead accepts and closes a bound ordinary executor task. Acceptance SHALL identify the assignment, source sessions and accepted result. First reports, intermediate corrections, cancellations, arbitrary closed cards and elapsed time SHALL NOT qualify. The interface SHALL maintain routine binding metadata.

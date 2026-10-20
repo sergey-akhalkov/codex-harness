@@ -1,7 +1,9 @@
 //! User-facing lifecycle commands consume the real board's accepted identity.
 
 use super::*;
-use harness_core::delivery_reflection::{DeliveryState, LifecycleStatus, StageState};
+use harness_core::delivery_reflection::{
+    DeliveryState, LifecycleStatus, ReflectionController, StageState,
+};
 
 pub(super) fn install_fixture(workspace: &Workspace) {
     let bin = workspace.home.join("harness/bin");
@@ -21,6 +23,51 @@ pub(super) fn install_fixture(workspace: &Workspace) {
     .unwrap();
 }
 
+/// A disposable kit source with the role inputs needed by the real CLI. Tests
+/// that change `self_reflection_enabled` must never edit the checkout that is
+/// also serving unrelated test binaries.
+pub(super) fn source_fixture(workspace: &Workspace, name: &str, enabled: bool) -> PathBuf {
+    let source = workspace.root().join(format!("source-{name}"));
+    let kit = kit_root();
+    copy_tree(&kit.join("global"), &source.join("global"));
+    copy_tree(&kit.join(".agents/skills"), &source.join(".agents/skills"));
+    set_source_enabled(&source, enabled);
+    source
+}
+
+pub(super) fn set_source_enabled(source: &Path, enabled: bool) {
+    let path = source.join("global/orchestration.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let (from, to) = if enabled {
+        (
+            "self_reflection_enabled = false",
+            "self_reflection_enabled = true",
+        )
+    } else {
+        (
+            "self_reflection_enabled = true",
+            "self_reflection_enabled = false",
+        )
+    };
+    if !text.contains(to) {
+        assert_eq!(text.matches(from).count(), 1, "{}", path.display());
+        fs::write(path, text.replace(from, to)).unwrap();
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 pub(super) fn command(
     workspace: &Workspace,
     action: &str,
@@ -36,12 +83,23 @@ fn manager_command(
     lead: Option<&str>,
     extra: &[&str],
 ) -> Command {
+    manager_command_for_source(manager, &kit_root(), workspace, action, lead, extra)
+}
+
+fn manager_command_for_source(
+    manager: &Path,
+    source: &Path,
+    workspace: &Workspace,
+    action: &str,
+    lead: Option<&str>,
+    extra: &[&str],
+) -> Command {
     let mut command = Command::new(manager);
     command
         .args(["delivery-improvement", action, "--project"])
         .arg(&workspace.checkout)
         .arg("--source")
-        .arg(kit_root())
+        .arg(source)
         .arg("--codex-home")
         .arg(&workspace.home)
         .args(extra)
@@ -66,14 +124,28 @@ fn command_with(
         .unwrap()
 }
 
-fn command_from(
-    manager: &Path,
+fn command_with_source(
     workspace: &Workspace,
+    source: &Path,
     action: &str,
     lead: Option<&str>,
     extra: &[&str],
 ) -> std::process::Output {
-    manager_command(manager, workspace, action, lead, extra)
+    manager_command_for_source(&manager(), source, workspace, action, lead, extra)
+        .current_dir(&workspace.checkout)
+        .output()
+        .unwrap()
+}
+
+fn command_from_source(
+    manager: &Path,
+    workspace: &Workspace,
+    source: &Path,
+    action: &str,
+    lead: Option<&str>,
+    extra: &[&str],
+) -> std::process::Output {
+    manager_command_for_source(manager, source, workspace, action, lead, extra)
         .current_dir(&workspace.checkout)
         .output()
         .unwrap()
@@ -113,6 +185,16 @@ pub(super) fn process_spec_from(
     lead_thread: &str,
     action: &str,
 ) -> CommandSpec {
+    process_spec_from_source(workspace, manager, &kit_root(), lead_thread, action)
+}
+
+pub(super) fn process_spec_from_source(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+    lead_thread: &str,
+    action: &str,
+) -> CommandSpec {
     let mut spec = CommandSpec::new(manager);
     spec.args = vec![
         "delivery-improvement".into(),
@@ -120,7 +202,7 @@ pub(super) fn process_spec_from(
         "--project".into(),
         workspace.checkout.as_os_str().to_owned(),
         "--source".into(),
-        kit_root().into_os_string(),
+        source.as_os_str().to_owned(),
         "--codex-home".into(),
         workspace.home.as_os_str().to_owned(),
     ];
@@ -288,16 +370,312 @@ fn process_without_a_new_accepted_outcome_is_model_free_and_preserves_state() {
 }
 
 #[test]
+fn disabled_config_refuses_enable_before_lifecycle_mutation() {
+    let workspace = Workspace::new("gate-enable-disabled", LeadMode::Delivered);
+    let (controller, _task) = accepted::prepare(&workspace);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "enable-disabled", false);
+    let before = controller.stored_state().unwrap();
+
+    let output = command_with_source(&workspace, &source, "enable", Some(LEAD_THREAD), &[]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("self_reflection_enabled = false"), "{text}");
+    assert!(
+        text.contains("global/orchestration.toml") || text.contains("orchestration.toml"),
+        "{text}"
+    );
+    assert_eq!(controller.stored_state().unwrap(), before);
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+}
+
+#[test]
+fn disabled_config_blocks_process_and_continuation_and_reports_the_effective_gate() {
+    let workspace = Workspace::new("gate-disabled-process", LeadMode::Delivered);
+    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "disabled-process", false);
+    let before = controller.stored_state().unwrap().unwrap();
+
+    let status = success(command_with_source(
+        &workspace,
+        &source,
+        "status",
+        None,
+        &[],
+    ));
+    assert_eq!(status["selfReflectionEnabled"], false, "{status}");
+    assert_eq!(status["modelWork"], "stopped", "{status}");
+    assert_eq!(
+        status["configPath"],
+        json!(fs::canonicalize(source.join("global/orchestration.toml")).unwrap()),
+        "{status}"
+    );
+    assert!(
+        status["modelWorkReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("self_reflection_enabled = false")),
+        "{status}"
+    );
+
+    let continuation = command_with_source(
+        &workspace,
+        &source,
+        "continue",
+        Some(LEAD_THREAD),
+        &["--acceptance", &acceptance, "--stage", "executor"],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&continuation.stdout),
+        String::from_utf8_lossy(&continuation.stderr)
+    );
+    assert!(!continuation.status.success(), "{text}");
+    assert!(text.contains("self_reflection_enabled = false"), "{text}");
+    let unchanged = controller.stored_state().unwrap().unwrap();
+    assert_eq!(unchanged.records, before.records);
+    assert_eq!(unchanged.binding, before.binding);
+    assert_eq!(unchanged.checkpoint, before.checkpoint);
+
+    let processed = success(command_with_source(
+        &workspace,
+        &source,
+        "process",
+        Some(LEAD_THREAD),
+        &[],
+    ));
+    assert_eq!(processed["selfReflectionEnabled"], false, "{processed}");
+    assert_eq!(processed["modelWork"], "stopped", "{processed}");
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.records, before.records);
+    assert_eq!(after.binding, before.binding);
+}
+
+#[test]
+fn disabled_config_refuses_manual_execution_before_any_fork_or_state_write() {
+    let workspace = Workspace::new("gate-manual-disabled", LeadMode::Delivered);
+    let source = source_fixture(&workspace, "manual-disabled", false);
+    let state_dir = workspace.state.join("manual-disabled-run");
+    let mut request = workspace.request("manual-disabled");
+    request["source"] = json!(source);
+    request["stateDir"] = json!(state_dir);
+    fs::write(&workspace.request, serde_json::to_vec(&request).unwrap()).unwrap();
+
+    let output = Command::new(manager())
+        .args(["self-reflection", "--request"])
+        .arg(&workspace.request)
+        .current_dir(&workspace.checkout)
+        .env("CODEX_HOME", &workspace.home)
+        .env_remove("HARNESS_REFLECTION_SESSION")
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("self_reflection_enabled = false"), "{text}");
+    assert!(!state_dir.exists(), "{}", state_dir.display());
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+}
+
+#[test]
+fn disabled_period_closures_are_skipped_at_the_event_boundary_and_never_swept() {
+    use harness_core::{
+        board_cli,
+        delivery_reflection::{AcceptanceBinding, Purpose, acceptance_metadata},
+    };
+
+    let workspace = Workspace::new("gate-disabled-period", LeadMode::Delivered);
+    let (controller, task) = accepted::prepare(&workspace);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "disabled-period", true);
+    success(command_with_source(
+        &workspace,
+        &source,
+        "enable",
+        Some(LEAD_THREAD),
+        &[],
+    ));
+    let boundary = controller.stored_state().unwrap().unwrap().checkpoint;
+    set_source_enabled(&source, false);
+
+    let binding = AcceptanceBinding::new(
+        &task,
+        "disabled-run",
+        "disabled-assignment",
+        "disabled-result",
+        "disabled-revision",
+        vec![EXECUTOR_SOURCE.to_owned()],
+        LEAD_THREAD,
+        "reflection-fixture-lead",
+        Purpose::Ordinary,
+    )
+    .with_turns(
+        Some(EXECUTOR_SOURCE.to_owned()),
+        Some(EXECUTOR_SOURCE_TURN.to_owned()),
+        Some(LEAD_SOURCE_TURN.to_owned()),
+    );
+    board_cli::close_accepted(
+        Path::new("bd.exe"),
+        &workspace.checkout,
+        "reflection-fixture-lead",
+        &task,
+        &acceptance_metadata(&binding).unwrap(),
+    )
+    .unwrap();
+
+    let skipped = success(command_with_source(
+        &workspace,
+        &source,
+        "process",
+        Some(LEAD_THREAD),
+        &[],
+    ));
+    assert_eq!(skipped["selfReflectionEnabled"], false, "{skipped}");
+    assert_eq!(skipped["retained"], 0, "{skipped}");
+    let state = controller.stored_state().unwrap().unwrap();
+    assert!(state.checkpoint > boundary, "{state:?}");
+    assert!(state.records.is_empty(), "{state:?}");
+    assert_eq!(state.last_poll.as_ref().unwrap().accepted, 0);
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+
+    set_source_enabled(&source, true);
+    let after = success(command_with_source(
+        &workspace,
+        &source,
+        "process",
+        Some(LEAD_THREAD),
+        &[],
+    ));
+    assert_eq!(after["retained"], 0, "{after}");
+    assert!(
+        controller
+            .stored_state()
+            .unwrap()
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+}
+
+#[test]
 fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes() {
     let workspace = Workspace::new("lifecycle-normal-accept", LeadMode::Delivered);
     install_fixture(&workspace);
     normal_acceptance(&workspace, &manager());
 }
 
+#[test]
+fn running_host_observes_disable_between_stages_and_reuses_executor_after_reenable() {
+    let workspace = Workspace::new("gate-dynamic-disable", LeadMode::Delivered);
+    let (controller, _request, acceptance) = accepted::accepted(&workspace);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "dynamic-disable", true);
+    workspace.lead_state.lock().unwrap().source_turn_active = true;
+
+    let spec = process_spec_from_source(&workspace, &manager(), &source, LEAD_THREAD, "_serve");
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let until = Instant::now() + Duration::from_secs(90);
+    loop {
+        if controller
+            .record(&acceptance)
+            .unwrap()
+            .is_some_and(|record| record.executor.state == StageState::Retained)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "executor reflection did not retain its result: {:?}; requests={:?}",
+            controller.record(&acceptance).unwrap(),
+            request_counts(&workspace)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    let pending = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(pending.lead.state, StageState::Pending);
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+    let executor_before = fs::read(state_dir.join("executor-stage.json")).unwrap();
+    let chain_before = read_json(&state_dir.join("chain.json"));
+
+    set_source_enabled(&source, false);
+    workspace.lead_state.lock().unwrap().source_turn_active = false;
+    std::thread::sleep(Duration::from_millis(3_000));
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    let disabled = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(disabled.executor.state, StageState::Retained);
+    assert_eq!(disabled.lead.state, StageState::Pending);
+    assert_eq!(
+        fs::read(state_dir.join("executor-stage.json")).unwrap(),
+        executor_before
+    );
+
+    set_source_enabled(&source, true);
+    loop {
+        if controller.record(&acceptance).unwrap().unwrap().delivery == DeliveryState::Consumed {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "exact accepted synthesis was not consumed after re-enable: {:?}",
+            controller.record(&acceptance).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(
+        fs::read(state_dir.join("executor-stage.json")).unwrap(),
+        executor_before
+    );
+    let chain_after = read_json(&state_dir.join("chain.json"));
+    assert_eq!(
+        chain_after["executorSource"],
+        chain_before["executorSource"]
+    );
+    assert_eq!(chain_after["executorStage"], chain_before["executorStage"]);
+    assert_eq!(chain_after["acceptance"], chain_before["acceptance"]);
+
+    success(command_from_source(
+        &manager(),
+        &workspace,
+        &source,
+        "disable",
+        None,
+        &[],
+    ));
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+}
+
 /// The ordinary accepted-work lifecycle, independent of where the manager and
 /// launcher were installed. The producer is the public retained completion and
 /// the only acceptance identity is the board's exact native acceptance.
 pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (String, String) {
+    normal_acceptance_with_source(workspace, manager, &kit_root())
+}
+
+fn prepare_ordinary_acceptance(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+    disable_before_accept: bool,
+    accept_source: Option<&Path>,
+) -> (ReflectionController, String, String, String, Value) {
     use harness_core::{
         board_cli,
         delivery_reflection::{Purpose, board_source_identity},
@@ -310,13 +688,17 @@ pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (Strin
         lead.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
         lead.source_turn_active = true;
     }
-    success(command_from(
+    success(command_from_source(
         manager,
         workspace,
+        source,
         "enable",
         Some(LEAD_THREAD),
         &[],
     ));
+    if disable_before_accept {
+        set_source_enabled(source, false);
+    }
     board_cli::set_purpose_metadata(
         Path::new("bd.exe"),
         &workspace.checkout,
@@ -337,7 +719,8 @@ pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (Strin
         "Synthetic accepted executor result with completed checks.",
     )
     .unwrap();
-    let pool = task_worktree::pool_state_dir(&workspace.home, &kit_root()).unwrap();
+    let pool_source = accept_source.unwrap_or(&workspace.checkout);
+    let pool = task_worktree::pool_state_dir(&workspace.home, pool_source).unwrap();
     fs::create_dir_all(&pool).unwrap();
     let retained = task_worktree::retain_completion(
         &pool,
@@ -368,11 +751,14 @@ pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (Strin
     assert!(retained.eligibility.eligible, "{retained:?}");
 
     let accept = || {
-        let output = Command::new(manager)
+        let mut command = Command::new(manager);
+        command
             .args(["executor", "accept", &task, "--project"])
-            .arg(&workspace.checkout)
-            .arg("--source")
-            .arg(kit_root())
+            .arg(&workspace.checkout);
+        if let Some(accept_source) = accept_source {
+            command.arg("--source").arg(accept_source);
+        }
+        let output = command
             .arg("--codex-home")
             .arg(&workspace.home)
             .current_dir(&workspace.checkout)
@@ -387,16 +773,72 @@ pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (Strin
     };
     let accepted = accept();
     assert_eq!(accepted["duplicate"], false);
-    assert_eq!(accepted["reflection"]["automaticTrigger"], true);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["purpose"], "ordinary", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    for field in [
+        "acceptanceId",
+        "run",
+        "assignment",
+        "result",
+        "resultLocator",
+        "revision",
+        "executorSession",
+        "executorTurn",
+        "leadSession",
+        "leadTurn",
+    ] {
+        assert!(
+            accepted[field]
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty()),
+            "acceptance receipt lost {field}: {accepted}"
+        );
+    }
+    let expected_permission = !disable_before_accept;
+    assert_eq!(
+        accepted["reflection"]["selfReflectionEnabled"], expected_permission,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], expected_permission,
+        "{accepted}"
+    );
     assert_eq!(accepted["leadTurn"], LEAD_SOURCE_TURN);
     assert_eq!(accepted["executorTurn"], EXECUTOR_SOURCE_TURN);
     let acceptance = accepted["acceptanceId"].as_str().unwrap();
     let repeated = accept();
     assert_eq!(repeated["duplicate"], true);
     assert_eq!(repeated["acceptanceId"], acceptance);
+    assert_eq!(
+        repeated["reflection"]["selfReflectionEnabled"], expected_permission,
+        "{repeated}"
+    );
+    assert_eq!(
+        repeated["reflection"]["automaticTrigger"], expected_permission,
+        "{repeated}"
+    );
     assert_eq!(request_counts(workspace), (0, 0, 0, 0));
 
-    let spec = process_spec_from(workspace, manager, LEAD_THREAD, "_serve");
+    (
+        controller,
+        task,
+        acceptance.to_owned(),
+        retained.result.unwrap().sha256,
+        accepted,
+    )
+}
+
+fn normal_acceptance_with_source(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+) -> (String, String) {
+    let (controller, task, acceptance, retained_result, _accepted) =
+        prepare_ordinary_acceptance(workspace, manager, source, false, Some(source));
+    let acceptance = acceptance.as_str();
+
+    let spec = process_spec_from_source(workspace, manager, source, LEAD_THREAD, "_serve");
     let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
     let until = Instant::now() + Duration::from_secs(90);
     loop {
@@ -434,9 +876,16 @@ pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (Strin
     }
     assert_eq!(request_counts(workspace), (1, 1, 1, 1));
     let record = controller.record(acceptance).unwrap().unwrap();
-    assert_eq!(record.binding.result, retained.result.unwrap().sha256);
+    assert_eq!(record.binding.result, retained_result);
     assert_eq!(record.binding.lead_turn.as_deref(), Some(LEAD_SOURCE_TURN));
-    success(command_from(manager, workspace, "disable", None, &[]));
+    success(command_from_source(
+        manager,
+        workspace,
+        source,
+        "disable",
+        None,
+        &[],
+    ));
     let finished = wait_session(session);
     assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
     assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
@@ -446,6 +895,151 @@ pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (Strin
         "the installed chain must derive its identity without a caller-authored request"
     );
     (task, acceptance.to_owned())
+}
+
+#[test]
+fn ordinary_acceptance_remains_usable_while_reflection_is_disabled() {
+    let workspace = Workspace::new("gate-ordinary-acceptance", LeadMode::Delivered);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "ordinary-acceptance", true);
+    let (controller, task, acceptance, _result, accepted) =
+        prepare_ordinary_acceptance(&workspace, &manager(), &source, true, Some(&source));
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert_eq!(accepted["reflection"]["selfReflectionEnabled"], false);
+    assert_eq!(accepted["reflection"]["automaticTrigger"], false);
+
+    let status = success(command_with_source(
+        &workspace,
+        &source,
+        "status",
+        None,
+        &[],
+    ));
+    assert_eq!(status["selfReflectionEnabled"], false, "{status}");
+    assert_eq!(status["modelWork"], "stopped", "{status}");
+
+    // Re-enable before the first poll. The acceptance itself was recorded while
+    // permission was false, so later permission must not make that closure
+    // eligible for reflection.
+    set_source_enabled(&source, true);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 0, "{poll:?}");
+    assert_eq!(poll.model_calls, 0, "{poll:?}");
+    assert!(poll.recovery.is_none(), "{poll:?}");
+    assert!(
+        poll.ignored >= 1,
+        "the disabled-period acceptance was not ignored: {poll:?}"
+    );
+    assert!(
+        poll.refusals.is_empty(),
+        "the disabled-period acceptance added a refusal: {poll:?}"
+    );
+    assert!(
+        controller.record(&acceptance).unwrap().is_none(),
+        "a closure accepted while reflection was disabled became a reflection record"
+    );
+
+    let processed = success(command_with_source(
+        &workspace,
+        &source,
+        "process",
+        Some(LEAD_THREAD),
+        &[],
+    ));
+    assert_eq!(processed["lifecycle"], "active", "{processed}");
+    assert_eq!(processed["retained"], 0, "{processed}");
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    assert!(
+        controller
+            .stored_state()
+            .unwrap()
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert!(
+        !acceptance.trim().is_empty(),
+        "accepted closure identity was not retained"
+    );
+    assert!(!task.trim().is_empty());
+}
+
+#[test]
+fn ordinary_acceptance_reads_the_installed_kit_permission_without_consumer_config() {
+    for explicit_consumer in [false, true] {
+        let workspace = Workspace::new(
+            if explicit_consumer {
+                "gate-installed-explicit"
+            } else {
+                "gate-installed-implicit"
+            },
+            LeadMode::Delivered,
+        );
+        install_fixture(&workspace);
+        let source = source_fixture(&workspace, "installed-acceptance", true);
+        fs::write(
+            workspace.home.join("harness/installation.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 2,
+                "settings": {"sourceRoot": source},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !workspace
+                .checkout
+                .join("global/orchestration.toml")
+                .exists(),
+            "the consumer fixture must not supply kit configuration"
+        );
+
+        let (controller, _task, acceptance, _result, accepted) = prepare_ordinary_acceptance(
+            &workspace,
+            &manager(),
+            &source,
+            true,
+            explicit_consumer.then_some(workspace.checkout.as_path()),
+        );
+        assert_eq!(accepted["status"], "accepted", "{accepted}");
+        assert_eq!(accepted["purpose"], "ordinary", "{accepted}");
+        assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+        assert_eq!(
+            accepted["reflection"]["selfReflectionEnabled"], false,
+            "{accepted}"
+        );
+        assert_eq!(
+            accepted["reflection"]["automaticTrigger"], false,
+            "{accepted}"
+        );
+
+        set_source_enabled(&source, true);
+        let poll = controller.poll().unwrap();
+        assert_eq!(poll.accepted, 0, "{poll:?}");
+        assert_eq!(poll.model_calls, 0, "{poll:?}");
+        assert!(
+            poll.ignored >= 1,
+            "the installed-kit disabled acceptance was not ignored: {poll:?}"
+        );
+        assert!(
+            poll.refusals.is_empty(),
+            "the installed-kit disabled acceptance added a refusal: {poll:?}"
+        );
+        assert!(
+            controller.record(&acceptance).unwrap().is_none(),
+            "re-enabling the installed kit scheduled the disabled-period acceptance"
+        );
+
+        let processed = success(command_with_source(
+            &workspace,
+            &source,
+            "process",
+            Some(LEAD_THREAD),
+            &[],
+        ));
+        assert_eq!(processed["retained"], 0, "{processed}");
+        assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+    }
 }
 
 #[test]
@@ -536,6 +1130,21 @@ fn foreign_lead_is_refused_and_disabled_processing_keeps_pending_work() {
     assert!(!foreign.status.success());
     assert!(String::from_utf8_lossy(&foreign.stderr).contains("real lead is unavailable"));
     assert_eq!(controller.stored_state().unwrap().unwrap(), before);
+
+    let disabled_source = source_fixture(&workspace, "lifecycle-off-disabled", false);
+    let before_disabled = controller.stored_state().unwrap().unwrap();
+    let disabled_foreign = command_with_source(
+        &workspace,
+        &disabled_source,
+        "process",
+        Some("foreign-lead"),
+        &[],
+    );
+    assert!(!disabled_foreign.status.success());
+    assert!(String::from_utf8_lossy(&disabled_foreign.stderr).contains("real lead is unavailable"));
+    let after_disabled = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after_disabled.checkpoint, before_disabled.checkpoint);
+    assert_eq!(after_disabled.records, before_disabled.records);
     success(command(&workspace, "disable", None));
     success(command(&workspace, "disable", None));
     let off = success(command(&workspace, "process", None));

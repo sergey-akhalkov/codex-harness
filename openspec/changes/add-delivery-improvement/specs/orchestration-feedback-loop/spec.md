@@ -18,6 +18,10 @@ Lead and executor feedback about the work, the orchestration, instructions, tool
 - **WHEN** the accepted-task executor reflection and lead synthesis return an attributable problem
 - **THEN** the real lead records or updates the bounded board item at its next safe decision boundary without requiring the original reporter to repeat the observation or granting either fork board-write authority
 
+#### Scenario: Feedback work continues while reflection is disabled
+- **WHEN** `self_reflection_enabled` is false and a lead records, triages or accepts ordinary work
+- **THEN** those feedback and acceptance operations remain available, start no executor- or lead-reflection model call, and a closure accepted while false remains ineligible if the value is re-enabled before its first event observation
+
 ### Requirement: Observations are routed by kind
 
 Each observation SHALL be classified before it competes as an incubator vote. A verified reusable procedure in owned skill scope SHALL be handed to `autonomous-skill-evolution` and SHALL NOT wait for the vote threshold. Process, orchestration, requirement, tool and unclear or material changes SHALL remain incubator items unless they qualify for the existing consequence override or the explicit verified-improvement admission under active `delivery-improvement`. Kit-wide skill or instruction demand from consuming projects SHALL promote to the kit backlog without private consuming-project data; `autonomous-skill-evolution` SHALL execute any subsequent library mutation under its own evaluation contract. Promotion and routing confer eligibility for planning; they SHALL NOT write skill packages or substitute incubator votes or verified-improvement admission for skill-evaluation. Implementing a verified improvement SHALL additionally require the activated mandate and the lead's scoped acceptance of that work.

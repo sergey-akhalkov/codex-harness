@@ -85,6 +85,38 @@ A stop prevents new reflection and improvement assignments under that mandate wh
 
 Installed enable/status/disable/recovery must own routine prerequisites and report cause and next action. Reuse the existing `delivery-improvement` command namespace if useful, without preserving an observer-specific implementation solely for compatibility: it was not delivered. The two skills, native trigger, fork chain, feedback decision and consuming sessions are one end-to-end feature.
 
+### 8. Configuration permission is separate from lifecycle activation
+
+`self_reflection_enabled` in `global/orchestration.toml` is a default-on,
+boolean permission for new reflection model stages. True only permits work
+under an explicitly activated lifecycle; it never creates or reactivates one.
+False stops new executor and lead model calls through every dispatch owner
+while ordinary lead, executor and acceptance work remains available.
+
+Each new stage re-reads the effective source configuration. A host that is
+already running therefore observes an on-to-off change without restart. A stage
+already executing may finish and retain its result; the coordinator checks
+again before the dependent lead stage. The existing controller owns the lock,
+checkpoint, recovery and retained records. The normal acceptance owner resolves
+the effective permission before closing the board task. The selected source
+keeps its pool-provenance meaning, whether explicit or the default project.
+A recognized kit checkout supplies its configuration; an ordinary consumer
+uses the kit source recorded by the normal installation. Pool provenance is
+not silently retargeted to the kit. The permission is recorded in the
+acceptance binding and public receipt. Default-true bindings omit the field on
+serialization so retained acceptance metadata keeps the legacy shape; false is
+explicit. Accepting while false therefore succeeds but creates an ineligible
+closure; the existing event evaluator skips it as its normal `Ignored` result
+even if the flag returns to true before the first poll. Closures otherwise
+observed during the disabled interval advance the normal event boundary without
+admission. Neither path sweeps the disabled interval after re-enable or
+duplicates retained work, and this adds no refusal or persisted-state
+vocabulary. A disabled `process` still authenticates the managed lead and active
+binding before advancing the retained checkpoint; a foreign lead is refused
+without changing the checkpoint or records.
+Status reports the effective value, the source path and why model work is
+stopped.
+
 ### Parallel candidate implementation and predeclared evaluation
 
 Keep the initial evidence and uncertainty in `proposal.md`; do not turn the

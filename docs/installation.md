@@ -131,6 +131,21 @@ Codex and the executor profile work. Connecting the subscription component
 does not authorize a provider or create a user's Z.AI profile. Choose billing
 routes explicitly; see [subscription setup](subscription-models.md).
 
+The shipped orchestration profile also sets `self_reflection_enabled = true`.
+This is a permission gate for new accepted-work reflection model calls, not an
+activation: a project still requires an explicit `delivery-improvement enable`.
+An omitted key is true for compatibility. Set it to `false` to stop new
+reflection stages while ordinary lead, executor and acceptance work continues;
+retained results and pending work are preserved.
+Ordinary acceptance uses the installed kit configuration when its source is a
+consumer project, with or without an explicit `--source`. A selected kit supplies
+its own configuration; consumer pool provenance remains unchanged. Default-true bindings
+omit the field from the legacy-compatible acceptance metadata; false is
+explicit. An acceptance made while false still succeeds, records that
+permission in its receipt, and remains ineligible for reflection if the value is
+re-enabled before the next poll: the closure is consumed as an existing ignored
+event, not a new refusal.
+
 For a first installation, when `codex-harness` is not yet on PATH, bootstrap
 the manager with Cargo's ordinary development profile and let **deploy**
 publish the optimized immutable release build:

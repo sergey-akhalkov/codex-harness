@@ -13,6 +13,7 @@ pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
         board,
         &request.codex_home,
     );
+    super::gate::ReflectionGate::load(&request.source)?.ensure_enabled()?;
     let polled = controller.poll()?;
     if let Some(recovery) = polled.recovery {
         return Err(invalid(format!(
@@ -43,8 +44,13 @@ pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
         run_executor(&chain, admission)
     })?;
     check_binding(&controller, &chain)?;
+    // The executor result is retained before this fresh read. A concurrent
+    // on-to-off change therefore leaves the lead stage pending instead of
+    // starting another model call or discarding the executor outcome.
+    super::gate::ReflectionGate::load(&chain.source)?.ensure_enabled()?;
     preflight_lead(&chain)?;
     wait_for_lead_turn(&chain)?;
+    super::gate::ReflectionGate::load(&chain.source)?.ensure_enabled()?;
     let lead = run_recorded_stage(&controller, &chain, Stage::Lead, |admission| {
         run_lead(&chain, &executor, admission)
     })?;

@@ -319,13 +319,19 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
     let controller = options.controller()?;
     match options.command.as_str() {
-        "status" => status(&controller, &options.home),
+        "status" => status(
+            &controller,
+            &options.home,
+            &gate::ReflectionGate::load(&options.source)?,
+        ),
         "enable" => {
-            let (lead, owner_process) = options.managed_lead()?;
             // Resolve both roles and configured routes before changing journal
             // configuration. Actual stage startup revalidates these identities.
             let config = orchestration_config::load(&options.source)?;
+            let gate = gate::ReflectionGate::from_config(&options.source, &config);
+            gate.ensure_enabled()?;
             declarations(&options, &config)?;
+            let (lead, owner_process) = options.managed_lead()?;
             let launcher = options.home.join("harness/bin/codex.exe");
             if !launcher.is_file() {
                 return Err(invalid(
@@ -404,11 +410,27 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
 
 const MAX_STATUS_RECORDS: usize = 64;
 
-fn status(controller: &ReflectionController, home: &Path) -> io::Result<i32> {
+fn status(
+    controller: &ReflectionController,
+    home: &Path,
+    gate: &gate::ReflectionGate,
+) -> io::Result<i32> {
     let Some(state) = controller.stored_state()? else {
-        println!("{}", json!({"lifecycle": "inactive", "pending": 0}));
+        let (model_work, reason) = gate.model_work(None);
+        println!(
+            "{}",
+            json!({
+                "lifecycle": "inactive",
+                "pending": 0,
+                "selfReflectionEnabled": gate.enabled,
+                "configPath": gate.config_path,
+                "modelWork": model_work,
+                "modelWorkReason": reason,
+            })
+        );
         return Ok(0);
     };
+    let (model_work, model_work_reason) = gate.model_work(Some(&state));
     let records: Vec<Value> = state
         .records
         .values()
@@ -431,6 +453,10 @@ fn status(controller: &ReflectionController, home: &Path) -> io::Result<i32> {
             "recovery": state.recovery,
             "lastPoll": state.last_poll,
             "stateFile": controller.state_file()?,
+            "selfReflectionEnabled": gate.enabled,
+            "configPath": gate.config_path,
+            "modelWork": model_work,
+            "modelWorkReason": model_work_reason,
             "host": host::status(home, &state.binding.lead_session)?,
             "records": records,
             "recordsOmitted": omitted,
@@ -693,11 +719,12 @@ fn succession(options: &Options, controller: &ReflectionController) -> io::Resul
 }
 
 fn process(options: &Options, controller: &ReflectionController, quiet: bool) -> io::Result<i32> {
+    let gate = gate::ReflectionGate::load(&options.source)?;
     let idle = || {
         if quiet {
             Ok(0)
         } else {
-            status(controller, &options.home)
+            status(controller, &options.home, &gate)
         }
     };
     let Some(state) = controller.stored_state()? else {
@@ -716,6 +743,15 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
             return idle();
         }
         return Err(invalid(checked.detail));
+    }
+    if !gate.enabled {
+        // The disabled path advances the retained event checkpoint, which is a
+        // lifecycle write. It therefore still requires the managed lead and
+        // active binding above. No model work, stage admission, retained result
+        // or other lifecycle state changes; re-enabling sees only work retained
+        // before the gate closed.
+        controller.poll_without_admission()?;
+        return idle();
     }
     // This is the ordinary current-owner route. Refresh the exact process
     // proof while the registration is available so a later retirement of the
@@ -750,7 +786,7 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
     };
     let Some(record) = record else {
         if !quiet {
-            return status(controller, &options.home);
+            return status(controller, &options.home, &gate);
         }
         return Ok(0);
     };
@@ -797,6 +833,7 @@ fn continuation(
     lead: &str,
     owner_process: &RetainedOwnerProcess,
 ) -> io::Result<i32> {
+    gate::ReflectionGate::load(&options.source)?.ensure_enabled()?;
     let continuation = options.continuation.as_ref().ok_or_else(|| {
         invalid("continue requires --acceptance and --stage; nothing was changed")
     })?;
