@@ -10,8 +10,8 @@ use harness_core::{
     board_cli,
     delivery_reflection::{
         AcceptanceBinding, ActivationRequest, BudgetLimit, DeliveryState, Finding, JournalPolicy,
-        Purpose, ReflectionController, ReflectionLimits, Stage, StageState, UsageDelta,
-        acceptance_metadata,
+        Purpose, ReflectionController, ReflectionLimits, ReflectionState, Stage, StageState,
+        StageWork, SubmittedAccounting, UsageDelta, acceptance_metadata,
     },
 };
 use std::ffi::OsString;
@@ -363,6 +363,86 @@ fn submitted_timeout_unknown(
     (workspace, controller, acceptance, state_dir, submitted)
 }
 
+/// Reproduces the installed predecessor: the exact retained turn is natively
+/// interrupted with known token/work accounting, while the accepted ledger has
+/// already charged that accounting and retained it as Unknown without a pause
+/// or continuation. The attempts and cumulative context also cover prior work.
+fn submitted_interrupted_exhaustion(
+    name: &str,
+) -> (Workspace, ReflectionController, String, PathBuf, Vec<u8>) {
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 3,
+        max_turns_per_stage: 2,
+        max_tokens_per_stage: 120_000,
+        max_tokens_per_record: 200_000,
+        max_context_bytes_per_stage: 4 * 1024 * 1024,
+        max_context_bytes_per_record: 8 * 1024 * 1024,
+        ..ReflectionLimits::default()
+    };
+    let (workspace, controller, acceptance, state_dir, submitted) =
+        submitted_timeout_unknown(name, limits);
+    let artifact_path = state_dir.join("executor-stage.json");
+    let mut native = read_json(&artifact_path);
+    assert_eq!(native["status"], "unknown", "{native}");
+    assert_eq!(native["fork"], submitted["fork"], "{native}");
+    assert_eq!(native["turnId"], EXECUTOR_FORK_TURN, "{native}");
+    native["status"] = json!("interrupted");
+    native["usageKnown"] = json!(true);
+    native["usage"] = json!({
+        "input_tokens": 440_013,
+        "cached_input_tokens": 0,
+        "output_tokens": 1_000,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 441_013,
+    });
+    native["usageUnknownReason"] = Value::Null;
+    native["workKnown"] = json!(true);
+    native["work"] = json!({
+        "investigations": 2,
+        "context_bytes": 37_839,
+    });
+    native["workUnknownReason"] = Value::Null;
+    native["sourceContextBytes"] = json!(0);
+    native["sourceContextAccounted"] = json!(true);
+    native["result"] = Value::Null;
+    native["error"] = json!("the native turn ended interrupted");
+    native["budgetPause"] = Value::Null;
+    fs::write(&artifact_path, serde_json::to_vec(&native).unwrap()).unwrap();
+
+    let state_path = controller.state_file().unwrap();
+    let mut ledger: ReflectionState =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let record = ledger.records.get_mut(&acceptance).unwrap();
+    record.executor.state = StageState::Unknown;
+    record.executor.usage.attempts = 2;
+    record.executor.usage.turns = 1;
+    record.executor.usage.tokens = 441_013;
+    record.executor.usage.investigations = 2;
+    record.executor.usage.context_bytes = 1_905_243;
+    record.executor.usage_reconciled = false;
+    record.executor.work_reconciled = true;
+    record.executor.pause = None;
+    record.executor.outcome = None;
+    record.executor.submitted_accounting = Some(SubmittedAccounting {
+        usage: UsageDelta {
+            turns: 1,
+            tokens: 441_013,
+        },
+        work: StageWork {
+            investigations: 2,
+            context_bytes: 37_839,
+        },
+    });
+    fs::write(&state_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let native_bytes = fs::read(&artifact_path).unwrap();
+    (workspace, controller, acceptance, state_dir, native_bytes)
+}
+
+fn process_reflection(workspace: &Workspace) -> ConsoleOutcome {
+    let spec = lifecycle::process_spec_from(workspace, &manager(), LEAD_THREAD, "process");
+    wait_session(ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap())
+}
+
 #[test]
 fn submitted_timeout_reconciliation_retains_measured_usage_and_blocks_the_lead() {
     let limits = ReflectionLimits {
@@ -571,6 +651,219 @@ fn submitted_timeout_reconciliation_retains_a_failed_turn_without_fabricating_us
 }
 
 #[test]
+fn submitted_interruption_reconciliation_pauses_exhausted_tokens_without_replay() {
+    let (workspace, controller, acceptance, state_dir, native_bytes) =
+        submitted_interrupted_exhaustion("submitted-interruption-exhausted");
+    let artifact_path = state_dir.join("executor-stage.json");
+    let expected_fork = read_json(&artifact_path)["fork"].clone();
+    let calls = request_counts(&workspace);
+
+    let paused = process_reflection(&workspace);
+    assert_refused(
+        &paused,
+        "stage_tokens observed 441013 exceeds allowed 120000",
+    );
+    assert!(
+        paused
+            .transcript
+            .contains("No new fork or turn was started"),
+        "{}",
+        paused.transcript
+    );
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(fs::read(&artifact_path).unwrap(), native_bytes);
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Blocked);
+    assert_eq!(record.executor.usage.attempts, 2);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 441_013);
+    assert_eq!(record.executor.usage.investigations, 2);
+    assert_eq!(record.executor.usage.context_bytes, 1_905_243);
+    assert!(record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+    assert_eq!(record.executor.submitted_accounting, None);
+    assert!(record.executor.outcome.is_none());
+    let pause = record.executor.pause.as_ref().unwrap();
+    assert_eq!(pause.limit, BudgetLimit::StageTokens);
+    assert_eq!(pause.observed, 441_013);
+    assert_eq!(pause.allowed, 120_000);
+    assert!(
+        pause
+            .continuation_choice
+            .contains("delivery-improvement continue")
+            && pause.continuation_choice.contains("--stage executor")
+            && pause.continuation_choice.contains("--max-tokens-per-stage")
+            && pause
+                .continuation_choice
+                .contains("--max-tokens-per-record"),
+        "{}",
+        pause.continuation_choice
+    );
+    assert!(
+        pause
+            .evidence
+            .iter()
+            .any(|item| item.contains("interrupted") && item.contains("not replayed")),
+        "{pause:?}"
+    );
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.lead.usage.attempts, 0);
+    assert_eq!(record.delivery, DeliveryState::Pending);
+
+    let status = status_json(&workspace);
+    let entry = status["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["acceptance"] == json!(acceptance))
+        .unwrap();
+    assert_eq!(entry["executor"]["state"], json!("blocked"), "{entry}");
+    assert_eq!(entry["executor"]["usageReconciled"], json!(true), "{entry}");
+    assert_eq!(entry["executor"]["workReconciled"], json!(true), "{entry}");
+    assert_eq!(
+        entry["executor"]["missingReconciliation"],
+        json!([]),
+        "{entry}"
+    );
+    assert_eq!(
+        entry["executor"]["pause"]["limit"],
+        json!("stage_tokens"),
+        "{entry}"
+    );
+    assert!(
+        entry["executor"]["continuation"]
+            .as_str()
+            .is_some_and(|continuation| continuation.contains("--stage executor")),
+        "{entry}"
+    );
+
+    let repeated = process_reflection(&workspace);
+    assert_eq!(repeated.outcome.exit_code, 0, "{}", repeated.transcript);
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(fs::read(&artifact_path).unwrap(), native_bytes);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+
+    let continued = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "executor",
+            "--max-tokens-per-stage",
+            "500000",
+            "--max-tokens-per-record",
+            "600000",
+        ],
+        2,
+        "fixture-executor-reflection-fork-2",
+        "fixture-executor-reflection-turn-2",
+    );
+    assert_eq!(continued.outcome.exit_code, 0, "{}", continued.transcript);
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
+
+    let archived_path = state_dir.join("executor-stage-attempt-2.json");
+    assert_eq!(fs::read(&archived_path).unwrap(), native_bytes);
+    let archived = read_json(&archived_path);
+    assert_eq!(archived["status"], json!("interrupted"), "{archived}");
+    assert_eq!(archived["fork"], expected_fork, "{archived}");
+    assert_eq!(archived["turnId"], EXECUTOR_FORK_TURN, "{archived}");
+    assert_eq!(archived["usageKnown"], json!(true), "{archived}");
+    assert_eq!(
+        archived["usage"]["total_tokens"],
+        json!(441_013),
+        "{archived}"
+    );
+    assert_eq!(archived["work"]["investigations"], json!(2), "{archived}");
+
+    let final_record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(final_record.executor.state, StageState::Retained);
+    assert_eq!(final_record.executor.usage.attempts, 3);
+    assert_eq!(final_record.executor.usage.turns, 2);
+    assert_eq!(final_record.executor.usage.tokens, 441_133);
+    assert_eq!(final_record.executor.usage.investigations, 4);
+    assert!(
+        final_record.executor.usage.context_bytes >= 1_905_243,
+        "{final_record:?}"
+    );
+    assert!(final_record.executor.pause.is_none());
+    assert_eq!(final_record.lead.state, StageState::Retained);
+    assert_eq!(final_record.delivery, DeliveryState::Consumed);
+    assert_eq!(final_record.lead.usage.tokens, 240);
+    assert_eq!(final_record.usage_totals().tokens, 441_373);
+    let current = read_json(&artifact_path);
+    assert_eq!(current["status"], json!("completed"), "{current}");
+    assert_eq!(
+        current["turnId"],
+        json!("fixture-executor-reflection-turn-2"),
+        "{current}"
+    );
+}
+
+#[test]
+fn submitted_interruption_reconciliation_refuses_identity_drift_before_mutation() {
+    let (workspace, controller, acceptance, state_dir, _native_bytes) =
+        submitted_interrupted_exhaustion("submitted-interruption-identity-drift");
+    let artifact_path = state_dir.join("executor-stage.json");
+    let mut native = read_json(&artifact_path);
+    native["sourceThread"] = json!("synthetic-drifted-source");
+    fs::write(&artifact_path, serde_json::to_vec(&native).unwrap()).unwrap();
+    let drifted_native = fs::read(&artifact_path).unwrap();
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    let calls = request_counts(&workspace);
+
+    let refused = process_reflection(&workspace);
+    assert_refused(&refused, "drifted chain");
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(fs::read(&artifact_path).unwrap(), drifted_native);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+    assert_eq!(record.executor.state, StageState::Unknown);
+    assert_eq!(record.executor.pause, None);
+}
+
+#[test]
+fn submitted_interruption_below_token_allowance_stays_unknown_without_retry() {
+    let (workspace, controller, acceptance, state_dir, native_bytes) =
+        submitted_interrupted_exhaustion("submitted-interruption-under-budget");
+    let raised = ReflectionLimits {
+        max_attempts_per_stage: 3,
+        max_turns_per_stage: 2,
+        max_tokens_per_stage: 500_000,
+        max_tokens_per_record: 600_000,
+        max_context_bytes_per_stage: 4 * 1024 * 1024,
+        max_context_bytes_per_record: 8 * 1024 * 1024,
+        ..ReflectionLimits::default()
+    };
+    controller
+        .activate(&ActivationRequest {
+            lead_session: LEAD_THREAD.to_owned(),
+            run: None,
+            boundary: None,
+            journal: JournalPolicy::RequireExisting,
+            limits: Some(raised),
+        })
+        .unwrap();
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    let calls = request_counts(&workspace);
+
+    let idle = process_reflection(&workspace);
+    assert_eq!(idle.outcome.exit_code, 0, "{}", idle.transcript);
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(
+        fs::read(&state_dir.join("executor-stage.json")).unwrap(),
+        native_bytes
+    );
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+    assert_eq!(record.executor.state, StageState::Unknown);
+    assert_eq!(record.executor.pause, None);
+    assert!(!record.executor.usage_reconciled);
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.delivery, DeliveryState::Pending);
+}
+
+#[test]
 fn token_exhaustion_blocks_the_lead_and_resume_keeps_the_first_stage_usage() {
     let workspace = Workspace::new("budget-token-exhaustion", LeadMode::Delivered);
     let limits = ReflectionLimits {
@@ -732,7 +1025,10 @@ fn unknown_new_turn_usage_stays_explicit_and_blocks_dependent_work() {
     assert!(!record.executor.usage_reconciled);
     assert_eq!(record.executor.usage.attempts, 1);
     assert_eq!(record.executor.usage.turns, 1);
-    assert_eq!(record.executor.usage.tokens, 0);
+    assert_eq!(
+        record.executor.usage.tokens, 120,
+        "the observed partial-token lower bound stays charged while usage remains unreconciled"
+    );
     assert!(
         record
             .executor

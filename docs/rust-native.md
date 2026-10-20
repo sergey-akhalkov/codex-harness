@@ -450,6 +450,16 @@ stays explicitly unknown. Reconciliation preserves attempts, observed work,
 cumulative costs and finite limits, so exhausted limits continue to block
 dependent work.
 
+An exact retained native turn already marked `interrupted` with known token
+usage and observed work transitions model-free to the existing budget pause only
+when its settled cost exceeds a current finite stage or record token allowance.
+The native terminal evidence stays unchanged, repeat processing creates no fork
+or turn, and the submitted usage and work are not charged twice. A known
+interruption below both token allowances stays `Unknown` without an automatic
+retry or dependent lead stage. After an exhausted-cost pause, the recorded
+explicit `continue` command may authorize one fresh finite attempt under raised
+allowances while preserving prior attempts and costs.
+
 Recovery is explicit and model-free. After inspecting the reported gap,
 `recover --resolution resume-retained --project CHECKOUT` continues from a
 recorded retained journal floor. For a reconciled source or unjournaled gap,

@@ -3,9 +3,10 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    BudgetLimit, DeliveryState as RecordedDeliveryState, LifecycleStatus, ReflectionController,
-    ReflectionRecord, Stage, StageAdmission, StageRecord, StageState as RecordedStageState,
-    StageWork, SubmittedAccounting, UsageDelta,
+    BudgetLimit, BudgetPause, DeliveryState as RecordedDeliveryState, LifecycleStatus,
+    ReflectionController, ReflectionLimits, ReflectionRecord, Stage, StageAdmission, StageRecord,
+    StageState as RecordedStageState, StageUsage, StageWork, SubmittedAccounting, UsageDelta,
+    UsageTotals,
 };
 
 pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
@@ -302,8 +303,10 @@ pub(super) fn retained_pre_fork_rejection(
 }
 
 /// Selects an unknown stage whose retained native artifact still names the
-/// exact submitted fork and turn. Only the explicit process selects this
-/// shape; reopening it observes that turn and never creates a fork or turn.
+/// exact submitted fork and turn, or a measured interrupted turn whose known
+/// cost already exhausted a finite token allowance. Only the explicit process
+/// selects these shapes; reconciliation observes existing evidence and never
+/// creates a fork or turn.
 pub(super) fn retained_submitted_reconciliation(
     controller: &ReflectionController,
     record: &ReflectionRecord,
@@ -316,6 +319,7 @@ pub(super) fn retained_submitted_reconciliation(
         .ok()?
         .with_extension("")
         .join(&record.acceptance_id);
+    let limits = controller.stored_state().ok().flatten()?.limits;
     [Stage::Executor, Stage::Lead].into_iter().find(|stage| {
         let slot = recorded_stage(record, *stage);
         if slot.state != RecordedStageState::Unknown
@@ -328,11 +332,115 @@ pub(super) fn retained_submitted_reconciliation(
             .ok()
             .and_then(|bytes| serde_json::from_slice::<StageState>(&bytes).ok())
             .is_some_and(|native| {
-                native.status == StageStatus::Unknown
-                    && native.turn_id.is_some()
-                    && native.fork.is_some()
+                if native.turn_id.is_none() || native.fork.is_none() {
+                    return false;
+                }
+                match native.status {
+                    StageStatus::Unknown => true,
+                    StageStatus::Interrupted => {
+                        native.usage_known
+                            && native.work_known
+                            && native.result.is_none()
+                            && native.budget_pause.is_none()
+                            && interrupted_token_exhaustion(record, *stage, &native, &limits)
+                                .is_some()
+                    }
+                    _ => false,
+                }
             })
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InterruptedTokenExhaustion {
+    limit: BudgetLimit,
+    observed: u64,
+    allowed: u64,
+}
+
+/// Mirrors the submitted-accounting replacement used by the core owner. The
+/// ledger's existing lower bounds win, so deciding whether a known interruption
+/// exhausted a token allowance neither charges it twice nor lowers prior cost.
+fn settled_submitted_usage(
+    record: &ReflectionRecord,
+    stage: Stage,
+    native: &StageState,
+) -> (StageUsage, UsageTotals) {
+    let slot = recorded_stage(record, stage);
+    let previous = slot.submitted_accounting.unwrap_or_default();
+    let usage = stage_usage_delta(native);
+    let work = stage_work(native);
+    let accounted_usage = UsageDelta {
+        turns: previous.usage.turns.max(usage.turns),
+        tokens: previous.usage.tokens.max(usage.tokens),
+    };
+    let accounted_work = StageWork {
+        investigations: previous.work.investigations.max(work.investigations),
+        context_bytes: previous.work.context_bytes.max(work.context_bytes),
+    };
+    let mut settled = slot.usage.clone();
+    settled.turns = slot
+        .usage
+        .turns
+        .saturating_sub(previous.usage.turns)
+        .saturating_add(accounted_usage.turns);
+    settled.tokens = slot
+        .usage
+        .tokens
+        .saturating_sub(previous.usage.tokens)
+        .saturating_add(accounted_usage.tokens);
+    settled.investigations = slot
+        .usage
+        .investigations
+        .saturating_sub(previous.work.investigations)
+        .saturating_add(accounted_work.investigations);
+    settled.context_bytes = slot
+        .usage
+        .context_bytes
+        .saturating_sub(previous.work.context_bytes)
+        .saturating_add(accounted_work.context_bytes);
+    let mut totals = record.usage_totals();
+    totals.turns = totals
+        .turns
+        .saturating_sub(slot.usage.turns)
+        .saturating_add(settled.turns);
+    totals.tokens = totals
+        .tokens
+        .saturating_sub(slot.usage.tokens)
+        .saturating_add(settled.tokens);
+    totals.investigations = totals
+        .investigations
+        .saturating_sub(slot.usage.investigations)
+        .saturating_add(settled.investigations);
+    totals.context_bytes = totals
+        .context_bytes
+        .saturating_sub(slot.usage.context_bytes)
+        .saturating_add(settled.context_bytes);
+    (settled, totals)
+}
+
+fn interrupted_token_exhaustion(
+    record: &ReflectionRecord,
+    stage: Stage,
+    native: &StageState,
+    limits: &ReflectionLimits,
+) -> Option<InterruptedTokenExhaustion> {
+    let (settled, totals) = settled_submitted_usage(record, stage, native);
+    if settled.tokens > limits.max_tokens_per_stage {
+        Some(InterruptedTokenExhaustion {
+            limit: BudgetLimit::StageTokens,
+            observed: settled.tokens,
+            allowed: limits.max_tokens_per_stage,
+        })
+    } else if totals.tokens > limits.max_tokens_per_record {
+        Some(InterruptedTokenExhaustion {
+            limit: BudgetLimit::RecordTokens,
+            observed: totals.tokens,
+            allowed: limits.max_tokens_per_record,
+        })
+    } else {
+        None
+    }
 }
 
 /// Reopens the accepted unknown stage only when its native artifact still
@@ -395,6 +503,181 @@ fn reopen_submitted_unknown(
     native.updated_ms = now_ms();
     persist(state_path, &native)?;
     Ok(true)
+}
+
+fn interrupted_budget_pause(
+    chain: &ChainState,
+    stage: Stage,
+    native: &StageState,
+    record: &ReflectionRecord,
+    limits: &ReflectionLimits,
+    exhaustion: InterruptedTokenExhaustion,
+) -> BudgetPause {
+    let (settled, totals) = settled_submitted_usage(record, stage, native);
+    let admission = StageAdmission::new(limits, &settled, &totals);
+    let usage = stage_usage_delta(native);
+    let work = stage_work(native);
+    let continuation = accepted_continuation(
+        &chain.executor_stage.checkout,
+        &chain.source,
+        &chain.codex_home,
+        &chain.acceptance,
+        stage,
+        exhaustion.limit,
+        exhaustion.observed,
+        exhaustion.allowed,
+        &admission,
+        StageWork::default(),
+    );
+    let fork_thread = native
+        .fork
+        .as_ref()
+        .map(|fork| fork.fork_thread.as_str())
+        .unwrap_or("unknown");
+    let turn = native.turn_id.as_deref().unwrap_or("unknown");
+    BudgetPause {
+        limit: exhaustion.limit,
+        observed: exhaustion.observed,
+        allowed: exhaustion.allowed,
+        missing_fact: "The exact accepted reflection turn ended interrupted after its measured usage exhausted the finite token allowance; no reflection outcome is established.".to_owned(),
+        continuation_choice: continuation,
+        evidence: vec![
+            format!(
+                "native fork {fork_thread} turn {turn} ended interrupted under the validated accepted source/role identity; the native artifact is retained unchanged and this turn is not replayed"
+            ),
+            format!(
+                "known submitted usage {} turn(s), {} tokens; known observed work {} investigations, {} supplied-context bytes",
+                usage.turns, usage.tokens, work.investigations, work.context_bytes
+            ),
+            format!(
+                "settled stage tokens {}/{}; record tokens {}/{}; attempts {}; prior attempts, costs and lower bounds are preserved",
+                settled.tokens,
+                limits.max_tokens_per_stage,
+                totals.tokens,
+                limits.max_tokens_per_record,
+                settled.attempts
+            ),
+        ],
+    }
+}
+
+/// Converts a validated native interruption with decisive accounting into the
+/// existing retained budget pause. The native artifact is read only; the
+/// accepted ledger is reopened only when the installed predecessor already
+/// charged this exact submitted turn and then paused it without a model call.
+fn reconcile_known_interrupted_stage(
+    controller: &ReflectionController,
+    chain: &ChainState,
+    stage: Stage,
+    state_path: &Path,
+    native: &StageState,
+) -> io::Result<Option<BudgetPause>> {
+    if native.status != StageStatus::Interrupted {
+        return Ok(None);
+    }
+    if !native.usage_known || !native.work_known {
+        return Ok(None);
+    }
+    if native.turn_id.is_none()
+        || native.fork.is_none()
+        || native.result.is_some()
+        || native.budget_pause.is_some()
+    {
+        return Err(invalid(format!(
+            "the native {} interrupted stage does not name exactly one submitted fork/turn without an outcome or prior pause; its accepted ledger cannot be reconciled without inventing evidence",
+            stage.as_str()
+        )));
+    }
+    let (declaration, source, role) = match stage {
+        Stage::Executor => (
+            &chain.executor_stage,
+            &chain.executor_source,
+            Role::ExecutorSelfReflection,
+        ),
+        Stage::Lead => (
+            &chain.lead_stage,
+            &chain.lead_source,
+            Role::LeadSelfReflection,
+        ),
+    };
+    let prepared = prepare_stage(chain, declaration, role)?;
+    validate_stage(native, chain, declaration, source, &prepared)?;
+    let state = controller.stored_state()?.ok_or_else(|| {
+        invalid("the accepted closure reflection state disappeared; no interruption was reconciled")
+    })?;
+    let record = state.records.get(&chain.acceptance).ok_or_else(|| {
+        invalid("the accepted closure record disappeared; no interruption was reconciled")
+    })?;
+    if record.delivery == RecordedDeliveryState::Consumed {
+        return Err(invalid(format!(
+            "{} reflection belongs to an already consumed delivery; its interruption cannot be turned into another attempt",
+            stage.as_str()
+        )));
+    }
+    let slot = recorded_stage(record, stage);
+    if slot.outcome.is_some() || slot.pause.is_some() || slot.usage_reconciled {
+        return Err(invalid(format!(
+            "{} reflection is {:?} with an outcome, pause or already reconciled usage; refusing an ambiguous interruption transition",
+            stage.as_str(),
+            slot.state
+        )));
+    }
+    let usage = stage_usage_delta(native);
+    let work = stage_work(native);
+    if usage.turns != 1 {
+        return Err(invalid(format!(
+            "the native {} interruption does not account for exactly one submitted turn",
+            stage.as_str()
+        )));
+    }
+    if let Some(previous) = slot.submitted_accounting {
+        if previous.usage != usage || previous.work != work {
+            return Err(invalid(format!(
+                "the {} accepted ledger's submitted accounting does not equal the exact known native interruption; refusing to infer, drop or charge a delta at {}",
+                stage.as_str(),
+                state_path.display()
+            )));
+        }
+    } else if slot.state == RecordedStageState::Unknown {
+        return Err(invalid(format!(
+            "the unknown {} accepted stage does not retain the submitted accounting for its known native interruption; refusing to add it again at {}",
+            stage.as_str(),
+            state_path.display()
+        )));
+    }
+    let Some(exhaustion) = interrupted_token_exhaustion(record, stage, native, &state.limits)
+    else {
+        return Ok(None);
+    };
+    let pause = interrupted_budget_pause(chain, stage, native, record, &state.limits, exhaustion);
+    match slot.state {
+        RecordedStageState::Unknown => {
+            controller.reopen_submitted_stage(
+                &chain.acceptance,
+                stage,
+                SubmittedAccounting { usage, work },
+            )?;
+        }
+        RecordedStageState::InFlight => {}
+        other => {
+            return Err(invalid(format!(
+                "{} reflection is {other:?}, not reconciled in flight or unknown; no interruption pause was written",
+                stage.as_str()
+            )));
+        }
+    }
+    controller.pause_stage(
+        &chain.acceptance,
+        stage,
+        pause.clone(),
+        usage,
+        work,
+        true,
+        true,
+        None,
+        None,
+    )?;
+    Ok(Some(pause))
 }
 
 /// Reconciles exactly one acknowledged native `thread/fork` rejection before
@@ -569,6 +852,35 @@ fn run_recorded_stage(
                     state_path.display()
                 )));
             }
+            let native: StageState = read_json(&state_path, MAX_REQUEST_BYTES)?;
+            if native.status == StageStatus::Interrupted {
+                if !native.usage_known || !native.work_known {
+                    return Err(invalid(format!(
+                        "{} reflection retains a native interrupted turn without decisive known usage and work at {}; its ledger stays unknown and no automatic retry or dependent work was started",
+                        stage.as_str(),
+                        state_path.display()
+                    )));
+                }
+                let Some(pause) = reconcile_known_interrupted_stage(
+                    controller,
+                    chain,
+                    stage,
+                    &state_path,
+                    &native,
+                )?
+                else {
+                    return Err(invalid(format!(
+                        "{} reflection retains a known native interrupted turn at {}, but its measured cost remains within the current finite token allowances; no model-free continuation is available and its ledger stays unknown without an automatic retry",
+                        stage.as_str(),
+                        state_path.display()
+                    )));
+                };
+                return Err(invalid(format!(
+                    "{} reflection reconciled its known native interrupted turn into a budget pause without a model request: {}. No new fork or turn was started",
+                    stage.as_str(),
+                    pause.summary()
+                )));
+            }
             if reopen_submitted_unknown(controller, chain, stage, &state_path)? {
                 record = controller.record(&chain.acceptance)?.ok_or_else(|| {
                     invalid(
@@ -672,6 +984,26 @@ fn run_recorded_stage(
             let native = fs::read(&state_path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<StageState>(&bytes).ok());
+            if let Some(native) = native
+                .as_ref()
+                .filter(|native| native.status == StageStatus::Interrupted)
+            {
+                if native.usage_known && native.work_known {
+                    if let Some(pause) = reconcile_known_interrupted_stage(
+                        controller,
+                        chain,
+                        stage,
+                        &state_path,
+                        native,
+                    )? {
+                        return Err(invalid(format!(
+                            "{} reflection reconciled its known native interrupted turn into a budget pause without a model request: {}. No new fork or turn was started",
+                            stage.as_str(),
+                            pause.summary()
+                        )));
+                    }
+                }
+            }
             if native
                 .as_ref()
                 .is_some_and(|native| native.status == StageStatus::TurnSubmitted)
