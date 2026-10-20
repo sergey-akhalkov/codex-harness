@@ -2582,13 +2582,18 @@ impl ReflectionController {
                 )));
             }
             match slot.submitted_accounting {
-                Some(previous) if previous != accounted => {
-                    return Err(conflict(&format!(
-                        "the {} native submitted-turn accounting differs from the accepted ledger's provisional accounting; refusing to replace an ambiguous delta",
-                        stage.as_str()
-                    )));
+                Some(previous) => {
+                    if accounted.usage.turns > previous.usage.turns
+                        || accounted.usage.tokens > previous.usage.tokens
+                        || accounted.work.investigations > previous.work.investigations
+                        || accounted.work.context_bytes > previous.work.context_bytes
+                    {
+                        return Err(conflict(&format!(
+                            "the {} native submitted-turn accounting exceeds the accepted ledger's provisional accounting; refusing to infer an uncharged delta",
+                            stage.as_str()
+                        )));
+                    }
                 }
-                Some(_) => {}
                 None => {
                     if accounted.usage.turns > slot.usage.turns
                         || accounted.usage.tokens > slot.usage.tokens
@@ -2669,7 +2674,7 @@ impl ReflectionController {
     ) -> io::Result<StageReceipt> {
         normalize_outcome(&mut outcome)?;
         let detail = detail.into();
-        let detail = if detail.trim().is_empty() {
+        let mut detail = if detail.trim().is_empty() {
             None
         } else {
             Some(bounded_text("usage uncertainty", &detail, MAX_TEXT_BYTES)?)
@@ -2690,7 +2695,16 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            settle_submitted_accounting(slot, usage, work);
+            let (accounted_usage, accounted_work) = settle_submitted_accounting(slot, usage, work);
+            let usage_reconciled = usage_reconciled && accounted_usage == usage;
+            let work_reconciled = work_reconciled && accounted_work == work;
+            if accounted_usage != usage || accounted_work != work {
+                detail = with_lower_bound_detail(
+                    detail,
+                    accounted_usage != usage,
+                    accounted_work != work,
+                );
+            }
             slot.state = StageState::Retained;
             slot.usage.last_error = detail;
             slot.usage_reconciled = usage_reconciled;
@@ -2782,10 +2796,10 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            settle_submitted_usage(slot, usage);
+            let accounted_usage = settle_submitted_usage(slot, usage);
             slot.state = StageState::Blocked;
             slot.usage.last_error = Some(error);
-            slot.usage_reconciled = true;
+            slot.usage_reconciled = accounted_usage == usage;
             slot.work_reconciled = true;
             slot.outcome = None;
             slot.pause = None;
@@ -2831,7 +2845,6 @@ impl ReflectionController {
                 "; observed work remains unreconciled and blocks dependent work: {reason}"
             ));
         }
-        let detail = bounded_text("budget pause detail", &detail, MAX_TEXT_BYTES)?;
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;
         let mut state = self.active_state(&path)?;
@@ -2848,7 +2861,14 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            settle_submitted_accounting(slot, usage, work);
+            let (accounted_usage, accounted_work) = settle_submitted_accounting(slot, usage, work);
+            let usage_reconciled = usage_reconciled && accounted_usage == usage;
+            let work_reconciled = work_reconciled && accounted_work == work;
+            if let Some(note) = lower_bound_note(accounted_usage != usage, accounted_work != work) {
+                detail.push_str("; ");
+                detail.push_str(&note);
+            }
+            let detail = bounded_text("budget pause detail", &detail, MAX_TEXT_BYTES)?;
             slot.state = StageState::Blocked;
             slot.usage.last_error = Some(detail);
             slot.usage_reconciled = usage_reconciled;
@@ -2905,7 +2925,7 @@ impl ReflectionController {
         work: StageWork,
         work_reconciled: bool,
     ) -> io::Result<StageReceipt> {
-        let error = bounded_text("stage uncertainty", &error.into(), MAX_TEXT_BYTES)?;
+        let mut error = bounded_text("stage uncertainty", &error.into(), MAX_TEXT_BYTES)?;
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;
         let mut state = self.active_state(&path)?;
@@ -2922,11 +2942,22 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            if usage.turns > 0 {
-                record_submitted_accounting(slot, usage, work);
+            let work_reconciled = if usage.turns > 0 {
+                let (accounted_usage, accounted_work) =
+                    record_submitted_accounting(slot, usage, work);
+                if accounted_usage != usage || accounted_work != work {
+                    error = with_lower_bound_detail(
+                        Some(error),
+                        accounted_usage != usage,
+                        accounted_work != work,
+                    )
+                    .unwrap_or_default();
+                }
+                work_reconciled && accounted_work == work
             } else {
                 add_usage(slot, usage, work);
-            }
+                work_reconciled
+            };
             slot.state = StageState::Unknown;
             slot.usage.last_error = Some(error);
             slot.usage_reconciled = false;
@@ -3819,76 +3850,128 @@ fn add_usage(slot: &mut StageRecord, usage: UsageDelta, work: StageWork) {
     slot.usage.context_bytes = slot.usage.context_bytes.saturating_add(work.context_bytes);
 }
 
-fn replace_submitted_usage(slot: &mut StageRecord, usage: UsageDelta) {
+fn replace_submitted_usage(slot: &mut StageRecord, usage: UsageDelta) -> UsageDelta {
     let previous = slot
         .submitted_accounting
         .map(|accounting| accounting.usage)
         .unwrap_or_default();
+    let accounted = UsageDelta {
+        turns: previous.turns.max(usage.turns),
+        tokens: previous.tokens.max(usage.tokens),
+    };
     slot.usage.turns = slot
         .usage
         .turns
         .saturating_sub(previous.turns)
-        .saturating_add(usage.turns);
+        .saturating_add(accounted.turns);
     slot.usage.tokens = slot
         .usage
         .tokens
         .saturating_sub(previous.tokens)
-        .saturating_add(usage.tokens);
+        .saturating_add(accounted.tokens);
     if let Some(accounting) = &mut slot.submitted_accounting {
-        accounting.usage = usage;
+        accounting.usage = accounted;
     }
+    accounted
 }
 
-fn replace_submitted_work(slot: &mut StageRecord, work: StageWork) {
+fn replace_submitted_work(slot: &mut StageRecord, work: StageWork) -> StageWork {
     let previous = slot
         .submitted_accounting
         .map(|accounting| accounting.work)
         .unwrap_or_default();
+    let accounted = StageWork {
+        investigations: previous.investigations.max(work.investigations),
+        context_bytes: previous.context_bytes.max(work.context_bytes),
+    };
     slot.usage.investigations = slot
         .usage
         .investigations
         .saturating_sub(previous.investigations)
-        .saturating_add(work.investigations);
+        .saturating_add(accounted.investigations);
     slot.usage.context_bytes = slot
         .usage
         .context_bytes
         .saturating_sub(previous.context_bytes)
-        .saturating_add(work.context_bytes);
+        .saturating_add(accounted.context_bytes);
     if let Some(accounting) = &mut slot.submitted_accounting {
-        accounting.work = work;
+        accounting.work = accounted;
     }
+    accounted
 }
 
-fn record_submitted_accounting(slot: &mut StageRecord, usage: UsageDelta, work: StageWork) {
-    replace_submitted_usage(slot, usage);
-    replace_submitted_work(slot, work);
-    slot.submitted_accounting = Some(SubmittedAccounting { usage, work });
+fn record_submitted_accounting(
+    slot: &mut StageRecord,
+    usage: UsageDelta,
+    work: StageWork,
+) -> (UsageDelta, StageWork) {
+    let accounted_usage = replace_submitted_usage(slot, usage);
+    let accounted_work = replace_submitted_work(slot, work);
+    slot.submitted_accounting = Some(SubmittedAccounting {
+        usage: accounted_usage,
+        work: accounted_work,
+    });
+    (accounted_usage, accounted_work)
 }
 
-fn settle_submitted_accounting(slot: &mut StageRecord, usage: UsageDelta, work: StageWork) {
-    replace_submitted_usage(slot, usage);
-    replace_submitted_work(slot, work);
+fn settle_submitted_accounting(
+    slot: &mut StageRecord,
+    usage: UsageDelta,
+    work: StageWork,
+) -> (UsageDelta, StageWork) {
+    let accounted_usage = replace_submitted_usage(slot, usage);
+    let accounted_work = replace_submitted_work(slot, work);
     slot.submitted_accounting = None;
+    (accounted_usage, accounted_work)
 }
 
-fn settle_submitted_usage(slot: &mut StageRecord, usage: UsageDelta) {
-    replace_submitted_usage(slot, usage);
+fn settle_submitted_usage(slot: &mut StageRecord, usage: UsageDelta) -> UsageDelta {
+    let accounted = replace_submitted_usage(slot, usage);
     slot.submitted_accounting = None;
+    accounted
 }
 
 fn record_explicit_usage(slot: &mut StageRecord, usage: UsageDelta) {
-    if slot.submitted_accounting.is_some() {
-        replace_submitted_usage(slot, usage);
-    } else {
-        add_usage(slot, usage, StageWork::default());
+    add_usage(slot, usage, StageWork::default());
+    if let Some(accounting) = &mut slot.submitted_accounting {
+        accounting.usage.turns = accounting.usage.turns.saturating_add(usage.turns);
+        accounting.usage.tokens = accounting.usage.tokens.saturating_add(usage.tokens);
     }
 }
 
 fn record_explicit_work(slot: &mut StageRecord, work: StageWork) {
-    if slot.submitted_accounting.is_some() {
-        replace_submitted_work(slot, work);
-    } else {
-        add_usage(slot, UsageDelta::default(), work);
+    add_usage(slot, UsageDelta::default(), work);
+    if let Some(accounting) = &mut slot.submitted_accounting {
+        accounting.work.investigations = accounting
+            .work
+            .investigations
+            .saturating_add(work.investigations);
+        accounting.work.context_bytes = accounting
+            .work
+            .context_bytes
+            .saturating_add(work.context_bytes);
+    }
+}
+
+fn lower_bound_note(usage: bool, work: bool) -> Option<String> {
+    let dimensions = match (usage, work) {
+        (true, true) => "token usage and observed work",
+        (true, false) => "token usage",
+        (false, true) => "observed work",
+        (false, false) => return None,
+    };
+    Some(format!(
+        "native {dimensions} decreased below an already observed lower bound; the prior cost was retained and completeness remains unknown"
+    ))
+}
+
+fn with_lower_bound_detail(detail: Option<String>, usage: bool, work: bool) -> Option<String> {
+    let note = lower_bound_note(usage, work)?;
+    match detail {
+        Some(detail) if detail.len() + note.len() + 2 <= MAX_TEXT_BYTES => {
+            Some(format!("{detail}; {note}"))
+        }
+        _ => Some(note),
     }
 }
 

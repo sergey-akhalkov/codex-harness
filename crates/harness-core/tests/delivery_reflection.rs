@@ -6,7 +6,8 @@ use harness_core::delivery_reflection::{
     ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, BindingStatus, DeliveryState,
     EventRefusal, Finding, JournalOwnership, JournalPolicy, PURPOSE_METADATA, PollReceipt, Purpose,
     RecoveryKind, ReflectionController, ReflectionLimits, RefusalCode, RetainedOwnerProcess, Stage,
-    StageOutcome, SuccessionRequest, TaskBindingStatus, UsageDelta, acceptance_metadata,
+    StageOutcome, StageWork, SubmittedAccounting, SuccessionRequest, TaskBindingStatus, UsageDelta,
+    acceptance_metadata,
 };
 use serde_json::{Value, json};
 use std::{
@@ -353,6 +354,42 @@ fn acceptance_for_task(poll: &PollReceipt, task: &str) -> String {
         .unwrap_or_else(|| panic!("no reflection job for task {task}: {poll:?}"))
         .acceptance_id
         .clone()
+}
+
+fn unknown_executor_with_partial_accounting(
+    board: &Board,
+    title: &str,
+) -> (ReflectionController, String) {
+    let controller = board.controller();
+    activate(&controller, JournalPolicy::EnableIfMissing);
+    let task = board.create_task(title, Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "partial-accounting"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    let acceptance_id = acceptance_for_task(&poll, &task);
+    controller
+        .begin_stage(&acceptance_id, Stage::Executor)
+        .unwrap();
+    controller
+        .mark_stage_unknown_with_work_and_usage(
+            &acceptance_id,
+            Stage::Executor,
+            "fixture submitted turn is unknown",
+            UsageDelta {
+                turns: 1,
+                tokens: 100,
+            },
+            StageWork {
+                investigations: 3,
+                context_bytes: 500,
+            },
+            false,
+        )
+        .unwrap();
+    (controller, acceptance_id)
 }
 
 fn refusal_codes(refusals: &[EventRefusal]) -> Vec<RefusalCode> {
@@ -1070,6 +1107,207 @@ fn durable_chain_unknown_capacity_and_cumulative_limits_survive_restart() {
     let record = restarted.record(&id_d).unwrap().unwrap();
     assert_eq!(record.usage_totals().tokens, 20);
     assert_eq!(record.executor.usage.attempts, 1);
+}
+
+#[test]
+fn explicit_missing_accounting_adds_to_the_submitted_cost() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    let (controller, acceptance_id) =
+        unknown_executor_with_partial_accounting(&board, "Explicit missing reflection accounting");
+
+    controller
+        .record_unknown_usage(
+            &acceptance_id,
+            Stage::Executor,
+            UsageDelta {
+                turns: 0,
+                tokens: 20,
+            },
+        )
+        .unwrap();
+    controller
+        .record_observed_work(
+            &acceptance_id,
+            Stage::Executor,
+            StageWork {
+                investigations: 1,
+                context_bytes: 30,
+            },
+        )
+        .unwrap();
+
+    let record = controller.record(&acceptance_id).unwrap().unwrap();
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 120);
+    assert_eq!(record.executor.usage.investigations, 4);
+    assert_eq!(record.executor.usage.context_bytes, 530);
+    assert!(record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+    let submitted = SubmittedAccounting {
+        usage: UsageDelta {
+            turns: 1,
+            tokens: 120,
+        },
+        work: StageWork {
+            investigations: 4,
+            context_bytes: 530,
+        },
+    };
+    assert_eq!(record.executor.submitted_accounting, Some(submitted));
+
+    // A later complete cumulative observation covers the explicit additions,
+    // so replacing the submitted contribution must not charge them again.
+    controller
+        .reopen_submitted_stage(&acceptance_id, Stage::Executor, submitted)
+        .unwrap();
+    controller
+        .retain_stage_with_work(
+            &acceptance_id,
+            Stage::Executor,
+            outcome(Finding::NoFinding, "completed after explicit additions"),
+            submitted.usage,
+            submitted.work,
+        )
+        .unwrap();
+    let completed = controller.record(&acceptance_id).unwrap().unwrap();
+    assert_eq!(completed.executor.usage.turns, 1);
+    assert_eq!(completed.executor.usage.tokens, 120);
+    assert_eq!(completed.executor.usage.investigations, 4);
+    assert_eq!(completed.executor.usage.context_bytes, 530);
+    assert!(completed.executor.usage_reconciled);
+    assert!(completed.executor.work_reconciled);
+    assert_eq!(completed.executor.submitted_accounting, None);
+}
+
+#[test]
+fn submitted_replacement_never_erases_known_cost_or_double_charges_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    let (controller, acceptance_id) =
+        unknown_executor_with_partial_accounting(&board, "Submitted replacement lower bound");
+    let submitted = SubmittedAccounting {
+        usage: UsageDelta {
+            turns: 1,
+            tokens: 100,
+        },
+        work: StageWork {
+            investigations: 3,
+            context_bytes: 500,
+        },
+    };
+
+    controller
+        .reopen_submitted_stage(&acceptance_id, Stage::Executor, submitted)
+        .unwrap();
+    controller
+        .mark_stage_unknown_with_work_and_usage(
+            &acceptance_id,
+            Stage::Executor,
+            "native retrieval became unavailable",
+            UsageDelta {
+                turns: 1,
+                tokens: 0,
+            },
+            StageWork::default(),
+            false,
+        )
+        .unwrap();
+    let unavailable = controller.record(&acceptance_id).unwrap().unwrap();
+    assert_eq!(
+        unavailable.executor.state,
+        harness_core::delivery_reflection::StageState::Unknown
+    );
+    assert_eq!(unavailable.executor.usage.turns, 1);
+    assert_eq!(unavailable.executor.usage.tokens, 100);
+    assert_eq!(unavailable.executor.usage.investigations, 3);
+    assert_eq!(unavailable.executor.usage.context_bytes, 500);
+    assert!(!unavailable.executor.usage_reconciled);
+    assert!(!unavailable.executor.work_reconciled);
+    assert_eq!(unavailable.executor.submitted_accounting, Some(submitted));
+
+    let decreased_accounting = SubmittedAccounting {
+        usage: UsageDelta {
+            turns: 1,
+            tokens: 80,
+        },
+        work: StageWork {
+            investigations: 2,
+            context_bytes: 400,
+        },
+    };
+    controller
+        .reopen_submitted_stage(&acceptance_id, Stage::Executor, decreased_accounting)
+        .unwrap();
+    let reopened_lower = controller.record(&acceptance_id).unwrap().unwrap();
+    assert_eq!(reopened_lower.executor.usage.tokens, 100);
+    assert_eq!(reopened_lower.executor.usage.investigations, 3);
+    assert_eq!(reopened_lower.executor.usage.context_bytes, 500);
+    assert_eq!(
+        reopened_lower.executor.submitted_accounting,
+        Some(submitted)
+    );
+    controller
+        .mark_stage_unknown_with_work_and_usage(
+            &acceptance_id,
+            Stage::Executor,
+            "native retrieval decreased",
+            UsageDelta {
+                turns: 1,
+                tokens: 80,
+            },
+            StageWork {
+                investigations: 2,
+                context_bytes: 400,
+            },
+            false,
+        )
+        .unwrap();
+    let decreasing = controller.record(&acceptance_id).unwrap().unwrap();
+    assert_eq!(decreasing.executor.usage.tokens, 100);
+    assert_eq!(decreasing.executor.usage.investigations, 3);
+    assert_eq!(decreasing.executor.usage.context_bytes, 500);
+    assert!(!decreasing.executor.usage_reconciled);
+    assert!(!decreasing.executor.work_reconciled);
+    assert_eq!(decreasing.executor.submitted_accounting, Some(submitted));
+    assert!(
+        decreasing
+            .executor
+            .usage
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("already observed lower bound"))
+    );
+
+    controller
+        .reopen_submitted_stage(&acceptance_id, Stage::Executor, submitted)
+        .unwrap();
+    controller
+        .retain_stage_with_work(
+            &acceptance_id,
+            Stage::Executor,
+            outcome(
+                Finding::NoFinding,
+                "completed after repeated reconciliation",
+            ),
+            UsageDelta {
+                turns: 1,
+                tokens: 120,
+            },
+            StageWork {
+                investigations: 4,
+                context_bytes: 600,
+            },
+        )
+        .unwrap();
+    let completed = controller.record(&acceptance_id).unwrap().unwrap();
+    assert_eq!(completed.executor.usage.turns, 1);
+    assert_eq!(completed.executor.usage.tokens, 120);
+    assert_eq!(completed.executor.usage.investigations, 4);
+    assert_eq!(completed.executor.usage.context_bytes, 600);
+    assert!(completed.executor.usage_reconciled);
+    assert!(completed.executor.work_reconciled);
+    assert_eq!(completed.executor.submitted_accounting, None);
 }
 
 #[test]

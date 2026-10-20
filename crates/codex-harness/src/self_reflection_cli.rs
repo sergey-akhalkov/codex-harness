@@ -806,27 +806,7 @@ pub(crate) fn stage_is_completed(state: &StageState) -> bool {
 /// with an estimate.
 pub(crate) fn stage_usage_delta(state: &StageState) -> UsageDelta {
     let tokens = if state.usage_known {
-        state
-            .usage
-            .get("total_tokens")
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| {
-                state
-                    .usage
-                    .get("input_tokens")
-                    .copied()
-                    .flatten()
-                    .unwrap_or(0)
-                    .saturating_add(
-                        state
-                            .usage
-                            .get("output_tokens")
-                            .copied()
-                            .flatten()
-                            .unwrap_or(0),
-                    )
-            })
+        observed_token_floor(state)
     } else {
         0
     };
@@ -834,6 +814,39 @@ pub(crate) fn stage_usage_delta(state: &StageState) -> UsageDelta {
         turns: u64::from(state.turn_id.is_some()),
         tokens,
     }
+}
+
+/// The numeric token contribution already observed for this exact turn,
+/// including a partial lower bound whose completeness is still unknown.
+pub(crate) fn stage_accounted_usage(state: &StageState) -> UsageDelta {
+    UsageDelta {
+        turns: u64::from(state.turn_id.is_some()),
+        tokens: observed_token_floor(state),
+    }
+}
+
+fn observed_token_floor(state: &StageState) -> u64 {
+    state
+        .usage
+        .get("total_tokens")
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| {
+            state
+                .usage
+                .get("input_tokens")
+                .copied()
+                .flatten()
+                .unwrap_or(0)
+                .saturating_add(
+                    state
+                        .usage
+                        .get("output_tokens")
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0),
+                )
+        })
 }
 
 pub(crate) fn stage_work(state: &StageState) -> StageWork {
@@ -3597,6 +3610,60 @@ fn discard_unmeasured_pre_turn_zero(state: &mut StageState) -> bool {
     true
 }
 
+fn merge_usage_lower_bound(
+    previous: &Usage,
+    observed: &Usage,
+    observed_known: bool,
+) -> (Usage, bool) {
+    let mut retained = previous.clone();
+    let mut complete = observed_known;
+    for (field, observed_value) in observed {
+        let previous_value = previous.get(field).copied().flatten();
+        match (previous_value, *observed_value) {
+            (Some(previous_value), Some(observed_value)) => {
+                if observed_value < previous_value {
+                    complete = false;
+                }
+                retained.insert(field.clone(), Some(observed_value.max(previous_value)));
+            }
+            (Some(previous_value), None) => {
+                complete = false;
+                retained.insert(field.clone(), Some(previous_value));
+            }
+            (None, observed_value) => {
+                retained.insert(field.clone(), observed_value);
+            }
+        }
+    }
+    if observed_known {
+        for (field, previous_value) in previous {
+            if previous_value.is_some() && !observed.contains_key(field) {
+                complete = false;
+            }
+        }
+    }
+    (retained, complete)
+}
+
+fn merge_work_lower_bound(
+    previous: StageWork,
+    observed: StageWork,
+    observed_known: bool,
+) -> (StageWork, bool) {
+    let retained = StageWork {
+        investigations: previous.investigations.max(observed.investigations),
+        context_bytes: previous.context_bytes.max(observed.context_bytes),
+    };
+    (retained, observed_known && retained == observed)
+}
+
+fn append_unknown_reason(reason: Option<String>, note: &str) -> Option<String> {
+    Some(match reason {
+        Some(reason) => format!("{reason}; {note}"),
+        None => note.to_owned(),
+    })
+}
+
 fn apply_usage(state: &mut StageState, usage: UsageRetention) {
     let source_context_bytes = state.source_context_bytes;
     let charged_source_context = if state.source_context_accounted {
@@ -3604,23 +3671,42 @@ fn apply_usage(state: &mut StageState, usage: UsageRetention) {
     } else {
         source_context_bytes
     };
-    state.usage = usage.usage;
-    state.usage_known = usage.known;
-    state.usage_unknown_reason = usage.unknown_reason;
+    let (retained_usage, usage_complete) =
+        merge_usage_lower_bound(&state.usage, &usage.usage, usage.known);
+    let mut usage_unknown_reason = usage.unknown_reason;
+    if usage.known && !usage_complete {
+        usage_unknown_reason = append_unknown_reason(
+            usage_unknown_reason,
+            "a later native measurement was lower than already observed usage; the higher observed cost was retained and completeness remains unknown",
+        );
+    }
+    state.usage = retained_usage;
+    state.usage_known = usage_complete;
+    state.usage_unknown_reason = usage_unknown_reason;
     state.matched_response_ids = usage.matched_response_ids;
     state.copied_source_turns = usage.copied_source_turns;
     state.cumulative_thread = usage.cumulative_thread;
     state.coverage = usage.coverage;
     state.rollout = usage.rollout;
-    state.work = StageWork {
+    let observed_work = StageWork {
         investigations: usage.work.investigations,
         context_bytes: usage
             .work
             .context_bytes
             .saturating_add(charged_source_context),
     };
-    state.work_known = usage.work_known;
-    state.work_unknown_reason = usage.work_unknown_reason;
+    let (retained_work, work_complete) =
+        merge_work_lower_bound(state.work, observed_work, usage.work_known);
+    let mut work_unknown_reason = usage.work_unknown_reason;
+    if usage.work_known && !work_complete {
+        work_unknown_reason = append_unknown_reason(
+            work_unknown_reason,
+            "a later native work measurement was lower than already observed work; the higher observed work was retained and completeness remains unknown",
+        );
+    }
+    state.work = retained_work;
+    state.work_known = work_complete;
+    state.work_unknown_reason = work_unknown_reason;
     state.context_basis = if source_context_bytes == 0 {
         usage.context_basis
     } else {
@@ -4683,5 +4769,107 @@ stream_max_retries = 0
         let mut later_usage = pre_fork_state(exact, None);
         later_usage.usage_known = true;
         assert!(pre_fork_rejection(&later_usage).is_err());
+    }
+
+    #[test]
+    fn applied_usage_keeps_partial_lower_bounds_until_a_complete_measurement() {
+        let mut state = pre_fork_state("retained submitted turn".to_owned(), None);
+        state.turn_id = Some("retained-turn-id".to_owned());
+        state.usage_known = true;
+        state.usage = zero_usage();
+        state.usage.insert("total_tokens".to_owned(), Some(100));
+        state.work = StageWork {
+            investigations: 3,
+            context_bytes: 500,
+        };
+        state.work_known = true;
+
+        let retention = |known: bool,
+                         total_tokens: Option<u64>,
+                         investigations: u64,
+                         context_bytes: u64,
+                         work_known: bool,
+                         reason: &str| {
+            let mut usage = if known {
+                zero_usage()
+            } else {
+                rollout_reader::unknown_usage()
+            };
+            if let Some(total_tokens) = total_tokens {
+                usage.insert("total_tokens".to_owned(), Some(total_tokens));
+            }
+            UsageRetention {
+                known,
+                usage,
+                unknown_reason: (!known).then(|| reason.to_owned()),
+                matched_response_ids: Vec::new(),
+                copied_source_turns: Vec::new(),
+                cumulative_thread: None,
+                coverage: None,
+                rollout: None,
+                work: StageWork {
+                    investigations,
+                    context_bytes,
+                },
+                work_known,
+                work_unknown_reason: (!work_known).then(|| reason.to_owned()),
+                context_basis: None,
+            }
+        };
+
+        apply_usage(
+            &mut state,
+            retention(false, None, 0, 0, false, "native retrieval unavailable"),
+        );
+        assert_eq!(observed_token_floor(&state), 100);
+        assert_eq!(state.work.investigations, 3);
+        assert_eq!(state.work.context_bytes, 500);
+        assert!(!state.usage_known);
+        assert!(!state.work_known);
+        assert_eq!(
+            stage_accounted_usage(&state),
+            UsageDelta {
+                turns: 1,
+                tokens: 100,
+            }
+        );
+        assert!(
+            state
+                .usage_unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unavailable"))
+        );
+
+        apply_usage(
+            &mut state,
+            retention(true, Some(80), 2, 400, true, "native retrieval decreased"),
+        );
+        assert_eq!(observed_token_floor(&state), 100);
+        assert_eq!(state.work.investigations, 3);
+        assert_eq!(state.work.context_bytes, 500);
+        assert!(!state.usage_known);
+        assert!(!state.work_known);
+        assert!(
+            state
+                .usage_unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("higher observed cost"))
+        );
+        assert!(
+            state
+                .work_unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("higher observed work"))
+        );
+
+        apply_usage(
+            &mut state,
+            retention(true, Some(120), 4, 600, true, "native retrieval completed"),
+        );
+        assert_eq!(observed_token_floor(&state), 120);
+        assert_eq!(state.work.investigations, 4);
+        assert_eq!(state.work.context_bytes, 600);
+        assert!(state.usage_known);
+        assert!(state.work_known);
     }
 }
