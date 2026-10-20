@@ -1476,7 +1476,9 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     };
     task_worktree::hold_startup_reservation(&codex_home, &repository, index, &owner)?;
     drop(admission);
-    let (remote, branch) = task_worktree::upstream(&path)?;
+    // Continuation retains its bound base; upstream names are optional
+    // metadata, as on an explicit offline-base dispatch.
+    let (remote, branch) = task_worktree::upstream(&path).unwrap_or_default();
     let binding = SlotBinding {
         index,
         path,
