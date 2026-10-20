@@ -22,9 +22,11 @@
 //! - `HARNESS_IMPROVEMENT_FIXTURE_SESSION`: the thread identity to serve;
 //! - `HARNESS_IMPROVEMENT_FIXTURE_CONTROL`: what the controlled agent does
 //!   once the host submitted its assignment: `complete` (default) finishes the
-//!   turn, `hold` keeps the turn open without ever completing it so the real
-//!   stop owner can interrupt and end this run, and `fail` ends this child
-//!   with a nonzero exit code before any completion. With
+//!   turn, `protocol-defect` records an item without a type before the normal
+//!   completion so the finite host must refuse it, `hold` keeps the turn open
+//!   without ever completing it so the real stop owner can interrupt and end
+//!   this run, and `fail` ends this child with a nonzero exit code before any
+//!   completion. With
 //!   `HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER` the child records the
 //!   assignment it observed before `hold` or `fail` takes effect;
 //! - `HARNESS_IMPROVEMENT_FIXTURE_MODEL` / `..._EFFORT`: override the model and
@@ -360,6 +362,18 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                         }})),
                     );
                     record_selected_tools();
+                    if control == "protocol-defect" {
+                        // A real protocol deviation that does not itself change
+                        // the lifecycle: the exact completion below must not
+                        // turn this finite assignment into success.
+                        server.push(json!({
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": session.clone(),
+                                "item": {"id": "fixture-protocol-defect"},
+                            },
+                        }));
+                    }
                     if turn.commits {
                         let _ = commit_solution();
                     }

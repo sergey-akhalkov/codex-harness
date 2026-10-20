@@ -3914,6 +3914,57 @@ fn a_finite_managed_lead_reports_a_failed_assigned_turn_and_retires_its_owned_st
 }
 
 #[test]
+fn a_finite_managed_lead_refuses_a_protocol_defect_despite_a_later_completion() {
+    let lead = ManagedLead::new();
+    let session =
+        ConsoleSession::spawn(ConsoleSpec::new(lead.command(true, "protocol-defect"))).unwrap();
+    let host_pid = session.identity().pid;
+    let process = lead.owned_endpoint(host_pid);
+    let finished = console_wait(session);
+    let transcript = finished.transcript.replace("\r\n", "\n");
+    assert_eq!(finished.outcome.exit_code, 1, "{transcript}");
+    assert!(
+        transcript.contains(&format!(
+            "the assigned turn {LEAD_FIXTURE_TURN} did not complete"
+        )),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains(
+            "the assigned turn's state could not be established: item/completed carried no item type"
+        ),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("lead partial result (not a success):")
+            && transcript.contains(LEAD_FINAL),
+        "the failed turn's retained output was lost or labeled as success: {transcript}"
+    );
+    assert!(
+        transcript.contains("lead cleanup: confirmed;"),
+        "successful cleanup was not reported separately: {transcript}"
+    );
+    assert!(
+        !transcript.contains("lead result:"),
+        "a protocol defect printed a successful result: {transcript}"
+    );
+    assert!(
+        !lead.lead_record_path().exists(),
+        "the published address survived the defective finite session: {transcript}"
+    );
+    assert!(
+        !lead.transient_path(host_pid).exists(),
+        "the working endpoint survived the defective finite session: {transcript}"
+    );
+    wait_gone(
+        process.pid,
+        process.creation_time,
+        &process.program,
+        "the finite host's app-server survived the defective assignment",
+    );
+}
+
+#[test]
 fn the_default_managed_lead_stays_addressable_after_a_turn_until_its_frontend_ends() {
     let lead = ManagedLead::new();
     let session = ConsoleSession::spawn(ConsoleSpec::new(lead.command(false, "complete"))).unwrap();

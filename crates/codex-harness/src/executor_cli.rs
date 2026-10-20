@@ -708,6 +708,14 @@ fn host_lead_session(
                     ));
                     break;
                 }
+                if let Some(defect) = conversation.defect() {
+                    // A later completion cannot erase a protocol deviation.
+                    // The stream no longer establishes what was observed.
+                    failure = Some(format!(
+                        "the assigned turn's state could not be established: {defect}"
+                    ));
+                    break;
+                }
                 if let Some(state) = conversation.turn_outcome(&assigned.turn_id) {
                     match state {
                         Lifecycle::Completed => {}
@@ -764,29 +772,29 @@ fn host_lead_session(
                     .to_owned(),
             );
         }
-        if failure.is_none() {
-            if let Some(assigned) = assigned.as_ref() {
-                // The exact submitted turn is the only result this finite
-                // assignment may report; a resumed thread's history is not.
-                match conversation.final_message_for_turn(&assigned.turn_id) {
-                    Ok(FinalMessage::Present(text)) => final_message = Some(text),
-                    Ok(FinalMessage::Empty) => {
-                        failure = Some(
-                            "the assigned turn completed but wrote an empty final assistant message; an empty completion is not success"
-                                .to_owned(),
-                        );
-                    }
-                    Ok(FinalMessage::Missing) => {
-                        failure = Some(
-                            "the assigned turn completed without a final assistant message; a missing result is not success"
-                                .to_owned(),
-                        );
-                    }
-                    Err(error) => {
-                        failure = Some(format!(
-                            "the final output of the assigned turn could not be read: {error}"
-                        ));
-                    }
+        if failure.is_none()
+            && let Some(assigned) = assigned.as_ref()
+        {
+            // The exact submitted turn is the only result this finite
+            // assignment may report; a resumed thread's history is not.
+            match conversation.final_message_for_turn(&assigned.turn_id) {
+                Ok(FinalMessage::Present(text)) => final_message = Some(text),
+                Ok(FinalMessage::Empty) => {
+                    failure = Some(
+                        "the assigned turn completed but wrote an empty final assistant message; an empty completion is not success"
+                            .to_owned(),
+                    );
+                }
+                Ok(FinalMessage::Missing) => {
+                    failure = Some(
+                        "the assigned turn completed without a final assistant message; a missing result is not success"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    failure = Some(format!(
+                        "the final output of the assigned turn could not be read: {error}"
+                    ));
                 }
             }
         } else if let Some(assigned) = assigned.as_ref()
@@ -797,16 +805,8 @@ fn host_lead_session(
             // from success, but never discard it.
             final_message = Some(text);
         }
-        let (frontend_code, notes) = finish_lead_session(
-            request,
-            &plan,
-            &thread,
-            job,
-            frontend,
-            &conversation,
-            launcher,
-            None,
-        );
+        let (frontend_code, notes) =
+            finish_lead_session(request, &plan, job, frontend, &conversation, launcher, None);
         for note in &notes {
             println!("lead session note: {note}");
         }
@@ -848,9 +848,16 @@ fn host_lead_session(
                 if let Some(text) = final_message {
                     println!("lead partial result (not a success):\n{text}");
                 }
-                println!(
-                    "lead session: the assigned turn {turn_id} did not complete: {cause}; the native frontend and app-server child were closed and this address was retired"
-                );
+                println!("lead session: the assigned turn {turn_id} did not complete: {cause}");
+                if notes.is_empty() {
+                    println!(
+                        "lead cleanup: confirmed; the native frontend and app-server child were closed and this address was retired"
+                    );
+                } else {
+                    println!(
+                        "lead cleanup: unconfirmed; the state named by the cleanup notes above may remain and no cleanup claim is made"
+                    );
+                }
                 Ok(1)
             }
         }
@@ -885,7 +892,6 @@ fn host_lead_session(
         let (frontend_code, notes) = finish_lead_session(
             request,
             &plan,
-            &thread,
             job,
             frontend,
             &conversation,
@@ -926,7 +932,6 @@ fn host_lead_session(
 fn finish_lead_session(
     request: &LeadStart,
     plan: &ControlPlan,
-    thread: &str,
     job: Job,
     frontend: OwnedFrontend,
     conversation: &Conversation,
@@ -945,7 +950,8 @@ fn finish_lead_session(
     }
     // The address of a session that ended must not outlive it: a later spawn in
     // this thread resolves it before inheriting, and `lead message` refuses it.
-    if let Err(error) = control::retire_lead_endpoint(&request.codex_home, thread) {
+    if let Err(error) = control::retire_lead_endpoint(&request.codex_home, conversation.thread_id())
+    {
         notes.push(error.to_string());
     }
     for path in [&plan.paths.endpoint, &plan.paths.token] {
