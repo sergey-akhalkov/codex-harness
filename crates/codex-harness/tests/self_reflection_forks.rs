@@ -32,7 +32,7 @@ mod visibility;
 
 use control_endpoint::{Answer, Bearer, Server, Wire};
 use harness_core::console::{ConsoleOutcome, ConsoleSession, ConsoleSpec};
-use harness_core::delivery_reflection::RetainedOwnerProcess;
+use harness_core::delivery_reflection::{DeliveryState, RetainedOwnerProcess, StageState};
 use harness_core::process::{Cancellation, CommandSpec, Deadline};
 use harness_core::role_context::{self, Role};
 use serde_json::{Value, json};
@@ -698,6 +698,218 @@ fn assert_usage(stage: &Value, total: u64, cumulative: u64, response: &str, copi
             .as_array()
             .is_some_and(|turns| turns.iter().any(|turn| turn == copied)),
         "{stage}"
+    );
+}
+
+#[test]
+fn acknowledged_pre_fork_rejection_recovers_one_explicit_attempt_and_preserves_evidence() {
+    let workspace = Workspace::new("pre-fork-recovery", LeadMode::Delivered);
+    let (controller, request, acceptance) = accepted::accepted(&workspace);
+    lifecycle::install_fixture(&workspace);
+    let enabled = lifecycle::success(lifecycle::command(&workspace, "enable", Some(LEAD_THREAD)));
+    let initial = controller.stored_state().unwrap().unwrap();
+    let binding = initial.records.get(&acceptance).unwrap().binding.clone();
+    assert_eq!(enabled["checkpoint"], initial.checkpoint);
+    assert_eq!(enabled["revision"], initial.binding.revision);
+
+    let run_process = |executor_outcome: &str| {
+        let mut spec = lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+        spec.env.insert(
+            "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME".into(),
+            Some(executor_outcome.into()),
+        );
+        wait_session(ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap())
+    };
+
+    let rejected = run_process("fork-rejected");
+    assert_ne!(rejected.outcome.exit_code, 0, "{}", rejected.transcript);
+    assert!(
+        rejected.transcript.contains("failed to load configuration"),
+        "{}",
+        rejected.transcript
+    );
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+    let executor_path = state_dir.join("executor-stage.json");
+    let executor = read_json(&executor_path);
+    let rejection = json!({
+        "code": -32600,
+        "message": "failed to load configuration: Model provider `deepseek` not found"
+    });
+    assert_eq!(executor["status"], "failed", "{executor}");
+    assert!(executor["fork"].is_null(), "{executor}");
+    assert!(executor["turnId"].is_null(), "{executor}");
+    assert_eq!(executor["forkRejection"], rejection, "{executor}");
+    assert!(
+        executor["error"].as_str().is_some_and(|error| {
+            error.starts_with("the native request thread/fork was rejected: ")
+                && error.ends_with(&rejection.to_string())
+        }),
+        "{executor}"
+    );
+    assert_eq!(executor["usageKnown"], false, "{executor}");
+    assert!(
+        executor["usage"]
+            .as_object()
+            .is_some_and(|usage| usage.values().all(Value::is_null)),
+        "{executor}"
+    );
+    assert_eq!(
+        executor["work"],
+        json!({"investigations": 0, "context_bytes": 0}),
+        "{executor}"
+    );
+    assert_eq!(executor["workKnown"], false, "{executor}");
+    assert_eq!(executor["sourceContextBytes"], 0, "{executor}");
+    assert!(executor["contextBasis"].is_null(), "{executor}");
+
+    let rejected_record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(rejected_record.binding, binding);
+    assert_eq!(rejected_record.executor.state, StageState::Unknown);
+    assert!(!rejected_record.executor.usage_reconciled);
+    assert!(!rejected_record.executor.work_reconciled);
+    assert_eq!(rejected_record.executor.usage.attempts, 1);
+    assert_eq!(rejected_record.executor.usage.turns, 0);
+    assert_eq!(rejected_record.executor.usage.tokens, 0);
+    assert_eq!(rejected_record.executor.usage.investigations, 0);
+    assert_eq!(rejected_record.executor.usage.context_bytes, 0);
+    assert!(
+        rejected_record
+            .executor
+            .usage
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("failed to load configuration")),
+        "{rejected_record:?}"
+    );
+    assert_eq!(rejected_record.lead.state, StageState::Pending);
+    assert_eq!(rejected_record.lead.usage.attempts, 0);
+    assert_eq!(rejected_record.delivery, DeliveryState::Pending);
+    assert!(controller.stored_state().unwrap().unwrap().checkpoint >= initial.checkpoint);
+
+    // Retain the pre-fix artifact shape: the old stage JSON carried the exact
+    // error text but no typed forkRejection field. Recovery must recognize that
+    // acknowledged configuration-load suffix, not a permissive null-ID shape.
+    let mut legacy = executor;
+    assert!(
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("forkRejection")
+            .is_some()
+    );
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+    fs::write(&executor_path, &legacy_bytes).unwrap();
+    let native_dir = state_dir.join("executor-self-reflection-native");
+    assert!(native_dir.is_dir());
+    assert!(native_dir.join("endpoint.token").is_file());
+    assert!(native_dir.join("app-server.log").is_file());
+    let reconcile_dir = state_dir
+        .join("executor-self-reflection-reconcile")
+        .is_dir();
+    let surface = state_dir.join("executor-stage.surface.json").is_file();
+    let surface_result = state_dir
+        .join("executor-self-reflection-surface-result.json")
+        .is_file();
+
+    let before_direct = request_counts(&workspace);
+    assert_eq!(before_direct, (1, 0, 0, 0), "{before_direct:?}");
+    let direct = wait_session(spawn_chain_in_board(
+        &workspace,
+        &request,
+        "complete",
+        "complete",
+        EXECUTOR_RESULT,
+        LEAD_RESULT,
+        Some(&workspace.checkout),
+    ));
+    assert_ne!(direct.outcome.exit_code, 0, "{}", direct.transcript);
+    assert!(
+        direct.transcript.contains("requires explicit recovery"),
+        "{}",
+        direct.transcript
+    );
+    assert_eq!(request_counts(&workspace), before_direct);
+    assert_eq!(fs::read(&executor_path).unwrap(), legacy_bytes);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        rejected_record
+    );
+
+    let recovered = run_process("complete");
+    assert_eq!(recovered.outcome.exit_code, 0, "{}", recovered.transcript);
+    let completed = read_json(&executor_path);
+    let lead = read_json(&state_dir.join("lead-stage.json"));
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_eq!(completed["profile"], PROFILE, "{completed}");
+    assert_eq!(completed["model"], MODEL, "{completed}");
+    assert_eq!(completed["provider"], PROVIDER, "{completed}");
+    assert_eq!(completed["effort"], EFFORT, "{completed}");
+    assert_eq!(
+        completed["fork"]["forkThread"], EXECUTOR_FORK,
+        "{completed}"
+    );
+    assert_eq!(completed["turnId"], EXECUTOR_FORK_TURN, "{completed}");
+    assert!(completed["forkRejection"].is_null(), "{completed}");
+    assert_eq!(lead["status"], "completed", "{lead}");
+    assert_eq!(lead["profile"], "default", "{lead}");
+    assert_eq!(lead["provider"], PROVIDER, "{lead}");
+    assert_eq!(lead["fork"]["forkThread"], LEAD_FORK, "{lead}");
+    assert_eq!(lead["turnId"], LEAD_FORK_TURN, "{lead}");
+
+    let final_record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(final_record.binding, binding);
+    assert_eq!(final_record.executor.state, StageState::Retained);
+    assert_eq!(final_record.lead.state, StageState::Retained);
+    assert_eq!(final_record.executor.usage.attempts, 2);
+    assert_eq!(final_record.executor.usage.turns, 1);
+    assert!(final_record.executor.usage.tokens > 0);
+    assert_eq!(final_record.lead.usage.attempts, 1);
+    assert_eq!(final_record.lead.usage.turns, 1);
+    assert_eq!(final_record.delivery, DeliveryState::Consumed);
+    let final_state = controller.stored_state().unwrap().unwrap();
+    assert_eq!(final_state.binding, initial.binding);
+    assert!(final_state.checkpoint >= initial.checkpoint);
+
+    let archived_stage = state_dir.join("executor-stage-attempt-1.json");
+    assert_eq!(fs::read(&archived_stage).unwrap(), legacy_bytes);
+    let archived_native = state_dir.join("executor-stage-attempt-1-native");
+    assert!(archived_native.is_dir());
+    assert!(archived_native.join("endpoint.token").is_file());
+    assert!(archived_native.join("app-server.log").is_file());
+    assert_eq!(
+        state_dir
+            .join("executor-stage-attempt-1-reconcile")
+            .is_dir(),
+        reconcile_dir
+    );
+    assert_eq!(
+        state_dir
+            .join("executor-stage-attempt-1.surface.json")
+            .is_file(),
+        surface
+    );
+    assert_eq!(
+        state_dir
+            .join("executor-stage-attempt-1-surface-result.json")
+            .is_file(),
+        surface_result
+    );
+    assert_eq!(
+        request_counts(&workspace),
+        (2, 1, 1, 1),
+        "recovery must start exactly one new executor fork/turn and then the ordinary lead stage"
+    );
+    assert_eq!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/fork").len(),
+        2
+    );
+    assert_eq!(
+        fixture_requests(&workspace, "executor-self-reflection", "turn/start").len(),
+        1
     );
 }
 

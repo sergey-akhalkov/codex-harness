@@ -781,6 +781,8 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
                 record.executor.state == RecordedStageState::InFlight
                     || record.lead.state == RecordedStageState::InFlight
                     || retained_delivery(record)
+                    || (!quiet
+                        && accepted::retained_pre_fork_rejection(controller, record).is_some())
             })
         })
     };
@@ -792,7 +794,14 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
     };
     let request = request(options, controller, &record, &lead)?;
     let delivery_path = request.state_dir.join("lead-delivery.json");
-    let exit = accepted::execute(request, &options.project)?;
+    // Only the explicit same-lead process may reconcile an acknowledged
+    // pre-fork rejection. The automatic journal consumer keeps the existing
+    // refusal so a repeated failing input cannot silently loop.
+    let exit = if quiet {
+        accepted::execute(request, &options.project)?
+    } else {
+        accepted::execute_with_pre_fork_recovery(request, &options.project)?
+    };
     if quiet && exit != 0 {
         let delivery: DeliveryState = read_json(&delivery_path, MAX_REQUEST_BYTES)?;
         if !matches!(delivery.state.as_str(), "queued" | "pending") {
