@@ -21,6 +21,8 @@ mod installed;
 mod lead_recovery;
 #[path = "self_reflection_forks/lifecycle.rs"]
 mod lifecycle;
+#[path = "self_reflection_forks/profile_provider.rs"]
+mod profile_provider;
 #[path = "fixtures/reflection_install.rs"]
 mod reflection_install;
 #[path = "self_reflection_forks/succession.rs"]
