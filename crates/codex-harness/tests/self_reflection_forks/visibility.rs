@@ -53,8 +53,7 @@ fn process_running(pid: u32) -> bool {
 /// console, and that runner owns the native frontend. The frontend is
 /// therefore a grandchild of the manager, not its direct child: ownership is
 /// the manager's process tree, not one parent link.
-fn reflection_frontends(root: u32) -> Vec<u32> {
-    let expected = frontend_double();
+fn reflection_processes(root: u32, expected: &Path) -> Vec<u32> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot.is_null() || snapshot as isize == -1 {
         return Vec::new();
@@ -86,6 +85,55 @@ fn reflection_frontends(root: u32) -> Vec<u32> {
         }
     }
     found
+}
+
+fn reflection_frontends(root: u32) -> Vec<u32> {
+    reflection_processes(root, &frontend_double())
+}
+
+fn reflection_backends(workspace: &Workspace, root: u32) -> Vec<u32> {
+    reflection_processes(root, &workspace.home.join("harness/bin/codex.exe"))
+}
+
+/// Ends the app-server double serving an in-flight reflection turn. The
+/// manager, its visible frontend and the retained native identities stay
+/// owned; the host observes a control-transport failure instead of waiting for
+/// the production 300-second bound.
+pub(super) fn terminate_reflection_backend(workspace: &Workspace, root: u32) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            process_running(root),
+            "the owning manager pid {root} exited before its app-server double was established"
+        );
+        let backends = reflection_backends(workspace, root);
+        if let [pid] = backends.as_slice() {
+            println!("reflection app-server pid {pid} is live under owning manager pid {root}");
+            terminate_pid(*pid);
+            wait_until(
+                || !process_running(*pid),
+                Duration::from_secs(5),
+                "the test-owned reflection app-server did not exit",
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the owning manager pid {root} did not expose exactly one reflection app-server within 20s: {backends:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Waits for the manager root to end after it persisted the unknown submitted
+/// turn. The caller already owns the console session whose job reaps any
+/// remaining descendants.
+pub(super) fn wait_for_owned_manager_exit(root: u32) {
+    wait_until(
+        || !process_running(root),
+        Duration::from_secs(20),
+        "the test-owned reflection manager did not exit",
+    );
 }
 
 fn wait_for_reflection_frontend(root: u32, previous: Option<u32>) -> u32 {
@@ -128,7 +176,7 @@ fn wait_for_submitted_stage(workspace: &Workspace) -> Value {
     wait_for_submitted_stage_in(&workspace.state)
 }
 
-fn wait_for_stage_status_in(state_dir: &Path, status: &str, description: &str) -> Value {
+pub(super) fn wait_for_stage_status_in(state_dir: &Path, status: &str, description: &str) -> Value {
     let path = state_dir.join("executor-stage.json");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -143,7 +191,7 @@ fn wait_for_stage_status_in(state_dir: &Path, status: &str, description: &str) -
     }
 }
 
-fn wait_for_submitted_stage_in(state_dir: &Path) -> Value {
+pub(super) fn wait_for_submitted_stage_in(state_dir: &Path) -> Value {
     wait_for_stage_status_in(
         state_dir,
         "turn-submitted",

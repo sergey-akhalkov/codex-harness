@@ -2375,6 +2375,7 @@ fn run_stage(
         }
     };
     state.turn_id = Some(turn.turn_id.clone());
+    discard_unmeasured_pre_turn_zero(&mut state);
     state.status = StageStatus::TurnSubmitted;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
@@ -2434,6 +2435,7 @@ fn drive_submitted_stage(
                 );
             }
             Ok(Lifecycle::Failed) => {
+                retain_submitted_usage(chain, fork_thread, turn, &mut state);
                 state.status = StageStatus::Failed;
                 state.error = conversation
                     .failure()
@@ -2442,11 +2444,13 @@ fn drive_submitted_stage(
                 break finish(state_path, state);
             }
             Ok(Lifecycle::Interrupted) => {
+                retain_submitted_usage(chain, fork_thread, turn, &mut state);
                 state.status = StageStatus::Interrupted;
                 state.error = Some("the native turn ended interrupted".to_owned());
                 break finish(state_path, state);
             }
             Ok(Lifecycle::Defect) => {
+                retain_submitted_usage(chain, fork_thread, turn, &mut state);
                 state.status = StageStatus::Unknown;
                 state.error = conversation.defect().map(str::to_owned).or_else(|| {
                     Some("the native conversation reported a protocol defect".to_owned())
@@ -2454,6 +2458,7 @@ fn drive_submitted_stage(
                 break finish(state_path, state);
             }
             Ok(other) => {
+                retain_submitted_usage(chain, fork_thread, turn, &mut state);
                 state.status = StageStatus::Unknown;
                 state.error = Some(format!(
                     "the native turn ended in non-terminal state {}; its outcome is unknown",
@@ -2493,6 +2498,7 @@ fn drive_submitted_stage(
                 break finish(state_path, state);
             }
             Err(DriveFailure::Timeout(bound)) => {
+                retain_submitted_usage(chain, fork_thread, turn, &mut state);
                 state.status = StageStatus::Unknown;
                 state.error = Some(format!(
                     "no terminal native state was established within {bound:?}; the turn may still be running and is not replayed"
@@ -2500,6 +2506,7 @@ fn drive_submitted_stage(
                 break finish(state_path, state);
             }
             Err(DriveFailure::Error(error)) => {
+                retain_submitted_usage(chain, fork_thread, turn, &mut state);
                 state.status = StageStatus::Unknown;
                 state.error = Some(format!(
                     "observing the native turn failed, so its outcome is unknown: {error}"
@@ -2668,6 +2675,7 @@ fn recover_pre_submission(
         }
     };
     state.turn_id = Some(turn.turn_id.clone());
+    discard_unmeasured_pre_turn_zero(&mut state);
     state.status = StageStatus::TurnSubmitted;
     state.updated_ms = now_ms();
     persist(state_path, &state)?;
@@ -2853,6 +2861,7 @@ fn reconcile_submitted(
         .turn_id
         .clone()
         .ok_or_else(|| invalid("a submitted stage carries no turn identity to reconcile"))?;
+    discard_unmeasured_pre_turn_zero(&mut state);
     let retain_unrestored = |mut state: StageState, cause: String| -> io::Result<StageState> {
         state.error = Some(format!(
             "native visibility restoration for retained fork {fork_thread} turn {turn} did not complete: {cause}. No new turn was started; the submitted turn remains recoverable"
@@ -2970,6 +2979,7 @@ fn reconcile_submitted(
                 );
             }
             "failed" | "interrupted" => {
+                retain_submitted_usage(chain, &fork_thread, &turn, &mut state);
                 state.status = if status == "failed" {
                     StageStatus::Failed
                 } else {
@@ -2984,6 +2994,7 @@ fn reconcile_submitted(
             _ => {}
         }
         if Instant::now() >= until {
+            retain_submitted_usage(chain, &fork_thread, &turn, &mut state);
             state.status = StageStatus::Unknown;
             state.error = Some(format!(
                 "reconciliation did not establish a terminal state for retained turn {turn}; it is not replayed"
@@ -3465,6 +3476,7 @@ fn retain_completed(
         .clone()
         .ok_or_else(|| invalid("a completed reflection stage carries no turn identity"))?;
     let thread = conversation.read_thread_record(fork_thread)?;
+    retain_submitted_usage(chain, fork_thread, &turn, &mut state);
     match assistant_text(&thread, &turn) {
         RetainedResult::Present(text) => {
             bound_result(&text)?;
@@ -3488,8 +3500,6 @@ fn retain_completed(
             return finish(state_path, state);
         }
     }
-    let usage = retain_usage(&chain.codex_home, fork_thread, &turn);
-    apply_usage(&mut state, usage);
     let mut evidence = vec![format!(
         "exact new-turn rollout: {}",
         state
@@ -3533,6 +3543,58 @@ fn retain_completed(
         state.cumulative_thread.is_some()
     );
     Ok(state)
+}
+
+/// Recharges the exact submitted turn's native rollout accounting. A dead
+/// process or a stale pre-turn zero never proves zero model cost.
+fn retain_submitted_usage(
+    chain: &ChainState,
+    fork_thread: &str,
+    turn: &str,
+    state: &mut StageState,
+) {
+    let usage = retain_usage(&chain.codex_home, fork_thread, turn);
+    apply_usage(state, usage);
+}
+
+/// Clears only a known zero recorded before any model response. Measured
+/// nonzero usage and matched response evidence are never discarded.
+fn discard_unmeasured_pre_turn_zero(state: &mut StageState) -> bool {
+    if !state.usage_known || !state.matched_response_ids.is_empty() {
+        return false;
+    }
+    let total = state
+        .usage
+        .get("total_tokens")
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| {
+            state
+                .usage
+                .get("input_tokens")
+                .copied()
+                .flatten()
+                .unwrap_or(0)
+                .saturating_add(
+                    state
+                        .usage
+                        .get("output_tokens")
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0),
+                )
+        });
+    if total != 0 {
+        return false;
+    }
+    state.usage = rollout_reader::unknown_usage();
+    state.usage_known = false;
+    state.usage_unknown_reason = Some(
+        "the retained pre-turn zero is not model cost; the exact submitted turn's native token usage has not been measured"
+            .to_owned(),
+    );
+    state.matched_response_ids.clear();
+    true
 }
 
 fn apply_usage(state: &mut StageState, usage: UsageRetention) {

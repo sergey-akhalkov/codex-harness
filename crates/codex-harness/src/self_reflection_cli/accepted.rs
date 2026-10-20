@@ -5,7 +5,7 @@ use super::*;
 use harness_core::delivery_reflection::{
     BudgetLimit, DeliveryState as RecordedDeliveryState, LifecycleStatus, ReflectionController,
     ReflectionRecord, Stage, StageAdmission, StageRecord, StageState as RecordedStageState,
-    UsageDelta,
+    StageWork, SubmittedAccounting, UsageDelta,
 };
 
 pub(super) fn execute(request: Request, board: &Path) -> io::Result<i32> {
@@ -301,6 +301,102 @@ pub(super) fn retained_pre_fork_rejection(
     })
 }
 
+/// Selects an unknown stage whose retained native artifact still names the
+/// exact submitted fork and turn. Only the explicit process selects this
+/// shape; reopening it observes that turn and never creates a fork or turn.
+pub(super) fn retained_submitted_reconciliation(
+    controller: &ReflectionController,
+    record: &ReflectionRecord,
+) -> Option<Stage> {
+    if record.delivery == RecordedDeliveryState::Consumed {
+        return None;
+    }
+    let state_dir = controller
+        .state_file()
+        .ok()?
+        .with_extension("")
+        .join(&record.acceptance_id);
+    [Stage::Executor, Stage::Lead].into_iter().find(|stage| {
+        let slot = recorded_stage(record, *stage);
+        if slot.state != RecordedStageState::Unknown
+            || slot.outcome.is_some()
+            || slot.pause.is_some()
+        {
+            return false;
+        }
+        fs::read(stage_state_path(&state_dir, *stage))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StageState>(&bytes).ok())
+            .is_some_and(|native| {
+                native.status == StageStatus::Unknown
+                    && native.turn_id.is_some()
+                    && native.fork.is_some()
+            })
+    })
+}
+
+/// Reopens the accepted unknown stage only when its native artifact still
+/// names an exact submitted fork and turn under the current accepted
+/// identities. The native provisional accounting must already be included in
+/// the ledger; a mismatch is refused as ambiguous and no model work starts.
+fn reopen_submitted_unknown(
+    controller: &ReflectionController,
+    chain: &ChainState,
+    stage: Stage,
+    state_path: &Path,
+) -> io::Result<bool> {
+    let (declaration, source, role) = match stage {
+        Stage::Executor => (
+            &chain.executor_stage,
+            &chain.executor_source,
+            Role::ExecutorSelfReflection,
+        ),
+        Stage::Lead => (
+            &chain.lead_stage,
+            &chain.lead_source,
+            Role::LeadSelfReflection,
+        ),
+    };
+    let prepared = prepare_stage(chain, declaration, role)?;
+    let mut native: StageState = read_json(state_path, MAX_REQUEST_BYTES)?;
+    validate_stage(&native, chain, declaration, source, &prepared)?;
+    if native.status != StageStatus::Unknown || native.turn_id.is_none() || native.fork.is_none() {
+        return Ok(false);
+    }
+    if !stage_work_known(&native) {
+        return Err(invalid(format!(
+            "the retained {} native submitted turn has no measured observed work; its ledger cannot be reopened without inventing or dropping work",
+            stage.as_str()
+        )));
+    }
+    let fork_thread = native
+        .fork
+        .as_ref()
+        .map(|fork| fork.fork_thread.clone())
+        .unwrap_or_default();
+    let turn = native.turn_id.clone().unwrap_or_default();
+    controller.reopen_submitted_stage(
+        &chain.acceptance,
+        stage,
+        SubmittedAccounting {
+            usage: stage_usage_delta(&native),
+            work: stage_work(&native),
+        },
+    )?;
+    discard_unmeasured_pre_turn_zero(&mut native);
+    let prior = native
+        .error
+        .take()
+        .unwrap_or_else(|| "no prior detail".to_owned());
+    native.status = StageStatus::TurnSubmitted;
+    native.error = Some(format!(
+        "explicit reconciliation reopened the exact submitted fork {fork_thread} turn {turn} after a non-terminal observation; no new fork or turn was started. Prior detail: {prior}"
+    ));
+    native.updated_ms = now_ms();
+    persist(state_path, &native)?;
+    Ok(true)
+}
+
 /// Reconciles exactly one acknowledged native `thread/fork` rejection before
 /// any fork or turn existed. The native artifact is checked against the
 /// retained chain identity and must contain no result, fork, turn, usage or
@@ -473,15 +569,29 @@ fn run_recorded_stage(
                     state_path.display()
                 )));
             }
-            recover_pre_fork_rejection(controller, chain, stage, &state_path)?;
-            record = controller.record(&chain.acceptance)?.ok_or_else(|| {
-                invalid("the accepted closure record disappeared during pre-fork recovery")
-            })?;
-            if recorded_stage(&record, stage).state != RecordedStageState::Pending {
-                return Err(invalid(format!(
-                    "{} reflection did not return to pending after reconciling the acknowledged pre-fork rejection; no new fork was started",
-                    stage.as_str()
-                )));
+            if reopen_submitted_unknown(controller, chain, stage, &state_path)? {
+                record = controller.record(&chain.acceptance)?.ok_or_else(|| {
+                    invalid(
+                        "the accepted closure record disappeared during submitted-turn recovery",
+                    )
+                })?;
+                if recorded_stage(&record, stage).state != RecordedStageState::InFlight {
+                    return Err(invalid(format!(
+                        "{} reflection did not return to in flight after reopening its exact submitted turn; no new fork or turn was started",
+                        stage.as_str()
+                    )));
+                }
+            } else {
+                recover_pre_fork_rejection(controller, chain, stage, &state_path)?;
+                record = controller.record(&chain.acceptance)?.ok_or_else(|| {
+                    invalid("the accepted closure record disappeared during pre-fork recovery")
+                })?;
+                if recorded_stage(&record, stage).state != RecordedStageState::Pending {
+                    return Err(invalid(format!(
+                        "{} reflection did not return to pending after reconciling the acknowledged pre-fork rejection; no new fork was started",
+                        stage.as_str()
+                    )));
+                }
             }
         }
         other => {

@@ -782,7 +782,9 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
                     || record.lead.state == RecordedStageState::InFlight
                     || retained_delivery(record)
                     || (!quiet
-                        && accepted::retained_pre_fork_rejection(controller, record).is_some())
+                        && (accepted::retained_pre_fork_rejection(controller, record).is_some()
+                            || accepted::retained_submitted_reconciliation(controller, record)
+                                .is_some()))
             })
         })
     };

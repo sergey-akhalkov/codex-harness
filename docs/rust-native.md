@@ -440,6 +440,16 @@ result. The owned consumer observes queued delivery without repeating either
 reflection. An indeterminate or failed delivery stops automatic processing and
 keeps the existing receipt for explicit reconciliation after its cause is resolved.
 
+`process` may reopen one accepted stage left `Unknown` only when its native
+artifact still names an exact submitted fork and turn and the recorded
+task/run/source/role/model identities still match. It resumes that fork to
+observe the existing turn, issues no new fork or `turn/start`, and re-reads the
+exact turn's rollout accounting. A pre-turn known zero in an older artifact is
+not model cost: measured nonzero usage replaces it, while unavailable usage
+stays explicitly unknown. Reconciliation preserves attempts, observed work,
+cumulative costs and finite limits, so exhausted limits continue to block
+dependent work.
+
 Recovery is explicit and model-free. After inspecting the reported gap,
 `recover --resolution resume-retained --project CHECKOUT` continues from a
 recorded retained journal floor. For a reconciled source or unjournaled gap,

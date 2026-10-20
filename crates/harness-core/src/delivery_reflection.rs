@@ -745,6 +745,18 @@ pub struct StageRecord {
     pub work_reconciled: bool,
     #[serde(default)]
     pub pause: Option<BudgetPause>,
+    /// Accounting already included in `usage` for the currently submitted
+    /// native turn. Reopening an exact submitted reconciliation replaces this
+    /// delta with the final measured one instead of charging the turn twice.
+    #[serde(default)]
+    pub submitted_accounting: Option<SubmittedAccounting>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubmittedAccounting {
+    pub usage: UsageDelta,
+    pub work: StageWork,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2506,6 +2518,7 @@ impl ReflectionController {
         slot.state = StageState::InFlight;
         slot.usage_reconciled = false;
         slot.work_reconciled = false;
+        slot.submitted_accounting = None;
         let source_sessions = match stage {
             Stage::Executor => record.binding.executor_sessions.clone(),
             Stage::Lead => vec![state.binding.lead_session.clone()],
@@ -2525,6 +2538,85 @@ impl ReflectionController {
         };
         self.write_state_at(&path, &state)?;
         Ok(start)
+    }
+
+    /// Reopens the exact submitted attempt already represented by an unknown
+    /// stage, preserving every recorded cost and the attempt counter. The
+    /// caller must have proved from native evidence that this is the same
+    /// retained fork/turn and that `accounted` was already included in the
+    /// stage totals. A later retention replaces that provisional delta instead
+    /// of charging the submitted turn or its work a second time.
+    pub fn reopen_submitted_stage(
+        &self,
+        acceptance_id: &str,
+        stage: Stage,
+        accounted: SubmittedAccounting,
+    ) -> io::Result<StageReceipt> {
+        let path = self.state_path(&self.current_source()?);
+        let _lock = self.lock(&path)?;
+        let mut state = self.active_state(&path)?;
+        let record_tokens = {
+            let record = state
+                .records
+                .get_mut(acceptance_id)
+                .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
+            let slot = stage_slot(record, stage);
+            if slot.state != StageState::Unknown {
+                return Err(conflict(&format!(
+                    "{} reflection is {:?}, not the unknown submitted state being reconciled",
+                    stage.as_str(),
+                    slot.state
+                )));
+            }
+            if slot.outcome.is_some() || slot.pause.is_some() {
+                return Err(conflict(&format!(
+                    "{} reflection is unknown but still carries a retained outcome or budget pause; refusing to reopen an ambiguous attempt",
+                    stage.as_str()
+                )));
+            }
+            if accounted.usage.turns != 1 {
+                return Err(conflict(&format!(
+                    "the {} native submitted-turn accounting names {} turns, not exactly the one turn being reconciled",
+                    stage.as_str(),
+                    accounted.usage.turns
+                )));
+            }
+            match slot.submitted_accounting {
+                Some(previous) if previous != accounted => {
+                    return Err(conflict(&format!(
+                        "the {} native submitted-turn accounting differs from the accepted ledger's provisional accounting; refusing to replace an ambiguous delta",
+                        stage.as_str()
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    if accounted.usage.turns > slot.usage.turns
+                        || accounted.usage.tokens > slot.usage.tokens
+                        || accounted.work.investigations > slot.usage.investigations
+                        || accounted.work.context_bytes > slot.usage.context_bytes
+                    {
+                        return Err(conflict(&format!(
+                            "the submitted {} native accounting is not included in the accepted stage totals; refusing to infer or reset prior costs",
+                            stage.as_str()
+                        )));
+                    }
+                    slot.submitted_accounting = Some(accounted);
+                }
+            }
+            slot.state = StageState::InFlight;
+            slot.outcome = None;
+            slot.pause = None;
+            slot.usage_reconciled = false;
+            slot.work_reconciled = false;
+            slot.usage.last_error = None;
+            record.usage_totals().tokens
+        };
+        let receipt = {
+            let record = &state.records[acceptance_id];
+            stage_receipt(record, stage, false, record_tokens)
+        };
+        self.write_state_at(&path, &state)?;
+        Ok(receipt)
     }
 
     pub fn retain_stage(
@@ -2598,7 +2690,7 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            add_usage(slot, usage, work);
+            settle_submitted_accounting(slot, usage, work);
             slot.state = StageState::Retained;
             slot.usage.last_error = detail;
             slot.usage_reconciled = usage_reconciled;
@@ -2690,7 +2782,7 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            add_usage(slot, usage, StageWork::default());
+            settle_submitted_usage(slot, usage);
             slot.state = StageState::Blocked;
             slot.usage.last_error = Some(error);
             slot.usage_reconciled = true;
@@ -2756,7 +2848,7 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            add_usage(slot, usage, work);
+            settle_submitted_accounting(slot, usage, work);
             slot.state = StageState::Blocked;
             slot.usage.last_error = Some(detail);
             slot.usage_reconciled = usage_reconciled;
@@ -2830,7 +2922,11 @@ impl ReflectionController {
                     slot.state
                 )));
             }
-            add_usage(slot, usage, work);
+            if usage.turns > 0 {
+                record_submitted_accounting(slot, usage, work);
+            } else {
+                add_usage(slot, usage, work);
+            }
             slot.state = StageState::Unknown;
             slot.usage.last_error = Some(error);
             slot.usage_reconciled = false;
@@ -2873,7 +2969,7 @@ impl ReflectionController {
                     slot.usage_reconciled
                 )));
             }
-            add_usage(slot, usage, StageWork::default());
+            record_explicit_usage(slot, usage);
             slot.usage_reconciled = true;
             if slot.work_reconciled {
                 slot.usage.last_error = None;
@@ -2920,7 +3016,7 @@ impl ReflectionController {
                     slot.work_reconciled
                 )));
             }
-            add_usage(slot, UsageDelta::default(), work);
+            record_explicit_work(slot, work);
             slot.work_reconciled = true;
             if slot.usage_reconciled {
                 slot.usage.last_error = None;
@@ -3166,6 +3262,7 @@ impl ReflectionController {
             slot.state = StageState::Pending;
             slot.outcome = None;
             slot.pause = None;
+            slot.submitted_accounting = None;
             slot.usage.last_error = None;
             record.usage_totals().tokens
         };
@@ -3720,6 +3817,79 @@ fn add_usage(slot: &mut StageRecord, usage: UsageDelta, work: StageWork) {
         .investigations
         .saturating_add(work.investigations);
     slot.usage.context_bytes = slot.usage.context_bytes.saturating_add(work.context_bytes);
+}
+
+fn replace_submitted_usage(slot: &mut StageRecord, usage: UsageDelta) {
+    let previous = slot
+        .submitted_accounting
+        .map(|accounting| accounting.usage)
+        .unwrap_or_default();
+    slot.usage.turns = slot
+        .usage
+        .turns
+        .saturating_sub(previous.turns)
+        .saturating_add(usage.turns);
+    slot.usage.tokens = slot
+        .usage
+        .tokens
+        .saturating_sub(previous.tokens)
+        .saturating_add(usage.tokens);
+    if let Some(accounting) = &mut slot.submitted_accounting {
+        accounting.usage = usage;
+    }
+}
+
+fn replace_submitted_work(slot: &mut StageRecord, work: StageWork) {
+    let previous = slot
+        .submitted_accounting
+        .map(|accounting| accounting.work)
+        .unwrap_or_default();
+    slot.usage.investigations = slot
+        .usage
+        .investigations
+        .saturating_sub(previous.investigations)
+        .saturating_add(work.investigations);
+    slot.usage.context_bytes = slot
+        .usage
+        .context_bytes
+        .saturating_sub(previous.context_bytes)
+        .saturating_add(work.context_bytes);
+    if let Some(accounting) = &mut slot.submitted_accounting {
+        accounting.work = work;
+    }
+}
+
+fn record_submitted_accounting(slot: &mut StageRecord, usage: UsageDelta, work: StageWork) {
+    replace_submitted_usage(slot, usage);
+    replace_submitted_work(slot, work);
+    slot.submitted_accounting = Some(SubmittedAccounting { usage, work });
+}
+
+fn settle_submitted_accounting(slot: &mut StageRecord, usage: UsageDelta, work: StageWork) {
+    replace_submitted_usage(slot, usage);
+    replace_submitted_work(slot, work);
+    slot.submitted_accounting = None;
+}
+
+fn settle_submitted_usage(slot: &mut StageRecord, usage: UsageDelta) {
+    replace_submitted_usage(slot, usage);
+    slot.submitted_accounting = None;
+}
+
+fn record_explicit_usage(slot: &mut StageRecord, usage: UsageDelta) {
+    if slot.submitted_accounting.is_some() {
+        replace_submitted_usage(slot, usage);
+    } else {
+        add_usage(slot, usage, StageWork::default());
+    }
+}
+
+fn record_explicit_work(slot: &mut StageRecord, work: StageWork) {
+    if slot.submitted_accounting.is_some() {
+        replace_submitted_work(slot, work);
+    } else {
+        add_usage(slot, UsageDelta::default(), work);
+    }
 }
 
 fn normalize_outcome(outcome: &mut StageOutcome) -> io::Result<()> {

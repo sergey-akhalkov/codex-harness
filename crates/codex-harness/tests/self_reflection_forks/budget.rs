@@ -221,6 +221,355 @@ fn status_json(workspace: &Workspace) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+/// A native fork rollout that names the exact retained fork. With no totals it
+/// proves the observed work but leaves the submitted turn's token usage
+/// unavailable; with totals it supplies the exact measured response deltas.
+fn write_submitted_rollout(workspace: &Workspace, totals: &[u64]) -> PathBuf {
+    let sessions = workspace.home.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join("executor-submitted-recovery.jsonl");
+    let mut lines = vec![json!({
+        "type": "session_meta",
+        "payload": {"id": EXECUTOR_FORK},
+    })];
+    let mut cumulative_input = 0u64;
+    let mut cumulative_output = 0u64;
+    for (index, total) in totals.iter().enumerate() {
+        let output = 1_000u64.min(*total);
+        let input = total - output;
+        cumulative_input += input;
+        cumulative_output += output;
+        lines.push(json!({
+            "type": "token_usage_record",
+            "payload": {
+                "turn_id": EXECUTOR_FORK_TURN,
+                "response_id": format!("executor-submitted-response-{index}"),
+                "usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": 0,
+                    "output_tokens": output,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": total,
+                },
+                "turn_token_usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": 0,
+                    "output_tokens": output,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": total,
+                },
+                "thread_token_usage": {
+                    "input_tokens": cumulative_input,
+                    "cached_input_tokens": 0,
+                    "output_tokens": cumulative_output,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": cumulative_input + cumulative_output,
+                },
+            },
+        }));
+    }
+    let text = lines
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{text}\n")).unwrap();
+    path
+}
+
+fn finish_owned_process(session: ConsoleSession) {
+    let pid = session.identity().pid;
+    visibility::wait_for_owned_manager_exit(pid);
+    drop(session);
+}
+
+fn submitted_timeout_unknown(
+    name: &str,
+    limits: ReflectionLimits,
+) -> (Workspace, ReflectionController, String, PathBuf, Value) {
+    let workspace = Workspace::new(name, LeadMode::Delivered);
+    let (controller, _request, acceptance) = accepted_with_limits(&workspace, limits);
+    lifecycle::install_fixture(&workspace);
+    let before = controller.stored_state().unwrap().unwrap();
+    let enabled = lifecycle::success(lifecycle::command(&workspace, "enable", Some(LEAD_THREAD)));
+    assert_eq!(enabled["checkpoint"], before.checkpoint);
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+    write_submitted_rollout(&workspace, &[]);
+
+    let mut first_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME".into(),
+        Some("unknown-hold".into()),
+    );
+    first_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let session = ConsoleSession::spawn(ConsoleSpec::new(first_spec)).unwrap();
+    let manager_pid = session.identity().pid;
+    let submitted = visibility::wait_for_submitted_stage_in(&state_dir);
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(submitted["status"], "turn-submitted", "{submitted}");
+    assert_eq!(
+        submitted["fork"]["forkThread"], EXECUTOR_FORK,
+        "{submitted}"
+    );
+    assert_eq!(submitted["turnId"], EXECUTOR_FORK_TURN, "{submitted}");
+    assert_eq!(submitted["usageKnown"], json!(false), "{submitted}");
+    assert!(submitted["usage"]["total_tokens"].is_null(), "{submitted}");
+    assert_eq!(submitted["workKnown"], json!(true), "{submitted}");
+    assert!(
+        submitted["work"]["context_bytes"].as_u64().unwrap_or(0) > 0,
+        "{submitted}"
+    );
+
+    visibility::terminate_reflection_backend(&workspace, manager_pid);
+    let unknown_stage = visibility::wait_for_stage_status_in(
+        &state_dir,
+        "unknown",
+        "the ended app-server did not leave the submitted turn explicitly unknown",
+    );
+    assert_eq!(
+        unknown_stage["turnId"], EXECUTOR_FORK_TURN,
+        "{unknown_stage}"
+    );
+    let ledger_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let recorded = controller.record(&acceptance).unwrap().unwrap();
+        if recorded.executor.state == StageState::Unknown {
+            break;
+        }
+        assert!(
+            Instant::now() < ledger_deadline,
+            "the accepted executor ledger did not record the unknown submitted turn within 20s: {recorded:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    finish_owned_process(session);
+
+    let unknown = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(unknown.executor.state, StageState::Unknown);
+    assert_eq!(unknown.executor.usage.attempts, 1);
+    assert_eq!(unknown.executor.usage.turns, 1);
+    assert_eq!(unknown.executor.usage.tokens, 0);
+    assert!(!unknown.executor.usage_reconciled);
+    assert_eq!(unknown.lead.state, StageState::Pending);
+    assert_eq!(unknown.delivery, DeliveryState::Pending);
+    (workspace, controller, acceptance, state_dir, submitted)
+}
+
+#[test]
+fn submitted_timeout_reconciliation_retains_measured_usage_and_blocks_the_lead() {
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 1,
+        max_turns_per_stage: 1,
+        max_tokens_per_stage: 120_000,
+        max_tokens_per_record: 200_000,
+        ..ReflectionLimits::default()
+    };
+    let (workspace, controller, acceptance, state_dir, submitted) =
+        submitted_timeout_unknown("submitted-timeout-reconcile", limits);
+    let submitted_work = submitted["work"].clone();
+    let source_context_bytes = submitted["sourceContextBytes"].clone();
+    let binding = controller.record(&acceptance).unwrap().unwrap().binding;
+
+    // Older artifacts could retain the pre-turn known zero even after the
+    // exact turn was accepted. That flag is not evidence of model cost.
+    let artifact_path = state_dir.join("executor-stage.json");
+    let mut legacy = read_json(&artifact_path);
+    assert_eq!(legacy["status"], "unknown", "{legacy}");
+    legacy["usageKnown"] = json!(true);
+    legacy["usage"] = json!({
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+    });
+    legacy["usageUnknownReason"] = Value::Null;
+    legacy["matchedResponseIds"] = json!([]);
+    fs::write(&artifact_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    // The exact submitted turn now exposes three measured native responses.
+    write_submitted_rollout(&workspace, &[147_004, 147_004, 147_005]);
+
+    let mut reconcile_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    reconcile_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let reconcile_session = ConsoleSession::spawn(ConsoleSpec::new(reconcile_spec)).unwrap();
+    visibility::wait_for_stage_status_in(
+        &state_dir,
+        "completed",
+        "the ordinary process did not reconcile the retained submitted turn",
+    );
+    finish_owned_process(reconcile_session);
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        fixture_requests(&workspace, "executor-self-reflection", "turn/start").len(),
+        1,
+        "reconciliation started another turn"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "reconciliation started another thread"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/resume")
+            .iter()
+            .any(|resume| resume["params"]["threadId"] == json!(EXECUTOR_FORK)),
+        "reconciliation did not resume the retained fork"
+    );
+
+    let completed = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_eq!(completed["fork"], submitted["fork"], "{completed}");
+    assert_eq!(completed["turnId"], EXECUTOR_FORK_TURN, "{completed}");
+    assert_eq!(completed["result"], EXECUTOR_RESULT, "{completed}");
+    assert_eq!(completed["usageKnown"], json!(true), "{completed}");
+    assert_eq!(
+        completed["usage"]["total_tokens"],
+        json!(441_013),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["matchedResponseIds"],
+        json!([
+            "executor-submitted-response-0",
+            "executor-submitted-response-1",
+            "executor-submitted-response-2",
+        ]),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["sourceContextBytes"], source_context_bytes,
+        "{completed}"
+    );
+    assert_eq!(completed["work"], submitted_work, "{completed}");
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.binding, binding);
+    assert_eq!(record.executor.state, StageState::Retained);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 441_013);
+    assert!(record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+    assert!(record.executor.pause.is_none());
+    assert_eq!(
+        record.executor.outcome.as_ref().unwrap().summary,
+        EXECUTOR_RESULT
+    );
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.lead.usage.attempts, 0);
+    assert_eq!(record.lead.usage.turns, 0);
+    assert_eq!(record.delivery, DeliveryState::Pending);
+    assert_eq!(record.usage_totals().tokens, 441_013);
+
+    // Repeating the ordinary process neither replays work nor fabricates a
+    // cheaper completion while the recorded limits stay exhausted.
+    let calls = request_counts(&workspace);
+    let mut repeat_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    repeat_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_RESULT".into(),
+        Some(EXECUTOR_RESULT.into()),
+    );
+    let repeat_session = ConsoleSession::spawn(ConsoleSpec::new(repeat_spec)).unwrap();
+    finish_owned_process(repeat_session);
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(read_json(&state_dir.join("executor-stage.json")), completed);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+}
+
+#[test]
+fn submitted_timeout_reconciliation_retains_a_failed_turn_without_fabricating_usage() {
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 1,
+        max_turns_per_stage: 1,
+        max_tokens_per_stage: 120_000,
+        max_tokens_per_record: 200_000,
+        ..ReflectionLimits::default()
+    };
+    let (workspace, controller, acceptance, state_dir, submitted) =
+        submitted_timeout_unknown("submitted-timeout-failed", limits);
+
+    let mut reconcile_spec =
+        lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    reconcile_spec.env.insert(
+        "HARNESS_REFLECTION_FIXTURE_EXECUTOR_OUTCOME".into(),
+        Some("failed".into()),
+    );
+    let reconcile_session = ConsoleSession::spawn(ConsoleSpec::new(reconcile_spec)).unwrap();
+    visibility::wait_for_stage_status_in(
+        &state_dir,
+        "failed",
+        "the ordinary process did not observe the retained turn as failed",
+    );
+    finish_owned_process(reconcile_session);
+
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        fixture_requests(&workspace, "executor-self-reflection", "turn/start").len(),
+        1,
+        "failed reconciliation started another turn"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "failed reconciliation started another thread"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/resume")
+            .iter()
+            .any(|resume| resume["params"]["threadId"] == json!(EXECUTOR_FORK)),
+        "failed reconciliation did not resume the retained fork"
+    );
+
+    let failed = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["fork"], submitted["fork"], "{failed}");
+    assert_eq!(failed["turnId"], EXECUTOR_FORK_TURN, "{failed}");
+    assert_eq!(failed["usageKnown"], json!(false), "{failed}");
+    assert!(failed["usage"]["total_tokens"].is_null(), "{failed}");
+    assert_eq!(failed["matchedResponseIds"], json!([]), "{failed}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("observed the retained turn")),
+        "{failed}"
+    );
+
+    let record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(record.executor.state, StageState::Unknown);
+    assert_eq!(record.executor.usage.attempts, 1);
+    assert_eq!(record.executor.usage.turns, 1);
+    assert_eq!(record.executor.usage.tokens, 0);
+    assert!(!record.executor.usage_reconciled);
+    assert!(record.executor.work_reconciled);
+    assert_eq!(record.executor.pause, None);
+    assert!(record.executor.outcome.is_none());
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.lead.usage.attempts, 0);
+    assert_eq!(record.lead.usage.turns, 0);
+    assert_eq!(record.delivery, DeliveryState::Pending);
+    assert_eq!(record.usage_totals().tokens, 0);
+
+    let calls = request_counts(&workspace);
+    let repeat_spec = lifecycle::process_spec_from(&workspace, &manager(), LEAD_THREAD, "process");
+    let repeat_session = ConsoleSession::spawn(ConsoleSpec::new(repeat_spec)).unwrap();
+    finish_owned_process(repeat_session);
+    assert_eq!(request_counts(&workspace), calls);
+    assert_eq!(read_json(&state_dir.join("executor-stage.json")), failed);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+}
+
 #[test]
 fn token_exhaustion_blocks_the_lead_and_resume_keeps_the_first_stage_usage() {
     let workspace = Workspace::new("budget-token-exhaustion", LeadMode::Delivered);
