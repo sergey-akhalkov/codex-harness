@@ -1238,6 +1238,17 @@ fn stage_plan(
         BoundIdentity::resolve(&prepared.binding),
         paths,
     );
+    // The app-server has no `--profile` flag. Layer the declared profile's
+    // native configuration onto this child exactly as ordinary dispatch does;
+    // without it a provider the profile defines does not exist when
+    // `thread/fork` verifies the declared route. The base configuration is
+    // still loaded by the app-server, so unrelated settings are preserved.
+    for config in
+        orchestration_config::profile_config_overrides(&chain.codex_home, &declaration.profile)?
+    {
+        plan.args.push("-c".into());
+        plan.args.push(config.into());
+    }
     plan.executor_session = false;
     plan.bounded_lead_session = false;
     plan.reflection_session = true;
@@ -3923,4 +3934,335 @@ fn persist<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         .ok_or_else(|| invalid("a retained state path has no directory"))?;
     fs::create_dir_all(parent)?;
     write_staged(path, &serde_json::to_vec_pretty(value)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE_CONFIG: &str = r#"model = "gpt-6-astra"
+model_provider = "base_only"
+model_reasoning_effort = "low"
+approval_policy = "never"
+model_context_window = 123456
+
+[model_providers.base_only]
+base_url = "https://base.example.test/v1"
+wire_api = "responses"
+
+[projects.'d:/unrelated']
+trust_level = "trusted"
+"#;
+
+    const DS_CONFIG: &str = r#"model = "deepseek-flash"
+model_provider = "deepseek"
+model_reasoning_effort = "max"
+
+[features]
+hooks = false
+
+[model_providers.deepseek]
+name = "owned deepseek"
+base_url = "https://deepseek.example.test/v1"
+env_key = "SYNTHETIC_DEEPSEEK_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+"#;
+
+    fn kit_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .canonicalize()
+            .expect("canonical workspace root")
+    }
+
+    fn stage_declaration(
+        role: Role,
+        revision: &str,
+        profile: &str,
+        model: &str,
+        provider: &str,
+        effort: &str,
+        checkout: &Path,
+    ) -> StageDeclaration {
+        StageDeclaration {
+            role: role.label().to_owned(),
+            revision: revision.to_owned(),
+            profile: profile.to_owned(),
+            model: model.to_owned(),
+            provider: provider.to_owned(),
+            effort: effort.to_owned(),
+            checkout: checkout.to_path_buf(),
+            title: "synthetic reflection".to_owned(),
+        }
+    }
+
+    fn chain_state(
+        root: &Path,
+        home: &Path,
+        executor_stage: StageDeclaration,
+        lead_stage: StageDeclaration,
+    ) -> ChainState {
+        ChainState {
+            schema: SCHEMA,
+            task: "synthetic task".to_owned(),
+            run: "synthetic-run".to_owned(),
+            acceptance: "synthetic acceptance".to_owned(),
+            state_dir: root.join("state"),
+            source: kit_root(),
+            codex_home: home.to_path_buf(),
+            launcher: root.join("codex-harness.exe"),
+            executor_source: Boundary {
+                thread: "executor-source".to_owned(),
+                last_turn: "executor-turn".to_owned(),
+            },
+            lead_source: Boundary {
+                thread: "lead-source".to_owned(),
+                last_turn: "lead-turn".to_owned(),
+            },
+            executor_stage,
+            lead_stage,
+            lead_return: LeadReturn {
+                endpoint: root.join("lead-endpoint.json"),
+                thread: "lead-thread".to_owned(),
+            },
+            bound_seconds: 1,
+            accepted_work: None,
+        }
+    }
+
+    fn config_pairs(plan: &ControlPlan) -> Vec<String> {
+        let mut pairs = Vec::new();
+        let mut args = plan.args.iter();
+        while let Some(flag) = args.next() {
+            assert_eq!(
+                flag.to_string_lossy(),
+                "-c",
+                "unexpected non-config app-server argument"
+            );
+            let value = args
+                .next()
+                .expect("every app-server -c flag names its value");
+            pairs.push(value.to_string_lossy().into_owned());
+        }
+        pairs
+    }
+
+    #[test]
+    fn stage_plan_layers_the_declared_profile_route_for_native_fork_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.toml"), BASE_CONFIG).unwrap();
+        fs::write(home.join("ds.config.toml"), DS_CONFIG).unwrap();
+
+        let role = Role::ExecutorSelfReflection;
+        let resolved = role_context::resolve(&kit_root(), role).unwrap();
+        let executor_stage = stage_declaration(
+            role,
+            &resolved.revision,
+            "ds",
+            "deepseek-flash",
+            "deepseek",
+            "max",
+            root.path(),
+        );
+        let lead_stage = stage_declaration(
+            Role::LeadSelfReflection,
+            &resolved.revision,
+            "default",
+            "gpt-6-astra",
+            "base_only",
+            "low",
+            root.path(),
+        );
+        let chain = chain_state(root.path(), &home, executor_stage.clone(), lead_stage);
+        let prepared = prepare_stage(&chain, &executor_stage, role).unwrap();
+        let plan = stage_plan(
+            &chain,
+            &executor_stage,
+            &prepared,
+            &root.path().join("native-stage"),
+        )
+        .unwrap();
+
+        let pairs = config_pairs(&plan);
+        for expected in [
+            r#"model="deepseek-flash""#,
+            r#"model_provider="deepseek""#,
+            r#"model_reasoning_effort="max""#,
+            "features.hooks=false",
+            r#"model_providers.deepseek.name="owned deepseek""#,
+            r#"model_providers.deepseek.base_url="https://deepseek.example.test/v1""#,
+            r#"model_providers.deepseek.env_key="SYNTHETIC_DEEPSEEK_KEY""#,
+            r#"model_providers.deepseek.wire_api="responses""#,
+            "model_providers.deepseek.requires_openai_auth=false",
+            "model_providers.deepseek.supports_websockets=false",
+            "model_providers.deepseek.request_max_retries=0",
+            "model_providers.deepseek.stream_max_retries=0",
+        ] {
+            assert!(
+                pairs.iter().any(|pair| pair == expected),
+                "the native app-server did not receive {expected:?}: {pairs:?}"
+            );
+        }
+        for unrelated in ["approval_policy=", "model_context_window=", "projects."] {
+            assert!(
+                pairs.iter().all(|pair| !pair.starts_with(unrelated)),
+                "the profile layer must not copy unrelated base configuration {unrelated:?}: {pairs:?}"
+            );
+        }
+        assert_eq!(plan.identity.profile, "ds");
+        assert_eq!(plan.identity.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(plan.identity.model_provider.as_deref(), Some("deepseek"));
+        assert_eq!(plan.identity.reasoning_effort.as_deref(), Some("max"));
+        assert!(plan.reflection_session);
+        assert!(plan.overrides.contains_key("skills.config"));
+    }
+
+    #[test]
+    fn stage_plan_leaves_the_default_lead_profile_to_the_loaded_base_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.toml"), BASE_CONFIG).unwrap();
+
+        let role = Role::LeadSelfReflection;
+        let resolved = role_context::resolve(&kit_root(), role).unwrap();
+        let lead_stage = stage_declaration(
+            role,
+            &resolved.revision,
+            "default",
+            "gpt-6-astra",
+            "base_only",
+            "low",
+            root.path(),
+        );
+        let executor_stage = stage_declaration(
+            Role::ExecutorSelfReflection,
+            &resolved.revision,
+            "ds",
+            "deepseek-flash",
+            "deepseek",
+            "max",
+            root.path(),
+        );
+        let chain = chain_state(root.path(), &home, executor_stage, lead_stage.clone());
+        let prepared = prepare_stage(&chain, &lead_stage, role).unwrap();
+        let plan = stage_plan(
+            &chain,
+            &lead_stage,
+            &prepared,
+            &root.path().join("native-stage"),
+        )
+        .unwrap();
+
+        assert!(
+            plan.args.is_empty(),
+            "the default profile is already the app-server's base configuration: {:?}",
+            plan.args
+        );
+        assert_eq!(plan.identity.profile, "default");
+        assert_eq!(plan.identity.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(plan.identity.model_provider.as_deref(), Some("base_only"));
+        assert_eq!(plan.identity.reasoning_effort.as_deref(), Some("low"));
+        assert!(plan.reflection_session);
+    }
+
+    #[test]
+    fn prepare_stage_refuses_a_declared_route_that_differs_from_the_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.toml"), BASE_CONFIG).unwrap();
+        fs::write(home.join("ds.config.toml"), DS_CONFIG).unwrap();
+
+        let role = Role::ExecutorSelfReflection;
+        let resolved = role_context::resolve(&kit_root(), role).unwrap();
+        let exact = stage_declaration(
+            role,
+            &resolved.revision,
+            "ds",
+            "deepseek-flash",
+            "deepseek",
+            "max",
+            root.path(),
+        );
+        let chain = chain_state(
+            root.path(),
+            &home,
+            exact.clone(),
+            stage_declaration(
+                Role::LeadSelfReflection,
+                &resolved.revision,
+                "default",
+                "gpt-6-astra",
+                "base_only",
+                "low",
+                root.path(),
+            ),
+        );
+
+        for (field, declaration) in [
+            (
+                "model",
+                StageDeclaration {
+                    model: "other-model".to_owned(),
+                    ..exact.clone()
+                },
+            ),
+            (
+                "modelProvider",
+                StageDeclaration {
+                    provider: "other-provider".to_owned(),
+                    ..exact.clone()
+                },
+            ),
+            (
+                "reasoningEffort",
+                StageDeclaration {
+                    effort: "low".to_owned(),
+                    ..exact.clone()
+                },
+            ),
+            (
+                "role",
+                StageDeclaration {
+                    role: "lead-self-reflection".to_owned(),
+                    ..exact.clone()
+                },
+            ),
+        ] {
+            let error = prepare_stage(&chain, &declaration, role)
+                .err()
+                .expect("a mismatched declared route must refuse");
+            let message = error.to_string();
+            assert!(
+                message.contains(field) || message.contains("declared stage role"),
+                "the {field} mismatch was not named: {message}"
+            );
+        }
+
+        fs::write(
+            home.join("missing-effort.config.toml"),
+            "model = \"deepseek-flash\"\nmodel_provider = \"deepseek\"\n",
+        )
+        .unwrap();
+        let missing_effort = StageDeclaration {
+            profile: "missing-effort".to_owned(),
+            ..exact
+        };
+        let error = prepare_stage(&chain, &missing_effort, role)
+            .err()
+            .expect("an unverifiable declared effort must refuse");
+        assert!(
+            error.to_string().contains("leaves reasoningEffort unset"),
+            "an unverifiable declared effort must refuse: {error}"
+        );
+    }
 }
