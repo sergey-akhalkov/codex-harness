@@ -1,13 +1,26 @@
 ## Why
 
-`executor watch` can return success when the native turn has completed but the
-host has not yet saved its exit status and final message. A lead then receives
-an incomplete result and must read the same receipt again before reviewing the
-work or releasing its slot. This race was observed during actual executor runs.
+The historical `executor watch` defect returned success before the host saved
+its exit status and final message. Current source already contains the fix
+(`e2395f5`) and the regression
+`watch_waits_for_host_finalization_after_turn_completion`. This change now owns
+reconciliation and remaining acceptance, not a new implementation from an
+assumed failing current HEAD. Source presence does not prove installed behavior.
+
+## Evidence and hypothesis
+
+The inspectable evidence is `crates/codex-harness/src/executor_cli.rs`
+(`completion_awaiting_host`, `watch`, `settled_watch_outcome`) and
+`crates/codex-harness/tests/executor_observation.rs`. Hypothesis: correlating
+success with retained host finalization eliminates premature successful returns
+in the controlled transition without losing timeout, failure or reply semantics.
+The primary metric is premature-success count; the required change is a failing
+historical control to zero such successes under identical transitions. No
+productivity or frequency estimate is inferred from this regression.
 
 ## What Changes
 
-- Keep watching a completion observation that still awaits host finalization.
+- Reuse and verify the existing wait for host finalization; implement only a demonstrated remaining gap.
 - Return successful completion only with the current run's finalized outcome
   and retained result; report an actual output defect through the existing
   lifecycle contract.

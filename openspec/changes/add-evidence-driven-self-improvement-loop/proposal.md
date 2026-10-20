@@ -1,8 +1,26 @@
 ## Why
 
-The harness can account for attempts and retain feedback, but it does not yet turn observed losses into an autonomous cycle of initial measurement, hypothesis formulation, implementation, remeasurement and evidence-backed retention or rollback. Useful improvement must justify its investigation and experiment cost: some hypotheses need two complete task implementations, while others can be decided through a shorter real operation or agent task.
+The harness already implements evidence intake, frozen comparison policy, benefit-gated integration and rejected-candidate runtime restoration. This change owns the remaining integration and real installed acceptance of the complete data-to-decision cycle; it is not an unimplemented controller proposal. Useful improvement must justify its investigation and experiment cost: some hypotheses need two complete task implementations, while others can be decided through a shorter real operation or agent task.
 
 Improvement also includes subtraction: accumulated features, instructions and machinery can consume context, operations and maintenance without a corresponding benefit. Occam's razor favors the simplest sufficient solution with supported usefulness; neither low usage nor fewer files alone proves that a capability should disappear.
+
+## Evidence and remaining qualification
+
+Current code owners are `improvement_intake` (retained observations, mechanism and experiment selection), `improvement_spec` (qualified/frozen planning), `improvement_policy` (actual outcomes and predeclared decision), `improvement_activation` (exact supported integration), and the CLI `improvement_driver` (restoration before continuation). Their native tests establish only their exercised scope. The tasks still retain missing real-agent, installed-continuation and recovery acceptance; checked planning or fixture results cannot close those gaps.
+
+The planning audit also found stale problem statements despite existing fixes and a missing historical evidence reference in current changes. These observed failure modes justify explicit current-state qualification and traceability checks, not an invented measured productivity gain. Hypotheses must originate in retained data; complete implementation and functional correctness alone cannot establish benefit. An unsuccessful candidate must leave no introduced effects in accepted source or active delivery, while its recoverable patch and negative evidence remain available outside those surfaces.
+
+The historical parallel-lib-test interference report is an unqualified
+investigation lead, not an implementation-ready hypothesis. Its cited board
+record and history are unavailable; neither the reported failure count nor the
+shared-state cause is established for current source. A future proposal requires
+retained source/toolchain/environment identities, explicit test-execution
+parallelism (`--test-threads`, not Cargo build jobs), a demonstrated interfering
+test/state pair and an unchanged failing control. Record a bounded initial
+measurement plan before running it; no reproduction means inconclusive/deferred,
+not a guessed fix or permission to weaken the suite. Existing test acceptance
+remains intact. This condition preserves the useful investigation basis without
+an unsupported active implementation plan.
 
 ## What Changes
 
@@ -32,4 +50,4 @@ Improvement also includes subtraction: accumulated features, instructions and ma
 
 ## Impact
 
-Extend the existing Rust CLI, `harness-core` outcome and board modules, native attempt runner and their tests. Reuse the shared rollout reader, independent acceptance, process observation, visible dispatch, skill packaging and installation lifecycle. Add the owned skill and update the relevant operating guides during implementation. No new tracker, external benchmark service or first-party scripting runtime is required. This planning change does not run models, create operational board tasks, alter installed settings or implement the loop.
+Complete the existing Rust CLI, `harness-core` outcome and board modules, native attempt runner and their tests. Reuse the shared rollout reader, independent acceptance, process observation, visible dispatch, installed owned skill and installation lifecycle. No new tracker, external benchmark service or first-party scripting runtime is required. Revising these artifacts alone neither executes the pending model comparisons nor establishes live benefit or complete installed acceptance.
