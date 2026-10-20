@@ -373,6 +373,22 @@ checkpoint, pending work, recovery state and the controller's verified process
 liveness and log location. Disable prevents new stages and preserves retained
 results and journal configuration, including other consumers' use.
 
+`global/orchestration.toml` also carries the default-on
+`self_reflection_enabled` permission. The effective value is read from the
+declared source before each new reflection stage, so a running host observes an
+on-to-off change without restart and the next model stage stops. An already
+running stage may finish and retain its result. `false` blocks new executor and
+lead model calls through manual execution, the owned process, continuation and
+the internal stage runner while ordinary lead, executor and acceptance work
+remains available. It does not activate a project and does not discard retained
+results, pending-stage identities, usage or recovery. Closures observed during
+the disabled interval advance the existing event checkpoint without admission,
+so enabling later does not replay or sweep them. Status reports
+`selfReflectionEnabled`, `configPath`, `modelWork` and `modelWorkReason`; enable
+refuses before lifecycle mutation while the value is false. The shipped source
+sets `self_reflection_enabled = true`, and an omitted key also defaults to true
+for compatibility. A non-boolean value fails before model work.
+
 Status distinguishes pending model stages from unfinished work and retained,
 undelivered synthesis. `process` also reconciles an already submitted stage or
 delivery; an empty new-stage queue does not mean that the lead received the

@@ -10,6 +10,11 @@ executor_profiles = ["ds"]
 # Active executor runs allowed at once. Held ordinary, experiment, review and
 # executor tasks consume the independent managed pool capacity below.
 max_concurrent_executors = 6
+# Default-on permission gate for accepted-work self-reflection. Set to false
+# to prevent new executor and lead reflection model calls while ordinary lead,
+# executor and acceptance work remains available. This does not activate a
+# project; reflection still requires an explicit lifecycle enable.
+self_reflection_enabled = true
 # Managed worktree capacity, separate from active executor admission. Positions
 # are created lazily and reused; a full pool refuses overflow.
 worktree_pool_size = 6

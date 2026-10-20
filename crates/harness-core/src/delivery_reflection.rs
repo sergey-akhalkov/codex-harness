@@ -1754,7 +1754,7 @@ impl ReflectionController {
     /// Reads new committed closures without launching a model. Any recovery
     /// condition stops consumption at the retained checkpoint.
     pub fn poll(&self) -> io::Result<PollReceipt> {
-        match self.poll_outcome()? {
+        match self.poll_outcome(true)? {
             PollOutcome::Receipt(receipt) => Ok(*receipt),
             PollOutcome::Inactive => Err(conflict(
                 "delivery reflection is inactive; activate it before polling",
@@ -1768,13 +1768,30 @@ impl ReflectionController {
     /// Polls while the lifecycle is retained and active. A normal stop observed
     /// before any stage dispatch is a typed no-op, not a failed consumer.
     pub fn poll_if_active(&self) -> io::Result<Option<PollReceipt>> {
-        match self.poll_outcome()? {
+        match self.poll_outcome(true)? {
             PollOutcome::Receipt(receipt) => Ok(Some(*receipt)),
             PollOutcome::Inactive | PollOutcome::Stopped => Ok(None),
         }
     }
 
-    fn poll_outcome(&self) -> io::Result<PollOutcome> {
+    /// Advances the committed-event checkpoint without admitting any eligible
+    /// closure. This is used only while configuration forbids new reflection
+    /// model work: the disabled interval is consumed at its normal event
+    /// boundary instead of being replayed after permission returns. Retained
+    /// records, stage identities, usage and recovery are untouched.
+    pub fn poll_without_admission(&self) -> io::Result<PollReceipt> {
+        match self.poll_outcome(false)? {
+            PollOutcome::Receipt(receipt) => Ok(*receipt),
+            PollOutcome::Inactive => Err(conflict(
+                "delivery reflection is inactive; activate it before polling",
+            )),
+            PollOutcome::Stopped => Err(conflict(
+                "delivery reflection is stopped; activate it before polling",
+            )),
+        }
+    }
+
+    fn poll_outcome(&self, admit: bool) -> io::Result<PollOutcome> {
         let current = self.current_source()?;
         let path = self.state_path(&current);
         let _lock = self.lock(&path)?;
@@ -1903,7 +1920,11 @@ impl ReflectionController {
                 )?;
                 break;
             }
-            match self.evaluate_event(&state, &event) {
+            match if admit {
+                self.evaluate_event(&state, &event)
+            } else {
+                Ok(EvaluatedEvent::Ignored)
+            } {
                 Ok(EvaluatedEvent::Ignored) => {
                     ignored += 1;
                 }

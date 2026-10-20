@@ -48,6 +48,7 @@ use std::{
 };
 
 mod accepted;
+mod gate;
 pub(crate) mod host;
 pub(crate) mod lifecycle;
 mod surface;
@@ -440,6 +441,7 @@ fn execute(path: &Path, board: Option<&Path>) -> io::Result<i32> {
 /// route reads its request file and calls this; the automatic delivery
 /// controller builds the same request from accepted records.
 pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
+    gate::ReflectionGate::load(&request.source)?.ensure_enabled()?;
     let (chain, _lease) = prepare_chain(request)?;
     preflight_lead(&chain)?;
     let limits = ReflectionLimits::default();
@@ -483,6 +485,7 @@ pub(crate) fn execute_request(request: Request) -> io::Result<i32> {
         context_bytes: executor_usage.context_bytes,
     };
     let lead_admission = StageAdmission::new(&limits, &StageUsage::default(), &record_totals);
+    gate::ReflectionGate::load(&chain.source)?.ensure_enabled()?;
     preflight_lead(&chain)?;
     let lead_state = {
         let _admission = admit_stage(&chain, Role::LeadSelfReflection, true)?;
@@ -611,6 +614,7 @@ fn admit_stage(
         _ => return Err(invalid("only reflection roles can claim stage admission")),
     };
     let config = orchestration_config::load(&chain.source)?;
+    gate::ReflectionGate::from_config(&chain.source, &config).ensure_enabled()?;
     crate::executor_cli::reflection_admission::acquire(
         &chain.codex_home,
         &declaration.checkout,

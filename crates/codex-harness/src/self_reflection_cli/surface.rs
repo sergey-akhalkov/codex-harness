@@ -79,6 +79,7 @@ pub(super) fn run_stage_in_surface(
     prompt: String,
     admission: Option<&StageAdmission>,
 ) -> io::Result<StageState> {
+    super::gate::ReflectionGate::load(&chain.source)?.ensure_enabled()?;
     let retained = if state_path.exists() {
         Some(read_json::<StageState>(state_path, MAX_REQUEST_BYTES)?)
     } else {
@@ -344,6 +345,7 @@ pub(super) fn execute_stage_runner(request_path: &Path) -> io::Result<i32> {
             request.schema
         )));
     }
+    super::gate::ReflectionGate::load(&request.chain.source)?.ensure_enabled()?;
     // The coordinator holds this lease across spawn and wait. A direct
     // invocation can take it, which proves no coordinator is driving the
     // request; refuse before any fork or model turn.

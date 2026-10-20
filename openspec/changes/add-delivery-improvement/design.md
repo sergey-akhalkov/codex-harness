@@ -85,6 +85,23 @@ A stop prevents new reflection and improvement assignments under that mandate wh
 
 Installed enable/status/disable/recovery must own routine prerequisites and report cause and next action. Reuse the existing `delivery-improvement` command namespace if useful, without preserving an observer-specific implementation solely for compatibility: it was not delivered. The two skills, native trigger, fork chain, feedback decision and consuming sessions are one end-to-end feature.
 
+### 8. Configuration permission is separate from lifecycle activation
+
+`self_reflection_enabled` in `global/orchestration.toml` is a default-on,
+boolean permission for new reflection model stages. True only permits work
+under an explicitly activated lifecycle; it never creates or reactivates one.
+False stops new executor and lead model calls through every dispatch owner
+while ordinary lead, executor and acceptance work remains available.
+
+Each new stage re-reads the effective source configuration. A host that is
+already running therefore observes an on-to-off change without restart. A stage
+already executing may finish and retain its result; the coordinator checks
+again before the dependent lead stage. The existing controller owns the lock,
+checkpoint, recovery and retained records. A disabled poll advances the normal
+board-event boundary without admitting events, so later re-enable does not
+sweep closures from the disabled interval or duplicate retained work. Status
+reports the effective value, the source path and why model work is stopped.
+
 ### Parallel candidate implementation and predeclared evaluation
 
 Keep the initial evidence and uncertainty in `proposal.md`; do not turn the

@@ -22,6 +22,34 @@ Installed activation SHALL enable the two-stage reflection chain for the current
 - **WHEN** ordinary development proceeds without activation
 - **THEN** no automatic reflection runs and ordinary lead, executor and feedback behavior remains available
 
+### Requirement: Configuration permission gates new reflection model work
+
+The installed configuration SHALL define a boolean `self_reflection_enabled` permission that defaults to true. True SHALL permit only an explicitly activated lifecycle and SHALL NOT activate a project. False SHALL prevent new executor and lead reflection model calls while ordinary lead, executor, acceptance and feedback work remains available. The effective value SHALL be re-read before each new stage and SHALL preserve retained work and disabled-period event boundaries.
+
+#### Scenario: The permission is omitted
+- **WHEN** an existing or new configuration omits `self_reflection_enabled`
+- **THEN** it defaults to true and preserves the current explicitly activated behavior without activating a project by itself
+
+#### Scenario: Model work is disabled
+- **WHEN** `self_reflection_enabled` is false
+- **THEN** no new executor or lead reflection model call starts from manual, automatic, continuation or internal dispatch, enable refuses before lifecycle mutation, and ordinary acceptance still completes
+
+#### Scenario: The flag changes between stages
+- **WHEN** a host has retained an executor reflection and the flag changes from true to false before the lead stage
+- **THEN** the executor result, identity, usage and pending lead stage remain retained, no lead model call starts, and a later true value resumes the retained lead stage without repeating the executor
+
+#### Scenario: Closures occur while disabled
+- **WHEN** an ordinary accepted closure is committed while the flag is false and the flag later returns to true
+- **THEN** the disabled interval was checkpointed without admission, no reflection record or model call is created for that closure, and retained pre-disable work is not duplicated
+
+#### Scenario: Status explains stopped model work
+- **WHEN** the caller reads status while the flag is false or the lifecycle is not active
+- **THEN** the result names the effective flag, configuration path and concrete reason no new model work may start
+
+#### Scenario: The permission has an invalid type
+- **WHEN** the configuration supplies a string, integer or other non-boolean value
+- **THEN** configuration loading fails before model work or lifecycle mutation
+
 ### Requirement: Accepted ordinary work is the automatic trigger
 
 The system SHALL start executor reflection only after the lead accepts and closes a bound ordinary executor task. Acceptance SHALL identify the assignment, source sessions and accepted result. First reports, intermediate corrections, cancellations, arbitrary closed cards and elapsed time SHALL NOT qualify. The interface SHALL maintain routine binding metadata.
