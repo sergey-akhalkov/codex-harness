@@ -363,6 +363,36 @@ codex-harness delivery-improvement status --project CHECKOUT
 codex-harness delivery-improvement disable --project CHECKOUT
 ```
 
+### Ordinary accepted closure ownership and recovery
+
+`executor accept` closes as the authenticated approving lead. Before writing
+acceptance metadata, an open task assigned to another actor is conditionally
+transferred to that lead with `bd update ... --if-assignee ... --if-status ...`.
+The guarded update never uses `--force`; if the claim changed, acceptance fails
+before writing metadata. A task that is already unassigned or assigned to the
+lead needs no ownership write. A successful close is idempotent: replaying the
+same task and run returns `duplicate: true` with the recorded acceptance.
+
+An open task that already carries acceptance metadata is always refused
+automatically. A reopen, cancellation, mismatched metadata and an interrupted
+close after the metadata write can share that visible state, so acceptance
+neither rewrites nor guesses. Inspect `bd show TASK` and
+`bd history TASK --events`. If that inspection verifies an interrupted close,
+the actual approving lead can use the existing guarded board commands to finish
+it, then replay validation:
+
+```powershell
+$env:BEADS_ACTOR = "LEAD"
+bd update TASK --assignee LEAD --if-assignee OLD_ASSIGNEE --if-status open --json
+bd close TASK --reason accepted --json
+codex-harness executor accept TASK --run RECORDED_RUN --project CHECKOUT
+```
+
+The replay must report `status: accepted`, `duplicate: true`, and the unchanged
+acceptance identity. Do not remove or replace metadata, delete history, or use
+`--force`. If history shows a reopen or cancellation, use a fresh task (or an
+explicitly reviewed board correction) rather than treating old work as accepted.
+
 Enable runs inside the real managed lead conversation. It resolves the kit,
 configured profiles, roles and registered lead address before activating the
 board's native event journal at its current boundary. Repeated activation keeps

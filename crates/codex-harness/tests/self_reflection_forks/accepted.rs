@@ -13,11 +13,20 @@ const ACTOR: &str = "reflection-fixture-lead";
 const ACCEPTED_EXECUTOR_RESULT: &str = "NO FINDING";
 
 pub(super) fn native(workspace: &Workspace, program: &str, args: &[&str]) -> std::process::Output {
+    native_as(workspace, program, ACTOR, args)
+}
+
+pub(super) fn native_as(
+    workspace: &Workspace,
+    program: &str,
+    actor: &str,
+    args: &[&str],
+) -> std::process::Output {
     let output = Command::new(program)
         .args(args)
         .current_dir(&workspace.checkout)
         .env("BD_NON_INTERACTIVE", "1")
-        .env("BEADS_ACTOR", ACTOR)
+        .env("BEADS_ACTOR", actor)
         .output()
         .unwrap();
     assert!(

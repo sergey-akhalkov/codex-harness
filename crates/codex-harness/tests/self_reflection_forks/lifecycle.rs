@@ -2,7 +2,8 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    DeliveryState, LifecycleStatus, ReflectionController, StageState,
+    AcceptanceBinding, DeliveryState, LifecycleStatus, ReflectionController, StageState,
+    acceptance_metadata,
 };
 
 pub(super) fn install_fixture(workspace: &Workspace) {
@@ -576,6 +577,348 @@ fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes()
 }
 
 #[test]
+fn ordinary_acceptance_reassigns_executor_task_and_closes_exactly_once() {
+    let workspace = Workspace::new("ordinary-assignment", LeadMode::Delivered);
+    install_fixture(&workspace);
+    let prepared = prepare_ordinary_acceptance_setup(
+        &workspace,
+        &manager(),
+        &kit_root(),
+        false,
+        Some(&kit_root()),
+    );
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &["update", &prepared.task, "--assignee", "executor", "--json"],
+    );
+
+    let accepted = prepared.accept(&workspace);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["duplicate"], false, "{accepted}");
+    assert_eq!(accepted["run"], "accepted-run", "{accepted}");
+    assert_eq!(
+        accepted["assignment"], prepared.binding.assignment,
+        "{accepted}"
+    );
+    assert_eq!(accepted["result"], prepared.binding.result, "{accepted}");
+    assert_eq!(
+        accepted["revision"], prepared.binding.revision,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["acceptanceId"],
+        prepared.binding.acceptance_id().unwrap(),
+        "{accepted}"
+    );
+    assert_eq!(accepted["executorSession"], EXECUTOR_SOURCE, "{accepted}");
+    assert_eq!(accepted["leadSession"], LEAD_THREAD, "{accepted}");
+    assert_eq!(accepted["leadTurn"], LEAD_SOURCE_TURN, "{accepted}");
+    assert_eq!(accepted["currentLeadTurn"], LEAD_SOURCE_TURN, "{accepted}");
+    assert_eq!(accepted["executorTurn"], EXECUTOR_SOURCE_TURN, "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["selfReflectionEnabled"], true,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], true,
+        "{accepted}"
+    );
+    let shown = show_task(&workspace, &prepared.task);
+    assert_eq!(shown["status"], "closed", "{shown}");
+    assert_eq!(shown["close_reason"], "accepted", "{shown}");
+    assert_eq!(shown["assignee"], LEAD_THREAD, "{shown}");
+    let events = history_events(&workspace, &prepared.task);
+    assert_eq!(accepted_closures(&events), 1, "{events:?}");
+    assert!(
+        events.iter().any(|event| event["event_type"] == "closed"
+            && event["new_value"] == "accepted"
+            && event["actor"] == LEAD_THREAD),
+        "{events:?}"
+    );
+
+    let repeated = prepared.accept(&workspace);
+    assert_eq!(repeated["duplicate"], true, "{repeated}");
+    assert_eq!(
+        repeated["acceptanceId"], accepted["acceptanceId"],
+        "{repeated}"
+    );
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        1,
+        "a repeated acceptance must not create another closure"
+    );
+}
+
+#[test]
+fn ordinary_acceptance_refuses_partial_close_then_recovers_through_lead_commands() {
+    let workspace = Workspace::new("ordinary-partial-close", LeadMode::Delivered);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "ordinary-partial-close", true);
+    let prepared =
+        prepare_ordinary_acceptance_setup(&workspace, &manager(), &source, true, Some(&source));
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &["update", &prepared.task, "--assignee", "executor", "--json"],
+    );
+    write_acceptance_metadata(&workspace, &prepared);
+    let before = show_task(&workspace, &prepared.task);
+    assert_eq!(before["status"], "open", "{before}");
+    assert_eq!(before["assignee"], "executor", "{before}");
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        0,
+        "the fixture must stop after metadata and before its close"
+    );
+
+    let refused = prepared.accept_raw(&workspace);
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{text}");
+    assert!(
+        text.contains("open but already carries acceptance metadata"),
+        "{text}"
+    );
+    assert!(text.contains("Never use --force"), "{text}");
+    let unchanged = show_task(&workspace, &prepared.task);
+    assert_eq!(unchanged["status"], "open", "{unchanged}");
+    assert_eq!(unchanged["assignee"], "executor", "{unchanged}");
+    assert_eq!(unchanged["metadata"], before["metadata"], "{unchanged}");
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        0
+    );
+
+    // The supported recovery keeps the recorded metadata. The actual approving
+    // lead conditionally reclaims the completed task and closes it with the
+    // accepted reason; replay then validates rather than rewrites that record.
+    set_source_enabled(&source, true);
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &[
+            "update",
+            &prepared.task,
+            "--assignee",
+            LEAD_THREAD,
+            "--if-assignee",
+            "executor",
+            "--if-status",
+            "open",
+            "--json",
+        ],
+    );
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &["close", &prepared.task, "--reason", "accepted", "--json"],
+    );
+
+    let accepted = prepared.accept(&workspace);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["duplicate"], true, "{accepted}");
+    assert_eq!(accepted["leadTurn"], LEAD_SOURCE_TURN, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["selfReflectionEnabled"], false,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], false,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["acceptanceId"],
+        prepared.binding.acceptance_id().unwrap(),
+        "{accepted}"
+    );
+    let events = history_events(&workspace, &prepared.task);
+    assert_eq!(accepted_closures(&events), 1, "{events:?}");
+    let repeated = prepared.accept(&workspace);
+    assert_eq!(repeated["duplicate"], true, "{repeated}");
+    assert_eq!(repeated["acceptanceId"], accepted["acceptanceId"]);
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        1,
+        "recovering the partial close must not duplicate the closure"
+    );
+
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &[
+            "reopen",
+            &prepared.task,
+            "--reason",
+            "new evidence",
+            "--json",
+        ],
+    );
+    let refused = prepared.accept_raw(&workspace);
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{text}");
+    assert!(
+        text.contains("open but already carries acceptance metadata"),
+        "{text}"
+    );
+    let shown = show_task(&workspace, &prepared.task);
+    assert_eq!(shown["status"], "open", "{shown}");
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        1,
+        "a reopened task must not gain a second accepted closure"
+    );
+}
+
+#[test]
+fn ordinary_acceptance_refuses_cancelled_then_reopened_work() {
+    let workspace = Workspace::new("ordinary-cancelled-reopen", LeadMode::Delivered);
+    install_fixture(&workspace);
+    let prepared = prepare_ordinary_acceptance_setup(
+        &workspace,
+        &manager(),
+        &kit_root(),
+        false,
+        Some(&kit_root()),
+    );
+    write_acceptance_metadata(&workspace, &prepared);
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &[
+            "update",
+            &prepared.task,
+            "--assignee",
+            LEAD_THREAD,
+            "--json",
+        ],
+    );
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &["close", &prepared.task, "--reason", "cancelled", "--json"],
+    );
+    let cancelled = prepared.accept_raw(&workspace);
+    let cancelled_text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&cancelled.stdout),
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    assert!(!cancelled.status.success(), "{cancelled_text}");
+    assert!(
+        cancelled_text.contains("already closed with reason 'cancelled', not accepted"),
+        "{cancelled_text}"
+    );
+    assert_eq!(show_task(&workspace, &prepared.task)["status"], "closed");
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        0,
+        "cancelled work must never become accepted"
+    );
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &[
+            "reopen",
+            &prepared.task,
+            "--reason",
+            "cancelled work was reopened",
+            "--json",
+        ],
+    );
+
+    let refused = prepared.accept_raw(&workspace);
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{text}");
+    assert!(
+        text.contains("open but already carries acceptance metadata"),
+        "{text}"
+    );
+    assert_eq!(show_task(&workspace, &prepared.task)["status"], "open");
+    assert!(
+        history_events(&workspace, &prepared.task)
+            .iter()
+            .any(|event| event["event_type"] == "closed" && event["new_value"] == "cancelled"),
+        "the fixture must record a cancelled closure before reopening"
+    );
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        0,
+        "cancelled work must never become accepted"
+    );
+}
+
+#[test]
+fn ordinary_acceptance_refuses_mismatched_partial_metadata_without_rewriting() {
+    let workspace = Workspace::new("ordinary-mismatched-partial", LeadMode::Delivered);
+    install_fixture(&workspace);
+    let prepared = prepare_ordinary_acceptance_setup(
+        &workspace,
+        &manager(),
+        &kit_root(),
+        false,
+        Some(&kit_root()),
+    );
+    let mut mismatched = prepared.binding.clone();
+    mismatched.result = "0".repeat(64);
+    accepted::native_as(
+        &workspace,
+        "bd.exe",
+        LEAD_THREAD,
+        &["update", &prepared.task, "--assignee", "executor", "--json"],
+    );
+    for (key, value) in acceptance_metadata(&mismatched).unwrap() {
+        let pair = format!("{key}={value}");
+        accepted::native(
+            &workspace,
+            "bd.exe",
+            &["update", &prepared.task, "--set-metadata", &pair, "--json"],
+        );
+    }
+    let before = show_task(&workspace, &prepared.task);
+
+    let refused = prepared.accept_raw(&workspace);
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{text}");
+    assert!(
+        text.contains("open but already carries acceptance metadata"),
+        "{text}"
+    );
+    let after = show_task(&workspace, &prepared.task);
+    assert_eq!(after["status"], "open", "{after}");
+    assert_eq!(after["assignee"], "executor", "{after}");
+    assert_eq!(after["metadata"], before["metadata"], "{after}");
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        0
+    );
+}
+
+#[test]
 fn running_host_observes_disable_between_stages_and_reuses_executor_after_reenable() {
     let workspace = Workspace::new("gate-dynamic-disable", LeadMode::Delivered);
     let (controller, _request, acceptance) = accepted::accepted(&workspace);
@@ -669,13 +1012,85 @@ pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (Strin
     normal_acceptance_with_source(workspace, manager, &kit_root())
 }
 
-fn prepare_ordinary_acceptance(
+struct PreparedOrdinaryAcceptance {
+    controller: ReflectionController,
+    task: String,
+    retained_result: String,
+    binding: AcceptanceBinding,
+    manager: PathBuf,
+    accept_source: Option<PathBuf>,
+}
+
+impl PreparedOrdinaryAcceptance {
+    fn accept_raw(&self, workspace: &Workspace) -> std::process::Output {
+        let mut command = Command::new(&self.manager);
+        command
+            .args(["executor", "accept", &self.task, "--project"])
+            .arg(&workspace.checkout);
+        if let Some(accept_source) = &self.accept_source {
+            command.arg("--source").arg(accept_source);
+        }
+        command
+            .arg("--codex-home")
+            .arg(&workspace.home)
+            .current_dir(&workspace.checkout)
+            .env("CODEX_HOME", &workspace.home)
+            .env("CODEX_THREAD_ID", LEAD_THREAD)
+            .env_remove("HARNESS_REFLECTION_SESSION")
+            .env_remove("HARNESS_EXECUTOR_SESSION")
+            .env_remove("HARNESS_BOUNDED_LEAD_SESSION")
+            .output()
+            .unwrap()
+    }
+
+    fn accept(&self, workspace: &Workspace) -> Value {
+        success(self.accept_raw(workspace))
+    }
+}
+
+fn show_task(workspace: &Workspace, task: &str) -> Value {
+    let shown = accepted::native(workspace, "bd.exe", &["show", task, "--json"]);
+    let mut value: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    if let Value::Array(rows) = &value {
+        value = rows.first().cloned().unwrap();
+    }
+    value
+}
+
+fn history_events(workspace: &Workspace, task: &str) -> Vec<Value> {
+    let shown = accepted::native(
+        workspace,
+        "bd.exe",
+        &["history", task, "--events", "--json"],
+    );
+    serde_json::from_slice(&shown.stdout).unwrap()
+}
+
+fn accepted_closures(events: &[Value]) -> usize {
+    events
+        .iter()
+        .filter(|event| event["event_type"] == "closed" && event["new_value"] == "accepted")
+        .count()
+}
+
+fn write_acceptance_metadata(workspace: &Workspace, prepared: &PreparedOrdinaryAcceptance) {
+    for (key, value) in acceptance_metadata(&prepared.binding).unwrap() {
+        let pair = format!("{key}={value}");
+        accepted::native(
+            workspace,
+            "bd.exe",
+            &["update", &prepared.task, "--set-metadata", &pair, "--json"],
+        );
+    }
+}
+
+fn prepare_ordinary_acceptance_setup(
     workspace: &Workspace,
     manager: &Path,
     source: &Path,
     disable_before_accept: bool,
     accept_source: Option<&Path>,
-) -> (ReflectionController, String, String, String, Value) {
+) -> PreparedOrdinaryAcceptance {
     use harness_core::{
         board_cli,
         delivery_reflection::{Purpose, board_source_identity},
@@ -749,29 +1164,54 @@ fn prepare_ordinary_acceptance(
     )
     .unwrap();
     assert!(retained.eligibility.eligible, "{retained:?}");
+    let retained_result = retained.result.as_ref().unwrap().sha256.clone();
+    let binding = AcceptanceBinding::new(
+        task.clone(),
+        "accepted-run".to_owned(),
+        retained
+            .assignment
+            .as_ref()
+            .unwrap()
+            .assignment_sha256
+            .clone(),
+        retained_result.clone(),
+        retained.source.revision.clone().unwrap(),
+        vec![EXECUTOR_SOURCE.to_owned()],
+        LEAD_THREAD.to_owned(),
+        LEAD_THREAD.to_owned(),
+        Purpose::Ordinary,
+    )
+    .with_turns(
+        Some(EXECUTOR_SOURCE.to_owned()),
+        Some(EXECUTOR_SOURCE_TURN.to_owned()),
+        Some(LEAD_SOURCE_TURN.to_owned()),
+    )
+    .with_self_reflection_enabled(!disable_before_accept);
+    PreparedOrdinaryAcceptance {
+        controller,
+        task,
+        retained_result,
+        binding,
+        manager: manager.to_path_buf(),
+        accept_source: accept_source.map(Path::to_path_buf),
+    }
+}
 
-    let accept = || {
-        let mut command = Command::new(manager);
-        command
-            .args(["executor", "accept", &task, "--project"])
-            .arg(&workspace.checkout);
-        if let Some(accept_source) = accept_source {
-            command.arg("--source").arg(accept_source);
-        }
-        let output = command
-            .arg("--codex-home")
-            .arg(&workspace.home)
-            .current_dir(&workspace.checkout)
-            .env("CODEX_HOME", &workspace.home)
-            .env("CODEX_THREAD_ID", LEAD_THREAD)
-            .env_remove("HARNESS_REFLECTION_SESSION")
-            .env_remove("HARNESS_EXECUTOR_SESSION")
-            .env_remove("HARNESS_BOUNDED_LEAD_SESSION")
-            .output()
-            .unwrap();
-        success(output)
-    };
-    let accepted = accept();
+fn prepare_ordinary_acceptance(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+    disable_before_accept: bool,
+    accept_source: Option<&Path>,
+) -> (ReflectionController, String, String, String, Value) {
+    let prepared = prepare_ordinary_acceptance_setup(
+        workspace,
+        manager,
+        source,
+        disable_before_accept,
+        accept_source,
+    );
+    let accepted = prepared.accept(workspace);
     assert_eq!(accepted["duplicate"], false);
     assert_eq!(accepted["status"], "accepted", "{accepted}");
     assert_eq!(accepted["purpose"], "ordinary", "{accepted}");
@@ -807,7 +1247,7 @@ fn prepare_ordinary_acceptance(
     assert_eq!(accepted["leadTurn"], LEAD_SOURCE_TURN);
     assert_eq!(accepted["executorTurn"], EXECUTOR_SOURCE_TURN);
     let acceptance = accepted["acceptanceId"].as_str().unwrap();
-    let repeated = accept();
+    let repeated = prepared.accept(workspace);
     assert_eq!(repeated["duplicate"], true);
     assert_eq!(repeated["acceptanceId"], acceptance);
     assert_eq!(
@@ -821,10 +1261,10 @@ fn prepare_ordinary_acceptance(
     assert_eq!(request_counts(workspace), (0, 0, 0, 0));
 
     (
-        controller,
-        task,
+        prepared.controller,
+        prepared.task,
         acceptance.to_owned(),
-        retained.result.unwrap().sha256,
+        prepared.retained_result,
         accepted,
     )
 }

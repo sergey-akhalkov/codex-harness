@@ -467,6 +467,72 @@ pub fn issue_metadata(issue: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+fn take_accepted_assignment(
+    bd: &Path,
+    project: &Path,
+    actor: &str,
+    task: &str,
+    issue: &Value,
+) -> io::Result<()> {
+    let assignee = issue
+        .get("assignee")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if assignee.is_empty() || assignee == actor {
+        return Ok(());
+    }
+    let status = issue
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if status.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("task {task} has no status for accepted-close ownership preparation"),
+        ));
+    }
+    json_ok_actor(
+        bd,
+        project,
+        actor,
+        &[
+            "update",
+            task,
+            "--assignee",
+            actor,
+            "--if-assignee",
+            assignee,
+            "--if-status",
+            status,
+            "--json",
+        ],
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "task {task} is assigned to {assignee} and could not be transferred to accepting lead {actor} without a forced claim; no acceptance metadata was written: {error}"
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+/// One refusal for an open task whose acceptance metadata may be an interrupted
+/// close or a reopened/cancelled task. Automatic recovery cannot distinguish
+/// those states, so both the automatic path and the board close guard use this
+/// guidance instead of rewriting durable evidence.
+pub fn open_acceptance_refusal(task: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "task {task} is open but already carries acceptance metadata. A reopened or cancelled task and an interrupted close after the metadata write have the same board state, so automatic acceptance will not rewrite or close it. Inspect `bd show {task}` and `bd history {task} --events`. Only after verifying an interrupted close, transfer it to the actual approving lead, close it with reason 'accepted' under that lead's board identity, and rerun `executor accept --run <recorded-run>`. Never use --force; use a fresh task for reopened or cancelled work."
+        ),
+    )
+}
+
 /// Records only the `harness.purpose` key on one board task. `bd update
 /// --set-metadata` is the existing per-key mutation; unrelated metadata stays
 /// on the issue, and the caller verifies the re-read answer before dispatch.
@@ -564,6 +630,10 @@ pub fn close_accepted(
             duplicate: true,
         });
     }
+    if issue_metadata(&before).contains_key(crate::delivery_reflection::ACCEPTANCE_METADATA) {
+        return Err(open_acceptance_refusal(task));
+    }
+    take_accepted_assignment(bd, project, actor, task, &before)?;
     for (key, value) in metadata {
         let pair = format!("{key}={value}");
         json_ok_actor(

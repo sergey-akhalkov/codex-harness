@@ -158,10 +158,7 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         return receipt(&request.task, purpose, &lead, &reflection, &accepted);
     }
     if board_cli::issue_metadata(&issue).contains_key(ACCEPTANCE_METADATA) {
-        return Err(invalid(&format!(
-            "board task {} is open but already carries acceptance metadata; a reopened or partially applied closure is ambiguous and is never overwritten",
-            request.task
-        )));
+        return Err(board_cli::open_acceptance_refusal(&request.task));
     }
     let config_source = if source.join("global/roles.toml").is_file() {
         source.clone()
