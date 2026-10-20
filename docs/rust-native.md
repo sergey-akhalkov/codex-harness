@@ -471,7 +471,15 @@ profiles and return address come from the existing owners. The normal lead
 acceptance producer binds the accepted work; callers must not invent those
 identities to make a task eligible. `delivery-improvement process --project
 CHECKOUT` processes one retained eligible acceptance through the same owner; it
-does not create acceptance. Unknown outcomes and source/binding drift require
+does not create acceptance. After correcting a native `thread/fork`
+configuration-load rejection, the same live managed lead can run this command
+to continue the retained acceptance. Recovery requires the acknowledged
+`-32600` rejection and evidence that no fork, turn or model work existed.
+It preserves the failed attempt and its artifacts, reconciles only the proven
+zero model usage and work, and consumes the next finite attempt. Automatic
+processing never retries this rejection. Transport failures, incomplete
+evidence and already submitted turns do not qualify for this recovery.
+Other unknown outcomes and source/binding drift require
 reconciliation rather than repeated model calls. The independent skill drafts
 remain outside discovery in `.agents/skill-candidates` until evaluation allows
 publication. No comparison benefit is established by the model-free checks.
