@@ -1088,6 +1088,27 @@ pub enum Reply {
     Unanswered,
 }
 
+/// The server's own acknowledged refusal of a `thread/fork` request.
+///
+/// This is deliberately narrower than [`Reply::Rejected`]: it exists only for
+/// the one request whose refusal proves that no fork and no model turn were
+/// created. An unanswered request or a transport failure stays an ordinary
+/// timeout/error because neither establishes the absence of model work.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForkRejected(pub Value);
+
+impl std::fmt::Display for ForkRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the native request thread/fork was rejected: {}",
+            excerpt(&self.0.to_string(), 400)
+        )
+    }
+}
+
+impl std::error::Error for ForkRejected {}
+
 /// The final assistant message of a thread, or why it is absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalMessage {
@@ -1403,16 +1424,13 @@ impl Conversation {
         let source_apps_before = app_catalogue(&mut conversation, None)?;
         let suppressed_mcp_servers = inherited_mcp_servers(&source_mcp_before)?;
         let suppressed_apps = enabled_app_ids(&source_apps_before)?;
-        let forked = conversation.call(
-            "thread/fork",
-            fork_params(
-                plan,
-                source_thread,
-                source_last_turn,
-                &suppressed_mcp_servers,
-                &suppressed_apps,
-            )?,
-        )?;
+        let forked = conversation.fork_request(fork_params(
+            plan,
+            source_thread,
+            source_last_turn,
+            &suppressed_mcp_servers,
+            &suppressed_apps,
+        )?)?;
         let fork_thread = forked["thread"]["id"]
             .as_str()
             .filter(|id| !id.is_empty())
@@ -1803,6 +1821,24 @@ impl Conversation {
             self.turn = Some(turn.clone());
         }
         Ok(turn)
+    }
+
+    /// Starts the one native fork request whose acknowledged refusal proves
+    /// that no fork and no turn were created. A rejection carries the server's
+    /// exact error object as [`ForkRejected`]; an unanswered request remains a
+    /// timeout with unknown conversation state.
+    fn fork_request(&mut self, params: Value) -> io::Result<Value> {
+        match self.request("thread/fork", params)? {
+            Reply::Result(result) => Ok(result),
+            Reply::Rejected(error) => Err(io::Error::other(ForkRejected(error))),
+            Reply::Unanswered => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the native request thread/fork was not answered within {:?}; the conversation state is unknown and must not be reported as progress",
+                    self.bound
+                ),
+            )),
+        }
     }
 
     /// Sends one bounded native request and returns its `result`.

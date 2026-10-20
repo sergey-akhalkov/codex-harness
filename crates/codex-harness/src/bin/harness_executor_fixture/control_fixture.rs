@@ -1035,6 +1035,15 @@ fn reflection_answer(state: &mut ReflectionState, notifier: &Notifier, request: 
                     "message": "the reflection fork does not name the exact source boundary"
                 }));
             }
+            if state.outcome == "fork-rejected" {
+                // The exact acknowledged refusal the retained live artifact
+                // carries: the server rejected the request before creating a
+                // fork, so no fork or turn identity exists.
+                return Answer::Error(json!({
+                    "code": -32600,
+                    "message": "failed to load configuration: Model provider `deepseek` not found"
+                }));
+            }
             state.forked = true;
             state.record_fork(params);
             let mut route = state.route(params);

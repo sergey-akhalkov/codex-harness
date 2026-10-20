@@ -78,6 +78,8 @@ const FORK_CONTEXT_BASIS: &str = "serialized fork thread record returned by the 
 
 const EXECUTOR_STAGE: &str = "executor-self-reflection";
 const LEAD_STAGE: &str = "lead-self-reflection";
+const FORK_REJECTION_PREFIX: &str = "the native request thread/fork was rejected: ";
+const CONFIGURATION_LOAD_REJECTION_PREFIX: &str = "failed to load configuration:";
 
 fn invalid(message: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("self-reflection: {message}"))
@@ -249,6 +251,11 @@ pub(crate) struct StageState {
     source_context_bytes: u64,
     #[serde(default)]
     budget_pause: Option<BudgetPause>,
+    /// The server's exact acknowledged `thread/fork` error. It is retained only
+    /// when the native request was refused before any fork or turn existed, so
+    /// an explicit recovery can prove that no model work was performed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork_rejection: Option<Value>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -295,6 +302,7 @@ impl StageState {
             context_basis: None,
             source_context_bytes: 0,
             budget_pause: None,
+            fork_rejection: None,
             error: None,
             updated_ms: now_ms(),
         }
@@ -2126,6 +2134,10 @@ fn run_stage(
             Ok(started) => started,
             Err(error) => {
                 state.status = StageStatus::Failed;
+                state.fork_rejection = error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<control::ForkRejected>())
+                    .map(|rejection| rejection.0.clone());
                 state.error = Some(error.to_string());
                 state.updated_ms = now_ms();
                 persist(state_path, &state)?;
@@ -2606,6 +2618,108 @@ fn validate_stage(
         ));
     }
     Ok(())
+}
+
+/// Returns the exact acknowledged `thread/fork` rejection only when the
+/// retained native evidence proves that no fork, turn, result or usage was
+/// created. An unanswered request, a transport failure or any later stage
+/// state is refused: an ambiguous outcome must never be reconciled as zero
+/// model work.
+fn pre_fork_rejection(state: &StageState) -> io::Result<Value> {
+    let refusal = || {
+        invalid(format!(
+            "the retained {} evidence is not an acknowledged native thread/fork rejection before any fork or turn: status={} fork={} turn={} usageKnown={} workKnown={}",
+            state.stage,
+            status_name(state.status),
+            state.fork.is_some(),
+            state.turn_id.is_some(),
+            state.usage_known,
+            state.work_known,
+        ))
+    };
+    if state.status != StageStatus::Failed
+        || state.fork.is_some()
+        || state.turn_id.is_some()
+        || state.result_state.is_some()
+        || state.result.is_some()
+        || state.usage_known
+        || state.usage_unknown_reason.is_some()
+        || !state.usage.values().all(Option::is_none)
+        || !state.matched_response_ids.is_empty()
+        || !state.copied_source_turns.is_empty()
+        || state.cumulative_thread.is_some()
+        || state.coverage.is_some()
+        || state.rollout.is_some()
+        || state.work != StageWork::default()
+        || state.work_known
+        || state.work_unknown_reason.is_some()
+        || state.context_basis.is_some()
+        || state.source_context_bytes != 0
+        || state.budget_pause.is_some()
+    {
+        return Err(refusal());
+    }
+    let error = state.error.as_deref().ok_or_else(refusal)?;
+    let suffix = error
+        .strip_prefix(FORK_REJECTION_PREFIX)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the retained {} stage failure is not an acknowledged native thread/fork rejection: {error}",
+                state.stage
+            ))
+        })?;
+    let parsed_suffix = serde_json::from_str::<Value>(suffix).ok();
+    let rejection = match (&state.fork_rejection, parsed_suffix) {
+        (Some(rejection), Some(parsed)) if rejection == &parsed => rejection.clone(),
+        (Some(_), Some(_)) => {
+            return Err(invalid(format!(
+                "the retained {} stage failure and its typed native thread/fork rejection disagree: {suffix}",
+                state.stage
+            )));
+        }
+        (Some(rejection), None) => {
+            let raw = rejection.to_string();
+            let matches = match suffix.strip_suffix("...") {
+                Some(prefix) => raw.starts_with(prefix),
+                None => raw == suffix,
+            };
+            if !matches {
+                return Err(invalid(format!(
+                    "the retained {} stage failure is not the typed native thread/fork rejection: {suffix}",
+                    state.stage
+                )));
+            }
+            rejection.clone()
+        }
+        (None, Some(parsed)) => parsed,
+        (None, None) => {
+            return Err(invalid(format!(
+                "the retained {} stage failure carries no complete native rejection object: {suffix}; no usage or work was reconciled",
+                state.stage
+            )));
+        }
+    };
+    let object = rejection.as_object().ok_or_else(|| {
+        invalid(format!(
+            "the retained {} native thread/fork rejection is not a JSON object: {rejection}",
+            state.stage
+        ))
+    })?;
+    let code = object.get("code").and_then(Value::as_i64);
+    let message = object.get("message").and_then(Value::as_str);
+    match (code, message) {
+        (Some(-32600), Some(message))
+            if message
+                .strip_prefix(CONFIGURATION_LOAD_REJECTION_PREFIX)
+                .is_some_and(|detail| !detail.trim().is_empty()) =>
+        {
+            Ok(rejection)
+        }
+        _ => Err(invalid(format!(
+            "the retained {} native thread/fork rejection is not the acknowledged -32600 configuration-load failure: {rejection}",
+            state.stage
+        ))),
+    }
 }
 
 fn reconcile_submitted(
@@ -4264,5 +4378,129 @@ stream_max_retries = 0
             error.to_string().contains("leaves reasoningEffort unset"),
             "an unverifiable declared effort must refuse: {error}"
         );
+    }
+
+    fn pre_fork_state(error: String, fork_rejection: Option<Value>) -> StageState {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let role = Role::ExecutorSelfReflection;
+        let declaration = stage_declaration(
+            role,
+            "retained-revision",
+            "ds",
+            "deepseek-flash",
+            "deepseek",
+            "max",
+            root.path(),
+        );
+        let chain = chain_state(root.path(), &home, declaration.clone(), declaration.clone());
+        let source = Boundary {
+            thread: "retained-source".to_owned(),
+            last_turn: "retained-turn".to_owned(),
+        };
+        let mut state = StageState::new(
+            &chain,
+            &declaration,
+            &source,
+            "retained reflection".to_owned(),
+        );
+        state.status = StageStatus::Failed;
+        state.error = Some(error);
+        state.fork_rejection = fork_rejection;
+        state
+    }
+
+    #[test]
+    fn pre_fork_rejection_accepts_only_the_exact_acknowledged_error() {
+        let rejection = json!({
+            "code": -32600,
+            "message": "failed to load configuration: Model provider `deepseek` not found"
+        });
+        let exact = format!("{FORK_REJECTION_PREFIX}{rejection}");
+        assert_eq!(
+            pre_fork_rejection(&pre_fork_state(exact.clone(), None)).unwrap(),
+            rejection
+        );
+        assert_eq!(
+            pre_fork_rejection(&pre_fork_state(exact, Some(rejection.clone()))).unwrap(),
+            rejection
+        );
+        let generic = json!({"code": -32600, "message": "provider unavailable"});
+        assert!(
+            pre_fork_rejection(&pre_fork_state(
+                format!("{FORK_REJECTION_PREFIX}{generic}"),
+                None,
+            ))
+            .is_err(),
+            "a non-configuration rejection must not establish that no model work ran"
+        );
+        let wrong_code = json!({
+            "code": -32603,
+            "message": "failed to load configuration: Model provider `deepseek` not found"
+        });
+        assert!(
+            pre_fork_rejection(&pre_fork_state(
+                format!("{FORK_REJECTION_PREFIX}{wrong_code}"),
+                None,
+            ))
+            .is_err(),
+            "only the acknowledged invalid-request code is a fork rejection"
+        );
+    }
+
+    #[test]
+    fn pre_fork_rejection_refuses_transport_and_incomplete_evidence() {
+        let transport = "the native request thread/fork was not answered within 20s; the conversation state is unknown".to_owned();
+        assert!(pre_fork_rejection(&pre_fork_state(transport, None)).is_err());
+
+        let truncated =
+            format!("{FORK_REJECTION_PREFIX}{{\"code\":-32600,\"message\":\"incomplete");
+        assert!(pre_fork_rejection(&pre_fork_state(truncated, None)).is_err());
+
+        let trailing = format!(
+            "{FORK_REJECTION_PREFIX}{} trailing",
+            json!({"code": -32600, "message": "provider unavailable"})
+        );
+        assert!(pre_fork_rejection(&pre_fork_state(trailing, None)).is_err());
+    }
+
+    #[test]
+    fn pre_fork_rejection_refuses_malformed_contradictory_or_later_evidence() {
+        let rejection = json!({
+            "code": -32600,
+            "message": "failed to load configuration: Model provider `deepseek` not found"
+        });
+        let exact = format!("{FORK_REJECTION_PREFIX}{rejection}");
+
+        assert!(
+            pre_fork_rejection(&pre_fork_state(
+                exact.clone(),
+                Some(json!({"code": -32600, "message": "different refusal"})),
+            ))
+            .is_err()
+        );
+        assert!(
+            pre_fork_rejection(&pre_fork_state(
+                format!("{FORK_REJECTION_PREFIX}{{\"code\":\"-32600\",\"message\":\"provider unavailable\"}}"),
+                None,
+            ))
+            .is_err()
+        );
+        assert!(
+            pre_fork_rejection(&pre_fork_state(
+                format!("{FORK_REJECTION_PREFIX}{{\"code\":-32600,\"message\":\"failed to load configuration:   \"}}"),
+                None,
+            ))
+            .is_err()
+        );
+
+        let mut later_turn = pre_fork_state(exact.clone(), None);
+        later_turn.turn_id = Some("retained-turn-id".to_owned());
+        assert!(pre_fork_rejection(&later_turn).is_err());
+
+        let mut later_usage = pre_fork_state(exact, None);
+        later_usage.usage_known = true;
+        assert!(pre_fork_rejection(&later_usage).is_err());
     }
 }
