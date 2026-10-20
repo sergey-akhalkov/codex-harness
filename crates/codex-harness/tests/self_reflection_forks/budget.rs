@@ -674,8 +674,8 @@ fn installed_continuation_resumes_the_exact_pause_without_resetting_costs() {
         ..ReflectionLimits::default()
     };
     let (controller, request, acceptance) = accepted_with_limits(&workspace, limits);
-    install_fixture(&workspace);
     assert_eq!(&request["acceptance"], &json!(acceptance));
+    install_fixture(&workspace);
 
     let paused = delivery_cli(
         &workspace,
@@ -855,6 +855,352 @@ fn installed_continuation_resumes_the_exact_pause_without_resetting_costs() {
     let raised = controller.stored_state().unwrap().unwrap().limits;
     assert_eq!(raised.max_investigations_per_stage, 4);
     assert_eq!(raised.max_investigations_per_record, 8);
+}
+
+#[test]
+fn installed_pre_turn_context_continuation_resumes_exact_fork_and_charges_once() {
+    let workspace = Workspace::new("budget-cli-pre-turn-context", LeadMode::Delivered);
+    let limits = ReflectionLimits {
+        max_attempts_per_stage: 1,
+        max_turns_per_stage: 1,
+        max_tokens_per_stage: 240,
+        max_tokens_per_record: 480,
+        max_investigations_per_stage: 1,
+        max_investigations_per_record: 2,
+        max_context_bytes_per_stage: 1,
+        max_context_bytes_per_record: 1_000_000,
+        ..ReflectionLimits::default()
+    };
+    let (controller, request, acceptance) = accepted_with_limits(&workspace, limits);
+    assert_eq!(&request["acceptance"], &json!(acceptance));
+    install_fixture(&workspace);
+    let state_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&acceptance);
+
+    let paused = delivery_cli(
+        &workspace,
+        "process",
+        &[],
+        0,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&paused, "stage_context_bytes observed");
+    assert_eq!(request_counts(&workspace), (1, 0, 0, 0));
+    let native = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(native["status"], json!("budget-paused"), "{native}");
+    assert_eq!(native["turnId"], Value::Null, "{native}");
+    assert_eq!(
+        native["fork"]["forkThread"],
+        json!(EXECUTOR_FORK),
+        "{native}"
+    );
+    let source_context_bytes = native["sourceContextBytes"].as_u64().unwrap();
+    assert!(source_context_bytes > 0, "{native}");
+    assert_eq!(
+        native["work"]["context_bytes"],
+        json!(source_context_bytes),
+        "{native}"
+    );
+    let paused_record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(paused_record.executor.state, StageState::Blocked);
+    assert_eq!(paused_record.executor.usage.attempts, 1);
+    assert_eq!(paused_record.executor.usage.turns, 0);
+    assert_eq!(
+        paused_record.executor.usage.context_bytes,
+        source_context_bytes
+    );
+    assert_eq!(
+        paused_record.binding.executor_turn.as_deref(),
+        Some(EXECUTOR_SOURCE_TURN),
+        "the continuation changed the accepted executor source turn"
+    );
+
+    let unchanged = delivery_cli(
+        &workspace,
+        "continue",
+        &["--acceptance", &acceptance, "--stage", "executor"],
+        0,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_refused(&unchanged, "--max-context-bytes-per-stage");
+    assert!(
+        unchanged.transcript.contains("nothing was changed"),
+        "{}",
+        unchanged.transcript
+    );
+    assert_eq!(request_counts(&workspace), (1, 0, 0, 0));
+    assert_eq!(read_json(&state_dir.join("executor-stage.json")), native);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        paused_record
+    );
+
+    let raised_context_bytes = source_context_bytes.saturating_add(1).to_string();
+    // A retained zero-turn pause may resume only through the routing it
+    // declared. Drift in the installed profile must refuse before the ledger
+    // transition or any native request, rather than reforking under a new
+    // model or marking the exact pause unknown.
+    let profile_path = workspace.home.join(format!("{PROFILE}.config.toml"));
+    let profile = fs::read_to_string(&profile_path).unwrap();
+    fs::write(&profile_path, profile.replacen(MODEL, "drifted-model", 1)).unwrap();
+    let drifted = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "executor",
+            "--max-context-bytes-per-stage",
+            &raised_context_bytes,
+        ],
+        0,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    fs::write(&profile_path, &profile).unwrap();
+    assert_refused(&drifted, "refusing to resume a drifted native attempt");
+    assert!(
+        drifted.transcript.contains("nothing was changed"),
+        "{}",
+        drifted.transcript
+    );
+    assert_eq!(request_counts(&workspace), (1, 0, 0, 0));
+    assert_eq!(read_json(&state_dir.join("executor-stage.json")), native);
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        paused_record
+    );
+
+    let continued = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "executor",
+            "--max-context-bytes-per-stage",
+            &raised_context_bytes,
+        ],
+        0,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    // The executor continuation completes its original fork. The lead stage
+    // then forks with its own larger supplied context and pauses before its
+    // first turn under the same per-stage byte allowance.
+    assert_refused(&continued, "stage_context_bytes observed");
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 0));
+    let resumes = fixture_requests(&workspace, "executor-self-reflection", "thread/resume");
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    assert_eq!(
+        resumes[0]["params"]["threadId"], EXECUTOR_FORK,
+        "{resumes:?}"
+    );
+    assert!(
+        fixture_requests(&workspace, "executor-self-reflection", "thread/start").is_empty(),
+        "continuation started a replacement thread"
+    );
+
+    let completed = read_json(&state_dir.join("executor-stage.json"));
+    assert_eq!(completed["status"], json!("completed"), "{completed}");
+    assert_eq!(
+        completed["fork"]["forkThread"],
+        json!(EXECUTOR_FORK),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["turnId"],
+        json!(EXECUTOR_FORK_TURN),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["sourceThread"],
+        json!(EXECUTOR_SOURCE),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["sourceLastTurn"],
+        json!(EXECUTOR_SOURCE_TURN),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["copiedSourceTurns"],
+        json!([EXECUTOR_SOURCE_TURN]),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["sourceContextBytes"],
+        json!(source_context_bytes),
+        "{completed}"
+    );
+    assert_eq!(
+        completed["work"]["context_bytes"],
+        json!(0),
+        "the resumed turn must not charge the fork's supplied source context again: {completed}"
+    );
+    assert_eq!(completed["budgetPause"], Value::Null, "{completed}");
+
+    let after_executor = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(after_executor.executor.state, StageState::Retained);
+    assert_eq!(after_executor.executor.usage.attempts, 1);
+    assert_eq!(after_executor.executor.usage.turns, 1);
+    assert_eq!(after_executor.executor.usage.tokens, 120);
+    assert_eq!(after_executor.executor.usage.investigations, 0);
+    assert_eq!(
+        after_executor.executor.usage.context_bytes, source_context_bytes,
+        "the original source context is charged exactly once"
+    );
+    assert!(after_executor.executor.pause.is_none());
+    assert_eq!(after_executor.executor.usage.last_error, None);
+    assert_eq!(
+        after_executor.binding.executor_turn.as_deref(),
+        Some(EXECUTOR_SOURCE_TURN)
+    );
+    assert_eq!(after_executor.lead.state, StageState::Blocked);
+    assert_eq!(after_executor.lead.usage.attempts, 1);
+    assert_eq!(after_executor.lead.usage.turns, 0);
+    let lead_context_bytes = after_executor.lead.usage.context_bytes;
+    assert!(
+        lead_context_bytes > source_context_bytes,
+        "{after_executor:?}"
+    );
+    assert_eq!(
+        after_executor.lead.pause.as_ref().unwrap().observed,
+        lead_context_bytes
+    );
+
+    let lead_native = read_json(&state_dir.join("lead-stage.json"));
+    assert_eq!(
+        lead_native["status"],
+        json!("budget-paused"),
+        "{lead_native}"
+    );
+    assert_eq!(lead_native["turnId"], Value::Null, "{lead_native}");
+    assert_eq!(
+        lead_native["fork"]["forkThread"],
+        json!(LEAD_FORK),
+        "{lead_native}"
+    );
+    assert_eq!(
+        lead_native["sourceContextBytes"],
+        json!(lead_context_bytes),
+        "{lead_native}"
+    );
+    assert_eq!(
+        lead_native["work"]["context_bytes"],
+        json!(lead_context_bytes),
+        "{lead_native}"
+    );
+
+    let raised_lead_bytes = lead_context_bytes.saturating_add(1).to_string();
+    let lead_continued = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "lead",
+            "--max-context-bytes-per-stage",
+            &raised_lead_bytes,
+        ],
+        0,
+        LEAD_FORK,
+        LEAD_FORK_TURN,
+    );
+    assert_eq!(
+        lead_continued.outcome.exit_code, 0,
+        "{}",
+        lead_continued.transcript
+    );
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    let lead_resumes = fixture_requests(&workspace, "lead-self-reflection", "thread/resume");
+    assert_eq!(lead_resumes.len(), 1, "{lead_resumes:?}");
+    assert_eq!(
+        lead_resumes[0]["params"]["threadId"], LEAD_FORK,
+        "{lead_resumes:?}"
+    );
+    assert!(
+        fixture_requests(&workspace, "lead-self-reflection", "thread/start").is_empty(),
+        "lead continuation started a replacement thread"
+    );
+    let lead_completed = read_json(&state_dir.join("lead-stage.json"));
+    assert_eq!(
+        lead_completed["status"],
+        json!("completed"),
+        "{lead_completed}"
+    );
+    assert_eq!(
+        lead_completed["fork"]["forkThread"],
+        json!(LEAD_FORK),
+        "{lead_completed}"
+    );
+    assert_eq!(
+        lead_completed["turnId"],
+        json!(LEAD_FORK_TURN),
+        "{lead_completed}"
+    );
+    assert_eq!(
+        lead_completed["sourceContextBytes"],
+        json!(lead_context_bytes),
+        "{lead_completed}"
+    );
+    assert_eq!(
+        lead_completed["work"]["context_bytes"],
+        json!(0),
+        "the lead continuation must not charge supplied context again: {lead_completed}"
+    );
+    assert_eq!(
+        lead_completed["budgetPause"],
+        Value::Null,
+        "{lead_completed}"
+    );
+
+    let final_record = controller.record(&acceptance).unwrap().unwrap();
+    assert_eq!(final_record.executor, after_executor.executor);
+    assert_eq!(final_record.lead.state, StageState::Retained);
+    assert_eq!(final_record.lead.usage.attempts, 1);
+    assert_eq!(final_record.lead.usage.turns, 1);
+    assert_eq!(final_record.lead.usage.tokens, 240);
+    assert_eq!(final_record.lead.usage.investigations, 0);
+    assert_eq!(final_record.lead.usage.context_bytes, lead_context_bytes);
+    assert!(final_record.lead.pause.is_none());
+    assert_eq!(final_record.lead.usage.last_error, None);
+    assert_eq!(final_record.delivery, DeliveryState::Consumed);
+    assert_eq!(final_record.usage_totals().attempts, 2);
+    assert_eq!(
+        final_record.usage_totals().context_bytes,
+        source_context_bytes.saturating_add(lead_context_bytes)
+    );
+
+    let repeated = delivery_cli(
+        &workspace,
+        "continue",
+        &[
+            "--acceptance",
+            &acceptance,
+            "--stage",
+            "executor",
+            "--max-context-bytes-per-stage",
+            &raised_context_bytes,
+        ],
+        0,
+        EXECUTOR_FORK,
+        EXECUTOR_FORK_TURN,
+    );
+    assert_ne!(repeated.outcome.exit_code, 0, "{}", repeated.transcript);
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(
+        controller.record(&acceptance).unwrap().unwrap(),
+        final_record
+    );
 }
 
 #[test]

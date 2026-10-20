@@ -3,7 +3,7 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    DeliveryState as RecordedDeliveryState, LifecycleStatus, ReflectionController,
+    BudgetLimit, DeliveryState as RecordedDeliveryState, LifecycleStatus, ReflectionController,
     ReflectionRecord, Stage, StageAdmission, StageRecord, StageState as RecordedStageState,
     UsageDelta,
 };
@@ -154,6 +154,111 @@ fn stage_state_path(state_dir: &Path, stage: Stage) -> PathBuf {
         Stage::Executor => "executor-stage.json",
         Stage::Lead => "lead-stage.json",
     })
+}
+
+/// Proves that the retained blocked stage is its original fork paused before
+/// the first turn. Only this shape may resume the existing attempt; a pause
+/// after a submitted turn, a missing native artifact or any identity drift
+/// keeps the ordinary explicit-retry path.
+pub(super) fn resumable_pre_turn_pause(
+    controller: &ReflectionController,
+    record: &ReflectionRecord,
+    stage: Stage,
+    declaration: &StageDeclaration,
+) -> io::Result<bool> {
+    let recorded = recorded_stage(record, stage);
+    if recorded.state != RecordedStageState::Blocked || recorded.pause.is_none() {
+        return Ok(false);
+    }
+    let state_dir = controller
+        .state_file()?
+        .with_extension("")
+        .join(&record.acceptance_id);
+    let path = stage_state_path(&state_dir, stage);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let native: StageState = read_json(&path, MAX_REQUEST_BYTES)?;
+    let (role, source_thread, source_turn) = match stage {
+        Stage::Executor => (
+            EXECUTOR_STAGE,
+            record.binding.executor_session.as_deref(),
+            record.binding.executor_turn.as_deref(),
+        ),
+        Stage::Lead => (
+            LEAD_STAGE,
+            Some(record.binding.lead_session.as_str()),
+            record.binding.lead_turn.as_deref(),
+        ),
+    };
+    let (Some(source_thread), Some(source_turn)) = (source_thread, source_turn) else {
+        return Ok(false);
+    };
+    let usage = stage_usage_delta(&native);
+    let pre_turn_pause = native.stage == role
+        && native.task == record.binding.task
+        && native.run == record.binding.run
+        && native.acceptance == record.acceptance_id
+        && native.source_thread == source_thread
+        && native.source_last_turn == source_turn
+        && native.status == StageStatus::BudgetPaused
+        && native.turn_id.is_none()
+        && native.fork.is_some()
+        && native.budget_pause.as_ref().is_some_and(|pause| {
+            matches!(
+                pause.limit,
+                BudgetLimit::StageContextBytes | BudgetLimit::RecordContextBytes
+            )
+        })
+        && native.usage_known
+        && usage.turns == 0
+        && usage.tokens == 0
+        && native.work_known
+        && native.source_context_bytes > 0
+        && native.work.context_bytes == native.source_context_bytes
+        && recorded.usage.attempts >= 1
+        && recorded.usage.turns == 0
+        && recorded.usage.tokens == 0
+        && recorded.usage.investigations == 0
+        && recorded.usage.context_bytes == native.source_context_bytes;
+    if !pre_turn_pause {
+        return Ok(false);
+    }
+    let (Some(executor_session), Some(executor_turn), Some(lead_turn)) = (
+        record.binding.executor_session.as_deref(),
+        record.binding.executor_turn.as_deref(),
+        record.binding.lead_turn.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    let executor_source = Boundary {
+        thread: executor_session.to_owned(),
+        last_turn: executor_turn.to_owned(),
+    };
+    let lead_source = Boundary {
+        thread: record.binding.lead_session.clone(),
+        last_turn: lead_turn.to_owned(),
+    };
+    let visible_title = stage_visible_title(
+        declaration,
+        &record.binding.task,
+        &record.binding.run,
+        &executor_source,
+        &lead_source,
+    );
+    if native.role_revision != declaration.revision
+        || native.profile != declaration.profile
+        || native.model != declaration.model
+        || native.provider != declaration.provider
+        || native.effort != declaration.effort
+        || native.visible_title != visible_title
+    {
+        return Err(invalid(format!(
+            "the retained zero-turn {} pause names a different role revision, model, provider, effort or visible identity than the current accepted-stage declaration; refusing to resume a drifted native attempt; nothing was changed",
+            stage.as_str()
+        )));
+    }
+    Ok(true)
 }
 
 /// An unknown stage whose ledger records no model work at all. Only this shape
@@ -472,7 +577,12 @@ fn run_recorded_stage(
                     && native.turn_id.is_none()
                     && native.fork.is_some()
             });
-            if pre_submission_loss_retained
+            let pre_turn_pause_retained = native.as_ref().is_some_and(|native| {
+                native.status == StageStatus::BudgetPaused
+                    && native.turn_id.is_none()
+                    && native.fork.is_some()
+            });
+            if (pre_submission_loss_retained || pre_turn_pause_retained)
                 && (starts_new_attempt || recorded.state == RecordedStageState::InFlight)
             {
                 // The exact fork is known and no turn was submitted. Keep the

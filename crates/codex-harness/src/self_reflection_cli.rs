@@ -251,6 +251,11 @@ pub(crate) struct StageState {
     source_context_bytes: u64,
     #[serde(default)]
     budget_pause: Option<BudgetPause>,
+    /// The supplied fork context is already included in the accepted work
+    /// recorded for this existing attempt. Native evidence keeps the measured
+    /// source bytes, while later work deltas must not charge them again.
+    #[serde(default)]
+    source_context_accounted: bool,
     /// The server's exact acknowledged `thread/fork` error. It is retained only
     /// when the native request was refused before any fork or turn existed, so
     /// an explicit recovery can prove that no model work was performed.
@@ -302,6 +307,7 @@ impl StageState {
             context_basis: None,
             source_context_bytes: 0,
             budget_pause: None,
+            source_context_accounted: false,
             fork_rejection: None,
             error: None,
             updated_ms: now_ms(),
@@ -1195,17 +1201,12 @@ fn prepare_stage(
         },
     )?;
     require_route(&binding, declaration, role)?;
-    let visible_title = format!(
-        "{} {} | profile={} provider={} model={} effort={} | task={} run={} checkpoint={}",
-        role.label(),
-        declaration.title,
-        binding.profile,
-        binding.model_provider.as_deref().unwrap_or_default(),
-        binding.model.as_deref().unwrap_or_default(),
-        binding.reasoning_effort.as_deref().unwrap_or_default(),
-        chain.task,
-        chain.run,
-        source_checkpoint(&chain.executor_source, &chain.lead_source)
+    let visible_title = stage_visible_title(
+        declaration,
+        &chain.task,
+        &chain.run,
+        &chain.executor_source,
+        &chain.lead_source,
     );
     let native_title = native_reflection_title(role, &binding, &chain.run);
     Ok(PreparedStage {
@@ -1215,6 +1216,25 @@ fn prepare_stage(
         visible_title,
         native_title,
     })
+}
+
+fn stage_visible_title(
+    declaration: &StageDeclaration,
+    task: &str,
+    run: &str,
+    executor: &Boundary,
+    lead: &Boundary,
+) -> String {
+    format!(
+        "{} {} | profile={} provider={} model={} effort={} | task={task} run={run} checkpoint={}",
+        declaration.role,
+        declaration.title,
+        declaration.profile,
+        declaration.provider,
+        declaration.model,
+        declaration.effort,
+        source_checkpoint(executor, lead)
+    )
 }
 
 fn source_checkpoint(executor: &Boundary, lead: &Boundary) -> String {
@@ -2161,8 +2181,10 @@ fn run_stage(
             admission,
         );
     }
-    if state.status == StageStatus::VisibilityLost
-        && state.turn_id.is_none()
+    if matches!(
+        state.status,
+        StageStatus::VisibilityLost | StageStatus::BudgetPaused
+    ) && state.turn_id.is_none()
         && state.fork.is_some()
     {
         return recover_pre_submission(
@@ -2504,10 +2526,11 @@ fn drive_submitted_stage(
     outcome
 }
 
-/// Resumes the exact known fork after a pre-submission surface loss, verifies
-/// its replacement surface, and only then admits the initial turn once. The
-/// fork identity and measured work are retained; this function never forks
-/// again and never replays a turn whose submission was not established.
+/// Resumes the exact known fork after a pre-submission surface loss or budget
+/// pause, verifies its replacement surface, and only then admits the initial
+/// turn once. The fork identity and measured work are retained; this function
+/// never forks again and never replays a turn whose submission was not
+/// established.
 fn recover_pre_submission(
     chain: &ChainState,
     stage: Stage,
@@ -2532,6 +2555,21 @@ fn recover_pre_submission(
         ))
     })?;
     ensure_admission_available(admission)?;
+    if state.status == StageStatus::BudgetPaused {
+        // The accepted budget pause already charged this attempt's measured
+        // source context. Keep the measurement as evidence, but return only
+        // the resumed turn's delta so the same context is not charged again.
+        if !state.source_context_accounted {
+            state.work.context_bytes = state
+                .work
+                .context_bytes
+                .saturating_sub(state.source_context_bytes);
+            state.source_context_accounted = true;
+        }
+        state.budget_pause = None;
+        state.updated_ms = now_ms();
+        persist(state_path, &state)?;
+    }
     let retain_lost = |mut state: StageState, cause: String| -> io::Result<StageState> {
         state.error = Some(format!(
             "pre-submission reflection recovery for retained fork {fork_thread} did not restore visibility: {cause}. No turn was submitted; the exact fork remains retryable through the ordinary process"
@@ -3464,6 +3502,7 @@ fn retain_completed(
         "copied source turns retained as evidence, not newly charged: {}",
         state.copied_source_turns.len()
     ));
+    state.budget_pause = None;
     if let Some(pause) = admission.and_then(|admission| {
         work_budget_pause(chain, stage, admission, stage_work(&state), evidence)
     }) {
@@ -3498,6 +3537,11 @@ fn retain_completed(
 
 fn apply_usage(state: &mut StageState, usage: UsageRetention) {
     let source_context_bytes = state.source_context_bytes;
+    let charged_source_context = if state.source_context_accounted {
+        0
+    } else {
+        source_context_bytes
+    };
     state.usage = usage.usage;
     state.usage_known = usage.known;
     state.usage_unknown_reason = usage.unknown_reason;
@@ -3511,7 +3555,7 @@ fn apply_usage(state: &mut StageState, usage: UsageRetention) {
         context_bytes: usage
             .work
             .context_bytes
-            .saturating_add(source_context_bytes),
+            .saturating_add(charged_source_context),
     };
     state.work_known = usage.work_known;
     state.work_unknown_reason = usage.work_unknown_reason;

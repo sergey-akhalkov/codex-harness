@@ -921,11 +921,16 @@ fn continuation(
     })?;
     validate_reconciliation(continuation, stage_name, slot)?;
     let limits = raised_limits(continuation, &state.limits, pause, stage_name)?;
-    validate_projected_admission(&record, slot, &limits, continuation)?;
     // Stage routing and the exact accepted boundaries are validated before any
     // retained state changes. The continuation then executes only this
     // acceptance through the same accepted-stage controller as `process`.
     let request = request(options, controller, &record, lead)?;
+    let declaration = match stage {
+        Stage::Executor => &request.executor_stage,
+        Stage::Lead => &request.lead_stage,
+    };
+    let same_attempt = accepted::resumable_pre_turn_pause(controller, &record, stage, declaration)?;
+    validate_projected_admission(&record, slot, &limits, continuation, same_attempt)?;
     controller.retain_owner_process(lead, owner_process)?;
 
     if let Some(usage) = continuation.usage {
@@ -937,7 +942,11 @@ fn continuation(
     if !continuation.limits.is_empty() {
         controller.configure_limits(&limits)?;
     }
-    controller.retry_stage(acceptance, stage)?;
+    if same_attempt {
+        controller.continue_stage(acceptance, stage)?;
+    } else {
+        controller.retry_stage(acceptance, stage)?;
+    }
     accepted::execute(request, &options.project)
 }
 
@@ -1030,6 +1039,7 @@ fn validate_projected_admission(
     slot: &StageRecord,
     limits: &ReflectionLimits,
     continuation: &Continuation,
+    same_attempt: bool,
 ) -> io::Result<()> {
     let usage = continuation.usage.unwrap_or_default();
     let work = continuation.work.unwrap_or_default();
@@ -1047,11 +1057,11 @@ fn validate_projected_admission(
     let stage_name = stage_arg(continuation.stage);
     let refusal = |flag: &str, observed: u64, scope: &str| {
         invalid(format!(
-            "continuing {stage_name} reflection would admit no new attempt: {scope} observed {observed} leaves no allowance; set --{flag} above {observed} (at least {}) and keep the record floor at or above the stage value; nothing was changed",
+            "continuing {stage_name} reflection would admit no usable work: {scope} observed {observed} leaves no allowance; set --{flag} above {observed} (at least {}) and keep the record floor at or above the stage value; nothing was changed",
             observed.saturating_add(1)
         ))
     };
-    if u64::from(slot.usage.attempts) >= u64::from(limits.max_attempts_per_stage) {
+    if !same_attempt && u64::from(slot.usage.attempts) >= u64::from(limits.max_attempts_per_stage) {
         return Err(refusal(
             "max-attempts-per-stage",
             u64::from(slot.usage.attempts),

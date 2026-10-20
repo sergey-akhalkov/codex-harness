@@ -96,7 +96,7 @@ pub(super) fn run_stage_in_surface(
         Some(state) => match state.status {
             StageStatus::NotStarted => admission.is_some(),
             StageStatus::TurnSubmitted => true,
-            StageStatus::VisibilityLost => {
+            StageStatus::VisibilityLost | StageStatus::BudgetPaused => {
                 state.turn_id.is_none() && state.fork.is_some() && admission.is_some()
             }
             _ => false,

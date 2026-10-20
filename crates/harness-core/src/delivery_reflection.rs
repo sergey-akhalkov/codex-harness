@@ -2937,6 +2937,170 @@ impl ReflectionController {
         Ok(receipt)
     }
 
+    /// Re-admits the exact blocked budget pause into its existing attempt.
+    /// The caller must have proven from retained native evidence that the
+    /// attempt paused before any turn. Attempt counters and recorded costs are
+    /// preserved; unlike [`Self::retry_stage`], this starts no new attempt.
+    pub fn continue_stage(&self, acceptance_id: &str, stage: Stage) -> io::Result<StageReceipt> {
+        let current = self.current_source()?;
+        let path = self.state_path(&current);
+        let _lock = self.lock(&path)?;
+        let mut state = self.active_state(&path)?;
+        if state.recovery.is_some() {
+            return Err(recovery_error(
+                "reflection recovery is pending; reconcile the retained records before continuing a paused stage",
+            ));
+        }
+        if !state.source.same_scope(&current)
+            || normalize(&state.source.branch) != normalize(&current.branch)
+        {
+            return Err(recovery_error(
+                "board source or branch changed; poll and reconcile before continuing a paused stage",
+            ));
+        }
+        let binding_check =
+            self.check_active_binding(&state.binding.lead_session, Some(acceptance_id))?;
+        if !binding_check.is_active() {
+            return Err(conflict(&format!(
+                "cannot continue {} reflection: {}",
+                stage.as_str(),
+                binding_check.detail
+            )));
+        }
+        let active = state
+            .records
+            .values()
+            .map(|record| {
+                usize::from(record.executor.state == StageState::InFlight)
+                    + usize::from(record.lead.state == StageState::InFlight)
+            })
+            .sum::<usize>();
+        if active >= state.limits.max_active_stages as usize {
+            return Err(conflict(&format!(
+                "{} reflection stages are already in flight; configured capacity is {}",
+                active, state.limits.max_active_stages
+            )));
+        }
+        let limits = state.limits.clone();
+        let record_tokens = {
+            let record = state
+                .records
+                .get_mut(acceptance_id)
+                .ok_or_else(|| invalid(&format!("unknown acceptance id '{acceptance_id}'")))?;
+            if record.delivery == DeliveryState::Consumed {
+                return Err(conflict(
+                    "the accepted delivery is already consumed; no stage may run again",
+                ));
+            }
+            if stage == Stage::Lead {
+                if record.executor.state != StageState::Retained {
+                    return Err(conflict(
+                        "lead reflection is ineligible until the executor outcome is retained",
+                    ));
+                }
+                if !record.executor.usage_reconciled {
+                    return Err(conflict(
+                        "lead reflection is ineligible until the executor stage's new-turn usage is reconciled",
+                    ));
+                }
+                if !record.executor.work_reconciled {
+                    return Err(conflict(
+                        "lead reflection is ineligible until the executor stage's observed work is reconciled",
+                    ));
+                }
+            }
+            let record_totals = record.usage_totals();
+            let slot = stage_slot(record, stage);
+            if slot.state != StageState::Blocked {
+                return Err(conflict(&format!(
+                    "{} reflection is {:?}, not a retained budget pause",
+                    stage.as_str(),
+                    slot.state
+                )));
+            }
+            let pause = slot.pause.as_ref().ok_or_else(|| {
+                conflict(&format!(
+                    "{} reflection is blocked without a retained budget pause",
+                    stage.as_str()
+                ))
+            })?;
+            if !slot.usage_reconciled {
+                return Err(conflict(
+                    "the paused stage's new-turn usage must be reconciled before continuing",
+                ));
+            }
+            if !slot.work_reconciled {
+                return Err(conflict(
+                    "the paused stage's observed investigation/context work must be reconciled before continuing",
+                ));
+            }
+            if pause.limit.configured(&limits) <= pause.observed {
+                return Err(conflict(&format!(
+                    "{} reflection remains paused at {} observed {}; configure that allowance above the observed value before continuing",
+                    stage.as_str(),
+                    pause.limit.as_str(),
+                    pause.observed
+                )));
+            }
+            if slot.usage.attempts == 0 {
+                return Err(conflict(&format!(
+                    "{} reflection has no recorded attempt to continue",
+                    stage.as_str()
+                )));
+            }
+            for (name, used, limit) in [
+                ("turn", slot.usage.turns, limits.max_turns_per_stage),
+                ("token", slot.usage.tokens, limits.max_tokens_per_stage),
+                (
+                    "investigation",
+                    slot.usage.investigations,
+                    limits.max_investigations_per_stage,
+                ),
+                (
+                    "supplied-context byte",
+                    slot.usage.context_bytes,
+                    limits.max_context_bytes_per_stage,
+                ),
+            ] {
+                if used >= limit {
+                    return Err(conflict(&format!(
+                        "{} reflection reached its {limit} {name} allowance",
+                        stage.as_str()
+                    )));
+                }
+            }
+            if record_totals.tokens >= limits.max_tokens_per_record {
+                return Err(conflict(&format!(
+                    "accepted task reached its {} token allowance across both stages",
+                    limits.max_tokens_per_record
+                )));
+            }
+            if record_totals.investigations >= limits.max_investigations_per_record {
+                return Err(conflict(&format!(
+                    "accepted task reached its {} investigation allowance across both stages",
+                    limits.max_investigations_per_record
+                )));
+            }
+            if record_totals.context_bytes >= limits.max_context_bytes_per_record {
+                return Err(conflict(&format!(
+                    "accepted task reached its {} supplied-context byte allowance across both stages",
+                    limits.max_context_bytes_per_record
+                )));
+            }
+            slot.state = StageState::InFlight;
+            slot.outcome = None;
+            slot.pause = None;
+            slot.usage.last_error = None;
+            record.usage_totals().tokens
+        };
+        let receipt = {
+            let record = &state.records[acceptance_id];
+            stage_receipt(record, stage, false, record_tokens)
+        };
+        self.write_state_at(&path, &state)?;
+        Ok(receipt)
+    }
+
     pub fn retry_stage(&self, acceptance_id: &str, stage: Stage) -> io::Result<StageReceipt> {
         let path = self.state_path(&self.current_source()?);
         let _lock = self.lock(&path)?;

@@ -458,6 +458,14 @@ allowance increases; unchanged limits, a different stage or an already consumed
 delivery refuse before another model turn. Stage and record limits cover
 attempts, turns, tokens, investigations and supplied-context bytes.
 
+When retained native evidence proves that the pause happened before any turn on
+an existing fork, with zero model usage, no investigations, one already-charged
+source context and unchanged role/routing identity, `continue` re-admits that
+exact fork. It starts no replacement fork, preserves the attempt count and
+charges the source context only once. Post-turn or otherwise unproven pauses
+still consume a new finite attempt, and completed, submitted or unknown
+outcomes are never replayed.
+
 If status reports unreconciled usage or work, continuation additionally requires
 the measured missing additions through the paired `--reconcile-usage-turns` /
 `--reconcile-usage-tokens` or `--reconcile-investigations` /
