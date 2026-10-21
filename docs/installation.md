@@ -132,8 +132,11 @@ does not authorize a provider or create a user's Z.AI profile. Choose billing
 routes explicitly; see [subscription setup](subscription-models.md).
 
 The shipped orchestration profile also sets `self_reflection_enabled = true`.
-The managed lead automatically prepares its project's reflection lifecycle;
-no separate `delivery-improvement enable` is required. An omitted key is true
+Ordinary interactive `codex` automatically prepares its current session's
+reflection transport and project lifecycle; no separate lead-start or
+`delivery-improvement enable` command is required. Existing unmanaged sessions
+take this update on their next ordinary launch. Finished sessions, historical
+acceptances and their pending stages remain dormant. An omitted key is true
 for compatibility. Set it to `false` to stop new
 reflection stages while ordinary lead, executor and acceptance work continues;
 retained results and pending work are preserved.
