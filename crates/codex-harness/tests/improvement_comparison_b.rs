@@ -8,7 +8,11 @@ use improvement_comparison_common::*;
 
 use harness_core::build_identity;
 use serde_json::{Value, json};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// One successful model-free measured pair through the ordinary control-backed
 /// dispatch route: real visible dispatch, native frontend attachment, the
@@ -208,6 +212,1529 @@ fn one_real_control_backed_pair_settles_through_native_observation() {
         );
     }
     assert!(!generation.is_empty());
+}
+
+#[test]
+fn baseline_qualification_frames_the_frozen_task_with_distinct_native_profiles() {
+    baseline_workflow_case(true, None);
+}
+
+#[test]
+fn baseline_qualification_requires_the_independent_oracle_despite_lead_acceptance() {
+    baseline_workflow_case(false, None);
+}
+
+#[test]
+fn baseline_qualification_consumes_an_independent_semantic_reviewer() {
+    baseline_workflow_case(true, Some(SemanticReviewCase::Accept));
+}
+
+#[test]
+fn baseline_qualification_rejects_a_substantive_semantic_finding() {
+    baseline_workflow_case(true, Some(SemanticReviewCase::Reject));
+}
+
+#[test]
+fn baseline_qualification_corrects_one_malformed_reviewer_result() {
+    baseline_workflow_case(true, Some(SemanticReviewCase::MalformedThenAccept));
+}
+
+#[test]
+fn baseline_qualification_refuses_an_unknown_semantic_judgment() {
+    baseline_workflow_case(true, Some(SemanticReviewCase::Unknown));
+}
+
+#[test]
+fn baseline_qualification_refuses_incomplete_action_coverage() {
+    baseline_workflow_case_with(
+        true,
+        Some(SemanticReviewCase::Accept),
+        ActionCapture::ExecutorDetailRemoved,
+        RetainedOracleCase::Ordinary,
+    );
+}
+
+#[test]
+fn baseline_unstarted_oracle_is_incomplete_and_retries_once() {
+    baseline_workflow_case_with(
+        true,
+        None,
+        ActionCapture::Complete,
+        RetainedOracleCase::HeldUnstarted,
+    );
+}
+
+#[test]
+fn baseline_unstarted_oracle_before_ledger_preserves_wait_cost() {
+    baseline_workflow_case_with(
+        true,
+        None,
+        ActionCapture::Complete,
+        RetainedOracleCase::HeldUnstartedBeforeLedger,
+    );
+}
+
+#[test]
+fn baseline_legacy_false_row_is_preserved_and_recovered() {
+    baseline_workflow_case_with(
+        true,
+        None,
+        ActionCapture::Complete,
+        RetainedOracleCase::LegacyFalseRow,
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticReviewCase {
+    Accept,
+    Reject,
+    MalformedThenAccept,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionCapture {
+    Complete,
+    ExecutorDetailRemoved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedOracleCase {
+    Ordinary,
+    HeldUnstarted,
+    HeldUnstartedBeforeLedger,
+    LegacyFalseRow,
+}
+
+fn baseline_workflow_case(
+    independent_acceptance_passes: bool,
+    review_case: Option<SemanticReviewCase>,
+) {
+    baseline_workflow_case_with(
+        independent_acceptance_passes,
+        review_case,
+        ActionCapture::Complete,
+        RetainedOracleCase::Ordinary,
+    );
+}
+
+fn baseline_workflow_case_with(
+    independent_acceptance_passes: bool,
+    review_case: Option<SemanticReviewCase>,
+    action_capture: ActionCapture,
+    retained_oracle_case: RetainedOracleCase,
+) {
+    let _serial = INSTALL.lock().unwrap();
+    let mut fixture = Fixture::new("qualification-native-frame");
+    if matches!(
+        retained_oracle_case,
+        RetainedOracleCase::HeldUnstarted | RetainedOracleCase::HeldUnstartedBeforeLedger
+    ) {
+        let mut request: Value =
+            serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+        request["timeout_seconds"] = json!(5);
+        let bytes = serde_json::to_vec(&request).unwrap();
+        fs::write(&fixture.request, &bytes).unwrap();
+        fixture.request_sha256 = build_identity::hash_bytes(&bytes);
+    }
+    let launcher = std::path::PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+    fixture_build(
+        &fixture.state,
+        "h-build",
+        &fixture.proj,
+        &launcher,
+        "baseline",
+    );
+    fixture.write_spec(&[], None);
+    let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    let previous = spec["comparison"].take();
+    let config = fixture
+        .spec
+        .with_file_name("qualification-native-config.toml");
+    fs::write(&config, "model = 'gpt-6-astra'\nmodel_provider = 'openai'\nmodel_reasoning_effort = 'xhigh'\n[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n").unwrap();
+    let prompt = fixture.spec.with_file_name("qualification-task.txt");
+    fs::write(&prompt, "Read the frozen add-workload OpenSpec task and frame its implementation inside solution.txt and sleep_ms. Preserve its independent acceptance.").unwrap();
+    let review_run_id = format!("{}-semantic-review", spec["run"].as_str().unwrap());
+    let reviewer = review_case.map(|case| {
+        let config = fixture
+            .spec
+            .with_file_name("qualification-review-config.toml");
+        fs::write(
+            &config,
+            "sandbox_mode = 'read-only'\napproval_policy = 'never'\nmodel = 'gpt-6-astra'\nmodel_provider = 'openai'\nmodel_reasoning_effort = 'xhigh'\n[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+        )
+        .unwrap();
+        let criteria = fixture
+            .spec
+            .with_file_name("qualification-review-criteria.txt");
+        fs::write(
+            &criteria,
+            "The submitted result must implement the frozen task and preserve its declared acceptance.\n",
+        )
+        .unwrap();
+        let accepted = format!(
+            "{{\"run_id\":\"{review_run_id}\",\"findings\":[],\"unresolved_issues\":[]}}"
+        );
+        // The rejection finding binds a declared physical location in its
+        // evidence but paraphrases the content instead of quoting the line.
+        let initial = match case {
+            SemanticReviewCase::Accept => accepted.clone(),
+            SemanticReviewCase::Reject => format!(
+                "{{\"run_id\":\"{review_run_id}\",\"findings\":[{{\"path\":\"solution.txt\",\"line\":1,\"description\":\"the submitted content does not demonstrate the frozen workload result\",\"evidence\":\"solution.txt:1 is the only submitted content and shows no implemented result\"}}],\"unresolved_issues\":[]}}"
+            ),
+            SemanticReviewCase::MalformedThenAccept => format!(
+                "{{\"run_id\":\"{review_run_id}\",\"findings\":[{{\"path\":\"solution.txt\",\"line\":1,\"description\":\"the submitted content does not demonstrate the frozen workload result\"}}],\"unresolved_issues\":[]}}"
+            ),
+            SemanticReviewCase::Unknown => format!(
+                "{{\"run_id\":\"{review_run_id}\",\"findings\":[],\"unresolved_issues\":[\"the frozen task criterion cannot be judged from the supplied packet\"]}}"
+            ),
+        };
+        let corrected =
+            (case == SemanticReviewCase::MalformedThenAccept).then(|| accepted.clone());
+        (config, criteria, initial, corrected)
+    });
+    spec["local_runner"] = Value::Null;
+    spec["qualification"] = Value::Null;
+    spec["baseline_qualification"] = json!({
+        "schema": 1,
+        "task": previous["task"],
+        "task_prompt": {"path": prompt, "sha256": build_identity::hash_file(&prompt).unwrap()},
+        "runtime": {
+            "state": fixture.state, "build": fixture.state.join("builds/h-build"),
+            "label": "accepted-native-runtime", "upstream": fixture.upstream,
+            "native_config": {"path": config, "sha256": build_identity::hash_file(&config).unwrap()},
+            "private_inputs": []
+        },
+        "acceptance": previous["acceptance"],
+        "workflow": {"schema":1,"lead_profile":"default","executor_profile":"ds","max_corrections":1,"capacity":2},
+        "report": fixture.spec.with_file_name("qualification-result.txt")
+    });
+    if let Some((config, criteria, _, _)) = &reviewer {
+        spec["baseline_qualification"]["semantic_review"] = json!({
+            "schema": 1,
+            "runtime": {
+                "state": fixture.state,
+                "build": fixture.state.join("builds/h-build"),
+                "label": "accepted-semantic-review-runtime",
+                "upstream": fixture.upstream,
+                "native_config": {
+                    "path": config,
+                    "sha256": build_identity::hash_file(config).unwrap()
+                },
+                "private_inputs": []
+            },
+            "profile": "ds",
+            "criteria": {
+                "path": criteria,
+                "sha256": build_identity::hash_file(criteria).unwrap()
+            },
+            "sources": ["solution.txt"],
+            "max_corrections": 1
+        });
+    }
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let assignment = json!({
+        "schema":1, "objective":"Implement the frozen workload in the bound checkout.",
+        "inputs":[], "outputs":["solution.txt"], "invariants":["Preserve frozen acceptance."],
+        "acceptance":["The independent workload check must pass."], "consumer":"qualification controller", "escalate":[]
+    }).to_string();
+    let environment = [
+        CONTROL_CHILD_MODE,
+        ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
+        ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", "lead-frame"),
+        (
+            "HARNESS_IMPROVEMENT_FIXTURE_SESSION",
+            "12345678-1234-4234-8234-123456789001",
+        ),
+        ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", "frame"),
+        ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", assignment.as_str()),
+    ];
+    let started = fixture.improve_with_env(
+        &[
+            "start",
+            "--run",
+            fixture.run.to_str().unwrap(),
+            "--spec",
+            fixture.spec.to_str().unwrap(),
+            "--supervision",
+            "once",
+        ],
+        &environment,
+    );
+    assert!(started.status.success(), "{}", text(&started));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["phase"], "baseline-qualification", "{cursor}");
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1, "{cursor}");
+    let attempt = &cursor["attempts"][0];
+    assert_eq!(attempt["role"], "lead-frame");
+    assert_eq!(attempt["profile"], "default");
+    assert_eq!(attempt["model"], "gpt-6-astra");
+    assert_eq!(attempt["reasoning_effort"], "xhigh");
+    let receipt = std::path::PathBuf::from(attempt["receipt"].as_str().unwrap());
+    let terminal = wait_for_terminal_receipt(&receipt);
+    assert_eq!(terminal["observation"]["state"], "completed", "{terminal}");
+
+    let report_path = fixture.spec.with_file_name("qualification-result.txt");
+    fs::write(&report_path, "unrelated report must survive").unwrap();
+    let collision = fixture.resume();
+    assert!(!collision.status.success(), "{}", text(&collision));
+    assert!(
+        text(&collision).contains("report already exists"),
+        "{}",
+        text(&collision)
+    );
+    assert_eq!(
+        fs::read_to_string(&report_path).unwrap(),
+        "unrelated report must survive"
+    );
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
+    fs::remove_file(&report_path).unwrap();
+
+    let original = fs::read(&receipt).unwrap();
+    let mut foreign: Value = serde_json::from_slice(&original).unwrap();
+    foreign["originatingLead"]["runGeneration"] = json!("unrelated-generation");
+    fs::write(&receipt, serde_json::to_vec(&foreign).unwrap()).unwrap();
+    let refused = fixture.resume();
+    assert!(refused.status.success(), "{}", text(&refused));
+    assert!(fixture.cursor()["baseline_qualification"]["workflow"]["lead"].is_null());
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
+    fs::write(&receipt, original).unwrap();
+
+    let resume_turn_with_suffix = |role: &str, result: &str, suffix: &str| {
+        let output = fixture.improve_with_env(
+            &["resume", "--run", fixture.run.to_str().unwrap()],
+            &[
+                CONTROL_CHILD_MODE,
+                ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
+                ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", role),
+                ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", result),
+                (
+                    "HARNESS_IMPROVEMENT_FIXTURE_SESSION",
+                    if role == "lead-review" {
+                        "12345678-1234-4234-8234-123456789001"
+                    } else if role == "lead-acceptance" {
+                        "12345678-1234-4234-8234-123456789003"
+                    } else {
+                        "12345678-1234-4234-8234-123456789002"
+                    },
+                ),
+                ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", suffix),
+                (
+                    "HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_TEXT",
+                    if role == "correction" {
+                        if independent_acceptance_passes {
+                            "solved"
+                        } else {
+                            "still-broken"
+                        }
+                    } else {
+                        "needs-correction"
+                    },
+                ),
+            ],
+        );
+        assert!(output.status.success(), "{}", text(&output));
+        output
+    };
+    let resume_turn = |role: &str, result: &str| {
+        let suffix = format!(
+            "attempt-{}",
+            fixture.cursor()["attempts"].as_array().unwrap().len() + 1
+        );
+        resume_turn_with_suffix(role, result, &suffix)
+    };
+    let wait_last = || {
+        let cursor = fixture.cursor();
+        let attempt = cursor["attempts"].as_array().unwrap().last().unwrap();
+        let receipt = std::path::PathBuf::from(attempt["receipt"].as_str().unwrap());
+        let terminal = wait_for_terminal_receipt(&receipt);
+        assert_eq!(terminal["observation"]["state"], "completed", "{terminal}");
+    };
+    resume_turn(
+        "executor",
+        "Implemented the task and committed the scoped solution.",
+    );
+    let cursor = fixture.cursor();
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(qualification["lead_binding"]["model"], "gpt-6-astra");
+    assert_eq!(qualification["executor_binding"]["model"], "deepseek-flash");
+    assert_eq!(qualification["executor_binding"]["reasoning_effort"], "max");
+    assert_eq!(qualification["workflow"]["lead"]["profile"], "default");
+    assert!(
+        qualification["workflow"]["lead"]["session"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(qualification["workflow"]["executor"], Value::Null);
+    assert!(qualification["accepted"].is_null());
+    let retained = std::path::PathBuf::from(
+        cursor["attempts"][0]["retained"]["result"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_to_string(retained).unwrap(), assignment);
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(cursor["attempts"][1]["profile"], "ds");
+    assert_eq!(cursor["attempts"][1]["model"], "deepseek-flash");
+    wait_last();
+    let executor_receipt =
+        std::path::PathBuf::from(cursor["attempts"][1]["receipt"].as_str().unwrap());
+    let executor_terminal = wait_for_terminal_receipt(&executor_receipt);
+    let executor_turn = executor_terminal["observation"]["turn"]
+        .as_str()
+        .expect("the completed executor turn records its exact native turn")
+        .to_owned();
+    if action_capture == ActionCapture::ExecutorDetailRemoved {
+        let detail = std::path::PathBuf::from(
+            cursor["attempts"][1]["detail"]
+                .as_str()
+                .expect("the executor records its bounded action stream locator"),
+        );
+        assert!(detail.is_file(), "{}", detail.display());
+        // The host may still be finishing its own bounded detail writes when
+        // the receipt turns terminal; remove the exact source with a bounded
+        // retry instead of racing a sharing violation.
+        let mut removed = false;
+        for _ in 0..100 {
+            match fs::remove_file(&detail) {
+                Ok(()) => {
+                    removed = true;
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+                    ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(error) => panic!("cannot remove {}: {error}", detail.display()),
+            }
+        }
+        assert!(removed, "cannot remove {}", detail.display());
+    }
+    resume_turn(
+        "lead-review",
+        "CORRECT: Address the one concrete scoped correction and rerun the check.",
+    );
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 3);
+    wait_last();
+    let lead_session =
+        fixture.cursor()["baseline_qualification"]["workflow"]["lead"]["session"].clone();
+    resume_turn(
+        "correction",
+        "Applied the concrete correction and verified the task.",
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 4);
+    assert_eq!(cursor["attempts"][2]["binding"]["session"], lead_session);
+    let executor_session =
+        cursor["baseline_qualification"]["workflow"]["executor"]["session"].clone();
+    wait_last();
+    resume_turn(
+        "lead-review",
+        "ACCEPT: The scoped result and applicable checks satisfy the original task.",
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        cursor["attempts"][3]["binding"]["session"],
+        executor_session
+    );
+    wait_last();
+    if let Some((_, _, initial_result, corrected_result)) = &reviewer {
+        if action_capture == ActionCapture::ExecutorDetailRemoved {
+            let suffix = format!(
+                "attempt-{}",
+                fixture.cursor()["attempts"].as_array().unwrap().len() + 1
+            );
+            let refused = fixture.improve_with_env(
+                &["resume", "--run", fixture.run.to_str().unwrap()],
+                &[
+                    CONTROL_CHILD_MODE,
+                    ("HARNESS_IMPROVEMENT_FIXTURE_SCENARIO", "measured-workflow"),
+                    ("HARNESS_IMPROVEMENT_FIXTURE_ROLE", "lead-acceptance"),
+                    ("HARNESS_IMPROVEMENT_FIXTURE_RESULT", initial_result),
+                    (
+                        "HARNESS_IMPROVEMENT_FIXTURE_SESSION",
+                        "12345678-1234-4234-8234-123456789003",
+                    ),
+                    ("HARNESS_IMPROVEMENT_FIXTURE_TURN_SUFFIX", &suffix),
+                    (
+                        "HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_TEXT",
+                        "needs-correction",
+                    ),
+                ],
+            );
+            assert!(!refused.status.success(), "{}", text(&refused));
+            assert!(
+                text(&refused).contains("action coverage is incomplete"),
+                "{}",
+                text(&refused)
+            );
+            let refused_cursor = fixture.cursor();
+            assert_eq!(
+                refused_cursor["attempts"].as_array().unwrap().len(),
+                5,
+                "no reviewer turn is dispatched from incomplete action evidence: {refused_cursor}"
+            );
+            assert!(
+                !refused_cursor["attempts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|attempt| attempt["role"] == "semantic-review"),
+                "{refused_cursor}"
+            );
+            let qualification = &refused_cursor["baseline_qualification"];
+            assert!(qualification["accepted"].is_null(), "{refused_cursor}");
+            assert!(qualification["row"].is_null(), "{refused_cursor}");
+            assert!(qualification["oracle"].is_null(), "{refused_cursor}");
+            assert!(
+                qualification["condition"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("action view is missing or incomplete"),
+                "{refused_cursor}"
+            );
+            let actions_path = fixture
+                .run
+                .join("baseline-qualification/reviewer/source/actions.json");
+            let actions: Value = serde_json::from_slice(&fs::read(&actions_path).unwrap()).unwrap();
+            assert_eq!(actions["action_evidence_complete"], false, "{actions}");
+            let executor_coverage = actions["action_coverage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["attempt"] == "executor-1")
+                .expect("the unavailable executor action view keeps one explicit coverage record");
+            assert_eq!(executor_coverage["complete"], false, "{actions}");
+            assert!(
+                executor_coverage["note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unavailable"),
+                "{actions}"
+            );
+            assert!(
+                !actions["action_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["attempt"] == "executor-1"),
+                "an unavailable action stream is recorded as a gap, not as an empty no-effect view: {actions}"
+            );
+            let repeated = fixture.resume();
+            assert!(!repeated.status.success(), "{}", text(&repeated));
+            assert!(
+                text(&repeated).contains("action coverage is incomplete"),
+                "{}",
+                text(&repeated)
+            );
+            assert_eq!(
+                fixture.cursor()["attempts"].as_array().unwrap().len(),
+                5,
+                "the settled refusal is not replayed into a reviewer dispatch"
+            );
+            let stopped = fixture.stop();
+            assert!(stopped.status.success(), "{}", text(&stopped));
+            return;
+        }
+        resume_turn("lead-acceptance", initial_result);
+        let cursor = fixture.cursor();
+        assert_eq!(cursor["attempts"].as_array().unwrap().len(), 6, "{cursor}");
+        let review_attempt = &cursor["attempts"][5];
+        assert_eq!(review_attempt["role"], "semantic-review", "{cursor}");
+        assert_eq!(review_attempt["profile"], "ds", "{cursor}");
+        assert_eq!(review_attempt["model"], "deepseek-flash", "{cursor}");
+        assert_eq!(review_attempt["state"], "started", "{cursor}");
+        wait_last();
+        let actions_path = fixture
+            .run
+            .join("baseline-qualification/reviewer/source/actions.json");
+        let actions: Value = serde_json::from_slice(&fs::read(&actions_path).unwrap()).unwrap();
+        assert_eq!(actions["action_evidence_complete"], true, "{actions}");
+        let participants = actions["participants"].as_array().unwrap();
+        let coverage = actions["action_coverage"].as_array().unwrap();
+        assert_eq!(
+            coverage.len(),
+            participants.len(),
+            "every required participant turn keeps one explicit coverage record: {actions}"
+        );
+        for (participant, coverage) in participants.iter().zip(coverage) {
+            assert_eq!(coverage["attempt"], participant["attempt"], "{actions}");
+            assert_eq!(coverage["role"], participant["role"], "{actions}");
+            assert_eq!(coverage["session"], participant["session"], "{actions}");
+            assert_eq!(coverage["complete"], true, "{actions}");
+            assert!(
+                coverage["turn"]
+                    .as_str()
+                    .is_some_and(|turn| !turn.is_empty()),
+                "every complete coverage record names its exact completed turn: {actions}"
+            );
+            assert_eq!(coverage["malformed_records"], 0, "{actions}");
+            assert_eq!(coverage["partial_records"], 0, "{actions}");
+            assert_eq!(coverage["omitted_records"], 0, "{actions}");
+            assert_eq!(coverage["truncated"], false, "{actions}");
+            assert_eq!(
+                coverage["source_bytes"], coverage["retained_bytes"],
+                "{actions}"
+            );
+            assert!(
+                coverage["terminal_events"].as_u64().unwrap() >= 1,
+                "{actions}"
+            );
+            assert_eq!(
+                coverage["action_records"].as_u64().unwrap(),
+                actions["action_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|action| action["attempt"] == participant["attempt"])
+                    .count() as u64,
+                "{actions}"
+            );
+        }
+        let executor_action = actions["action_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| {
+                action["item"] == "fixture-command-executor-1" && action["phase"] == "completed"
+            })
+            .unwrap_or_else(|| {
+                panic!("the retained executor command event reaches the packet: {actions}")
+            });
+        assert_eq!(executor_action["attempt"], "executor-1", "{actions}");
+        assert_eq!(executor_action["role"], "executor", "{actions}");
+        assert_eq!(executor_action["session"], executor_session, "{actions}");
+        assert_eq!(
+            executor_action["turn"].as_str(),
+            Some(executor_turn.as_str()),
+            "{actions}"
+        );
+        assert_eq!(executor_action["kind"], "tool", "{actions}");
+        assert_eq!(executor_action["tool"], "command", "{actions}");
+        assert_eq!(
+            executor_action["command"], "git status --short",
+            "{actions}"
+        );
+        assert_eq!(executor_action["status"], "completed", "{actions}");
+        assert_eq!(executor_action["exit_code"], 0, "{actions}");
+        assert!(
+            executor_action["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("solution.txt"),
+            "{actions}"
+        );
+        let executor_coverage = coverage
+            .iter()
+            .find(|entry| entry["attempt"] == "executor-1")
+            .expect("the executor turn keeps its coverage record");
+        assert_eq!(
+            executor_coverage["turn"].as_str(),
+            Some(executor_turn.as_str()),
+            "the coverage record and every executor action share the exact completed turn: {actions}"
+        );
+        println!(
+            "semantic action evidence: run_id={} complete={} participants={} coverage={} action={}",
+            actions["run_id"].as_str().unwrap_or("?"),
+            actions["action_evidence_complete"],
+            participants.len(),
+            coverage
+                .iter()
+                .map(|entry| format!(
+                    "{}/{}:complete={}",
+                    entry["attempt"].as_str().unwrap_or("?"),
+                    entry["action_records"],
+                    entry["complete"]
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            executor_action
+        );
+        if let Some(corrected) = corrected_result {
+            let suffix = format!(
+                "attempt-{}",
+                fixture.cursor()["attempts"].as_array().unwrap().len() + 1
+            );
+            resume_turn_with_suffix("lead-acceptance", corrected, &suffix);
+            let cursor = fixture.cursor();
+            assert_eq!(cursor["attempts"].as_array().unwrap().len(), 7, "{cursor}");
+            let corrected_attempt = &cursor["attempts"][6];
+            assert_eq!(corrected_attempt["role"], "semantic-review", "{cursor}");
+            assert_eq!(corrected_attempt["state"], "started", "{cursor}");
+            wait_last();
+        }
+    }
+    if review_case == Some(SemanticReviewCase::Unknown) {
+        let (_, _, unknown_result, _) = reviewer.as_ref().unwrap();
+        let refused = fixture.resume();
+        assert!(!refused.status.success(), "{}", text(&refused));
+        assert!(
+            text(&refused).contains("unresolved issues"),
+            "{}",
+            text(&refused)
+        );
+        let cursor = fixture.cursor();
+        assert_eq!(cursor["attempts"].as_array().unwrap().len(), 6, "{cursor}");
+        let review_attempt = &cursor["attempts"][5];
+        assert_eq!(review_attempt["state"], "completed", "{cursor}");
+        assert_eq!(
+            review_attempt["binding"]["session"], "12345678-1234-4234-8234-123456789003",
+            "{cursor}"
+        );
+        let retained =
+            std::path::PathBuf::from(review_attempt["retained"]["result"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(&retained).unwrap(),
+            unknown_result.as_str()
+        );
+        let qualification = &cursor["baseline_qualification"];
+        assert!(qualification["accepted"].is_null(), "{cursor}");
+        assert!(qualification["row"].is_null(), "{cursor}");
+        assert!(qualification["oracle"].is_null(), "{cursor}");
+        assert_eq!(
+            qualification["semantic_review"]["judgment_kind"], "unknown",
+            "{cursor}"
+        );
+        assert_eq!(qualification["semantic_review"]["findings"], 0, "{cursor}");
+        assert_eq!(
+            qualification["semantic_review"]["unresolved_issues"], 1,
+            "{cursor}"
+        );
+        let repeated = fixture.resume();
+        assert!(!repeated.status.success(), "{}", text(&repeated));
+        assert!(
+            text(&repeated).contains("unresolved issues"),
+            "{}",
+            text(&repeated)
+        );
+        let repeated_cursor = fixture.cursor();
+        assert_eq!(
+            repeated_cursor["attempts"].as_array().unwrap().len(),
+            6,
+            "{repeated_cursor}"
+        );
+        let repeated_attempt = &repeated_cursor["attempts"][5];
+        let repeated_retained =
+            std::path::PathBuf::from(repeated_attempt["retained"]["result"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(&repeated_retained).unwrap(),
+            unknown_result.as_str()
+        );
+        println!(
+            "semantic-review evidence: case=Unknown run_id={review_run_id} attempts=1 session=12345678-1234-4234-8234-123456789003 retained={} judgment=unknown accepted=null row=none",
+            retained.display()
+        );
+        let stopped = fixture.stop();
+        assert!(stopped.status.success(), "{}", text(&stopped));
+        return;
+    }
+    let expected_attempts = match review_case {
+        None => 5,
+        Some(SemanticReviewCase::MalformedThenAccept) => 7,
+        Some(_) => 6,
+    };
+    let oracle_workspace = std::path::PathBuf::from(
+        fixture.cursor()["baseline_qualification"]["task_workspace"]
+            .as_str()
+            .unwrap(),
+    );
+    let preserved = oracle_workspace.join("unrelated.txt");
+    fs::write(&preserved, "preserve before acceptance").unwrap();
+    let changed = fixture.resume();
+    assert!(!changed.status.success(), "{}", text(&changed));
+    assert!(
+        text(&changed).contains("oracle workspace changed"),
+        "{}",
+        text(&changed)
+    );
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap(),
+        "preserve before acceptance"
+    );
+    let changed_cursor = fixture.cursor();
+    assert!(changed_cursor["baseline_qualification"]["oracle"].is_null());
+    assert_eq!(
+        changed_cursor["attempts"].as_array().unwrap().len(),
+        expected_attempts
+    );
+    if let Some((_, _, initial_result, corrected_result)) = &reviewer {
+        let final_index = if corrected_result.is_some() { 6 } else { 5 };
+        let final_result = corrected_result.as_ref().unwrap_or(initial_result);
+        let review_attempt = &changed_cursor["attempts"][final_index];
+        assert_eq!(review_attempt["state"], "completed", "{changed_cursor}");
+        assert_eq!(
+            review_attempt["binding"]["session"], "12345678-1234-4234-8234-123456789003",
+            "{changed_cursor}"
+        );
+        let retained =
+            std::path::PathBuf::from(review_attempt["retained"]["result"].as_str().unwrap());
+        assert_eq!(fs::read_to_string(retained).unwrap(), final_result.as_str());
+        let expected_kind = if review_case == Some(SemanticReviewCase::Reject) {
+            "reject"
+        } else {
+            "accept"
+        };
+        assert_eq!(
+            changed_cursor["baseline_qualification"]["semantic_review"]["judgment_kind"],
+            expected_kind,
+            "{changed_cursor}"
+        );
+        if corrected_result.is_some() {
+            let first_attempt = &changed_cursor["attempts"][5];
+            assert_eq!(first_attempt["state"], "completed", "{changed_cursor}");
+            assert_eq!(
+                first_attempt["binding"]["session"], "12345678-1234-4234-8234-123456789003",
+                "{changed_cursor}"
+            );
+            let first_retained =
+                std::path::PathBuf::from(first_attempt["retained"]["result"].as_str().unwrap());
+            assert_eq!(
+                fs::read_to_string(first_retained).unwrap(),
+                initial_result.as_str()
+            );
+        }
+    }
+    fs::remove_file(&preserved).unwrap();
+    match retained_oracle_case {
+        RetainedOracleCase::Ordinary => {}
+        RetainedOracleCase::HeldUnstarted | RetainedOracleCase::HeldUnstartedBeforeLedger => {
+            run_held_unstarted_case(
+                &fixture,
+                expected_attempts,
+                retained_oracle_case == RetainedOracleCase::HeldUnstartedBeforeLedger,
+            );
+            return;
+        }
+        RetainedOracleCase::LegacyFalseRow => {
+            run_legacy_false_row_case(&fixture, expected_attempts);
+            return;
+        }
+    }
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][4]["binding"]["session"], lead_session);
+    let workflow = &cursor["baseline_qualification"]["workflow"];
+    assert_eq!(workflow["completed"], true);
+    assert_eq!(workflow["lead_accepted"], true);
+    assert_eq!(workflow["corrections"].as_array().unwrap().len(), 1);
+    assert_eq!(cursor["phase"], "baseline-qualification-recorded");
+    let review_rejects = review_case == Some(SemanticReviewCase::Reject);
+    let expected_accepted = independent_acceptance_passes && !review_rejects;
+    assert_eq!(
+        cursor["baseline_qualification"]["accepted"],
+        expected_accepted
+    );
+    assert_ne!(lead_session, executor_session);
+    let row_path =
+        std::path::PathBuf::from(cursor["baseline_qualification"]["row"].as_str().unwrap());
+    let row_bytes = fs::read(&row_path).unwrap();
+    let row: Value = serde_json::from_slice(&row_bytes).unwrap();
+    let expected_native_runs = if review_case.is_some() { 3 } else { 2 };
+    let expected_responses = match review_case {
+        None => 5,
+        Some(SemanticReviewCase::MalformedThenAccept) => 7,
+        Some(_) => 6,
+    };
+    let expected_total_tokens = expected_responses * 120;
+    assert_eq!(
+        row["native_runs"].as_array().unwrap().len(),
+        expected_native_runs
+    );
+    assert_eq!(
+        row["usage"]["total_tokens"], expected_total_tokens,
+        "each distinct participant response is charged once: {row}"
+    );
+    assert_eq!(row["usage"]["response_count"], expected_responses, "{row}");
+    assert_eq!(
+        row["checks"][0]["passed"], independent_acceptance_passes,
+        "{row}"
+    );
+    assert_eq!(row["accepted"], expected_accepted, "{row}");
+    if review_case.is_some() {
+        let semantic = row["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "independent-semantic-review")
+            .expect("the row retains the independent semantic judgment");
+        assert_eq!(semantic["executed"], true, "{row}");
+        assert_eq!(semantic["passed"], !review_rejects, "{row}");
+        assert_eq!(
+            semantic["findings"],
+            if review_rejects { 1 } else { 0 },
+            "{row}"
+        );
+        assert_eq!(semantic["unresolved_issues"], 0, "{row}");
+        assert_eq!(
+            cursor["baseline_qualification"]["semantic_review"]["judgment_kind"],
+            if review_rejects { "reject" } else { "accept" }
+        );
+    }
+    let oracle_path =
+        std::path::PathBuf::from(cursor["baseline_qualification"]["oracle"].as_str().unwrap());
+    let oracle_bytes = fs::read(&oracle_path).unwrap();
+    let oracle_record: Value = serde_json::from_slice(&oracle_bytes).unwrap();
+    assert_eq!(oracle_record["checker_executed"], true, "{oracle_record}");
+    if !independent_acceptance_passes {
+        assert_eq!(oracle_record["passed"], false, "{oracle_record}");
+        assert!(
+            !oracle_record["runs"].as_array().unwrap().is_empty(),
+            "the genuine failing checker executed a worker: {oracle_record}"
+        );
+        assert!(
+            !row["interventions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|intervention| intervention["kind"] == "independent-check-unstarted"),
+            "a genuine failing checker is final, not an unstarted admission: {row}"
+        );
+        assert!(
+            !fixture
+                .run
+                .join("baseline-qualification/oracle-retry-1.json")
+                .exists(),
+            "an executed failing checker is never retried"
+        );
+        assert!(
+            cursor["baseline_qualification"]["unstarted_oracles"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "an executed failing checker leaves no unstarted evidence: {cursor}"
+        );
+    }
+    let report =
+        std::path::PathBuf::from(cursor["baseline_qualification"]["report"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(report).unwrap(),
+        "Applied the concrete correction and verified the task."
+    );
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        expected_attempts
+    );
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    if let Some(case) = review_case {
+        let reviewer_attempts: Vec<&Value> = cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|attempt| attempt["role"] == "semantic-review")
+            .collect();
+        println!(
+            "semantic-review evidence: case={case:?} run_id={review_run_id} attempts={} sessions={} retained={} native_runs={} responses={} tokens={} judgment={} accepted={} row={}",
+            reviewer_attempts.len(),
+            reviewer_attempts
+                .iter()
+                .map(|attempt| attempt["binding"]["session"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(","),
+            reviewer_attempts
+                .iter()
+                .map(|attempt| attempt["retained"]["result"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(","),
+            expected_native_runs,
+            expected_responses,
+            expected_total_tokens,
+            if review_rejects { "reject" } else { "accept" },
+            expected_accepted,
+            row_path.display()
+        );
+    }
+    if review_case == Some(SemanticReviewCase::Accept) && independent_acceptance_passes {
+        let (_, criteria, _, _) = reviewer.as_ref().unwrap();
+        let criteria_bytes = fs::read(criteria).unwrap();
+        fs::write(criteria, b"changed acceptance criteria\n").unwrap();
+        let changed = fixture.resume();
+        let output = text(&changed);
+        assert!(!changed.status.success(), "{output}");
+        assert!(output.contains("semantic review criteria"), "{output}");
+        assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+        assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+        fs::write(criteria, criteria_bytes).unwrap();
+        let settled = fixture.resume();
+        assert!(settled.status.success(), "{}", text(&settled));
+        assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+        assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    }
+    let stopped = fixture.stop();
+    assert!(stopped.status.success(), "{}", text(&stopped));
+}
+
+fn resume_with_isolated_heavy(fixture: &Fixture, heavy: &Path, cpu: &Path) -> std::process::Output {
+    let heavy = heavy.display().to_string();
+    let cpu = cpu.display().to_string();
+    fixture.improve_with_env(
+        &["resume", "--run", fixture.run.to_str().unwrap()],
+        &[
+            ("CODEX_HARNESS_HEAVY_ACCOUNT", heavy.as_str()),
+            ("CODEX_HARNESS_CPU_ACCOUNT", cpu.as_str()),
+        ],
+    )
+}
+
+/// Occupy the only slot of an isolated heavy account with the native hold
+/// fixture. The returned process owns the slot until it is killed.
+fn hold_isolated_heavy(fixture: &Fixture, name: &str) -> std::process::Child {
+    let account = fixture.root.join(name);
+    harness_core::heavy_command::prepare(&account).unwrap();
+    let mut budget = harness_core::heavy_command::Budget::read(&account).unwrap();
+    budget.max_concurrent_trees = 1;
+    harness_core::heavy_command::Budget::write(&account, &budget).unwrap();
+    let started = fixture.root.join(format!("{name}-started.txt"));
+    let launch = env!("CARGO_BIN_EXE_harness-launch-fixture");
+    let child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--attempt")
+        .arg(name)
+        .arg("--")
+        .arg(launch)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "180000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &started)
+        .spawn()
+        .expect("the isolated heavy holder starts");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the isolated heavy holder did not acquire its slot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child
+}
+
+/// A held admission proves the checker never started. The first explicit
+/// resume must record incomplete evidence, not task rejection; releasing the
+/// slot lets exactly one later explicit resume run the checker and settle a
+/// genuinely verified row that keeps the original failure and workflow costs.
+fn run_held_unstarted_case(fixture: &Fixture, expected_attempts: usize, before_ledger: bool) {
+    let account = fixture.root.join("unstarted-heavy-account");
+    let cpu = fixture.root.join("unstarted-cpu-account");
+    let mut holder = hold_isolated_heavy(fixture, "unstarted-heavy-account");
+    let held = resume_with_isolated_heavy(fixture, &account, &cpu);
+    let output = text(&held);
+    assert!(!held.status.success(), "{output}");
+    assert!(output.contains("proven never to start"), "{output}");
+    assert!(
+        output.contains("incomplete, not a task-quality rejection"),
+        "{output}"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["phase"], "baseline-qualification", "{cursor}");
+    let qualification = &cursor["baseline_qualification"];
+    assert!(qualification["accepted"].is_null(), "{cursor}");
+    assert!(qualification["row"].is_null(), "{cursor}");
+    assert!(qualification["oracle"].is_null(), "{cursor}");
+    assert!(
+        qualification["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("incomplete"),
+        "{cursor}"
+    );
+    let unstarted = &qualification["unstarted_oracles"][0];
+    assert_eq!(unstarted["attempt"], 1, "{cursor}");
+    assert_eq!(unstarted["stage"], "admission-wait", "{cursor}");
+    assert_eq!(unstarted["legacy"], false, "{cursor}");
+    let elapsed = unstarted["elapsed_seconds"]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<f64>()
+        .expect("the retained admission elapsed time is numeric");
+    assert!((5.0..6.5).contains(&elapsed), "{cursor}");
+    assert!(
+        unstarted["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no worker started"),
+        "{cursor}"
+    );
+    assert!(
+        unstarted["replacement"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("oracle-retry-1.json"),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        expected_attempts,
+        "an unstarted checker dispatches no model turn: {cursor}"
+    );
+    let retained_oracle = PathBuf::from(unstarted["oracle"].as_str().unwrap());
+    let retained_started = PathBuf::from(unstarted["started"].as_str().unwrap());
+    let retained_failure = PathBuf::from(unstarted["failure"].as_str().unwrap());
+    assert_eq!(
+        build_identity::hash_file(&retained_oracle).unwrap(),
+        unstarted["oracle_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        build_identity::hash_file(&retained_started).unwrap(),
+        unstarted["started_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        build_identity::hash_file(&retained_failure).unwrap(),
+        unstarted["failure_sha256"].as_str().unwrap()
+    );
+    let failure: Value = serde_json::from_slice(&fs::read(&retained_failure).unwrap()).unwrap();
+    assert_eq!(failure["stage"], "admission-wait", "{failure}");
+    assert_eq!(failure["spawned"], false, "{failure}");
+    assert!(failure["admission"].is_object(), "{failure}");
+    assert!(
+        failure["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no worker started"),
+        "{failure}"
+    );
+    let original_oracle = PathBuf::from(
+        qualification["unstarted_oracles"][0]["oracle"]
+            .as_str()
+            .unwrap(),
+    );
+    let original_oracle_bytes = fs::read(&original_oracle).unwrap();
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-1.json")
+            .exists()
+    );
+
+    // A recovery interrupted after persisting the retry intent leaves the
+    // checker start unknown. The explicit resume must refuse replay and keep
+    // the original incomplete receipts and attempt count exactly as retained.
+    let before_interruption = fixture.cursor();
+    let retry_path = PathBuf::from(unstarted["replacement"].as_str().unwrap());
+    let mut interrupted = before_interruption.clone();
+    interrupted["baseline_qualification"]["oracle"] = json!(retry_path.to_string_lossy());
+    fixture.write_cursor(&interrupted);
+    let refused = resume_with_isolated_heavy(fixture, &account, &cpu);
+    let output = text(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("result is unknown"), "{output}");
+    let after_interruption = fixture.cursor();
+    assert_eq!(
+        after_interruption["phase"], "baseline-qualification",
+        "{after_interruption}"
+    );
+    assert_eq!(
+        PathBuf::from(
+            after_interruption["baseline_qualification"]["oracle"]
+                .as_str()
+                .unwrap()
+        ),
+        retry_path,
+        "the refusal preserves the persisted submission intent: {after_interruption}"
+    );
+    assert_eq!(
+        after_interruption["baseline_qualification"]["unstarted_oracles"],
+        before_interruption["baseline_qualification"]["unstarted_oracles"],
+        "the interrupted recovery preserves every prior receipt: {after_interruption}"
+    );
+    assert_eq!(
+        after_interruption["attempts"], before_interruption["attempts"],
+        "an unknown checker start dispatches no model turn: {after_interruption}"
+    );
+    assert!(
+        !retry_path.exists(),
+        "an unknown checker start is never duplicated: {}",
+        retry_path.display()
+    );
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+    let mut restored = after_interruption;
+    restored["baseline_qualification"]["oracle"] = Value::Null;
+    if before_ledger {
+        // A crash after the oracle record was written, before its admission
+        // failure reached the cursor ledger, must retain that wait cost too.
+        restored["baseline_qualification"]["oracle"] =
+            json!(fixture.run.join("baseline-qualification/oracle.json"));
+        restored["baseline_qualification"]["unstarted_oracles"] = json!([]);
+    }
+    fixture.write_cursor(&restored);
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let resumed = resume_with_isolated_heavy(fixture, &account, &cpu);
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["phase"], "baseline-qualification-recorded",
+        "{cursor}"
+    );
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(qualification["accepted"], true, "{cursor}");
+    assert!(qualification["condition"].is_null(), "{cursor}");
+    assert_eq!(
+        qualification["unstarted_oracles"].as_array().unwrap().len(),
+        1,
+        "the original admission failure stays retained: {cursor}"
+    );
+    assert_eq!(fs::read(&original_oracle).unwrap(), original_oracle_bytes);
+    let oracle_path = PathBuf::from(qualification["oracle"].as_str().unwrap());
+    assert!(
+        oracle_path.ends_with("oracle-retry-1.json"),
+        "the later explicit resume uses one free retry name: {cursor}"
+    );
+    let oracle: Value = serde_json::from_slice(&fs::read(&oracle_path).unwrap()).unwrap();
+    assert_eq!(oracle["checker_executed"], true, "{oracle}");
+    assert_eq!(oracle["passed"], true, "{oracle}");
+    let row_path = PathBuf::from(qualification["row"].as_str().unwrap());
+    let row: Value = serde_json::from_slice(&fs::read(&row_path).unwrap()).unwrap();
+    assert_eq!(row["accepted"], true, "{row}");
+    assert_eq!(row["checks"][0]["passed"], true, "{row}");
+    assert_eq!(
+        row["checks"][0]["evidence_sha256"],
+        build_identity::hash_file(&oracle_path).unwrap(),
+        "the replacement row hashes its actual new oracle record: {row}"
+    );
+    assert_eq!(
+        PathBuf::from(row["checks"][0]["evidence"].as_str().unwrap()),
+        oracle_path
+    );
+    assert!(
+        row["interventions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |intervention| intervention["kind"] == "independent-check-unstarted"
+                    && intervention["attempt"] == 1
+            ),
+        "the settled row retains the original admission failure: {row}"
+    );
+    assert_eq!(row["usage"]["response_count"], 5, "{row}");
+    assert_eq!(row["usage"]["total_tokens"], 600, "{row}");
+    assert_eq!(row["native_runs"].as_array().unwrap().len(), 2, "{row}");
+
+    let row_bytes = fs::read(&row_path).unwrap();
+    let oracle_bytes = fs::read(&oracle_path).unwrap();
+    let evidence_state = qualification["unstarted_oracles"].clone();
+    let attempts_state = cursor["attempts"].clone();
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    assert_eq!(
+        fixture.cursor()["baseline_qualification"]["unstarted_oracles"],
+        evidence_state
+    );
+    assert_eq!(fixture.cursor()["attempts"], attempts_state);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+
+    // Changed frozen identities refuse before a new checker effect. The row
+    // and the executed oracle stay exactly as settled.
+    let report = PathBuf::from(qualification["report"].as_str().unwrap());
+    let report_bytes = fs::read(&report).unwrap();
+    fs::write(&report, b"changed outside this run\n").unwrap();
+    let changed = fixture.resume();
+    let output = text(&changed);
+    assert!(!changed.status.success(), "{output}");
+    assert!(
+        output.contains("owned qualification report changed"),
+        "{output}"
+    );
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+    fs::write(&report, report_bytes).unwrap();
+
+    let request_bytes = fs::read(&fixture.request).unwrap();
+    let mut changed_request = request_bytes.clone();
+    changed_request.push(b' ');
+    fs::write(&fixture.request, &changed_request).unwrap();
+    let changed = fixture.resume();
+    let output = text(&changed);
+    assert!(!changed.status.success(), "{output}");
+    assert!(
+        output.contains("frozen acceptance request changed"),
+        "{output}"
+    );
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    fs::write(&fixture.request, &request_bytes).unwrap();
+
+    let run_spec = fixture.run.join("spec.json");
+    let spec_bytes = fs::read(&run_spec).unwrap();
+    let mut changed_spec: Value = serde_json::from_slice(&spec_bytes).unwrap();
+    changed_spec["baseline_qualification"]["task"]["revision"] = json!("0".repeat(40));
+    fs::write(&run_spec, serde_json::to_vec_pretty(&changed_spec).unwrap()).unwrap();
+    let changed = fixture.resume();
+    let output = text(&changed);
+    assert!(!changed.status.success(), "{output}");
+    assert!(
+        output.contains("run inputs changed since start"),
+        "{output}"
+    );
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    fs::write(&run_spec, &spec_bytes).unwrap();
+
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    assert_eq!(fs::read(&row_path).unwrap(), row_bytes);
+    assert_eq!(fs::read(&oracle_path).unwrap(), oracle_bytes);
+    let stopped = fixture.stop();
+    assert!(stopped.status.success(), "{}", text(&stopped));
+}
+
+/// A legacy record settled by the old owner claims an executed check but has
+/// the exact pre-spawn admission message and no worker run. Recovery must
+/// preserve the mistaken row byte-for-byte, retain its admission evidence,
+/// run one new checker and write a row that hashes the new oracle record.
+fn run_legacy_false_row_case(fixture: &Fixture, expected_attempts: usize) {
+    let settled = fixture.resume();
+    assert!(settled.status.success(), "{}", text(&settled));
+    let cursor = fixture.cursor();
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(qualification["accepted"], true, "{cursor}");
+    let row_path = PathBuf::from(qualification["row"].as_str().unwrap());
+    let oracle_path = PathBuf::from(qualification["oracle"].as_str().unwrap());
+    let row: Value = serde_json::from_slice(&fs::read(&row_path).unwrap()).unwrap();
+    let genuine: Value = serde_json::from_slice(&fs::read(&oracle_path).unwrap()).unwrap();
+    assert_eq!(genuine["checker_executed"], true);
+    assert_eq!(genuine["passed"], true);
+
+    // A false record with no positive pre-spawn admission proof is ambiguous.
+    // It must refuse replay before the mistaken legacy row is involved, leaving
+    // the genuine row and the ambiguous record bytes untouched.
+    let ambiguous_evidence = fixture.root.join("ambiguous-oracle-evidence");
+    fs::create_dir_all(&ambiguous_evidence).unwrap();
+    let ambiguous_path = ambiguous_evidence.join("oracle.json");
+    let ambiguous = json!({
+        "schema":1, "id":"outcome", "kind":"real-task", "executed":true,
+        "checker_executed":false, "passed":false, "exit_code":1, "model_calls":0,
+        "checker_route":"shared-heavy-command",
+        "started_at": genuine["started_at"], "ended_at": genuine["ended_at"],
+        "evidence": ambiguous_path,
+        "acceptance_request_sha256": genuine["acceptance_request_sha256"],
+        "task_contract_sha256": genuine["task_contract_sha256"],
+        "oracle_program_sha256": genuine["oracle_program_sha256"],
+        "oracle_inputs": genuine["oracle_inputs"],
+        "failure":"independent checker did not complete; inspect retained failure.json",
+        "runs": [],
+    });
+    let mut ambiguous_started = ambiguous.clone();
+    ambiguous_started["ended_at"] = Value::Null;
+    ambiguous_started.as_object_mut().unwrap().remove("failure");
+    ambiguous_started.as_object_mut().unwrap().remove("runs");
+    fs::write(&ambiguous_path, serde_json::to_vec(&ambiguous).unwrap()).unwrap();
+    fs::write(
+        ambiguous_evidence.join("oracle-started.json"),
+        serde_json::to_vec(&ambiguous_started).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        ambiguous_evidence.join("failure.json"),
+        serde_json::to_vec(&json!({
+            "kind":"Other",
+            "message":"the checker start and exit are unknown after an interrupted recovery; elapsed 1.0s",
+            "raw_os_error":null,
+            "acceptance_request_sha256": genuine["acceptance_request_sha256"],
+            "task_contract_sha256": genuine["task_contract_sha256"],
+            "oracle_program_sha256": genuine["oracle_program_sha256"],
+            "oracle_inputs": genuine["oracle_inputs"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ambiguous_bytes = serde_json::to_vec(&ambiguous).unwrap();
+    fs::write(&oracle_path, &ambiguous_bytes).unwrap();
+    let genuine_row_bytes = fs::read(&row_path).unwrap();
+    let before_ambiguity = fixture.cursor();
+    let refused = fixture.resume();
+    let output = text(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("start is unknown"), "{output}");
+    assert!(output.contains("must not be replayed"), "{output}");
+    assert_eq!(fs::read(&oracle_path).unwrap(), ambiguous_bytes);
+    assert_eq!(fs::read(&row_path).unwrap(), genuine_row_bytes);
+    assert_eq!(
+        fixture.cursor()["baseline_qualification"]["accepted"],
+        before_ambiguity["baseline_qualification"]["accepted"],
+        "an ambiguous start is not reclassified: {output}"
+    );
+    assert_eq!(fixture.cursor()["attempts"], before_ambiguity["attempts"]);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-1.json")
+            .exists()
+    );
+
+    let evidence = fixture.root.join("legacy-oracle-evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    let original_evidence = evidence.join("oracle.json");
+    let unstarted = json!({
+        "schema":1, "id":"outcome", "kind":"real-task", "executed":true,
+        "checker_executed":false, "passed":false, "exit_code":1, "model_calls":0,
+        "checker_route":"shared-heavy-command",
+        "started_at": genuine["started_at"],
+        "ended_at": genuine["ended_at"],
+        "evidence": original_evidence,
+        "task_contract_sha256": genuine["task_contract_sha256"],
+        "oracle_program_sha256": genuine["oracle_program_sha256"],
+        "oracle_inputs": genuine["oracle_inputs"],
+        "failure":"independent checker did not complete; inspect retained failure.json",
+        "runs": [],
+    });
+    let mut started = unstarted.clone();
+    started["ended_at"] = Value::Null;
+    started.as_object_mut().unwrap().remove("failure");
+    started.as_object_mut().unwrap().remove("runs");
+    let failure = json!({
+        "kind":"Other",
+        "message":"the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed 60.0s",
+        "raw_os_error": null,
+    });
+    fs::write(&original_evidence, serde_json::to_vec(&unstarted).unwrap()).unwrap();
+    fs::write(
+        evidence.join("oracle-started.json"),
+        serde_json::to_vec(&started).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        evidence.join("failure.json"),
+        serde_json::to_vec(&failure).unwrap(),
+    )
+    .unwrap();
+    let false_bytes = serde_json::to_vec(&unstarted).unwrap();
+    fs::write(&oracle_path, &false_bytes).unwrap();
+    let false_sha256 = build_identity::hash_bytes(&false_bytes);
+
+    let mut legacy_row = row.clone();
+    legacy_row["accepted"] = json!(false);
+    legacy_row["checks"][0]["passed"] = json!(false);
+    legacy_row["checks"][0]["evidence"] = json!(oracle_path.to_string_lossy());
+    legacy_row["checks"][0]["evidence_sha256"] = json!(false_sha256);
+    let legacy_row_bytes = serde_json::to_vec_pretty(&legacy_row).unwrap();
+    fs::write(&row_path, &legacy_row_bytes).unwrap();
+
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("baseline-qualification-recorded");
+    cursor["baseline_qualification"]["accepted"] = json!(false);
+    cursor["baseline_qualification"]["condition"] = Value::Null;
+    cursor["baseline_qualification"]["oracle"] = json!(oracle_path.to_string_lossy());
+    cursor["baseline_qualification"]["row"] = json!(row_path.to_string_lossy());
+    fixture.write_cursor(&cursor);
+
+    let recovered = fixture.resume();
+    assert!(recovered.status.success(), "{}", text(&recovered));
+    let cursor = fixture.cursor();
+    let qualification = &cursor["baseline_qualification"];
+    assert_eq!(
+        cursor["phase"], "baseline-qualification-recorded",
+        "{cursor}"
+    );
+    assert_eq!(qualification["accepted"], true, "{cursor}");
+    assert!(qualification["condition"].is_null(), "{cursor}");
+    let preserved = PathBuf::from(qualification["row_unstarted"].as_str().unwrap());
+    assert_eq!(fs::read(&preserved).unwrap(), legacy_row_bytes);
+    assert_eq!(
+        qualification["row_unstarted_sha256"],
+        build_identity::hash_bytes(&legacy_row_bytes)
+    );
+    let unstarted = &qualification["unstarted_oracles"][0];
+    assert_eq!(unstarted["attempt"], 1, "{cursor}");
+    assert_eq!(unstarted["legacy"], true, "{cursor}");
+    assert_eq!(unstarted["stage"], "admission-wait", "{cursor}");
+    assert_eq!(unstarted["elapsed_seconds"], "60.0", "{cursor}");
+    assert_eq!(
+        unstarted["message"],
+        "the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed 60.0s",
+        "{cursor}"
+    );
+    assert_eq!(
+        unstarted["superseded_row_sha256"],
+        build_identity::hash_bytes(&legacy_row_bytes)
+    );
+    assert_eq!(
+        PathBuf::from(unstarted["superseded_row"].as_str().unwrap()),
+        preserved
+    );
+    let new_oracle = PathBuf::from(qualification["oracle"].as_str().unwrap());
+    assert!(new_oracle.ends_with("oracle-retry-1.json"), "{cursor}");
+    let new_record: Value = serde_json::from_slice(&fs::read(&new_oracle).unwrap()).unwrap();
+    assert_eq!(new_record["checker_executed"], true, "{new_record}");
+    assert_eq!(new_record["passed"], true, "{new_record}");
+    let new_row_path = PathBuf::from(qualification["row"].as_str().unwrap());
+    let new_row: Value = serde_json::from_slice(&fs::read(&new_row_path).unwrap()).unwrap();
+    assert_eq!(new_row["accepted"], true, "{new_row}");
+    assert_eq!(new_row["checks"][0]["passed"], true, "{new_row}");
+    assert_eq!(
+        new_row["checks"][0]["evidence_sha256"],
+        build_identity::hash_file(&new_oracle).unwrap(),
+        "the replacement row binds its actual new record: {new_row}"
+    );
+    assert_eq!(new_row["usage"], legacy_row["usage"], "{new_row}");
+    assert_eq!(
+        new_row["native_runs"], legacy_row["native_runs"],
+        "{new_row}"
+    );
+    assert!(
+        new_row["interventions"].as_array().unwrap().iter().any(
+            |intervention| intervention["kind"] == "independent-check-unstarted"
+                && intervention["attempt"] == 1
+                && intervention["legacy"] == true
+        ),
+        "{new_row}"
+    );
+    assert_eq!(fs::read(&oracle_path).unwrap(), false_bytes);
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        expected_attempts
+    );
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+
+    let new_row_bytes = fs::read(&new_row_path).unwrap();
+    let new_oracle_bytes = fs::read(&new_oracle).unwrap();
+    let repeated = fixture.resume();
+    assert!(repeated.status.success(), "{}", text(&repeated));
+    assert_eq!(fs::read(&new_row_path).unwrap(), new_row_bytes);
+    assert_eq!(fs::read(&new_oracle).unwrap(), new_oracle_bytes);
+    assert_eq!(fs::read(&preserved).unwrap(), legacy_row_bytes);
+    assert!(
+        !fixture
+            .run
+            .join("baseline-qualification/oracle-retry-2.json")
+            .exists()
+    );
+    let stopped = fixture.stop();
+    assert!(stopped.status.success(), "{}", text(&stopped));
 }
 
 /// An existing kit workload already carries its own executor declaration; the

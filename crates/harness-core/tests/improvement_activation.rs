@@ -8,7 +8,7 @@
 //! ambient account state, model call or live installation is touched.
 
 use harness_core::benefit_gate::{
-    DecisionDraft, DecisionOutcome, Publication, QualityOutcome, publish_decision,
+    DecisionBasis, DecisionDraft, DecisionOutcome, Publication, QualityOutcome, publish_decision,
 };
 use harness_core::board_feedback;
 use harness_core::board_hypothesis::{
@@ -531,8 +531,10 @@ fn policy() -> ComparisonPolicy {
             implementation_seconds: 10.0,
             evaluation_seconds: 5.0,
             maintenance_seconds_per_task: 0.5,
+            token_accounting: None,
         },
         conjunction: None,
+        payback: None,
     }
 }
 
@@ -837,6 +839,7 @@ fn run_spec(
         removal: None,
         evidence_root: None,
         comparison: None,
+        baseline_qualification: None,
     }
 }
 
@@ -1115,6 +1118,7 @@ fn publication_is_idempotent_and_a_newer_conflicting_decision_blocks_integration
         experiment: scenario.experiment.clone(),
         outcome: DecisionOutcome::Adopt,
         quality: QualityOutcome::Unchanged,
+        basis: DecisionBasis::Efficiency,
         matched: 1,
         tolerance_percent: 5.0,
         baseline_seconds: 100.0,
@@ -1129,6 +1133,12 @@ fn publication_is_idempotent_and_a_newer_conflicting_decision_blocks_integration
         scope: "case-b".into(),
         reason: "contradictory-fixture".into(),
         detail: None,
+        baseline_tokens: None,
+        candidate_tokens: None,
+        cumulative_baseline_tokens: None,
+        cumulative_candidate_tokens: None,
+        cumulative_baseline: None,
+        payback: None,
     };
     let Publication::Recorded { .. } =
         publish_decision(&scenario.bd, &scenario.board, &contradictory).unwrap()

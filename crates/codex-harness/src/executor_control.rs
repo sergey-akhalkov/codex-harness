@@ -101,6 +101,37 @@ pub const DEFAULT_POLL: Duration = Duration::from_millis(200);
 const DRAIN: Duration = Duration::from_millis(25);
 /// Bounded pause between readiness attempts.
 const RETRY: Duration = Duration::from_millis(50);
+/// A reflection catalogue is read in bounded pages; an endless or malformed
+/// cursor fails closed instead of guessing an empty tool surface.
+const MAX_CATALOGUE_PAGES: usize = 64;
+const REFLECTION_FEATURE_SWITCHES: [&str; 26] = [
+    "features.apps",
+    "features.enable_mcp_apps",
+    "features.codex_apps_mcp_2026_07_28",
+    "features.plugins",
+    "features.remote_plugin",
+    "features.browser_use",
+    "features.browser_use_external",
+    "features.browser_use_full_cdp_access",
+    "features.browser_annotation_api",
+    "features.in_app_browser",
+    "features.computer_use",
+    "features.image_generation",
+    "features.artifact",
+    "features.code_mode",
+    "features.hooks",
+    "features.goals",
+    "features.multi_agent",
+    "features.multi_agent_v2",
+    "features.agent_message_board",
+    "features.deferred_executor",
+    "features.request_permissions_tool",
+    "features.guardian_approval",
+    "features.use_agent_identity",
+    "features.send_message_to_user_async",
+    "features.workspace_dependencies",
+    "features.skill_mcp_dependency_install",
+];
 
 fn invalid(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
@@ -128,7 +159,7 @@ fn excerpt(text: &str, limit: usize) -> String {
 /// Replaces a state file through a staged write, so a reader, the lead reading
 /// the endpoint record while the run is live, never observes a partial record,
 /// and a failed staging leaves the previous bytes in place.
-fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| invalid("control state path has no directory"))?;
@@ -442,8 +473,6 @@ fn run_generation() -> io::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// The identity the harness bound for one executor run: the resolved profile
-/// binding of the dispatch, against which the started thread is verified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BoundIdentity {
@@ -547,6 +576,16 @@ pub struct ControlPlan {
     /// conversations. Its own session marker, never the executor one, makes
     /// the kit's dispatch entries refuse inside its process tree.
     pub bounded_lead_session: bool,
+    /// Whether this plan serves a bounded, read-only self-reflection
+    /// conversation. A reflection fork stays single-agent exactly like an
+    /// executor, is refused every native agent tool, and carries its own
+    /// session marker instead of being mislabelled as an executor or bounded
+    /// lead. It may only fork an existing conversation; it never starts one.
+    pub reflection_session: bool,
+    /// Developer instructions for the conversation this plan starts or forks.
+    /// A reflection stage sets the resolved reflection role here; an ordinary
+    /// conversation leaves it unset and keeps the native instruction sources.
+    pub developer_instructions: Option<String>,
     /// Bound for readiness and for every request's answer.
     pub bound: Duration,
     /// Record-read timeout of one pump step.
@@ -578,6 +617,8 @@ impl ControlPlan {
             env: BTreeMap::new(),
             executor_session: true,
             bounded_lead_session: false,
+            reflection_session: false,
+            developer_instructions: None,
             bound: DEFAULT_BOUND,
             poll: DEFAULT_POLL,
         }
@@ -639,7 +680,7 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         OsString::from("--ws-token-file"),
         plan.paths.token.clone().into_os_string(),
     ];
-    if plan.executor_session || plan.bounded_lead_session {
+    if plan.executor_session || plan.bounded_lead_session || plan.reflection_session {
         // A managed lead session keeps the native agent capability: neither
         // this override nor the session marker reaches its app-server child.
         // A bounded lead conversation is a bounded decision participant, not
@@ -648,6 +689,37 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         args.extend(EXECUTOR_AGENT_TOOLS_OFF.map(OsString::from));
     }
     args.extend(plan.args.iter().cloned());
+    if plan.reflection_session {
+        // The reflection child is a fresh process. Denying these channels at
+        // process scope prevents a persisted source thread from activating a
+        // plugin, app, hook, browser or computer tool before `thread/fork`.
+        // `features.goals` is deliberately not disabled at process scope: the
+        // same app-server serves the controller's source/fork goal reads and
+        // the fork-local clear, and that stable feature also gates those RPCs.
+        // The fork's own config below keeps inherited goal tools off.
+        for feature in REFLECTION_FEATURE_SWITCHES
+            .iter()
+            .filter(|feature| **feature != "features.goals")
+        {
+            args.push(OsString::from("-c"));
+            args.push(OsString::from(format!("{feature}=false")));
+        }
+        // Goal RPCs are process-wide administrative controls, while inherited
+        // goal continuation is a fork-local setting. A source home may disable
+        // goals, but this app-server must still read, clear and verify the
+        // source and fork goals. This override follows every caller argument
+        // so the process remains able to administer goal state; `fork_params`
+        // keeps the feature off in the fork's own config, so the fork still
+        // has no inherited goal or autonomous continuation.
+        args.push(OsString::from("-c"));
+        args.push(OsString::from("features.goals=true"));
+        args.push(OsString::from("-c"));
+        args.push(OsString::from("web_search=\"disabled\""));
+        // The native tool transport is required for permitted reads. Tool
+        // authority stays bounded by the fork sandbox and closed catalogues.
+        args.push(OsString::from("-c"));
+        args.push(OsString::from("features.code_mode_host=true"));
+    }
     args
 }
 
@@ -714,6 +786,21 @@ impl Endpoint {
     /// The loopback port of this endpoint.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// This endpoint addressed to the thread the native frontend selected.
+    /// The process proof, address and bearer are unchanged; only the registry
+    /// identity is attached.
+    pub(crate) fn for_thread(&self, thread_id: &str) -> io::Result<Self> {
+        let key = lead_key(thread_id)?;
+        if key != thread_id {
+            return Err(invalid(
+                "the selected native thread identity is not an exact registry key",
+            ));
+        }
+        let mut endpoint = self.clone();
+        endpoint.thread_id = Some(key);
+        Ok(endpoint)
     }
 
     /// Writes the record where the lead reads it: beside the dispatch receipt,
@@ -967,6 +1054,38 @@ pub struct TurnStart {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkEvidence {
+    pub source_thread: String,
+    pub source_last_turn: String,
+    pub fork_thread: String,
+    pub source_turns_before: Vec<String>,
+    pub source_turns_after: Vec<String>,
+    pub source_goal_before: Value,
+    pub source_goal_after: Value,
+    pub fork_goal_before_clear: Value,
+    pub fork_goal_after_clear: Value,
+    pub goal_cleared: bool,
+    pub source_preserved: bool,
+    pub cwd: String,
+    pub sandbox: Value,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// The inherited MCP server names disabled only on this fork. The source
+    /// conversation's own configuration is never changed.
+    #[serde(default)]
+    pub suppressed_mcp_servers: Vec<String>,
+    /// The enabled Apps disabled only on this fork.
+    #[serde(default)]
+    pub suppressed_apps: Vec<String>,
+    /// The post-fork native MCP and Apps catalogue summary. It is present only
+    /// after the fork proved that no inherited tool remains exposed.
+    #[serde(default)]
+    pub tool_surface: Value,
+}
+
 /// The answer to one bounded native request, exactly as the protocol delivered
 /// it.
 ///
@@ -983,6 +1102,27 @@ pub enum Reply {
     /// No answer arrived within the request bound.
     Unanswered,
 }
+
+/// The server's own acknowledged refusal of a `thread/fork` request.
+///
+/// This is deliberately narrower than [`Reply::Rejected`]: it exists only for
+/// the one request whose refusal proves that no fork and no model turn were
+/// created. An unanswered request or a transport failure stays an ordinary
+/// timeout/error because neither establishes the absence of model work.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForkRejected(pub Value);
+
+impl std::fmt::Display for ForkRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the native request thread/fork was rejected: {}",
+            excerpt(&self.0.to_string(), 400)
+        )
+    }
+}
+
+impl std::error::Error for ForkRejected {}
 
 /// The final assistant message of a thread, or why it is absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1174,6 +1314,9 @@ pub struct Conversation {
     /// The turn whose terminal status can finish this run. Assignment
     /// submission and later accepted input update it. A historical turn cannot.
     turn: Option<TurnStart>,
+    /// The exact turn whose terminal outcome was committed. A historical
+    /// completion never sets it, and new assignment clears it.
+    terminal_turn: Option<String>,
     /// Turns whose terminal status was already observed. A replay cannot finish
     /// this run.
     settled_turns: BTreeSet<String>,
@@ -1238,6 +1381,164 @@ impl Conversation {
         Ok(conversation)
     }
 
+    /// Starts one harness-owned app-server child and forks an existing thread
+    /// at an exact completed checkpoint.
+    ///
+    /// The declared checkpoint may be followed by legitimate later source
+    /// work. It is located anywhere in the thread, must be completed, and is
+    /// the only boundary whose preservation is required: turns through that
+    /// checkpoint and the source goal are compared before and after the fork.
+    /// The fork receives fork-local suppression of every inherited MCP server,
+    /// enabled App and external tool channel, and its effective MCP and Apps
+    /// catalogues must be empty of exposed tools before it is named or any turn
+    /// can start.
+    pub fn start_forking(
+        job: &Job,
+        plan: &ControlPlan,
+        source_thread: &str,
+        source_last_turn: &str,
+    ) -> io::Result<(Self, ForkEvidence)> {
+        if source_thread.is_empty() || source_last_turn.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a reflection fork requires the exact source thread and its completed checkpoint turn",
+            ));
+        }
+        if !plan.reflection_session {
+            return Err(invalid(
+                "a fork requires an explicitly read-only reflection plan; refusing to fork under an executor or lead plan",
+            ));
+        }
+        if plan.sandbox.as_deref() != Some("read-only") {
+            return Err(invalid(
+                "a reflection fork requires the read-only sandbox; refusing to start a fork that could edit files",
+            ));
+        }
+        if plan
+            .developer_instructions
+            .as_deref()
+            .is_none_or(|instructions| instructions.trim().is_empty())
+        {
+            return Err(invalid(
+                "a reflection fork requires the resolved reflection role instructions",
+            ));
+        }
+        if plan.title.trim().is_empty() {
+            return Err(invalid(
+                "a reflection fork requires a distinct visible title before any turn starts",
+            ));
+        }
+        let mut conversation = Self::open(job, plan)?;
+        let source_before = conversation.read_thread_record(source_thread)?;
+        let source_turns_before = turn_ids(&source_before)?;
+        let (checkpoint_index_before, checkpoint_before) =
+            completed_checkpoint(&source_before, source_last_turn)?;
+        let checkpoint_prefix_before = checkpoint_prefix(&source_before, checkpoint_index_before)?;
+        let source_goal_before = conversation.thread_goal(source_thread)?;
+        let source_mcp_before = mcp_catalogue(&mut conversation, None)?;
+        let source_apps_before = app_catalogue(&mut conversation, None)?;
+        let suppressed_mcp_servers = inherited_mcp_servers(&source_mcp_before)?;
+        let suppressed_apps = enabled_app_ids(&source_apps_before)?;
+        let forked = conversation.fork_request(fork_params(
+            plan,
+            source_thread,
+            source_last_turn,
+            &suppressed_mcp_servers,
+            &suppressed_apps,
+        )?)?;
+        let fork_thread = forked["thread"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    "thread/fork answered without a thread identity; no reflection conversation exists",
+                )
+            })?
+            .to_owned();
+        if fork_thread == source_thread {
+            return Err(invalid(
+                "thread/fork answered with the source thread identity; refusing to treat the source as a fork",
+            ));
+        }
+        if let Err(mismatch) = plan.identity.verify(&forked) {
+            return Err(invalid(format!(
+                "the reflection fork did not preserve the declared routing: {mismatch}; no turn was started"
+            )));
+        }
+        verify_fork_environment(plan, &forked)?;
+        let tool_surface = verify_reflection_tool_surface(
+            &mut conversation,
+            &fork_thread,
+            &suppressed_apps,
+        )
+        .map_err(|error| {
+            invalid(format!(
+                "the reflection fork's inherited tool surface could not be proven closed: {error}; no turn was started"
+            ))
+        })?;
+        let fork_goal_before_clear = conversation.thread_goal(&fork_thread)?;
+        let goal_cleared = !fork_goal_before_clear.is_null();
+        if goal_cleared {
+            conversation.clear_thread_goal(&fork_thread)?;
+        }
+        let fork_goal_after_clear = conversation.thread_goal(&fork_thread)?;
+        if !fork_goal_after_clear.is_null() {
+            return Err(invalid(format!(
+                "forked thread {fork_thread} still carries an inherited goal after clear; refusing to start a turn that could continue the source work"
+            )));
+        }
+        let source_after = conversation.read_thread_record(source_thread)?;
+        let (checkpoint_index_after, checkpoint_after) =
+            completed_checkpoint(&source_after, source_last_turn)?;
+        let checkpoint_prefix_after = checkpoint_prefix(&source_after, checkpoint_index_after)?;
+        let source_turns_after = turn_ids(&source_after)?;
+        let source_goal_after = conversation.thread_goal(source_thread)?;
+        let source_mcp_after = mcp_catalogue(&mut conversation, None)?;
+        let source_apps_after = app_catalogue(&mut conversation, None)?;
+        let source_preserved = checkpoint_index_after == checkpoint_index_before
+            && checkpoint_after == checkpoint_before
+            && checkpoint_prefix_after == checkpoint_prefix_before
+            && source_goal_after == source_goal_before
+            && mcp_catalogue_identity(&source_mcp_after)?
+                == mcp_catalogue_identity(&source_mcp_before)?
+            && app_catalogue_identity(&source_apps_after)?
+                == app_catalogue_identity(&source_apps_before)?;
+        if !source_preserved {
+            return Err(invalid(format!(
+                "selected source checkpoint {source_last_turn} of thread {source_thread}, its goal, or its tool settings changed during the fork; later legitimate source turns are allowed, but this checkpoint is no longer the preserved boundary"
+            )));
+        }
+        conversation.call(
+            "thread/name/set",
+            json!({"threadId": fork_thread, "name": plan.title}),
+        )?;
+        conversation.thread_id = fork_thread.clone();
+        conversation.endpoint.thread_id = Some(fork_thread.clone());
+        conversation.record_endpoint(plan)?;
+        let evidence = ForkEvidence {
+            source_thread: source_thread.to_owned(),
+            source_last_turn: source_last_turn.to_owned(),
+            fork_thread,
+            source_turns_before,
+            source_turns_after,
+            source_goal_before,
+            source_goal_after,
+            fork_goal_before_clear,
+            fork_goal_after_clear,
+            goal_cleared,
+            source_preserved,
+            cwd: forked["cwd"].as_str().unwrap_or_default().to_owned(),
+            sandbox: forked["sandbox"].clone(),
+            model: forked["model"].as_str().map(str::to_owned),
+            model_provider: forked["modelProvider"].as_str().map(str::to_owned),
+            reasoning_effort: forked["reasoningEffort"].as_str().map(str::to_owned),
+            suppressed_mcp_servers,
+            suppressed_apps,
+            tool_surface,
+        };
+        Ok((conversation, evidence))
+    }
+
     /// Starts the app-server and resumes one exact existing thread.
     ///
     /// This does not call `thread/start`. The conversation identity is the
@@ -1279,7 +1580,7 @@ impl Conversation {
         Ok(conversation)
     }
 
-    fn open(job: &Job, plan: &ControlPlan) -> io::Result<Self> {
+    pub(crate) fn open(job: &Job, plan: &ControlPlan) -> io::Result<Self> {
         if plan.launcher.as_os_str().is_empty() || plan.slot.as_os_str().is_empty() {
             return Err(invalid(
                 "a control session requires the launcher, the kit home and the bound slot",
@@ -1318,6 +1619,7 @@ impl Conversation {
             defect: None,
             failure: None,
             turn: None,
+            terminal_turn: None,
             settled_turns: BTreeSet::new(),
             closure_begun: false,
             pending_terminal: None,
@@ -1412,6 +1714,7 @@ impl Conversation {
             defect: None,
             failure: None,
             turn: None,
+            terminal_turn: None,
             settled_turns: BTreeSet::new(),
             closure_begun: false,
             pending_terminal: None,
@@ -1437,6 +1740,24 @@ impl Conversation {
         &self.thread_id
     }
 
+    /// Adopts the thread the native frontend selected on this backend. The
+    /// ordinary host starts no thread of its own: selection is observed from
+    /// the frontend's exact `result.thread.id`, then the same app-server is
+    /// driven for that conversation. Changing the addressed thread is allowed
+    /// only after its selection callback has completed the verified ownership
+    /// transfer; this object can never cross to another app-server.
+    pub(crate) fn adopt_thread(&mut self, thread_id: &str) -> io::Result<()> {
+        let key = lead_key(thread_id)?;
+        if key != thread_id {
+            return Err(invalid(
+                "the selected native thread identity is not an exact registry key",
+            ));
+        }
+        self.thread_id = key.clone();
+        self.endpoint.thread_id = Some(key);
+        Ok(())
+    }
+
     /// The identity the started thread was verified against, when this session
     /// started its own thread.
     #[allow(dead_code)] // Read back through the receipt by the addressing commands.
@@ -1457,6 +1778,19 @@ impl Conversation {
     /// The lifecycle state the conversation has reached so far.
     pub fn lifecycle(&self) -> Option<Lifecycle> {
         self.lifecycle
+    }
+
+    /// The terminal outcome committed for exactly `turn_id`, if any.
+    ///
+    /// This is stronger than reading the thread-wide lifecycle: a historical
+    /// turn, a frontend exit or an unrelated thread state cannot answer for
+    /// the turn a finite host assigned.
+    pub fn turn_outcome(&self, turn_id: &str) -> Option<Lifecycle> {
+        if self.terminal_turn.as_deref() != Some(turn_id) {
+            return None;
+        }
+        self.lifecycle
+            .filter(|state| state.is_terminal() || *state == Lifecycle::Defect)
     }
 
     /// The first protocol deviation observed. A run with a recorded deviation
@@ -1516,9 +1850,28 @@ impl Conversation {
         };
         if !self.closure_begun {
             self.pending_terminal = None;
+            self.terminal_turn = None;
             self.turn = Some(turn.clone());
         }
         Ok(turn)
+    }
+
+    /// Starts the one native fork request whose acknowledged refusal proves
+    /// that no fork and no turn were created. A rejection carries the server's
+    /// exact error object as [`ForkRejected`]; an unanswered request remains a
+    /// timeout with unknown conversation state.
+    fn fork_request(&mut self, params: Value) -> io::Result<Value> {
+        match self.request("thread/fork", params)? {
+            Reply::Result(result) => Ok(result),
+            Reply::Rejected(error) => Err(io::Error::other(ForkRejected(error))),
+            Reply::Unanswered => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the native request thread/fork was not answered within {:?}; the conversation state is unknown and must not be reported as progress",
+                    self.bound
+                ),
+            )),
+        }
     }
 
     /// Sends one bounded native request and returns its `result`.
@@ -1681,12 +2034,119 @@ impl Conversation {
         Ok(thread.clone())
     }
 
+    /// Reads one exact thread record (`thread/read includeTurns`) and refuses
+    /// an answer that names another thread. This is the read used to verify a
+    /// fork's source boundary and its preservation, not a conversation's own
+    /// mutable state.
+    pub fn read_thread_record(&mut self, thread_id: &str) -> io::Result<Value> {
+        if thread_id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reading a thread record requires its exact identity",
+            ));
+        }
+        let read = match self.request(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": true}),
+        )? {
+            Reply::Result(result) => result,
+            Reply::Rejected(error) if error.to_string().contains("list_turns") => {
+                self.call("thread/read", json!({"threadId": thread_id}))?
+            }
+            Reply::Rejected(error) => {
+                return Err(io::Error::other(format!(
+                    "the native request thread/read was rejected: {}",
+                    excerpt(&error.to_string(), 400)
+                )));
+            }
+            Reply::Unanswered => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the native request thread/read was not answered within {:?}; the conversation state is unknown and must not be reported as progress",
+                        self.bound
+                    ),
+                ));
+            }
+        };
+        let thread = &read["thread"];
+        if thread["id"].as_str() != Some(thread_id) {
+            return Err(invalid(format!(
+                "thread/read answered for thread {} instead of {thread_id}; refusing to read another conversation",
+                thread["id"]
+            )));
+        }
+        Ok(thread.clone())
+    }
+
+    /// Parses the native `thread/goal/get` answer without guessing. A null goal is
+    /// the documented absence; an object is the exact stored goal. Any other shape,
+    /// including a missing field, is a malformed answer and stays an error.
+    fn parse_thread_goal(answer: &Value) -> io::Result<Value> {
+        match answer.get("goal") {
+            Some(goal @ (Value::Null | Value::Object(_))) => Ok(goal.clone()),
+            Some(other) => Err(invalid(format!(
+                "thread/goal/get answered with a non-goal value {}; refusing to guess goal state",
+                excerpt(&other.to_string(), 200)
+            ))),
+            None => Err(invalid(
+                "thread/goal/get answered without a goal field; refusing to guess goal state",
+            )),
+        }
+    }
+
+    /// Reads one exact thread goal through the native goal owner. A null answer
+    /// means the thread has no goal; a missing or malformed answer is refused
+    /// rather than treated as an absent goal.
+    pub fn thread_goal(&mut self, thread_id: &str) -> io::Result<Value> {
+        if thread_id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reading a thread goal requires its exact identity",
+            ));
+        }
+        let answer = self.call("thread/goal/get", json!({"threadId": thread_id}))?;
+        Self::parse_thread_goal(&answer)
+    }
+
+    /// Clears one thread goal as an automatic lifecycle mutation and verifies
+    /// that the native owner now reports no goal. A failed clear leaves the
+    /// conversation untouched and returns the error before any turn starts.
+    pub fn clear_thread_goal(&mut self, thread_id: &str) -> io::Result<()> {
+        self.call(
+            "thread/goal/clear",
+            json!({"threadId": thread_id, "origin": "automatic"}),
+        )?;
+        let goal = self.thread_goal(thread_id)?;
+        if !goal.is_null() {
+            return Err(invalid(format!(
+                "thread {thread_id} still reports a goal after thread/goal/clear; refusing to start a turn"
+            )));
+        }
+        Ok(())
+    }
+
     /// The final assistant message of the accepted turn, taken from the thread
     /// items rather than from any transport acknowledgement or an older turn.
     pub fn final_message(&mut self) -> io::Result<FinalMessage> {
+        let turn_id = self.turn.as_ref().map(|turn| turn.turn_id.clone());
+        match turn_id.as_deref() {
+            Some(turn_id) => self.final_message_for_turn(turn_id),
+            None => {
+                let thread = self.thread_state()?;
+                Ok(final_message_for(&thread, None))
+            }
+        }
+    }
+
+    /// The final assistant message of exactly `turn_id`.
+    ///
+    /// A caller that assigned one new turn must read that turn, not whatever
+    /// turn this conversation accepted last: a resumed thread's completed
+    /// history is not the new result.
+    pub fn final_message_for_turn(&mut self, turn_id: &str) -> io::Result<FinalMessage> {
         let thread = self.thread_state()?;
-        let turn_id = self.turn.as_ref().map(|turn| turn.turn_id.as_str());
-        Ok(final_message_for(&thread, turn_id))
+        Ok(final_message_for(&thread, Some(turn_id)))
     }
 
     fn initialize(&mut self) -> io::Result<()> {
@@ -1856,6 +2316,7 @@ impl Conversation {
                     Some("systemError") => {
                         let message = "the native thread reported a system error".to_owned();
                         self.failure = Some(message.clone());
+                        self.terminal_turn = self.turn.as_ref().map(|turn| turn.turn_id.clone());
                         (self.set(Lifecycle::Failed), Some(message))
                     }
                     Some(other) => (
@@ -2031,6 +2492,7 @@ impl Conversation {
 
     fn accept_observed_turn(&mut self, id: &str) {
         self.pending_terminal = None;
+        self.terminal_turn = None;
         if !self.closure_begun
             && self
                 .lifecycle
@@ -2068,6 +2530,7 @@ impl Conversation {
             }
         }
         self.lifecycle = Some(state);
+        self.terminal_turn = self.turn.as_ref().map(|turn| turn.turn_id.clone());
         self.closure_begun = true;
         if let Some(receipt) = self.receipt.clone() {
             let _ = mark_input_closure(&receipt);
@@ -2153,6 +2616,9 @@ fn thread_params(plan: &ControlPlan) -> Value {
     if let Some(sandbox) = &plan.sandbox {
         params.insert("sandbox".into(), json!(sandbox));
     }
+    if let Some(instructions) = &plan.developer_instructions {
+        params.insert("developerInstructions".into(), json!(instructions));
+    }
     let mut config = Map::new();
     if let Some(effort) = &plan.identity.reasoning_effort {
         config.insert("model_reasoning_effort".into(), json!(effort));
@@ -2164,6 +2630,440 @@ fn thread_params(plan: &ControlPlan) -> Value {
         params.insert("config".into(), Value::Object(config));
     }
     Value::Object(params)
+}
+
+/// The exact `thread/fork` request of one reflection stage. The source is
+/// pinned by thread and completed checkpoint turn, the inherited goal's initial
+/// continuation is deferred, and the fork receives only the reflection routing,
+/// developer instructions, read-only sandbox this plan declares and fork-local
+/// suppression of every inherited external tool channel.
+fn fork_params(
+    plan: &ControlPlan,
+    source_thread: &str,
+    source_last_turn: &str,
+    suppressed_mcp_servers: &[String],
+    suppressed_apps: &[String],
+) -> io::Result<Value> {
+    let mut params = Map::new();
+    params.insert("threadId".into(), json!(source_thread));
+    params.insert("lastTurnId".into(), json!(source_last_turn));
+    params.insert("deferGoalContinuation".into(), json!(true));
+    params.insert("cwd".into(), json!(plan.slot));
+    if let Some(model) = &plan.identity.model {
+        params.insert("model".into(), json!(model));
+    }
+    if let Some(provider) = &plan.identity.model_provider {
+        params.insert("modelProvider".into(), json!(provider));
+    }
+    if let Some(policy) = &plan.approval_policy {
+        params.insert("approvalPolicy".into(), json!(policy));
+    }
+    if let Some(sandbox) = &plan.sandbox {
+        params.insert("sandbox".into(), json!(sandbox));
+    }
+    if let Some(instructions) = &plan.developer_instructions {
+        params.insert("developerInstructions".into(), json!(instructions));
+    }
+    let mut config = Map::new();
+    if let Some(effort) = &plan.identity.reasoning_effort {
+        config.insert("model_reasoning_effort".into(), json!(effort));
+    }
+    for (key, value) in &plan.overrides {
+        config.insert(key.clone(), value.clone());
+    }
+    for feature in REFLECTION_FEATURE_SWITCHES {
+        config.insert(feature.into(), json!(false));
+    }
+    config.insert("web_search".into(), json!("disabled"));
+    config.insert("features.code_mode_host".into(), json!(true));
+    if !suppressed_mcp_servers.is_empty() {
+        config.insert(
+            "mcp_servers".into(),
+            disabled_channel_overrides(suppressed_mcp_servers),
+        );
+    }
+    if !suppressed_apps.is_empty() {
+        config.insert("apps".into(), disabled_channel_overrides(suppressed_apps));
+    }
+    config.insert("agents.enabled".into(), json!(false));
+    params.insert("config".into(), Value::Object(config));
+    Ok(Value::Object(params))
+}
+
+/// One fork-local config table that disables every named inherited channel.
+///
+/// The app-server request-config key is a dotted path, but the value is passed
+/// through `json_to_toml`, so a whole table value keeps each JSON object key as
+/// a literal table key. That supports every native server name, including
+/// `odd.name`, without renaming or changing the source configuration. A dotted
+/// scalar key such as `mcp_servers.odd.name.enabled` would split the name into
+/// three path segments. The source catalogue still supplies the exact names,
+/// and the post-fork catalogue verification fails closed if any channel remains
+/// exposed.
+fn disabled_channel_overrides(names: &[String]) -> Value {
+    let mut table = Map::new();
+    for name in names {
+        table.insert(name.clone(), json!({"enabled": false}));
+    }
+    Value::Object(table)
+}
+
+/// Locates the exact declared checkpoint anywhere in a thread and requires
+/// that turn itself to be completed. Later legitimate turns do not move it.
+fn completed_checkpoint(thread: &Value, checkpoint: &str) -> io::Result<(usize, Value)> {
+    let turns = thread["turns"]
+        .as_array()
+        .ok_or_else(|| invalid("a thread record carries no turns array"))?;
+    let mut found = None;
+    for (index, turn) in turns.iter().enumerate() {
+        if turn["id"].as_str() == Some(checkpoint) && found.replace(index).is_some() {
+            return Err(invalid(format!(
+                "source thread carries duplicate turns named {checkpoint}; refusing an ambiguous checkpoint"
+            )));
+        }
+    }
+    let index = found.ok_or_else(|| {
+        invalid(format!(
+            "source thread does not contain the declared completed checkpoint {checkpoint}"
+        ))
+    })?;
+    let status = turns[index]["status"].as_str().unwrap_or_default();
+    if status != "completed" {
+        return Err(invalid(format!(
+            "source checkpoint {checkpoint} is {status}, not completed; refusing to fork unfinished work"
+        )));
+    }
+    Ok((index, turns[index].clone()))
+}
+
+/// The immutable portion of a source thread through its selected checkpoint.
+/// Later turns are intentionally excluded so ordinary lead progress after the
+/// checkpoint remains legitimate.
+fn checkpoint_prefix(thread: &Value, checkpoint_index: usize) -> io::Result<Vec<Value>> {
+    let turns = thread["turns"]
+        .as_array()
+        .ok_or_else(|| invalid("a thread record carries no turns array"))?;
+    turns
+        .get(..=checkpoint_index)
+        .map(<[Value]>::to_vec)
+        .ok_or_else(|| invalid("the selected source checkpoint moved outside the thread"))
+}
+
+/// Reads the complete MCP catalogue without invoking a tool. A loaded thread
+/// (`Some`) reuses that conversation's MCP connections; `None` reads the
+/// process catalogue, which is what a fresh reflection app-server inherits and
+/// what `thread/fork` carries into the read-only fork. A source thread owned by
+/// another live app-server cannot be resumed here ("already has an active
+/// writer"), and its rollout records no MCP configuration, so a thread-scoped
+/// read of an unloaded source would not describe the fork's inherited set.
+fn mcp_catalogue(
+    conversation: &mut Conversation,
+    thread_id: Option<&str>,
+) -> io::Result<Vec<Value>> {
+    let mut cursor: Option<String> = None;
+    let mut entries = Vec::new();
+    for _ in 0..MAX_CATALOGUE_PAGES {
+        let mut params = Map::new();
+        if let Some(thread_id) = thread_id {
+            params.insert("threadId".into(), json!(thread_id));
+        }
+        params.insert("detail".into(), json!("toolsAndAuthOnly"));
+        params.insert("limit".into(), json!(100));
+        if let Some(current) = &cursor {
+            params.insert("cursor".into(), json!(current));
+        }
+        let answer = conversation.call("mcpServerStatus/list", Value::Object(params))?;
+        let data = answer["data"]
+            .as_array()
+            .ok_or_else(|| invalid("mcpServerStatus/list answered without a data array"))?;
+        entries.extend(data.iter().cloned());
+        let next = match answer.get("nextCursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(next)) if !next.is_empty() => Some(next.clone()),
+            Some(_) => {
+                return Err(invalid(
+                    "mcpServerStatus/list answered with a malformed next cursor",
+                ));
+            }
+        };
+        match next {
+            None => return Ok(entries),
+            Some(next) if cursor.as_deref() == Some(next.as_str()) => {
+                return Err(invalid(
+                    "mcpServerStatus/list repeated its cursor; the MCP catalogue is incomplete",
+                ));
+            }
+            Some(next) => cursor = Some(next),
+        }
+    }
+    Err(invalid(
+        "mcpServerStatus/list exceeded its bounded page count; the MCP catalogue is incomplete",
+    ))
+}
+
+/// Reads the complete Apps catalogue without opening an app. As with the MCP
+/// catalogue, `None` reads the process catalogue a fresh reflection app-server
+/// inherits; a loaded fork uses its own thread scope.
+fn app_catalogue(
+    conversation: &mut Conversation,
+    thread_id: Option<&str>,
+) -> io::Result<Vec<Value>> {
+    let mut cursor: Option<String> = None;
+    let mut entries = Vec::new();
+    for _ in 0..MAX_CATALOGUE_PAGES {
+        let mut params = Map::new();
+        if let Some(thread_id) = thread_id {
+            params.insert("threadId".into(), json!(thread_id));
+        }
+        params.insert("limit".into(), json!(100));
+        if let Some(current) = &cursor {
+            params.insert("cursor".into(), json!(current));
+        }
+        let answer = conversation.call("app/list", Value::Object(params))?;
+        let data = answer["data"]
+            .as_array()
+            .ok_or_else(|| invalid("app/list answered without a data array"))?;
+        entries.extend(data.iter().cloned());
+        let next = match answer.get("nextCursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(next)) if !next.is_empty() => Some(next.clone()),
+            Some(_) => return Err(invalid("app/list answered with a malformed next cursor")),
+        };
+        match next {
+            None => return Ok(entries),
+            Some(next) if cursor.as_deref() == Some(next.as_str()) => {
+                return Err(invalid(
+                    "app/list repeated its cursor; the Apps catalogue is incomplete",
+                ));
+            }
+            Some(next) => cursor = Some(next),
+        }
+    }
+    Err(invalid(
+        "app/list exceeded its bounded page count; the Apps catalogue is incomplete",
+    ))
+}
+
+/// Names every configured MCP server visible to the source thread. Suppression
+/// is fork-local; enumerating the source does not change its configuration.
+fn inherited_mcp_servers(catalogue: &[Value]) -> io::Result<Vec<String>> {
+    let mut names = BTreeSet::new();
+    for server in catalogue {
+        let name = server["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid("an inherited MCP server carries no name"))?;
+        names.insert(name.to_owned());
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// The enabled Apps of the source thread, in stable order. `isEnabled` defaults
+/// to true in the native catalogue contract, so an entry that omits it is
+/// treated as enabled and suppressed on the fork.
+fn enabled_app_ids(catalogue: &[Value]) -> io::Result<Vec<String>> {
+    let mut ids = BTreeSet::new();
+    for app in catalogue {
+        let id = app["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid("an Apps catalogue entry carries no identity"))?;
+        if app
+            .get("isEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            ids.insert(id.to_owned());
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+/// The stable identity of a source MCP catalogue: server names and their tool
+/// and resource inventories. Runtime connection state is intentionally
+/// excluded, because a live server may reconnect without changing the source
+/// conversation's tool settings.
+fn mcp_catalogue_identity(catalogue: &[Value]) -> io::Result<Value> {
+    let mut identity = Vec::with_capacity(catalogue.len());
+    for server in catalogue {
+        let name = server["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid("an MCP catalogue entry carries no name"))?;
+        let tools = server["tools"]
+            .as_object()
+            .map(|tools| tools.keys().cloned().collect::<Vec<_>>())
+            .ok_or_else(|| invalid(format!("MCP server {name} carries no tools object")))?;
+        identity.push(json!({
+            "name": name,
+            "tools": tools,
+            "resources": server["resources"],
+            "resourceTemplates": server["resourceTemplates"],
+        }));
+    }
+    Ok(Value::Array(identity))
+}
+
+/// The stable identity of a source Apps catalogue: identities and their
+/// configured enabled state, without transient accessibility.
+fn app_catalogue_identity(catalogue: &[Value]) -> io::Result<Value> {
+    let mut identity = Vec::with_capacity(catalogue.len());
+    for app in catalogue {
+        let id = app["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid("an Apps catalogue entry carries no identity"))?;
+        identity.push(json!({
+            "id": id,
+            "isEnabled": app.get("isEnabled").and_then(Value::as_bool).unwrap_or(true),
+        }));
+    }
+    Ok(Value::Array(identity))
+}
+
+/// Proves the fork has no exposed MCP server, MCP tool/resource, or accessible
+/// App before it is named or receives a turn. Disabled server records are
+/// accepted only with empty catalogues; any unavailable verification fails
+/// closed. An App whose identity was explicitly disabled must report disabled;
+/// an App identity that cannot be expressed as a supported config key must at
+/// least report that it is not accessible.
+fn verify_reflection_tool_surface(
+    conversation: &mut Conversation,
+    fork_thread: &str,
+    suppressed_apps: &[String],
+) -> io::Result<Value> {
+    let mcp = mcp_catalogue(conversation, Some(fork_thread))?;
+    let mut mcp_summary = Vec::with_capacity(mcp.len());
+    for server in mcp {
+        let name = server["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid("an MCP catalogue entry carries no name"))?;
+        let runtime = server["runtimeStatus"].as_str();
+        let tools = server["tools"]
+            .as_object()
+            .ok_or_else(|| invalid(format!("MCP server {name} carries no tools object")))?;
+        let resources = server["resources"]
+            .as_array()
+            .ok_or_else(|| invalid(format!("MCP server {name} carries no resources array")))?;
+        let templates = server["resourceTemplates"].as_array().ok_or_else(|| {
+            invalid(format!(
+                "MCP server {name} carries no resourceTemplates array"
+            ))
+        })?;
+        let discovery_error = server
+            .get("toolsError")
+            .filter(|value| !value.is_null())
+            .map(Value::to_string);
+        if runtime != Some("disabled")
+            || !tools.is_empty()
+            || !resources.is_empty()
+            || !templates.is_empty()
+            || discovery_error.is_some()
+        {
+            return Err(invalid(format!(
+                "MCP server {name} remains exposed (runtime={}, tools={}, resources={}, templates={}, discoveryError={}); refusing the reflection fork",
+                runtime.unwrap_or("unknown"),
+                tools.len(),
+                resources.len(),
+                templates.len(),
+                discovery_error.unwrap_or_else(|| "none".to_owned())
+            )));
+        }
+        mcp_summary.push(json!({
+            "name": name,
+            "runtimeStatus": runtime,
+            "tools": 0,
+            "resources": 0,
+            "resourceTemplates": 0,
+        }));
+    }
+    let apps = app_catalogue(conversation, Some(fork_thread))?;
+    let mut app_summary = Vec::with_capacity(apps.len());
+    for app in apps {
+        let id = app["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid("an Apps catalogue entry carries no identity"))?;
+        let enabled = app
+            .get("isEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let accessible = app
+            .get("isAccessible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let addressable = suppressed_apps.iter().any(|suppressed| suppressed == id);
+        if accessible || (enabled && addressable) {
+            return Err(invalid(format!(
+                "App {id} remains exposed in the reflection fork (enabled={enabled}, accessible={accessible}); refusing inherited app tool authority"
+            )));
+        }
+        app_summary.push(json!({
+            "id": id,
+            "enabled": enabled,
+            "accessible": accessible,
+        }));
+    }
+    Ok(json!({
+        "verified": true,
+        "mcpServers": mcp_summary,
+        "apps": app_summary,
+    }))
+}
+
+fn turn_ids(thread: &Value) -> io::Result<Vec<String>> {
+    let turns = thread["turns"]
+        .as_array()
+        .ok_or_else(|| invalid("a thread record carries no turns array"))?;
+    let mut ids = Vec::with_capacity(turns.len());
+    for turn in turns {
+        let id = turn["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid("a thread turn carries no identity"))?;
+        ids.push(id.to_owned());
+    }
+    Ok(ids)
+}
+
+/// Verifies the effective fork environment beyond the model binding: the
+/// declared working directory and a read-only sandbox. The native response
+/// reports a sandbox policy object; both that shape and a plain mode string are
+/// accepted only when they say read-only.
+fn verify_fork_environment(plan: &ControlPlan, forked: &Value) -> io::Result<()> {
+    let cwd = forked["cwd"]
+        .as_str()
+        .ok_or_else(|| invalid("thread/fork answered without an effective cwd"))?;
+    let expected = plan.slot.to_string_lossy();
+    if !normalize_slot(cwd).eq_ignore_ascii_case(&normalize_slot(&expected)) {
+        return Err(invalid(format!(
+            "thread/fork ran at {cwd} instead of the declared slot {expected}; no turn was started"
+        )));
+    }
+    if !sandbox_is_read_only(&forked["sandbox"]) {
+        return Err(invalid(format!(
+            "thread/fork did not report a read-only sandbox ({}); no turn was started",
+            excerpt(&forked["sandbox"].to_string(), 200)
+        )));
+    }
+    Ok(())
+}
+
+fn sandbox_is_read_only(value: &Value) -> bool {
+    let read_only = |text: &str| {
+        text.eq_ignore_ascii_case("read-only") || text.eq_ignore_ascii_case("readOnly")
+    };
+    match value {
+        Value::String(text) => read_only(text),
+        Value::Object(map) => map
+            .get("mode")
+            .or_else(|| map.get("type"))
+            .or_else(|| map.get("kind"))
+            .and_then(Value::as_str)
+            .is_some_and(read_only),
+        _ => false,
+    }
 }
 
 #[allow(dead_code)]
@@ -2820,5 +3720,118 @@ mod tests {
             paths.endpoint,
             PathBuf::from(r"C:\home\harness\lead-endpoints\host\4242.json")
         );
+    }
+
+    #[test]
+    fn disabled_channel_overrides_keep_every_literal_name() {
+        let names = vec![
+            "inherited-mutator".to_owned(),
+            "odd.name".to_owned(),
+            "odd name".to_owned(),
+            "odd\"quote".to_owned(),
+        ];
+        let value = disabled_channel_overrides(&names);
+        let table = value.as_object().unwrap();
+        for name in &names {
+            assert_eq!(
+                table[name].get("enabled").and_then(Value::as_bool),
+                Some(false),
+                "{value}"
+            );
+        }
+    }
+
+    fn reflection_plan(args: Vec<OsString>) -> ControlPlan {
+        let root = home("reflection-args");
+        let paths = ControlPaths {
+            endpoint: root.join("endpoint.json"),
+            token: root.join("token"),
+            log: root.join("log"),
+        };
+        let mut plan = ControlPlan::new(
+            PathBuf::from("codex.exe"),
+            root.clone(),
+            root,
+            "reflection check",
+            BoundIdentity {
+                profile: "ds".to_owned(),
+                model: Some("deepseek-flash".to_owned()),
+                model_provider: Some("deepseek".to_owned()),
+                reasoning_effort: Some("max".to_owned()),
+            },
+            paths,
+        );
+        plan.executor_session = false;
+        plan.reflection_session = true;
+        plan.args = args;
+        plan
+    }
+
+    #[test]
+    fn reflection_app_server_administers_goals_while_its_fork_keeps_them_disabled() {
+        let plan = reflection_plan(vec![
+            OsString::from("-c"),
+            OsString::from("features.goals=false"),
+        ]);
+        let args: Vec<String> = app_server_args(&plan, 4242)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let caller_value = args
+            .iter()
+            .position(|arg| arg == "features.goals=false")
+            .expect("the caller's conflicting override stays in the command");
+        let process_value = args
+            .iter()
+            .position(|arg| arg == "features.goals=true")
+            .expect("a reflection app-server must be able to read and clear goals");
+        assert_eq!(args[process_value - 1], "-c", "{args:?}");
+        assert!(
+            caller_value < process_value,
+            "the controller's goal RPC capability must win over a caller override: {args:?}"
+        );
+        for feature in REFLECTION_FEATURE_SWITCHES
+            .iter()
+            .filter(|feature| **feature != "features.goals")
+        {
+            assert!(
+                args.iter().any(|arg| arg == &format!("{feature}=false")),
+                "{feature} was not disabled at process scope: {args:?}"
+            );
+        }
+        let fork = fork_params(&plan, "source", "turn", &[], &[]).unwrap();
+        assert_eq!(fork["deferGoalContinuation"], true, "{fork}");
+        assert_eq!(fork["config"]["features.goals"], false, "{fork}");
+    }
+
+    #[test]
+    fn thread_goal_answers_are_only_null_or_an_object() {
+        assert_eq!(
+            Conversation::parse_thread_goal(&json!({"goal": null})).unwrap(),
+            Value::Null
+        );
+        let answer = json!({
+            "goal": {
+                "threadId": "thread-goal",
+                "objective": "preserve the exact fixture objective",
+                "status": "paused"
+            }
+        });
+        assert_eq!(
+            Conversation::parse_thread_goal(&answer).unwrap(),
+            answer["goal"]
+        );
+        for malformed in [
+            json!({}),
+            json!({"goal": "paused"}),
+            json!({"goal": []}),
+            json!({"goal": 7}),
+        ] {
+            let error = Conversation::parse_thread_goal(&malformed).unwrap_err();
+            assert!(
+                error.to_string().contains("refusing to guess goal state"),
+                "{malformed}: {error}"
+            );
+        }
     }
 }

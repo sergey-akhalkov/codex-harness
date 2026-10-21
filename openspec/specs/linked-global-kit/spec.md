@@ -219,23 +219,23 @@ When diagnostic transports are retained, command and native MCP handlers using t
 
 ### Requirement: Persistent global hook suspension
 
-The kit SHALL support a recoverable suspension of all Codex lifecycle hooks across user/base configuration, the managed profile and installed hook definitions. Development without ordinary lifecycle hooks SHALL remain the reusable default after completion, update and archive. The specifically accepted RTK command-compression hook SHALL be the only newly enabled managed exception, with bounded execution and native trust. Already-running sessions retaining cached diagnostic harness handlers SHALL perform no automatic diagnostic analysis, fallback scan, context injection or completion continuation. A fresh consumer outside the checkout SHALL observe only the accepted selection, with base and managed profile agreement. Machine-local markers and backups SHALL remain outside reusable source. A fresh core-only installation without the accepted capability SHALL not enable hooks.
+The kit SHALL support a recoverable suspension of all Codex lifecycle hooks across user/base configuration, the managed profile and installed hook definitions. Development without ordinary lifecycle hooks SHALL remain the reusable default after completion, update and archive. The accepted RTK command-compression hook and original Ponytail plugin hooks SHALL be the selected exceptions, with bounded execution and native trust. Already-running sessions retaining cached diagnostic harness handlers SHALL perform no automatic diagnostic analysis, fallback scan, context injection or completion continuation. A fresh consumer outside the checkout SHALL observe only the accepted selection, with base and managed profile agreement. Machine-local markers and backups SHALL remain outside reusable source. A fresh core-only installation without either accepted capability SHALL not enable hooks. Existing hook selection SHALL not disable selected Ponytail merely because RTK is off.
 
 #### Scenario: A cached session invokes an old handler
 - **WHEN** an old automatic diagnostic handler is invoked
 - **THEN** it returns without diagnostic work or feedback
 
 #### Scenario: Another project starts a new session
-- **WHEN** it consumes the installed base or managed profile with RTK selected
-- **THEN** only the trusted RTK exception is enabled among managed hooks, without project-local configuration
+- **WHEN** it consumes the installed base or managed profile with RTK or Ponytail selected and trusted
+- **THEN** the selected exceptions are available without project-local configuration or reactivated diagnostic and Stop handlers
 
 #### Scenario: The optimization change is completed
 - **WHEN** its tasks are closed, archived or followed by a kit update
-- **THEN** the consumer retains the accepted RTK selection and no backup or lifecycle label reactivates rejected hooks
+- **THEN** the consumer retains the accepted selection and no backup or lifecycle label reactivates rejected hooks
 
 #### Scenario: Explicit suspension or disconnection
 - **WHEN** the RTK capability is disabled or disconnected
-- **THEN** its hook is inactive, rollback remains recoverable and unrelated user configuration is preserved
+- **THEN** its hook is inactive, existing rollback remains recoverable and unrelated configuration, including native Ponytail selection, is preserved
 
 ### Requirement: Accepted capability selection survives lifecycle operations
 
@@ -365,6 +365,8 @@ The kit SHALL expose the evolution workflow, the `skills-usage-analysis` skill, 
 
 The kit SHALL provide a single `codex-harness deploy` command that builds an immutable candidate from an absolute source checkout (or reuses an explicit build), installs or updates the core connection with user-default homes, verifies the installed launcher through its own version build identity and executor usage probe, re-reads the installation metadata, and reports one receipt. A relative source SHALL produce an explicit error naming the absolute-path requirement. The command SHALL offer an explicit `--reset` for installations whose recorded link ownership no longer matches reality: reset removes exactly the recorded owned objects that are reparse points or already missing, preserves and reports every regular file or foreign object, writes a receipt before removal, and then performs a normal installation. The ordinary verbs SHALL keep refusing silent repair. An `--all` option SHALL chain the existing scoped component updates after the core connection and report each component outcome in the same receipt.
 
+For `deploy --preview` without an explicit build, the kit SHALL reuse an eligible integrity-verified existing build selected by the existing build-selection authority when one is available, without compiling solely to produce that preview. The plan SHALL identify both the selected build and requested source and disclose any freshness limitation; preview reuse SHALL NOT certify new source as compiled, tested, installed or approved. Explicit build selection SHALL remain authoritative. When no eligible existing build is available, the existing candidate preparation path SHALL remain available with its normal errors and safeguards. A later applying deployment SHALL independently enforce its source/build and ownership checks. Preview SHALL preserve installation links, selections, settings and reset targets, including component previews requested with `--all`.
+
 The kit SHALL provide a `harness-deploy` skill, delivered with the kit's skills, that owns the deployment procedure: everyday one-action delivery, receipt verification, deliberate blocked-installation repair through `deploy --reset`, and the prohibition of out-of-band link retargeting to working-tree builds. The skill SHALL reference the installation guide as the authoritative detail home instead of duplicating it.
 
 #### Scenario: Everyday delivery is one command
@@ -378,3 +380,27 @@ The kit SHALL provide a `harness-deploy` skill, delivered with the kit's skills,
 #### Scenario: The full delivery chain runs in one action
 - **WHEN** the operator runs `deploy --source <absolute-checkout> --all`
 - **THEN** the core connection is followed by the scoped component updates in order, and the receipt reports each component's outcome and stops at the first failure with prior work preserved
+
+#### Scenario: A planning preview reuses a verified available build
+- **WHEN** an operator requests `deploy --preview` without `--build` and an eligible verified existing build is available
+- **THEN** the plan uses that identified build without invoking compilation, reports its relationship to the requested source, and leaves the installation unchanged
+
+#### Scenario: Preview reuse does not grant applying authority
+- **WHEN** a plan used an older verified build for changed source and the operator later requests applying deployment
+- **THEN** normal source/build verification and preparation apply independently, and the earlier preview cannot authorize delivery of stale or altered executable bytes
+
+#### Scenario: Explicit selection and unavailable builds remain honest
+- **WHEN** the operator supplies an explicit build, or implicit preview finds no eligible verified build
+- **THEN** explicit selection retains its existing meaning, unavailable or altered artifacts are never reported as verified, and the normal preparation or error path applies when required
+
+#### Scenario: Full or repair preview does not perform installation effects
+- **WHEN** the preview also requests component updates or reset
+- **THEN** every requested plan is reported through existing component owners while links, settings, selected runtime and reset targets remain unchanged
+
+### Requirement: Documented setup consumes the native Ponytail package
+
+The ordinary setup guide SHALL include original Ponytail through native Codex commands. Its instructions, skills and hooks SHALL remain in that external package; harness data SHALL retain existing direct source connections. Codex SHALL remain the installation and trust owner.
+
+#### Scenario: A fresh checkout is installed elsewhere
+- **WHEN** the receiving agent follows documented harness and Ponytail setup
+- **THEN** the plugin and supplements are globally available without copied rules, private machine state or a custom package manager

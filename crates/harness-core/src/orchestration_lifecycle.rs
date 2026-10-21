@@ -59,26 +59,32 @@ pub struct RoleState {
     pub cause: Option<String>,
 }
 
-/// Resolve both roles read-only. A missing role source or manifest is
-/// reported with the input it names; it never fails this check.
+/// Resolve every declared responsibility role read-only. A missing role
+/// source or manifest is reported with the input it names; it never fails
+/// this check.
 fn role_states(source: &Path) -> Vec<RoleState> {
-    [Role::Lead, Role::Executor]
-        .into_iter()
-        .map(|role| match role_context::resolve(source, role) {
-            Ok(resolved) => RoleState {
-                role: role.label(),
-                status: "resolved",
-                revision: Some(resolved.revision),
-                cause: None,
-            },
-            Err(error) => RoleState {
-                role: role.label(),
-                status: "gap",
-                revision: None,
-                cause: Some(error.to_string()),
-            },
-        })
-        .collect()
+    [
+        Role::Lead,
+        Role::Executor,
+        Role::ExecutorSelfReflection,
+        Role::LeadSelfReflection,
+    ]
+    .into_iter()
+    .map(|role| match role_context::resolve(source, role) {
+        Ok(resolved) => RoleState {
+            role: role.label(),
+            status: "resolved",
+            revision: Some(resolved.revision),
+            cause: None,
+        },
+        Err(error) => RoleState {
+            role: role.label(),
+            status: "gap",
+            revision: None,
+            cause: Some(error.to_string()),
+        },
+    })
+    .collect()
 }
 
 pub fn check(
@@ -322,7 +328,6 @@ mod tests {
     fn installed_profiles(home: &Path) {
         fs::create_dir_all(home).unwrap();
         fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
-        fs::write(home.join("zai.config.toml"), "model = 'glm-5.3'\n").unwrap();
     }
 
     fn guidance(user: &Path, names: &[&str]) {
@@ -379,6 +384,7 @@ mod tests {
             requirements: "synthetic".into(),
             stopped: true,
             active_lead: "default".into(),
+            purpose: Some("ordinary".into()),
             assignments: vec![Assignment {
                 id: "a1".into(),
                 profile: "ds".into(),
@@ -387,6 +393,7 @@ mod tests {
                 attempt: 1,
                 accepted: None,
                 defect: None,
+                purpose: Some("ordinary".into()),
             }],
         };
         fs::create_dir_all(home.join("worktrees/exec/repo")).unwrap();
@@ -444,10 +451,11 @@ mod tests {
         let user = root.path().join("user");
         installed_profiles(&home);
         fs::remove_file(home.join("ds.config.toml")).unwrap();
-        let before = fs::read(home.join("zai.config.toml")).unwrap();
+        fs::write(home.join("unrelated.txt"), b"preserved").unwrap();
+        let before = fs::read(home.join("unrelated.txt")).unwrap();
         let error = check(&source, &home, &user, false).unwrap_err();
         assert!(error.to_string().contains("profile 'ds' is not installed"));
-        assert_eq!(fs::read(home.join("zai.config.toml")).unwrap(), before);
+        assert_eq!(fs::read(home.join("unrelated.txt")).unwrap(), before);
         assert!(!user.exists());
     }
 
@@ -495,6 +503,14 @@ mod tests {
             ("global/lead.md", "Fixture lead responsibility"),
             ("global/executor.md", "Fixture executor responsibility"),
             (
+                "global/executor-reflection.md",
+                "Fixture executor reflection responsibility",
+            ),
+            (
+                "global/lead-reflection.md",
+                "Fixture lead reflection responsibility",
+            ),
+            (
                 "skills/shared/SKILL.md",
                 "---\nname: shared\ndescription: fixture\n---\nFixture shared skill",
             ),
@@ -504,7 +520,7 @@ mod tests {
             ),
             (
                 "global/roles.toml",
-                "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n",
+                "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n[roles.executor-self-reflection]\ninstructions = 'global/executor-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/lead-reflection.md'\nskills = []\n",
             ),
         ] {
             fs::write(source.join(path), body).unwrap();
@@ -526,7 +542,12 @@ mod tests {
                 .iter()
                 .map(|state| (state.role, state.status))
                 .collect::<Vec<_>>(),
-            [("lead", "gap"), ("executor", "gap")]
+            [
+                ("lead", "gap"),
+                ("executor", "gap"),
+                ("executor-self-reflection", "gap"),
+                ("lead-self-reflection", "gap"),
+            ]
         );
         for state in &report.roles {
             assert!(state.revision.is_none(), "{}", state.role);
@@ -547,13 +568,24 @@ mod tests {
                 .iter()
                 .map(|state| (state.role, state.status))
                 .collect::<Vec<_>>(),
-            [("lead", "resolved"), ("executor", "resolved")]
+            [
+                ("lead", "resolved"),
+                ("executor", "resolved"),
+                ("executor-self-reflection", "resolved"),
+                ("lead-self-reflection", "resolved"),
+            ]
         );
-        let lead = states[0].revision.clone().unwrap();
-        let executor = states[1].revision.clone().unwrap();
-        assert!(!lead.is_empty());
-        assert!(!executor.is_empty());
-        assert_ne!(lead, executor);
+        let revisions = states
+            .iter()
+            .map(|state| state.revision.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert!(revisions.iter().all(|revision| !revision.is_empty()));
+        for (index, revision) in revisions.iter().enumerate() {
+            assert!(
+                !revisions[..index].contains(revision),
+                "role revisions must identify their distinct owned inputs: {revision}"
+            );
+        }
         assert!(states.iter().all(|state| state.cause.is_none()));
     }
 

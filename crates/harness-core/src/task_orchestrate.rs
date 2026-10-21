@@ -24,6 +24,7 @@ pub fn merge_accepted(
     current: &Path,
 ) -> io::Result<LaneDisposition> {
     task_store::accept(record, assignment)?;
+    task_store::validate_purpose(record)?;
     if mapping.path.is_dir() && current.is_dir() {
         let head = Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -100,6 +101,7 @@ pub fn reassign(
             ));
         }
     }
+    task_store::validate_purpose(record)?;
     let current = record
         .assignments
         .iter()
@@ -128,19 +130,20 @@ pub fn resume(record: &TaskRecord) -> io::Result<()> {
             "stopped task stays stopped after restart",
         ));
     }
+    task_store::validate_purpose(record)?;
     Ok(())
 }
 
-pub fn seed_assignment(id: &str, profile: &str, thread: &str, worktree: &Path) -> Assignment {
-    Assignment {
-        id: id.into(),
-        profile: profile.into(),
-        owner_thread: Some(thread.into()),
-        worktree: Some(worktree.to_path_buf()),
-        attempt: 1,
-        accepted: None,
-        defect: None,
-    }
+/// Seeds one assignment that continues the owning task's exact purpose. The
+/// purpose is copied from the record, never inferred.
+pub fn seed_assignment(
+    id: &str,
+    profile: &str,
+    thread: &str,
+    worktree: &Path,
+    purpose: Option<&str>,
+) -> Assignment {
+    task_store::seed_assignment(id, profile, thread, worktree, purpose)
 }
 
 #[cfg(test)]
@@ -214,7 +217,14 @@ mod tests {
             requirements: "done.txt exists".into(),
             stopped: false,
             active_lead: "default".into(),
-            assignments: vec![seed_assignment("a1", "xai", "exec-xai", &tree)],
+            purpose: Some("ordinary".into()),
+            assignments: vec![seed_assignment(
+                "a1",
+                "xai",
+                "exec-xai",
+                &tree,
+                Some("ordinary"),
+            )],
         };
         let disposition = merge_accepted(&mut record, "a1", &mapping, &source).unwrap();
         assert_eq!(record.assignments[0].accepted, Some(true));
@@ -277,11 +287,13 @@ mod tests {
             requirements: "checks pass".into(),
             stopped: false,
             active_lead: "default".into(),
+            purpose: Some("ordinary".into()),
             assignments: vec![seed_assignment(
                 "a1",
                 "xai",
                 "exec-xai",
                 &root.path().join("missing-tree"),
+                Some("ordinary"),
             )],
         };
         let mapping = mapping(
@@ -308,7 +320,14 @@ mod tests {
             requirements: "synthetic".into(),
             stopped: false,
             active_lead: "default".into(),
-            assignments: vec![seed_assignment("a1", "xai", "exec-xai", Path::new("wt"))],
+            purpose: Some("ordinary".into()),
+            assignments: vec![seed_assignment(
+                "a1",
+                "xai",
+                "exec-xai",
+                Path::new("wt"),
+                Some("ordinary"),
+            )],
         };
         let error = reconcile_before_replace(&record, "a1").unwrap_err();
         assert!(error.to_string().contains("still owns"));
@@ -376,11 +395,13 @@ mod tests {
             requirements: "synthetic".into(),
             stopped: false,
             active_lead: "default".into(),
+            purpose: Some("ordinary".into()),
             assignments: vec![seed_assignment(
                 "lead",
                 "default",
                 "lead-1",
                 Path::new("ws"),
+                Some("ordinary"),
             )],
         };
         record.assignments.push(seed_assignment(
@@ -388,6 +409,7 @@ mod tests {
             "xai",
             "exec-xai",
             Path::new("wt"),
+            Some("ordinary"),
         ));
         reconcile_before_replace(&record, "worker").unwrap_err();
         reassign(

@@ -18,8 +18,8 @@ mod executor_warning;
 
 use control_endpoint::{Answer, Bearer, Poll, Server, Wire};
 use executor_warning::{
-    QueueOutcome, Relay, WarningContract, WarningNotification, WarningQueue, WarningState,
-    supported_contract,
+    QueueOutcome, Relay, SelectionObserver, WarningContract, WarningNotification, WarningQueue,
+    WarningState, supported_contract,
 };
 use harness_core::task_control::ControlConnection;
 use harness_core::{
@@ -33,8 +33,9 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -53,6 +54,7 @@ const OTHER_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24ff";
 const WARNING: &str = "cache guard degraded: exact-session usage is unavailable for this response";
 const WAIT: Duration = Duration::from_secs(10);
 const SETTLE: Duration = Duration::from_millis(400);
+const MAX_PENDING_SELECTIONS: usize = 64;
 
 // ------------------------------------------------------------------- exports
 // Minimal synthetic stand-ins for the installed export's documents: only the
@@ -346,6 +348,23 @@ fn wait_for(mut condition: impl FnMut() -> bool, reason: &str) {
 
 fn record_of(text: String) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|error| panic!("not a JSON record: {error}: {text}"))
+}
+
+type ObserverLog = Arc<Mutex<Vec<String>>>;
+
+fn observer_log() -> ObserverLog {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn observed_threads(log: &ObserverLog) -> Vec<String> {
+    log.lock().unwrap().clone()
+}
+
+fn recording_observer(log: ObserverLog) -> SelectionObserver {
+    Arc::new(move |thread_id| {
+        log.lock().unwrap().push(thread_id.to_owned());
+        Ok(())
+    })
 }
 
 // ------------------------------------------------------------------ contract
@@ -1092,6 +1111,379 @@ fn no_credential_or_host_log_content_reaches_the_relayed_payloads() {
         json!({"message": WARNING, "threadId": THREAD}),
         "{warning}"
     );
+
+    frontend.close();
+    relay.close();
+}
+
+// -------------------------------------------------------- observed selection
+
+#[test]
+fn observed_selection_registers_before_response_and_gates_the_first_turn() {
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    server.answer(
+        "thread/start",
+        Answer::Result(json!({"thread": {"id": THREAD}})),
+    );
+    server.answer(
+        "turn/start",
+        Answer::Result(json!({"turn": {"id": "turn-1", "status": "inProgress"}})),
+    );
+    let seen = observer_log();
+    let entered_seen = Arc::clone(&seen);
+    let (entered_tx, entered_rx) = mpsc::channel::<String>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let observer = Arc::new(move |thread_id: &str| -> io::Result<()> {
+        entered_seen.lock().unwrap().push(thread_id.to_owned());
+        entered_tx
+            .send(thread_id.to_owned())
+            .map_err(|_| io::Error::other("observer entry receiver dropped"))?;
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(WAIT)
+            .map_err(|error| io::Error::other(format!("observer release failed: {error}")))?;
+        Ok(())
+    });
+    let mut relay = Relay::start_observed(server.port, TOKEN, observer).unwrap();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+
+    frontend.request(1, "thread/start", json!({"cwd": "fixture"}));
+    let entered = entered_rx
+        .recv_timeout(WAIT)
+        .expect("the host observer was not called for the successful selection");
+    assert_eq!(entered, THREAD);
+    assert!(
+        matches!(frontend.receive(Duration::from_millis(200)), Wait::Idle),
+        "the selection response reached the frontend before the callback returned"
+    );
+
+    release_tx.send(()).unwrap();
+    let selected = record_of(frontend.receive(WAIT).text());
+    assert_eq!(selected["id"], 1, "{selected}");
+    assert_eq!(selected["result"]["thread"]["id"], THREAD, "{selected}");
+
+    frontend.request(
+        2,
+        "turn/start",
+        json!({"threadId": OTHER_THREAD, "input": []}),
+    );
+    let refused = record_of(frontend.receive(WAIT).text());
+    assert_eq!(refused["id"], 2, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("host has registered")),
+        "{refused}"
+    );
+    assert!(
+        server.requests_for("turn/start").is_empty(),
+        "a wrong-thread turn reached the app-server"
+    );
+
+    frontend.request(
+        3,
+        "turn/start",
+        json!({"threadId": THREAD, "input": [{"type": "text", "text": "first turn"}]}),
+    );
+    let started = record_of(frontend.receive(WAIT).text());
+    assert_eq!(started["id"], 3, "{started}");
+    assert_eq!(started["result"]["turn"]["id"], "turn-1", "{started}");
+    let turns = server.requests_for("turn/start");
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(turns[0]["params"]["threadId"], THREAD);
+    assert_eq!(observed_threads(&seen), vec![THREAD.to_owned()]);
+
+    frontend.close();
+    relay.close();
+}
+
+#[test]
+fn observed_resume_and_fork_register_the_returned_threads() {
+    for (method, source, returned) in [
+        ("thread/resume", THREAD, THREAD),
+        ("thread/fork", OTHER_THREAD, THREAD),
+    ] {
+        let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+        server.answer(method, Answer::Result(json!({"thread": {"id": returned}})));
+        server.answer(
+            "turn/start",
+            Answer::Result(json!({"turn": {"id": "turn-1", "status": "inProgress"}})),
+        );
+        let seen = observer_log();
+        let mut relay =
+            Relay::start_observed(server.port, TOKEN, recording_observer(Arc::clone(&seen)))
+                .unwrap();
+        let mut frontend = Frontend::attach(relay.port(), TOKEN);
+
+        frontend.request(1, method, json!({"threadId": source}));
+        let selected = record_of(frontend.receive(WAIT).text());
+        assert_eq!(selected["id"], 1, "{method}: {selected}");
+        assert_eq!(selected["result"]["thread"]["id"], returned, "{selected}");
+        assert_eq!(observed_threads(&seen), vec![returned.to_owned()]);
+
+        frontend.request(2, "turn/start", json!({"threadId": returned}));
+        let started = record_of(frontend.receive(WAIT).text());
+        assert_eq!(started["id"], 2, "{method}: {started}");
+        assert_eq!(server.requests_for(method)[0]["params"]["threadId"], source);
+        let turns = server.requests_for("turn/start");
+        assert_eq!(turns.len(), 1, "{method}: {turns:?}");
+        assert_eq!(turns[0]["params"]["threadId"], returned);
+        assert!(
+            server.requests_for("thread/list").is_empty(),
+            "{method} discovered historical sessions"
+        );
+
+        frontend.close();
+        relay.close();
+    }
+}
+
+#[test]
+fn observed_switch_registers_each_selection_and_gates_the_previous_thread() {
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    server.answer_sequence(
+        "thread/resume",
+        vec![
+            Answer::Result(json!({"thread": {"id": THREAD}})),
+            Answer::Result(json!({"thread": {"id": OTHER_THREAD}})),
+        ],
+    );
+    server.answer(
+        "turn/start",
+        Answer::Result(json!({"turn": {"id": "turn-1", "status": "inProgress"}})),
+    );
+    let seen = observer_log();
+    let mut relay =
+        Relay::start_observed(server.port, TOKEN, recording_observer(Arc::clone(&seen))).unwrap();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+
+    frontend.request(1, "thread/resume", json!({"threadId": THREAD}));
+    assert_eq!(
+        record_of(frontend.receive(WAIT).text())["result"]["thread"]["id"],
+        THREAD
+    );
+    frontend.request(2, "thread/resume", json!({"threadId": OTHER_THREAD}));
+    assert_eq!(
+        record_of(frontend.receive(WAIT).text())["result"]["thread"]["id"],
+        OTHER_THREAD
+    );
+    assert_eq!(
+        observed_threads(&seen),
+        vec![THREAD.to_owned(), OTHER_THREAD.to_owned()]
+    );
+
+    frontend.request(3, "turn/start", json!({"threadId": THREAD}));
+    let refused = record_of(frontend.receive(WAIT).text());
+    assert_eq!(refused["id"], 3, "{refused}");
+    assert!(refused.get("result").is_none(), "{refused}");
+    assert!(server.requests_for("turn/start").is_empty());
+
+    frontend.request(4, "turn/start", json!({"threadId": OTHER_THREAD}));
+    let started = record_of(frontend.receive(WAIT).text());
+    assert_eq!(started["id"], 4, "{started}");
+    let turns = server.requests_for("turn/start");
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(turns[0]["params"]["threadId"], OTHER_THREAD);
+
+    frontend.close();
+    relay.close();
+}
+
+#[test]
+fn unsolicited_notifications_and_failed_selections_do_not_establish_ownership() {
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    server.answer("initialize", Answer::Result(json!({})));
+    server.answer(
+        "thread/start",
+        Answer::Error(json!({"code": -32600, "message": "selection refused"})),
+    );
+    let seen = observer_log();
+    let mut relay =
+        Relay::start_observed(server.port, TOKEN, recording_observer(Arc::clone(&seen))).unwrap();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+
+    frontend.request(
+        1,
+        "initialize",
+        json!({"clientInfo": {"name": "relay-check"}}),
+    );
+    assert_eq!(record_of(frontend.receive(WAIT).text())["id"], 1);
+    server.push(json!({"method": "thread/started", "params": {"thread": {"id": OTHER_THREAD}}}));
+    let notification = record_of(frontend.receive(WAIT).text());
+    assert_eq!(notification["method"], "thread/started", "{notification}");
+
+    frontend.request(2, "turn/start", json!({"threadId": OTHER_THREAD}));
+    let refused_turn = record_of(frontend.receive(WAIT).text());
+    assert_eq!(refused_turn["id"], 2, "{refused_turn}");
+    assert!(refused_turn.get("result").is_none(), "{refused_turn}");
+    assert!(server.requests_for("turn/start").is_empty());
+
+    frontend.request(3, "thread/start", json!({"cwd": "fixture"}));
+    let refused_selection = record_of(frontend.receive(WAIT).text());
+    assert_eq!(refused_selection["id"], 3, "{refused_selection}");
+    assert_eq!(refused_selection["error"]["message"], "selection refused");
+    assert!(observed_threads(&seen).is_empty());
+
+    frontend.close();
+    relay.close();
+}
+
+#[test]
+fn malformed_selection_identities_are_refused_without_registration() {
+    let oversized = "a".repeat(129);
+    for (label, result) in [
+        ("missing identity", json!({"thread": {}})),
+        ("non-string identity", json!({"thread": {"id": 7}})),
+        ("path identity", json!({"thread": {"id": "../escape"}})),
+        ("oversized identity", json!({"thread": {"id": oversized}})),
+    ] {
+        let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+        server.answer("thread/start", Answer::Result(result));
+        let seen = observer_log();
+        let mut relay =
+            Relay::start_observed(server.port, TOKEN, recording_observer(Arc::clone(&seen)))
+                .unwrap();
+        let mut frontend = Frontend::attach(relay.port(), TOKEN);
+
+        frontend.request(1, "thread/start", json!({"cwd": "fixture"}));
+        let refused = record_of(frontend.receive(WAIT).text());
+        assert_eq!(refused["id"], 1, "{label}: {refused}");
+        assert!(refused.get("result").is_none(), "{label}: {refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("thread identity")),
+            "{label}: {refused}"
+        );
+        assert!(
+            observed_threads(&seen).is_empty(),
+            "{label} reached the observer"
+        );
+        assert!(
+            server.requests_for("turn/start").is_empty(),
+            "{label} submitted a turn"
+        );
+
+        frontend.close();
+        relay.close();
+    }
+}
+
+#[test]
+fn callback_refusal_is_refused_before_the_selection_success_is_forwarded() {
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    server.answer(
+        "thread/start",
+        Answer::Result(json!({"thread": {"id": THREAD}})),
+    );
+    let seen = observer_log();
+    let refused_seen = Arc::clone(&seen);
+    let observer = Arc::new(move |thread_id: &str| -> io::Result<()> {
+        refused_seen.lock().unwrap().push(thread_id.to_owned());
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "registration unavailable",
+        ))
+    });
+    let mut relay = Relay::start_observed(server.port, TOKEN, observer).unwrap();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+
+    frontend.request(1, "thread/start", json!({"cwd": "fixture"}));
+    let refused = record_of(frontend.receive(WAIT).text());
+    assert_eq!(refused["id"], 1, "{refused}");
+    assert!(refused.get("result").is_none(), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not register")),
+        "{refused}"
+    );
+    assert_eq!(observed_threads(&seen), vec![THREAD.to_owned()]);
+
+    frontend.request(2, "turn/start", json!({"threadId": THREAD}));
+    let refused_turn = record_of(frontend.receive(WAIT).text());
+    assert_eq!(refused_turn["id"], 2, "{refused_turn}");
+    assert!(refused_turn.get("result").is_none(), "{refused_turn}");
+    assert!(
+        server.requests_for("turn/start").is_empty(),
+        "a turn reached the app-server after callback refusal"
+    );
+
+    frontend.close();
+    relay.close();
+}
+
+#[test]
+fn observed_selection_releases_a_queued_warning_for_the_selected_thread() {
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    server.answer(
+        "thread/start",
+        Answer::Result(json!({"thread": {"id": THREAD}})),
+    );
+    let observer: SelectionObserver = Arc::new(|_| Ok(()));
+    let mut relay = Relay::start_observed(server.port, TOKEN, observer).unwrap();
+    let warnings = relay.warnings();
+    assert_eq!(warnings.queue(WARNING), QueueOutcome::Queued);
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+    assert!(
+        matches!(frontend.receive(SETTLE), Wait::Idle),
+        "a warning was delivered before any thread was selected"
+    );
+
+    frontend.request(1, "thread/start", json!({"cwd": "fixture"}));
+    let selected = record_of(frontend.receive(WAIT).text());
+    assert_eq!(selected["id"], 1, "{selected}");
+    let warning = record_of(frontend.receive(WAIT).text());
+    assert_eq!(warning["method"], "warning", "{warning}");
+    assert_eq!(warning["params"]["threadId"], THREAD, "{warning}");
+    assert_eq!(warnings.status().state, WarningState::Sent);
+
+    frontend.close();
+    relay.close();
+}
+
+#[test]
+fn pending_selection_correlation_is_bounded_and_refuses_the_next_request() {
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    server.answer("thread/start", Answer::Silence);
+    let seen = observer_log();
+    let mut relay =
+        Relay::start_observed(server.port, TOKEN, recording_observer(Arc::clone(&seen))).unwrap();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+
+    for id in 1u64..=MAX_PENDING_SELECTIONS as u64 {
+        frontend.request(id, "thread/start", json!({"cwd": format!("fixture-{id}")}));
+    }
+    wait_for(
+        || server.requests_for("thread/start").len() == MAX_PENDING_SELECTIONS,
+        "the relay did not forward the bounded pending selections",
+    );
+
+    frontend.request(
+        MAX_PENDING_SELECTIONS as u64 + 1,
+        "thread/start",
+        json!({"cwd": "overflow"}),
+    );
+    let refused = record_of(frontend.receive(WAIT).text());
+    assert_eq!(
+        refused["id"],
+        MAX_PENDING_SELECTIONS as u64 + 1,
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot correlate another")),
+        "{refused}"
+    );
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        MAX_PENDING_SELECTIONS,
+        "an over-bound selection request reached the app-server"
+    );
+    assert!(observed_threads(&seen).is_empty());
 
     frontend.close();
     relay.close();

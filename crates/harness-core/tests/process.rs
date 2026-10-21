@@ -74,11 +74,15 @@ mod native {
     use std::time::Instant;
     use windows_sys::Win32::Foundation::*;
     use windows_sys::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY, OpenJobObjectW,
+        IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JobObjectExtendedLimitInformation, OpenJobObjectW,
+        QueryInformationJobObject, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::*;
 
     const CLEANUP: Duration = Duration::from_secs(5);
+    const JOB_OBJECT_QUERY: u32 = 0x0004;
+    const JOB_OBJECT_SET_ATTRIBUTES: u32 = 0x0002;
 
     // Independent psapi.h layout; only PrivateUsage is used as committed
     // private memory, never working set or the job's attempted-charge peak.
@@ -1815,6 +1819,415 @@ mod native {
                 "cpu_job_memory_limit_bytes": 0
             }),
         );
+    }
+
+    const SESSION_WORKER: &str = "HARNESS_HEAVY_AGGREGATE_SESSION_WORKER";
+    const SESSION_WORKER_READY: &str = "HARNESS_HEAVY_AGGREGATE_SESSION_READY";
+    const SESSION_WORKER_FINAL: &str = "HARNESS_HEAVY_AGGREGATE_SESSION_FINAL";
+    const SESSION_WORKER_RELEASE: &str = "HARNESS_HEAVY_AGGREGATE_SESSION_RELEASE";
+    const SESSION_WORKER_MARKER: &str = "HARNESS_HEAVY_AGGREGATE_SESSION_MARKER";
+    const SESSION_WORKER_NAME: &str = "HARNESS_HEAVY_AGGREGATE_SESSION_NAME";
+
+    fn allow_breakaway(name: &str) {
+        let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            OpenJobObjectW(
+                JOB_OBJECT_QUERY | JOB_OBJECT_SET_ATTRIBUTES,
+                0,
+                wide.as_ptr(),
+            )
+        };
+        assert!(
+            !handle.is_null(),
+            "open breakaway job: {}",
+            io::Error::last_os_error()
+        );
+        let mut extended: windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe {
+                QueryInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &mut extended as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of_val(&extended) as u32,
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "query breakaway job: {}",
+            io::Error::last_os_error()
+        );
+        extended.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        assert_ne!(
+            unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &extended as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of_val(&extended) as u32,
+                )
+            },
+            0,
+            "set breakaway job: {}",
+            io::Error::last_os_error()
+        );
+        unsafe { CloseHandle(handle) };
+    }
+
+    fn process_in_named_job(pid: u32, name: &str) -> bool {
+        let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+        wide.push(0);
+        let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide.as_ptr()) };
+        assert!(
+            !job.is_null(),
+            "open job {name}: {}",
+            io::Error::last_os_error()
+        );
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(
+            !process.is_null(),
+            "open process {pid}: {}",
+            io::Error::last_os_error()
+        );
+        let mut inside = 0;
+        let result = unsafe { IsProcessInJob(process, job, &mut inside) };
+        unsafe {
+            CloseHandle(process);
+            CloseHandle(job);
+        }
+        assert_ne!(
+            result,
+            0,
+            "query job membership: {}",
+            io::Error::last_os_error()
+        );
+        inside != 0
+    }
+
+    fn session_worker_spec(
+        account: &Path,
+        ready: &Path,
+        final_path: &Path,
+        release: &Path,
+        marker: &Path,
+        session: &str,
+        stderr: &Path,
+    ) -> CommandSpec {
+        let mut command = CommandSpec::new(std::env::current_exe().unwrap());
+        command.args = vec![
+            "process::native::heavy_aggregate_session_worker".into(),
+            "--exact".into(),
+            "--test-threads=1".into(),
+            "--nocapture".into(),
+        ];
+        for (key, value) in [
+            (SESSION_WORKER, account.as_os_str().to_owned()),
+            (SESSION_WORKER_READY, ready.as_os_str().to_owned()),
+            (SESSION_WORKER_FINAL, final_path.as_os_str().to_owned()),
+            (SESSION_WORKER_RELEASE, release.as_os_str().to_owned()),
+            (SESSION_WORKER_MARKER, marker.as_os_str().to_owned()),
+        ] {
+            command.env.insert(key.into(), Some(value));
+        }
+        command
+            .env
+            .insert(SESSION_WORKER_NAME.into(), Some(session.into()));
+        command.stderr = Some(std::fs::File::create(stderr).unwrap());
+        command
+    }
+
+    fn wait_for_worker_result(ready: &Path, final_path: &Path) -> (bool, Value) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            for (is_ready, path) in [(true, ready), (false, final_path)] {
+                if let Ok(bytes) = std::fs::read(path)
+                    && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                {
+                    return (is_ready, value);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not report through {}",
+                ready.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_json(path: &Path) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(bytes) = std::fs::read(path)
+                && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not report through {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn heavy_aggregate_session_worker() {
+        let Some(account) = std::env::var_os(SESSION_WORKER) else {
+            return;
+        };
+        let path = |key| PathBuf::from(std::env::var_os(key).unwrap());
+        let final_path = path(SESSION_WORKER_FINAL);
+        if let Err(error) = run_session_worker(&PathBuf::from(account)) {
+            record(
+                &final_path,
+                json!({"stage": "error", "error": error.to_string()}),
+            );
+            std::process::exit(17);
+        }
+    }
+
+    fn run_session_worker(account: &Path) -> io::Result<()> {
+        let path = |key| PathBuf::from(std::env::var_os(key).unwrap());
+        let ready = path(SESSION_WORKER_READY);
+        let final_path = path(SESSION_WORKER_FINAL);
+        let release = path(SESSION_WORKER_RELEASE);
+        let marker = path(SESSION_WORKER_MARKER);
+        let session = std::env::var(SESSION_WORKER_NAME).unwrap();
+        let budget = SharedCpuBudget::acquire(account, SHARED_CPU_PERCENT)?;
+        let aggregate = HeavyAggregate::acquire(account, AGGREGATE_LIMIT)?;
+        let lifecycle = Job::new(Limits::default())?;
+        let suspended =
+            aggregate.spawn_suspended(Some(&budget), &lifecycle, &spec("hold", &marker))?;
+        let pid = suspended.process().identity().pid;
+        let ready_value = json!({
+            "stage": "ready",
+            "pid": pid,
+            "cpu": budget.contains(suspended.process())?,
+            "aggregate": aggregate.contains(suspended.process())?,
+            "lifecycle": lifecycle.contains(suspended.process())?,
+            "session": process_in_named_job(pid, &session),
+            "caller_session": process_in_named_job(std::process::id(), &session),
+            "caller_cpu": process_in_named_job(std::process::id(), budget.name()),
+        });
+        record(&ready, ready_value);
+        let payload = suspended.resume()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !release.is_file() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "session worker release",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let stopped = lifecycle.terminate(0, CLEANUP)?;
+        let cancelled = payload.wait_for_exit(CLEANUP)?;
+        record(
+            &final_path,
+            json!({
+                "stage": "done",
+                "cancelled": cancelled,
+                "remaining": stopped.active_processes,
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn heavy_aggregate_admits_two_caller_sessions_without_weakening_containment() {
+        exercise_two_caller_sessions(true);
+    }
+
+    fn exercise_two_caller_sessions(permit_caller_breakaway: bool) {
+        let scenario = if permit_caller_breakaway {
+            "breakaway"
+        } else {
+            "inherited"
+        };
+        let root = root(&format!("heavy-aggregate-{scenario}-sessions"));
+        let account = canonical_account(&root, "account");
+        let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let aggregate = HeavyAggregate::acquire(&account, AGGREGATE_LIMIT).unwrap();
+        // Each named Job models a dispatching caller branch. Breakaway-enabled
+        // sessions let payloads leave that branch; inherited sessions do not.
+        let session_one_name = format!(
+            "Harness.Process.Session.{}.{scenario}.one",
+            std::process::id()
+        );
+        let session_two_name = format!(
+            "Harness.Process.Session.{}.{scenario}.two",
+            std::process::id()
+        );
+        let session_one = Job::new_named(Limits::default(), &session_one_name).unwrap();
+        let session_two = Job::new_named(Limits::default(), &session_two_name).unwrap();
+        if permit_caller_breakaway {
+            allow_breakaway(&session_one_name);
+            allow_breakaway(&session_two_name);
+        }
+        let release = root.join("release");
+        let ready_one = root.join("one.ready.json");
+        let final_one = root.join("one.final.json");
+        let ready_two = root.join("two.ready.json");
+        let final_two = root.join("two.final.json");
+        let stderr_one = root.join("one.stderr");
+        let stderr_two = root.join("two.stderr");
+        let worker_one = budget
+            .spawn(
+                &session_one,
+                &session_worker_spec(
+                    &account,
+                    &ready_one,
+                    &final_one,
+                    &release,
+                    &root.join("one.payload.json"),
+                    &session_one_name,
+                    &stderr_one,
+                ),
+            )
+            .unwrap();
+        let first = wait_for_worker_result(&ready_one, &final_one);
+        let worker_two = budget
+            .spawn(
+                &session_two,
+                &session_worker_spec(
+                    &account,
+                    &ready_two,
+                    &final_two,
+                    &release,
+                    &root.join("two.payload.json"),
+                    &session_two_name,
+                    &stderr_two,
+                ),
+            )
+            .unwrap();
+        let second = wait_for_worker_result(&ready_two, &final_two);
+        std::fs::write(&release, b"release").unwrap();
+        let outcome_one = run(session_one, &worker_one);
+        let outcome_two = run(session_two, &worker_two);
+        let stderr_one = std::fs::read_to_string(&stderr_one).unwrap_or_default();
+        let stderr_two = std::fs::read_to_string(&stderr_two).unwrap_or_default();
+        let detail = format!(
+            "scenario={scenario}\nfirst={}\nsecond={}\nfirst outcome={outcome_one:?}\nsecond outcome={outcome_two:?}\nfirst stderr={stderr_one}\nsecond stderr={stderr_two}",
+            first.1, second.1
+        );
+        assert!(
+            first.0,
+            "the first session did not start its payload: {detail}"
+        );
+        if permit_caller_breakaway {
+            assert!(
+                second.0,
+                "the second sibling session could not start the same aggregate: {detail}"
+            );
+            for (label, outcome) in [("first", &outcome_one), ("second", &outcome_two)] {
+                assert_eq!(
+                    (outcome.reason, outcome.exit_code, outcome.process_exit_code),
+                    (StopReason::Exited, 0, 0),
+                    "{label} worker did not complete normally: {detail}"
+                );
+            }
+            for (label, ready) in [("first", &first.1), ("second", &second.1)] {
+                for field in ["cpu", "aggregate", "lifecycle"] {
+                    assert_eq!(
+                        ready[field], true,
+                        "{label} left its required {field} job: {detail}"
+                    );
+                }
+                assert_eq!(
+                    ready["session"], false,
+                    "{label} stayed in the caller branch: {detail}"
+                );
+                assert_eq!(
+                    ready["caller_session"], true,
+                    "{label} caller branch was not observed: {detail}"
+                );
+            }
+            for (label, final_value) in [
+                ("first", wait_for_json(&final_one)),
+                ("second", wait_for_json(&final_two)),
+            ] {
+                assert_eq!(
+                    final_value["cancelled"], true,
+                    "{label} lifecycle did not cancel its payload: {detail}"
+                );
+                assert_eq!(
+                    final_value["remaining"], 0,
+                    "{label} left a lifecycle member: {detail}"
+                );
+            }
+        } else {
+            assert!(
+                !second.0,
+                "the non-breakaway second session unexpectedly started: {detail}"
+            );
+            assert_eq!(second.1["stage"], "error", "{detail}");
+            let second_error = second.1["error"].as_str().unwrap_or_default();
+            assert!(
+                second_error.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK")
+                    && second_error.contains("another caller branch"),
+                "the failure did not name the caller-Job capability boundary: {detail}"
+            );
+            assert_eq!(
+                (
+                    outcome_one.reason,
+                    outcome_one.exit_code,
+                    outcome_one.process_exit_code
+                ),
+                (StopReason::Exited, 0, 0),
+                "the first worker did not complete normally: {detail}"
+            );
+            assert_eq!(
+                (
+                    outcome_two.reason,
+                    outcome_two.exit_code,
+                    outcome_two.process_exit_code
+                ),
+                (StopReason::Exited, 17, 17),
+                "the rejected second worker did not fail closed: {detail}"
+            );
+            for field in ["cpu", "aggregate", "lifecycle"] {
+                assert_eq!(
+                    first.1[field], true,
+                    "first left its required {field} job: {detail}"
+                );
+            }
+            assert_eq!(first.1["session"], true, "{detail}");
+            assert_eq!(first.1["caller_session"], true, "{detail}");
+            let final_one = wait_for_json(&final_one);
+            assert_eq!(
+                final_one["cancelled"], true,
+                "first lifecycle did not cancel after the rejected sibling: {detail}"
+            );
+            assert_eq!(
+                final_one["remaining"], 0,
+                "first lifecycle left a member after the rejected sibling: {detail}"
+            );
+        }
+        assert_eq!(
+            aggregate.snapshot().unwrap().active_processes,
+            0,
+            "lifecycle cancellation left members in the aggregate: {detail}"
+        );
+        record(
+            &root.join("verified.json"),
+            json!({
+                "scenario": scenario,
+                "sessions": [session_one_name, session_two_name],
+                "first": first.1,
+                "second": second.1,
+                "cancelled": true,
+            }),
+        );
+    }
+
+    #[test]
+    fn heavy_aggregate_fails_closed_for_two_nonbreakaway_caller_branches() {
+        exercise_two_caller_sessions(false);
     }
 
     #[test]

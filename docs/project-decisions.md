@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-10-16**.
+Last updated: **2026-10-17**.
 
 ## Public pack
 
@@ -115,6 +115,17 @@ Other consuming projects are not reconfigured by that local language addition.
 
 ## Outcome, quality and speed
 
+**2026-10-21, confirmed:** `self_reflection_enabled` is the ordinary activation
+control for accepted-work self-reflection. True must prepare the supported lead's
+project lifecycle automatically; a second manual enable step is not acceptable.
+False blocks new model stages while preserving retained work. The host owns
+routine preparation, first-event capture and verified ownership transitions.
+Ordinary interactive `codex` must prepare the transport automatically. Reflection
+is restricted to current or new sessions: enabling the flag must never reopen
+finished sessions, backfill historical acceptances or run their pending stages.
+Retain their history without dispatch. Explicit native resume makes only that
+selected conversation current and does not replay its historical acceptances.
+
 **2026-09-13, confirmed:** during sustained work, improve the execution method
 as well as the product. Act on repeated expensive stages without waiting for
 the user to intervene. Invest incrementally in shorter feedback, valid prepared
@@ -123,20 +134,90 @@ cost. Routine in-scope workflow improvements need no separate specification;
 short tasks need no optimization ceremony. Preserve full acceptance, authority
 and recovery. The canonical details remain in the portable principles below.
 
-**2026-10-16, clarified:** an active delivery-improvement observer should turn
-one clear, attributable bottleneck into a bounded correction promptly. Do not
+**2026-10-17, revised:** replace the unaccepted persistent observer with
+post-acceptance self-reflection. A lead-accepted ordinary task's beads closure
+starts a native executor fork using `executor-self-reflection`; its retained
+result starts a lead fork using `lead-self-reflection`. The synthesis returns
+to the real lead, who owns decisions and assignments. Reflection and improvement
+work, including its descendants, does not trigger another automatic reflection.
+Use durable native events and retained stage identities, not model polling or
+a separate transcript feed. This is the selected design, not a delivery claim;
+the [self-reflection specification](../openspec/specs/delivery-improvement/spec.md)
+owns implementation and acceptance.
+
+**2026-10-19, revised:** the purpose of post-acceptance self-reflection is to
+reduce the full cost of future changes and maintenance while preserving quality
+and timely delivery of useful results. Adoption is the lead's reasoned engineering
+judgment about concrete lasting benefit, not a mandatory percentage reduction in
+time or tokens, a closed checklist or a weighted score. Equal independent task
+success is allowed but is not itself benefit; quality must remain no worse than
+the control, with no P0/P1 regression.
+
+Consider the affected users and likely future changes, the mechanism and expected
+reuse of the benefit, and the complete cost and risk of introducing and keeping
+the change. Simpler code or interfaces, easier diagnosis and recovery, fewer
+incidents, lower context burden and easier replacement can justify adoption
+without immediate time or token savings; these are examples, not an exhaustive
+set. More code, tools, instructions or architectural machinery must earn their
+ongoing cost. Endless polishing that delays useful delivery is also a cost.
+Tokens are the spending currency: assess the complete accepted-result path,
+including reflection, implementation, failed attempts, coordination and rework.
+Larger instructions can be worthwhile when their recurring input cost is repaid
+by fewer corrections or other supported effects; neither prompt length nor a
+single call's token count decides value. Without token savings, useful changes
+may still be adopted at no greater full token cost. Increased full token cost
+requires a concrete payback mechanism, observable benefit measures and a bounded
+relevant-use horizon, supported by actual use and checks. Qualitative confidence
+or a forecast alone does not establish payback. Consider cumulative adopted
+changes against the retained baseline so successive small increases cannot hide
+drift. Prefer long-term lower token cost with faster delivery and preserved or
+better quality; benefit measures remain task-specific, not a closed checklist.
+Prefer the smallest effective correction, including doing nothing when that is
+better. Reflection and improvement implementation may run alongside ordinary
+work within available capacity; neither routinely becomes a prerequisite for
+accepting or delivering ordinary work. The responsible lead may hold a release
+when reflection exposes a concrete incident risk relevant to that release,
+judging impact, likelihood, exposure, mitigation and the cost of delay. A potential
+incident need not occur first. Record the reason and a checkable release condition
+in the existing task; the reflection itself cannot impose or lift the hold.
+Parallel duration is not itself a delivery delay:
+count actual contention, lead distraction, integration conflicts and ongoing
+burden, without adding overlapping elapsed spans twice. Distinguish observed
+effects from forecasts and uncertainty; confidence
+in long-term value is not a claim that the future has been proved.
+
+Before candidate model dispatch, declare the concrete benefit to examine, relevant
+use and quality horizon, complete cost coverage and bounded stopping conditions.
+Retain real acceptance, all adverse or inconclusive observations and verified
+baseline restoration on rejection. Record the adoption reason and material
+trade-offs in the existing decision owner, without new paperwork or proof quotas.
+This supersedes mandatory dual savings and strict quality improvement for this
+change; it does not rewrite frozen policies of other experiments.
+
+**2026-10-21, deployment preview:** the user removed the mandatory model-backed
+comparison and benefit gate from `reuse-verified-build-for-deployment-preview`.
+Complete that change through direct native behavior acceptance, current-source
+integration and installed delivery verification. Preserve integrity, freshness
+and ownership checks and retained historical evidence. Avoiding compilation for
+an eligible preview does not establish overall time or token savings. This scoped
+decision does not close the executor-watch workload or parent improvement loop.
+
+One clear, attributable bottleneck should produce a bounded correction promptly. Do not
 wait for repeated episodes, votes or statistical proof when the available facts
 already support the remedy. Investigate only uncertainty that changes the
 decision, and verify the result proportionately through its actual use. Keep
-the observer module's adoption comparison separate from the handling of each
-finding; preserve required acceptance and scope boundaries. The active change
-owns this [single-observation admission](../openspec/changes/add-delivery-improvement/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
+the reflection mechanism's release acceptance separate from the handling of each
+finding; preserve required acceptance and scope boundaries. The feedback specification
+owns this [single-observation admission](../openspec/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
 
-The user also authorized isolated candidate implementation in parallel with
-comparison preparation to shorten delivery. The candidate remains inactive;
-the [evaluation and acceptance gates](../openspec/changes/add-delivery-improvement/design.md#parallel-candidate-implementation-and-predeclared-evaluation)
-remain unchanged. This accepts possible unused implementation, not a lower
-acceptance standard.
+Release acceptance requires one real sequential executor-fork reflection,
+lead-fork synthesis receiving its result, and verified consumption and disposition
+by the current live lead, plus applicable regression and global installation checks.
+The live lead may delegate a useful recommendation through the ordinary executor
+process; neither a completed improvement nor a comparative campaign blocks release.
+The self-reflection specification owns the [real-chain acceptance](../openspec/specs/delivery-improvement/spec.md#requirement-real-sequential-chain-gates-release).
+This does not establish savings or waive the user's cost/payback requirements
+when deciding whether to adopt individual improvements.
 
 Deliver a quality, verified end-to-end MVP through real components as early as
 possible, then complete the whole agreed result. Small transparent operating

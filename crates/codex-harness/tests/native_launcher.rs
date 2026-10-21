@@ -11,7 +11,9 @@ use harness_core::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -77,6 +79,14 @@ impl Fixture {
         fs::write(
             source.join("global/harness.config.toml"),
             "approval_policy = 'never'\n",
+        )
+        .unwrap();
+        // Existing cases exercise the native and legacy paths; the ordinary
+        // reflection cases below opt in by rewriting this file. Omitting the
+        // key still defaults on, which its own case exercises.
+        fs::write(
+            source.join("global/orchestration.toml"),
+            reflection_config(Some(false)),
         )
         .unwrap();
         fs::write(source.join("global/kit.json"), serde_json::to_vec(&json!({"schema":1,"profile_name":"harness","profile":"global/harness.config.toml","instructions":"AGENTS.md","skills":"skills","agents":"agents","hooks":"hooks.json","token_hooks":"rtk-hooks.json"})).unwrap()).unwrap();
@@ -148,6 +158,8 @@ impl Fixture {
             .env(CPU_ACCOUNT_ENV, &self.account)
             .env_remove(CPU_PERCENT_ENV)
             .env_remove("HARNESS_EXECUTOR_SESSION")
+            .env_remove("HARNESS_REFLECTION_SESSION")
+            .env_remove("HARNESS_BOUNDED_LEAD_SESSION")
             .env_remove("HARNESS_LAUNCH_FIXTURE_MODE");
         c
     }
@@ -158,6 +170,30 @@ impl Fixture {
             "sha256": build_identity::hash_file(consumer).unwrap(),
             "package": null
         }));
+    }
+    fn set_reflection(&self, enabled: Option<bool>) {
+        self.write_reflection(&reflection_config(enabled));
+    }
+    fn write_reflection(&self, body: &str) {
+        fs::write(self.source.join("global/orchestration.toml"), body).unwrap();
+    }
+    /// Replace the placeholder manager with the owned native capture fixture,
+    /// then re-record its digest so the immutable launch admission accepts it.
+    fn install_manager(&self) {
+        let build = self.launcher.parent().unwrap();
+        let manager = build.join("codex-harness.exe");
+        fs::copy(env!("CARGO_BIN_EXE_harness-launch-fixture"), &manager).unwrap();
+        let mut record = build_identity::read_record(build).unwrap();
+        record.binaries.insert(
+            "codex-harness.exe".into(),
+            build_identity::hash_file(&manager).unwrap(),
+        );
+        fs::write(
+            build.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        build_selection::activate(&self.state, build).unwrap();
     }
     fn console(&self, mode: &str) -> ConsoleSession {
         let mut c = CommandSpec::new(&self.launcher);
@@ -174,10 +210,401 @@ impl Fixture {
         // must not pick up from the developer's environment.
         c.env.insert(CPU_PERCENT_ENV.into(), None);
         c.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
+        c.env.insert("HARNESS_REFLECTION_SESSION".into(), None);
+        c.env.insert("HARNESS_BOUNDED_LEAD_SESSION".into(), None);
         c.env
             .insert("HARNESS_LAUNCH_FIXTURE_MODE".into(), Some(mode.into()));
         ConsoleSession::spawn(ConsoleSpec::new(c)).unwrap()
     }
+}
+
+fn reflection_config(enabled: Option<bool>) -> String {
+    let mut text = concat!(
+        "schema = 1\n",
+        "lead_profile = \"default\"\n",
+        "successor_lead_profile = \"default\"\n",
+        "executor_profiles = [\"default\"]\n",
+        "max_concurrent_executors = 1\n",
+    )
+    .to_owned();
+    if let Some(enabled) = enabled {
+        text.push_str(&format!("self_reflection_enabled = {enabled}\n"));
+    }
+    text
+}
+
+/// Run one ordinary launcher invocation through its actual entry point and
+/// return the captured fixture report. The fixture exits 19 after reporting,
+/// which also makes the launcher's exit forwarding observable.
+fn launch_report(f: &Fixture, args: &[OsString]) -> (i32, Value) {
+    launch_report_with_env(f, args, &[])
+}
+
+fn launch_report_with_env(
+    f: &Fixture,
+    args: &[OsString],
+    environment: &[(&str, &str)],
+) -> (i32, Value) {
+    let mut command = f.command();
+    command
+        .args(args)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
+        .env("CODEX_MANAGED_BY_BUN", "1");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"reflection input line\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "launcher produced no fixture report: {error}; status {:?}; stderr {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code().unwrap_or(-1), report)
+}
+
+fn ordinary_reflection_args(f: &Fixture) -> (Vec<OsString>, PathBuf) {
+    let sub = f.root.path().join("sub");
+    let added = f.root.path().join("added");
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(&added).unwrap();
+    (
+        vec![
+            OsString::from("--profile"),
+            OsString::from("work"),
+            OsString::from("-m"),
+            OsString::from("gpt-6-astra"),
+            OsString::from("-C"),
+            OsString::from("sub"),
+            OsString::from("--add-dir"),
+            added.clone().into_os_string(),
+            OsString::from("hello"),
+        ],
+        added,
+    )
+}
+
+#[test]
+fn ordinary_reflection_forwards_prepared_argv_env_cwd_and_exit_to_manager() {
+    let f = Fixture::new();
+    let (args, added) = ordinary_reflection_args(&f);
+
+    f.set_reflection(Some(false));
+    let (native_code, native) = launch_report(&f, &args);
+    assert_eq!(native_code, 19);
+    let native_args = native["args"].as_array().unwrap();
+    for expected in [
+        "--profile",
+        "work",
+        "-m",
+        "gpt-6-astra",
+        "-C",
+        "sub",
+        "--add-dir",
+    ] {
+        assert!(
+            native_args
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|arg| arg == expected),
+            "the prepared native argv lost {expected}: {native_args:?}"
+        );
+    }
+    let added = added.canonicalize().unwrap();
+    let roots: Value = serde_json::from_str(
+        native["environment"]["HARNESS_LSP_WORKSPACE_ROOTS"]
+            .as_str()
+            .expect("the prepared environment must carry the additional roots"),
+    )
+    .unwrap();
+    assert!(
+        roots
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|path| Path::new(path)
+                .canonicalize()
+                .is_ok_and(|path| path == added)),
+        "the prepared environment lost the explicit --add-dir root: {roots:?}"
+    );
+
+    f.set_reflection(Some(true));
+    f.install_manager();
+    let (manager_code, manager) = launch_report(&f, &args);
+    assert_eq!(manager_code, 19);
+    let manager_args = manager["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    assert_eq!(manager_args[1], "--codex-home");
+    assert_eq!(
+        Path::new(manager_args[2].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        f.home.canonicalize().unwrap()
+    );
+    assert_eq!(manager_args[3], "--");
+    assert_eq!(
+        &manager_args[4..],
+        native_args.as_slice(),
+        "the manager must receive the prepared native argv unchanged"
+    );
+    assert_eq!(manager["cwd"], native["cwd"]);
+    assert_eq!(manager["stdin"], native["stdin"]);
+    assert_eq!(
+        manager["environment"], native["environment"],
+        "the manager must receive the prepared environment unchanged"
+    );
+}
+
+#[test]
+fn ordinary_reflection_false_keeps_the_native_launcher_path() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(false));
+    let (code, report) = launch_report(&f, &[OsString::from("hello")]);
+    assert_eq!(code, 19);
+    assert_ne!(report["args"][0], "_ordinary-lead");
+}
+
+#[test]
+fn ordinary_reflection_preserves_resume_and_fork_selection() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let cases = [
+        ("resume", vec!["resume", "--last", "continue"]),
+        ("fork", vec!["fork", "9b2f", "continue"]),
+    ];
+    for (name, selection) in cases {
+        let args = selection
+            .iter()
+            .copied()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        let (code, report) = launch_report(&f, &args);
+        assert_eq!(code, 19, "{name}");
+        let manager_args = report["args"].as_array().unwrap();
+        assert_eq!(manager_args[0], "_ordinary-lead", "{name}");
+        let native = manager_args[4..]
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let start = native
+            .iter()
+            .position(|arg| *arg == name)
+            .unwrap_or_else(|| panic!("{name} selection is missing: {native:?}"));
+        assert_eq!(
+            &native[start..],
+            selection.as_slice(),
+            "the manager must receive the native {name} selection unchanged"
+        );
+    }
+}
+
+#[test]
+fn ordinary_reflection_defaults_on_when_the_permission_is_omitted_or_missing() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(None);
+    let (code, report) = launch_report(&f, &[OsString::from("hello")]);
+    assert_eq!(code, 19);
+    assert_eq!(report["args"][0], "_ordinary-lead");
+
+    fs::remove_file(f.source.join("global/orchestration.toml")).unwrap();
+    let (code, report) = launch_report(&f, &[OsString::from("hello")]);
+    assert_eq!(code, 19);
+    assert_eq!(report["args"][0], "_ordinary-lead");
+}
+
+#[test]
+fn ordinary_reflection_rejects_invalid_configuration_before_starting_a_payload() {
+    let f = Fixture::new();
+    f.install_manager();
+    let mut body = reflection_config(None);
+    body.push_str("self_reflection_enabled = 1\n");
+    f.write_reflection(&body);
+    let marker = f.root.path().join("invalid-configuration-started");
+    let output = f
+        .command()
+        .args(["hello"])
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &marker)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("orchestration configuration is invalid"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "an invalid permission must start no payload"
+    );
+}
+
+#[test]
+fn ordinary_reflection_bypasses_nonordinary_and_owned_sessions() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let cases: Vec<(&str, Vec<&str>, Vec<(&str, &str)>)> = vec![
+        (
+            "explicit remote",
+            vec!["--remote", "ws://127.0.0.1:1", "hello"],
+            vec![],
+        ),
+        ("noninteractive exec", vec!["exec", "hello"], vec![]),
+        ("internal app-server", vec!["app-server"], vec![]),
+        ("help", vec!["--help"], vec![]),
+        ("version", vec!["--version"], vec![]),
+        ("short version", vec!["-V"], vec![]),
+        (
+            "executor session",
+            vec!["hello"],
+            vec![("HARNESS_EXECUTOR_SESSION", "1")],
+        ),
+        (
+            "reflection session",
+            vec!["hello"],
+            vec![("HARNESS_REFLECTION_SESSION", "1")],
+        ),
+        (
+            "bounded lead session",
+            vec!["hello"],
+            vec![("HARNESS_BOUNDED_LEAD_SESSION", "1")],
+        ),
+    ];
+    for (name, raw, environment) in cases {
+        let args = raw.iter().copied().map(OsString::from).collect::<Vec<_>>();
+        let (code, report) = launch_report_with_env(&f, &args, &environment);
+        assert_eq!(code, 19, "{name}");
+        assert_ne!(
+            report["args"][0], "_ordinary-lead",
+            "{name} must keep its native owner"
+        );
+    }
+}
+
+#[test]
+fn ordinary_reflection_forwards_native_frontend_flags_to_manager() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let args = vec![
+        OsString::from("--search"),
+        OsString::from("--dangerously-bypass-hook-trust"),
+        OsString::from("hello"),
+    ];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    let expected = args
+        .iter()
+        .map(|arg| json!(arg.to_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert!(
+        manager_args.ends_with(&expected),
+        "the manager must receive native frontend choices unchanged: {manager_args:?}"
+    );
+}
+
+#[test]
+fn ordinary_reflection_forwards_oss_provider_selection_to_manager() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let args = vec![
+        OsString::from("--oss"),
+        OsString::from("--local-provider"),
+        OsString::from("ollama"),
+        OsString::from("hello"),
+    ];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    let expected = args
+        .iter()
+        .map(|arg| json!(arg.to_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert!(
+        manager_args.ends_with(&expected),
+        "the manager must receive the OSS selection unchanged: {manager_args:?}"
+    );
+}
+
+#[test]
+fn ordinary_reflection_leaves_declared_oss_provider_to_native_frontend() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    fs::write(f.home.join("config.toml"), "oss_provider = \"lmstudio\"\n").unwrap();
+    let (code, report) = launch_report(&f, &[OsString::from("--oss"), OsString::from("hello")]);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    assert!(
+        manager_args.ends_with(&[json!("--oss"), json!("hello")]),
+        "the manager must receive the declared OSS selection unchanged: {manager_args:?}"
+    );
+}
+
+#[test]
+fn ordinary_reflection_forwards_bare_oss_selection_to_manager() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let args = vec![OsString::from("--oss"), OsString::from("hello")];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    let expected = args
+        .iter()
+        .map(|arg| json!(arg.to_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert!(
+        manager_args.ends_with(&expected),
+        "the manager must leave bare OSS discovery to the native frontend: {manager_args:?}"
+    );
+}
+
+#[test]
+fn ordinary_reflection_keeps_uncapped_cpu_selection_on_the_manager_path() {
+    let f = Fixture::new();
+    // The uncapped payload verifies that it left this account's shared budget
+    // by name. Keep the fixture's memberless budget alive for that lookup.
+    let _budget = SharedCpuBudget::acquire(&f.account, SHARED_CPU_PERCENT).unwrap();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let args = vec![
+        OsString::from("--harness-cpu"),
+        OsString::from("uncapped"),
+        OsString::from("hello"),
+    ];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    assert!(
+        manager_args.ends_with(&[json!("hello")]),
+        "the CPU selector is consumed by the launcher; the prepared argv is unchanged: {manager_args:?}"
+    );
 }
 
 /// Re-record the fixture build's source identity after the test edited the

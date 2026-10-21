@@ -325,10 +325,10 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
             // verified build of the selected source in this manager's owned
             // state, so new sessions pick up a fresh manager without replacing
             // one that is still running.
-            let build = match optional(&options.values, "--build") {
+            let build = plain_path(match optional(&options.values, "--build") {
                 Some(build) => build,
                 None => native_build::delivery_build(&source)?,
-            };
+            });
             let timeout = options
                 .values
                 .get(&OsString::from("--timeout-seconds"))
@@ -627,22 +627,35 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
         })
         .transpose()?
         .unwrap_or(45);
-    let build = match optional("--build") {
-        Some(build) => build,
+    let (build, build_selection) = match optional("--build") {
+        Some(build) => (build, "explicit"),
         None => {
             let state = match optional("--state") {
                 Some(state) => state,
                 None => current_state()?,
             };
-            let cargo = values
-                .get(&OsString::from("--cargo"))
-                .cloned()
-                .unwrap_or_else(|| "cargo".into());
-            plain_path(native_build::prepare(&source, &state, &cargo)?.build)
+            let existing = if preview {
+                native_build::preview_build(&state, &source).ok().flatten()
+            } else {
+                None
+            };
+            if let Some(build) = existing {
+                (build, "verified-existing")
+            } else {
+                let cargo = values
+                    .get(&OsString::from("--cargo"))
+                    .cloned()
+                    .unwrap_or_else(|| "cargo".into());
+                (
+                    plain_path(native_build::prepare(&source, &state, &cargo)?.build),
+                    "prepared",
+                )
+            }
         }
     };
     let build = plain_path(build);
     core_install::validate_candidate_build(&source, &build)?;
+    let build_check = harness_core::build_identity::check(&build, Some(&source));
     let build_identity = harness_core::build_identity::read_record(&build)
         .map(|record| record.source.sha256.chars().take(16).collect::<String>())
         .unwrap_or_default();
@@ -695,12 +708,14 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
     )?)?;
     let mut components = Vec::new();
     let mut status = if preview { "preview" } else { "deployed" };
-    if all && !preview {
-        let manager = codex_home.join("harness/bin/codex-harness.exe");
-        // Component steps run through the manager this deploy just delivered,
-        // not through this possibly older process: their behavior then always
-        // matches the delivered source, and a component fix in that source
-        // takes effect in the same delivery run.
+    if all {
+        let manager = if preview {
+            env::current_exe()?
+        } else {
+            codex_home.join("harness/bin/codex-harness.exe")
+        };
+        // Applying steps consume the delivered manager. Preview uses this
+        // manager with each component's read-only planning flag.
         for name in ["code-tools", "token-workflow", "board", "subscriptions"] {
             let (verb, arguments) = component_step_args(
                 name,
@@ -711,6 +726,9 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
             );
             let mut step = Command::new(&manager);
             step.arg(verb).args(&arguments);
+            if preview {
+                step.arg("--preview");
+            }
             match step.output() {
                 Ok(output) => {
                     if !output.stderr.is_empty() {
@@ -742,7 +760,9 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
                                 "error": error
                             }));
                             status = "partial";
-                            break;
+                            if !preview {
+                                break;
+                            }
                         }
                     }
                 }
@@ -753,7 +773,9 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
                         "error": format!("starting delivered manager failed: {error}")
                     }));
                     status = "partial";
-                    break;
+                    if !preview {
+                        break;
+                    }
                 }
             }
         }
@@ -777,6 +799,8 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
             "source": source,
             "build": build,
             "build_identity": build_identity,
+            "build_selection": build_selection,
+            "build_check": build_check,
             "reset": reset_report,
             "core": core,
             "components": components,

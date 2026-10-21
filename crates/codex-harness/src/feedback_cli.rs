@@ -29,6 +29,7 @@ use harness_core::board_feedback::{
     RouteTarget, RoutedAction, VoteDecision, VoteLedger,
 };
 use harness_core::board_hypothesis;
+use harness_core::improvement_policy::PaybackRecord;
 use harness_core::improvement_spec::{OpenSpec, Specification};
 use harness_core::{benefit_gate, pacing, scoped_observations};
 use serde::Deserialize;
@@ -39,10 +40,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic|derived-evidence --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-admit --project DIRECTORY --mechanism TOKEN --conditions TOKEN --observation REF --predicted TEXT --counterexample TEXT --acceptance TEXT --spec REF --basis REF [--fresh-basis REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-search --project DIRECTORY [--mechanism TOKEN] [--conditions TOKEN] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-trial --project DIRECTORY --item ID --experiment ID --role candidate|workload --counterpart ID [--evidence REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-implement --project DIRECTORY --item ID --role candidate|workload --branch NAME --base REVISION --revision REVISION --worktree LOCATOR [--runtime ID] [--baseline-runtime ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-decision --project DIRECTORY --item ID --experiment ID --outcome adopt|reject|inconclusive --quality unchanged|improved|regressed|unmeasurable --matched N --tolerance-percent VALUE --baseline-seconds VALUE --candidate-seconds VALUE --baseline-arm NAME --candidate-arm NAME --accounting TERMS --baseline-revision REVISION --candidate-revision REVISION --acceptance REF --coverage TERMS --scope TOKEN --reason TOKEN [--detail TEXT] [--close yes] [--defer UNTIL] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-reconcile --project DIRECTORY --item ID --outcome reject|inconclusive --change NAME [--action retain|archive] [--openspec-project DIRECTORY] [--planning-root DIRECTORY] [--store ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-propose --project DIRECTORY --item ID --proposal REF --target TOKEN --evidence REF --loss TOKEN [--preview REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-decide --project DIRECTORY --item ID --decision approve|refuse|withdraw --proposal REF --target TOKEN [--actions experiment,integration,publication] --loss TOKEN [--basis REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-check --project DIRECTORY --item ID --proposal REF --target TOKEN --action experiment|integration|publication [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` (v1 and v2) records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's recorded benefit-gate decision with its comparison consistency, its recorded evidence binding (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) and its limitations (the record is read back; it is not rerun or independently certified here). Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board.\nThe hypothesis verbs keep one durable `task` labeled hypothesis per hypothesis: admission searches open, closed and deferred cards first, reuses the prior same-condition conclusion and requires a recorded fresh basis before reconsideration, so a repeated trial creates no duplicate card; `hypothesis-trial` records the explicit candidate/workload relationship as a nonblocking `related` edge plus its experiment reference; `hypothesis-implement` records the candidate branch/base/revision/worktree and prepared runtime identities without adopting or closing anything; `hypothesis-decision` publishes the evidence-bound `benefit-gate v2` record (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) idempotently and refuses a decision its own comparison cannot support, then optionally closes or defers the card; `hypothesis-reconcile` reconciles an unadopted outcome with the change's actual task state read through the installed OpenSpec CLI: retention writes nothing, archival uses the supported non-synchronizing path only when every required task is actually done, and an unfinished required task is never closed through an outcome. The removal verbs keep the user's decision separate from measured benefit: `removal-propose` records each reviewed proposal version (any changed reviewed field, including the bounded prose detail, is appended as the new current version), `removal-decide` records the user's approve/refuse/withdraw bound to that exact reviewed content (an approval must name its reviewed loss, which must equal the recorded proposal's loss; the recorded `reviewed=` digest covers every reviewed field), and `removal-check` resolves the latest decision for one exact proposal/target/action (exit 0 only when authorized): an unreadable, incomplete-proposal or changed-proposal newer record never falls back to an older approval, a refusal or withdrawal authorizes nothing, a proposal version recorded after the decision needs a fresh decision before any further removal effect, and no benefit verdict is accepted as consent. No verb creates votes, another tracker or a model call.";
+const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback record --project DIRECTORY --source-feedback ID --observation TEXT --reporter ID --kind derived-evidence [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--verified-work WORK --improvement-reason TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-admit --project DIRECTORY --mechanism TOKEN --conditions TOKEN --observation REF --predicted TEXT --counterexample TEXT --acceptance TEXT --spec REF --basis REF [--fresh-basis REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-search --project DIRECTORY [--mechanism TOKEN] [--conditions TOKEN] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-trial --project DIRECTORY --item ID --experiment ID --role candidate|workload --counterpart ID [--evidence REF] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-implement --project DIRECTORY --item ID --role candidate|workload --branch NAME --base REVISION --revision REVISION --worktree LOCATOR [--runtime ID] [--baseline-runtime ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-decision --project DIRECTORY --item ID --experiment ID --outcome adopt|reject|inconclusive --quality unchanged|improved|regressed|unmeasurable --matched N --tolerance-percent VALUE --baseline-seconds VALUE --candidate-seconds VALUE --baseline-arm NAME --candidate-arm NAME --accounting TERMS --baseline-revision REVISION --candidate-revision REVISION --acceptance REF --coverage TERMS --scope TOKEN --reason TOKEN [--basis efficiency|engineering-judgment --basis-ref REF] [--baseline-tokens N --candidate-tokens N --cumulative-baseline-tokens N --cumulative-candidate-tokens N --cumulative-baseline REVISION] [--payback-file PAYBACK.json] [--detail TEXT] [--close yes] [--defer UNTIL] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback hypothesis-reconcile --project DIRECTORY --item ID --outcome reject|inconclusive --change NAME [--action retain|archive] [--openspec-project DIRECTORY] [--planning-root DIRECTORY] [--store ID] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-propose --project DIRECTORY --item ID --proposal REF --target TOKEN --evidence REF --loss TOKEN [--preview REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-decide --project DIRECTORY --item ID --decision approve|refuse|withdraw --proposal REF --target TOKEN [--actions experiment,integration,publication] --loss TOKEN [--basis REF] [--detail TEXT] [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback removal-check --project DIRECTORY --item ID --proposal REF --target TOKEN --action experiment|integration|publication [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. `record --kind derived-evidence` requires --source-feedback and appends bounded analysis to that existing record without creating a feedback card or vote; source episode, reporter kind and parent come from the board record. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `feedback-derived`, `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` (v1 and v2) records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's recorded benefit-gate decision with its comparison consistency, its recorded evidence binding (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) and its limitations (the record is read back; it is not rerun or independently certified here). Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board.\nThe hypothesis verbs keep one durable `task` labeled hypothesis per hypothesis: admission searches open, closed and deferred cards first, reuses the prior same-condition conclusion and requires a recorded fresh basis before reconsideration, so a repeated trial creates no duplicate card; `hypothesis-trial` records the explicit candidate/workload relationship as a nonblocking `related` edge plus its experiment reference; `hypothesis-implement` records the candidate branch/base/revision/worktree and prepared runtime identities without adopting or closing anything; `hypothesis-decision` publishes the evidence-bound `benefit-gate v2` record (experiment, exact revisions, acceptance evidence, metric coverage, scope and reason) idempotently and refuses a decision its own comparison cannot support, then optionally closes or defers the card; under `--basis engineering-judgment` it also carries complete measured local token cost and derives cumulative cost from the retained baseline and prior adopted experiments; an increased cost is published only with the predeclared `PaybackRecord` from `--payback-file`, including each observed measure, unit, direction and acceptance-bound evidence, while a stale baseline, conflicting explicit totals or unsupported return is refused before mutation; `hypothesis-reconcile` reconciles an unadopted outcome with the change's actual task state read through the installed OpenSpec CLI: retention writes nothing, archival uses the supported non-synchronizing path only when every required task is actually done, and an unfinished required task is never closed through an outcome. The removal verbs keep the user's decision separate from measured benefit: `removal-propose` records each reviewed proposal version (any changed reviewed field, including the bounded prose detail, is appended as the new current version), `removal-decide` records the user's approve/refuse/withdraw bound to that exact reviewed content (an approval must name its reviewed loss, which must equal the recorded proposal's loss; the recorded `reviewed=` digest covers every reviewed field), and `removal-check` resolves the latest decision for one exact proposal/target/action (exit 0 only when authorized): an unreadable, incomplete-proposal or changed-proposal newer record never falls back to an older approval, a refusal or withdrawal authorizes nothing, a proposal version recorded after the decision needs a fresh decision before any further removal effect, and no benefit verdict is accepted as consent. No verb creates votes, another tracker or a model call.";
 
 /// Bound on the caller-supplied triage decision document.
 const MAX_DECISIONS_BYTES: u64 = 256 * 1024;
+/// Bound on one caller-supplied payback record.
+const MAX_PAYBACK_BYTES: u64 = 64 * 1024;
 /// Bound on one batch document; larger sets are split by the caller.
 const MAX_DECISIONS: usize = 512;
 /// Bound on the installation record read for the installed kit source.
@@ -246,9 +249,18 @@ fn board_cli_unavailable(detail: &str) -> io::Error {
     harness_core::board_cli::unavailable(detail)
 }
 
-fn discover_bd() -> io::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEX_HOME") {
-        let candidate = PathBuf::from(home).join("harness/bin").join(bd_name());
+pub(crate) fn discover_bd() -> io::Result<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    discover_bd_from_home(home.as_deref())
+}
+
+pub(crate) fn discover_bd_in(home: &Path) -> io::Result<PathBuf> {
+    discover_bd_from_home(Some(home))
+}
+
+fn discover_bd_from_home(home: Option<&Path>) -> io::Result<PathBuf> {
+    if let Some(home) = home {
+        let candidate = home.join("harness/bin").join(bd_name());
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -280,6 +292,7 @@ fn record(args: &[OsString]) -> io::Result<i32> {
         "--project",
         "--bd",
         "--source",
+        "--source-feedback",
         "--observation",
         "--scope",
         "--reporter",
@@ -288,12 +301,52 @@ fn record(args: &[OsString]) -> io::Result<i32> {
         "--parent",
     ])?;
     let board = resolve_board(&options)?;
+    let kind = ReporterKind::parse(options.required("--kind")?)?;
+    if kind == ReporterKind::DerivedEvidence {
+        if options.get("--scope").is_some()
+            || options.get("--episode").is_some()
+            || options.get("--parent").is_some()
+        {
+            return Err(invalid(
+                "derived-evidence takes episode, scope and parent from --source-feedback; omit --episode, --scope and --parent",
+            ));
+        }
+        let receipt = board_feedback::record_derived_feedback(
+            &board.bd,
+            &board.project,
+            options.required("--source-feedback")?,
+            options.required("--reporter")?,
+            options.required("--observation")?,
+        )?;
+        println!(
+            "derived feedback source={} target={} reporter={} source_reporter={} source_kind={} episode={} parent={} record={} votes=0 limits={}",
+            receipt.record.source,
+            receipt.target_id,
+            receipt.record.reporter,
+            receipt.record.source_reporter,
+            receipt.record.source_kind.as_str(),
+            receipt.record.episode,
+            receipt.record.parent_id,
+            if receipt.written {
+                "written"
+            } else {
+                "already-recorded"
+            },
+            board.limits
+        );
+        return Ok(0);
+    }
+    if options.get("--source-feedback").is_some() {
+        return Err(invalid(
+            "--source-feedback is only valid with --kind derived-evidence",
+        ));
+    }
     let draft = FeedbackDraft {
         observation: options.required("--observation")?.to_owned(),
         scope: options.required("--scope")?.to_owned(),
         reporter: options.required("--reporter")?.to_owned(),
         episode: options.required("--episode")?.to_owned(),
-        kind: ReporterKind::parse(options.required("--kind")?)?,
+        kind,
         parent_id: options.required("--parent")?.to_owned(),
     };
     let bounded = BoundedFeedback::try_from_draft(draft)?;
@@ -341,12 +394,13 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
     let item = options.required("--item")?;
     let ledger = board_feedback::inspect_ledger(&board.bd, &board.project, item)?;
     println!(
-        "ledger {item} votes={} counted={} merges={} routes={} promotions={} limits={}",
+        "ledger {item} votes={} counted={} merges={} routes={} promotions={} derived={} limits={}",
         ledger.votes.len(),
         ledger.counted(),
         ledger.merges.len(),
         ledger.routes.len(),
         ledger.promotions.len(),
+        ledger.derived.len(),
         board.limits
     );
     for vote in &ledger.votes {
@@ -357,6 +411,18 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
             vote.kind.as_str(),
             vote.counted,
             vote.reason.as_str()
+        );
+    }
+    for derived in &ledger.derived {
+        println!(
+            "derived source={} source_reporter={} source_kind={} reporter={} episode={} parent={} analysis={}",
+            derived.source,
+            derived.source_reporter,
+            derived.source_kind.as_str(),
+            derived.reporter,
+            derived.episode,
+            derived.parent_id,
+            display_text(&derived.analysis)
         );
     }
     for merge in &ledger.merges {
@@ -374,11 +440,7 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
         println!(
             "promotion route={} basis={} counted={} target={}",
             promotion.route.as_str(),
-            if promotion.override_used {
-                "override"
-            } else {
-                "votes"
-            },
+            promotion.basis(),
             promotion.counted,
             promotion.target.as_deref().unwrap_or("none")
         );
@@ -427,7 +489,11 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
             let (supported, phrase, status) = match assessment.verdict {
                 benefit_gate::Verdict::Consistent => (
                     "yes",
-                    "recorded comparison consistent within its declared tolerance",
+                    if latest.basis.as_deref() == Some("engineering-judgment") {
+                        "recorded engineering-judgment adoption retains measured cost and its declared basis"
+                    } else {
+                        "recorded comparison consistent within its declared tolerance"
+                    },
                     "adopted",
                 ),
                 benefit_gate::Verdict::Unsupported => (
@@ -494,6 +560,8 @@ fn binding_text(record: &benefit_gate::GateRecord) -> String {
         ("coverage", record.coverage.as_deref()),
         ("scope", record.scope.as_deref()),
         ("reason", record.reason.as_deref()),
+        ("basis", record.basis.as_deref()),
+        ("basis_ref", record.basis_ref.as_deref()),
     ]
     .into_iter()
     .filter_map(|(name, value)| {
@@ -602,6 +670,8 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
         "--scope",
         "--override-consequence",
         "--override-reason",
+        "--verified-work",
+        "--improvement-reason",
     ])?;
     let board = resolve_board(&options)?;
     let item = options.required("--item")?;
@@ -644,18 +714,40 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
     }
     let consequence = options.get("--override-consequence");
     let reason = options.get("--override-reason");
-    let evidence = match (consequence, reason) {
-        (Some(consequence), Some(reason)) => PromotionEvidence::ConsequenceOverride {
-            consequence: consequence.to_owned(),
-            reason: reason.to_owned(),
-        },
-        (None, None) => PromotionEvidence::Votes {
-            threshold: board.vote_threshold,
-        },
-        _ => {
+    let verified_work = options.get("--verified-work");
+    let improvement_reason = options.get("--improvement-reason");
+    let evidence = if verified_work.is_some() || improvement_reason.is_some() {
+        if consequence.is_some() || reason.is_some() {
             return Err(invalid(
-                "--override-consequence and --override-reason are both required for a consequence override",
+                "verified improvement cannot be combined with a consequence override",
             ));
+        }
+        let (Some(work), Some(reason)) = (verified_work, improvement_reason) else {
+            return Err(invalid(
+                "--verified-work and --improvement-reason are both required",
+            ));
+        };
+        PromotionEvidence::VerifiedImprovement(
+            board_feedback::VerifiedImprovementRequest::for_current_lead(
+                &harness_core::native_launcher::codex_home()?,
+                work,
+                reason,
+            )?,
+        )
+    } else {
+        match (consequence, reason) {
+            (Some(consequence), Some(reason)) => PromotionEvidence::ConsequenceOverride {
+                consequence: consequence.to_owned(),
+                reason: reason.to_owned(),
+            },
+            (None, None) => PromotionEvidence::Votes {
+                threshold: board.vote_threshold,
+            },
+            _ => {
+                return Err(invalid(
+                    "--override-consequence and --override-reason are both required for a consequence override",
+                ));
+            }
         }
     };
     let route = match route {
@@ -677,13 +769,9 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
             "promotion already recorded: {} route={} basis={} counted={} threshold={} target={} limits={} (no promotion record was written; any missing labels are reconciled)",
             outcome.item_id,
             outcome.route.as_str(),
-            if outcome.override_used {
-                "override"
-            } else {
-                "votes"
-            },
+            outcome.basis(),
             outcome.counted,
-            if outcome.override_used {
+            if outcome.basis() != "votes" {
                 "none".to_owned()
             } else {
                 board.vote_threshold.to_string()
@@ -697,13 +785,9 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
         "promoted {} route={} basis={} counted={} threshold={} target={} limits={}",
         outcome.item_id,
         outcome.route.as_str(),
-        if outcome.override_used {
-            "override"
-        } else {
-            "votes"
-        },
+        outcome.basis(),
         outcome.counted,
-        if outcome.override_used {
+        if outcome.basis() != "votes" {
             "none".to_owned()
         } else {
             board.vote_threshold.to_string()
@@ -1012,10 +1096,18 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         "--experiment",
         "--outcome",
         "--quality",
+        "--basis",
+        "--basis-ref",
         "--matched",
         "--tolerance-percent",
         "--baseline-seconds",
         "--candidate-seconds",
+        "--baseline-tokens",
+        "--candidate-tokens",
+        "--cumulative-baseline-tokens",
+        "--cumulative-candidate-tokens",
+        "--cumulative-baseline",
+        "--payback-file",
         "--baseline-arm",
         "--candidate-arm",
         "--accounting",
@@ -1034,6 +1126,87 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         .ok_or_else(|| invalid("--outcome is adopt, reject or inconclusive"))?;
     let quality = benefit_gate::QualityOutcome::parse(options.required("--quality")?)
         .ok_or_else(|| invalid("--quality is unchanged, improved, regressed or unmeasurable"))?;
+    let basis = match options.get("--basis").unwrap_or("efficiency") {
+        "efficiency" => {
+            if options.get("--basis-ref").is_some() {
+                return Err(invalid("--basis-ref requires --basis engineering-judgment"));
+            }
+            benefit_gate::DecisionBasis::Efficiency
+        }
+        "engineering-judgment" => {
+            let reference = options.get("--basis-ref").ok_or_else(|| {
+                invalid(
+                    "--basis engineering-judgment requires --basis-ref with the predeclared lasting-benefit reference",
+                )
+            })?;
+            benefit_gate::DecisionBasis::EngineeringJudgment {
+                basis: reference.to_owned(),
+            }
+        }
+        "maintenance" => {
+            return Err(invalid(
+                "--basis maintenance is not an opt-in adoption basis; use --basis engineering-judgment with --basis-ref",
+            ));
+        }
+        other => {
+            return Err(invalid(&format!(
+                "--basis is efficiency or engineering-judgment, not {other}"
+            )));
+        }
+    };
+    let engineering = matches!(
+        &basis,
+        benefit_gate::DecisionBasis::EngineeringJudgment { .. }
+    );
+    let any_tokens = [
+        "--baseline-tokens",
+        "--candidate-tokens",
+        "--cumulative-baseline-tokens",
+        "--cumulative-candidate-tokens",
+        "--cumulative-baseline",
+    ]
+    .iter()
+    .any(|flag| options.get(flag).is_some());
+    let any_payback = options.get("--payback-file").is_some();
+    if !engineering && (any_tokens || any_payback) {
+        return Err(invalid(
+            "token cost and payback options require --basis engineering-judgment",
+        ));
+    }
+    let baseline_tokens = options
+        .get("--baseline-tokens")
+        .map(|value| count("--baseline-tokens", value))
+        .transpose()?;
+    let candidate_tokens = options
+        .get("--candidate-tokens")
+        .map(|value| count("--candidate-tokens", value))
+        .transpose()?;
+    let cumulative_baseline_tokens = options
+        .get("--cumulative-baseline-tokens")
+        .map(|value| count("--cumulative-baseline-tokens", value))
+        .transpose()?;
+    let cumulative_candidate_tokens = options
+        .get("--cumulative-candidate-tokens")
+        .map(|value| count("--cumulative-candidate-tokens", value))
+        .transpose()?;
+    let local_tokens = baseline_tokens.is_some() as usize + candidate_tokens.is_some() as usize;
+    if local_tokens == 1 {
+        return Err(invalid(
+            "--baseline-tokens and --candidate-tokens are recorded together",
+        ));
+    }
+    let cumulative_tokens = cumulative_baseline_tokens.is_some() as usize
+        + cumulative_candidate_tokens.is_some() as usize
+        + options.get("--cumulative-baseline").is_some() as usize;
+    if cumulative_tokens != 0 && cumulative_tokens != 3 {
+        return Err(invalid(
+            "--cumulative-baseline-tokens, --cumulative-candidate-tokens and --cumulative-baseline are recorded together",
+        ));
+    }
+    let payback = options
+        .get("--payback-file")
+        .map(|value| load_payback(Path::new(value)))
+        .transpose()?;
     let close = match options.get("--close") {
         None | Some("no") => false,
         Some("yes") => true,
@@ -1044,6 +1217,7 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         experiment: options.required("--experiment")?.to_owned(),
         outcome,
         quality,
+        basis,
         matched: count("--matched", options.required("--matched")?)?,
         tolerance_percent: number(
             "--tolerance-percent",
@@ -1067,6 +1241,12 @@ fn hypothesis_decision(args: &[OsString]) -> io::Result<i32> {
         scope: options.required("--scope")?.to_owned(),
         reason: options.required("--reason")?.to_owned(),
         detail: options.get("--detail").map(str::to_owned),
+        baseline_tokens,
+        candidate_tokens,
+        cumulative_baseline_tokens,
+        cumulative_candidate_tokens,
+        cumulative_baseline: options.get("--cumulative-baseline").map(str::to_owned),
+        payback,
     };
     let publication = benefit_gate::publish_decision(&board.bd, &board.project, &draft)?;
     println!(
@@ -1464,6 +1644,44 @@ fn routed_kinds(ledger: &VoteLedger) -> Vec<ObservationKind> {
         }
     }
     kinds
+}
+
+/// Reads the one bounded payback record file used by the decision verb.
+/// The file carries the existing `PaybackRecord` shape rather than expanding
+/// repeated command-line fields; the publication owner validates its declared
+/// measures and observed values against the decision.
+fn load_payback(path: &Path) -> io::Result<PaybackRecord> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        invalid(&format!(
+            "payback file {} is unreadable: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(invalid(&format!(
+            "payback path {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_PAYBACK_BYTES {
+        return Err(invalid(&format!(
+            "payback file {} is {} bytes; the limit is {MAX_PAYBACK_BYTES}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        invalid(&format!(
+            "payback file {} is unreadable: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "payback file {} is not a PaybackRecord JSON document: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn load_decisions(path: &Path) -> io::Result<Vec<RoutedAction>> {

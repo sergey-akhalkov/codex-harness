@@ -26,7 +26,10 @@ the delivery done.
 
 - `--all` also chains the scoped component updates (code tools, token
   workflow, board, subscriptions) and reports each one.
-- `--preview` plans without building links.
+- `--preview` plans without changing the installation. Without `--build`, it
+  reuses an eligible verified build from the same checkout without compilation;
+  otherwise normal preparation applies. Check `build_selection` and
+  `build_check` in the receipt: an older build's plan does not verify new source.
 - `--build`/`--state` pin or place the candidate explicitly.
 
 ## Repairing a blocked installation

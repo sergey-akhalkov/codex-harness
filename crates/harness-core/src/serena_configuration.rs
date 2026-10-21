@@ -99,6 +99,10 @@ pub fn ls_specific_settings(registry: &Value) -> io::Result<BTreeMap<String, Val
             }
         };
         let mut setting = launch_setting(&base, &args);
+        if serena_id == "rust" {
+            // Cargo verification belongs to explicit checks, not each navigation edit.
+            setting["initializationOptions"] = json!({"checkOnSave": false});
+        }
         // pasls reads its CodeTools configuration (PP/FPCDIR) from
         // `ls_specific_settings["pascal"]`, so the pinned FPC driver and
         // source tree need their own entries next to the launch command.

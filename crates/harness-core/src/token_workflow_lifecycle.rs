@@ -199,9 +199,16 @@ fn apply_token_workflow_features(
         publish_feature(home, &upstream, Feature::Hooks, true)?;
         return Ok(());
     }
+    let keep_plugin_hooks = match ConfigSnapshot::read(&home.join("config.toml")) {
+        Ok(config) => feature_edit::ponytail_selected(config.contents())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
     if previous_enabled {
         let features = feature_edit::discover_features(&upstream, home, feature_timeout())?;
-        publish_feature(home, &upstream, Feature::Hooks, false)?;
+        if !keep_plugin_hooks {
+            publish_feature(home, &upstream, Feature::Hooks, false)?;
+        }
         if features.code_mode {
             let previous_code_mode = previous
                 .and_then(|value| value["previousCodeMode"].as_bool())
@@ -210,7 +217,11 @@ fn apply_token_workflow_features(
         }
         return Ok(());
     }
-    publish_feature(home, &upstream, Feature::Hooks, false)
+    if keep_plugin_hooks {
+        Ok(())
+    } else {
+        publish_feature(home, &upstream, Feature::Hooks, false)
+    }
 }
 
 fn planned_token_workflow_state(
@@ -1647,40 +1658,45 @@ code_mode = false
     }
 
     #[test]
-    fn disconnect_restores_recorded_code_mode_and_disables_hooks() {
-        let root = tempfile::tempdir().unwrap();
-        let (home, rtk, _, request) = staged_request(root.path());
-        let upstream = compile_codex_features(root.path());
-        write_installation(&home, &upstream);
-        fs::write(
-            home.join("config.toml"),
-            b"[features]
-hooks = true
-code_mode = true
-",
-        )
-        .unwrap();
-        let destination = home.join("harness/bin/rtk.exe");
-        std::os::windows::fs::symlink_file(&rtk, &destination).unwrap();
-        fs::write(
-            home.join("harness/token-workflow.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "enabled": true,
-                "previousCodeMode": false,
-                "links": [{
-                    "destination": destination,
-                    "source": rtk,
-                    "sha256": build_identity::hash_file(&rtk).unwrap()
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let report = disconnect(&request).unwrap();
-        assert_eq!(report.status, "Token workflow disconnected");
-        let config = config_text(&home);
-        assert!(config.contains("hooks = false"), "{config}");
-        assert!(config.contains("code_mode = false"), "{config}");
+    fn disconnect_restores_code_mode_and_preserves_native_ponytail_choice() {
+        for (ponytail_enabled, hooks_enabled) in [(false, true), (true, true), (true, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let (home, rtk, _, request) = staged_request(root.path());
+            let upstream = compile_codex_features(root.path());
+            write_installation(&home, &upstream);
+            fs::write(
+                home.join("config.toml"),
+                format!("[features]\nhooks = {hooks_enabled}\ncode_mode = true\n[plugins.\"ponytail@ponytail\"]\nenabled = {ponytail_enabled}\n"),
+            ).unwrap();
+            let destination = home.join("harness/bin/rtk.exe");
+            std::os::windows::fs::symlink_file(&rtk, &destination).unwrap();
+            fs::write(
+                home.join("harness/token-workflow.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "enabled": true,
+                    "previousCodeMode": false,
+                    "links": [{
+                        "destination": destination,
+                        "source": rtk,
+                        "sha256": build_identity::hash_file(&rtk).unwrap()
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let report = disconnect(&request).unwrap();
+            assert_eq!(report.status, "Token workflow disconnected");
+            let config: toml::Value = toml::from_str(&config_text(&home)).unwrap();
+            assert_eq!(
+                config["features"]["hooks"].as_bool(),
+                Some(ponytail_enabled && hooks_enabled)
+            );
+            assert_eq!(config["features"]["code_mode"].as_bool(), Some(false));
+            assert_eq!(
+                config["plugins"]["ponytail@ponytail"]["enabled"].as_bool(),
+                Some(ponytail_enabled)
+            );
+        }
     }
 
     #[test]

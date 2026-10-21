@@ -22,12 +22,17 @@
 mod improvement_comparison;
 #[path = "improvement_driver.rs"]
 mod improvement_driver;
+#[path = "improvement_qualification.rs"]
+mod improvement_qualification;
 #[path = "improvement_workflow.rs"]
 mod improvement_workflow;
 
 use crate::executor_cli::{
-    ConversationState, VisibleAccepted, VisibleConversation, dispatch_visible_conversation,
-    executor_title, receipt_view, stop_owned_run,
+    ConversationState, PromptSource, VisibleAccepted, VisibleConversation,
+    VisibleExecutorContinuation, VisibleLeadContinuation, VisibleLeadConversation,
+    continue_visible_executor_conversation, continue_visible_lead_conversation,
+    dispatch_visible_conversation, dispatch_visible_lead_conversation, executor_title,
+    receipt_view, stop_owned_run,
 };
 use harness_core::board_feedback;
 use harness_core::board_hypothesis;
@@ -36,10 +41,10 @@ use harness_core::improvement_experiment::{self, Arm, CorroborationStatus, Prepa
 use harness_core::improvement_loop::{
     Attempt, AttemptRole, AttemptState, CURSOR_FILE, Cursor, DispatchBinding, DispatchFacts,
     DispatchGate, EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity,
-    ObservedOutcome, Phase, RemovalGate, ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE,
-    VariantSet, candidate_removal_gate, declared_removal_gate, dispatch_gate, dispatch_owner,
-    frozen_removal_digest, now_ms, read_json, selection_gate, settle_completed_reuse,
-    verify_dispatch_identity, write_json_atomic,
+    ObservedOutcome, Phase, PreSubmissionEvidence, RemovalGate, ResumeReport, RunMutation, RunSpec,
+    RunStore, SPEC_FILE, VariantSet, candidate_removal_gate, declared_removal_gate, dispatch_gate,
+    dispatch_owner, frozen_removal_digest, now_ms, read_json, retain_attempt_evidence,
+    selection_gate, settle_completed_reuse, verify_dispatch_identity, write_json_atomic,
 };
 use harness_core::improvement_spec::OpenSpec;
 use harness_core::orchestration_config;
@@ -47,11 +52,13 @@ use serde_json::json;
 use std::{ffi::OsString, io, path::Path, path::PathBuf, time::Duration};
 
 const USAGE: &str = "\
-codex-harness improve start --run DIRECTORY --spec FILE [--supervision once|continuous] [--integration-check FILE] [--successor-spec FILE --successor-run DIRECTORY]
+codex-harness improve start --run DIRECTORY --spec FILE [--supervision once|continuous] [--prepare-only] [--integration-check FILE] [--successor-spec FILE --successor-run DIRECTORY]
 codex-harness improve status --run DIRECTORY [--json]
 codex-harness improve select --run DIRECTORY --variant baseline|candidate
 codex-harness improve stop --run DIRECTORY [--reason TEXT]
 codex-harness improve resume --run DIRECTORY
+codex-harness improve review --prepare --review DIRECTORY --declaration FILE
+codex-harness improve review --resume --review DIRECTORY [--declaration FILE]
 codex-harness improve prepare-runtime --source DIRECTORY --state DIRECTORY --output FILE
 
 One explicitly started, durable improvement run. Beads owns the hypothesis and
@@ -72,6 +79,25 @@ change must qualify before any implementation, and a validated committed
 candidate reaches candidate-ready. Each model conversation uses the visible
 owner; a missing evidence base records idle, a missing gate records blocked,
 and neither starts hidden model work.
+
+--prepare-only is valid only for run inputs with a baseline_qualification
+declaration and single-step supervision. It defaults to once when
+--supervision is omitted and refuses continuous supervision before creating the
+run. It installs and verifies the ordinary and declared reviewer runtimes,
+freezes the task copy, prepares the independent oracle workspace, persists the
+unchanged gates and participant bindings, reports the exact homes, checkout,
+task and workspace plus the resume command, and dispatches no model attempt.
+Preparation is not acceptance and does not trust native hooks; the first actual
+launch may still require native first-use or hook consent.
+
+review --prepare freezes one eligible retained ordinary completion together with
+its verified Git source, retained result and action sidecars, then prepares the
+shared semantic-review packet and reviewer runtime without dispatching a model.
+review --resume revalidates the frozen declaration, completion, packet and
+reviewer runtime, reconciles the retained native review generation, and advances
+the ordinary semantic-review lifecycle once. A settled judgment is reported as
+accepted or rejected and repeats without another model request; live or unknown
+state never launches a duplicate reviewer.
 
 A run that declares the explicit comparison inputs also prepares and drives
 the sequential measured pair from candidate-ready. Continuous supervision is
@@ -151,6 +177,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         Some("select") => select(&args[1..]),
         Some("stop") => stop(&args[1..]),
         Some("resume") => resume(&args[1..]),
+        Some("review") => improvement_qualification::review(&args[1..]),
         Some("prepare-runtime") => improvement_driver::prepare_runtime(&args[1..]),
         _ => Err(invalid(
             "invalid improve options; use codex-harness improve --help",
@@ -564,6 +591,7 @@ enum AttemptEvidence {
     Verified {
         state: ConversationState,
         observed: ObservedIdentity,
+        pre_submission: Option<PreSubmissionEvidence>,
     },
     Refused(String),
 }
@@ -607,6 +635,7 @@ fn attempt_evidence(attempt: &Attempt) -> AttemptEvidence {
         IdentityCheck::Verified => AttemptEvidence::Verified {
             state: view.state,
             observed,
+            pre_submission: view.pre_submission,
         },
         IdentityCheck::Mismatch(reason) | IdentityCheck::Missing(reason) => {
             AttemptEvidence::Refused(reason)
@@ -1156,6 +1185,102 @@ fn print_report(run: &Run) -> io::Result<()> {
     Ok(())
 }
 
+fn print_preparation_report(run: &Run) -> io::Result<()> {
+    let state = run
+        .cursor
+        .baseline_qualification
+        .as_ref()
+        .ok_or_else(|| invalid("preparation recorded no qualification state"))?;
+    let ordinary_home = state
+        .home
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no ordinary runtime home"))?;
+    let checkout = state
+        .checkout
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no dispatch checkout"))?;
+    let task_copy = state
+        .task_copy
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no frozen task copy"))?;
+    let task_workspace = state
+        .task_workspace
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no oracle workspace"))?;
+    let runtime = state
+        .runtime
+        .as_deref()
+        .ok_or_else(|| invalid("preparation recorded no ordinary runtime receipt"))?;
+    let ordinary_adoption =
+        state.role_adoption(harness_core::improvement_loop::QualificationRuntimeRole::Ordinary);
+    let reviewer_adoption = state
+        .semantic_review
+        .as_ref()
+        .and_then(|review| review.adoption.as_ref());
+    println!("prepare-only: model-free preparation complete; no model attempt was dispatched");
+    if let Some(adoption) = ordinary_adoption {
+        println!(
+            "ordinary home: {} (adopted unchanged; no installation or trust write)",
+            ordinary_home.display()
+        );
+        println!(
+            "ordinary adoption: runtime={} origin cursor={} retained workspaces={}",
+            adoption.runtime.path.display(),
+            adoption.origin_cursor.path.display(),
+            adoption.trusted_workspaces.len()
+        );
+    } else {
+        println!("ordinary home: {}", ordinary_home.display());
+    }
+    match state.semantic_review.as_ref() {
+        Some(review) => {
+            let reviewer_home = review
+                .home
+                .as_deref()
+                .ok_or_else(|| invalid("preparation recorded no reviewer runtime home"))?;
+            if let Some(adoption) = reviewer_adoption {
+                println!(
+                    "reviewer home: {} (adopted unchanged; no installation or trust write)",
+                    reviewer_home.display()
+                );
+                println!(
+                    "reviewer adoption: runtime={} origin cursor={} retained workspaces={}",
+                    adoption.runtime.path.display(),
+                    adoption.origin_cursor.path.display(),
+                    adoption.trusted_workspaces.len()
+                );
+            } else {
+                println!("reviewer home: {}", reviewer_home.display());
+            }
+        }
+        None => println!("reviewer home: none declared"),
+    }
+    println!("dispatch checkout: {}", checkout.display());
+    println!("task copy: {}", task_copy.display());
+    println!(
+        "task base: {}",
+        state.task_base.as_deref().unwrap_or("unknown")
+    );
+    println!("oracle workspace: {}", task_workspace.display());
+    println!("runtime receipt: {}", runtime.display());
+    println!(
+        "next: codex-harness improve resume --run \"{}\"",
+        run.store.root().display()
+    );
+    if ordinary_adoption.is_some()
+        && (state.semantic_review.is_none() || reviewer_adoption.is_some())
+    {
+        println!(
+            "note: every declared native home was adopted unchanged at its retained path; preparation performed no installation, connection or trust write. The unchanged token hook is already approved; a later dispatch may still append its own workspace trust entry."
+        );
+    } else {
+        println!(
+            "note: preparation does not accept the task or trust native hooks; the first actual launch may still require native first-use or hook consent"
+        );
+    }
+    Ok(())
+}
+
 fn start(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(
         args,
@@ -1167,15 +1292,30 @@ fn start(args: &[OsString]) -> io::Result<i32> {
             "--successor-spec",
             "--successor-run",
         ],
-        &[],
+        &["--prepare-only"],
     )?;
     let run_dir = PathBuf::from(options.required("--run")?);
     let spec_path = PathBuf::from(options.required("--spec")?);
-    let supervision = improvement_driver::parse_supervision(options.get("--supervision"))?;
+    let prepare_only = options.has("--prepare-only");
+    let supervision = if prepare_only && options.get("--supervision").is_none() {
+        improvement_driver::Supervision::Once
+    } else {
+        improvement_driver::parse_supervision(options.get("--supervision"))?
+    };
+    if prepare_only && supervision != improvement_driver::Supervision::Once {
+        return Err(invalid(
+            "--prepare-only requires single-step preparation; pass --supervision once or omit it, and resume explicitly afterward",
+        ));
+    }
     if !run_dir.is_absolute() || !spec_path.is_absolute() {
         return Err(invalid("--run and --spec must be absolute paths"));
     }
     let spec = RunSpec::load(&spec_path)?;
+    if prepare_only && spec.baseline_qualification.is_none() {
+        return Err(invalid(
+            "--prepare-only requires a baseline_qualification declaration; no run was created",
+        ));
+    }
     for (name, protected) in [
         ("the run project", &spec.project),
         ("the planning root", &spec.specification.planning_root),
@@ -1269,6 +1409,13 @@ fn start(args: &[OsString]) -> io::Result<i32> {
         None,
     )?;
 
+    if prepare_only {
+        improvement_qualification::prepare(&mut run)?;
+        print_report(&run)?;
+        print_preparation_report(&run)?;
+        return Ok(0);
+    }
+
     // The planning/implementation workflow advances as far as the recorded
     // state and the dispatch gates allow: it consumes a retained investigator
     // result through grounded intake, qualifies the selected candidate's own
@@ -1314,6 +1461,7 @@ fn record_accepted(cursor: &mut Cursor, attempt_id: &str, accepted: &VisibleAcce
                                 created,
                                 program,
                             }),
+                        pre_submission: None,
                     });
                 }
                 (_, _, None) => {
@@ -1535,10 +1683,11 @@ fn state_reason(state: &ConversationState) -> Option<String> {
 /// evidence before the pool files can be overwritten. Returns the recorded
 /// note, including an explicit retention failure.
 fn settle_verified(
-    store: &RunStore,
+    root: &Path,
     attempt: &mut Attempt,
     outcome: ObservedOutcome,
     observed: &ObservedIdentity,
+    pre_submission: Option<PreSubmissionEvidence>,
     at: u64,
     note: String,
 ) -> String {
@@ -1546,10 +1695,19 @@ fn settle_verified(
     let result = attempt.result.clone();
     let retained = receipt
         .as_deref()
-        .map(|receipt| store.retain_evidence(&attempt.id, receipt, result.as_deref()));
-    attempt.settle(outcome, at);
+        .map(|receipt| retain_attempt_evidence(root, &attempt.id, receipt, result.as_deref()));
+    // Backoff is measured from the dispatch attempt, not from a later
+    // reconciliation: a pre-submission failure discovered long after it
+    // happened must not restart the retry window merely because resume found
+    // it now.
+    let settled_at = if outcome == ObservedOutcome::Failed && pre_submission.is_some() {
+        attempt.updated_ms.min(at)
+    } else {
+        at
+    };
+    attempt.settle(outcome, settled_at);
     attempt.freeze_observed(observed);
-    let note = match retained {
+    let mut note = match retained {
         Some(Ok(retained)) => {
             attempt.retained = Some(retained);
             note
@@ -1560,6 +1718,17 @@ fn settle_verified(
         }
         None => note,
     };
+    if outcome == ObservedOutcome::Failed
+        && let Some(evidence) = pre_submission
+    {
+        if let Some(binding) = &mut attempt.binding {
+            binding.pre_submission = Some(evidence);
+            note = format!(
+                "{note}; {}; the failed generation is retained and only a separately bound retry may proceed",
+                evidence.reason()
+            );
+        }
+    }
     attempt.reason = Some(note.clone());
     note
 }
@@ -1591,7 +1760,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
             continue;
         };
         let evidence = attempt_evidence(&run.cursor.attempts[index]);
-        let (slot, owner, session, state, observed) = match evidence {
+        let (slot, owner, session, state, observed, pre_submission) = match evidence {
             AttemptEvidence::Refused(reason) => {
                 let note = format!(
                     "cleanup refused: {reason}; the effect stays retained as unknown and is never bound to the current receipt contents"
@@ -1606,7 +1775,11 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                 notes.push((id, note));
                 continue;
             }
-            AttemptEvidence::Verified { state, observed } => {
+            AttemptEvidence::Verified {
+                state,
+                observed,
+                pre_submission,
+            } => {
                 let binding = run.cursor.attempts[index]
                     .binding
                     .as_ref()
@@ -1617,6 +1790,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                     binding.session.clone().or_else(|| observed.session.clone()),
                     state,
                     observed,
+                    pre_submission,
                 )
             }
         };
@@ -1626,7 +1800,15 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                 state_reason(&state).unwrap_or_else(|| "settled from the receipt".to_owned())
             );
             let attempt = &mut run.cursor.attempts[index];
-            let note = settle_verified(&run.store, attempt, outcome, &observed, at, note);
+            let note = settle_verified(
+                run.store.root(),
+                attempt,
+                outcome,
+                &observed,
+                pre_submission,
+                at,
+                note,
+            );
             run.cursor
                 .effect(EffectKind::OwnedCleanup, format!("attempt={id}: {note}"));
             notes.push((id, note));
@@ -1654,6 +1836,7 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                         AttemptEvidence::Verified {
                             state: post_state,
                             observed: post_observed,
+                            pre_submission: post_pre_submission,
                         },
                     ) => match terminal_outcome(&post_state) {
                         Some(outcome) => {
@@ -1664,10 +1847,11 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
                             );
                             let attempt = &mut run.cursor.attempts[index];
                             settle_verified(
-                                &run.store,
+                                run.store.root(),
                                 attempt,
                                 outcome,
                                 &post_observed,
+                                post_pre_submission,
                                 at,
                                 prefix,
                             )
@@ -1770,6 +1954,10 @@ fn stop(args: &[OsString]) -> io::Result<i32> {
         run.cursor.stop(&reason);
     }
     run.store.save_cursor(&run.cursor)?;
+    let settled_adoptions = improvement_qualification::settle_adoption_claims(
+        &run,
+        harness_core::improvement_runtime::AdoptionClaimStatus::Stopped,
+    )?;
 
     if already_stopped {
         println!(
@@ -1779,6 +1967,9 @@ fn stop(args: &[OsString]) -> io::Result<i32> {
         );
     } else {
         println!("improve stop: run {} stopped ({reason})", run.spec.run);
+    }
+    for note in &settled_adoptions {
+        println!("improve stop: {note}");
     }
     for (id, note) in &cleanup {
         println!("improve stop: attempt {id}: {note}");
@@ -1797,25 +1988,20 @@ fn stop(args: &[OsString]) -> io::Result<i32> {
     Ok(0)
 }
 
-fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
-    let mut cursor = run.cursor.clone();
-    let mut report = ResumeReport::default();
-    let mut notes = Vec::new();
-    let planning_ok = OpenSpec::default()
-        .revalidate(&run.store.planning()?)
-        .map_err(|error| error.to_string());
-    if let Err(reason) = &planning_ok {
-        notes.push(format!(
-            "planning revalidation failed: {reason}; dependent comparison requires preparation again"
-        ));
-    }
-    let stale_planning = || "planning inputs changed since the attempt".to_owned();
-    let at = now_ms();
-    // In-flight attempts and attempts retained as unknown both reconcile from
-    // the receipts of their frozen accepted dispatch generation: an
-    // authoritative terminal outcome settles them once, a live host stays
-    // retained live, and a receipt that now belongs to another run - or a
-    // truly unobserved effect - stays unknown without ever being replayed.
+/// Reconcile every in-flight or unknown attempt from the receipt of its
+/// frozen accepted dispatch generation. An authoritative terminal outcome
+/// settles the attempt once and retains its evidence before the pool can
+/// reuse the files; a live host stays retained live; a receipt that now
+/// belongs to another generation, or an unobserved effect, stays unknown
+/// without ever being replayed. This is shared by the OpenSpec run resume and
+/// the independent ordinary-review resume so both paths use one evidence
+/// protocol.
+pub(super) fn reconcile_attempts(
+    root: &Path,
+    cursor: &mut Cursor,
+    at: u64,
+    report: &mut ResumeReport,
+) {
     let reconcile_ids: Vec<String> = cursor
         .attempts_requiring_reconciliation()
         .iter()
@@ -1838,23 +2024,24 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
                 ));
                 report.unknown.push(attempt.id.clone());
             }
-            AttemptEvidence::Verified { state, observed } => {
+            AttemptEvidence::Verified {
+                state,
+                observed,
+                pre_submission,
+            } => {
                 if let Some(outcome) = terminal_outcome(&state) {
                     let prefix = state_reason(&state)
                         .unwrap_or_else(|| "settled from the verified receipt".to_owned());
                     let attempt = &mut cursor.attempts[index];
-                    settle_verified(&run.store, attempt, outcome, &observed, at, prefix);
-                    if outcome == ObservedOutcome::Completed
-                        && !settle_completed_reuse(
-                            attempt,
-                            planning_ok.clone().map_err(|_| stale_planning()),
-                        )
-                    {
-                        report.remeasure.push((
-                            attempt.id.clone(),
-                            attempt.reuse_refused.clone().unwrap_or_default(),
-                        ));
-                    }
+                    settle_verified(
+                        root,
+                        attempt,
+                        outcome,
+                        &observed,
+                        pre_submission,
+                        at,
+                        prefix,
+                    );
                     report.settled.push(attempt.id.clone());
                     continue;
                 }
@@ -1899,6 +2086,22 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
             }
         }
     }
+}
+
+fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
+    let mut cursor = run.cursor.clone();
+    let mut report = ResumeReport::default();
+    let mut notes = Vec::new();
+    let planning_ok = OpenSpec::default()
+        .revalidate(&run.store.planning()?)
+        .map_err(|error| error.to_string());
+    if let Err(reason) = &planning_ok {
+        notes.push(format!(
+            "planning revalidation failed: {reason}; dependent comparison requires preparation again"
+        ));
+    }
+    let stale_planning = || "planning inputs changed since the attempt".to_owned();
+    reconcile_attempts(run.store.root(), &mut cursor, now_ms(), &mut report);
     // Completed attempts settle reuse against the current planning inputs.
     for attempt in &mut cursor.attempts {
         if attempt.state == AttemptState::Completed {

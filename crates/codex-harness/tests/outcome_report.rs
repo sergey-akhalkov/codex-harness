@@ -1,5 +1,66 @@
+use harness_core::improvement_policy::ComparisonPolicy;
 use serde_json::{Value, json};
 use std::{fs, process::Command};
+
+fn cli() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+    command.arg("outcome-report");
+    command
+}
+
+fn policy_json() -> Value {
+    json!({
+        "schema": 1,
+        "objective": "time",
+        "basis": "efficiency",
+        "meaningfulEffectPercent": 10.0,
+        "tolerancePercent": 5.0,
+        "requireAcceptance": true,
+        "taskMix": "one frozen task case",
+        "stopping": {"maxAttemptsPerArm": 3, "requiredUnits": 1},
+        "repeatedSelection": "predeclared",
+        "tradeOff": Value::Null,
+        "uncertainty": "unknown evidence stays inconclusive",
+        "horizonTasks": 5.0,
+        "overhead": {
+            "implementationSeconds": 10.0,
+            "evaluationSeconds": 5.0,
+            "maintenanceSecondsPerTask": 0.5
+        }
+    })
+}
+
+fn policy_attempt(
+    id: &str,
+    arm: &str,
+    start: f64,
+    seconds: f64,
+    accepted: bool,
+    declaration: &Value,
+) -> Value {
+    let mut row = attempt(id, arm);
+    row["started_at"] = json!(start);
+    row["ended_at"] = json!(start + seconds);
+    row["observed_model_metadata_verified"] = json!(true);
+    row["native_runs"][0]["started_at"] = json!(start);
+    row["native_runs"][0]["ended_at"] = json!(start + 2.0);
+    row["native_runs"][0]["rounds"] = json!(3);
+    row["native_runs"][0]["tool_operations"] = json!(6);
+    row["native_runs"][0]["usage"] = json!({
+        "model": "fixed",
+        "total_tokens": 100,
+        "input_tokens": 100,
+        "cached_input_tokens": 40,
+        "output_tokens": 20,
+        "reasoning_tokens": 5,
+    });
+    row["checks"][0]["started_at"] = json!(start + 2.0);
+    row["checks"][0]["ended_at"] = json!(start + seconds);
+    row["checks"][0]["passed"] = json!(accepted);
+    row["checks"][0]["exit_code"] = json!(if accepted { 0 } else { 1 });
+    row["declaration"] = declaration.clone();
+    row
+}
 
 fn run(path: &std::path::Path, markdown: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
@@ -1196,4 +1257,763 @@ fn the_retained_trace_identity_refuses_missing_or_changed_bytes() {
     assert!(reason.contains("is missing"), "{reason}");
     let reason = RetainedTrace::capture(&trace_path).unwrap_err().to_string();
     assert!(reason.contains("missing or unreadable"), "{reason}");
+}
+
+fn qualification_run(
+    session: &str,
+    input: u64,
+    cached: u64,
+    output: u64,
+    reasoning: u64,
+    responses: u64,
+) -> Value {
+    json!({
+        "session": session,
+        "status": "completed",
+        "started_at": 0.0,
+        "ended_at": 2.0,
+        "usage": {
+            "input_tokens": input,
+            "cached_input_tokens": cached,
+            "output_tokens": output,
+            "reasoning_output_tokens": reasoning,
+            "total_tokens": input + output,
+            "response_count": responses,
+        },
+    })
+}
+
+fn qualification_aggregate(runs: &[Value]) -> Value {
+    let mut aggregate = serde_json::Map::new();
+    for key in [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "response_count",
+    ] {
+        let total = runs.iter().try_fold(0_u64, |total, run| {
+            total.checked_add(run["usage"][key].as_u64()?)
+        });
+        if let Some(total) = total {
+            aggregate.insert(key.to_owned(), json!(total));
+        }
+    }
+    Value::Object(aggregate)
+}
+
+fn qualification_row(
+    id: &str,
+    accepted: bool,
+    review_passed: bool,
+    runs: Vec<Value>,
+    aggregate: Value,
+) -> Value {
+    json!({
+        "attempt_id": id,
+        "case_id": "native-control",
+        "unit": "run/native-control",
+        "qualification_scope": "ordinary control observation; no comparison margins, reflection qualification or benefit verdict",
+        "arm": "baseline",
+        "started_at": 0.0,
+        "execution_started_at": 0.0,
+        "ended_at": 3.0,
+        "accepted": accepted,
+        "native_runs": runs,
+        "usage": aggregate,
+        "checks": [
+            {"id":"independent-acceptance","round":0,"required":true,"executed":true,"passed":true,"started_at":2.0,"ended_at":3.0,"evidence":"private/acceptance","evidence_sha256":"aaaa"},
+            {"id":"independent-semantic-review","round":0,"required":true,"executed":true,"passed":review_passed,"evidence":"private/review","evidence_sha256":"bbbb"}
+        ],
+        "children": [],
+        "interventions": [],
+        "retry_of": null
+    })
+}
+
+#[test]
+fn native_qualification_wrapper_is_consumed_without_losing_checks_or_usage() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("native-qualification.json");
+    let runs = vec![
+        qualification_run("session-a", 100, 40, 20, 10, 2),
+        qualification_run("session-b", 50, 10, 5, 2, 1),
+    ];
+    let aggregate = qualification_aggregate(&runs);
+    let accepted = qualification_row("native-a", true, true, runs.clone(), aggregate.clone());
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[accepted]})).unwrap(),
+    )
+    .unwrap();
+    let original = fs::read(&input).unwrap();
+
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let attempt = &report["attempts"][0];
+    assert_eq!(attempt["status"], "accepted", "{report}");
+    assert_eq!(attempt["correct"], true, "{report}");
+    assert_eq!(attempt["accepted"], true, "{report}");
+    assert_eq!(attempt["usage"]["status"], "per_run", "{report}");
+    assert_eq!(attempt["usage"]["runs"].as_array().unwrap().len(), 2);
+    let total: u64 = attempt["usage"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["total_tokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 175);
+    assert_eq!(attempt["usage"]["aggregate_verified"], true);
+    assert!(attempt["usage"].get("recorded_aggregate").is_none());
+    assert!(
+        attempt["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check.get("exit_code").is_none())
+    );
+    assert!(
+        attempt["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("no_opposite_arm"))
+    );
+    assert!(report["comparisons"].as_array().unwrap().is_empty());
+    assert_eq!(report["benefit_status"], "not_evaluated");
+    assert_eq!(fs::read(&input).unwrap(), original);
+
+    // The normalized report remains consumable by the same CLI.
+    fs::write(&input, &output.stdout).unwrap();
+    let second = run(&input, false);
+    assert!(second.status.success());
+    let normalized: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(normalized["attempts"][0]["status"], "accepted");
+    assert_eq!(normalized["attempts"][0]["usage"]["status"], "per_run");
+    assert_eq!(
+        normalized["attempts"][0]["usage"]["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // An explicit failed acceptance stays failed and retains the failed check.
+    let failed = qualification_row("native-b", false, false, runs.clone(), aggregate.clone());
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[failed]})).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["attempts"][0]["status"], "failed", "{report}");
+    assert_eq!(report["attempts"][0]["correct"], false);
+    assert_eq!(report["attempts"][0]["accepted"], false);
+    assert_eq!(report["attempts"][0]["checks"][1]["passed"], false);
+
+    // A contradictory aggregate is retained but not presented as measured.
+    let mut contradictory = aggregate;
+    contradictory["total_tokens"] = json!(999);
+    let row = qualification_row("native-c", true, true, runs, contradictory);
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[row]})).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["attempts"][0]["usage"]["status"], "unknown");
+    assert_eq!(
+        report["attempts"][0]["usage"]["recorded_aggregate"]["total_tokens"],
+        999
+    );
+    assert!(
+        report["attempts"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("usage_aggregate_mismatch"))
+    );
+
+    // A missing per-run counter must not hide a contradiction in another
+    // fully known counter.
+    let incomplete_runs = vec![
+        json!({"session":"session-c","status":"completed","usage":{"total_tokens":10}}),
+        json!({"session":"session-d","status":"completed","usage":{"total_tokens":10}}),
+        json!({"session":"session-e","status":"completed","usage":{"total_tokens":10}}),
+    ];
+    let row = qualification_row(
+        "native-d",
+        true,
+        true,
+        incomplete_runs,
+        json!({"input_tokens":100,"total_tokens":999}),
+    );
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"attempts":[row]})).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let usage = &report["attempts"][0]["usage"];
+    assert_eq!(usage["status"], "unknown", "{report}");
+    assert_eq!(usage["runs"].as_array().unwrap().len(), 3);
+    assert_eq!(usage["recorded_aggregate"]["total_tokens"], 999);
+    assert_eq!(usage["aggregate_verified"], false);
+    assert!(
+        usage["contradictions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("usage_aggregate_mismatch"))
+    );
+    assert!(
+        report["attempts"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("usage_aggregate_mismatch"))
+    );
+}
+
+#[test]
+fn declared_policy_evaluates_retained_attempts_through_the_native_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("attempts.json");
+    let policy_json = policy_json();
+    fs::write(
+        &policy_path,
+        serde_json::to_vec_pretty(&policy_json).unwrap(),
+    )
+    .unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json.clone()).unwrap();
+    let declaration = policy.declaration();
+    let baseline = policy_attempt("b1", "baseline", 0.0, 100.0, true, &declaration);
+    let candidate = policy_attempt("c1", "candidate", 200.0, 80.0, true, &declaration);
+    fs::write(
+        &input_path,
+        serde_json::to_vec(&json!([baseline, candidate])).unwrap(),
+    )
+    .unwrap();
+    let policy_bytes = fs::read(&policy_path).unwrap();
+    let input_bytes = fs::read(&input_path).unwrap();
+
+    let declared_output = cli()
+        .arg("--declare-policy")
+        .arg(&policy_path)
+        .output()
+        .unwrap();
+    assert!(
+        declared_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&declared_output.stderr)
+    );
+    assert!(declared_output.stderr.is_empty());
+    let declared: Value = serde_json::from_slice(&declared_output.stdout).unwrap();
+    assert_eq!(declared["policy"], policy_json);
+    let digest = declared["digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
+    assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+    fs::write(&declaration_path, &declared_output.stdout).unwrap();
+    let declaration_bytes = fs::read(&declaration_path).unwrap();
+
+    let evaluated = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(
+        evaluated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&evaluated.stderr)
+    );
+    assert!(evaluated.stderr.is_empty());
+    let evaluation: Value = serde_json::from_slice(&evaluated.stdout).unwrap();
+    assert_eq!(evaluation["policyDigest"], declared["digest"]);
+    assert_eq!(evaluation["decision"], "adopt");
+    assert_eq!(evaluation["matched"], 1);
+    assert_eq!(evaluation["baselineSeconds"], 100.0);
+    assert_eq!(evaluation["candidateSeconds"], 80.0);
+    assert!(evaluation.get("schema_version").is_none());
+    assert_eq!(fs::read(&input_path).unwrap(), input_bytes);
+    assert_eq!(fs::read(&declaration_path).unwrap(), declaration_bytes);
+    assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+
+    // The normal report mode stays a summary and never evaluates supplied data.
+    let normal = cli().arg("--input").arg(&input_path).output().unwrap();
+    assert!(normal.status.success());
+    let summary: Value = serde_json::from_slice(&normal.stdout).unwrap();
+    assert_eq!(summary["schema_version"], 2);
+    assert_eq!(summary["benefit_status"], "not_evaluated");
+    assert!(summary.get("policyDigest").is_none());
+
+    // A slower candidate is a supported negative result, not an adoption.
+    let regression = json!([
+        policy_attempt("b2", "baseline", 0.0, 100.0, true, &declaration),
+        policy_attempt("c2", "candidate", 200.0, 120.0, true, &declaration),
+    ]);
+    fs::write(&input_path, serde_json::to_vec(&regression).unwrap()).unwrap();
+    let rejected = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(
+        rejected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let evaluation: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(evaluation["decision"], "reject", "{evaluation}");
+}
+
+#[test]
+fn policy_entry_refuses_ambiguous_missing_malformed_oversized_and_tampered_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("attempts.json");
+    let policy_json = policy_json();
+    fs::write(&policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json).unwrap();
+    let declaration = policy.declaration();
+    fs::write(
+        &input_path,
+        serde_json::to_vec(&json!([
+            policy_attempt("b", "baseline", 0.0, 100.0, true, &declaration),
+            policy_attempt("c", "candidate", 200.0, 80.0, true, &declaration),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let declared_output = cli()
+        .arg("--declare-policy")
+        .arg(&policy_path)
+        .output()
+        .unwrap();
+    assert!(declared_output.status.success());
+    fs::write(&declaration_path, &declared_output.stdout).unwrap();
+    let policy_bytes = fs::read(&policy_path).unwrap();
+    let declaration_bytes = fs::read(&declaration_path).unwrap();
+    let input_bytes = fs::read(&input_path).unwrap();
+
+    let refused = |output: std::process::Output| {
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
+    };
+
+    refused(
+        cli()
+            .arg("--declare-policy")
+            .arg(&policy_path)
+            .arg("--input")
+            .arg(&input_path)
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--declare-policy")
+            .arg(&policy_path)
+            .arg("--policy")
+            .arg(&declaration_path)
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--declare-policy")
+            .arg(&policy_path)
+            .arg("--markdown")
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--input")
+            .arg(&input_path)
+            .arg("--policy")
+            .arg(&declaration_path)
+            .arg("--markdown")
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--policy")
+            .arg(&declaration_path)
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--input")
+            .arg(&input_path)
+            .arg("--input")
+            .arg(&input_path)
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--input")
+            .arg(&input_path)
+            .arg("--policy")
+            .arg(&declaration_path)
+            .arg("--policy")
+            .arg(&declaration_path)
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--declare-policy")
+            .arg(&policy_path)
+            .arg("--declare-policy")
+            .arg(&policy_path)
+            .output()
+            .unwrap(),
+    );
+    refused(cli().arg("--policy").output().unwrap());
+    refused(cli().arg("--input").arg("--markdown").output().unwrap());
+
+    let missing = root.path().join("missing.json");
+    refused(
+        cli()
+            .arg("--declare-policy")
+            .arg(&missing)
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--input")
+            .arg(&missing)
+            .arg("--policy")
+            .arg(&declaration_path)
+            .output()
+            .unwrap(),
+    );
+    refused(
+        cli()
+            .arg("--input")
+            .arg(&input_path)
+            .arg("--policy")
+            .arg(&missing)
+            .output()
+            .unwrap(),
+    );
+
+    let malformed_policy = root.path().join("malformed-policy.json");
+    let malformed_declaration = root.path().join("malformed-declaration.json");
+    let malformed_input = root.path().join("malformed-input.json");
+    let oversized_policy = root.path().join("oversized-policy.json");
+    let oversized_input = root.path().join("oversized-input.json");
+    for (path, bytes) in [
+        (&malformed_policy, b"private-parser-content".to_vec()),
+        (&malformed_declaration, b"{}".to_vec()),
+        (&malformed_input, b"{}".to_vec()),
+        (&oversized_policy, vec![b'x'; 8 * 1024 * 1024 + 1]),
+        (&oversized_input, vec![b'x'; 8 * 1024 * 1024 + 1]),
+    ] {
+        fs::write(path, &bytes).unwrap();
+        let mut command = cli();
+        if path == &malformed_policy || path == &oversized_policy {
+            command.arg("--declare-policy").arg(path);
+        } else if path == &malformed_input || path == &oversized_input {
+            command
+                .arg("--input")
+                .arg(path)
+                .arg("--policy")
+                .arg(&declaration_path);
+        } else {
+            command
+                .arg("--input")
+                .arg(&input_path)
+                .arg("--policy")
+                .arg(path);
+        }
+        let output = command.output().unwrap();
+        refused(output);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    let mut tampered: Value = serde_json::from_slice(&declared_output.stdout).unwrap();
+    tampered["policy"]["tolerancePercent"] = json!(6.0);
+    let tampered_path = root.path().join("tampered.json");
+    fs::write(&tampered_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let tampered_bytes = fs::read(&tampered_path).unwrap();
+    let output = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&tampered_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("digest"));
+    assert_eq!(fs::read(&tampered_path).unwrap(), tampered_bytes);
+
+    assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+    assert_eq!(fs::read(&declaration_path).unwrap(), declaration_bytes);
+    assert_eq!(fs::read(&input_path).unwrap(), input_bytes);
+}
+
+#[test]
+fn missing_decisive_evidence_never_adopts_through_the_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("attempts.json");
+    let policy_json = policy_json();
+    fs::write(&policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json).unwrap();
+    let declaration = policy.declaration();
+    fs::write(
+        &declaration_path,
+        serde_json::to_vec(&policy.declare().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let mut candidate = policy_attempt("c", "candidate", 200.0, 80.0, true, &declaration);
+    candidate["native_runs"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_operations");
+    let bytes = serde_json::to_vec(&json!([
+        policy_attempt("b", "baseline", 0.0, 100.0, true, &declaration),
+        candidate,
+    ]))
+    .unwrap();
+    fs::write(&input_path, &bytes).unwrap();
+
+    let output = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let evaluation: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(evaluation["decision"], "inconclusive", "{evaluation}");
+    assert_ne!(evaluation["decision"], "adopt");
+    assert!(
+        evaluation["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| {
+                reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("metric coverage is incomplete"))
+            }),
+        "{evaluation}"
+    );
+    assert_eq!(fs::read(&input_path).unwrap(), bytes);
+}
+
+#[test]
+fn composed_schema_two_report_preserves_corroboration_for_evaluation() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("report.json");
+    let mut policy_json = policy_json();
+    policy_json["stopping"]["requiredUnits"] = json!(2);
+    fs::write(&policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json).unwrap();
+    let declaration = policy.declaration();
+    fs::write(
+        &declaration_path,
+        serde_json::to_vec(&policy.declare().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let rows = vec![
+        policy_attempt("b", "baseline", 0.0, 100.0, true, &declaration),
+        policy_attempt("c", "candidate", 200.0, 80.0, true, &declaration),
+    ];
+    let report = harness_core::outcome_report::summarize_attempts(&rows).unwrap();
+    let receipt = json!({
+        "schema": 1,
+        "status": "selected",
+        "required_units": 1,
+        "selection": {
+            "schema": 1,
+            "requiredUnits": 1,
+            "status": "ready",
+            "units": [{
+                "owner": "card-prior",
+                "caseId": "case-prior",
+                "experiment": "exp-prior",
+                "mechanism": "bounded-output",
+                "conditions": "local-tool-runs",
+                "revision": "rev-prior",
+                "treeSha256": "c".repeat(64)
+            }],
+            "excluded": [{
+                "owner": "card-other",
+                "caseId": "case-other",
+                "reason": "notApplicable"
+            }]
+        },
+        "reason": Value::Null
+    });
+    let report = harness_core::outcome_report::attach_corroboration(&report, &receipt).unwrap();
+    assert_eq!(report["corroboration"]["status"], "ready");
+    let corroboration_digest = report["corroboration"]["digest"].clone();
+    fs::write(&input_path, serde_json::to_vec(&report).unwrap()).unwrap();
+    let report_bytes = fs::read(&input_path).unwrap();
+
+    let output = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let evaluation: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(evaluation["decision"], "adopt", "{evaluation}");
+    assert_eq!(
+        evaluation["corroboration"]["status"], "ready",
+        "{evaluation}"
+    );
+    assert_eq!(evaluation["corroboration"]["ready"], true);
+    assert_eq!(evaluation["corroboration"]["digest"], corroboration_digest);
+    assert_eq!(
+        evaluation["corroboration"]["excluded"][0]["owner"],
+        "card-other"
+    );
+    assert_eq!(
+        evaluation["corroboration"]["excluded"][0]["caseId"],
+        "case-other"
+    );
+    assert_eq!(
+        evaluation["corroboration"]["excluded"][0]["reason"],
+        "notApplicable"
+    );
+    assert_eq!(fs::read(&input_path).unwrap(), report_bytes);
+}
+
+#[test]
+fn schema_two_report_attempts_are_renormalized_before_evaluation() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("report.json");
+    let policy_json = policy_json();
+    fs::write(&policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json).unwrap();
+    let declaration = policy.declaration();
+    fs::write(
+        &declaration_path,
+        serde_json::to_vec(&policy.declare().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let rows = vec![
+        policy_attempt("b", "baseline", 0.0, 100.0, true, &declaration),
+        policy_attempt("c", "candidate", 200.0, 80.0, true, &declaration),
+    ];
+    let mut report = harness_core::outcome_report::summarize_attempts(&rows).unwrap();
+    assert_eq!(
+        report["units"][0]["effect"]["candidate_seconds"],
+        json!(80.0)
+    );
+    assert_eq!(report["units"][0]["positive_effect"], json!(true));
+
+    // Change the retained candidate attempt itself, while leaving every
+    // derived positive field and status from the earlier serialization in
+    // place. A schema number alone cannot make those fields authoritative.
+    report["attempts"][1]["ended_at"] = json!(320.0);
+    report["attempts"][1]["checks"][0]["ended_at"] = json!(320.0);
+    assert_eq!(report["attempts"][1]["elapsed_seconds"], json!(80.0));
+    assert_eq!(report["attempts"][1]["total_result_seconds"], json!(80.0));
+    assert_eq!(report["attempts"][1]["status"], json!("accepted"));
+    assert_eq!(
+        report["units"][0]["effect"]["candidate_seconds"],
+        json!(80.0)
+    );
+    fs::write(&input_path, serde_json::to_vec(&report).unwrap()).unwrap();
+
+    let output = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let evaluation: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(evaluation["decision"], "reject", "{evaluation}");
+}
+
+#[test]
+fn schema_two_report_attempt_bound_cannot_be_bypassed_by_derived_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let policy_path = root.path().join("policy.json");
+    let declaration_path = root.path().join("declaration.json");
+    let input_path = root.path().join("report.json");
+    let policy_json = policy_json();
+    fs::write(&policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
+    let policy: ComparisonPolicy = serde_json::from_value(policy_json).unwrap();
+    let declaration = policy.declaration();
+    fs::write(
+        &declaration_path,
+        serde_json::to_vec(&policy.declare().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let rows = vec![
+        policy_attempt("b", "baseline", 0.0, 100.0, true, &declaration),
+        policy_attempt("c", "candidate", 200.0, 80.0, true, &declaration),
+    ];
+    let mut report = harness_core::outcome_report::summarize_attempts(&rows).unwrap();
+    assert_eq!(report["attempts"].as_array().unwrap().len(), 2);
+    let mut attempts = report["attempts"].as_array().unwrap().clone();
+    attempts.resize(1025, attempts[0].clone());
+    report["attempts"] = Value::Array(attempts);
+    assert_eq!(report["accounting"]["attempts"], json!(2));
+    fs::write(&input_path, serde_json::to_vec(&report).unwrap()).unwrap();
+
+    let output = cli()
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--policy")
+        .arg(&declaration_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).is_empty());
 }

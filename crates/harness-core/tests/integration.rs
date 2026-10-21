@@ -6,6 +6,7 @@
 mod cancellable_pipe;
 mod config_creation;
 mod config_file;
+mod delivery_reflection;
 mod feature_discovery;
 mod feature_edit;
 mod improvement_activation;

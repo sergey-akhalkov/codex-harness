@@ -7,7 +7,7 @@
 
 use harness_core::{
     board_lifecycle, build_identity, core_disconnect, core_install, installation_state::PathScope,
-    orchestration_config, orchestration_lifecycle, task_worktree,
+    orchestration_config, orchestration_lifecycle, role_context, task_worktree,
 };
 use std::{
     collections::BTreeMap,
@@ -29,10 +29,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     let upstream = PathBuf::from(
         std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("explicit native Codex executable"),
     );
-    let root = tempfile::Builder::new()
-        .prefix("osa-isolated-")
-        .tempdir()
-        .unwrap();
+    let root = IsolatedRoot::new();
     let root_path = disk_path(root.path());
     eprintln!("isolated orchestration evidence: {}", root_path.display());
     let build = root_path.join("build");
@@ -171,7 +168,6 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         "model = 'deepseek-flash'\n",
     )
     .unwrap();
-    fs::write(codex_home.join("zai.config.toml"), "model = 'glm-5.3'\n").unwrap();
     let delivery = orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap();
     eprintln!("loop delivery report: {delivery:?}");
     assert_eq!(delivery.status, "Orchestration connected");
@@ -184,8 +180,13 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
             .iter()
             .map(|state| (state.role, state.status))
             .collect::<Vec<_>>(),
-        [("lead", "resolved"), ("executor", "resolved")],
-        "the role inputs this checkout owns resolve for delivery"
+        [
+            ("lead", "resolved"),
+            ("executor", "resolved"),
+            ("executor-self-reflection", "resolved"),
+            ("lead-self-reflection", "resolved"),
+        ],
+        "every responsibility role this checkout owns resolves for delivery"
     );
     let role_revision = |role: &str| {
         delivery
@@ -197,9 +198,25 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     };
     let lead_revision = role_revision("lead");
     let executor_revision = role_revision("executor");
+    let executor_reflection_revision = role_revision("executor-self-reflection");
+    let lead_reflection_revision = role_revision("lead-self-reflection");
     assert!(!lead_revision.is_empty());
     assert!(!executor_revision.is_empty());
-    assert_ne!(lead_revision, executor_revision);
+    assert!(!executor_reflection_revision.is_empty());
+    assert!(!lead_reflection_revision.is_empty());
+    let mut revisions = delivery
+        .roles
+        .iter()
+        .filter_map(|state| state.revision.clone())
+        .collect::<Vec<_>>();
+    let role_count = revisions.len();
+    revisions.sort();
+    revisions.dedup();
+    assert_eq!(
+        revisions.len(),
+        role_count,
+        "each role revision identifies its distinct owned inputs"
+    );
     let roles_of = |report: &orchestration_lifecycle::CheckReport| {
         report
             .roles
@@ -209,6 +226,9 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     };
     let delivered_roles = roles_of(&delivery);
     let configured = orchestration_config::load(&source).unwrap();
+    assert_eq!(configured.lead_profile, "default");
+    assert_eq!(configured.successor_lead_profile, "default");
+    assert_eq!(configured.executor_profiles, ["ds"]);
     assert_eq!(
         delivery.max_concurrent_executors,
         Some(configured.max_concurrent_executors)
@@ -223,6 +243,34 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     );
     assert_eq!(delivery.model_calls, 0);
     assert!(!delivery.mutated);
+
+    for (role, required) in [
+        (
+            role_context::Role::ExecutorSelfReflection,
+            [
+                "bounded, read-only retrospective over one accepted executor",
+                "Do not edit files, the board, guidance, specifications or configuration",
+                "Return one compact synthesis",
+            ],
+        ),
+        (
+            role_context::Role::LeadSelfReflection,
+            [
+                "bounded, read-only synthesis over one lead conversation",
+                "executor self-reflection retained from a completed task",
+                "Do not edit files, the board, guidance, specifications or configuration",
+            ],
+        ),
+    ] {
+        let resolved = role_context::resolve(&source, role).unwrap();
+        for text in required {
+            assert!(
+                resolved.developer_instructions.contains(text),
+                "{} omits its read-only responsibility: {text}",
+                role.label()
+            );
+        }
+    }
 
     let board = board_lifecycle::Request {
         source: source.clone(),
@@ -439,6 +487,296 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert!(!enabled(&executor_catalogue, "team-lead", "user"));
     assert!(enabled(&executor_catalogue, "board-workflow", "user"));
     assert!(enabled(&executor_catalogue, "foreign-project", "repo"));
+
+    // Drafted reflection skills stay outside ordinary discovery until their
+    // evaluation gate accepts them: neither role's catalogue may expose them.
+    for candidate in ["executor-self-reflection", "lead-self-reflection"] {
+        assert!(
+            source
+                .join(".agents/skill-candidates")
+                .join(candidate)
+                .join("SKILL.md")
+                .is_file(),
+            "candidate {candidate} is retained as an inactive draft"
+        );
+        assert!(
+            !source.join(".agents/skills").join(candidate).exists()
+                && !user_home.join(".agents/skills").join(candidate).exists(),
+            "candidate {candidate} must not be installed into a discovery root"
+        );
+        let listed = format!("name={candidate};");
+        assert!(
+            !lead_catalogue.lines().any(|line| line.starts_with(&listed))
+                && !executor_catalogue
+                    .lines()
+                    .any(|line| line.starts_with(&listed)),
+            "catalogue exposed the unevaluated candidate {candidate}"
+        );
+    }
+
+    // The installed launcher outside the checkout exposes the candidate
+    // acceptance and lifecycle commands. Every call below uses only owned
+    // process-scoped homes, the synthetic board and no provider or model.
+    let installed_harness = codex_home.join("harness/bin/codex-harness.exe");
+    let project_text = project.to_str().unwrap();
+    let home_text = codex_home.to_str().unwrap();
+    let installed = |args: &[&str], thread: Option<&str>| -> Output {
+        let mut command = Command::new(&installed_harness);
+        command
+            .current_dir(&workspace)
+            .env("CODEX_HOME", &codex_home)
+            .env("USERPROFILE", &user_home)
+            .env("HOME", &user_home)
+            .env("APPDATA", user_home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", user_home.join("AppData/Local"))
+            .env("TEMP", user_home.join("AppData/Local/Temp"))
+            .env("TMP", user_home.join("AppData/Local/Temp"))
+            .env_remove("HARNESS_EXECUTOR_SESSION")
+            .env_remove("HARNESS_REFLECTION_SESSION")
+            .args(args);
+        match thread {
+            Some(thread) => {
+                command.env("CODEX_THREAD_ID", thread);
+            }
+            None => {
+                command.env_remove("CODEX_THREAD_ID");
+            }
+        }
+        command.output().unwrap()
+    };
+
+    let help = installed(&["executor", "accept", "--help"], None);
+    assert!(
+        help.status.success(),
+        "{}",
+        failed_output("installed executor accept --help", &help)
+    );
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    )
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ");
+    for required in [
+        "Accept retained structured executor work as the live lead",
+        "TASK is the exact",
+        "writes the acceptance binding through the board owner and closes",
+        "reports whether automatic reflection is eligible",
+        "Repeating the same accepted result is a no-op",
+    ] {
+        assert!(
+            help_text.contains(required),
+            "installed accept help omits {required:?}: {help_text}"
+        );
+    }
+
+    let installed_check = installed(
+        &[
+            "check",
+            "--core-only",
+            "--codex-home",
+            home_text,
+            "--user-home",
+            user_home.to_str().unwrap(),
+            "--dependency-user-home",
+            user_home.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        installed_check.status.success(),
+        "{}",
+        failed_output("installed core check", &installed_check)
+    );
+    let installed_check: serde_json::Value =
+        serde_json::from_slice(&installed_check.stdout).unwrap();
+    assert_eq!(installed_check["status"], "connected");
+    assert_eq!(installed_check["model_calls"], 0);
+    let orchestration = &installed_check["orchestration"];
+    assert_eq!(orchestration["status"], "Orchestration connected");
+    assert_eq!(orchestration["model_calls"], 0);
+    assert_eq!(orchestration["mutated"], false);
+    assert_eq!(orchestration["lead_profile"], "default");
+    assert_eq!(orchestration["successor_lead_profile"], "default");
+    assert_eq!(
+        orchestration["executor_profiles"],
+        serde_json::json!(["ds"])
+    );
+    let expected_role_revisions = delivery
+        .roles
+        .iter()
+        .map(|state| {
+            (
+                state.role.to_owned(),
+                state.revision.clone().expect("resolved fixture role"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let installed_roles = orchestration["roles"].as_array().unwrap();
+    assert_eq!(
+        installed_roles.len(),
+        expected_role_revisions.len(),
+        "the installed check reports every declared responsibility role"
+    );
+    let installed_role_revisions = installed_roles
+        .iter()
+        .map(|state| {
+            assert_eq!(state["status"], "resolved", "{state}");
+            assert!(state["cause"].is_null(), "{state}");
+            (
+                state["role"].as_str().unwrap().to_owned(),
+                state["revision"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        installed_role_revisions, expected_role_revisions,
+        "installed role resolution matches the owned source revisions"
+    );
+
+    // Repeat status is model-free and creates no retained lifecycle. Missing
+    // inputs refuse before journal configuration or board effects.
+    let state_dir = codex_home.join("harness/delivery-reflection");
+    assert!(
+        !state_dir.exists(),
+        "the fixture starts without retained reflection state"
+    );
+    let status_args = [
+        "delivery-improvement",
+        "status",
+        "--project",
+        project_text,
+        "--codex-home",
+        home_text,
+    ];
+    for repeat in 0..2 {
+        let status = installed(&status_args, None);
+        assert!(
+            status.status.success(),
+            "{}",
+            failed_output("installed delivery-improvement status", &status)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["lifecycle"], "inactive", "repeat {repeat}: {status}");
+        assert_eq!(status["pending"], 0, "repeat {repeat}: {status}");
+        assert_eq!(
+            status.as_object().unwrap().len(),
+            2,
+            "inactive status reports no invented lifecycle state: {status}"
+        );
+        assert!(
+            !state_dir.exists(),
+            "repeat status must not create retained reflection state"
+        );
+    }
+    let enable_args = [
+        "delivery-improvement",
+        "enable",
+        "--project",
+        project_text,
+        "--codex-home",
+        home_text,
+    ];
+    let missing_thread = installed(&enable_args, None);
+    assert_eq!(
+        missing_thread.status.code(),
+        Some(2),
+        "{}",
+        failed_output(
+            "installed delivery-improvement enable without a lead",
+            &missing_thread
+        )
+    );
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&missing_thread.stdout),
+            String::from_utf8_lossy(&missing_thread.stderr)
+        )
+        .contains("CODEX_THREAD_ID is missing"),
+        "{}",
+        failed_output(
+            "installed delivery-improvement enable without a lead",
+            &missing_thread
+        )
+    );
+    let unavailable_lead = installed(&enable_args, Some("isolated-missing-lead"));
+    assert_eq!(
+        unavailable_lead.status.code(),
+        Some(2),
+        "{}",
+        failed_output(
+            "installed delivery-improvement enable with an absent lead",
+            &unavailable_lead
+        )
+    );
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&unavailable_lead.stdout),
+            String::from_utf8_lossy(&unavailable_lead.stderr)
+        )
+        .contains("the real lead is unavailable"),
+        "{}",
+        failed_output(
+            "installed delivery-improvement enable with an absent lead",
+            &unavailable_lead
+        )
+    );
+    assert!(
+        !state_dir.exists(),
+        "refused enable must not configure a journal or retain reflection state"
+    );
+
+    let issue = |id: &str| -> serde_json::Value {
+        let value = json(&bd, &project, &["show", id, "--json"]);
+        value
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .unwrap_or(value)
+    };
+    let before_accept = issue(&epic_id);
+    assert_eq!(before_accept["status"], "open");
+    let refused = installed(
+        &[
+            "executor",
+            "accept",
+            &epic_id,
+            "--project",
+            project_text,
+            "--codex-home",
+            home_text,
+        ],
+        None,
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "{}",
+        failed_output("installed executor accept without a live lead", &refused)
+    );
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&refused.stdout),
+            String::from_utf8_lossy(&refused.stderr)
+        )
+        .contains("CODEX_THREAD_ID is missing or blank"),
+        "{}",
+        failed_output("installed executor accept without a live lead", &refused)
+    );
+    let after_accept = issue(&epic_id);
+    assert_eq!(
+        after_accept["status"], "open",
+        "accept refusal leaves the synthetic task open"
+    );
+    assert_eq!(
+        after_accept["metadata"], before_accept["metadata"],
+        "accept refusal records no acceptance metadata"
+    );
 
     board_lifecycle::disconnect(&board_on).unwrap();
     assert!(
@@ -790,6 +1128,15 @@ fn failed(command: &str, out: &Output) -> String {
     )
 }
 
+fn failed_output(command: &str, out: &Output) -> String {
+    format!(
+        "{command} exited {}: {}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 fn board_git(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -822,6 +1169,38 @@ struct PathRestore(Option<std::ffi::OsString>);
 impl PathRestore {
     fn capture() -> Self {
         Self(std::env::var_os("PATH"))
+    }
+}
+
+/// Owned isolated homes. Set `HARNESS_KEEP_ISOLATED_EVIDENCE` to retain the
+/// whole fixture, including rollback preservation evidence, after the run.
+struct IsolatedRoot(Option<tempfile::TempDir>);
+
+impl IsolatedRoot {
+    fn new() -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("osa-isolated-")
+            .tempdir()
+            .unwrap();
+        Self(Some(dir))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_ref().unwrap().path()
+    }
+}
+
+impl Drop for IsolatedRoot {
+    fn drop(&mut self) {
+        if std::env::var_os("HARNESS_KEEP_ISOLATED_EVIDENCE").is_none() {
+            return;
+        }
+        if let Some(dir) = self.0.take() {
+            eprintln!(
+                "retained isolated evidence: {}",
+                disk_path(&dir.keep()).display()
+            );
+        }
     }
 }
 impl Drop for PathRestore {

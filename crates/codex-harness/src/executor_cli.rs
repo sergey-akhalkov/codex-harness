@@ -4,6 +4,7 @@
 //! succession, OFAP 4.1).
 #![cfg(windows)]
 
+use harness_core::delivery_reflection::Purpose;
 use harness_core::native_launcher;
 #[cfg(test)]
 use harness_core::orchestration_config::executor_session_args;
@@ -31,21 +32,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+use harness_core::improvement_loop::PreSubmissionEvidence;
 use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
+mod acceptance;
 #[path = "executor_control.rs"]
-mod control;
+pub(crate) mod control;
 #[path = "executor_input.rs"]
 mod executor_input;
 #[path = "executor_message.rs"]
-mod executor_message;
+pub(crate) mod executor_message;
 #[path = "executor_stop.rs"]
 mod executor_stop;
 #[path = "executor_observation.rs"]
 mod observation;
+pub(crate) mod reflection_admission;
 // The native warning relay: the frontend-facing socket the host may append a
 // degraded diagnostic to. It is not a second backend address, and `executor
 // message` and `executor stop` never resolve a run through it.
@@ -54,11 +58,13 @@ mod warning;
 
 use control::{
     BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, FinalMessage, Lifecycle,
+    TurnStart,
 };
 use observation::{
     COVERAGE_NATIVE, ControlOutcome, RunObservation, RunTracker, STATE_ACCEPTED, STATE_COMPLETED,
     STATE_DEFECT, STATE_FAILED, STATE_INTERRUPTED, STATE_STARTED,
 };
+pub(crate) use warning::SelectionObserver;
 use warning::{Relay, WarningQueue};
 
 const USAGE: &str = concat!(
@@ -69,6 +75,7 @@ const USAGE: &str = concat!(
     "codex-harness executor assignment --source CHECKOUT [--repository REPO] --slot N --assignment FILE [--base REV] [--owner ID]\n",
     "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
     "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY [--repository REPO]\n",
+    "codex-harness executor accept TASK --project DIRECTORY [--source CHECKOUT] [--codex-home DIRECTORY] [--run GENERATION]\n  Accept retained structured executor work as the live lead: derive the exact assignment, result, executor session/turn and current lead turn, close TASK through the board owner, and report reflection eligibility. Repeating the same accepted result is a no-op.\n",
     "codex-harness executor stop [--source CHECKOUT] [--codex-home DIRECTORY] [--repository REPO] [--slot N] [--owner ID] [--session SESSION_ID] [--timeout SECONDS]\n",
     "codex-harness executor message [--source CHECKOUT] [--codex-home DIRECTORY] [--repository REPO] [--slot N] [--owner ID] [--session SESSION_ID] [--text TEXT | --file FILE]\n",
     "codex-harness executor message --reply-to MESSAGE_ID [--text TEXT | --file FILE]\n",
@@ -166,6 +173,11 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
             refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
             succeed(&args[1..])
         }
+        Some("accept") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            refuse_bounded_lead_dispatch(std::env::var_os(BOUNDED_LEAD_SESSION_ENV))?;
+            acceptance::run(&args[1..])
+        }
         _ => Err(invalid("invalid native executor options")),
     }
 }
@@ -174,12 +186,14 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
 /// endpoint of its own. `lead message` is the other direction and keeps its
 /// own usage beside it.
 const LEAD_START_USAGE: &str = "\
-codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID] [--exec PROMPT] [--exec-file FILE]
+codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID] [--exec PROMPT] [--exec-file FILE] [--once]
   Host the configured lead profile in this terminal via one native app-server/TUI.
   The exact thread records a kit-local endpoint inherited by executors from its shells;
   lead message reaches it. Resume the exact THREAD_ID after its endpoint ends. Native
   routing and cwd stay unchanged; no daemon or second conversation. PROMPT is
-  submitted only after the frontend attaches.
+  submitted only after the frontend attaches. --once requires that prompt and ends
+  this session after the newly assigned turn is terminal; without it the host stays
+  persistent for later turns and automatic reflection delivery.
 ";
 /// Usage of the bounded lead conversation entries: `dispatch` starts one
 /// fresh pooled lead conversation, and `resume` continues an exact recorded
@@ -299,6 +313,9 @@ struct LeadStart {
     session: Option<String>,
     /// Optional first turn, submitted only after the native frontend attaches.
     prompt: Option<String>,
+    /// Close this finite assignment when that exact first turn is terminal,
+    /// instead of keeping the managed lead host alive for later turns.
+    once: bool,
 }
 
 fn lead_start(args: &[OsString]) -> io::Result<i32> {
@@ -359,11 +376,16 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
     let mut session = None;
     let mut prompt = None;
     let mut prompt_file = None;
+    let mut once = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = arg
             .to_str()
             .ok_or_else(|| invalid(&invalid_lead_option("<not Unicode>")))?;
+        if key == "--once" {
+            once = true;
+            continue;
+        }
         let value = iter
             .next()
             .ok_or_else(|| invalid(&invalid_lead_option(key)))?;
@@ -423,11 +445,17 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
             ));
         }
     };
+    if once && prompt.is_none() {
+        return Err(invalid(
+            "lead start --once requires the exact first prompt: pass --exec PROMPT or --exec-file FILE; without it the managed lead stays persistent until its frontend closes",
+        ));
+    }
     let request = LeadStart {
         source,
         codex_home,
         session,
         prompt,
+        once,
     };
     // An identity that cannot name a registry record is refused before any
     // process, listener or conversation exists.
@@ -444,7 +472,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
 
 fn invalid_lead_option(key: &str) -> String {
     format!(
-        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID, --exec PROMPT and --exec-file FILE only"
+        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID, --exec PROMPT, --exec-file FILE and --once only"
     )
 }
 
@@ -637,15 +665,19 @@ fn host_lead_session(
     };
     let thread = conversation.thread_id().to_owned();
     let (frontend, registry) = expose_lead_conversation(&plan, request, &title, &mut conversation)?;
-    if let Some(prompt) = request.prompt.as_deref()
-        && let Err(error) = conversation.assign(prompt)
-    {
-        let _ = frontend.close();
-        let _ = control::retire_lead_endpoint(&request.codex_home, &thread);
-        retire_lead_session_files(&plan);
-        return Err(invalid(&format!(
-            "the managed lead conversation did not accept its first prompt: {error}"
-        )));
+    let mut assigned: Option<TurnStart> = None;
+    if let Some(prompt) = request.prompt.as_deref() {
+        match conversation.assign(prompt) {
+            Ok(turn) => assigned = Some(turn),
+            Err(error) => {
+                let _ = frontend.close();
+                let _ = control::retire_lead_endpoint(&request.codex_home, &thread);
+                retire_lead_session_files(&plan);
+                return Err(invalid(&format!(
+                    "the managed lead conversation did not accept its first prompt: {error}"
+                )));
+            }
+        }
     }
     note_log(
         &plan.paths.log,
@@ -655,31 +687,272 @@ fn host_lead_session(
             registry
         ),
     );
-    // The frontend owns this terminal until it ends. Pumping keeps the
-    // conversation's own transport drained without asking the model anything;
-    // a backend that ends first gets a short grace so the frontend can leave
-    // the terminal surface by itself.
-    let mut failure: Option<String> = None;
-    let mut deadline: Option<Instant> = None;
-    while frontend.is_running()? {
-        if failure.is_none() {
-            if let Err(error) = conversation.pump() {
-                failure = Some(error.to_string());
-                deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
+    if request.once {
+        // A finite assignment is the inverse of the persistent managed lead:
+        // the exact turn submitted above owns this host's lifetime. Nothing
+        // else can finish it - not frontend exit, silence, a historical turn
+        // or a timer. Cleanup below reuses the same frontend, address and
+        // app-server owners as the persistent path.
+        let mut failure: Option<String> = None;
+        let mut final_message: Option<String> = None;
+        if let Some(assigned) = assigned.as_ref() {
+            // Consume delivered records before judging the frontend: a terminal
+            // record and the frontend's departure can become visible in the
+            // same observation. One extra pump after a departure drains records
+            // already buffered for this host; the exit alone never answers for
+            // the turn.
+            let mut drained_after_exit = false;
+            loop {
+                if let Err(error) = conversation.pump() {
+                    failure = Some(format!(
+                        "the assigned turn could not be observed to a terminal result: {error}"
+                    ));
+                    break;
+                }
+                if let Some(defect) = conversation.defect() {
+                    // A later completion cannot erase a protocol deviation.
+                    // The stream no longer establishes what was observed.
+                    failure = Some(format!(
+                        "the assigned turn's state could not be established: {defect}"
+                    ));
+                    break;
+                }
+                if let Some(state) = conversation.turn_outcome(&assigned.turn_id) {
+                    match state {
+                        Lifecycle::Completed => {}
+                        Lifecycle::Failed => {
+                            failure = Some(
+                                conversation
+                                    .failure()
+                                    .unwrap_or("the assigned turn failed without a message")
+                                    .to_owned(),
+                            );
+                        }
+                        Lifecycle::Interrupted => {
+                            failure = Some(
+                                "the assigned turn was interrupted before it completed".to_owned(),
+                            );
+                        }
+                        Lifecycle::Defect => {
+                            failure = Some(format!(
+                                "the assigned turn's state could not be established: {}",
+                                conversation.defect().unwrap_or(
+                                    "the native control stream reported a protocol deviation"
+                                )
+                            ));
+                        }
+                        Lifecycle::NativeStart | Lifecycle::Running => {}
+                    }
+                    break;
+                }
+                match frontend.is_running() {
+                    Ok(true) => {}
+                    Ok(false) if !drained_after_exit => {
+                        drained_after_exit = true;
+                        continue;
+                    }
+                    Ok(false) => {
+                        failure = Some(
+                            "the native frontend ended before the assigned turn reached a terminal result; this assignment has no completed result"
+                                .to_owned(),
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        failure = Some(format!(
+                            "the native frontend could not be observed while the assigned turn was running: {error}"
+                        ));
+                        break;
+                    }
+                }
+                thread::sleep(control::DEFAULT_POLL);
             }
-        } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
+        } else {
+            failure = Some(
+                "no prompt was assigned to this finite lead session; --once requires the exact first prompt"
+                    .to_owned(),
+            );
         }
-        thread::sleep(control::DEFAULT_POLL);
+        if failure.is_none()
+            && let Some(assigned) = assigned.as_ref()
+        {
+            // The exact submitted turn is the only result this finite
+            // assignment may report; a resumed thread's history is not.
+            match conversation.final_message_for_turn(&assigned.turn_id) {
+                Ok(FinalMessage::Present(text)) => final_message = Some(text),
+                Ok(FinalMessage::Empty) => {
+                    failure = Some(
+                        "the assigned turn completed but wrote an empty final assistant message; an empty completion is not success"
+                            .to_owned(),
+                    );
+                }
+                Ok(FinalMessage::Missing) => {
+                    failure = Some(
+                        "the assigned turn completed without a final assistant message; a missing result is not success"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    failure = Some(format!(
+                        "the final output of the assigned turn could not be read: {error}"
+                    ));
+                }
+            }
+        } else if let Some(assigned) = assigned.as_ref()
+            && let Ok(FinalMessage::Present(text)) =
+                conversation.final_message_for_turn(&assigned.turn_id)
+        {
+            // Keep any partial output of a failed or interrupted turn separate
+            // from success, but never discard it.
+            final_message = Some(text);
+        }
+        let (frontend_code, notes) =
+            finish_lead_session(request, &plan, job, frontend, &conversation, launcher, None);
+        for note in &notes {
+            println!("lead session note: {note}");
+        }
+        let turn_id = assigned
+            .as_ref()
+            .map(|turn| turn.turn_id.as_str())
+            .unwrap_or("unassigned");
+        match failure {
+            None if notes.is_empty() => {
+                if let Some(text) = final_message {
+                    println!("lead result:\n{text}");
+                }
+                println!(
+                    "lead session: ended thread {thread} profile {profile} assigned-turn {turn_id} outcome completed frontend-exit {}",
+                    frontend_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unrecorded".to_owned())
+                );
+                println!(
+                    "lead endpoint: {} was retired; the app-server child ended and no address of this conversation remains",
+                    registry
+                );
+                Ok(0)
+            }
+            None => {
+                // The turn completed and its output is retained, but this host
+                // could not confirm that it released every owned resource. The
+                // result is not a completed assignment while an address or
+                // child may survive it.
+                if let Some(text) = final_message {
+                    println!("lead result (cleanup unconfirmed):\n{text}");
+                }
+                println!(
+                    "lead session: the assigned turn {turn_id} completed, but this host could not confirm every cleanup step; the retained result is not a completed assignment, and the state named by the cleanup notes above requires repair"
+                );
+                Ok(1)
+            }
+            Some(cause) => {
+                if let Some(text) = final_message {
+                    println!("lead partial result (not a success):\n{text}");
+                }
+                println!("lead session: the assigned turn {turn_id} did not complete: {cause}");
+                if notes.is_empty() {
+                    println!(
+                        "lead cleanup: confirmed; the native frontend and app-server child were closed and this address was retired"
+                    );
+                } else {
+                    println!(
+                        "lead cleanup: unconfirmed; the state named by the cleanup notes above may remain and no cleanup claim is made"
+                    );
+                }
+                Ok(1)
+            }
+        }
+    } else {
+        let mut reflection = crate::self_reflection_cli::host::LeadLifecycle::new(
+            &request.codex_home,
+            &request.source,
+            &thread,
+        );
+        // The frontend owns this terminal until it ends. Pumping keeps the
+        // conversation's own transport drained without asking the model anything;
+        // a backend that ends first gets a short grace so the frontend can leave
+        // the terminal surface by itself.
+        let mut failure: Option<String> = None;
+        let mut deadline: Option<Instant> = None;
+        while frontend.is_running()? {
+            if failure.is_none() {
+                if let Err(error) = conversation.pump() {
+                    failure = Some(error.to_string());
+                    deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
+                }
+            } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            if failure.is_none()
+                && let Err(error) = reflection.tick()
+            {
+                note_log(&plan.paths.log, &format!("reflection lifecycle: {error}"));
+            }
+            thread::sleep(control::DEFAULT_POLL);
+        }
+        let (frontend_code, notes) = finish_lead_session(
+            request,
+            &plan,
+            job,
+            frontend,
+            &conversation,
+            launcher,
+            Some(&mut reflection),
+        );
+        for note in &notes {
+            println!("lead session note: {note}");
+        }
+        match failure {
+            None => {
+                println!(
+                    "lead session: ended thread {thread} profile {profile} frontend-exit {}",
+                    frontend_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unrecorded".to_owned())
+                );
+                println!(
+                    "lead endpoint: {} was retired; the app-server child ended and no address of this conversation remains",
+                    registry
+                );
+                Ok(0)
+            }
+            Some(cause) => {
+                println!(
+                    "lead session: the app-server child ended while the native frontend was attached: {cause}; the conversation and its partial work stay in the native session, and this address was retired"
+                );
+                Ok(1)
+            }
+        }
     }
+}
+
+/// Ends the native frontend, retires this conversation's address and ends the
+/// app-server child this host owns, verifying the child by its recorded
+/// identity. The frontend exit code is read before it is closed; notes stay on
+/// the visible surface and never turn a failed run into a success.
+fn finish_lead_session(
+    request: &LeadStart,
+    plan: &ControlPlan,
+    job: Job,
+    frontend: OwnedFrontend,
+    conversation: &Conversation,
+    launcher: &Path,
+    reflection: Option<&mut crate::self_reflection_cli::host::LeadLifecycle>,
+) -> (Option<u32>, Vec<String>) {
     let frontend_code = frontend.exit_code().ok().flatten();
     let mut notes = Vec::new();
+    if let Some(reflection) = reflection
+        && let Err(error) = reflection.stop()
+    {
+        notes.push(format!("reflection lifecycle cleanup: {error}"));
+    }
     if let Err(error) = frontend.close() {
         notes.push(format!("the native frontend could not be ended: {error}"));
     }
     // The address of a session that ended must not outlive it: a later spawn in
     // this thread resolves it before inheriting, and `lead message` refuses it.
-    if let Err(error) = control::retire_lead_endpoint(&request.codex_home, &thread) {
+    if let Err(error) = control::retire_lead_endpoint(&request.codex_home, conversation.thread_id())
+    {
         notes.push(error.to_string());
     }
     for path in [&plan.paths.endpoint, &plan.paths.token] {
@@ -687,33 +960,10 @@ fn host_lead_session(
             notes.push(error.to_string());
         }
     }
-    if let Err(error) = end_owned_child(job, &conversation, launcher) {
+    if let Err(error) = end_owned_child(job, conversation, launcher) {
         notes.push(error.to_string());
     }
-    for note in &notes {
-        println!("lead session note: {note}");
-    }
-    match failure {
-        None => {
-            println!(
-                "lead session: ended thread {thread} profile {profile} frontend-exit {}",
-                frontend_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "unrecorded".to_owned())
-            );
-            println!(
-                "lead endpoint: {} was retired; the app-server child ended and no address of this conversation remains",
-                registry
-            );
-            Ok(0)
-        }
-        Some(cause) => {
-            println!(
-                "lead session: the app-server child ended while the native frontend was attached: {cause}; the conversation and its partial work stay in the native session, and this address was retired"
-            );
-            Ok(1)
-        }
-    }
+    (frontend_code, notes)
 }
 
 /// Names the conversation, attaches its native frontend and publishes the
@@ -979,6 +1229,11 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     let spawn_hint = match role {
         Role::Executor => "codex-harness executor spawn",
         Role::Lead => "codex-harness lead dispatch",
+        Role::ExecutorSelfReflection | Role::LeadSelfReflection => {
+            return Err(invalid(
+                "reflection roles are not dispatch continuations; use `codex-harness self-reflection`",
+            ));
+        }
     };
     let mut source = None;
     let mut repository = None;
@@ -1136,6 +1391,11 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
             }
             config.lead_profile.clone()
         }
+        Role::ExecutorSelfReflection | Role::LeadSelfReflection => {
+            return Err(invalid(
+                "reflection roles use the self-reflection runner and cannot continue a dispatch slot",
+            ));
+        }
     };
     let pool_size = worktree_pool_size(&config);
     let request = Dispatch {
@@ -1172,7 +1432,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     // preserving its checkout and partial work without a reset. A legacy
     // session record keeps the existing adoption so an interrupted
     // pre-migration session still resumes the same slot.
-    let (index, path, base, task, handle) = match task_worktree::load_slot_record(
+    let (index, path, base, task, handle, assignment) = match task_worktree::load_slot_record(
         &codex_home,
         &repository,
         slot,
@@ -1199,6 +1459,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
                 continued.base.clone().unwrap_or_default(),
                 Some(task),
                 continued.handle,
+                record.assignment.as_deref().cloned(),
             )
         }
         _ => {
@@ -1210,12 +1471,15 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
                 record.base.clone().unwrap_or_default(),
                 None,
                 None,
+                record.assignment.as_deref().cloned(),
             )
         }
     };
     task_worktree::hold_startup_reservation(&codex_home, &repository, index, &owner)?;
     drop(admission);
-    let (remote, branch) = task_worktree::upstream(&path)?;
+    // Continuation retains its bound base; upstream names are optional
+    // metadata, as on an explicit offline-base dispatch.
+    let (remote, branch) = task_worktree::upstream(&path).unwrap_or_default();
     let binding = SlotBinding {
         index,
         path,
@@ -1227,6 +1491,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         branch,
         task,
         handle,
+        assignment,
     };
     // The slot is adopted without a reset, so a rejected structured
     // assignment keeps its claim and its partial work for the next resume.
@@ -1240,6 +1505,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         }
     };
     let paths = run_paths(&codex_home, &repository, binding.index)?;
+    let submitted_assignment = submitted_assignment(&request.prompt)?;
     // Resume keeps the exact session on the managed presentation. Restart
     // starts a fresh conversation and carries the predecessor separately.
     let route = continuation_route(
@@ -1248,39 +1514,55 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         &session,
         &predecessor,
         BoundIdentity::resolve(&bound),
+        submitted_assignment,
     );
     launch_bound(&request, &binding, route, &bound, &paths)
 }
 
-/// Managed continuation route. Resume attaches the native frontend to the
-/// recorded session. Restart starts a fresh conversation, keeps the original
-/// task beside a bounded handoff, and does not resume the predecessor thread.
 fn continuation_route(
     fresh: bool,
     prompt: &str,
     session: &str,
     predecessor: &serde_json::Value,
     identity: BoundIdentity,
+    submitted: task_worktree::AssignmentSubmission,
 ) -> HostRoute {
-    let (assignment, original, resume_session) = if fresh {
+    let (assignment, original, resume_session, submitted) = if fresh {
         (
             restart_assignment(prompt, session, predecessor),
             Some(prompt.to_owned()),
             None,
+            // The submitted text is the restart handoff, not the assignment
+            // document, so it never reads as the bound structured submission.
+            task_worktree::AssignmentSubmission::restart(),
         )
     } else {
-        (prompt.to_owned(), None, Some(session.to_owned()))
+        (prompt.to_owned(), None, Some(session.to_owned()), submitted)
     };
     HostRoute::Control(Box::new(ControlReceipt {
         schema: CONTROL_SCHEMA,
         assignment,
         original_assignment: original,
+        submitted_assignment: Some(submitted),
         identity,
         presentation: NativePresentation::NativeTui,
         port: None,
         resume_session,
         role: None,
     }))
+}
+
+/// The assignment identity the run actually submits. A structured document is
+/// recorded with its own content hash; free text is recorded as free text. The
+/// receipt keeps this marker beside the rendered brief so completion retention
+/// can prove the bound structured assignment was the submitted one.
+fn submitted_assignment(prompt: &PromptSource) -> io::Result<task_worktree::AssignmentSubmission> {
+    match prompt {
+        PromptSource::FreeText(_) => Ok(task_worktree::AssignmentSubmission::free_text()),
+        PromptSource::Structured(assignment) => Ok(
+            task_worktree::AssignmentSubmission::structured(assignment.content_sha256()?),
+        ),
+    }
 }
 
 /// The checkpoint stays in the existing receipt and the original rollout.
@@ -1373,7 +1655,7 @@ impl SpawnMode {
 /// written before this field existed keeps the full TUI it was hosted with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum NativePresentation {
+pub(crate) enum NativePresentation {
     #[default]
     NativeTui,
     NativeInline,
@@ -1456,6 +1738,13 @@ struct ControlReceipt {
     /// Retain the original task independently of a restart's bounded handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_assignment: Option<String>,
+    /// The exact assignment identity this run submitted. `structured` carries
+    /// the submitted document's content hash, so retention can compare it with
+    /// the slot's verified board binding; free text and restart handoffs are
+    /// recorded as themselves. Absent on receipts written before this field,
+    /// which are never ordinary-acceptance eligible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submitted_assignment: Option<task_worktree::AssignmentSubmission>,
     /// The profile binding this dispatch resolved. The driver pins it on the
     /// started thread and refuses a conversation whose thread reports another
     /// model, provider or reasoning effort.
@@ -1688,6 +1977,11 @@ struct SlotBinding {
     task: Option<String>,
     #[serde(default)]
     handle: Option<String>,
+    /// Verified consumer-board task and assignment identity, when the
+    /// structured assignment declared `board_task`. An unknown purpose is
+    /// retained as unknown, not inferred from the task binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignment: Option<task_worktree::SlotAssignmentBinding>,
 }
 
 impl SlotBinding {
@@ -1708,8 +2002,32 @@ struct PreparedDispatch {
     route: HostRoute,
 }
 
+/// Resolve a structured assignment's declared consumer-board task before any
+/// slot is claimed, reset or bound. Legacy free-text and structured
+/// assignments without `board_task` never discover or contact a board.
+fn resolve_assignment_binding(
+    request: &Dispatch,
+) -> io::Result<Option<task_worktree::SlotAssignmentBinding>> {
+    let PromptSource::Structured(assignment) = &request.prompt else {
+        return Ok(None);
+    };
+    let Some(issue) = assignment.board_task.as_deref() else {
+        return Ok(None);
+    };
+    let bd = crate::feedback_cli::discover_bd_in(request.codex_home).map_err(|error| {
+        invalid(&format!(
+            "board task '{issue}' is declared but the consumer board executable is unavailable: {error}"
+        ))
+    })?;
+    executor_assignment::bind_board_task(assignment, request.repository, &bd).map(Some)
+}
+
 fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
     let bound = orchestration_config::binding(request.codex_home, request.profile)?;
+    // A board refusal is decided against the consuming repository before the
+    // slot is claimed, so a conflicting or unavailable task has no checkout
+    // effect and starts no model.
+    let assignment = resolve_assignment_binding(request)?;
     let slot = acquire_pool_slot(request)?;
     let binding = SlotBinding {
         index: slot.index,
@@ -1722,6 +2040,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         branch: slot.branch.clone(),
         task: slot.task.clone(),
         handle: slot.handle.clone(),
+        assignment,
     };
     // A structured assignment is validated against the checkout that was
     // actually allocated, before any launcher process starts.
@@ -1729,6 +2048,27 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         Ok(prompt) => prompt,
         Err(error) => return Err(release_unused_claim(request, &binding, error)),
     };
+    let submitted_assignment = submitted_assignment(&request.prompt)?;
+    // Attach the verified binding to the existing durable slot record. This
+    // runs after path validation and before any launcher. A recorded binding
+    // conflict is refused with the slot and its work untouched; unlike a
+    // rejected new assignment, it must not discard a binding the lead holds.
+    if let Some(assignment) = binding.assignment.as_ref() {
+        let (Some(task), Some(handle)) = (binding.task.as_deref(), binding.handle.as_deref())
+        else {
+            return Err(invalid(
+                "the selected slot has no durable task binding; a board-bound assignment requires one and was not dispatched",
+            ));
+        };
+        task_worktree::bind_slot_assignment(
+            request.codex_home,
+            request.repository,
+            binding.index,
+            task,
+            handle,
+            assignment.clone(),
+        )?;
+    }
     let paths = run_paths(request.codex_home, request.repository, binding.index)?;
     // Default and both presentation spellings share one control lifecycle.
     // The native frontend is attached by the host; explicit exec qualifies
@@ -1737,6 +2077,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
         schema: CONTROL_SCHEMA,
         assignment: prompt,
         original_assignment: None,
+        submitted_assignment: Some(submitted_assignment),
         identity: BoundIdentity::resolve(&bound),
         presentation: request.mode.presentation(),
         port: None,
@@ -1867,6 +2208,72 @@ pub(crate) struct VisibleLeadConversation {
     pub prompt: PromptSource,
 }
 
+/// One same-lead continuation requested by the controller. It names the exact
+/// recorded bounded-lead conversation - slot, owner and native session - and
+/// the next turn that lead must decide. The configured `lead_profile` and
+/// `Role::Lead` are resolved from the same source the fresh bounded lead used;
+/// no caller field can select another profile, slot or session.
+pub(crate) struct VisibleLeadContinuation {
+    pub codex_home: PathBuf,
+    pub source: PathBuf,
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub prompt: String,
+}
+
+#[derive(Debug)]
+
+/// The newly accepted continuation, read back from the receipt the shared
+/// continuation owner wrote. `generation` is this dispatch's own run
+/// generation; it is never the predecessor's. `session` is the exact
+/// conversation the recorded route resumes, not a fresh one.
+pub(crate) struct VisibleLeadContinuationAccepted {
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub generation: String,
+    pub profile: String,
+    pub role: Role,
+    pub exit_code: i32,
+    pub checkout: PathBuf,
+    pub receipt: PathBuf,
+    pub result: PathBuf,
+    pub detail: PathBuf,
+}
+
+/// One same-executor continuation requested by the controller. It names the
+/// exact recorded executor conversation and the executor profile that
+/// conversation was dispatched under; a correction can never switch role,
+/// profile, slot or session.
+pub(crate) struct VisibleExecutorContinuation {
+    pub codex_home: PathBuf,
+    pub source: PathBuf,
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub profile: String,
+    pub prompt: String,
+}
+
+/// The newly accepted executor continuation, read back from the receipt the
+/// shared continuation owner wrote. The generation is this turn's own, never
+/// the predecessor's, and the session is the exact conversation it resumed.
+#[derive(Debug)]
+pub(crate) struct VisibleExecutorContinuationAccepted {
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub generation: String,
+    pub profile: String,
+    pub role: Role,
+    pub exit_code: i32,
+    pub checkout: PathBuf,
+    pub receipt: PathBuf,
+    pub result: PathBuf,
+    pub detail: PathBuf,
+}
+
 /// Dispatches one fresh bounded lead conversation through the pooled dispatch
 /// owner. The configured `lead_profile` binding and the lead role composition
 /// are resolved and recorded before anything launches; a missing role input or
@@ -1927,6 +2334,633 @@ pub(crate) fn dispatch_visible_lead_conversation(
     Ok(accepted)
 }
 
+pub(crate) fn continue_visible_lead_conversation(
+    request: &VisibleLeadContinuation,
+) -> io::Result<VisibleLeadContinuationAccepted> {
+    continue_visible_lead_conversation_with_markers(
+        request,
+        std::env::var_os(EXECUTOR_SESSION_ENV),
+        std::env::var_os(BOUNDED_LEAD_SESSION_ENV),
+    )
+}
+
+/// The wrapper body with the process markers supplied by the caller, so the
+/// focused checks can exercise the same slot, receipt and launch contract
+/// without mutating the process environment.
+fn continue_visible_lead_conversation_with_markers(
+    request: &VisibleLeadContinuation,
+    executor_marker: Option<OsString>,
+    bounded_lead_marker: Option<OsString>,
+) -> io::Result<VisibleLeadContinuationAccepted> {
+    refuse_executor_dispatch(executor_marker)?;
+    refuse_bounded_lead_dispatch(bounded_lead_marker)?;
+    if !request.source.is_absolute() || !request.codex_home.is_absolute() {
+        return Err(invalid(
+            "bounded lead continuation source and codex home must be absolute paths",
+        ));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(invalid(
+            "bounded lead continuation needs a non-empty next assignment",
+        ));
+    }
+    let config = load(&request.source)?;
+    let profile = config.lead_profile.clone();
+    if profile.trim().is_empty() {
+        return Err(invalid(
+            "configured lead_profile is empty; no bounded lead conversation can be continued",
+        ));
+    }
+    let session = task_succession::exact_session_id(&request.session)?.to_owned();
+    let paths = run_paths(&request.codex_home, &request.source, request.slot)?;
+    let predecessor = lead_continuation_predecessor(
+        &paths.receipt,
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+        &session,
+        &profile,
+    )?;
+    // A continuation is a new turn on an idle recorded conversation. A live
+    // host still owns the slot, and a second identity must not share it.
+    refuse_a_live_owner(&request.codex_home, &request.source, &request.owner)?;
+    refuse_a_live_slot(
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+    )?;
+    let args = [
+        OsString::from("--source"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--repository"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--codex-home"),
+        request.codex_home.as_os_str().to_owned(),
+        OsString::from("--slot"),
+        OsString::from(request.slot.to_string()),
+        OsString::from("--owner"),
+        OsString::from(request.owner.as_str()),
+        OsString::from("--session"),
+        OsString::from(&session),
+        OsString::from("--exec"),
+        OsString::from(request.prompt.as_str()),
+    ];
+    let exit_code = continue_slot(&args, false, Role::Lead)?;
+    accepted_lead_continuation(
+        &paths,
+        request,
+        &session,
+        &profile,
+        &predecessor.generation,
+        exit_code,
+    )
+}
+
+/// Continues one exact recorded executor conversation through the shared
+/// continuation owner. The correction turn keeps the executor's slot, owner,
+/// session and declared profile; a fresh conversation or a role/profile
+/// fallback is refused instead of reported as a correction.
+pub(crate) fn continue_visible_executor_conversation(
+    request: &VisibleExecutorContinuation,
+) -> io::Result<VisibleExecutorContinuationAccepted> {
+    continue_visible_executor_conversation_with_markers(
+        request,
+        std::env::var_os(EXECUTOR_SESSION_ENV),
+        std::env::var_os(BOUNDED_LEAD_SESSION_ENV),
+    )
+}
+
+fn continue_visible_executor_conversation_with_markers(
+    request: &VisibleExecutorContinuation,
+    executor_marker: Option<OsString>,
+    bounded_lead_marker: Option<OsString>,
+) -> io::Result<VisibleExecutorContinuationAccepted> {
+    refuse_executor_dispatch(executor_marker)?;
+    refuse_bounded_lead_dispatch(bounded_lead_marker)?;
+    if !request.source.is_absolute() || !request.codex_home.is_absolute() {
+        return Err(invalid(
+            "executor continuation source and codex home must be absolute paths",
+        ));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(invalid(
+            "executor continuation needs a non-empty correction assignment",
+        ));
+    }
+    let config = load(&request.source)?;
+    let profile = executor_profile(&config, Some(request.profile.as_str()))?.to_owned();
+    if profile != request.profile {
+        return Err(invalid(&format!(
+            "executor continuation refused: the requested profile {} is not the configured executor profile {profile}",
+            request.profile
+        )));
+    }
+    let session = task_succession::exact_session_id(&request.session)?.to_owned();
+    let paths = run_paths(&request.codex_home, &request.source, request.slot)?;
+    let predecessor = executor_continuation_predecessor(
+        &paths.receipt,
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+        &session,
+        &profile,
+    )?;
+    refuse_a_live_owner(&request.codex_home, &request.source, &request.owner)?;
+    refuse_a_live_slot(
+        &request.codex_home,
+        &request.source,
+        request.slot,
+        &request.owner,
+    )?;
+    let args = [
+        OsString::from("--source"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--repository"),
+        request.source.as_os_str().to_owned(),
+        OsString::from("--codex-home"),
+        request.codex_home.as_os_str().to_owned(),
+        OsString::from("--slot"),
+        OsString::from(request.slot.to_string()),
+        OsString::from("--owner"),
+        OsString::from(request.owner.as_str()),
+        OsString::from("--session"),
+        OsString::from(&session),
+        OsString::from("--profile"),
+        OsString::from(&profile),
+        OsString::from("--exec"),
+        OsString::from(request.prompt.as_str()),
+    ];
+    let exit_code = continue_slot(&args, false, Role::Executor)?;
+    accepted_executor_continuation(&paths, request, &session, &profile, &predecessor, exit_code)
+}
+
+/// Reuses the exact predecessor proof for an executor turn: slot, owner,
+/// profile, session, role and a preserved checkout must all match before the
+/// shared continuation owner is touched.
+fn executor_continuation_predecessor(
+    receipt: &Path,
+    codex_home: &Path,
+    source: &Path,
+    slot: u32,
+    owner: &str,
+    session: &str,
+    profile: &str,
+) -> io::Result<String> {
+    let bytes = match fs::read(receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(&format!(
+                "no recorded executor conversation occupies slot {slot} for owner {owner}; dispatch one before requesting a correction"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the recorded executor conversation receipt {} is not JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    if value["slot"]["index"].as_u64() != Some(u64::from(slot))
+        || value["slot"]["owner"].as_str() != Some(owner)
+    {
+        return Err(invalid(&format!(
+            "executor continuation refused: receipt {} does not record slot {slot} owner {owner}",
+            receipt.display()
+        )));
+    }
+    if value["profile"].as_str() != Some(profile) {
+        return Err(invalid(&format!(
+            "executor continuation refused: the recorded conversation uses profile {}, not the declared executor profile {profile}",
+            value["profile"].as_str().unwrap_or("unrecorded")
+        )));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Executor.label() => {}
+        Some(role) => {
+            return Err(invalid(&format!(
+                "executor continuation refused: slot {slot} owner {owner} records role {}, not {}",
+                role.role,
+                Role::Executor.label()
+            )));
+        }
+        None => {
+            return Err(invalid(&format!(
+                "executor continuation refused: the receipt for slot {slot} owner {owner} does not record its responsibility role"
+            )));
+        }
+    }
+    let observed = value["observation"]["session"].as_str();
+    let previous = value["observation"]["previousSession"].as_str();
+    let resumed = value["control"]["resumeSession"].as_str();
+    for recorded in [observed, previous, resumed].into_iter().flatten() {
+        if recorded != session {
+            return Err(invalid(&format!(
+                "executor continuation refused: the recorded conversation names session {recorded}, not the exact requested session {session}"
+            )));
+        }
+    }
+    if observed.is_none() && previous.is_none() && resumed.is_none() {
+        return Err(invalid(&format!(
+            "executor continuation refused: the receipt for slot {slot} owner {owner} records no exact session"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| {
+            invalid(&format!(
+                "executor continuation refused: the receipt for slot {slot} owner {owner} records no run generation"
+            ))
+        })?;
+    let Some(record) = task_worktree::load_slot_record(codex_home, source, slot)? else {
+        return Err(invalid(&format!(
+            "executor continuation refused: slot {slot} has no recorded binding for owner {owner}; preserved work cannot be proved"
+        )));
+    };
+    match record.owner.as_deref() {
+        Some(existing) if existing == owner => {}
+        Some(other) => {
+            return Err(invalid(&format!(
+                "executor continuation refused: the slot record binds slot {slot} to {other}, not {owner}"
+            )));
+        }
+        None => {}
+    }
+    if !record.path.is_dir() {
+        return Err(invalid(&format!(
+            "executor continuation refused: the recorded checkout {} for slot {slot} is missing",
+            record.path.display()
+        )));
+    }
+    let recorded_checkout = value["slot"]["path"].as_str().ok_or_else(|| {
+        invalid(&format!(
+            "executor continuation refused: the receipt for slot {slot} records no checkout path"
+        ))
+    })?;
+    let recorded_checkout = fs::canonicalize(recorded_checkout).map_err(|error| {
+        invalid(&format!(
+            "executor continuation refused: the receipt checkout {recorded_checkout} cannot be resolved: {error}"
+        ))
+    })?;
+    let bound_checkout = fs::canonicalize(&record.path).map_err(|error| {
+        invalid(&format!(
+            "executor continuation refused: the slot checkout {} cannot be resolved: {error}",
+            record.path.display()
+        ))
+    })?;
+    if recorded_checkout != bound_checkout {
+        return Err(invalid(&format!(
+            "executor continuation refused: the receipt names checkout {}, but slot {slot} is bound to {}",
+            recorded_checkout.display(),
+            bound_checkout.display()
+        )));
+    }
+    Ok(generation.to_owned())
+}
+
+/// Reads back the executor continuation receipt and refuses any identity
+/// drift: same slot/owner/session/profile and role, a new generation, and no
+/// restart assignment.
+fn accepted_executor_continuation(
+    paths: &RunPaths,
+    request: &VisibleExecutorContinuation,
+    session: &str,
+    profile: &str,
+    predecessor_generation: &str,
+    exit_code: i32,
+) -> io::Result<VisibleExecutorContinuationAccepted> {
+    let bytes = fs::read(&paths.receipt)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the continuation receipt {} is not JSON: {error}",
+            paths.receipt.display()
+        ))
+    })?;
+    if value["slot"]["index"].as_u64() != Some(u64::from(request.slot))
+        || value["slot"]["owner"].as_str() != Some(request.owner.as_str())
+        || value["profile"].as_str() != Some(profile)
+    {
+        return Err(invalid(
+            "the continuation receipt does not record the requested executor slot, owner and profile",
+        ));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Executor.label() => {}
+        _ => {
+            return Err(invalid(
+                "the continuation receipt does not record the executor role; a role fallback is not accepted",
+            ));
+        }
+    }
+    if value["control"]["resumeSession"].as_str() != Some(session)
+        || value["observation"]["previousSession"].as_str() != Some(session)
+    {
+        return Err(invalid(&format!(
+            "the executor continuation did not resume the exact session {session}; a fresh conversation is never accepted"
+        )));
+    }
+    if !value["control"]["originalAssignment"].is_null() {
+        return Err(invalid(
+            "the executor continuation receipt records a restart assignment; a fresh conversation is never accepted",
+        ));
+    }
+    if let Some(observed) = value["observation"]["session"].as_str()
+        && observed != session
+    {
+        return Err(invalid(&format!(
+            "the executor continuation observed session {observed}, not the resumed session {session}"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| invalid("the continuation receipt records no run generation"))?;
+    if generation == predecessor_generation {
+        return Err(invalid(
+            "the continuation receipt still carries the predecessor generation; no new accepted run is recorded",
+        ));
+    }
+    let checkout = value["slot"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("the continuation receipt records no checkout path"))?;
+    Ok(VisibleExecutorContinuationAccepted {
+        slot: request.slot,
+        owner: request.owner.clone(),
+        session: session.to_owned(),
+        generation: generation.to_owned(),
+        profile: profile.to_owned(),
+        role: Role::Executor,
+        exit_code,
+        checkout,
+        receipt: paths.receipt.clone(),
+        result: paths.result.clone(),
+        detail: paths.detail.clone(),
+    })
+}
+
+/// The exact recorded conversation a lead continuation may continue. The
+/// predecessor generation is captured before the shared continuation owner
+/// overwrites the receipt, so the postcondition can prove the new run is not
+/// the same dispatch reported again.
+#[derive(Debug)]
+struct LeadContinuationPredecessor {
+    generation: String,
+}
+
+/// Verifies the exact same-lead predecessor before any effect. The receipt is
+/// authoritative for slot, owner, session, role and profile identity; the slot
+/// record proves the binding and preserved checkout, and the caller checks
+/// liveness separately before adopting anything.
+#[allow(clippy::too_many_arguments)]
+fn lead_continuation_predecessor(
+    receipt: &Path,
+    codex_home: &Path,
+    source: &Path,
+    slot: u32,
+    owner: &str,
+    session: &str,
+    profile: &str,
+) -> io::Result<LeadContinuationPredecessor> {
+    let bytes = match fs::read(receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(&format!(
+                "no recorded lead conversation occupies slot {slot} for owner {owner}; dispatch one with `codex-harness lead dispatch` before continuing it"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the recorded lead conversation receipt {} is not JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    let recorded_slot = value["slot"]["index"].as_u64();
+    if recorded_slot != Some(u64::from(slot)) {
+        return Err(invalid(&format!(
+            "lead continuation refused: receipt {} records slot {}, not the requested slot {slot}",
+            receipt.display(),
+            recorded_slot
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "none".into())
+        )));
+    }
+    let recorded_owner = value["slot"]["owner"].as_str();
+    if recorded_owner != Some(owner) {
+        return Err(invalid(&format!(
+            "lead continuation refused: slot {slot} is recorded for owner {}, not {owner}",
+            recorded_owner.unwrap_or("none")
+        )));
+    }
+    let recorded_profile = value["profile"].as_str();
+    if recorded_profile != Some(profile) {
+        return Err(invalid(&format!(
+            "lead continuation refused: the recorded conversation uses profile {}, but the configured lead_profile is {profile}; a continuation never switches profiles",
+            recorded_profile.unwrap_or("unrecorded")
+        )));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Lead.label() => {}
+        Some(role) => {
+            return Err(invalid(&format!(
+                "lead continuation refused: slot {slot} owner {owner} records role {}, not {}; continuing it under another role would present a role the conversation does not have",
+                role.role,
+                Role::Lead.label()
+            )));
+        }
+        None => {
+            return Err(invalid(&format!(
+                "lead continuation refused: the receipt for slot {slot} owner {owner} does not record its responsibility role; start a fresh bounded lead conversation instead of continuing an unverified one"
+            )));
+        }
+    }
+    let observed = value["observation"]["session"].as_str();
+    let previous = value["observation"]["previousSession"].as_str();
+    let resumed = value["control"]["resumeSession"].as_str();
+    for recorded in [observed, previous, resumed].into_iter().flatten() {
+        if recorded != session {
+            return Err(invalid(&format!(
+                "lead continuation refused: the recorded conversation names session {recorded}, not the exact requested session {session}"
+            )));
+        }
+    }
+    if observed.is_none() && previous.is_none() && resumed.is_none() {
+        return Err(invalid(&format!(
+            "lead continuation refused: the receipt for slot {slot} owner {owner} records no exact session; the conversation to continue cannot be proved"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| {
+            invalid(&format!(
+                "lead continuation refused: the receipt for slot {slot} owner {owner} records no run generation; a new accepted run cannot be distinguished from the predecessor"
+            ))
+        })?;
+    let Some(record) = task_worktree::load_slot_record(codex_home, source, slot)? else {
+        return Err(invalid(&format!(
+            "lead continuation refused: slot {slot} has no recorded binding for owner {owner}; preserved work cannot be proved"
+        )));
+    };
+    match record.owner.as_deref() {
+        Some(existing) if existing == owner => {}
+        Some(other) => {
+            return Err(invalid(&format!(
+                "lead continuation refused: the slot record binds slot {slot} to {other}, not {owner}"
+            )));
+        }
+        // A clean slot returns to the pool with no owner after reconciliation.
+        // The receipt and preserved checkout still prove this exact
+        // conversation, and `adopt_slot` rebinds the named owner without a
+        // reset; a recorded foreign owner is still refused above.
+        None => {}
+    }
+    if !record.path.is_dir() {
+        return Err(invalid(&format!(
+            "lead continuation refused: the recorded checkout {} for slot {slot} is missing; the preserved work cannot be continued",
+            record.path.display()
+        )));
+    }
+    let recorded_checkout = value["slot"]["path"].as_str().ok_or_else(|| {
+        invalid(&format!(
+            "lead continuation refused: the receipt for slot {slot} records no checkout path"
+        ))
+    })?;
+    let recorded_checkout = fs::canonicalize(recorded_checkout).map_err(|error| {
+        invalid(&format!(
+            "lead continuation refused: the receipt checkout {recorded_checkout} cannot be resolved: {error}"
+        ))
+    })?;
+    let bound_checkout = fs::canonicalize(&record.path).map_err(|error| {
+        invalid(&format!(
+            "lead continuation refused: the slot checkout {} cannot be resolved: {error}",
+            record.path.display()
+        ))
+    })?;
+    if recorded_checkout != bound_checkout {
+        return Err(invalid(&format!(
+            "lead continuation refused: the receipt names checkout {}, but slot {slot} is bound to {}",
+            recorded_checkout.display(),
+            bound_checkout.display()
+        )));
+    }
+    Ok(LeadContinuationPredecessor {
+        generation: generation.to_owned(),
+    })
+}
+
+/// Reads back the receipt the shared continuation owner just wrote. Every
+/// identity fact is checked against the request and the predecessor: the same
+/// slot/owner, the configured lead profile, the lead role, the exact resumed
+/// session on a resume route, and a new run generation. Any fresh
+/// conversation, profile or role fallback is refused instead of reported as an
+/// accepted continuation.
+fn accepted_lead_continuation(
+    paths: &RunPaths,
+    request: &VisibleLeadContinuation,
+    session: &str,
+    profile: &str,
+    predecessor_generation: &str,
+    exit_code: i32,
+) -> io::Result<VisibleLeadContinuationAccepted> {
+    let bytes = fs::read(&paths.receipt)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "the continuation receipt {} is not JSON: {error}",
+            paths.receipt.display()
+        ))
+    })?;
+    if value["slot"]["index"].as_u64() != Some(u64::from(request.slot)) {
+        return Err(invalid(&format!(
+            "the continuation receipt does not name the requested slot {}",
+            request.slot
+        )));
+    }
+    if value["slot"]["owner"].as_str() != Some(request.owner.as_str()) {
+        return Err(invalid(&format!(
+            "the continuation receipt does not name the requested owner {}",
+            request.owner
+        )));
+    }
+    if value["profile"].as_str() != Some(profile) {
+        return Err(invalid(&format!(
+            "the continuation receipt records profile {}, not the configured lead_profile {profile}; a profile fallback is not a same-lead continuation",
+            value["profile"].as_str().unwrap_or("unrecorded")
+        )));
+    }
+    match role_from_receipt(&value)? {
+        Some(role) if role.role == Role::Lead.label() => {}
+        Some(role) => {
+            return Err(invalid(&format!(
+                "the continuation receipt records role {}, not {}; a role fallback is not accepted",
+                role.role,
+                Role::Lead.label()
+            )));
+        }
+        None => {
+            return Err(invalid(
+                "the continuation receipt records no responsibility role; a same-lead continuation cannot be proved",
+            ));
+        }
+    }
+    let resumed = value["control"]["resumeSession"].as_str();
+    if resumed != Some(session) {
+        return Err(invalid(&format!(
+            "the continuation did not resume the exact lead session {session}; the receipt records {}; a fresh conversation is never accepted as a continuation",
+            resumed.unwrap_or("no resumed session")
+        )));
+    }
+    if !value["control"]["originalAssignment"].is_null() {
+        return Err(invalid(
+            "the continuation receipt records a restart assignment; a fresh conversation is never accepted as a same-lead continuation",
+        ));
+    }
+    if value["observation"]["previousSession"].as_str() != Some(session) {
+        return Err(invalid(&format!(
+            "the continuation receipt does not retain the resumed session {session} as its previous session"
+        )));
+    }
+    if let Some(observed) = value["observation"]["session"].as_str()
+        && observed != session
+    {
+        return Err(invalid(&format!(
+            "the continuation receipt observed session {observed}, not the resumed session {session}; a conversation switch is not accepted"
+        )));
+    }
+    let generation = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| invalid("the continuation receipt records no run generation"))?;
+    if generation == predecessor_generation {
+        return Err(invalid(
+            "the continuation receipt still carries the predecessor generation; no new accepted run is recorded",
+        ));
+    }
+    let checkout = value["slot"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("the continuation receipt records no checkout path"))?;
+    Ok(VisibleLeadContinuationAccepted {
+        slot: request.slot,
+        owner: request.owner.clone(),
+        session: session.to_owned(),
+        generation: generation.to_owned(),
+        profile: profile.to_owned(),
+        role: Role::Lead,
+        exit_code,
+        checkout,
+        receipt: paths.receipt.clone(),
+        result: paths.result.clone(),
+        detail: paths.detail.clone(),
+    })
+}
+
 /// The lifecycle fact one controller needs from a dispatch receipt. It is a
 /// bounded projection of the recorded observation; the full observation
 /// module stays private to this dispatcher.
@@ -1960,6 +2994,8 @@ pub(crate) struct ReceiptIdentity {
     /// The per-dispatch generation the dispatcher recorded.
     pub generation: Option<String>,
     pub session: Option<String>,
+    /// The exact native turn this dispatch submitted, when recorded.
+    pub turn: Option<String>,
     pub host: Option<(u32, u64, PathBuf)>,
 }
 
@@ -1970,6 +3006,9 @@ pub(crate) struct ReceiptIdentity {
 pub(crate) struct ReceiptView {
     pub identity: ReceiptIdentity,
     pub state: ConversationState,
+    /// Verified evidence that this receipt records a dispatch that failed
+    /// before any model request. Only explicit native facts produce a value.
+    pub pre_submission: Option<PreSubmissionEvidence>,
 }
 
 pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
@@ -1982,9 +3021,11 @@ pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
                     owner: None,
                     generation: None,
                     session: None,
+                    turn: None,
                     host: None,
                 },
                 state: ConversationState::Missing,
+                pre_submission: None,
             });
         }
         Err(error) => return Err(error),
@@ -2000,6 +3041,7 @@ pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
             .as_str()
             .map(str::to_owned),
         session: value["observation"]["session"].as_str().map(str::to_owned),
+        turn: value["observation"]["turn"].as_str().map(str::to_owned),
         host: (|| {
             let host = value.get("observation")?.get("host")?;
             if host.is_null() {
@@ -2013,7 +3055,12 @@ pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
         })(),
     };
     let state = conversation_state_of(&value);
-    Ok(ReceiptView { identity, state })
+    let pre_submission = RunObservation::from_receipt(&value).and_then(|run| run.pre_submission());
+    Ok(ReceiptView {
+        identity,
+        state,
+        pre_submission,
+    })
 }
 
 fn conversation_state_of(value: &serde_json::Value) -> ConversationState {
@@ -2104,6 +3151,60 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
     match &request.prompt {
         PromptSource::FreeText(text) => Ok(executor_assignment::free_text_brief(text)),
         PromptSource::Structured(assignment) => {
+            let recorded = binding.assignment.as_ref();
+            if let Some(declared) = assignment.board_task.as_deref() {
+                match recorded {
+                    Some(recorded) if recorded.issue == declared => {
+                        let content = assignment.content_sha256()?;
+                        if content != recorded.assignment_sha256 {
+                            return Err(invalid(&format!(
+                                "board task '{declared}' on slot {} carries assignment {content}, not the recorded assignment {}; a changed assignment is a new bound run, not a silent continuation",
+                                binding.index, recorded.assignment_sha256
+                            )));
+                        }
+                    }
+                    Some(recorded) => {
+                        return Err(invalid(&format!(
+                            "slot {} is bound to board task '{}', not '{}'; continue the recorded binding or dispatch the other task into its own slot",
+                            binding.index, recorded.issue, declared
+                        )));
+                    }
+                    None => {
+                        return Err(invalid(&format!(
+                            "board task '{declared}' has no recorded binding on slot {}; dispatch it as a fresh bound assignment instead of resuming an unbound slot",
+                            binding.index
+                        )));
+                    }
+                }
+            }
+            // The brief carries the effective purpose: the lead's explicit
+            // declaration when present, otherwise the purpose retained on the
+            // slot binding. An unknown purpose stays absent.
+            let mut effective = assignment.clone();
+            if let Some(recorded) = recorded {
+                match (assignment.purpose.as_deref(), recorded.purpose.as_deref()) {
+                    (Some(declared), Some(bound)) => {
+                        let declared = Purpose::parse(declared)?;
+                        let bound = Purpose::parse(bound)?;
+                        if declared != bound {
+                            return Err(invalid(&format!(
+                                "assignment purpose '{}' contradicts the recorded binding purpose '{}' on slot {}",
+                                declared.as_str(),
+                                bound.as_str(),
+                                binding.index
+                            )));
+                        }
+                    }
+                    (Some(_), None) => {
+                        return Err(invalid(&format!(
+                            "slot {} records an unknown purpose for this binding; dispatch the declaration as a new bound assignment instead of changing the retained binding",
+                            binding.index
+                        )));
+                    }
+                    (None, Some(bound)) => effective.purpose = Some(bound.to_owned()),
+                    (None, None) => {}
+                }
+            }
             let context = executor_assignment::AssignmentContext {
                 checkout: &binding.path,
                 base: &binding.base,
@@ -2113,8 +3214,11 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
             // The brief heading names the role the conversation actually
             // runs as; the declared contract itself is identical.
             match request.role {
-                Role::Executor => executor_assignment::brief(assignment, &context),
-                Role::Lead => executor_assignment::lead_brief(assignment, &context),
+                Role::Executor => executor_assignment::brief(&effective, &context),
+                Role::Lead => executor_assignment::lead_brief(&effective, &context),
+                Role::ExecutorSelfReflection | Role::LeadSelfReflection => Err(invalid(
+                    "reflection roles are not executor or lead dispatches",
+                )),
             }
         }
     }
@@ -2498,6 +3602,14 @@ fn role_title(role: Role, profile: &str, owner: &str) -> String {
     match role {
         Role::Executor => executor_title(profile, owner),
         Role::Lead => lead_dispatch_title(profile, owner),
+        Role::ExecutorSelfReflection => bounded_owner_title(
+            format!("ERefl ({}) - ", bounded_title_component(profile, 16)),
+            owner,
+        ),
+        Role::LeadSelfReflection => bounded_owner_title(
+            format!("LRefl ({}) - ", bounded_title_component(profile, 16)),
+            owner,
+        ),
     }
 }
 
@@ -2710,18 +3822,14 @@ fn held_binding<'a>(
     })
 }
 
-/// Slot indexes and owners of the repository's active executor runs: a run is
-/// active while its host lease is live or its dispatch still holds an
-/// exclusive startup claim. A held, suspended or cleanly exited task keeps
-/// pool capacity but not concurrency, and an ordinary task's held position
-/// never consumes it. `replacing` names the slot this dispatch reactivates,
-/// which does not count against itself.
+/// Active ordinary hosts/startup claims and admitted reflection stages share
+/// one repository concurrency allowance. Held worktrees alone do not consume it.
 fn active_executor_runs(
     codex_home: &Path,
     repository: &Path,
     pool_size: u32,
     replacing: Option<u32>,
-) -> io::Result<Vec<(u32, String)>> {
+) -> io::Result<Vec<String>> {
     let mut active = Vec::new();
     for index in 1..=pool_size.min(task_worktree::MAX_POOL_SLOTS) {
         if Some(index) == replacing {
@@ -2731,7 +3839,7 @@ fn active_executor_runs(
         if let Some(lease) = lease
             && lease_live(&lease)
         {
-            active.push((index, lease.owner));
+            active.push(format!("slot {index} is running '{}'", lease.owner));
             continue;
         }
         let Some(record) = task_worktree::load_slot_record(codex_home, repository, index)? else {
@@ -2745,41 +3853,50 @@ fn active_executor_runs(
             .as_ref()
             .is_some_and(task_worktree::startup_exclusive)
         {
-            active.push((index, owner));
+            active.push(format!("slot {index} is running '{owner}'"));
         }
     }
+    active.extend(reflection_admission::active(codex_home, repository)?);
     Ok(active)
 }
 
-/// Executor admission is separate from pool capacity: `max_concurrent_executors`
-/// bounds active runs, so one lead (or a successor with the same configuration)
-/// cannot multiply the allowance by dispatching along free pool slots. A
-/// bounded lead conversation counts as one active run like any other dispatch.
+/// Ordinary and bounded-lead dispatch use the same counter as reflection.
+/// Callers hold the repository admission lock through reservation publication.
 fn admit_executor_run(request: &Dispatch, replacing: Option<u32>) -> io::Result<()> {
-    let active = active_executor_runs(
+    admit_active_run(
         request.codex_home,
         request.repository,
         request.pool_size,
+        request.max_concurrency,
         replacing,
-    )?;
-    let limit = request.max_concurrency.max(1);
+        request.role,
+    )
+}
+
+fn admit_active_run(
+    home: &Path,
+    repository: &Path,
+    pool_size: u32,
+    max_concurrency: u32,
+    replacing: Option<u32>,
+    role: Role,
+) -> io::Result<()> {
+    let active = active_executor_runs(home, repository, pool_size, replacing)?;
+    let limit = max_concurrency.max(1);
     if active.len() as u32 >= limit {
-        let runs = active
-            .iter()
-            .map(|(index, owner)| format!("slot {index} is running '{owner}'"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        // A bounded lead conversation consumes the same active-run allowance
-        // as an executor run; the refusal names the shared limit truthfully
-        // for both roles.
-        let subject = match request.role {
+        let subject = match role {
             Role::Executor => "executor concurrency",
             Role::Lead => "run concurrency",
+            Role::ExecutorSelfReflection | Role::LeadSelfReflection => "reflection concurrency",
         };
-        return Err(invalid(&format!(
-            "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {runs}; a free pool slot does not grant another active run - stop or wait for a run",
-            active.len()
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            invalid(&format!(
+                "{subject} is full: {} of {limit} active runs (max_concurrent_executors): {}; a free pool slot does not grant another active run - stop or wait for a run",
+                active.len(),
+                active.join("; "),
+            )),
+        ));
     }
     Ok(())
 }
@@ -2796,6 +3913,31 @@ fn refuse_a_live_owner(codex_home: &Path, source: &Path, owner: &str) -> io::Res
         ))),
         None => Ok(()),
     }
+}
+
+/// A slot is hosted by at most one live identity. The exact owner is refused
+/// by `refuse_a_live_owner`; this sibling check closes a live lease held by a
+/// different identity on the same slot before a continuation adopts it.
+fn refuse_a_live_slot(codex_home: &Path, source: &Path, slot: u32, owner: &str) -> io::Result<()> {
+    let dir = task_worktree::pool_state_dir(codex_home, source)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for lease in entries
+        .flatten()
+        .filter_map(|entry| read_lease(&entry.path()))
+    {
+        if lease.index == slot && lease.owner != owner && lease_live(&lease) {
+            return Err(invalid(&format!(
+                "slot {slot} is already live in session {} ({}); stop it before continuing the recorded owner {owner}",
+                lease.owner,
+                lease.path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Process identity of the session host that holds a slot. The lease is what
@@ -2841,6 +3983,122 @@ fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPath
         result: dir.join(format!("message-{index}.txt")),
         detail: dir.join(format!("stream-{index}.jsonl")),
     })
+}
+
+/// Resolve one recorded pool slot's receipt and visible detail stream through
+/// the exact existing pool state resolver. The caller must still verify the
+/// receipt's generation, slot, owner, session and turn before treating the
+/// stream as that completion's evidence.
+pub(crate) fn pool_evidence_paths(
+    codex_home: &Path,
+    source: &Path,
+    slot: u32,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let paths = run_paths(codex_home, source, slot)?;
+    Ok((paths.receipt, paths.detail))
+}
+
+/// Builds one run's exact completion facts from its terminal dispatch receipt
+/// and hands them to the durable completion owner under the pool state root.
+/// The captured `originatingLead.runGeneration` is the run identity; the slot
+/// index and its files are provenance only and may be reused afterwards.
+pub(crate) fn retain_terminal_completion(
+    receipt: &Path,
+    run: &RunObservation,
+) -> io::Result<Option<task_worktree::RetainedCompletion>> {
+    let value = observation::read_receipt_value(receipt)?;
+    let Some(generation) = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let slot = &value["slot"];
+    if slot.is_null() {
+        return Ok(None);
+    }
+    let state_dir = receipt
+        .parent()
+        .ok_or_else(|| invalid("dispatch receipt has no state directory"))?;
+    let index = slot["index"]
+        .as_u64()
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| {
+            invalid(
+                "the receipt's slot binding records no pool index; completion facts were not retained",
+            )
+        })?;
+    let owner = slot["owner"]
+        .as_str()
+        .filter(|owner| !owner.trim().is_empty())
+        .ok_or_else(|| {
+            invalid(
+                "the receipt's slot binding records no owner; completion facts were not retained",
+            )
+        })?;
+    let checkout = slot["path"]
+        .as_str()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            invalid(
+                "the receipt's slot binding records no checkout path; completion facts were not retained",
+            )
+        })?;
+    let assignment = match slot.get("assignment").filter(|value| !value.is_null()) {
+        Some(value) => Some(
+            serde_json::from_value::<task_worktree::SlotAssignmentBinding>(value.clone()).map_err(
+                |error| {
+                    invalid(&format!(
+                        "the receipt's board assignment binding is not readable, so completion facts were not retained: {error}"
+                    ))
+                },
+            )?,
+        ),
+        None => None,
+    };
+    let submitted_assignment = value["control"]["submittedAssignment"]
+        .as_object()
+        .and_then(|_| {
+            serde_json::from_value::<task_worktree::AssignmentSubmission>(
+                value["control"]["submittedAssignment"].clone(),
+            )
+            .ok()
+        });
+    let facts = task_worktree::CompletionFacts {
+        run_generation: generation.to_owned(),
+        slot: index,
+        owner: owner.to_owned(),
+        checkout,
+        task: slot["task"].as_str().map(str::to_owned),
+        handle: slot["handle"].as_str().map(str::to_owned),
+        assignment,
+        submitted_assignment,
+        role: value["control"]["role"]["role"].as_str().map(str::to_owned),
+        state: run.state.clone(),
+        exit_code: run.exit_code,
+        session: run.session.clone(),
+        turn: run.turn.clone(),
+        result: run.result.clone(),
+    };
+    task_worktree::retain_completion(state_dir, &facts).map(Some)
+}
+
+/// One visible, bounded note for a run whose completion was retained as
+/// ineligible or could not be retained at all. It never changes the run's own
+/// outcome, its receipt, or the ordinary output already produced.
+pub(crate) fn completion_retention_note(receipt: &Path, run: &RunObservation) -> Option<String> {
+    match retain_terminal_completion(receipt, run) {
+        Ok(Some(retained)) if !retained.eligibility.eligible => Some(format!(
+            "completion {} is retained but not acceptance-eligible: {}",
+            retained.run_generation,
+            retained.eligibility.reasons.join("; ")
+        )),
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "completion facts were not retained; the run's own output is unchanged: {error}"
+        )),
+    }
 }
 
 /// Record this process as the live host of a bound slot. A slot that was
@@ -2965,15 +4223,15 @@ fn lease_live(lease: &SessionLease) -> bool {
     }
 }
 
-/// The live lease of one owner, if a host process holds it: the pool core asks
-/// liveness per owner, so every lease in the kit-local state directory counts.
+/// A live worktree owner's host lease. Reflection stage admission has no
+/// worktree position and must not be adopted as an ordinary owner binding.
 fn live_lease(codex_home: &Path, source: &Path, owner: &str) -> Option<SessionLease> {
     let dir = task_worktree::pool_state_dir(codex_home, source).ok()?;
     let entries = fs::read_dir(&dir).ok()?;
     entries
         .flatten()
         .filter_map(|entry| read_lease(&entry.path()))
-        .find(|lease| lease.owner == owner && lease_live(lease))
+        .find(|lease| lease.index != 0 && lease.owner == owner && lease_live(lease))
 }
 
 /// Is the recorded owner's host process still running? Shared with the
@@ -4733,7 +5991,7 @@ impl std::fmt::Display for FrontendLost {
 
 impl std::error::Error for FrontendLost {}
 
-struct OwnedFrontend {
+pub(crate) struct OwnedFrontend {
     job: Option<Job>,
     process: harness_core::process::OwnedProcess,
     program: PathBuf,
@@ -4749,10 +6007,11 @@ struct OwnedFrontend {
 /// suppression, and a managed lead session keeps the native agent capability
 /// of the interactive CLI it hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrontendRole {
+pub(crate) enum FrontendRole {
     Executor,
     BoundedLead,
     Lead,
+    Reflection,
 }
 
 impl FrontendRole {
@@ -4765,6 +6024,7 @@ impl FrontendRole {
             Self::Executor => "The assignment was not submitted",
             Self::BoundedLead => "No bounded lead conversation was exposed",
             Self::Lead => "No lead session was exposed",
+            Self::Reflection => "No reflection conversation was exposed",
         }
     }
 }
@@ -4774,7 +6034,7 @@ impl OwnedFrontend {
         self.process.identity()
     }
 
-    fn is_running(&self) -> io::Result<bool> {
+    pub(crate) fn is_running(&self) -> io::Result<bool> {
         self.process.is_running()
     }
 
@@ -4789,11 +6049,11 @@ impl OwnedFrontend {
     }
 
     /// The frontend's own exit code, when it already exited.
-    fn exit_code(&self) -> io::Result<Option<u32>> {
+    pub(crate) fn exit_code(&self) -> io::Result<Option<u32>> {
         self.process.exit_code()
     }
 
-    fn close(mut self) -> io::Result<()> {
+    pub(crate) fn close(mut self) -> io::Result<()> {
         if let Some(job) = self.job.take() {
             job.terminate(0, CONTROL_CLEANUP)?;
         }
@@ -4893,7 +6153,7 @@ fn write_frontend_record(
     )
 }
 
-fn note_log(log: &Path, line: &str) {
+pub(crate) fn note_log(log: &Path, line: &str) {
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log) {
         let _ = writeln!(file, "{line}");
     }
@@ -4903,7 +6163,7 @@ fn note_log(log: &Path, line: &str) {
 /// Message and stop resolve the slot's endpoint file; leaving the previous
 /// port, token or process in place would let that address act on the successor.
 /// A missing file is the first run of the slot.
-fn retire_stale_endpoint(path: &Path) -> io::Result<()> {
+pub(crate) fn retire_stale_endpoint(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -4935,7 +6195,7 @@ fn fail_with_frontend(
 /// lead frontends pin `agents.enabled=false`; the managed lead's own frontend
 /// keeps the native agent capability. That config override is not a permission
 /// override.
-fn attach_owned_frontend(
+pub(crate) fn attach_owned_frontend(
     plan: &ControlPlan,
     conversation: &Conversation,
     presentation: NativePresentation,
@@ -4983,7 +6243,7 @@ fn attach_owned_frontend(
                 ))
             })?,
         ),
-        FrontendRole::BoundedLead | FrontendRole::Lead => None,
+        FrontendRole::BoundedLead | FrontendRole::Lead | FrontendRole::Reflection => None,
     };
     let frontend_port = relay
         .as_ref()
@@ -5009,13 +6269,25 @@ fn attach_owned_frontend(
     for name in INHERITED_SESSION_ENV {
         spec.env.insert((*name).into(), None);
     }
-    if matches!(role, FrontendRole::Lead | FrontendRole::BoundedLead) {
+    if matches!(
+        role,
+        FrontendRole::Lead | FrontendRole::BoundedLead | FrontendRole::Reflection
+    ) {
         // A lead-role frontend must not inherit an executor marker: its
         // app-server has none, and a frontend that carried one would make the
         // lead's own nested CLI invocations look like executor sessions. An
         // executor frontend keeps the marker it was started with.
         spec.env.insert(EXECUTOR_SESSION_ENV.into(), None);
         spec.env.insert(control::EXECUTOR_RUN_ENV.into(), None);
+    }
+    if role == FrontendRole::Reflection {
+        // The frontend's own nested invocations must recognize the read-only
+        // reflection session and refuse dispatch or state mutations, exactly
+        // as the app-server child does for this stage.
+        spec.env.insert(
+            crate::self_reflection_cli::REFLECTION_SESSION_ENV.into(),
+            Some("1".into()),
+        );
     }
     spec.env
         .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
@@ -5033,6 +6305,95 @@ fn attach_owned_frontend(
         process,
         program: upstream,
         relay,
+    })
+}
+
+/// Attaches the native frontend without choosing its thread. The relay learns
+/// the exact identity from the frontend's own successful new/resume/fork
+/// response and runs `observer` before releasing that success to the frontend.
+/// The prepared TUI arguments, including a native profile, prompt and `--`
+/// separator, stay verbatim after the relay address; no resume target or model
+/// override is synthesized here.
+pub(crate) fn attach_observed_frontend(
+    plan: &ControlPlan,
+    frontend_cwd: &Path,
+    tui: &[OsString],
+    conversation: &Conversation,
+    observer: SelectionObserver,
+) -> io::Result<OwnedFrontend> {
+    if !io::stdout().is_terminal() || harness_core::task_control::console_caption()?.is_none() {
+        return Err(invalid(
+            "this host has no live terminal surface for the native frontend; run it in its own terminal instead of a redirected pipe",
+        ));
+    }
+    let upstream = upstream_executable(&plan.home).map_err(|error| {
+        invalid(&format!(
+            "native frontend attachment is unavailable ({error}). Remedy: restore harness/native-launch.json for this CODEX_HOME and retry"
+        ))
+    })?;
+    if !upstream.is_file() {
+        return Err(invalid(&format!(
+            "the registered native Codex frontend is missing: {}; restore the installed upstream and retry",
+            upstream.display()
+        )));
+    }
+    let relay = Relay::start_observed(
+        conversation.endpoint().port(),
+        conversation.endpoint().token(),
+        observer,
+    )
+    .map_err(|error| {
+        invalid(&format!(
+            "the native selection relay could not front this conversation: {error}; the frontend was not started and the selected thread was not registered"
+        ))
+    })?;
+    let mut spec = CommandSpec::new(&upstream);
+    spec.inherit_console = true;
+    spec.current_dir = Some(frontend_cwd.to_owned());
+    let mut args = vec![
+        OsString::from("--remote"),
+        OsString::from(format!("ws://127.0.0.1:{}", relay.port())),
+        OsString::from("--remote-auth-token-env"),
+        OsString::from(FRONTEND_TOKEN_ENV),
+    ];
+    args.extend(tui.iter().cloned());
+    spec.args = args;
+    spec.env.insert(
+        "CODEX_HOME".into(),
+        Some(plan.home.as_os_str().to_os_string()),
+    );
+    spec.env.insert(
+        FRONTEND_TOKEN_ENV.into(),
+        Some(conversation.endpoint().token().into()),
+    );
+    if let Some(Some(path)) = plan.env.get(&OsString::from("PATH")) {
+        spec.env.insert("PATH".into(), Some(path.clone()));
+    }
+    for name in INHERITED_SESSION_ENV {
+        spec.env.insert((*name).into(), None);
+    }
+    spec.env.insert(EXECUTOR_SESSION_ENV.into(), None);
+    spec.env.insert(control::EXECUTOR_RUN_ENV.into(), None);
+    spec.env.insert(BOUNDED_LEAD_SESSION_ENV.into(), None);
+    spec.env.insert(
+        crate::self_reflection_cli::REFLECTION_SESSION_ENV.into(),
+        None,
+    );
+    spec.env
+        .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
+    spec.env
+        .insert("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE".into(), None);
+    let job = Job::new(Limits::default())?;
+    let process = job.spawn(&spec).map_err(|error| {
+        invalid(&format!(
+            "the native frontend did not start: {error}; the selected thread was not registered"
+        ))
+    })?;
+    Ok(OwnedFrontend {
+        job: Some(job),
+        process,
+        program: upstream,
+        relay: Some(relay),
     })
 }
 
@@ -5059,7 +6420,10 @@ fn frontend_args(
         "-c".into(),
         "features.worktrees=false".into(),
     ];
-    if matches!(role, FrontendRole::Executor | FrontendRole::BoundedLead) {
+    if matches!(
+        role,
+        FrontendRole::Executor | FrontendRole::BoundedLead | FrontendRole::Reflection
+    ) {
         // Every frontend but the managed lead's own keeps the native agent
         // capability off: an executor or bounded lead conversation must not
         // re-expose the child-spawn tools through its own configuration.
@@ -5074,7 +6438,7 @@ fn frontend_args(
     args
 }
 
-fn wait_for_frontend(
+pub(crate) fn wait_for_frontend(
     frontend: &OwnedFrontend,
     conversation: &mut Conversation,
     resume_existing: bool,
@@ -5167,7 +6531,13 @@ fn host_control_conversation(
     // the successor is spawned so message and stop cannot reach this
     // conversation through the old port, token or process.
     if let Err(error) = retire_stale_endpoint(&plan.paths.endpoint) {
-        return fail_control(receipt, &mut tracker, error.to_string(), plan, None);
+        return fail_control_before_submission(
+            receipt,
+            &mut tracker,
+            error.to_string(),
+            plan,
+            None,
+        );
     }
     let job = Job::new(Limits::default())?;
     let started = match control.resume_session.as_deref() {
@@ -5181,7 +6551,9 @@ fn host_control_conversation(
     };
     let mut conversation = match started {
         Ok(conversation) => conversation,
-        Err(error) => return fail_control(receipt, &mut tracker, error, plan, Some(job)),
+        Err(error) => {
+            return fail_control_before_submission(receipt, &mut tracker, error, plan, Some(job));
+        }
     };
     // The thread identity exists before the first model request and is what
     // the receipt, the visible surface and the resume remedy name. A resume
@@ -5190,7 +6562,7 @@ fn host_control_conversation(
     if let Some(expected) = control.resume_session.as_deref()
         && thread != expected
     {
-        return fail_control(
+        return fail_control_before_submission(
             receipt,
             &mut tracker,
             format!(
@@ -5213,7 +6585,7 @@ fn host_control_conversation(
         match observation::cache::Monitor::new(receipt, &plan.home, Some(&cache_log)) {
             Ok(monitor) => monitor,
             Err(error) => {
-                return fail_control(
+                return fail_control_before_submission(
                     receipt,
                     &mut tracker,
                     format!("the cache-guard monitor could not start: {error}"),
@@ -5226,7 +6598,7 @@ fn host_control_conversation(
     tracker.observation.state = STATE_STARTED.into();
     tracker.observation.updated_ms = observation::now_ms();
     if let Err(error) = observation::update_receipt(receipt, &tracker.observation) {
-        return fail_control(
+        return fail_control_before_submission(
             receipt,
             &mut tracker,
             format!("the native identity record could not be written: {error}"),
@@ -5239,7 +6611,13 @@ fn host_control_conversation(
     // assignment is submitted: a record that does not is a broken address, not
     // a cosmetic detail.
     if let Err(error) = verify_recorded_endpoint(plan, &conversation) {
-        return fail_control(receipt, &mut tracker, format!("{error}"), plan, Some(job));
+        return fail_control_before_submission(
+            receipt,
+            &mut tracker,
+            format!("{error}"),
+            plan,
+            Some(job),
+        );
     }
     let backend = control::app_server_spec(plan, conversation.endpoint().port());
     let backend_args = backend
@@ -5262,7 +6640,7 @@ fn host_control_conversation(
     let mut frontend = None;
     if attach_frontend {
         if let Err(error) = conversation.prepare_named_empty(&plan.slot) {
-            return fail_control(
+            return fail_control_before_submission(
                 receipt,
                 &mut tracker,
                 format!(
@@ -5292,13 +6670,19 @@ fn host_control_conversation(
                     &plan.title,
                 ) {
                     let _ = attached.close();
-                    return fail_control(receipt, &mut tracker, error.to_string(), plan, Some(job));
+                    return fail_control_before_submission(
+                        receipt,
+                        &mut tracker,
+                        error.to_string(),
+                        plan,
+                        Some(job),
+                    );
                 }
                 if let Err(error) =
                     write_frontend_record(plan, &attached, conversation.thread_id(), "attached")
                 {
                     let _ = attached.close();
-                    return fail_control(
+                    return fail_control_before_submission(
                         receipt,
                         &mut tracker,
                         format!(
@@ -5315,10 +6699,12 @@ fn host_control_conversation(
                     && let Err(error) = monitor.set_warnings(attached.warnings())
                 {
                     let _ = attached.close();
-                    return fail_control(
+                    return fail_control_before_submission(
                         receipt,
                         &mut tracker,
-                        format!("the cache-guard warning surface could not be recorded: {error}"),
+                        format!(
+                            "the cache-guard warning surface could not be recorded: {error}; the assignment was not submitted"
+                        ),
                         plan,
                         Some(job),
                     );
@@ -5326,7 +6712,13 @@ fn host_control_conversation(
                 frontend = Some(attached);
             }
             Err(error) => {
-                return fail_control(receipt, &mut tracker, error.to_string(), plan, Some(job));
+                return fail_control_before_submission(
+                    receipt,
+                    &mut tracker,
+                    error.to_string(),
+                    plan,
+                    Some(job),
+                );
             }
         }
     }
@@ -5405,6 +6797,7 @@ fn host_control_conversation(
     // thread's items, never from a transport acknowledgement; the surface
     // already held the terminal record through its tail grace, so the
     // accepted turn's items are read directly at this boundary.
+    let accepted_turn = conversation.turn().map(|turn| turn.turn_id.clone());
     let (final_message, cause) = match state {
         Lifecycle::Completed => match conversation.final_message() {
             Ok(FinalMessage::Present(text)) => {
@@ -5446,10 +6839,18 @@ fn host_control_conversation(
     };
     let exit = tracker.finish_control(&ControlOutcome {
         state: state.receipt_state(),
+        turn: accepted_turn.as_deref(),
         final_message,
         cause: cause.as_deref(),
     });
     let record = observation::update_receipt(receipt, &tracker.observation);
+    // Retain this run's exact completion facts beside the run generation.
+    // This is best effort: retention never rewrites the run's outcome.
+    let completion_note = if record.is_ok() {
+        completion_retention_note(receipt, &tracker.observation)
+    } else {
+        None
+    };
     let attached = frontend.is_some();
     if record.is_ok()
         && let Some(frontend) = frontend.as_ref()
@@ -5515,6 +6916,13 @@ fn host_control_conversation(
             "the terminal run record could not be written: {error}; control log: {}",
             plan.paths.log.display()
         )));
+    }
+    if let Some(note) = completion_note {
+        if attached {
+            note_log(&plan.paths.log, &format!("completion retention: {note}"));
+        } else {
+            let _ = writeln!(stdout, "note: {note}");
+        }
     }
     stdout.flush()?;
     Ok(exit)
@@ -5827,6 +7235,22 @@ fn completed_agent_message(event: &control::ControlEvent) -> Option<String> {
     Some(text.to_owned())
 }
 
+/// Fails one control-backed run that provably never reached the assignment
+/// submission. The explicit marker is recorded with the failure so a later
+/// reconciliation can distinguish this generation from an unknown one. Call
+/// only from branches before `conversation.assign`; the assign error branch is
+/// ambiguous and must keep the generic failure.
+fn fail_control_before_submission(
+    receipt: &Path,
+    tracker: &mut RunTracker,
+    cause: String,
+    plan: &ControlPlan,
+    job: Option<Job>,
+) -> io::Result<i32> {
+    tracker.fail_before_submission(cause.clone());
+    fail_control(receipt, tracker, cause, plan, job)
+}
+
 /// Fails one control-backed run honestly: the receipt records a failed state
 /// with the cause and no exit code, the visible surface names the failure, the
 /// control log and the next action, and an owned tree is terminated. This host
@@ -5887,7 +7311,11 @@ fn fail_control(
 /// session's remaining members keep their own lifetime exactly as they do
 /// after an ordinary launcher exit on the JSONL route. The child is ended only
 /// when its live identity matches the one this host spawned.
-fn end_owned_child(job: Job, conversation: &Conversation, program: &Path) -> io::Result<()> {
+pub(crate) fn end_owned_child(
+    job: Job,
+    conversation: &Conversation,
+    program: &Path,
+) -> io::Result<()> {
     let Some(child) = conversation.process() else {
         return Ok(());
     };
@@ -7650,6 +9078,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         let text = resolve_prompt(&request, &binding).unwrap();
         assert!(text.starts_with("finish the sample outcome"), "{text}");
@@ -7824,6 +9253,7 @@ mod tests {
         for name in ["--source", "--codex-home", "--session", "--exec"] {
             assert!(message.contains(name), "{message}");
         }
+        assert!(message.contains("--once"), "{message}");
         let missing = lead_start(&[OsString::from("--session")]).unwrap_err();
         assert!(
             missing
@@ -7837,6 +9267,8 @@ mod tests {
         assert!(LEAD_START_USAGE.contains("--session THREAD_ID"));
         assert!(LEAD_START_USAGE.contains("--exec PROMPT"));
         assert!(LEAD_START_USAGE.contains("after the frontend attaches"));
+        assert!(LEAD_START_USAGE.contains("--once"));
+        assert!(LEAD_START_USAGE.contains("persistent"));
         assert!(lead_start(&[OsString::from("--help")]).is_ok());
         // The title a managed conversation carries names its profile and the
         // checkout it works in, exactly as an executor title names its owner.
@@ -7855,6 +9287,33 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(request.prompt.as_deref(), Some("first line\nsecond line\n"));
+        assert!(!request.once, "a managed lead stays persistent by default");
+        let once = parse_lead_start(&[
+            OsString::from("--codex-home"),
+            root.path().as_os_str().to_owned(),
+            OsString::from("--exec"),
+            OsString::from("one finite turn"),
+            OsString::from("--once"),
+        ])
+        .unwrap();
+        assert!(once.once);
+        assert_eq!(once.prompt.as_deref(), Some("one finite turn"));
+        // A finite session without the assigned prompt would have no turn to
+        // observe and could only wait forever; it is refused before any
+        // app-server or frontend starts.
+        let missing_prompt = parse_lead_start(&[
+            OsString::from("--codex-home"),
+            root.path().as_os_str().to_owned(),
+            OsString::from("--once"),
+        ])
+        .err()
+        .expect("a finite session requires its exact first prompt");
+        assert!(
+            missing_prompt
+                .to_string()
+                .contains("--once requires the exact first prompt"),
+            "{missing_prompt}"
+        );
         let conflict = parse_lead_start(&[
             OsString::from("--codex-home"),
             root.path().as_os_str().to_owned(),
@@ -8850,6 +10309,7 @@ mod tests {
             schema: CONTROL_SCHEMA,
             assignment: assignment.to_owned(),
             original_assignment: None,
+            submitted_assignment: Some(task_worktree::AssignmentSubmission::free_text()),
             identity: BoundIdentity::resolve(&bound),
             presentation: NativePresentation::NativeInline,
             port: None,
@@ -8929,6 +10389,7 @@ mod tests {
                 schema: CONTROL_SCHEMA,
                 assignment: assignment.to_owned(),
                 original_assignment: None,
+                submitted_assignment: Some(task_worktree::AssignmentSubmission::free_text()),
                 identity: BoundIdentity::resolve(&bound),
                 presentation: NativePresentation::NativeTui,
                 port: None,
@@ -9248,6 +10709,7 @@ mod tests {
                     schema: CONTROL_SCHEMA,
                     assignment: "Continue the outcome.".into(),
                     original_assignment: None,
+                    submitted_assignment: Some(task_worktree::AssignmentSubmission::free_text()),
                     identity: BoundIdentity::resolve(&bound),
                     presentation: NativePresentation::NativeTui,
                     port: None,
@@ -9528,6 +10990,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         let line = slot_summary(Role::Executor, &binding, None);
         for expected in [
@@ -9565,6 +11028,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         assert!(
             record_lease(&home, &binding).is_err(),
@@ -9635,6 +11099,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         // A hand-edited receipt meets the slot state reconciliation leaves
         // behind: no owner, so no ownership comparison can ever succeed.
@@ -9711,7 +11176,14 @@ mod tests {
         let predecessor = json!({
             "control": {"assignment": prompt, "originalAssignment": prompt}
         });
-        let resume = continuation_route(false, prompt, session, &predecessor, identity.clone());
+        let resume = continuation_route(
+            false,
+            prompt,
+            session,
+            &predecessor,
+            identity.clone(),
+            task_worktree::AssignmentSubmission::structured("fixture-assignment-hash"),
+        );
         let HostRoute::Control(control) = &resume;
         assert!(
             resume.args().is_empty(),
@@ -9721,15 +11193,34 @@ mod tests {
         assert_eq!(control.resume_session.as_deref(), Some(session));
         assert_eq!(control.assignment, prompt);
         assert!(control.original_assignment.is_none());
+        assert_eq!(
+            control.submitted_assignment,
+            Some(task_worktree::AssignmentSubmission::structured(
+                "fixture-assignment-hash"
+            )),
+            "resume preserves the structured assignment identity"
+        );
         assert!(!control.assignment.contains("fresh conversation"));
 
-        let restart = continuation_route(true, prompt, session, &predecessor, identity);
+        let restart = continuation_route(
+            true,
+            prompt,
+            session,
+            &predecessor,
+            identity,
+            task_worktree::AssignmentSubmission::structured("fixture-assignment-hash"),
+        );
         let HostRoute::Control(control) = &restart;
         assert!(
             control.resume_session.is_none(),
             "restart must not resume the predecessor thread"
         );
         assert_eq!(control.original_assignment.as_deref(), Some(prompt));
+        assert_eq!(
+            control.submitted_assignment,
+            Some(task_worktree::AssignmentSubmission::restart()),
+            "a restart handoff is never the bound structured assignment"
+        );
         assert!(control.assignment.contains(session), "{control:?}");
         assert!(control.assignment.contains("do not reset"), "{control:?}");
         assert!(
@@ -9738,6 +11229,453 @@ mod tests {
         );
         assert_ne!(control.assignment, prompt);
         assert_eq!(control.presentation, NativePresentation::NativeTui);
+    }
+
+    /// Exercise the same wrapper body without the marker inherited by the
+    /// test process itself.
+    fn continue_lead_for_test(
+        request: &VisibleLeadContinuation,
+    ) -> io::Result<VisibleLeadContinuationAccepted> {
+        continue_visible_lead_conversation_with_markers(request, None, None)
+    }
+
+    struct LeadContinuationCase {
+        root: PathBuf,
+        source: PathBuf,
+        home: PathBuf,
+        binding: SlotBinding,
+        receipt: PathBuf,
+        session: String,
+    }
+
+    impl Drop for LeadContinuationCase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn lead_continuation_case(name: &str) -> LeadContinuationCase {
+        let root = std::env::temp_dir().join(format!(
+            "executor-lead-continuation-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("proj");
+        let home = root.join("home");
+        let checkout = root.join("proj-wt1");
+        fs::create_dir_all(source.join("global")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(
+            source.join("global/orchestration.toml"),
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nworktree_pool_size = 1\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\n",
+        )
+        .unwrap();
+        let binding = SlotBinding {
+            index: 1,
+            path: checkout,
+            source: source.clone(),
+            repository: Some(source.clone()),
+            owner: "lead-exp-1".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+            task: None,
+            handle: None,
+            assignment: None,
+        };
+        write_test_slot_record(&home, &source, &binding);
+        let receipt = run_paths(&home, &source, 1).unwrap().receipt;
+        fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4".to_owned();
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&lead_continuation_receipt(&binding, "gen-1", &session))
+                .unwrap(),
+        )
+        .unwrap();
+        LeadContinuationCase {
+            root,
+            source,
+            home,
+            binding,
+            receipt,
+            session,
+        }
+    }
+
+    fn lead_continuation_receipt(
+        binding: &SlotBinding,
+        generation: &str,
+        session: &str,
+    ) -> serde_json::Value {
+        json!({
+            "schema": 1,
+            "profile": "default",
+            "slot": {
+                "index": binding.index,
+                "owner": binding.owner,
+                "path": binding.path,
+            },
+            "control": {
+                "schema": 1,
+                "assignment": "frame the measured unit",
+                "identity": {
+                    "profile": "default",
+                    "model": null,
+                    "modelProvider": null,
+                    "reasoningEffort": null,
+                },
+                "presentation": "native-tui",
+                "role": {
+                    "role": "lead",
+                    "revision": "fixture-revision",
+                    "args": [],
+                    "saved": "fixture-revision",
+                },
+                "resumeSession": null,
+            },
+            "observation": {
+                "coverage": "native",
+                "state": "completed",
+                "session": session,
+            },
+            "originatingLead": {"runGeneration": generation},
+        })
+    }
+
+    fn lead_continuation_request(case: &LeadContinuationCase) -> VisibleLeadContinuation {
+        VisibleLeadContinuation {
+            codex_home: case.home.clone(),
+            source: case.source.clone(),
+            slot: 1,
+            owner: "lead-exp-1".into(),
+            session: case.session.clone(),
+            prompt: "Review the executor result and decide whether it is accepted.".into(),
+        }
+    }
+
+    /// A continuation never adopts a slot from a mismatched receipt or slot
+    /// binding. Every refusal happens before the shared continuation owner can
+    /// record a new generation or touch the preserved work.
+    #[test]
+    fn lead_continuation_refuses_mismatched_identity_before_effects() {
+        let case = lead_continuation_case("identity");
+        let original_receipt = fs::read(&case.receipt).unwrap();
+        let slot_record = task_worktree::slot_record_path(&case.home, &case.source, 1).unwrap();
+        let original_slot = fs::read(&slot_record).unwrap();
+
+        let mut request = lead_continuation_request(&case);
+        request.owner = "lead-other".into();
+        let error = continue_lead_for_test(&request).unwrap_err().to_string();
+        assert!(
+            error.contains("recorded for owner lead-exp-1, not lead-other"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+        assert_eq!(fs::read(&slot_record).unwrap(), original_slot);
+
+        request = lead_continuation_request(&case);
+        request.session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23ff".into();
+        let error = continue_lead_for_test(&request).unwrap_err().to_string();
+        assert!(error.contains("not the exact requested session"), "{error}");
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["profile"] = json!("ds");
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uses profile ds"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["control"]["role"]["role"] = json!("executor");
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records role executor, not lead"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["control"]["role"] = serde_json::Value::Null;
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not record its responsibility role"),
+            "{error}"
+        );
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let slot_two = run_paths(&case.home, &case.source, 2).unwrap().receipt;
+        fs::create_dir_all(slot_two.parent().unwrap()).unwrap();
+        fs::write(&slot_two, &original_receipt).unwrap();
+        request = lead_continuation_request(&case);
+        request.slot = 2;
+        let error = continue_lead_for_test(&request).unwrap_err().to_string();
+        assert!(
+            error.contains("records slot 1, not the requested slot 2"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&slot_two).unwrap(), original_receipt);
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["originatingLead"] = serde_json::Value::Null;
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records no run generation"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        receipt["observation"] = json!({"coverage": "native", "state": "completed"});
+        fs::write(&case.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records no exact session"), "{error}");
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        let mut record: serde_json::Value = serde_json::from_slice(&original_slot).unwrap();
+        record["owner"] = json!("lead-other");
+        fs::write(&slot_record, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("slot record binds slot 1 to lead-other, not lead-exp-1"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+        fs::write(&slot_record, &original_slot).unwrap();
+    }
+
+    /// Both forms of live ownership refuse before an effect: the exact owner
+    /// already hosting the slot and a different identity holding the same
+    /// slot.
+    #[test]
+    fn lead_continuation_refuses_a_live_slot_before_effects() {
+        let case = lead_continuation_case("live");
+        let original = fs::read(&case.receipt).unwrap();
+        record_lease(&case.home, &case.binding).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already live in slot 1"), "{error}");
+        assert_eq!(fs::read(&case.receipt).unwrap(), original);
+        remove_lease(&case.home, &case.binding).unwrap();
+
+        let program = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        let path = lease_path(&case.home, &case.source, 1).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&SessionLease {
+                schema: 1,
+                owner: "lead-other".into(),
+                index: 1,
+                path: case.binding.path.clone(),
+                pid: identity.pid,
+                created: identity.creation_time,
+                program,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("slot 1 is already live in session lead-other"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original);
+    }
+
+    /// A missing recorded conversation or slot binding cannot be adopted as a
+    /// fresh conversation: both refuse before a launch and leave the receipt
+    /// untouched.
+    #[test]
+    fn lead_continuation_refuses_absent_work_without_adopting_a_slot() {
+        let case = lead_continuation_case("absent");
+        let slot_record = task_worktree::slot_record_path(&case.home, &case.source, 1).unwrap();
+        let original_slot = fs::read(&slot_record).unwrap();
+        let original_receipt = fs::read(&case.receipt).unwrap();
+        fs::remove_file(&case.receipt).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no recorded lead conversation occupies slot 1"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&slot_record).unwrap(), original_slot);
+        fs::write(&case.receipt, &original_receipt).unwrap();
+
+        fs::remove_file(&slot_record).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has no recorded binding for owner lead-exp-1"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+        fs::write(&slot_record, &original_slot).unwrap();
+
+        fs::remove_dir_all(&case.binding.path).unwrap();
+        let error = continue_lead_for_test(&lead_continuation_request(&case))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("checkout") && error.contains("is missing"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&case.receipt).unwrap(), original_receipt);
+    }
+
+    /// A clean slot legitimately returns to the pool with no recorded owner.
+    /// The receipt, session, checkout and preserved binding still prove the
+    /// exact conversation, so continuation may rebind that owner through
+    /// `adopt_slot`; a different recorded owner is still refused.
+    #[test]
+    fn lead_continuation_predecessor_accepts_a_clean_slot_but_refuses_a_foreign_owner() {
+        let case = lead_continuation_case("clean-slot");
+        let slot_record = task_worktree::slot_record_path(&case.home, &case.source, 1).unwrap();
+        let original_slot = fs::read(&slot_record).unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&original_slot).unwrap();
+        record["state"] = json!("free");
+        record["owner"] = serde_json::Value::Null;
+        fs::write(&slot_record, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let predecessor = lead_continuation_predecessor(
+            &case.receipt,
+            &case.home,
+            &case.source,
+            1,
+            "lead-exp-1",
+            &case.session,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(predecessor.generation, "gen-1");
+
+        record["owner"] = json!("lead-other");
+        fs::write(&slot_record, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let error = lead_continuation_predecessor(
+            &case.receipt,
+            &case.home,
+            &case.source,
+            1,
+            "lead-exp-1",
+            &case.session,
+            "default",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("slot record binds slot 1 to lead-other, not lead-exp-1"),
+            "{error}"
+        );
+        fs::write(&slot_record, &original_slot).unwrap();
+    }
+
+    /// The accepted continuation is the newly written receipt, never the
+    /// predecessor: the same slot/owner/session, the configured lead profile,
+    /// `Role::Lead`, a resume route and a different run generation are all
+    /// required. A fresh conversation or identity fallback is refused.
+    #[test]
+    fn accepted_lead_continuation_requires_new_identity_and_exact_resume_route() {
+        let case = lead_continuation_case("accepted");
+        let request = lead_continuation_request(&case);
+        let paths = run_paths(&case.home, &case.source, 1).unwrap();
+        let mut receipt = lead_continuation_receipt(&case.binding, "gen-2", &case.session);
+        receipt["control"]["resumeSession"] = json!(case.session);
+        receipt["observation"]["previousSession"] = json!(case.session);
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+        let accepted =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap();
+        assert_eq!(accepted.slot, 1);
+        assert_eq!(accepted.owner, "lead-exp-1");
+        assert_eq!(accepted.session, case.session);
+        assert_eq!(accepted.generation, "gen-2");
+        assert_eq!(accepted.profile, "default");
+        assert_eq!(accepted.role, Role::Lead);
+        assert_eq!(accepted.receipt, paths.receipt);
+        assert_eq!(accepted.result, paths.result);
+        assert_eq!(accepted.detail, paths.detail);
+        assert_eq!(accepted.exit_code, 0);
+        assert_eq!(accepted.checkout, case.binding.path);
+
+        receipt["originatingLead"]["runGeneration"] = json!("gen-1");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("still carries the predecessor generation"),
+            "{error}"
+        );
+
+        receipt["originatingLead"]["runGeneration"] = json!("gen-2");
+        receipt["control"]["resumeSession"] = serde_json::Value::Null;
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("did not resume the exact lead session"),
+            "{error}"
+        );
+
+        receipt["control"]["resumeSession"] = json!(case.session);
+        receipt["control"]["originalAssignment"] = json!("restart the work");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("restart assignment"), "{error}");
+
+        receipt["control"]["originalAssignment"] = serde_json::Value::Null;
+        receipt["control"]["role"]["role"] = json!("executor");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("records role executor, not lead"), "{error}");
+
+        receipt["control"]["role"]["role"] = json!("lead");
+        receipt["profile"] = json!("ds");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("profile ds"), "{error}");
+
+        receipt["profile"] = json!("default");
+        receipt["observation"]["session"] = json!("01a0c719-f4d4-7880-a9d2-1a96ee0f23ff");
+        fs::write(&paths.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let error =
+            accepted_lead_continuation(&paths, &request, &case.session, "default", "gen-1", 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("conversation switch"), "{error}");
     }
 
     #[test]
@@ -9811,6 +11749,7 @@ mod tests {
             branch: Some("main".into()),
             task: None,
             handle: None,
+            assignment: None,
         };
         write_test_slot_record(&home, &source, &binding);
         let report = slot_report(
@@ -9967,6 +11906,7 @@ mod tests {
             branch: None,
             task: None,
             handle: None,
+            assignment: None,
         };
         let mut run = RunObservation::accepted(
             PathBuf::from(r"C:\s\message-1.txt"),

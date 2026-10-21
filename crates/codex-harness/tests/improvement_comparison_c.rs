@@ -99,6 +99,39 @@ fn comparison_preparation_requires_policy_qualification_and_workload_planning() 
 fn an_invalid_conjunction_declaration_is_refused_before_effects() {
     let _serial = INSTALL.lock().unwrap();
 
+    // The quality mode is an explicit boolean in the native policy file. An
+    // omitted mode or a string substitute cannot default to noninferiority.
+    for (name, malformed_mode) in [
+        ("conjunction-missing-mode", None),
+        ("conjunction-malformed-mode", Some(json!("false"))),
+    ] {
+        let fixture = Fixture::new(name);
+        let mut policy = load_json(&fixture.policy);
+        policy["objective"] = json!("quality");
+        let mut conjunction = json!({
+            "minimumTimeReductionPercent": 10.0,
+            "minimumTokenReductionPercent": 25.0,
+        });
+        if let Some(mode) = malformed_mode {
+            conjunction["requireQualityImprovement"] = mode;
+        }
+        policy["conjunction"] = conjunction;
+        fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+        fixture.prepare_builds(&checkout);
+        fixture.start_with_ready_candidate(&checkout, false);
+        let resume = fixture.resume();
+        let output = text(&resume);
+        assert!(resume.status.success(), "{output}");
+        assert!(
+            output.contains("requireQualityImprovement") || output.contains("expected a boolean"),
+            "the invalid explicit quality mode is refused with its cause: {output}"
+        );
+        let status = fixture.status_json();
+        assert_eq!(status["attempts"].as_array().unwrap().len(), 0, "{status}");
+        assert!(!fixture.run.join("comparison").exists(), "{status}");
+    }
+
     // A recorded member missing from the declaration cannot be defaulted.
     let fixture = Fixture::new("conjunction-missing-member");
     let mut policy = load_json(&fixture.policy);

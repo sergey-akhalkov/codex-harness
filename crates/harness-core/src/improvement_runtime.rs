@@ -59,11 +59,13 @@
 use crate::{
     build_identity, core_disconnect, core_install,
     improvement_experiment::{Arm, ConsumedVariant, PreparedVariant, select_variant},
+    improvement_loop::{OwnerRecord, now_ms, read_json, write_json_atomic},
     installation_lock::InstallationLock,
     installation_state::PathScope,
     inventory,
     native_launcher::Registration as LaunchRegistration,
     outcome_qualification::{LocalRunner, RunnerRecord},
+    process::{Cancellation, Deadline, ExclusiveFileLock},
     registration_native,
 };
 use serde::{Deserialize, Serialize};
@@ -75,6 +77,10 @@ use std::{
 };
 
 pub const RUNTIME_SCHEMA: u32 = 2;
+
+const ADOPTION_CLAIM_SCHEMA: u32 = 1;
+const ADOPTION_CLAIM_LIMIT: u64 = 256 * 1024;
+const MAX_ADOPTION_CLAIMS: usize = 128;
 
 /// Provider id of the explicit local route written into every prepared arm.
 /// It matches the existing explicit local outcome route; no other provider is
@@ -394,6 +400,387 @@ pub struct FileIdentity {
     pub sha256: String,
 }
 
+/// The durable process identity of one run adopting an occupied home. It is
+/// recorded beside the origin cursor so another run can distinguish an
+/// interrupted same-owner resume from a second adopter. Liveness alone never
+/// releases the claim: only the owning run's completion or stop settles it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionOwner {
+    pub run: String,
+    pub pid: u32,
+    pub created: u64,
+    pub program: PathBuf,
+    pub claimed_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdoptionClaimStatus {
+    Active,
+    Completed,
+    Stopped,
+}
+
+impl AdoptionClaimStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// One bounded history entry of an adoption claim. Active claims are never
+/// reclaimed because time passed or because the recorded owner is no longer
+/// live; the same run may reconcile its own interrupted preparation, while a
+/// different run must wait for that run to complete or stop.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionClaim {
+    pub run: String,
+    pub spec_digest: String,
+    pub role: String,
+    pub runtime: FileIdentity,
+    pub origin_cursor: FileIdentity,
+    pub owner: AdoptionOwner,
+    pub status: AdoptionClaimStatus,
+    pub claimed_ms: u64,
+    pub updated_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdoptionClaimHistory {
+    schema: u32,
+    runtime: FileIdentity,
+    claims: Vec<AdoptionClaim>,
+}
+
+impl AdoptionOwner {
+    fn current(run: &str) -> io::Result<Self> {
+        let owner = OwnerRecord::current(run)?;
+        Ok(Self {
+            run: owner.run,
+            pid: owner.pid,
+            created: owner.created,
+            program: owner.program,
+            claimed_ms: owner.claimed_ms,
+        })
+    }
+}
+
+fn adoption_sidecar(path: &Path, suffix: &str) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid("the adopted runtime receipt has no usable file name"))?;
+    Ok(path.with_file_name(format!("{name}.{suffix}")))
+}
+
+fn adoption_claim_path(runtime: &Path) -> io::Result<PathBuf> {
+    adoption_sidecar(runtime, "adoption.json")
+}
+
+fn adoption_claim_lock_path(runtime: &Path) -> io::Result<PathBuf> {
+    adoption_sidecar(runtime, "adoption.lock")
+}
+
+fn verify_adoption_identity(identity: &FileIdentity, description: &str) -> io::Result<()> {
+    if !identity.path.is_absolute() || !identity.path.is_file() {
+        return Err(invalid(format!(
+            "the {description} is missing or not an absolute retained file"
+        )));
+    }
+    if build_identity::hash_file(&identity.path)? != identity.sha256 {
+        return Err(invalid(format!(
+            "the {description} changed; supply its exact retained identity"
+        )));
+    }
+    Ok(())
+}
+
+/// Canonicalize one retained file identity and re-verify its exact digest.
+/// Sequential adoption records and compares identities in this form so a
+/// caller-supplied path spelling cannot retarget a retained file.
+pub fn normalized_adoption_identity(identity: &FileIdentity) -> io::Result<FileIdentity> {
+    verify_adoption_identity(identity, "retained file")?;
+    let path = plain(&fs::canonicalize(&identity.path)?)?;
+    if build_identity::hash_file(&path)? != identity.sha256 {
+        return Err(invalid(
+            "the retained file changed; supply its exact retained identity",
+        ));
+    }
+    Ok(FileIdentity {
+        path,
+        sha256: identity.sha256.clone(),
+    })
+}
+
+fn read_adoption_claims(runtime: &FileIdentity) -> io::Result<AdoptionClaimHistory> {
+    verify_adoption_identity(runtime, "adoption runtime receipt")?;
+    let path = adoption_claim_path(&runtime.path)?;
+    match read_json::<AdoptionClaimHistory>(&path, ADOPTION_CLAIM_LIMIT) {
+        Ok(history) if history.schema == ADOPTION_CLAIM_SCHEMA => {
+            if history.runtime != *runtime {
+                return Err(invalid(format!(
+                    "the adoption claim ledger at {} belongs to another runtime receipt; preserve it instead of repointing it",
+                    path.display()
+                )));
+            }
+            Ok(history)
+        }
+        Ok(_) => Err(invalid(format!(
+            "the adoption claim ledger at {} has an unsupported schema; preserve it",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AdoptionClaimHistory {
+            schema: ADOPTION_CLAIM_SCHEMA,
+            runtime: runtime.clone(),
+            claims: Vec::new(),
+        }),
+        Err(error) => Err(invalid(format!(
+            "the adoption claim ledger at {} cannot be read ({error}); preserve it instead of replacing it",
+            path.display()
+        ))),
+    }
+}
+
+fn save_adoption_claims(
+    runtime: &FileIdentity,
+    history: &mut AdoptionClaimHistory,
+) -> io::Result<()> {
+    while history.claims.len() > MAX_ADOPTION_CLAIMS {
+        let Some(index) = history
+            .claims
+            .iter()
+            .position(|claim| claim.status != AdoptionClaimStatus::Active)
+        else {
+            return Err(invalid(
+                "the adoption claim ledger cannot shed history while every claim is active",
+            ));
+        };
+        history.claims.remove(index);
+    }
+    let path = adoption_claim_path(&runtime.path)?;
+    let bytes = serde_json::to_vec_pretty(history)?;
+    if bytes.len() as u64 > ADOPTION_CLAIM_LIMIT {
+        return Err(invalid(format!(
+            "the adoption claim ledger at {} would exceed its bound",
+            path.display()
+        )));
+    }
+    write_json_atomic(&path, history)
+}
+
+fn with_adoption_claim_lock<T>(
+    runtime: &FileIdentity,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let path = adoption_claim_lock_path(&runtime.path)?;
+    let deadline = Deadline::after(Duration::from_secs(5))?;
+    let _lock = ExclusiveFileLock::acquire(&path, deadline, &Cancellation::default()).map_err(
+        |error| {
+            invalid(format!(
+                "the exclusive adoption claim lock at {} was not acquired: {error}; no runtime was adopted",
+                path.display()
+            ))
+        },
+    )?;
+    action()
+}
+
+/// Acquire or reconcile this run's exclusive claim on one occupied runtime
+/// home. A different run's active claim always refuses before any installation,
+/// trust or model effect. Repeating the same exact run after interruption
+/// refreshes only its process identity and timestamp.
+pub fn acquire_adoption_claim(
+    runtime: &FileIdentity,
+    origin_cursor: &FileIdentity,
+    run: &str,
+    spec_digest: &str,
+    role: &str,
+) -> io::Result<AdoptionClaim> {
+    verify_adoption_identity(runtime, "adoption runtime receipt")?;
+    verify_adoption_identity(origin_cursor, "adoption origin cursor")?;
+    if run.trim().is_empty() || spec_digest.len() != 64 || role.trim().is_empty() {
+        return Err(invalid(
+            "an adoption claim requires a run, full spec digest and role",
+        ));
+    }
+    with_adoption_claim_lock(runtime, || {
+        let mut history = read_adoption_claims(runtime)?;
+        if let Some(active) = history
+            .claims
+            .iter()
+            .find(|claim| claim.status == AdoptionClaimStatus::Active)
+        {
+            if active.run != run
+                || active.spec_digest != spec_digest
+                || active.role != role
+                || active.runtime != *runtime
+                || active.origin_cursor != *origin_cursor
+            {
+                return Err(invalid(format!(
+                    "the retained runtime at {} is actively adopted by run {}; no second adopter or changed binding is allowed until that run completes or stops",
+                    runtime.path.display(),
+                    active.run
+                )));
+            }
+            let at = now_ms();
+            let owner = AdoptionOwner::current(run)?;
+            let claim = history
+                .claims
+                .iter_mut()
+                .find(|claim| claim.run == run)
+                .expect("the active claim was just found");
+            claim.owner = owner;
+            claim.updated_ms = at;
+            let settled = claim.clone();
+            save_adoption_claims(runtime, &mut history)?;
+            return Ok(settled);
+        }
+        if history.claims.iter().any(|claim| claim.run == run) {
+            return Err(invalid(format!(
+                "run {run} already settled its adoption claim on {}; a settled run cannot reopen that claim",
+                runtime.path.display()
+            )));
+        }
+        let at = now_ms();
+        let claim = AdoptionClaim {
+            run: run.to_owned(),
+            spec_digest: spec_digest.to_owned(),
+            role: role.to_owned(),
+            runtime: runtime.clone(),
+            origin_cursor: origin_cursor.clone(),
+            owner: AdoptionOwner::current(run)?,
+            status: AdoptionClaimStatus::Active,
+            claimed_ms: at,
+            updated_ms: at,
+            settled_ms: None,
+        };
+        history.claims.push(claim.clone());
+        save_adoption_claims(runtime, &mut history)?;
+        Ok(claim)
+    })
+}
+
+/// Require this run's previously acquired claim. A prepared run and every
+/// resume verify that the exact claim still exists; an active claim is
+/// reconciled to the current process identity, while a settled claim is
+/// returned unchanged so a completed run can re-verify its retained home.
+pub fn require_adoption_claim(
+    runtime: &FileIdentity,
+    origin_cursor: &FileIdentity,
+    run: &str,
+    spec_digest: &str,
+    role: &str,
+) -> io::Result<AdoptionClaim> {
+    with_adoption_claim_lock(runtime, || {
+        let mut history = read_adoption_claims(runtime)?;
+        if let Some(active) = history
+            .claims
+            .iter()
+            .find(|claim| claim.status == AdoptionClaimStatus::Active)
+            && active.run != run
+        {
+            return Err(invalid(format!(
+                "the retained runtime at {} is actively adopted by run {}; no resume through another run is allowed",
+                runtime.path.display(),
+                active.run
+            )));
+        }
+        let index = history
+            .claims
+            .iter()
+            .position(|claim| claim.run == run)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "run {run} holds no recorded adoption claim on {}; preserve the runtime and recover the original run instead of re-adopting it",
+                    runtime.path.display()
+                ))
+            })?;
+        let claim = &history.claims[index];
+        if claim.runtime != *runtime || claim.origin_cursor != *origin_cursor || claim.role != role
+        {
+            return Err(invalid(format!(
+                "run {run}'s adoption claim on {} no longer binds this runtime, origin cursor and role",
+                runtime.path.display()
+            )));
+        }
+        if claim.spec_digest != spec_digest {
+            return Err(invalid(format!(
+                "run {run}'s adoption claim on {} belongs to a different frozen declaration",
+                runtime.path.display()
+            )));
+        }
+        match claim.status {
+            AdoptionClaimStatus::Active => {
+                let at = now_ms();
+                let owner = AdoptionOwner::current(run)?;
+                let claim = &mut history.claims[index];
+                claim.owner = owner;
+                claim.updated_ms = at;
+                let retained = claim.clone();
+                save_adoption_claims(runtime, &mut history)?;
+                Ok(retained)
+            }
+            AdoptionClaimStatus::Stopped => {
+                // A stopped run that resumes keeps using the same retained
+                // home. Reactivate its exact claim so no other run can start
+                // adopting while this one continues; completion still cannot
+                // reopen a completed claim.
+                let at = now_ms();
+                let owner = AdoptionOwner::current(run)?;
+                let claim = &mut history.claims[index];
+                claim.status = AdoptionClaimStatus::Active;
+                claim.owner = owner;
+                claim.updated_ms = at;
+                claim.settled_ms = None;
+                let retained = claim.clone();
+                save_adoption_claims(runtime, &mut history)?;
+                Ok(retained)
+            }
+            AdoptionClaimStatus::Completed => Ok(claim.clone()),
+        }
+    })
+}
+
+/// Settle this run's claim after completion or stop. Other runs' claims and
+/// the bounded history are preserved. A completed claim is never downgraded to
+/// stopped by a later repeated stop.
+pub fn settle_adoption_claim(
+    runtime: &FileIdentity,
+    run: &str,
+    status: AdoptionClaimStatus,
+) -> io::Result<Option<AdoptionClaim>> {
+    if status == AdoptionClaimStatus::Active {
+        return Err(invalid(
+            "an adoption claim can only settle as completed or stopped",
+        ));
+    }
+    with_adoption_claim_lock(runtime, || {
+        let mut history = read_adoption_claims(runtime)?;
+        let Some(claim) = history.claims.iter_mut().find(|claim| claim.run == run) else {
+            return Ok(None);
+        };
+        if claim.status == AdoptionClaimStatus::Active {
+            let at = now_ms();
+            claim.status = status;
+            claim.updated_ms = at;
+            claim.settled_ms = Some(at);
+            let settled = claim.clone();
+            save_adoption_claims(runtime, &mut history)?;
+            return Ok(Some(settled));
+        }
+        Ok(Some(claim.clone()))
+    })
+}
+
 /// One declared client setting exactly as it was written into the arm
 /// configuration, for drift checks and native-precedence reconciliation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -582,6 +969,7 @@ struct ValidatedClient {
 struct ValidatedPrivate {
     source: PathBuf,
     destination: String,
+    sha256: String,
 }
 
 struct Plan {
@@ -614,8 +1002,167 @@ impl Plan {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_arm_homes(
+    home: &Path,
+    user_home: &Path,
+    dependency_user_home: &Path,
+    build: &Path,
+    source: &Path,
+    protected: &[PathBuf],
+    occupied: bool,
+) -> io::Result<()> {
+    for (name, path) in [
+        ("home", home),
+        ("user home", user_home),
+        ("dependency user home", dependency_user_home),
+    ] {
+        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(invalid(format!(
+                "the {name} must be an absolute normalized directory"
+            )));
+        }
+        if !path.is_dir() {
+            return Err(invalid(format!(
+                "the {name} {} is not a fresh owned directory; prepare the homes first",
+                path.display()
+            )));
+        }
+        build_identity::ordinary(path)?;
+    }
+    let installation = home.join("harness/installation.json");
+    match (occupied, fs::symlink_metadata(&installation)) {
+        (false, Ok(_)) => {
+            return Err(invalid(format!(
+                "{} already carries an installation; restore it through the lifecycle owner before preparing this arm",
+                home.display()
+            )));
+        }
+        (true, Ok(metadata)) if !metadata.file_type().is_file() => {
+            return Err(invalid(format!(
+                "the adopted arm home {} does not carry an ordinary installation record",
+                home.display()
+            )));
+        }
+        (true, Ok(_)) => build_identity::ordinary(&installation)?,
+        (true, Err(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(format!(
+                "the adopted arm home {} carries no retained installation record; it cannot be adopted",
+                home.display()
+            )));
+        }
+        (true, Err(error)) => return Err(error),
+        (false, Err(_)) => {}
+    }
+    if home.join("AGENTS.override.md").exists() {
+        return Err(invalid(
+            "the arm home carries an AGENTS override; a fresh arm home must not shadow the prepared instructions",
+        ));
+    }
+    if let Some(ambient) = ambient_codex_home()
+        && same_place(home, &ambient)?
+    {
+        return Err(invalid(
+            "refusing to install an experiment arm into the ambient Codex home",
+        ));
+    }
+    if let Some(ambient) = ambient_user_home()
+        && (same_place(user_home, &ambient)? || same_place(dependency_user_home, &ambient)?)
+    {
+        return Err(invalid(
+            "refusing to install an experiment arm into the ambient user home",
+        ));
+    }
+    if overlaps(home, user_home) || overlaps(home, dependency_user_home) {
+        return Err(invalid(
+            "the arm home must stay disjoint from its user and dependency homes",
+        ));
+    }
+    if !same_place(user_home, dependency_user_home)? && overlaps(user_home, dependency_user_home) {
+        return Err(invalid(
+            "the arm user home and dependency user home must not nest inside each other",
+        ));
+    }
+    for (name, path) in [
+        ("home", home),
+        ("user home", user_home),
+        ("dependency user home", dependency_user_home),
+    ] {
+        if overlaps(path, build) {
+            return Err(invalid(format!(
+                "the arm {name} overlaps the prepared runtime; each experiment allocation must be separately owned"
+            )));
+        }
+        if overlaps(path, source) {
+            return Err(invalid(format!(
+                "the arm {name} overlaps its kit source checkout"
+            )));
+        }
+        for protected in protected {
+            if overlaps(path, protected) {
+                return Err(invalid(format!(
+                    "the arm {name} overlaps a protected experiment allocation ({}); each allocation must be separately owned",
+                    protected.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read-only admission for an already occupied, owned native home. It applies
+/// the same ambient, overlap, ordinary-path, protected-allocation and
+/// AGENTS-override guards as fresh installation while allowing only the home's
+/// own retained installation record. It never prepares, connects or copies
+/// configuration.
+pub fn verify_adoption_placement(runtime: &ArmRuntime, protected: &[PathBuf]) -> io::Result<()> {
+    let build = resolved(&runtime.variant.build)?;
+    let source = resolved(&runtime.source)?;
+    validate_arm_homes(
+        &runtime.home,
+        &runtime.user_home,
+        &runtime.dependency_user_home,
+        &build,
+        &source,
+        protected,
+        true,
+    )?;
+    let upstream = plain(&runtime.upstream)?;
+    if !upstream
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        || !upstream.is_absolute()
+    {
+        return Err(invalid(
+            "the adopted runtime's upstream client must be an absolute native executable",
+        ));
+    }
+    for (name, path) in [
+        ("prepared runtime", &build),
+        ("kit source", &source),
+        ("arm home", &runtime.home),
+        ("user home", &runtime.user_home),
+        ("dependency user home", &runtime.dependency_user_home),
+    ] {
+        if overlaps(&upstream, path) {
+            return Err(invalid(format!(
+                "the adopted runtime's upstream client overlaps the {name}"
+            )));
+        }
+    }
+    for protected in protected {
+        if overlaps(&upstream, protected) {
+            return Err(invalid(
+                "the adopted runtime's upstream client overlaps a protected experiment allocation",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate every explicit input without touching any installation state.
-fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
+fn prepare_plan(request: &ArmRequest, previous: Option<&ArmRuntime>) -> io::Result<Plan> {
+    let occupied = previous.is_some();
     let variant = &request.variant;
     bounded_value("arm label", &variant.label, 64)?;
     if variant.record_sha256.len() != 64 || variant.source_sha256.len() != 64 {
@@ -667,91 +1214,15 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
     let home = plain(&request.home)?;
     let user_home = plain(&request.user_home)?;
     let dependency_user_home = plain(&request.dependency_user_home)?;
-    for (name, path) in [
-        ("home", &home),
-        ("user home", &user_home),
-        ("dependency user home", &dependency_user_home),
-    ] {
-        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(invalid(format!(
-                "the {name} must be an absolute normalized directory"
-            )));
-        }
-        if !path.is_dir() {
-            return Err(invalid(format!(
-                "the {name} {} is not a fresh owned directory; prepare the homes first",
-                path.display()
-            )));
-        }
-        build_identity::ordinary(path)?;
-    }
-    if home.join("harness/installation.json").exists() {
-        return Err(invalid(format!(
-            "{} already carries an installation; restore it through the lifecycle owner before preparing this arm",
-            home.display()
-        )));
-    }
-    if home.join("AGENTS.override.md").exists() {
-        return Err(invalid(
-            "the arm home carries an AGENTS override; a fresh arm home must not shadow the prepared instructions",
-        ));
-    }
-    if let Some(ambient) = ambient_codex_home()
-        && same_place(&home, &ambient)?
-    {
-        return Err(invalid(
-            "refusing to install an experiment arm into the ambient Codex home",
-        ));
-    }
-    if let Some(ambient) = ambient_user_home()
-        && (same_place(&user_home, &ambient)? || same_place(&dependency_user_home, &ambient)?)
-    {
-        return Err(invalid(
-            "refusing to install an experiment arm into the ambient user home",
-        ));
-    }
-    if overlaps(&home, &user_home) || overlaps(&home, &dependency_user_home) {
-        return Err(invalid(
-            "the arm home must stay disjoint from its user and dependency homes",
-        ));
-    }
-    if !same_place(&user_home, &dependency_user_home)?
-        && overlaps(&user_home, &dependency_user_home)
-    {
-        return Err(invalid(
-            "the arm user home and dependency user home must not nest inside each other",
-        ));
-    }
-    for (name, path) in [
-        ("home", &home),
-        ("user home", &user_home),
-        ("dependency user home", &dependency_user_home),
-    ] {
-        if overlaps(path, &build) {
-            return Err(invalid(format!(
-                "the arm {name} overlaps the prepared runtime; each experiment allocation must be separately owned"
-            )));
-        }
-        if overlaps(path, &source) {
-            return Err(invalid(format!(
-                "the arm {name} overlaps its kit source checkout"
-            )));
-        }
-    }
-    for protected in &request.protected {
-        for (name, path) in [
-            ("home", &home),
-            ("user home", &user_home),
-            ("dependency user home", &dependency_user_home),
-        ] {
-            if overlaps(path, protected) {
-                return Err(invalid(format!(
-                    "the arm {name} overlaps a protected experiment allocation ({}); each allocation must be separately owned",
-                    protected.display()
-                )));
-            }
-        }
-    }
+    validate_arm_homes(
+        &home,
+        &user_home,
+        &dependency_user_home,
+        &build,
+        &source,
+        &request.protected,
+        occupied,
+    )?;
 
     let upstream = plain(&request.upstream)?;
     if !upstream
@@ -850,7 +1321,7 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
             let table = parse_config_bytes(&bytes, "the existing arm configuration")?;
             declared_settings_present(&table, &validated.settings).map_err(|error| {
                 invalid(format!(
-                    "an existing config.toml does not match the declared client inputs ({error}); a fresh arm home is never merged"
+                    "an existing config.toml does not match the declared client inputs ({error}); an arm home is never merged"
                 ))
             })?;
             verify_client_values(&table, &validated.record)?;
@@ -867,7 +1338,7 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
         (Some(_), Err(error)) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
     }
-    let private_inputs = validate_private_inputs(&home, &request.private_inputs)?;
+    let private_inputs = validate_private_inputs(&home, &request.private_inputs, previous)?;
 
     Ok(Plan {
         variant: variant.clone(),
@@ -1333,6 +1804,7 @@ fn kit_manifest(source: &Path) -> io::Result<inventory::Manifest> {
 fn validate_private_inputs(
     home: &Path,
     inputs: &[PrivateInput],
+    previous: Option<&ArmRuntime>,
 ) -> io::Result<Vec<ValidatedPrivate>> {
     let mut seen = BTreeSet::new();
     let mut validated = Vec::new();
@@ -1342,12 +1814,13 @@ fn validate_private_inputs(
                 "every private runner input needs an explicit absolute source file",
             ));
         }
-        hash_file("a private runner input", &input.source, FILE_LIMIT).map_err(|error| {
-            invalid(format!(
-                "the private input {} is unresolved ({error})",
-                input.destination
-            ))
-        })?;
+        let sha256 =
+            hash_file("a private runner input", &input.source, FILE_LIMIT).map_err(|error| {
+                invalid(format!(
+                    "the private input {} is unresolved ({error})",
+                    input.destination
+                ))
+            })?;
         let relative = Path::new(&input.destination);
         let valid = !input.destination.is_empty()
             && !relative.is_absolute()
@@ -1383,9 +1856,14 @@ fn validate_private_inputs(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
             Ok(_) => {
-                if fs::read(&destination)? != fs::read(&input.source)? {
+                if !private_input_destination_matches(
+                    &destination,
+                    &sha256,
+                    &input.destination,
+                    previous,
+                )? {
                     return Err(invalid(format!(
-                        "the private input destination {} already exists with different content; a fresh arm home is never merged",
+                        "the private input destination {} already exists with different content; an arm home is never merged",
                         input.destination
                     )));
                 }
@@ -1394,6 +1872,7 @@ fn validate_private_inputs(
         validated.push(ValidatedPrivate {
             source: input.source.clone(),
             destination: input.destination.clone(),
+            sha256,
         });
     }
     Ok(validated)
@@ -1408,11 +1887,37 @@ fn validate_private_inputs(
 /// presented as ready. Installed state is restored through
 /// [`retire_arm`]/[`discard_arm`], never rewritten in place.
 pub fn install_arm(request: &ArmRequest) -> io::Result<ArmRuntime> {
-    let plan = prepare_plan(request)?;
+    let plan = prepare_plan(request, None)?;
+    install_plan(&plan, None)
+}
+
+/// Update one already prepared arm to an explicitly requested immutable build
+/// in its existing owned homes through the native installation owner.
+///
+/// The previous runtime is evidence for the exact arm, upstream client, homes
+/// and retained inputs, not a claim that its mutable source still matches the
+/// old build. A prior source change therefore does not block the request; the
+/// new build and the installed ownership are verified independently. Repeating
+/// the same request after the update completed but before the caller persisted
+/// its result is safe: the native owner recognizes the already-installed build
+/// and performs fresh runtime and consumption verification.
+pub fn refresh_arm(previous: &ArmRuntime, request: &ArmRequest) -> io::Result<ArmRuntime> {
+    validate_refresh_identity(previous, request)?;
+    let plan = prepare_plan(request, Some(previous))?;
+    validate_refresh_authority(previous, &plan)?;
+    install_plan(&plan, Some(previous))
+}
+
+fn install_plan(plan: &Plan, previous: Option<&ArmRuntime>) -> io::Result<ArmRuntime> {
+    let operation = if previous.is_some() {
+        "refresh"
+    } else {
+        "installation"
+    };
     let preview = core_install::connect(&plan.connect_request(), true).map_err(|error| {
         invalid(format!(
-            "the {} arm failed its installation preflight ({error}); nothing was installed",
-            plan.variant.label
+            "the {} arm failed its {operation} preflight ({error}); no state was changed",
+            plan.variant.label,
         ))
     })?;
     if preview.status != "preview" || preview.model_calls != 0 || preview.runtime.is_some() {
@@ -1421,49 +1926,18 @@ pub fn install_arm(request: &ArmRequest) -> io::Result<ArmRuntime> {
         ));
     }
 
-    if let Some(client) = &plan.client {
-        let path = plan.home.join("config.toml");
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::write(&path, &client.config_bytes)?;
-            }
-            Err(error) => return Err(error),
-            Ok(_) => {}
-        }
-    }
-    for input in &plan.private_inputs {
-        let destination = plan.home.join(&input.destination);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::symlink_metadata(&destination) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::copy(&input.source, &destination)?;
-            }
-            Err(error) => return Err(error),
-            Ok(_) => {
-                // An identical destination from the same explicit input is
-                // reused; changed content is never recorded as prepared.
-                if fs::read(&destination)? != fs::read(&input.source)? {
-                    return Err(invalid(format!(
-                        "the private input destination {} changed during preparation; preserving it",
-                        input.destination
-                    )));
-                }
-            }
-        }
-    }
+    install_plan_inputs(plan, previous)?;
 
     let report = core_install::connect(&plan.connect_request(), false).map_err(|error| {
         invalid(format!(
-            "the {} arm installation was not completed ({error}); the arm is not ready and its owned state can be restored with the lifecycle owner",
-            plan.variant.label
+            "the {} arm {operation} was not completed ({error}); the requested build is not claimed ready and the native owner retains recovery state",
+            plan.variant.label,
         ))
     })?;
     if report.status != "connected" || report.model_calls != 0 {
         return Err(invalid(format!(
-            "the {} arm installation did not report a completed model-free connection",
-            plan.variant.label
+            "the {} arm {operation} did not report a completed model-free connection",
+            plan.variant.label,
         )));
     }
     let runtime = report
@@ -1483,18 +1957,275 @@ pub fn install_arm(request: &ArmRequest) -> io::Result<ArmRuntime> {
         runtime_executable_sha256: runtime.executable_sha256.clone(),
         runtime_evidence: runtime.evidence.clone(),
     };
-    if token_workflow_advertised(&plan.source)? {
-        prepare_token_workflow(&plan)?;
-        restore_declared_settings(&plan)?;
+    if token_workflow_advertised(&plan.source).map_err(|error| {
+        unverified_native_update(
+            plan,
+            "the token workflow advertisement could not be re-read",
+            &error,
+        )
+    })? {
+        prepare_token_workflow(plan).map_err(|error| {
+            unverified_native_update(
+                plan,
+                "the token workflow component was not retained as prepared evidence",
+                &error,
+            )
+        })?;
+        restore_declared_settings(plan).map_err(|error| {
+            unverified_native_update(
+                plan,
+                "the declared client settings were not restored after native consent",
+                &error,
+            )
+        })?;
     }
-    let observed = observe(&plan, facts)?;
+    let observed = observe(plan, facts).map_err(|error| {
+        unverified_native_update(
+            plan,
+            "the installed runtime could not be observed as a fresh arm receipt",
+            &error,
+        )
+    })?;
     verify_consumption(&observed).map_err(|error| {
-        invalid(format!(
-            "the {} arm installation was applied but its consumption identity did not verify ({error}); it is not ready and must be restored through the lifecycle owner",
-            plan.variant.label
-        ))
+        unverified_native_update(
+            plan,
+            "the installed runtime's consumption identity did not verify",
+            &error,
+        )
     })?;
     Ok(observed)
+}
+
+fn install_plan_inputs(plan: &Plan, previous: Option<&ArmRuntime>) -> io::Result<()> {
+    if let Some(client) = &plan.client {
+        let path = plan.home.join("config.toml");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::write(&path, &client.config_bytes)?;
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+    }
+    for input in &plan.private_inputs {
+        let destination = plan.home.join(&input.destination);
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if previous.is_some() {
+                    return Err(invalid(format!(
+                        "the retained private runner input {} is missing from the occupied arm home; a refresh never recreates retained inputs",
+                        input.destination
+                    )));
+                }
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&input.source, &destination)?;
+                if hash_file("a copied private runner input", &destination, FILE_LIMIT)?
+                    != input.sha256
+                {
+                    return Err(invalid(format!(
+                        "the private input {} changed while being prepared; preserving it",
+                        input.destination
+                    )));
+                }
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {
+                // An identical destination from the same explicit input is
+                // reused; a refresh also retains the exact native hook
+                // approval the client appended to its own profile. Changed
+                // content is never recorded as prepared.
+                if !private_input_destination_matches(
+                    &destination,
+                    &input.sha256,
+                    &input.destination,
+                    previous,
+                )? {
+                    return Err(invalid(format!(
+                        "the private input destination {} changed during preparation; preserving it",
+                        input.destination
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Accepts an existing private runner input destination when it still carries
+/// the explicit source bytes, or during a refresh when it carries exactly the
+/// retained bytes plus the native client's own hook approval for this arm.
+fn private_input_destination_matches(
+    destination: &Path,
+    frozen_sha256: &str,
+    destination_name: &str,
+    previous: Option<&ArmRuntime>,
+) -> io::Result<bool> {
+    if hash_file("a copied private runner input", destination, FILE_LIMIT)? == frozen_sha256 {
+        return Ok(true);
+    }
+    let Some(runtime) = previous else {
+        return Ok(false);
+    };
+    let destination_bytes = fs::read(destination)?;
+    Ok(private_input_matches_with_native_trust(
+        &destination_bytes,
+        frozen_sha256,
+        destination_name,
+        runtime,
+    ))
+}
+
+/// Preserve the prior configuration authority across a refresh: the explicit
+/// declaration may request a different immutable build, but it must not
+/// silently change the approved client identity, its declared settings or the
+/// explicit overlay the arm was installed with.
+fn validate_refresh_authority(previous: &ArmRuntime, plan: &Plan) -> io::Result<()> {
+    let configuration = previous.configuration.as_ref();
+    let prior_client = configuration.and_then(|record| record.client.as_ref());
+    let requested_client = plan.client.as_ref();
+    if requested_client.map(|client| &client.record) != prior_client {
+        return Err(invalid(
+            "the refresh request changes the approved client identity; preserve the installed client or prepare a new arm",
+        ));
+    }
+    let prior_settings = configuration
+        .map(|record| record.settings.as_slice())
+        .unwrap_or_default();
+    let requested_settings = requested_client
+        .map(|client| client.settings.as_slice())
+        .unwrap_or_default();
+    if requested_settings != prior_settings {
+        return Err(invalid(
+            "the refresh request changes the declared client settings; preserve the installed declaration",
+        ));
+    }
+    let prior_overlay = configuration.and_then(|record| record.overlay.as_ref());
+    let requested_overlay = requested_client.and_then(|client| client.overlay.as_ref());
+    if requested_overlay != prior_overlay {
+        return Err(invalid(
+            "the refresh request changes the explicit client overlay; preserve the installed declaration",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_refresh_identity(previous: &ArmRuntime, request: &ArmRequest) -> io::Result<()> {
+    if previous.schema != RUNTIME_SCHEMA || previous.model_calls != 0 {
+        return Err(invalid(
+            "the previous arm identity is not a model-free runtime receipt",
+        ));
+    }
+    if previous.arm != previous.variant.arm || previous.label != previous.variant.label {
+        return Err(invalid(
+            "the previous arm receipt does not match its prepared variant",
+        ));
+    }
+    if previous.installation.status != "connected"
+        || previous.installation.runtime_executable_sha256 != previous.upstream_sha256
+    {
+        return Err(invalid(
+            "the previous arm identity does not describe a verified native connection",
+        ));
+    }
+    if request.variant.arm != previous.arm || request.variant.label != previous.label {
+        return Err(invalid(
+            "a runtime refresh cannot change the prepared arm or label",
+        ));
+    }
+    for (name, previous_path, requested_path) in [
+        ("home", &previous.home, &request.home),
+        ("user home", &previous.user_home, &request.user_home),
+        (
+            "dependency user home",
+            &previous.dependency_user_home,
+            &request.dependency_user_home,
+        ),
+    ] {
+        if !same_place(previous_path, requested_path)? {
+            return Err(invalid(format!(
+                "the refresh request must retain the previous arm {name} exactly"
+            )));
+        }
+    }
+    if !same_place(&previous.upstream, &request.upstream)? {
+        return Err(invalid(
+            "the refresh request must retain the previous approved upstream client",
+        ));
+    }
+    if upstream_client_digest(&request.upstream)? != previous.upstream_sha256 {
+        return Err(invalid(
+            "the refresh request changes the approved upstream client; preserve the verified client or prepare a new arm",
+        ));
+    }
+    if previous.client_configured() != request.client.is_some() {
+        return Err(invalid(
+            "the refresh request changes whether approved local client inputs were declared",
+        ));
+    }
+    if previous.private.len() != request.private_inputs.len() {
+        return Err(invalid(
+            "the refresh request changes the retained private runner inputs",
+        ));
+    }
+    for retained in &previous.private {
+        let input = request
+            .private_inputs
+            .iter()
+            .find(|input| input.destination == retained.destination)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "the refresh request omits the retained private runner input {}",
+                    retained.destination
+                ))
+            })?;
+        if hash_file("a private runner input", &input.source, FILE_LIMIT)? != retained.sha256 {
+            return Err(invalid(format!(
+                "the refresh request changes the retained private runner input {}",
+                retained.destination
+            )));
+        }
+    }
+    let build = resolved(&previous.variant.build).map_err(|error| {
+        invalid(format!(
+            "the previous arm runtime build is unavailable ({error}); retain its immutable build as the prior receipt evidence"
+        ))
+    })?;
+    let record = build_identity::verify_record_integrity(&build).map_err(|error| {
+        invalid(format!(
+            "the previous arm runtime build is not intact ({error}); foreign or incomplete prior evidence is refused"
+        ))
+    })?;
+    if build_identity::hash_file(&build.join("build.json"))? != previous.variant.record_sha256
+        || record.source.sha256 != previous.variant.source_sha256
+    {
+        return Err(invalid(
+            "the previous arm runtime build no longer matches its retained receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn unverified_native_update(plan: &Plan, stage: &str, error: &io::Error) -> io::Error {
+    let recovery = match core_install::preview_recovery(
+        &plan.home,
+        &plan.user_home,
+        &plan.dependency_user_home,
+    ) {
+        Ok(preview) => format!(
+            "status={} action={} journal={} model_calls={}",
+            preview.status,
+            preview.action,
+            preview.journal.unwrap_or("none"),
+            preview.model_calls,
+        ),
+        Err(recovery) => format!("unavailable ({recovery})"),
+    };
+    invalid(format!(
+        "the {} arm native update completed, but {stage} ({error}); no success receipt is returned and the previous runtime is not claimed restored. Native recovery: {recovery}",
+        plan.variant.label,
+    ))
 }
 
 fn checked_link(destination: &Path, source: &Path, directory: bool) -> io::Result<PathBuf> {
@@ -1992,11 +2723,12 @@ fn observe(plan: &Plan, facts: InstallationFacts) -> io::Result<ArmRuntime> {
 
     let mut private = Vec::new();
     for input in &plan.private_inputs {
-        let destination = plan.home.join(&input.destination);
-        let sha256 = hash_file("a copied private runner input", &destination, FILE_LIMIT)?;
         private.push(PrivateRecord {
             destination: input.destination.clone(),
-            sha256,
+            // The retained identity is the declared source bytes. Native
+            // consent may legitimately append its approval to the live
+            // profile; consumption verifies that exact record separately.
+            sha256: input.sha256.clone(),
         });
     }
     let components = observe_components(plan)?;
@@ -2244,13 +2976,20 @@ pub fn verify_consumption_with_trust(
             // same file before the first model request
             // (`executor_cli::ensure_workspace_trust` appends one
             // `[projects.'<workspace>'] trust_level = "trusted"` block per
-            // slot), so a prepared arm legitimately gains exactly the
-            // trailing entries of the workspaces its owner authorized for
-            // dispatch. Accept nothing else: removing exactly those blocks
-            // must reproduce the prepared bytes.
-            let restored = strip_appended_trust(&bytes, trusted_workspaces)
-                .filter(|stripped| build_identity::hash_bytes(stripped) == configuration.sha256);
-            if restored.is_none() {
+            // slot), and the native client records the user's approval of
+            // this arm's unchanged token hook. The approval may already belong
+            // to the frozen preparation or be recorded later; either way the
+            // exact prepared bytes must remain an intermediate candidate.
+            let restored =
+                strip_appended_trust(&bytes, trusted_workspaces).is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| {
+                        build_identity::hash_bytes(candidate) == configuration.sha256
+                            || strip_native_hook_trust(candidate, runtime).is_some_and(|stripped| {
+                                build_identity::hash_bytes(&stripped) == configuration.sha256
+                            })
+                    })
+                });
+            if !restored {
                 return Err(invalid("the arm configuration changed since preparation"));
             }
         }
@@ -2280,10 +3019,26 @@ pub fn verify_consumption_with_trust(
         let destination = runtime.home.join(&private.destination);
         let sha256 = hash_file("a copied private runner input", &destination, FILE_LIMIT)?;
         if sha256 != private.sha256 {
-            return Err(invalid(format!(
-                "the private runner input {} changed since preparation",
-                private.destination
-            )));
+            let metadata = fs::metadata(&destination)?;
+            if metadata.len() > FILE_LIMIT {
+                return Err(invalid(
+                    "a copied private runner input exceeds its size bound",
+                ));
+            }
+            let bytes = fs::read(&destination)?;
+            if bytes.len() as u64 > FILE_LIMIT
+                || !private_input_matches_with_native_trust(
+                    &bytes,
+                    &private.sha256,
+                    &private.destination,
+                    runtime,
+                )
+            {
+                return Err(invalid(format!(
+                    "the private runner input {} changed since preparation",
+                    private.destination
+                )));
+            }
         }
     }
 
@@ -2361,29 +3116,231 @@ pub fn select_arm(
 /// Removes the trailing trusted-project blocks the ordinary dispatch appends
 /// to an arm configuration (`executor_cli::ensure_workspace_trust` writes
 /// `\n[projects.'<workspace>']\ntrust_level = "trusted"\n` once per slot) for
-/// exactly the workspaces authorized for the arm's own dispatcher.
+/// exactly the workspaces authorized for the arm's own dispatcher, yielding
+/// every intermediate state so a prepared configuration that already ends
+/// with trusted-project blocks can still match its frozen digest.
 /// Anything else - an appended comment, another projects entry, another
 /// workspace or a changed trust level - keeps its bytes and therefore still
 /// fails the comparison.
-fn strip_appended_trust(bytes: &[u8], trusted_workspaces: &[PathBuf]) -> Option<Vec<u8>> {
+fn strip_appended_trust(bytes: &[u8], trusted_workspaces: &[PathBuf]) -> Option<Vec<Vec<u8>>> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut current = text;
-    loop {
-        let Some(rest) = current.strip_suffix("\ntrust_level = \"trusted\"\n") else {
-            return Some(current.as_bytes().to_vec());
-        };
+    let mut candidates = vec![current.as_bytes().to_vec()];
+    while let Some(rest) = current.strip_suffix("\ntrust_level = \"trusted\"\n") {
         let section = rest.rsplit('\n').next()?;
-        let named = section.strip_prefix("[projects.'")?.strip_suffix("']")?;
+        let Some(named) = section
+            .strip_prefix("[projects.'")
+            .and_then(|named| named.strip_suffix("']"))
+        else {
+            break;
+        };
         if named.is_empty()
             || named.contains('\'')
             || !trusted_workspaces
                 .iter()
                 .any(|workspace| same_trust_workspace(named, workspace))
         {
-            return None;
+            break;
         }
         current = &rest[..rest.len() - section.len() - 1];
+        candidates.push(current.as_bytes().to_vec());
     }
+    Some(candidates)
+}
+
+struct NativeHookTrust {
+    subtable: String,
+    profile_record: String,
+}
+
+/// Builds the only native hook-trust records accepted for this arm. The key
+/// comes from the retained `hooks.json` link and the digest from the retained
+/// definition, so a foreign path, another event or handler, a changed
+/// definition or any additional field cannot reuse an earlier approval.
+fn native_hook_trust(runtime: &ArmRuntime) -> Option<NativeHookTrust> {
+    let Some(component) = runtime
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+    else {
+        return None;
+    };
+    let Some(link) = component
+        .links
+        .iter()
+        .find(|link| link.name == "hooks.json")
+    else {
+        return None;
+    };
+    let definition_path = checked_link(&link.destination, &link.source, false).ok()?;
+    let metadata = fs::metadata(&definition_path).ok()?;
+    if !metadata.is_file() || metadata.len() > COMPONENT_FILE_LIMIT {
+        return None;
+    }
+    let definition: serde_json::Value =
+        serde_json::from_slice(&fs::read(&definition_path).ok()?).ok()?;
+    let digest = normalized_hook_trust_hash(&definition)?;
+    let destination = link.destination.to_string_lossy();
+    if destination.contains('\'') || destination.contains('\n') || destination.contains('\r') {
+        return None;
+    }
+    let subtable =
+        format!("\n[hooks.state.'{destination}:pre_tool_use:0:0']\ntrusted_hash = \"{digest}\"\n");
+    let profile_record = format!("\n[hooks.state]\n{subtable}");
+    Some(NativeHookTrust {
+        subtable,
+        profile_record,
+    })
+}
+
+/// Removes exactly the local hook approval the native client appends to the
+/// arm configuration after the user accepts this arm's own unchanged
+/// token-hook definition.
+fn strip_native_hook_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<u8>> {
+    let Some(trust) = native_hook_trust(runtime) else {
+        return Some(bytes.to_vec());
+    };
+    // The exact native record is required: a changed digest, key or extra
+    // field does not match and remains part of the frozen comparison.
+    let text = std::str::from_utf8(bytes).ok()?;
+    match text.matches(&trust.subtable).count() {
+        0 => Some(bytes.to_vec()),
+        1 => Some(text.replacen(&trust.subtable, "", 1).into_bytes()),
+        _ => None,
+    }
+}
+
+/// Removes exactly the native profile-file consent record, including the
+/// native `[hooks.state]` parent header. Unlike the arm configuration path,
+/// a private profile must actually carry the record; an absent or duplicate
+/// approval is refused.
+fn strip_native_profile_trust(bytes: &[u8], runtime: &ArmRuntime) -> Option<Vec<u8>> {
+    let trust = native_hook_trust(runtime)?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    text.strip_suffix(&trust.profile_record)
+        .map(|stripped| stripped.as_bytes().to_vec())
+}
+
+/// The native profile file contract is a root-level `<profile>.config.toml`
+/// (`orchestration_config::profile_config`). Other private runner inputs keep
+/// their frozen bytes even when they carry the exact hook approval record.
+fn native_profile_config_destination(destination: &str) -> bool {
+    let mut components = Path::new(destination).components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".config.toml"))
+            .is_some_and(|profile| !profile.is_empty())
+}
+
+/// Accepts a private runner input only at its frozen digest, or after removing
+/// the one exact native hook approval and reconstructing the prepared CRLF
+/// bytes. The native serializer rewrites line endings to LF; no other byte
+/// change is admitted.
+fn private_input_matches_with_native_trust(
+    bytes: &[u8],
+    expected_sha256: &str,
+    destination: &str,
+    runtime: &ArmRuntime,
+) -> bool {
+    if build_identity::hash_bytes(bytes) == expected_sha256 {
+        return true;
+    }
+    if !native_profile_config_destination(destination) {
+        return false;
+    }
+    let Some(stripped) = strip_native_profile_trust(bytes, runtime) else {
+        return false;
+    };
+    if build_identity::hash_bytes(&stripped) == expected_sha256 {
+        return true;
+    }
+    if stripped.contains(&b'\r') {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&stripped) else {
+        return false;
+    };
+    let crlf = text.replace('\n', "\r\n");
+    build_identity::hash_bytes(crlf.as_bytes()) == expected_sha256
+}
+
+/// Mirrors the native client's hook trust identity for a `hooks.json`
+/// definition: the normalized command handler for `PreToolUse[0].hooks[0]`,
+/// serialized as TOML, converted to JSON with sorted object keys, and hashed.
+/// The digest is derived from the retained definition so a changed command or
+/// handler cannot reuse an earlier approval.
+fn normalized_hook_trust_hash(definition: &serde_json::Value) -> Option<String> {
+    let group = definition
+        .get("hooks")?
+        .get("PreToolUse")?
+        .as_array()?
+        .first()?;
+    let matcher = match group.get("matcher") {
+        Some(value) => Some(value.as_str()?),
+        None => None,
+    };
+    let handler = group.get("hooks")?.as_array()?.first()?;
+    if handler.get("type")?.as_str()? != "command" {
+        return None;
+    }
+    let command = handler.get("command")?.as_str()?;
+    if command.trim().is_empty() {
+        return None;
+    }
+    let timeout = match handler.get("timeout") {
+        Some(value) => i64::try_from(value.as_u64()?.max(1)).ok()?,
+        None => 600,
+    };
+    let is_async = match handler.get("async") {
+        Some(value) => value.as_bool()?,
+        None => false,
+    };
+    let status_message = match handler.get("statusMessage") {
+        Some(value) => Some(value.as_str()?),
+        None => None,
+    };
+    let additional_context_limit = match handler.get("additionalContextLimit") {
+        Some(value) => Some(i64::try_from(value.as_u64()?).ok()?),
+        None => None,
+    }
+    .filter(|limit| *limit != 2_500);
+    let mut normalized = toml::Table::new();
+    normalized.insert("type".into(), toml::Value::String("command".into()));
+    normalized.insert("command".into(), toml::Value::String(command.into()));
+    normalized.insert("timeout".into(), toml::Value::Integer(timeout));
+    normalized.insert("async".into(), toml::Value::Boolean(is_async));
+    if let Some(status_message) = status_message {
+        normalized.insert(
+            "statusMessage".into(),
+            toml::Value::String(status_message.into()),
+        );
+    }
+    if let Some(limit) = additional_context_limit {
+        normalized.insert("additionalContextLimit".into(), toml::Value::Integer(limit));
+    }
+    let mut identity = toml::Table::new();
+    identity.insert(
+        "event_name".into(),
+        toml::Value::String("pre_tool_use".into()),
+    );
+    if let Some(matcher) = matcher {
+        identity.insert("matcher".into(), toml::Value::String(matcher.into()));
+    }
+    identity.insert(
+        "hooks".into(),
+        toml::Value::Array(vec![toml::Value::Table(normalized)]),
+    );
+    let mut json = serde_json::to_value(toml::Value::Table(identity)).ok()?;
+    json.sort_all_objects();
+    let serialized = serde_json::to_vec(&json).ok()?;
+    Some(format!(
+        "sha256:{}",
+        build_identity::hash_bytes(&serialized)
+    ))
 }
 
 /// The ordinary dispatch writes the allocated workspace path lowercased. Path
@@ -2391,6 +3348,13 @@ fn strip_appended_trust(bytes: &[u8], trusted_workspaces: &[PathBuf]) -> Option<
 /// separators and case are compared through one normalized form.
 fn same_trust_workspace(named: &str, workspace: &Path) -> bool {
     normalize_trust_workspace(named) == normalize_trust_workspace(&workspace.to_string_lossy())
+}
+
+/// The normalized identity used for retained workspace-trust provenance.
+/// Sequential adoption derives its allowance from frozen checkouts, so the
+/// same spelling rules must be visible to the state owner.
+pub fn trust_workspace_key(path: &Path) -> String {
+    normalize_trust_workspace(&path.to_string_lossy())
 }
 
 fn normalize_trust_workspace(path: &str) -> String {
@@ -2596,6 +3560,7 @@ mod tests {
                 source: source.clone(),
                 destination: "notes.txt".to_owned(),
             }],
+            None,
         )
         .err()
         .expect("a private input over the shared bound must refuse");
@@ -2634,6 +3599,7 @@ mod tests {
                 source: source.clone(),
                 destination: "notes.bin".to_owned(),
             }],
+            None,
         )
         .err()
         .expect("a private input over the shared bound must refuse");

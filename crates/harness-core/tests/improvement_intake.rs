@@ -5,7 +5,7 @@
 //! temporary directory.
 
 use harness_core::benefit_gate::{
-    DecisionDraft, DecisionOutcome, Publication, QualityOutcome, publish_decision,
+    DecisionBasis, DecisionDraft, DecisionOutcome, Publication, QualityOutcome, publish_decision,
 };
 use harness_core::board_hypothesis::{
     self, Admission, BoundedHypothesis, HypothesisDraft, SearchFilter,
@@ -326,6 +326,7 @@ fn supported_proposal_admits_once_reuses_rejection_and_links_reconsideration() {
         experiment: "exp-cycle-1".to_owned(),
         outcome: DecisionOutcome::Reject,
         quality: QualityOutcome::Unchanged,
+        basis: DecisionBasis::Efficiency,
         matched: 2,
         tolerance_percent: 10.0,
         baseline_seconds: 100.0,
@@ -340,6 +341,12 @@ fn supported_proposal_admits_once_reuses_rejection_and_links_reconsideration() {
         scope: "task:synthetic.model:local".to_owned(),
         reason: "synthetic-regression".to_owned(),
         detail: None,
+        baseline_tokens: None,
+        candidate_tokens: None,
+        cumulative_baseline_tokens: None,
+        cumulative_candidate_tokens: None,
+        cumulative_baseline: None,
+        payback: None,
     };
     assert!(matches!(
         publish_decision(&bd, &project, &rejection).unwrap(),

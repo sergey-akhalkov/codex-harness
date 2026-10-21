@@ -12,6 +12,8 @@ const DEFAULT_INCUBATOR_CAP: u32 = 32;
 const DEFAULT_FEEDBACK_BATCH: u32 = 8;
 const DEFAULT_WORKTREE_LIMIT: u32 = 6;
 
+use crate::delivery_reflection::ReflectionLimits;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Orchestration {
@@ -37,6 +39,15 @@ pub struct Orchestration {
     /// not reset or retired and needs lead attention.
     #[serde(default = "default_worktree_limit")]
     pub worktree_limit: u32,
+    /// Optional finite budget and capacity for accepted-task reflection.
+    /// Omitted configurations use `ReflectionLimits::default()`.
+    #[serde(default)]
+    pub reflection_limits: Option<ReflectionLimits>,
+    /// Permission for new accepted-work reflection model stages. Omitted
+    /// configurations preserve the historical default-on behavior; reflection
+    /// still needs its separate explicit lifecycle activation.
+    #[serde(default = "default_self_reflection_enabled")]
+    pub self_reflection_enabled: bool,
 }
 
 fn default_vote_threshold() -> u32 {
@@ -51,6 +62,10 @@ fn default_feedback_batch() -> u32 {
 
 fn default_worktree_limit() -> u32 {
     DEFAULT_WORKTREE_LIMIT
+}
+
+fn default_self_reflection_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +319,9 @@ pub fn validate(config: &Orchestration, installed: &BTreeSet<String>) -> io::Res
             "orchestration worktree_limit must be a positive integer at most 64",
         ));
     }
+    if let Some(limits) = &config.reflection_limits {
+        limits.validate()?;
+    }
     Ok(())
 }
 
@@ -422,11 +440,98 @@ mod tests {
         assert_eq!(config.vote_threshold, 3);
         assert_eq!(config.incubator_size_cap, 32);
         assert_eq!(config.feedback_batch_limit, 8);
+        assert!(config.self_reflection_enabled);
         validate(&config, &installed(&["default", "ds", "zai"])).unwrap();
         let error = validate(&config, &installed(&["default", "zai"])).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("profile 'ds' is not installed"));
         assert!(!error.to_string().contains("substitut"));
+    }
+
+    #[test]
+    fn self_reflection_permission_defaults_on_and_parses_only_booleans() {
+        let base = r#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
+max_concurrent_executors = 2
+"#;
+        assert!(parse(base.as_bytes()).unwrap().self_reflection_enabled);
+        assert!(
+            parse(format!("{base}self_reflection_enabled = true\n").as_bytes())
+                .unwrap()
+                .self_reflection_enabled
+        );
+        assert!(
+            !parse(format!("{base}self_reflection_enabled = false\n").as_bytes())
+                .unwrap()
+                .self_reflection_enabled
+        );
+        for malformed in ["\"false\"", "0", "1"] {
+            let error = parse(format!("{base}self_reflection_enabled = {malformed}\n").as_bytes())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("orchestration configuration is invalid"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reflection_limits_are_optional_and_validated() {
+        let config = parse(
+            br#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
+max_concurrent_executors = 2
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.reflection_limits, None);
+        validate(&config, &installed(&["default", "ds"])).unwrap();
+
+        let config = parse(
+            br#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
+max_concurrent_executors = 2
+
+[reflection_limits]
+max_active_stages = 1
+max_attempts_per_stage = 2
+max_turns_per_stage = 4
+max_tokens_per_stage = 100
+max_tokens_per_record = 200
+max_events_per_poll = 10
+"#,
+        )
+        .unwrap();
+        let limits = config.reflection_limits.as_ref().unwrap();
+        assert_eq!(limits.max_active_stages, 1);
+        assert_eq!(limits.max_tokens_per_record, 200);
+        validate(&config, &installed(&["default", "ds"])).unwrap();
+
+        let mut invalid = config;
+        invalid
+            .reflection_limits
+            .as_mut()
+            .unwrap()
+            .max_active_stages = 0;
+        let error = validate(&invalid, &installed(&["default", "ds"])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reflection max_active_stages must be between 1 and 8"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -442,6 +547,8 @@ mod tests {
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
             worktree_limit: 6,
+            reflection_limits: None,
+            self_reflection_enabled: true,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(
@@ -461,6 +568,8 @@ mod tests {
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
             worktree_limit: 6,
+            reflection_limits: None,
+            self_reflection_enabled: true,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(
@@ -480,6 +589,8 @@ mod tests {
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
             worktree_limit: 6,
+            reflection_limits: None,
+            self_reflection_enabled: true,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(
@@ -662,9 +773,9 @@ mod tests {
     #[test]
     fn shipped_defaults_materialize_independent_pool_capacity() {
         let config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
-        assert_eq!(config.max_concurrent_executors, 4);
-        assert_eq!(config.worktree_pool_size, Some(4));
-        assert_eq!(worktree_pool_size(&config), 4);
+        assert_eq!(config.max_concurrent_executors, 6);
+        assert_eq!(config.worktree_pool_size, Some(6));
+        assert_eq!(worktree_pool_size(&config), 6);
     }
 
     #[test]

@@ -1990,6 +1990,15 @@ fn attachment_failure_is_reported_before_the_assignment() {
             1,
             "{mode}"
         );
+        let record: Value = serde_json::from_slice(&fs::read(&host.receipt).unwrap()).unwrap();
+        assert_eq!(
+            record["observation"]["submission"], "not-attempted",
+            "{mode}: the pre-assignment failure carries the explicit native marker: {record}"
+        );
+        assert!(
+            record["observation"]["turn"].is_null() && record["observation"]["exitCode"].is_null(),
+            "{mode}: a pre-assignment failure records no turn and no exit code: {record}"
+        );
         let watched = lead_command()
             .args(["executor", "watch", "--receipt"])
             .arg(&host.receipt)

@@ -332,7 +332,7 @@ fn process_correlation_requires_a_verified_os_link_not_a_numeric_process_id() {
 
 /// Run one bounded git command with captured output; the controller never
 /// inherits a prompt or an interactive terminal.
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+pub(super) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -389,6 +389,18 @@ pub(super) fn advance(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> 
             | Phase::Blocked
     ) {
         return Ok(());
+    }
+    if run
+        .spec
+        .comparison
+        .as_ref()
+        .is_some_and(|comparison| comparison.workflow.is_some())
+    {
+        return block(
+            run,
+            notes,
+            "the declared executor/lead workflow runner is not connected in this build; preserve the frozen inputs and resume with a build supporting that workflow; no executor-only fallback or model dispatch was attempted".to_owned(),
+        );
     }
     // The predeclared selection decides the measured unit. A
     // `real-operation`/`local-operation` selection is executed directly as
@@ -955,7 +967,7 @@ fn policy_outside_candidate_reach(run: &Run, comparison: &ComparisonInputs) -> R
 /// missing ones stay absolute so an overlap is still recognized before the
 /// path exists. The Windows verbatim prefix is removed so both sides compare
 /// in the same shape whether or not they already exist.
-fn overlap_path(path: &Path) -> PathBuf {
+pub(super) fn overlap_path(path: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let resolved = fs::canonicalize(&absolute).unwrap_or(absolute);
     let text = resolved.to_string_lossy();
@@ -1449,7 +1461,7 @@ fn ensure_task_workspace(
     Ok(workspace)
 }
 
-fn clone_workspace(source: &Path, target: &Path) -> Result<(), String> {
+pub(super) fn clone_workspace(source: &Path, target: &Path) -> Result<(), String> {
     git(
         source,
         &[
@@ -1466,7 +1478,7 @@ fn clone_workspace(source: &Path, target: &Path) -> Result<(), String> {
 
 /// Read and structurally validate the frozen acceptance request without
 /// rewriting it. The supervisor's digest is checked at every use.
-fn read_acceptance_request(
+pub(super) fn read_acceptance_request(
     acceptance: &harness_core::improvement_loop::AcceptanceInputs,
 ) -> Result<Value, String> {
     let bytes = crate::outcome_run::bounded_read(&acceptance.request, 2 * 1024 * 1024)
@@ -2184,7 +2196,7 @@ fn attempt_ordinal(attempt_id: &str) -> u32 {
 /// declaration the visible dispatch owner reads from its source checkout. The
 /// declaration is host dispatch state, not task content, and is never
 /// committed.
-fn ensure_dispatch_checkout(source: &Path, binding: &ArmBinding) -> Result<(), String> {
+pub(super) fn ensure_dispatch_checkout(source: &Path, binding: &ArmBinding) -> Result<(), String> {
     if !source.exists() {
         git(
             &binding.workload.source,
@@ -2554,11 +2566,11 @@ fn record_workload_implementation(
     .map_err(|error| error.to_string())
 }
 
-/// The verified committed solution of one measured arm.
-struct Solution {
-    revision: String,
-    changed_paths: Vec<String>,
-    checkout: PathBuf,
+/// The verified committed solution of one ordinary or measured task.
+pub(super) struct Solution {
+    pub(super) revision: String,
+    pub(super) changed_paths: Vec<String>,
+    pub(super) checkout: PathBuf,
 }
 
 fn validate_solution(
@@ -2567,6 +2579,25 @@ fn validate_solution(
     bindings: &ExperimentBindings,
     comparison: &ComparisonInputs,
     arm: ComparisonArm,
+) -> Result<Solution, String> {
+    let binding = bindings
+        .arm(arm_to_experiment(arm))
+        .map_err(|error| error.to_string())?;
+    validate_committed_solution(
+        attempt,
+        &run.store.comparison_arm_dir(arm).join("checkout"),
+        &binding.workload.revision,
+        &comparison.task.writable_scope,
+        Some(&comparison.specification.change),
+    )
+}
+
+pub(super) fn validate_committed_solution(
+    attempt: &Attempt,
+    repository: &Path,
+    base: &str,
+    scope: &[String],
+    planning_change: Option<&str>,
 ) -> Result<Solution, String> {
     let checkout = attempt
         .checkout
@@ -2578,37 +2609,22 @@ fn validate_solution(
             checkout.display()
         ));
     }
-    let binding = bindings
-        .arm(arm_to_experiment(arm))
-        .map_err(|error| error.to_string())?;
-    let revision = git(&checkout, &["rev-parse", "HEAD"])
-        .map_err(|error| format!("the solution revision is unavailable: {error}"))?
-        .trim()
-        .to_owned();
-    let arm_checkout = run.store.comparison_arm_dir(arm).join("checkout");
+    let revision = git(&checkout, &["rev-parse", "HEAD"])?.trim().to_owned();
     if !git_ok(
-        &arm_checkout,
+        repository,
         &["cat-file", "-e", &format!("{revision}^{{commit}}")],
+    ) || !git_ok(
+        repository,
+        &["merge-base", "--is-ancestor", base, &revision],
     ) {
         return Err(format!(
-            "the solution revision {revision} is not an object of the {} arm's own repository",
-            arm.as_str()
-        ));
-    }
-    let base = binding.workload.revision.clone();
-    if !git_ok(
-        &arm_checkout,
-        &["merge-base", "--is-ancestor", &base, &revision],
-    ) {
-        return Err(format!(
-            "the solution revision {revision} is not a descendant of the frozen task revision"
+            "the solution revision {revision} is not a descendant in the bound task repository"
         ));
     }
     let status = git(
         &checkout,
         &["status", "--porcelain", "--untracked-files=normal"],
-    )
-    .map_err(|error| format!("the solution checkout status is unavailable: {error}"))?;
+    )?;
     let dirty: Vec<&str> = status
         .lines()
         .map(str::trim)
@@ -2624,19 +2640,26 @@ fn validate_solution(
     let changed = git(
         &checkout,
         &["diff", "--name-only", &format!("{base}..{revision}")],
-    )
-    .map_err(|error| format!("the changed-path list is unavailable: {error}"))?;
+    )?;
     let changed: Vec<String> = changed
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect();
-    changed_paths_within_scope(
-        &changed,
-        &comparison.task.writable_scope,
-        &comparison.specification.change,
-    )?;
+    if let Some(change) = planning_change {
+        changed_paths_within_scope(&changed, scope, change)?;
+    } else {
+        for path in &changed {
+            if !scope.iter().any(|allowed| {
+                path == allowed || path.starts_with(&format!("{}/", allowed.trim_end_matches('/')))
+            }) {
+                return Err(format!(
+                    "the committed path {path} is outside the frozen task writable scope"
+                ));
+            }
+        }
+    }
     Ok(Solution {
         revision,
         changed_paths: changed,
@@ -2644,17 +2667,273 @@ fn validate_solution(
     })
 }
 
-struct Acceptance {
-    passed: bool,
-    record_path: PathBuf,
-    started_at: f64,
-    ended_at: f64,
-    /// Observed result of preparing the acceptance workspace: the committed
-    /// solution was materialized and the workspace cleaned, so both arms are
-    /// checked from the same fresh source-only state. Any build products an
-    /// acceptance checker needs are prepared by the checker itself and their
-    /// time is part of this check's accounted span.
-    workspace_preparation: String,
+#[derive(Debug)]
+pub(super) struct Acceptance {
+    pub(super) passed: bool,
+    pub(super) record_path: PathBuf,
+    pub(super) started_at: f64,
+    pub(super) ended_at: f64,
+    /// The solution was materialized in an owned fresh source-only workspace.
+    pub(super) workspace_preparation: String,
+}
+
+/// Proven evidence that one checker invocation failed before any process could
+/// start. The record, its pre-start receipt and its failure are retained
+/// separately so a later explicit resume can add one new attempt without
+/// losing the original admission failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct UnstartedAcceptance {
+    pub(super) record_path: PathBuf,
+    pub(super) record_sha256: String,
+    pub(super) started_path: PathBuf,
+    pub(super) started_sha256: String,
+    pub(super) failure_path: PathBuf,
+    pub(super) failure_sha256: String,
+    pub(super) started_at: String,
+    pub(super) ended_at: String,
+    pub(super) elapsed_seconds: String,
+    pub(super) stage: String,
+    pub(super) message: String,
+    pub(super) legacy: bool,
+    pub(super) request_sha256: Option<String>,
+}
+
+/// The two outcomes the retained checker record can prove. An executed checker
+/// stays final even when it failed; an unstarted checker is incomplete and is
+/// never a task-quality rejection.
+#[derive(Debug)]
+pub(super) enum OracleOutcome {
+    Executed(Acceptance),
+    Unstarted(UnstartedAcceptance),
+}
+
+impl Acceptance {
+    fn executed(record: &Value, record_path: &Path) -> Result<Self, String> {
+        if record["runs"].as_array().is_none_or(|runs| runs.is_empty()) {
+            return Err(
+                "the retained oracle claims an executed checker without a completed worker run; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                    .to_owned(),
+            );
+        }
+        let started_at = record["started_at"]
+            .as_f64()
+            .ok_or_else(|| "the retained oracle start time is missing".to_owned())?;
+        let ended_at = record["ended_at"]
+            .as_f64()
+            .ok_or_else(|| "the retained oracle end time is missing".to_owned())?;
+        if ended_at < started_at {
+            return Err("the retained oracle ended before it started".to_owned());
+        }
+        Ok(Self {
+            passed: record["checker_executed"] == true && record["passed"] == true,
+            record_path: record_path.to_path_buf(),
+            started_at,
+            ended_at,
+            workspace_preparation: "source-only-fresh-workspace".to_owned(),
+        })
+    }
+}
+
+fn oracle_evidence(path: &Path) -> Result<Value, String> {
+    read_json(path, MAX_RUN_SPEC_BYTES).map_err(|error| {
+        format!(
+            "retained oracle evidence {} is unreadable: {error}",
+            path.display()
+        )
+    })
+}
+
+fn same_field(record: &Value, evidence: &Value, field: &str) -> bool {
+    record.get(field).is_some() && record.get(field) == evidence.get(field)
+}
+
+fn legacy_pre_spawn_admission(message: &str) -> bool {
+    let cause = message.starts_with(
+        "the declared deadline expired while waiting for the shared heavy-command slot:",
+    ) || message.starts_with("the shared heavy-command slot could not be acquired:");
+    cause && message.contains("no worker started")
+}
+
+fn legacy_elapsed(message: &str) -> Option<String> {
+    let start = message.rfind("elapsed ")? + "elapsed ".len();
+    let tail = &message[start..];
+    let end = tail.find('s')?;
+    Some(tail[..end].to_owned())
+}
+
+/// Classify one retained real-task oracle record. `checker_executed=true` is
+/// final, including a genuine failing verdict. A false value is unstarted only
+/// when the pre-start receipt binds this exact invocation and the failure owner
+/// proves the account admission wait failed before any process was created.
+/// Every other false record is ambiguous and refuses replay.
+pub(super) fn classify_oracle_record(
+    record: &Value,
+    record_path: &Path,
+    request_sha256: &str,
+) -> Result<OracleOutcome, String> {
+    if record["kind"] != "real-task" || record["executed"] != true {
+        return Err(format!(
+            "the acceptance entry point did not execute the frozen checker ({}); no result enters the comparison",
+            record["failure"]
+                .as_str()
+                .unwrap_or("no failure cause recorded")
+        ));
+    }
+    if record["checker_executed"] == true {
+        return Acceptance::executed(record, record_path).map(OracleOutcome::Executed);
+    }
+    if record["checker_executed"] != false {
+        return Err(
+            "the retained oracle does not state whether the checker executed; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                .to_owned(),
+        );
+    }
+    if record["passed"] != false
+        || record["model_calls"] != 0
+        || record["runs"]
+            .as_array()
+            .is_none_or(|runs| !runs.is_empty())
+    {
+        return Err(
+            "the retained oracle has no completed checker run but still claims a verdict or usage; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                .to_owned(),
+        );
+    }
+    if record["checker_route"].as_str() != Some("shared-heavy-command") {
+        return Err(
+            "the retained oracle names no shared-heavy-command route; its start is unknown and the attempt is incomplete, not a task-quality rejection"
+                .to_owned(),
+        );
+    }
+    if record["failure"]
+        .as_str()
+        .is_none_or(|failure| failure.is_empty())
+    {
+        return Err(
+            "the retained oracle records no failure cause for the missing checker run; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let started_at = record["started_at"]
+        .as_f64()
+        .ok_or_else(|| "the retained oracle start time is missing".to_owned())?;
+    let ended_at = record["ended_at"]
+        .as_f64()
+        .ok_or_else(|| "the retained oracle end time is missing".to_owned())?;
+    if ended_at < started_at {
+        return Err("the retained oracle ended before it started".to_owned());
+    }
+    let evidence_path = record["evidence"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| "the retained oracle names no original evidence record".to_owned())?;
+    if evidence_path.file_name().and_then(|name| name.to_str()) != Some("oracle.json") {
+        return Err("the retained oracle original evidence has an unexpected shape".to_owned());
+    }
+    let original = oracle_evidence(&evidence_path)?;
+    if &original != record {
+        return Err(
+            "the retained oracle record does not match its original evidence bytes; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let directory = evidence_path
+        .parent()
+        .ok_or_else(|| "the retained oracle original evidence has no parent".to_owned())?;
+    let started_path = directory.join("oracle-started.json");
+    let failure_path = directory.join("failure.json");
+    let started = oracle_evidence(&started_path)?;
+    let failure = oracle_evidence(&failure_path)?;
+    if started["kind"] != "real-task"
+        || started["executed"] != true
+        || started["checker_executed"] != false
+        || started["passed"] != false
+        || started["started_at"] != record["started_at"]
+        || started["ended_at"] != Value::Null
+        || started.get("failure").is_some()
+        || started.get("runs").is_some_and(|runs| runs != &json!([]))
+        || started["evidence"] != record["evidence"]
+        || !same_field(record, &started, "task_contract_sha256")
+        || !same_field(record, &started, "oracle_program_sha256")
+        || !same_field(record, &started, "oracle_inputs")
+    {
+        return Err(
+            "the pre-start oracle receipt does not bind this exact invocation; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let record_request = record["acceptance_request_sha256"].as_str();
+    let started_request = started["acceptance_request_sha256"].as_str();
+    let failure_request = failure["acceptance_request_sha256"].as_str();
+    if record_request.is_some_and(|value| value != request_sha256)
+        || started_request.is_some_and(|value| value != request_sha256)
+        || failure_request.is_some_and(|value| value != request_sha256)
+        || (record_request.is_some()
+            && started_request.is_some()
+            && record_request != started_request)
+        || (record_request.is_some()
+            && failure_request.is_some()
+            && record_request != failure_request)
+    {
+        return Err(
+            "the retained pre-start evidence binds a different acceptance request; its start is unknown and the attempt is incomplete"
+                .to_owned(),
+        );
+    }
+    let message = failure["message"]
+        .as_str()
+        .ok_or_else(|| "the retained admission failure has no message".to_owned())?;
+    if message.is_empty() {
+        return Err("the retained admission failure has an empty message".to_owned());
+    }
+    let structured_binding =
+        record_request.is_some() && started_request.is_some() && failure_request.is_some();
+    let (stage, legacy, elapsed_seconds) = if failure["stage"].as_str() == Some("admission-wait")
+        && failure["spawned"].as_bool() == Some(false)
+        && failure["admission"].is_object()
+        && structured_binding
+        && same_field(record, &failure, "task_contract_sha256")
+        && same_field(record, &failure, "oracle_program_sha256")
+        && same_field(record, &failure, "oracle_inputs")
+    {
+        let elapsed = failure["elapsed_seconds"]
+            .as_f64()
+            .map(|value| value.to_string())
+            .or_else(|| legacy_elapsed(message))
+            .ok_or_else(|| "the retained admission failure has no elapsed time".to_owned())?;
+        ("admission-wait".to_owned(), false, elapsed)
+    } else if failure.get("stage").is_none()
+        && failure.get("spawned").is_none()
+        && legacy_pre_spawn_admission(message)
+    {
+        let elapsed = legacy_elapsed(message).ok_or_else(|| {
+            "the retained legacy admission failure has no elapsed time".to_owned()
+        })?;
+        ("admission-wait".to_owned(), true, elapsed)
+    } else {
+        return Err(
+            "the retained oracle has no proven pre-spawn admission failure; its start is unknown and the attempt is incomplete, not a task-quality rejection and must not be replayed"
+                .to_owned(),
+        );
+    };
+    Ok(OracleOutcome::Unstarted(UnstartedAcceptance {
+        record_path: record_path.to_path_buf(),
+        record_sha256: build_identity::hash_file(record_path)
+            .map_err(|error| format!("the retained oracle record is unreadable: {error}"))?,
+        started_path: started_path.clone(),
+        started_sha256: build_identity::hash_file(&started_path)
+            .map_err(|error| format!("the pre-start oracle receipt is unreadable: {error}"))?,
+        failure_path: failure_path.clone(),
+        failure_sha256: build_identity::hash_file(&failure_path)
+            .map_err(|error| format!("the retained admission failure is unreadable: {error}"))?,
+        started_at: record["started_at"].to_string(),
+        ended_at: record["ended_at"].to_string(),
+        elapsed_seconds,
+        stage,
+        message: message.to_owned(),
+        legacy,
+        request_sha256: record_request.map(str::to_owned),
+    }))
 }
 
 /// The frozen identity of the supervisor process that owns one comparison
@@ -2752,9 +3031,6 @@ fn freeze_or_verify_supervisor(
     Ok(())
 }
 
-/// Materialize the committed solution into the frozen acceptance workspace
-/// and run the unchanged supervisor's real-task oracle entry point with the
-/// frozen request bytes. The record is retained before its outcome is used.
 fn run_oracle(
     run: &Run,
     comparison: &ComparisonInputs,
@@ -2785,38 +3061,60 @@ fn run_oracle(
     freeze_or_verify_supervisor(run, comparison, true).map_err(|reason| {
         format!("the unchanged supervisor is required to evaluate this candidate: {reason}")
     })?;
-    let checkout = solution.checkout.to_string_lossy().into_owned();
-    git(
+    let record_path = run.store.comparison_arm_dir(arm).join("oracle.json");
+    match execute_oracle(
+        &comparison.acceptance.request,
+        &comparison.acceptance.request_sha256,
         &workspace,
-        &[
-            "fetch",
-            "-q",
-            "--no-tags",
-            "--force",
-            &checkout,
-            &solution.revision,
-        ],
+        &solution.checkout,
+        &solution.revision,
+        &record_path,
+    )? {
+        OracleOutcome::Executed(acceptance) => Ok(acceptance),
+        OracleOutcome::Unstarted(unstarted) => Err(format!(
+            "the independent checker was proven never to start ({} at {}); the attempt is incomplete, not a rejected candidate, and is retained with its admission failure",
+            unstarted.stage,
+            unstarted.record_path.display()
+        )),
+    }
+}
+
+/// Materialize one committed revision into the frozen acceptance workspace
+/// and run the unchanged supervisor's real-task oracle entry point with the
+/// frozen request bytes. Shared by the comparison arms and the one-arm
+/// baseline qualification: neither caller authors the request, and the
+/// retained record is written before its outcome is used.
+pub(super) fn execute_oracle(
+    request: &Path,
+    request_sha256: &str,
+    workspace: &Path,
+    checkout: &Path,
+    revision: &str,
+    record_path: &Path,
+) -> Result<OracleOutcome, String> {
+    let checkout = checkout.to_string_lossy().into_owned();
+    git(
+        workspace,
+        &["fetch", "-q", "--no-tags", "--force", &checkout, revision],
     )
     .map_err(|error| format!("the solution could not be materialized for acceptance: {error}"))?;
-    git(
-        &workspace,
-        &["checkout", "-q", "--detach", "-f", &solution.revision],
-    )
-    .map_err(|error| format!("the acceptance workspace could not be checked out: {error}"))?;
-    git(&workspace, &["clean", "-fdxq"])
+    git(workspace, &["checkout", "-q", "--detach", "-f", revision])
+        .map_err(|error| format!("the acceptance workspace could not be checked out: {error}"))?;
+    git(workspace, &["clean", "-fdxq"])
         .map_err(|error| format!("the acceptance workspace could not be cleaned: {error}"))?;
     let workspace_preparation = "source-only-fresh-workspace".to_owned();
 
     let started_at = now_seconds();
     let supervisor = std::env::current_exe()
         .map_err(|error| format!("the supervisor executable is unavailable: {error}"))?;
+    let request_text = request.to_string_lossy();
     let output = Command::new(&supervisor)
         .args([
             "outcome-oracle",
             "--request",
-            &comparison.acceptance.request.to_string_lossy(),
+            request_text.as_ref(),
             "--request-sha256",
-            &comparison.acceptance.request_sha256,
+            request_sha256,
         ])
         .output()
         .map_err(|error| format!("the acceptance entry point could not start: {error}"))?;
@@ -2827,25 +3125,17 @@ fn run_oracle(
     let record: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!("the acceptance entry point returned no readable record: {error}")
     })?;
-    if record["kind"] != "real-task" || record["executed"] != true {
-        return Err(format!(
-            "the acceptance entry point did not execute the frozen checker ({}); no result enters the comparison",
-            record["failure"]
-                .as_str()
-                .unwrap_or("no failure cause recorded")
-        ));
-    }
-    let record_path = run.store.comparison_arm_dir(arm).join("oracle.json");
-    write_json_atomic(&record_path, &record)
+    write_json_atomic(record_path, &record)
         .map_err(|error| format!("the acceptance record could not be retained: {error}"))?;
-    let passed = record["passed"] == true && record["checker_executed"] == true;
-    Ok(Acceptance {
-        passed,
-        record_path,
-        started_at,
-        ended_at,
-        workspace_preparation,
-    })
+    match classify_oracle_record(&record, record_path, request_sha256)? {
+        OracleOutcome::Executed(mut acceptance) => {
+            acceptance.started_at = started_at;
+            acceptance.ended_at = ended_at;
+            acceptance.workspace_preparation = workspace_preparation;
+            Ok(OracleOutcome::Executed(acceptance))
+        }
+        unstarted => Ok(unstarted),
+    }
 }
 
 /// The declared subtractive treatment of a measured comparison: the frozen
@@ -3629,10 +3919,16 @@ fn verified_command_identity(
     matched.next().is_none().then(|| life.id.clone())
 }
 
-fn retained_observation(attempt: &Attempt) -> Option<Value> {
-    let retained = attempt.retained.as_ref()?;
+pub(super) fn retained_observation(attempt: &Attempt) -> Option<Value> {
+    retained_observation_at(&attempt.retained.as_ref()?.receipt)
+}
+
+/// The recorded observation object of one exact native receipt. The ordinary
+/// adapter holds a verified receipt path and must not fabricate an attempt just
+/// to reach the same bounded observation shape.
+pub(super) fn retained_observation_at(receipt: &Path) -> Option<Value> {
     let bytes = crate::outcome_run::bounded_read(
-        &retained.receipt,
+        receipt,
         harness_core::improvement_loop::MAX_RETAINED_RECEIPT_BYTES,
     )
     .ok()?;
@@ -3640,23 +3936,59 @@ fn retained_observation(attempt: &Attempt) -> Option<Value> {
     value.get("observation").cloned()
 }
 
-struct Sessions {
-    paths: Vec<PathBuf>,
-    verified: bool,
-    /// Why the observation is unverified; named for the arm refusal.
-    reason: Option<String>,
-    /// Distinct outer tool calls (recorded `function_call` items) across this
-    /// attempt's rollout files, deduplicated by call identity. `None` when the
-    /// rollouts were not read or lost lines, so the count stays unknown
-    /// instead of becoming a fabricated low number.
-    tool_calls: Option<u64>,
+pub(super) struct Sessions {
+    pub(super) paths: Vec<PathBuf>,
+    pub(super) verified: bool,
+    pub(super) reason: Option<String>,
+    /// Distinct recorded outer calls; absent when coverage is incomplete.
+    pub(super) tool_calls: Option<u64>,
 }
 
-/// Discover this attempt's own rollout files under the arm home and verify
-/// the observed model and reasoning effort through the rollout owner. A
-/// missing or mismatched session stays unverified with a named reason instead
-/// of being inferred.
 fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
+    let runtime_path = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.arm(arm_of_role(attempt.role)).runtime.clone());
+    let Some(runtime_path) = runtime_path else {
+        return Ok(Sessions {
+            paths: Vec::new(),
+            verified: false,
+            reason: Some("the arm runtime receipt is missing".to_owned()),
+            tool_calls: None,
+        });
+    };
+    let runtime: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
+    let (declared_model, declared_effort) = run
+        .spec
+        .comparison
+        .as_ref()
+        .map(|comparison| {
+            (
+                comparison.runtimes.client.runner.model.clone(),
+                comparison.runtimes.client.reasoning_effort.clone(),
+            )
+        })
+        .unwrap_or_default();
+    discover_attempt_sessions(
+        attempt,
+        &runtime.home,
+        &declared_model,
+        declared_effort.as_deref(),
+    )
+}
+
+/// Discover the rollout files of one attempt's exact native session under an
+/// explicit participant home and verify the observed model and effort. The
+/// baseline qualification has one prepared runtime instead of comparison
+/// arms, so it supplies the home and declared binding directly; the observed
+/// identity rules stay identical to the comparison path.
+pub(super) fn discover_attempt_sessions(
+    attempt: &Attempt,
+    home: &Path,
+    declared_model: &str,
+    declared_effort: Option<&str>,
+) -> io::Result<Sessions> {
     let unverified = |reason: String| Sessions {
         paths: Vec::new(),
         verified: false,
@@ -3674,16 +4006,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
                 .to_owned(),
         ));
     };
-    let runtime_path = run
-        .cursor
-        .comparison
-        .as_ref()
-        .and_then(|state| state.arm(arm_of_role(attempt.role)).runtime.clone());
-    let Some(runtime_path) = runtime_path else {
-        return Ok(unverified("the arm runtime receipt is missing".to_owned()));
-    };
-    let runtime: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
-    let sessions = runtime.home.join("sessions");
+    let sessions = home.join("sessions");
     let mut paths = Vec::new();
     if sessions.is_dir() {
         let mut pending = vec![sessions];
@@ -3693,7 +4016,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
                 entries += 1;
                 if entries > MAX_ROLLOUT_ENTRIES {
                     return Ok(unverified(
-                        "the arm home holds more rollout files than the bounded scan allows"
+                        "the participant home holds more rollout files than the bounded scan allows"
                             .to_owned(),
                     ));
                 }
@@ -3712,17 +4035,6 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
     }
     paths.sort();
     paths.dedup();
-    let (declared_model, declared_effort) = run
-        .spec
-        .comparison
-        .as_ref()
-        .map(|comparison| {
-            (
-                comparison.runtimes.client.runner.model.clone(),
-                comparison.runtimes.client.reasoning_effort.clone(),
-            )
-        })
-        .unwrap_or_default();
     if paths.is_empty() {
         return Ok(unverified(format!(
             "no rollout was observed for the attempt's recorded session {expected}; the measured model and effort cannot be verified"
@@ -3752,9 +4064,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         let model_matches = model == declared_model
             || model == format!("openai/{declared_model}")
             || model == format!("xai/{declared_model}");
-        let effort_matches = declared_effort
-            .as_deref()
-            .is_none_or(|declared| effort == declared);
+        let effort_matches = declared_effort.is_none_or(|declared| effort == declared);
         // Identity conflicts disqualify the observation. Provider attribution
         // for a local alias stays a disclosed limit of the accounting, not a
         // reason to drop the measured rollout.
@@ -3793,7 +4103,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         if !effort_matches {
             return Ok(unverified(format!(
                 "the observation recorded reasoning effort {effort} instead of the declared {}",
-                declared_effort.as_deref().unwrap_or("default")
+                declared_effort.unwrap_or("default")
             )));
         }
         observed_model = Some(model.to_owned());
@@ -3817,7 +4127,7 @@ fn arm_of_role(role: AttemptRole) -> ComparisonArm {
 /// reader's deduplicated response count retained as the measured model-request
 /// total. A partial or missing measurement is omitted, never reported as a
 /// fabricated zero.
-fn usage_totals(paths: &[PathBuf]) -> Option<Value> {
+pub(super) fn usage_totals(paths: &[PathBuf]) -> Option<Value> {
     if paths.is_empty() {
         return None;
     }
@@ -5670,4 +5980,272 @@ fn publish_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
         evaluation.coverage
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod oracle_classification_tests {
+    use super::*;
+
+    const REQUEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const CONTRACT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const PROGRAM: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn base_record() -> Value {
+        json!({
+            "schema": 1, "id": "outcome", "kind": "real-task", "executed": true,
+            "checker_executed": false, "passed": false, "exit_code": 1,
+            "model_calls": 0, "checker_route": "shared-heavy-command",
+            "started_at": 100.0, "ended_at": 130.0,
+            "evidence": "placeholder",
+            "acceptance_request_sha256": REQUEST,
+            "task_contract_sha256": CONTRACT,
+            "oracle_program_sha256": PROGRAM,
+            "oracle_inputs": {"input.txt": CONTRACT},
+            "failure": "independent checker did not complete; inspect retained failure.json",
+            "runs": [],
+        })
+    }
+
+    fn structured_failure(record: &Value, elapsed: f64) -> Value {
+        json!({
+            "kind": "Other",
+            "message": format!(
+                "the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed {elapsed:.1}s"
+            ),
+            "raw_os_error": null,
+            "stage": "admission-wait",
+            "spawned": false,
+            "elapsed_seconds": elapsed,
+            "acceptance_request_sha256": record["acceptance_request_sha256"],
+            "task_contract_sha256": record["task_contract_sha256"],
+            "oracle_program_sha256": record["oracle_program_sha256"],
+            "oracle_inputs": record["oracle_inputs"],
+            "admission": {"route": "shared-heavy-command"},
+        })
+    }
+
+    fn legacy_failure() -> Value {
+        json!({
+            "kind": "Other",
+            "message": "the declared deadline expired while waiting for the shared heavy-command slot: resource admission cancelled; no worker started; elapsed 60.0s",
+            "raw_os_error": null,
+        })
+    }
+
+    /// Write the exact invocation evidence beside a retained copy of the
+    /// oracle record. The caller mutates the pre-start receipt to exercise a
+    /// binding mismatch; the failure is written as supplied.
+    fn write_case(
+        mut record: Value,
+        patch_started: impl FnOnce(&mut Value),
+        failure: Value,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join("evidence");
+        fs::create_dir_all(&evidence).unwrap();
+        let oracle_path = evidence.join("oracle.json");
+        record["evidence"] = json!(oracle_path.to_string_lossy());
+        let mut started = record.clone();
+        started["ended_at"] = Value::Null;
+        started.as_object_mut().unwrap().remove("failure");
+        started.as_object_mut().unwrap().remove("runs");
+        patch_started(&mut started);
+        fs::write(&oracle_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::write(
+            evidence.join("oracle-started.json"),
+            serde_json::to_vec(&started).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            evidence.join("failure.json"),
+            serde_json::to_vec(&failure).unwrap(),
+        )
+        .unwrap();
+        let retained = root.path().join("retained-oracle.json");
+        fs::write(&retained, serde_json::to_vec(&record).unwrap()).unwrap();
+        (root, retained)
+    }
+
+    #[test]
+    fn an_executed_failing_checker_is_final() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oracle.json");
+        let record = json!({
+            "kind": "real-task", "executed": true, "checker_executed": true,
+            "passed": false, "started_at": 10.0, "ended_at": 20.0,
+            "runs": [{"status": "exited", "exit_code": 1}],
+        });
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        match classify_oracle_record(&record, &path, REQUEST).unwrap() {
+            OracleOutcome::Executed(acceptance) => assert!(!acceptance.passed),
+            OracleOutcome::Unstarted(_) => panic!("an executed failure is final"),
+        }
+    }
+
+    #[test]
+    fn an_executed_claim_without_its_worker_run_is_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oracle.json");
+        let record = json!({
+            "kind": "real-task", "executed": true, "checker_executed": true,
+            "passed": false, "started_at": 10.0, "ended_at": 20.0, "runs": [],
+        });
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let error = classify_oracle_record(&record, &path, REQUEST).unwrap_err();
+        assert!(error.contains("without a completed worker run"), "{error}");
+    }
+
+    #[test]
+    fn a_preparation_failure_is_ambiguous() {
+        let record = base_record();
+        let failure = json!({
+            "kind": "Other",
+            "message": "the admitted checker could not be prepared: access denied; elapsed 0.1s",
+            "raw_os_error": null,
+            "stage": "preparation",
+            "spawned": false,
+            "elapsed_seconds": 0.1,
+            "acceptance_request_sha256": record["acceptance_request_sha256"],
+            "task_contract_sha256": record["task_contract_sha256"],
+            "oracle_program_sha256": record["oracle_program_sha256"],
+            "oracle_inputs": record["oracle_inputs"],
+        });
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        let error = classify_oracle_record(&retained_record, &retained, REQUEST).unwrap_err();
+        assert!(
+            error.contains("no proven pre-spawn admission failure"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_structured_admission_failure_is_proven_unstarted() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        match classify_oracle_record(&retained_record, &retained, REQUEST).unwrap() {
+            OracleOutcome::Unstarted(unstarted) => {
+                assert!(!unstarted.legacy);
+                assert_eq!(unstarted.stage, "admission-wait");
+                assert_eq!(unstarted.elapsed_seconds.parse::<f64>().unwrap(), 2.0);
+            }
+            OracleOutcome::Executed(_) => panic!("admission never executed the checker"),
+        }
+    }
+
+    #[test]
+    fn an_execution_failure_is_ambiguous() {
+        let record = base_record();
+        let failure = json!({
+            "kind": "Other",
+            "message": "the admitted checker could not be started or cleaned: access denied; elapsed 1.0s",
+            "raw_os_error": null,
+            "stage": "execution",
+            "spawned": null,
+            "elapsed_seconds": 1.0,
+            "acceptance_request_sha256": record["acceptance_request_sha256"],
+            "task_contract_sha256": record["task_contract_sha256"],
+            "oracle_program_sha256": record["oracle_program_sha256"],
+            "oracle_inputs": record["oracle_inputs"],
+        });
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        let error = classify_oracle_record(&retained_record, &retained, REQUEST).unwrap_err();
+        assert!(
+            error.contains("no proven pre-spawn admission failure"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_generic_false_record_is_ambiguous() {
+        let record = base_record();
+        let failure = json!({
+            "kind": "Other",
+            "message": "the checker failed",
+            "raw_os_error": null,
+        });
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn the_legacy_pre_spawn_message_is_proven_unstarted() {
+        let mut record = base_record();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("acceptance_request_sha256");
+        let (_root, retained) = write_case(
+            record,
+            |started| {
+                started
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("acceptance_request_sha256");
+            },
+            legacy_failure(),
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        match classify_oracle_record(&retained_record, &retained, REQUEST).unwrap() {
+            OracleOutcome::Unstarted(unstarted) => {
+                assert!(unstarted.legacy);
+                assert_eq!(unstarted.stage, "admission-wait");
+                assert_eq!(unstarted.elapsed_seconds, "60.0");
+            }
+            OracleOutcome::Executed(_) => panic!("the legacy admission never executed the checker"),
+        }
+    }
+
+    #[test]
+    fn a_mismatched_pre_start_receipt_is_ambiguous() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(
+            record,
+            |started| started["task_contract_sha256"] = json!("0".repeat(64)),
+            failure,
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn a_mismatched_request_binding_is_ambiguous() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(
+            record,
+            |started| started["acceptance_request_sha256"] = json!("0".repeat(64)),
+            failure,
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn a_false_record_with_usage_is_ambiguous() {
+        let mut record = base_record();
+        record["runs"] = json!([{"exit_code": 1}]);
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(record, |_| {}, failure);
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
+
+    #[test]
+    fn a_started_receipt_with_an_end_time_is_ambiguous() {
+        let record = base_record();
+        let failure = structured_failure(&record, 2.0);
+        let (_root, retained) = write_case(
+            record,
+            |started| started["ended_at"] = json!(120.0),
+            failure,
+        );
+        let retained_record: Value = read_json(&retained, MAX_RUN_SPEC_BYTES).unwrap();
+        assert!(classify_oracle_record(&retained_record, &retained, REQUEST).is_err());
+    }
 }

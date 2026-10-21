@@ -41,6 +41,8 @@ pub const RUN_SCHEMA: u32 = 1;
 pub const CURSOR_SCHEMA: u32 = 1;
 pub const OWNER_SCHEMA: u32 = 1;
 pub const VARIANTS_SCHEMA: u32 = 1;
+/// Schema of one explicit one-arm baseline qualification declaration.
+pub const BASELINE_QUALIFICATION_SCHEMA: u32 = 1;
 pub const MAX_RUN_SPEC_BYTES: u64 = 256 * 1024;
 pub const MAX_CURSOR_BYTES: u64 = 1024 * 1024;
 /// The cursor is bounded recovery data: old effects are dropped (with a
@@ -368,6 +370,10 @@ pub struct TaskInputs {
     pub name: String,
     /// The workload's own writable scope, relative to the frozen task copy.
     pub writable_scope: Vec<String>,
+    /// Explicit analysis-only work; its source scope must remain empty.
+    /// This does not change the ordinary agent's runtime or tool authority.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 impl TaskInputs {
@@ -382,7 +388,13 @@ impl TaskInputs {
             ));
         }
         token("task name", &self.name, MAX_TOKEN)?;
-        if self.writable_scope.is_empty() || self.writable_scope.len() > MAX_SCOPE_ENTRIES {
+        if self.read_only {
+            if !self.writable_scope.is_empty() {
+                return Err(invalid(
+                    "a read_only task must have an empty writable_scope",
+                ));
+            }
+        } else if self.writable_scope.is_empty() || self.writable_scope.len() > MAX_SCOPE_ENTRIES {
             return Err(invalid(
                 "the task writable_scope must name 1-32 relative paths inside the frozen copy",
             ));
@@ -391,6 +403,48 @@ impl TaskInputs {
             relative_scope_entry(entry)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod task_input_tests {
+    use super::TaskInputs;
+    use serde_json::json;
+
+    #[test]
+    fn analysis_only_scope_is_explicit_and_cannot_authorize_writes() {
+        let source = tempfile::tempdir().unwrap();
+        let input = json!({
+            "source": source.path(),
+            "revision": "1234567",
+            "name": "retained-evidence-diagnosis",
+            "writable_scope": [],
+        });
+        let mut task: TaskInputs = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&task).unwrap(), input);
+        assert!(
+            !task.read_only,
+            "legacy tasks keep implementation semantics"
+        );
+        assert!(
+            task.validate().is_err(),
+            "an omitted scope must not grant analysis-only authority"
+        );
+        task.writable_scope.push("solution.txt".to_owned());
+        assert!(task.validate().is_ok());
+
+        let mut analysis = input;
+        analysis["read_only"] = json!(true);
+        let mut task: TaskInputs = serde_json::from_value(analysis).unwrap();
+        assert!(
+            task.validate().is_ok(),
+            "a read-only task needs no fictitious output file"
+        );
+        task.writable_scope.push("solution.txt".to_owned());
+        assert!(
+            task.validate().is_err(),
+            "read-only and write authority must not coexist"
+        );
     }
 }
 
@@ -517,6 +571,86 @@ pub struct ComparisonInputs {
     /// absent means a declared bearer cannot be supplied.
     #[serde(default)]
     pub observation_auth: Option<ClientInput>,
+    /// Optional declared bounded lead/executor/review workflow. Absent keeps
+    /// the legacy executor-only measured conversation exactly as before.
+    #[serde(default)]
+    pub workflow: Option<WorkflowInputs>,
+}
+
+/// One predeclared measured workflow composition. It names only the
+/// participant profiles and the bounded correction allowance: the task,
+/// source, acceptance entry point, policy and realized arm order stay frozen
+/// by the enclosing comparison inputs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowInputs {
+    pub schema: u32,
+    /// The configured bounded-lead profile every lead turn continues.
+    pub lead_profile: String,
+    /// The executor profile every executor turn must resolve.
+    pub executor_profile: String,
+    /// Same-executor correction turns allowed after review. The allowance is
+    /// finite and predeclared: each correction adds one executor turn and one
+    /// required review turn, so the declared total stays inside the cursor's
+    /// bounded attempt capacity instead of relying on an arbitrary smaller cap.
+    #[serde(default)]
+    pub max_corrections: u32,
+    /// Frozen concurrent capacity for the workflow participants. Zero keeps
+    /// the documented minimum of two (one lead and one executor slot); any
+    /// declared value must leave room for both participants.
+    #[serde(default)]
+    pub capacity: u32,
+}
+
+impl WorkflowInputs {
+    /// Validate the declared participant composition. The turn plan is
+    /// `3 + 2N`: one lead frame, one executor turn, one review turn and, per
+    /// declared correction, one same-executor correction plus the review that
+    /// must follow it. The plan is checked against the cursor's bounded attempt
+    /// capacity rather than an arbitrary smaller correction count.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != 1 {
+            return Err(invalid(format!(
+                "the declared measured workflow uses unsupported schema {}; this controller reads schema 1",
+                self.schema
+            )));
+        }
+        token("workflow lead profile", &self.lead_profile, MAX_TOKEN)?;
+        token(
+            "workflow executor profile",
+            &self.executor_profile,
+            MAX_TOKEN,
+        )?;
+        if self.lead_profile == self.executor_profile {
+            return Err(invalid(
+                "the declared measured workflow names one profile for both lead and executor turns; the participants must resolve distinct configured bindings",
+            ));
+        }
+        if self.capacity == 1 || self.capacity > 32 {
+            return Err(invalid(
+                "the declared workflow capacity must leave room for a lead and an executor slot (2-32)",
+            ));
+        }
+        if u64::from(self.planned_turns()) > MAX_ATTEMPTS as u64 {
+            return Err(invalid(format!(
+                "the declared {} correction turn(s) need {} workflow turns, beyond the cursor's bounded {MAX_ATTEMPTS} attempt capacity",
+                self.max_corrections,
+                self.planned_turns()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The exact number of participant turns this declaration plans.
+    pub fn planned_turns(&self) -> u32 {
+        3u32.saturating_add(self.max_corrections.saturating_mul(2))
+    }
+
+    /// The frozen participant capacity; an omitted declaration keeps the
+    /// documented minimum of two slots.
+    pub fn effective_capacity(&self) -> u32 {
+        if self.capacity == 0 { 2 } else { self.capacity }
+    }
 }
 
 impl ComparisonInputs {
@@ -569,6 +703,21 @@ impl ComparisonInputs {
                 ));
             }
         }
+        if let Some(workflow) = &self.workflow {
+            if workflow.schema != 1 {
+                return Err(invalid(format!(
+                    "the declared measured workflow uses unsupported schema {}; this controller reads schema 1",
+                    workflow.schema
+                )));
+            }
+            token("workflow lead profile", &workflow.lead_profile, MAX_TOKEN)?;
+            token(
+                "workflow executor profile",
+                &workflow.executor_profile,
+                MAX_TOKEN,
+            )?;
+            workflow.validate()?;
+        }
         Ok(())
     }
 
@@ -577,6 +726,457 @@ impl ComparisonInputs {
     pub fn declared_policy(&self) -> io::Result<crate::improvement_policy::DeclaredComparison> {
         let policy: ComparisonPolicy = read_json(&self.policy, MAX_RUN_SPEC_BYTES)?;
         policy.declare()
+    }
+}
+
+/// The exact retained identities that let one sequential qualification run
+/// adopt an already prepared home from a completed run. Both files are
+/// verified by digest before any local preparation or participant dispatch.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationRuntimeReuse {
+    /// The retained ordinary or reviewer runtime receipt being adopted.
+    pub runtime: crate::improvement_runtime::FileIdentity,
+    /// The completed origin run's terminal cursor. It binds the receipt, the
+    /// participant bindings and the frozen provenance of workspace trust.
+    pub cursor: crate::improvement_runtime::FileIdentity,
+}
+
+/// The role whose occupied native home one sequential run adopts. Ordinary
+/// implementation and reviewer homes remain distinct ownership domains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QualificationRuntimeRole {
+    Ordinary,
+    Reviewer,
+}
+
+impl QualificationRuntimeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Reviewer => "reviewer",
+        }
+    }
+}
+
+/// Persisted proof that one role consumed its exact retained runtime receipt
+/// and every workspace trust entry that receipt may legitimately carry. The
+/// trusted paths are derived from frozen prior role attempts and recursively
+/// from the origin's own adoption record, never from caller-declared lists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationRuntimeAdoption {
+    pub role: QualificationRuntimeRole,
+    pub runtime: crate::improvement_runtime::FileIdentity,
+    pub origin_cursor: crate::improvement_runtime::FileIdentity,
+    pub origin_spec_digest: String,
+    pub origin_declaration_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_workspaces: Vec<PathBuf>,
+}
+
+/// One immutable runtime prepared for an ordinary control workflow.
+/// Local comparisons retain their explicit route; native role workflows use
+/// a frozen base configuration and explicitly named private profile/auth files.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationRuntimeInputs {
+    pub state: PathBuf,
+    pub build: PathBuf,
+    pub label: String,
+    pub upstream: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientInputs>,
+    /// Explicit native base configuration, frozen before preparation. It is
+    /// copied into a fresh owned home before the existing installer connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_config: Option<crate::improvement_runtime::FileIdentity>,
+    /// Explicit files such as a named executor profile and native auth. The
+    /// existing runtime owner validates destinations and retains their hashes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_inputs: Vec<crate::improvement_runtime::PrivateInput>,
+    /// Explicit sequential adoption from a completed, unchanged native home.
+    /// Omitted reuse keeps the existing fresh-install route and serialized
+    /// declaration bytes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<QualificationRuntimeReuse>,
+}
+
+impl QualificationRuntimeInputs {
+    /// The declaration with its adoption link removed. Sequential adoption
+    /// compares this form so every generation keeps the same underlying
+    /// native runtime declaration even though its origin link differs.
+    pub fn without_reuse(&self) -> Self {
+        let mut declaration = self.clone();
+        declaration.reuse = None;
+        declaration
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        absolute_directory("the prepared qualification runtime state", &self.state)?;
+        if !self.build.is_absolute() {
+            return Err(invalid(
+                "the prepared qualification build must be an absolute path inside its owned state",
+            ));
+        }
+        line("qualification runtime label", &self.label, MAX_REASON)?;
+        if !self.upstream.is_absolute() || !self.upstream.is_file() {
+            return Err(invalid(format!(
+                "the explicit qualification upstream client is missing at {}",
+                self.upstream.display()
+            )));
+        }
+        match (&self.client, &self.native_config) {
+            (Some(client), None) => {
+                let endpoint = client.runner.endpoint.trim();
+                if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                    return Err(invalid(
+                        "the declared qualification client endpoint must be an explicit http(s) URL",
+                    ));
+                }
+            }
+            (None, Some(config)) => {
+                if !config.path.is_absolute()
+                    || !config.path.is_file()
+                    || fs::metadata(&config.path)?.len() > MAX_RUN_SPEC_BYTES
+                    || crate::build_identity::hash_file(&config.path)? != config.sha256
+                {
+                    return Err(invalid(
+                        "the declared native qualification configuration is missing, oversized or changed; preserve the run and supply its exact frozen input",
+                    ));
+                }
+                let text = fs::read_to_string(&config.path)?;
+                let table: toml::Table = toml::from_str(text.trim_start_matches('\u{feff}'))
+                    .map_err(|_| {
+                        invalid("the declared native qualification configuration is not valid TOML")
+                    })?;
+                for field in ["model", "model_reasoning_effort"] {
+                    if table
+                        .get(field)
+                        .and_then(toml::Value::as_str)
+                        .is_none_or(|value| value.trim().is_empty())
+                    {
+                        return Err(invalid(format!(
+                            "the native qualification configuration must explicitly declare {field}"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "qualification requires exactly one declared local client or frozen native configuration; no implicit model route is selected",
+                ));
+            }
+        }
+        if let Some(reuse) = &self.reuse {
+            if !reuse.runtime.path.is_absolute() || !reuse.runtime.path.is_file() {
+                return Err(invalid(
+                    "the adopted qualification runtime receipt is missing or not absolute",
+                ));
+            }
+            if !reuse.cursor.path.is_absolute() || !reuse.cursor.path.is_file() {
+                return Err(invalid(
+                    "the adopted qualification origin cursor is missing or not absolute",
+                ));
+            }
+            for (name, identity, limit) in [
+                ("runtime receipt", &reuse.runtime, MAX_RUN_SPEC_BYTES),
+                ("origin cursor", &reuse.cursor, MAX_CURSOR_BYTES),
+            ] {
+                if fs::metadata(&identity.path)?.len() > limit
+                    || crate::build_identity::hash_file(&identity.path)? != identity.sha256
+                {
+                    return Err(invalid(format!(
+                        "the adopted qualification {name} changed; supply its exact retained identity"
+                    )));
+                }
+            }
+            if reuse.runtime.path == reuse.cursor.path {
+                return Err(invalid(
+                    "the adopted runtime receipt and origin cursor must be distinct files",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub const SEMANTIC_REVIEW_SCHEMA: u32 = 1;
+/// Largest declared source set one semantic reviewer may inspect.
+pub const MAX_REVIEW_SOURCES: usize = 32;
+
+/// The optional independent semantic acceptance reviewer of one ordinary
+/// baseline qualification. It is a separate fresh native runtime installed
+/// into its own read-only home; it never shares the implementation runtime,
+/// its writable sandbox or its mutable user configuration.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticReviewInputs {
+    pub schema: u32,
+    /// The reviewer's own frozen native runtime declaration.
+    pub runtime: QualificationRuntimeInputs,
+    /// The installed native profile the reviewer conversation runs under.
+    pub profile: String,
+    /// Frozen acceptance criteria bytes the reviewer judges against.
+    pub criteria: crate::improvement_runtime::FileIdentity,
+    /// Declared source files at the submitted revision whose exact bytes and
+    /// physical lines the reviewer may cite. Paths are relative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    /// Finite same-reviewer allowance for one malformed-output correction.
+    #[serde(default)]
+    pub max_corrections: u32,
+}
+
+impl SemanticReviewInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != SEMANTIC_REVIEW_SCHEMA {
+            return Err(invalid(format!(
+                "semantic review inputs declare schema {}; this controller reads schema {SEMANTIC_REVIEW_SCHEMA}",
+                self.schema
+            )));
+        }
+        self.runtime.validate()?;
+        let config = self.runtime.native_config.as_ref().ok_or_else(|| {
+            invalid(
+                "semantic review requires its own frozen native configuration and a fresh installed home; a shared local client route is not accepted",
+            )
+        })?;
+        if self.runtime.client.is_some() {
+            return Err(invalid(
+                "semantic review installs its own read-only native runtime instead of reusing a declared local client",
+            ));
+        }
+        token("semantic reviewer profile", &self.profile, MAX_TOKEN)?;
+        review_native_config(config, &self.profile, &self.runtime.private_inputs)?;
+        if !self.criteria.path.is_absolute()
+            || !self.criteria.path.is_file()
+            || fs::metadata(&self.criteria.path)?.len() > MAX_RUN_SPEC_BYTES
+            || crate::build_identity::hash_file(&self.criteria.path)? != self.criteria.sha256
+        {
+            return Err(invalid(
+                "the semantic review criteria are missing, oversized or changed; supply their exact frozen bytes",
+            ));
+        }
+        if fs::read_to_string(&self.criteria.path)?.trim().is_empty() {
+            return Err(invalid("the semantic review criteria must not be empty"));
+        }
+        if self.sources.len() > MAX_REVIEW_SOURCES {
+            return Err(invalid(format!(
+                "the semantic reviewer may declare at most {MAX_REVIEW_SOURCES} source files"
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &self.sources {
+            relative_scope_entry(source)?;
+            if !seen.insert(source.trim().replace('\\', "/")) {
+                return Err(invalid(format!(
+                    "the semantic reviewer source {source} is declared more than once"
+                )));
+            }
+        }
+        if self.max_corrections > 1 {
+            return Err(invalid(
+                "the semantic reviewer allows at most one declared same-reviewer correction",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn review_native_config(
+    config: &crate::improvement_runtime::FileIdentity,
+    profile: &str,
+    private_inputs: &[crate::improvement_runtime::PrivateInput],
+) -> io::Result<()> {
+    let text = fs::read_to_string(&config.path)?;
+    let table: toml::Table = toml::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|_| invalid("the semantic reviewer native configuration is not valid TOML"))?;
+    for field in ["sandbox_mode", "approval_policy"] {
+        let declared = table
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if declared.is_empty() {
+            return Err(invalid(format!(
+                "the semantic reviewer native configuration must explicitly declare {field}"
+            )));
+        }
+    }
+    if table.get("sandbox_mode").and_then(toml::Value::as_str) != Some("read-only") {
+        return Err(invalid(
+            "the semantic reviewer runtime must declare sandbox_mode = \"read-only\"; the ordinary implementation runtime stays writable",
+        ));
+    }
+    if table.get("approval_policy").and_then(toml::Value::as_str) != Some("never") {
+        return Err(invalid(
+            "the read-only semantic reviewer must declare approval_policy = \"never\"; it cannot wait for an interactive approval",
+        ));
+    }
+    let profile_table = if profile == "default" {
+        None
+    } else {
+        let named = format!("{profile}.config.toml");
+        let profile_table = if let Some(input) = private_inputs
+            .iter()
+            .find(|input| input.destination == named)
+        {
+            let text = fs::read_to_string(&input.source)?;
+            toml::from_str(text.trim_start_matches('\u{feff}'))
+                .map_err(|_| invalid("the semantic reviewer profile file is not valid TOML"))?
+        } else {
+            table
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .and_then(|profiles| profiles.get(profile))
+                .and_then(toml::Value::as_table)
+                .cloned()
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "the semantic reviewer profile '{profile}' is not installed in the frozen native configuration"
+                    ))
+                })?
+        };
+        for (field, expected) in [("sandbox_mode", "read-only"), ("approval_policy", "never")] {
+            if let Some(value) = profile_table.get(field)
+                && value.as_str() != Some(expected)
+            {
+                return Err(invalid(format!(
+                    "the semantic reviewer profile '{profile}' may not override {field} away from {expected}"
+                )));
+            }
+        }
+        Some(profile_table)
+    };
+    let (model, effort) = if let Some(table) = profile_table.as_ref() {
+        (
+            toml_config_string(table, "model"),
+            toml_config_string(table, "model_reasoning_effort"),
+        )
+    } else {
+        (
+            toml_config_string(&table, "model"),
+            toml_config_string(&table, "model_reasoning_effort"),
+        )
+    };
+    for (name, value) in [("model", model), ("model_reasoning_effort", effort)] {
+        if value.is_none() {
+            return Err(invalid(format!(
+                "the semantic reviewer profile '{profile}' must resolve an explicit {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn toml_config_string(table: &toml::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// The explicit one-arm baseline qualification declaration. It freezes the
+/// task snapshot, the single prepared runtime, the independent acceptance, the
+/// participant profiles and the finite correction allowance before any effect.
+/// It deliberately carries no comparison policy, candidate arm, margins or
+/// verdict inputs: those belong to the later measured comparison.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineQualificationInputs {
+    pub schema: u32,
+    pub task: TaskInputs,
+    /// Ordinary task instructions, frozen separately from the experiment's
+    /// hypothesis and acceptance policy. The lead receives these exact bytes.
+    pub task_prompt: crate::improvement_runtime::FileIdentity,
+    pub runtime: QualificationRuntimeInputs,
+    pub acceptance: AcceptanceInputs,
+    pub workflow: WorkflowInputs,
+    /// Acceptance-runner-owned destination for the byte-for-byte copy of the
+    /// completed native result. It must stay outside the submitted product
+    /// checkout; the independent oracle reads it through its literal path.
+    pub report: PathBuf,
+    /// Optional independent semantic acceptance reviewer. Omitted preserves
+    /// the legacy program-only route without changing its serialized digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_review: Option<SemanticReviewInputs>,
+}
+
+impl BaselineQualificationInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != BASELINE_QUALIFICATION_SCHEMA {
+            return Err(invalid(format!(
+                "baseline qualification inputs declare schema {}; this controller reads schema {BASELINE_QUALIFICATION_SCHEMA}",
+                self.schema
+            )));
+        }
+        self.task.validate()?;
+        if !self.task_prompt.path.is_absolute()
+            || !self.task_prompt.path.is_file()
+            || fs::metadata(&self.task_prompt.path)?.len() > MAX_RUN_SPEC_BYTES
+            || crate::build_identity::hash_file(&self.task_prompt.path)? != self.task_prompt.sha256
+        {
+            return Err(invalid(
+                "the qualification task prompt is missing, oversized or changed; supply its exact frozen ordinary task instructions",
+            ));
+        }
+        if fs::read_to_string(&self.task_prompt.path)?
+            .trim()
+            .is_empty()
+        {
+            return Err(invalid("the qualification task prompt must not be empty"));
+        }
+        self.runtime.validate()?;
+        self.acceptance.validate()?;
+        self.workflow.validate()?;
+        if !self.report.is_absolute() {
+            return Err(invalid(
+                "the qualification report path must be absolute and predeclared",
+            ));
+        }
+        if self
+            .report
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none()
+        {
+            return Err(invalid(
+                "the qualification report path must name a file, not a directory",
+            ));
+        }
+        if self.report.starts_with(&self.task.source) {
+            return Err(invalid(
+                "the qualification report must stay outside the frozen task source; the submitted product checkout cannot own its own acceptance input",
+            ));
+        }
+        if let Some(review) = &self.semantic_review {
+            review.validate()?;
+            match (&self.runtime.reuse, &review.runtime.reuse) {
+                (None, Some(_)) => {
+                    return Err(invalid(
+                        "a semantic reviewer cannot adopt a retained runtime while the ordinary implementation runtime is prepared fresh; both occupy the same consent decision",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(invalid(
+                        "the declared semantic reviewer must adopt its retained runtime together with the ordinary implementation runtime; a fresh reviewer would request new native consent",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The frozen declaration digest recorded before the first turn. A changed
+    /// declaration refuses reuse instead of silently re-freezing margins,
+    /// bindings or the acceptance request.
+    pub fn digest(&self) -> io::Result<String> {
+        Ok(digest_bytes(&serde_json::to_vec(self)?))
     }
 }
 
@@ -614,6 +1214,11 @@ pub struct RunSpec {
     /// engaged and no measured attempt is dispatched.
     #[serde(default)]
     pub comparison: Option<ComparisonInputs>,
+    /// The explicit one-arm baseline qualification declaration. Absent keeps
+    /// every legacy route unchanged; present drives one real lead/executor
+    /// control workflow without a candidate arm or comparison verdict.
+    #[serde(default)]
+    pub baseline_qualification: Option<BaselineQualificationInputs>,
     /// The stages this run's authority permits.
     pub publication_scope: Vec<PublicationStage>,
     /// The independent acceptance/oracle reference, outside candidate writes.
@@ -731,6 +1336,44 @@ impl RunSpec {
             } else {
                 return Err(invalid(
                     "a declared comparison requires the explicit local runner it measures",
+                ));
+            }
+        }
+        if let Some(qualification) = &self.baseline_qualification {
+            qualification.validate()?;
+            if self.comparison.is_some() {
+                return Err(invalid(
+                    "a run cannot declare both a two-arm comparison and a one-arm baseline qualification; the qualification must finish before comparison margins are frozen",
+                ));
+            }
+            if self.runner.is_none() {
+                return Err(invalid(
+                    "a declared baseline qualification requires the runner profile that opens its visible conversations",
+                ));
+            }
+            match (&qualification.runtime.client, &self.local_runner) {
+                (Some(client), Some(local))
+                    if client.runner.endpoint == local.endpoint
+                        && client.runner.model == local.model => {}
+                (None, None) => {}
+                _ => {
+                    return Err(invalid(
+                        "qualification must consume its declared local runner or its explicit native configuration without an alternate local route",
+                    ));
+                }
+            }
+            if self
+                .runner
+                .as_ref()
+                .is_some_and(|runner| runner.profile != qualification.workflow.executor_profile)
+            {
+                return Err(invalid(
+                    "the run's visible-dispatch profile must be the baseline qualification's declared executor profile; an executor fallback is not accepted",
+                ));
+            }
+            if qualification.report.starts_with(&self.project) {
+                return Err(invalid(
+                    "the qualification report path must stay outside the submitted product checkout",
                 ));
             }
         }
@@ -994,6 +1637,13 @@ pub fn frozen_candidate_removal_digest(item: &str, comments: &[String]) -> Optio
 pub enum Phase {
     Planning,
     CandidateReady,
+    /// One declared one-arm baseline qualification is collecting control
+    /// observations through the real lead/executor workflow.
+    BaselineQualification,
+    /// The qualification completed and retained its native report, source
+    /// revision, oracle record and accounting row. This is a terminal phase
+    /// for the baseline slice; comparison margins remain a separate decision.
+    BaselineQualificationRecorded,
     BaselineAttempt,
     CandidateAttempt,
     Acceptance,
@@ -1009,6 +1659,8 @@ impl Phase {
         match self {
             Self::Planning => "planning",
             Self::CandidateReady => "candidate-ready",
+            Self::BaselineQualification => "baseline-qualification",
+            Self::BaselineQualificationRecorded => "baseline-qualification-recorded",
             Self::BaselineAttempt => "baseline-attempt",
             Self::CandidateAttempt => "candidate-attempt",
             Self::Acceptance => "acceptance",
@@ -1049,6 +1701,21 @@ pub enum AttemptRole {
     Implementer,
     Baseline,
     Candidate,
+    /// The fresh bounded-lead framing turn of one measured workflow.
+    LeadFrame,
+    /// The fresh executor turn of one baseline-qualification workflow. It
+    /// consumes the lead-authored assignment in the frozen dispatch checkout
+    /// and is not a measured comparison arm.
+    Executor,
+    /// A same-lead review continuation after the executor turn.
+    LeadReview,
+    /// A bounded same-executor correction continuation.
+    Correction,
+    /// The same-lead exact acceptance decision after review.
+    LeadAcceptance,
+    /// The independent read-only semantic acceptance reviewer after the lead
+    /// accepted. It applies no treatment and is not a measured arm.
+    SemanticReview,
 }
 
 impl AttemptRole {
@@ -1059,6 +1726,12 @@ impl AttemptRole {
             Self::Implementer => "implementer",
             Self::Baseline => "baseline",
             Self::Candidate => "candidate",
+            Self::LeadFrame => "lead-frame",
+            Self::Executor => "executor",
+            Self::LeadReview => "lead-review",
+            Self::Correction => "correction",
+            Self::LeadAcceptance => "lead-acceptance",
+            Self::SemanticReview => "semantic-review",
         }
     }
 
@@ -1069,6 +1742,12 @@ impl AttemptRole {
             Self::Implementer => "impl",
             Self::Baseline => "base",
             Self::Candidate => "cand",
+            Self::LeadFrame => "lframe",
+            Self::Executor => "exec",
+            Self::LeadReview => "lreview",
+            Self::Correction => "corr",
+            Self::LeadAcceptance => "laccept",
+            Self::SemanticReview => "sreview",
         }
     }
 
@@ -1149,6 +1828,39 @@ pub struct HostBinding {
     pub program: PathBuf,
 }
 
+/// Why a verified native dispatch is known to have made no model request.
+///
+/// Only two facts establish this: a dispatcher-written marker that exists only
+/// on branches before `conversation.assign`, or a tightly bounded legacy
+/// receipt carrying the exact native frontend-attachment failure for the
+/// observed session with an explicit assignment-not-submitted diagnostic. The
+/// absence of events, turns or a status string alone proves nothing.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreSubmissionEvidence {
+    /// The dispatcher persisted an explicit marker before it could issue
+    /// `turn/start`; the marker is never inferred from an empty stream.
+    NativeMarker,
+    /// A pre-marker receipt classified from the exact native frontend
+    /// attachment failure: the diagnostic names the observed session, the
+    /// assignment-not-submitted sentence is explicit, and no turn was
+    /// recorded. Retained as a legacy classification, not a fresh marker.
+    LegacyFrontendAttachment,
+}
+
+impl PreSubmissionEvidence {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NativeMarker => {
+                "the dispatcher recorded an explicit native pre-submission marker"
+            }
+            Self::LegacyFrontendAttachment => {
+                "legacy classification: the verified receipt records the exact native frontend-attachment failure, no observed turn and the explicit assignment-not-submitted diagnostic"
+            }
+        }
+    }
+}
+
 /// The frozen identity of the native dispatch an attempt accepted.
 ///
 /// A receipt path alone is not identity: the pool reuses `spawn-<slot>.json`
@@ -1168,6 +1880,11 @@ pub struct DispatchBinding {
     pub session: Option<String>,
     #[serde(default)]
     pub host: Option<HostBinding>,
+    /// Verified evidence that this exact accepted dispatch failed before a
+    /// model request. `None` means no such evidence is recorded, so the
+    /// generation is never replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_submission: Option<PreSubmissionEvidence>,
 }
 
 /// A freshly read native receipt identity, as the dispatcher's own receipt
@@ -1439,13 +2156,19 @@ pub struct Attempt {
 }
 
 impl Attempt {
-    /// A dispatch that failed before submission: no dispatch identity was
-    /// accepted, so no model request was made. The documented recovery for
-    /// this case is a fresh attempt under the configured bounded retry; an
-    /// attempt that accepted a dispatch (or settled a model effect) is never
-    /// replayed.
+    /// A dispatch that failed before submission: either no dispatch identity
+    /// was accepted at all, or the accepted generation carries verified
+    /// pre-submission evidence. The documented recovery for this case is a
+    /// fresh attempt under the configured bounded retry; an attempt that
+    /// accepted a dispatch without that evidence (or settled a model effect)
+    /// is never replayed.
     pub fn failed_before_submission(&self) -> bool {
-        self.state == AttemptState::Failed && self.binding.is_none()
+        self.state == AttemptState::Failed
+            && (self.binding.is_none()
+                || self
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.pre_submission.is_some()))
     }
 
     /// The explicit unsupported-evidence result for this attempt, naming the
@@ -1516,6 +2239,12 @@ pub enum EffectKind {
     /// The isolated baseline/candidate runtimes, frozen workload copies and
     /// fresh homes were prepared and verified model-free.
     ComparisonPrepared,
+    /// The one-arm baseline qualification froze its declaration, source
+    /// snapshot, participant bindings and single runtime before any turn.
+    BaselineQualificationPrepared,
+    /// The one-arm baseline qualification retained its native report copy,
+    /// source revision, independent oracle record and accounting row.
+    BaselineQualificationRecorded,
     /// One measured arm completed and passed (or failed) the frozen
     /// independent acceptance entry point.
     ComparisonArmAccepted,
@@ -1699,6 +2428,226 @@ impl ComparisonArm {
     }
 }
 
+/// One exact participant conversation in a measured workflow. The slot,
+/// owner, session and profile are read back from the accepted native receipt;
+/// later continuations must reproduce all of them.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowParticipant {
+    pub slot: u32,
+    pub owner: String,
+    pub session: String,
+    pub profile: String,
+}
+
+/// The retained turn sequence of one arm's measured workflow. Attempt ids
+/// point at the existing attempt records, which retain each turn's receipt,
+/// result and accounting evidence. The state derives the next declared turn
+/// from these durable identities, never from a clock or a replay.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowArmState {
+    /// Digest of the frozen workflow composition this arm started under.
+    pub declaration_digest: String,
+    /// The exact bounded-lead conversation, once its frame completed.
+    #[serde(default)]
+    pub lead: Option<WorkflowParticipant>,
+    /// The exact executor conversation, once its first turn completed.
+    #[serde(default)]
+    pub executor: Option<WorkflowParticipant>,
+    #[serde(default)]
+    pub lead_frame: Option<String>,
+    /// The one malformed-frame format correction continuation, if requested.
+    #[serde(default)]
+    pub lead_frame_correction: Option<String>,
+    #[serde(default)]
+    pub executor_attempt: Option<String>,
+    #[serde(default)]
+    pub review: Option<String>,
+    /// The exact first-line review decision (`accept`, `correct` or `reject`).
+    #[serde(default)]
+    pub review_token: Option<String>,
+    #[serde(default)]
+    pub corrections: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Option<String>,
+    /// The exact first-line final lead decision (`accept` or `reject`).
+    #[serde(default)]
+    pub lead_accepted: Option<bool>,
+    /// All declared turns settled and the lead decision recorded.
+    #[serde(default)]
+    pub completed: bool,
+}
+
+/// The exact first-line decision of one lead review. A review that returns no
+/// explicit decision is refused; acceptance is never inferred from prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Accept,
+    Correct,
+    Reject,
+}
+
+impl ReviewDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Correct => "correct",
+            Self::Reject => "reject",
+        }
+    }
+
+    pub fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "accept" => Ok(Self::Accept),
+            "correct" => Ok(Self::Correct),
+            "reject" => Ok(Self::Reject),
+            other => Err(invalid(format!(
+                "unrecognized review decision {other:?}; expected accept, correct or reject"
+            ))),
+        }
+    }
+}
+
+/// Parse the first meaningful review line. The lead must state its decision
+/// as the first word (`ACCEPT`, `CORRECT` or `REJECT`, any case); a message
+/// that only describes the work refuses instead of being read as acceptance.
+pub fn parse_review_decision(text: &str) -> io::Result<ReviewDecision> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| {
+            invalid("the lead review returned an empty result; no acceptance decision can be read")
+        })?;
+    let token = line
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    match token.to_ascii_uppercase().as_str() {
+        "ACCEPT" => Ok(ReviewDecision::Accept),
+        "CORRECT" => Ok(ReviewDecision::Correct),
+        "REJECT" => Ok(ReviewDecision::Reject),
+        _ => Err(invalid(format!(
+            "the lead review begins with {token:?} instead of ACCEPT, CORRECT or REJECT; the workflow never infers a decision from prose"
+        ))),
+    }
+}
+
+/// The next declared turn of one baseline-qualification workflow, derived
+/// only from retained state and the frozen declaration. The controller never
+/// invents a turn: each step names the exact participant conversation that
+/// must produce it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualificationStep {
+    /// Fresh bounded lead: frame the task and author the executor assignment.
+    Frame,
+    /// Fresh executor: consume the lead's assignment in the task checkout.
+    Execute,
+    /// Same lead: review the executor result and decide.
+    Review,
+    /// Same executor: apply one declared correction.
+    Correct,
+    /// The lead accepted: copy the native report and run the oracle.
+    Finalize,
+    /// The lead rejected the result.
+    Rejected,
+    /// The review asked for another correction after the finite allowance was
+    /// consumed; the observation ends without another executor turn.
+    Exhausted,
+}
+
+impl WorkflowArmState {
+    /// Derive the next turn from the retained identities. A correction clears
+    /// the review decision, so the turn after it must be a meaningful review;
+    /// acceptance never needs a confirmation-only lead turn.
+    pub fn next_step(&self, declared: &WorkflowInputs) -> io::Result<QualificationStep> {
+        if self.completed {
+            return Ok(match self.lead_accepted {
+                Some(true) => QualificationStep::Finalize,
+                _ => QualificationStep::Rejected,
+            });
+        }
+        if self.lead_frame.is_none() || self.lead.is_none() {
+            return Ok(QualificationStep::Frame);
+        }
+        if self.executor_attempt.is_none() || self.executor.is_none() {
+            return Ok(QualificationStep::Execute);
+        }
+        match self.review_token.as_deref() {
+            None => Ok(QualificationStep::Review),
+            Some("accept") => Ok(QualificationStep::Finalize),
+            Some("reject") => Ok(QualificationStep::Rejected),
+            Some("correct") => {
+                if self.corrections.len() as u32 >= declared.max_corrections {
+                    Ok(QualificationStep::Exhausted)
+                } else {
+                    Ok(QualificationStep::Correct)
+                }
+            }
+            Some(other) => Err(invalid(format!(
+                "the retained workflow records an unrecognized review decision {other:?}"
+            ))),
+        }
+    }
+
+    /// Record one completed review. Re-recording the same attempt is
+    /// idempotent so a controller crash between the effect and the cursor
+    /// write cannot duplicate the turn.
+    pub fn record_review(&mut self, attempt: &str, decision: ReviewDecision) -> io::Result<()> {
+        if let Some(existing) = &self.review
+            && existing != attempt
+        {
+            return Err(invalid(format!(
+                "the workflow already recorded review {existing}; {attempt} cannot replace it"
+            )));
+        }
+        self.review = Some(attempt.to_owned());
+        self.review_token = Some(decision.as_str().to_owned());
+        match decision {
+            ReviewDecision::Accept => self.lead_accepted = Some(true),
+            ReviewDecision::Reject => self.lead_accepted = Some(false),
+            ReviewDecision::Correct => {}
+        }
+        Ok(())
+    }
+
+    /// Record one dispatched correction after its executor turn settled. The
+    /// consumed allowance is counted here, and the cleared review decision
+    /// makes the next declared turn another meaningful review.
+    pub fn record_correction(
+        &mut self,
+        attempt: &str,
+        declared: &WorkflowInputs,
+    ) -> io::Result<()> {
+        if self.corrections.iter().any(|existing| existing == attempt) {
+            return Ok(());
+        }
+        if self.corrections.len() as u32 >= declared.max_corrections {
+            return Err(invalid(format!(
+                "the declared {} correction turn(s) are already consumed; no further correction can be dispatched",
+                declared.max_corrections
+            )));
+        }
+        if self.review_token.as_deref() != Some("correct") {
+            return Err(invalid(
+                "a correction requires a recorded CORRECT review that requested it",
+            ));
+        }
+        self.corrections.push(attempt.to_owned());
+        self.review = None;
+        self.review_token = None;
+        Ok(())
+    }
+
+    /// Mark the workflow's declared turns settled. `lead_accepted` is the
+    /// lead's decision, not the independent oracle's verdict.
+    pub fn record_completion(&mut self, lead_accepted: bool) {
+        self.lead_accepted = Some(lead_accepted);
+        self.completed = true;
+    }
+}
+
 /// The retained recovery state of one comparison arm. The prepared runtime
 /// receipt, the verified solution revision and the retained acceptance record
 /// are recovery data; the durable evidence lives in the run store files this
@@ -1734,6 +2683,9 @@ pub struct ArmComparisonState {
     /// The prepared immutable build this arm consumed.
     #[serde(default)]
     pub build: Option<PathBuf>,
+    /// The measured workflow turn state, when this comparison declares one.
+    #[serde(default)]
+    pub workflow: Option<WorkflowArmState>,
 }
 
 /// The retained comparison recovery state: the frozen policy identity, the
@@ -1745,6 +2697,10 @@ pub struct ComparisonState {
     pub schema: u32,
     /// Digest of the predeclared policy; a changed declaration refuses reuse.
     pub policy_digest: String,
+    /// Digest of the declared measured workflow composition, when one was
+    /// frozen before the first turn. A changed declaration refuses reuse.
+    #[serde(default)]
+    pub workflow_digest: Option<String>,
     /// The retained experiment bindings of the prepared comparison.
     #[serde(default)]
     pub bindings: Option<PathBuf>,
@@ -1783,6 +2739,7 @@ impl ComparisonState {
         Self {
             schema: COMPARISON_STATE_SCHEMA,
             policy_digest,
+            workflow_digest: None,
             bindings: None,
             planning: None,
             workload_card: None,
@@ -1809,6 +2766,296 @@ impl ComparisonState {
             ComparisonArm::Baseline => &mut self.baseline,
             ComparisonArm::Candidate => &mut self.candidate,
         }
+    }
+}
+
+pub const BASELINE_QUALIFICATION_STATE_SCHEMA: u32 = 1;
+
+/// The retained preparation, exact turns and judgment of the optional
+/// independent semantic reviewer. A judgment copy is retained after the
+/// reviewer result passes structural, location and evidence validation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticReviewState {
+    /// The reviewer runtime receipt installed into its own fresh home.
+    #[serde(default)]
+    pub runtime: Option<PathBuf>,
+    #[serde(default)]
+    pub home: Option<PathBuf>,
+    /// The minimal owned Git source frozen for this review.
+    #[serde(default)]
+    pub source: Option<PathBuf>,
+    /// The exact committed submission revision the reviewer judged.
+    #[serde(default)]
+    pub submission_revision: Option<String>,
+    /// The single commit of the frozen review packet.
+    #[serde(default)]
+    pub review_revision: Option<String>,
+    /// The retained review manifest and its exact digest.
+    #[serde(default)]
+    pub manifest: Option<PathBuf>,
+    #[serde(default)]
+    pub manifest_sha256: Option<String>,
+    /// The installed reviewer binding resolved before the first turn.
+    #[serde(default)]
+    pub binding: Option<QualificationBindingIdentity>,
+    /// The exact reviewer conversation, once its first turn was accepted.
+    #[serde(default)]
+    pub participant: Option<WorkflowParticipant>,
+    #[serde(default)]
+    pub initial_attempt: Option<String>,
+    #[serde(default)]
+    pub correction_attempt: Option<String>,
+    #[serde(default)]
+    pub correction_used: bool,
+    /// The retained judgment copy and its exact evidence identity.
+    #[serde(default)]
+    pub judgment: Option<PathBuf>,
+    #[serde(default)]
+    pub judgment_sha256: Option<String>,
+    /// `accept`, `reject` or `unknown`; absent until a judgment is settled.
+    #[serde(default)]
+    pub judgment_kind: Option<String>,
+    #[serde(default)]
+    pub findings: Option<u64>,
+    #[serde(default)]
+    pub unresolved_issues: Option<u64>,
+    /// The retained reviewer home and workspace provenance when this run
+    /// adopted a completed prior reviewer runtime instead of installing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<QualificationRuntimeAdoption>,
+}
+
+/// One participant binding resolved from the installed configuration before
+/// the first turn and never re-resolved from a fallback. The accepted native
+/// dispatch must reproduce all of these values.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationBindingIdentity {
+    pub profile: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+impl QualificationBindingIdentity {
+    pub fn of(binding: &crate::orchestration_config::ProfileBinding) -> Self {
+        Self {
+            profile: binding.profile.clone(),
+            model: binding.model.clone(),
+            model_provider: binding.model_provider.clone(),
+            reasoning_effort: binding.reasoning_effort.clone(),
+        }
+    }
+}
+
+/// The exact retained proof of one independent checker attempt that failed
+/// before any process could start. The paths point at run-owned copies; the
+/// original evidence remains untouched. The values are stored as the exact
+/// JSON representations so the record and the later accounting row agree.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UnstartedOracleEvidence {
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub oracle: PathBuf,
+    #[serde(default)]
+    pub oracle_sha256: String,
+    #[serde(default)]
+    pub started: PathBuf,
+    #[serde(default)]
+    pub started_sha256: String,
+    #[serde(default)]
+    pub failure: PathBuf,
+    #[serde(default)]
+    pub failure_sha256: String,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub ended_at: String,
+    #[serde(default)]
+    pub elapsed_seconds: String,
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub legacy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_row: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_row_sha256: Option<String>,
+    /// The oracle path reserved for the next explicit attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineQualificationState {
+    /// Schema of a retained qualification state; zero only in `Default`.
+    #[serde(default)]
+    pub schema: u32,
+    /// Digest of the frozen declaration; any later change refuses reuse.
+    #[serde(default)]
+    pub declaration_digest: String,
+    /// Frozen concurrent participant capacity.
+    #[serde(default)]
+    pub capacity: u32,
+    /// The retained prepared runtime receipt.
+    #[serde(default)]
+    pub runtime: Option<PathBuf>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub build: Option<PathBuf>,
+    /// The frozen single-commit task copy every dispatch is cloned from.
+    #[serde(default)]
+    pub task_copy: Option<PathBuf>,
+    /// The committed root revision of the frozen task copy, used for the
+    /// dispatch base and the executor ancestry check.
+    #[serde(default)]
+    pub task_base: Option<String>,
+    /// The frozen dispatch checkout derived from the task snapshot.
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// The fresh participant home the single prepared runtime installed into.
+    #[serde(default)]
+    pub home: Option<PathBuf>,
+    /// The frozen acceptance workspace the oracle checks.
+    #[serde(default)]
+    pub task_workspace: Option<PathBuf>,
+    /// The installed lead binding resolved before the first turn.
+    #[serde(default)]
+    pub lead_binding: Option<QualificationBindingIdentity>,
+    /// The installed executor binding resolved before the first turn.
+    #[serde(default)]
+    pub executor_binding: Option<QualificationBindingIdentity>,
+    /// The exact participant turns and their retained attempt identities.
+    #[serde(default)]
+    pub workflow: WorkflowArmState,
+    /// The exact committed source revision the latest completed executor (or
+    /// correction) turn left in the dispatch checkout. It may equal the
+    /// frozen base when the task required no product edit.
+    #[serde(default)]
+    pub source_revision: Option<String>,
+    /// The exact written clone of the latest completed executor result.
+    #[serde(default)]
+    pub report: Option<PathBuf>,
+    #[serde(default)]
+    pub report_sha256: Option<String>,
+    #[serde(default)]
+    pub report_bytes: Option<u64>,
+    /// The retained run-store result the report copy was made from.
+    #[serde(default)]
+    pub report_source: Option<PathBuf>,
+    /// The retained real-task oracle record.
+    #[serde(default)]
+    pub oracle: Option<PathBuf>,
+    /// Every checker attempt proven never to have started, in order. They
+    /// remain incomplete evidence and are never a task-quality rejection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unstarted_oracles: Vec<UnstartedOracleEvidence>,
+    /// The exact superseded accounting row retained before a proven-unstarted
+    /// check was retried. It is never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_unstarted: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_unstarted_sha256: Option<String>,
+    #[serde(default)]
+    pub accepted: Option<bool>,
+    /// The retained accounting row of this qualification unit.
+    #[serde(default)]
+    pub row: Option<PathBuf>,
+    /// Why this qualification produced no usable result.
+    #[serde(default)]
+    pub condition: Option<String>,
+    /// The optional independent semantic reviewer and its retained judgment.
+    /// Omitted cursors retain the legacy program-only route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_review: Option<SemanticReviewState>,
+    /// The retained ordinary home and workspace provenance when this run
+    /// adopted a completed prior ordinary runtime instead of installing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<QualificationRuntimeAdoption>,
+    #[serde(default)]
+    pub prepared_ms: Option<u64>,
+}
+
+impl BaselineQualificationState {
+    pub fn new(declaration_digest: String, capacity: u32) -> Self {
+        Self {
+            schema: BASELINE_QUALIFICATION_STATE_SCHEMA,
+            declaration_digest,
+            capacity,
+            ..Self::default()
+        }
+    }
+
+    /// The retained runtime receipt that owns this role's home.
+    pub fn role_runtime_path(&self, role: QualificationRuntimeRole) -> Option<&Path> {
+        match role {
+            QualificationRuntimeRole::Ordinary => self.runtime.as_deref(),
+            QualificationRuntimeRole::Reviewer => self
+                .semantic_review
+                .as_ref()
+                .and_then(|review| review.runtime.as_deref()),
+        }
+    }
+
+    /// The recorded adoption link for this role, if the run adopted a
+    /// completed prior home instead of installing one.
+    pub fn role_adoption(
+        &self,
+        role: QualificationRuntimeRole,
+    ) -> Option<&QualificationRuntimeAdoption> {
+        match role {
+            QualificationRuntimeRole::Ordinary => self.adoption.as_ref(),
+            QualificationRuntimeRole::Reviewer => self
+                .semantic_review
+                .as_ref()
+                .and_then(|review| review.adoption.as_ref()),
+        }
+    }
+
+    /// Record one role's adoption link. Repeating the same derived record is
+    /// accepted; a changed record refuses instead of repointing retained
+    /// provenance.
+    pub fn set_role_adoption(
+        &mut self,
+        role: QualificationRuntimeRole,
+        adoption: QualificationRuntimeAdoption,
+    ) -> io::Result<()> {
+        if adoption.role != role {
+            return Err(invalid(
+                "an adoption record must retain the role whose home it consumes",
+            ));
+        }
+        if let Some(existing) = self.role_adoption(role) {
+            return if existing == &adoption {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "the retained runtime adoption provenance changed; preserve the run instead of repointing it",
+                ))
+            };
+        }
+        match role {
+            QualificationRuntimeRole::Ordinary => self.adoption = Some(adoption),
+            QualificationRuntimeRole::Reviewer => {
+                let review = self.semantic_review.as_mut().ok_or_else(|| {
+                    invalid("the reviewer adoption has no retained semantic review state")
+                })?;
+                review.adoption = Some(adoption);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1863,6 +3110,10 @@ pub struct Cursor {
     /// The declared sequential comparison and its retained recovery state.
     #[serde(default)]
     pub comparison: Option<ComparisonState>,
+    /// The declared one-arm baseline qualification and its retained recovery
+    /// state. Mutually exclusive with `comparison` at spec validation.
+    #[serde(default)]
+    pub baseline_qualification: Option<BaselineQualificationState>,
     pub updated_ms: u64,
 }
 
@@ -1890,6 +3141,7 @@ impl Cursor {
             intake: None,
             candidate: None,
             comparison: None,
+            baseline_qualification: None,
             updated_ms: now_ms(),
         }
     }
@@ -2122,6 +3374,524 @@ impl Cursor {
     }
 }
 
+/// The bound on a retained adoption chain. A sequential qualification may
+/// follow earlier adoptions, but the chain is recovery data and must stay
+/// finite; a longer chain is refused instead of being walked indefinitely.
+const MAX_ADOPTION_CHAIN: usize = 64;
+
+/// One verified completed origin run whose occupied home a sequential
+/// qualification adopts. The runtime receipt and the origin cursor/state are
+/// retained so the caller can bind the origin's frozen participant identities
+/// before any effect.
+#[derive(Clone, Debug)]
+pub struct QualificationAdoptionOrigin {
+    pub adoption: QualificationRuntimeAdoption,
+    pub runtime: crate::improvement_runtime::ArmRuntime,
+    pub cursor: Cursor,
+    pub state: BaselineQualificationState,
+}
+
+fn same_retained_place(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = fs::canonicalize(left)?;
+    let right = fs::canonicalize(right)?;
+    Ok(crate::improvement_runtime::trust_workspace_key(&left)
+        == crate::improvement_runtime::trust_workspace_key(&right))
+}
+
+/// The exact workspaces one retained run's role conversations may have
+/// trusted: the run's own dispatch checkout/source plus every accepted or
+/// attempted role checkout. Reviewer provenance never borrows the ordinary
+/// checkout and ordinary provenance never borrows the reviewer source.
+fn role_workspaces(
+    cursor: &Cursor,
+    state: &BaselineQualificationState,
+    role: QualificationRuntimeRole,
+) -> Vec<PathBuf> {
+    let mut workspaces = Vec::new();
+    match role {
+        QualificationRuntimeRole::Ordinary => {
+            if let Some(checkout) = &state.checkout {
+                workspaces.push(checkout.clone());
+            }
+            for attempt in &cursor.attempts {
+                if matches!(
+                    attempt.role,
+                    AttemptRole::LeadFrame
+                        | AttemptRole::Executor
+                        | AttemptRole::LeadReview
+                        | AttemptRole::Correction
+                        | AttemptRole::LeadAcceptance
+                ) && let Some(checkout) = &attempt.checkout
+                {
+                    workspaces.push(checkout.clone());
+                }
+            }
+        }
+        QualificationRuntimeRole::Reviewer => {
+            if let Some(source) = state
+                .semantic_review
+                .as_ref()
+                .and_then(|review| review.source.clone())
+            {
+                workspaces.push(source);
+            }
+            for attempt in &cursor.attempts {
+                if attempt.role == AttemptRole::SemanticReview
+                    && let Some(checkout) = &attempt.checkout
+                {
+                    workspaces.push(checkout.clone());
+                }
+            }
+        }
+    }
+    workspaces
+}
+
+/// Verify and normalize one provenance set. Every workspace must still be an
+/// ordinary retained directory; a missing checkout, a file, or a relative
+/// path is a changed provenance record and refuses before effects.
+fn validated_workspaces(workspaces: Vec<PathBuf>, description: &str) -> io::Result<Vec<PathBuf>> {
+    for workspace in &workspaces {
+        if !workspace.is_absolute() || !workspace.is_dir() {
+            return Err(invalid(format!(
+                "the {description} at {} is missing or not an absolute retained workspace; preserve the origin checkouts",
+                workspace.display()
+            )));
+        }
+    }
+    let mut keyed = std::collections::BTreeMap::new();
+    for workspace in workspaces {
+        keyed
+            .entry(crate::improvement_runtime::trust_workspace_key(&workspace))
+            .or_insert(workspace);
+    }
+    Ok(keyed.into_values().collect())
+}
+
+struct OriginRun {
+    cursor_path: PathBuf,
+    cursor: Cursor,
+    spec: RunSpec,
+    state: BaselineQualificationState,
+}
+
+/// Load and verify one completed origin cursor and its sibling frozen spec.
+/// This is read-only and performs every origin gate before the caller acquires
+/// a claim, installs anything or dispatches a participant.
+fn load_origin_run(
+    cursor_path: &Path,
+    cursor_identity: &crate::improvement_runtime::FileIdentity,
+) -> io::Result<OriginRun> {
+    if cursor_path.file_name().and_then(|name| name.to_str()) != Some(CURSOR_FILE) {
+        return Err(invalid(format!(
+            "the adopted origin must name the retained run's {CURSOR_FILE}, not {}",
+            cursor_path.display()
+        )));
+    }
+    if crate::build_identity::hash_file(cursor_path)? != cursor_identity.sha256 {
+        return Err(invalid(
+            "the adopted origin cursor changed; supply its exact retained identity",
+        ));
+    }
+    let cursor: Cursor = read_json(cursor_path, MAX_CURSOR_BYTES)?;
+    if cursor.schema != CURSOR_SCHEMA {
+        return Err(invalid(
+            "the adopted origin cursor has an unsupported schema",
+        ));
+    }
+    let spec_path = cursor_path.with_file_name(SPEC_FILE);
+    let spec = RunSpec::load(&spec_path)?;
+    if cursor.run != spec.run {
+        return Err(invalid(
+            "the adopted origin cursor and frozen spec name different runs",
+        ));
+    }
+    if cursor.spec_digest != spec.digest()? {
+        return Err(invalid(
+            "the adopted origin spec changed after the origin started; its cursor no longer binds the frozen inputs",
+        ));
+    }
+    let declaration = spec
+        .baseline_qualification
+        .as_ref()
+        .ok_or_else(|| invalid("the adopted origin declares no baseline qualification"))?;
+    let state = cursor
+        .baseline_qualification
+        .clone()
+        .ok_or_else(|| invalid("the adopted origin retains no qualification state"))?;
+    if state.schema != BASELINE_QUALIFICATION_STATE_SCHEMA {
+        return Err(invalid(
+            "the adopted origin qualification state has an unsupported schema",
+        ));
+    }
+    if state.declaration_digest != declaration.digest()? {
+        return Err(invalid(
+            "the adopted origin state no longer binds its frozen declaration",
+        ));
+    }
+    if cursor.phase != Phase::BaselineQualificationRecorded {
+        return Err(invalid(format!(
+            "the adopted origin is in phase {} instead of the completed baseline-qualification-recorded phase",
+            cursor.phase.as_str()
+        )));
+    }
+    if !state.workflow.completed {
+        return Err(invalid(
+            "the adopted origin did not complete its participant workflow",
+        ));
+    }
+    if state.accepted.is_none() {
+        return Err(invalid(
+            "the adopted origin recorded no completed acceptance result",
+        ));
+    }
+    let row = state
+        .row
+        .as_ref()
+        .ok_or_else(|| invalid("the adopted origin retained no accounting row"))?;
+    if !row.is_absolute() || !row.is_file() {
+        return Err(invalid(format!(
+            "the adopted origin accounting row {} is missing; preserve it before adopting the home",
+            row.display()
+        )));
+    }
+    for attempt in &cursor.attempts {
+        if attempt.state.is_in_flight() || attempt.state == AttemptState::Unknown {
+            return Err(invalid(format!(
+                "the adopted origin attempt {} is {}; its effect is not terminal, so the home cannot be adopted",
+                attempt.id,
+                attempt.state.as_str()
+            )));
+        }
+    }
+    Ok(OriginRun {
+        cursor_path: cursor_path.to_path_buf(),
+        cursor,
+        spec,
+        state,
+    })
+}
+
+/// Derive and verify the complete workspace provenance of one role. The
+/// immediate origin contributes its frozen attempts and checkouts; every
+/// earlier adoption contributes exactly the workspaces its own record
+/// retained. A missing, changed, foreign, or cyclic link refuses instead of
+/// widening the trust allowance.
+fn chain_workspaces(
+    run: &OriginRun,
+    role: QualificationRuntimeRole,
+    expected_runtime: &Path,
+    visited: &mut std::collections::BTreeSet<String>,
+    depth: usize,
+) -> io::Result<Vec<PathBuf>> {
+    if depth > MAX_ADOPTION_CHAIN {
+        return Err(invalid(format!(
+            "the retained adoption chain exceeds {MAX_ADOPTION_CHAIN} links; preserve it instead of adopting an unbounded history"
+        )));
+    }
+    let key = format!(
+        "{}:{}",
+        crate::improvement_runtime::trust_workspace_key(&run.cursor_path),
+        run.cursor.spec_digest
+    );
+    if !visited.insert(key) {
+        return Err(invalid(
+            "the retained adoption provenance is cyclic; preserve the runs instead of adopting through a loop",
+        ));
+    }
+    let mut workspaces = role_workspaces(&run.cursor, &run.state, role);
+    if let Some(adoption) = run.state.role_adoption(role) {
+        if adoption.role != role {
+            return Err(invalid(format!(
+                "the retained {} adoption record names role {}; cross-role home sharing is refused",
+                role.as_str(),
+                adoption.role.as_str()
+            )));
+        }
+        let runtime = crate::improvement_runtime::normalized_adoption_identity(&adoption.runtime)?;
+        if !same_retained_place(&runtime.path, expected_runtime)? {
+            return Err(invalid(
+                "the retained adoption chain points at a different runtime receipt; preserve the original home",
+            ));
+        }
+        let recorded_runtime = run.state.role_runtime_path(role).ok_or_else(|| {
+            invalid(format!(
+                "the retained {} adoption records no runtime receipt",
+                role.as_str()
+            ))
+        })?;
+        if !same_retained_place(recorded_runtime, &runtime.path)? {
+            return Err(invalid(format!(
+                "the retained {} adoption no longer names this run's runtime receipt",
+                role.as_str()
+            )));
+        }
+        let ancestor_identity =
+            crate::improvement_runtime::normalized_adoption_identity(&adoption.origin_cursor)?;
+        let ancestor = load_origin_run(&ancestor_identity.path, &ancestor_identity)?;
+        if ancestor.cursor.spec_digest != adoption.origin_spec_digest {
+            return Err(invalid(
+                "the retained adoption origin spec digest changed; preserve the provenance instead of reusing it",
+            ));
+        }
+        let ancestor_declaration = ancestor
+            .spec
+            .baseline_qualification
+            .as_ref()
+            .ok_or_else(|| invalid("the adopted ancestor declares no baseline qualification"))?;
+        if ancestor_declaration.digest()? != adoption.origin_declaration_digest {
+            return Err(invalid(
+                "the retained adoption origin declaration changed; preserve the provenance instead of reusing it",
+            ));
+        }
+        let recorded_ancestor_runtime =
+            ancestor.state.role_runtime_path(role).ok_or_else(|| {
+                invalid(format!(
+                    "the adopted ancestor retains no {} runtime",
+                    role.as_str()
+                ))
+            })?;
+        if !same_retained_place(recorded_ancestor_runtime, &runtime.path)? {
+            return Err(invalid(
+                "the retained adoption ancestor no longer binds the same runtime receipt",
+            ));
+        }
+        let inherited = chain_workspaces(&ancestor, role, expected_runtime, visited, depth + 1)?;
+        let retained = validated_workspaces(
+            adoption.trusted_workspaces.clone(),
+            "recorded adoption provenance",
+        )?;
+        if retained != inherited {
+            return Err(invalid(
+                "the retained adoption provenance changed; derive it again from the frozen origin attempts instead of editing it",
+            ));
+        }
+        workspaces.extend(inherited);
+    }
+    validated_workspaces(workspaces, "retained role workspace")
+}
+
+/// Bind one retained runtime receipt to the exact non-reuse declaration it was
+/// prepared from. Every value the origin declaration could have changed is
+/// checked here; the live configuration and hook trust are then verified by
+/// the existing consumption owner at the same absolute home.
+fn bind_origin_receipt(
+    declaration: &QualificationRuntimeInputs,
+    runtime: &crate::improvement_runtime::ArmRuntime,
+) -> io::Result<()> {
+    if runtime.arm != crate::improvement_experiment::Arm::Baseline {
+        return Err(invalid(
+            "the adopted runtime is not the baseline control arm; candidate home sharing is refused",
+        ));
+    }
+    if runtime.label != declaration.label {
+        return Err(invalid(
+            "the adopted runtime label does not match the frozen declaration",
+        ));
+    }
+    if !same_retained_place(&runtime.variant.build, &declaration.build)? {
+        return Err(invalid(
+            "the adopted runtime build differs from the frozen declaration",
+        ));
+    }
+    if !same_retained_place(&runtime.upstream, &declaration.upstream)? {
+        return Err(invalid(
+            "the adopted runtime upstream client differs from the frozen declaration",
+        ));
+    }
+    if runtime.upstream_sha256 != crate::build_identity::hash_file(&declaration.upstream)? {
+        return Err(invalid(
+            "the adopted runtime upstream client changed since preparation",
+        ));
+    }
+    if runtime.private.len() != declaration.private_inputs.len() {
+        return Err(invalid(
+            "the adopted runtime retains a different set of private inputs than the frozen declaration",
+        ));
+    }
+    for input in &declaration.private_inputs {
+        let recorded = runtime
+            .private
+            .iter()
+            .find(|private| private.destination == input.destination)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "the adopted runtime retains no private input {} from the frozen declaration",
+                    input.destination
+                ))
+            })?;
+        if recorded.sha256 != crate::build_identity::hash_file(&input.source)? {
+            return Err(invalid(format!(
+                "the frozen private input {} changed since the origin prepared it",
+                input.destination
+            )));
+        }
+    }
+    match (&declaration.client, &declaration.native_config) {
+        (Some(client), None) => {
+            let configuration = runtime.configuration.as_ref().ok_or_else(|| {
+                invalid("the adopted runtime retains no client configuration receipt")
+            })?;
+            if !same_retained_place(&configuration.path, &runtime.home.join("config.toml"))? {
+                return Err(invalid(
+                    "the adopted runtime client configuration is not its owned home configuration",
+                ));
+            }
+            let recorded = configuration.client.as_ref().ok_or_else(|| {
+                invalid("the adopted runtime no longer records the declared client route")
+            })?;
+            if recorded.runner != crate::outcome_qualification::RunnerRecord::new(&client.runner) {
+                return Err(invalid(
+                    "the adopted runtime client route changed since preparation",
+                ));
+            }
+            if let Some(effort) = client.reasoning_effort.as_deref()
+                && recorded.reasoning_effort.as_deref() != Some(effort)
+            {
+                return Err(invalid(
+                    "the adopted runtime reasoning effort changed since preparation",
+                ));
+            }
+            match (&client.catalogue, &recorded.catalogue) {
+                (Some(path), Some(identity)) => {
+                    if !same_retained_place(&identity.path, path)?
+                        || identity.sha256 != crate::build_identity::hash_file(path)?
+                    {
+                        return Err(invalid(
+                            "the adopted runtime catalogue changed since preparation",
+                        ));
+                    }
+                }
+                (None, None) => {}
+                (None, Some(identity)) => {
+                    if client.overlay.is_none()
+                        || identity.sha256 != crate::build_identity::hash_file(&identity.path)?
+                    {
+                        return Err(invalid(
+                            "the adopted runtime catalogue is not traceable to the frozen declaration",
+                        ));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(invalid(
+                        "the adopted runtime lost the declared catalogue reference",
+                    ));
+                }
+            }
+            match (&client.overlay, &configuration.overlay) {
+                (Some(path), Some(identity)) => {
+                    if !same_retained_place(&identity.path, path)?
+                        || identity.sha256 != crate::build_identity::hash_file(path)?
+                    {
+                        return Err(invalid(
+                            "the adopted runtime client overlay changed since preparation",
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(invalid(
+                        "the adopted runtime client overlay does not match the frozen declaration",
+                    ));
+                }
+            }
+        }
+        (None, Some(_)) => {
+            let configuration = runtime.configuration.as_ref().ok_or_else(|| {
+                invalid("the adopted native runtime retains no configuration receipt")
+            })?;
+            if configuration.client.is_some()
+                || !same_retained_place(&configuration.path, &runtime.home.join("config.toml"))?
+            {
+                return Err(invalid(
+                    "the adopted native runtime configuration is not the declared owned home configuration",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "the adopted runtime declaration must carry exactly one frozen model route",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify a completed origin and derive the exact adoption record for one
+/// frozen runtime declaration. Every check here is read-only; the caller
+/// acquires the exclusive adoption claim and then runs the existing
+/// consumption verifier before any task, oracle or participant effect.
+pub fn validate_adoption_origin(
+    role: QualificationRuntimeRole,
+    reuse: &QualificationRuntimeReuse,
+    declaration: &QualificationRuntimeInputs,
+) -> io::Result<QualificationAdoptionOrigin> {
+    let runtime_identity =
+        crate::improvement_runtime::normalized_adoption_identity(&reuse.runtime)?;
+    let cursor_identity = crate::improvement_runtime::normalized_adoption_identity(&reuse.cursor)?;
+    if same_retained_place(&runtime_identity.path, &cursor_identity.path)? {
+        return Err(invalid(
+            "the adopted runtime receipt and origin cursor must be distinct files",
+        ));
+    }
+    let origin = load_origin_run(&cursor_identity.path, &cursor_identity)?;
+    let origin_declaration = origin
+        .spec
+        .baseline_qualification
+        .as_ref()
+        .ok_or_else(|| invalid("the adopted origin declares no baseline qualification"))?;
+    let role_declaration = match role {
+        QualificationRuntimeRole::Ordinary => &origin_declaration.runtime,
+        QualificationRuntimeRole::Reviewer => {
+            &origin_declaration
+                .semantic_review
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid("the adopted origin declares no independent semantic reviewer runtime")
+                })?
+                .runtime
+        }
+    };
+    if role_declaration.without_reuse() != declaration.without_reuse() {
+        return Err(invalid(format!(
+            "the adopted {} runtime declaration differs from the origin's frozen non-reuse inputs; a changed variant, client, private input or model route needs a fresh preparation",
+            role.as_str()
+        )));
+    }
+    let recorded_runtime = origin.state.role_runtime_path(role).ok_or_else(|| {
+        invalid(format!(
+            "the adopted origin records no {} runtime receipt",
+            role.as_str()
+        ))
+    })?;
+    if !same_retained_place(recorded_runtime, &runtime_identity.path)? {
+        return Err(invalid(format!(
+            "the adopted origin does not name this {} role's retained runtime receipt; cross-role home sharing is refused",
+            role.as_str()
+        )));
+    }
+    let runtime: crate::improvement_runtime::ArmRuntime =
+        read_json(&runtime_identity.path, MAX_RUN_SPEC_BYTES)?;
+    bind_origin_receipt(declaration, &runtime)?;
+    let mut visited = std::collections::BTreeSet::new();
+    let trusted_workspaces =
+        chain_workspaces(&origin, role, &runtime_identity.path, &mut visited, 0)?;
+    let adoption = QualificationRuntimeAdoption {
+        role,
+        runtime: runtime_identity,
+        origin_cursor: cursor_identity,
+        origin_spec_digest: origin.cursor.spec_digest.clone(),
+        origin_declaration_digest: origin_declaration.digest()?,
+        trusted_workspaces,
+    };
+    Ok(QualificationAdoptionOrigin {
+        adoption,
+        runtime,
+        cursor: origin.cursor,
+        state: origin.state,
+    })
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2268,7 +4038,7 @@ pub struct RunMutation {
     _lock: ExclusiveFileLock,
 }
 
-fn acquire_mutation_lock(root: &Path, wait: Duration) -> io::Result<RunMutation> {
+pub fn acquire_mutation_lock(root: &Path, wait: Duration) -> io::Result<RunMutation> {
     let path = root.join(MUTATION_LOCK_FILE);
     let deadline = Deadline::after(wait)?;
     ExclusiveFileLock::acquire(&path, deadline, &Cancellation::default())
@@ -2283,6 +4053,60 @@ fn acquire_mutation_lock(root: &Path, wait: Duration) -> io::Result<RunMutation>
             )
         })
         .map(|lock| RunMutation { _lock: lock })
+}
+
+/// Copies one verified terminal attempt's evidence into an owned root: the
+/// receipt snapshot and, when bounded, the terminal result. The pool reuses
+/// its `spawn-<slot>.json` and result files for later dispatches, so
+/// controller consumption reads these retained locators instead of the
+/// mutable pool files once an attempt has settled.
+pub fn retain_attempt_evidence(
+    root: &Path,
+    attempt_id: &str,
+    receipt: &Path,
+    result: Option<&Path>,
+) -> io::Result<RetainedEvidence> {
+    let safe: String = attempt_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    if safe.is_empty() || safe.len() > MAX_OWNER_BYTES {
+        return Err(invalid("invalid attempt identity for evidence retention"));
+    }
+    let dir = root.join("evidence").join(&safe);
+    fs::create_dir_all(&dir)?;
+    let receipt_bytes = bounded_read(receipt, MAX_RETAINED_RECEIPT_BYTES)?;
+    let receipt_path = dir.join("receipt.json");
+    fs::write(&receipt_path, &receipt_bytes)?;
+    let mut retained = RetainedEvidence {
+        receipt: receipt_path,
+        receipt_sha256: digest_bytes(&receipt_bytes),
+        result: None,
+        result_sha256: None,
+        note: None,
+        retained_ms: now_ms(),
+    };
+    if let Some(result) = result {
+        match bounded_read(result, MAX_RETAINED_RESULT_BYTES) {
+            Ok(bytes) => {
+                let path = dir.join("result.txt");
+                fs::write(&path, &bytes)?;
+                retained.result = Some(path);
+                retained.result_sha256 = Some(digest_bytes(&bytes));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                retained.note = Some(
+                    "the terminal result file was already gone when the attempt settled".to_owned(),
+                );
+            }
+            Err(error) => {
+                retained.note = Some(format!(
+                    "the terminal result was not retained within its bound: {error}"
+                ));
+            }
+        }
+    }
+    Ok(retained)
 }
 
 impl RunStore {
@@ -2482,59 +4306,15 @@ impl RunStore {
         })
     }
 
-    /// Copies one verified terminal attempt's evidence into the private run
-    /// store: the receipt snapshot and, when bounded, the terminal result.
-    /// The pool reuses its `spawn-<slot>.json` and result files for later
-    /// dispatches, so controller consumption reads these retained locators
-    /// instead of the mutable pool files once an attempt has settled.
+    /// Copies one verified terminal attempt's evidence into this private run
+    /// store. See [`retain_attempt_evidence`].
     pub fn retain_evidence(
         &self,
         attempt_id: &str,
         receipt: &Path,
         result: Option<&Path>,
     ) -> io::Result<RetainedEvidence> {
-        let safe: String = attempt_id
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
-            .collect();
-        if safe.is_empty() || safe.len() > MAX_OWNER_BYTES {
-            return Err(invalid("invalid attempt identity for evidence retention"));
-        }
-        let dir = self.root.join("evidence").join(&safe);
-        fs::create_dir_all(&dir)?;
-        let receipt_bytes = bounded_read(receipt, MAX_RETAINED_RECEIPT_BYTES)?;
-        let receipt_path = dir.join("receipt.json");
-        fs::write(&receipt_path, &receipt_bytes)?;
-        let mut retained = RetainedEvidence {
-            receipt: receipt_path,
-            receipt_sha256: digest_bytes(&receipt_bytes),
-            result: None,
-            result_sha256: None,
-            note: None,
-            retained_ms: now_ms(),
-        };
-        if let Some(result) = result {
-            match bounded_read(result, MAX_RETAINED_RESULT_BYTES) {
-                Ok(bytes) => {
-                    let path = dir.join("result.txt");
-                    fs::write(&path, &bytes)?;
-                    retained.result = Some(path);
-                    retained.result_sha256 = Some(digest_bytes(&bytes));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    retained.note = Some(
-                        "the terminal result file was already gone when the attempt settled"
-                            .to_owned(),
-                    );
-                }
-                Err(error) => {
-                    retained.note = Some(format!(
-                        "the terminal result was not retained within its bound: {error}"
-                    ));
-                }
-            }
-        }
-        Ok(retained)
+        retain_attempt_evidence(&self.root, attempt_id, receipt, result)
     }
 }
 

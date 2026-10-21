@@ -243,6 +243,8 @@ multi_agent = true
 multi_agent_v2 = false
 [analytics]
 enabled = false
+[tui]
+screen_reader_detection_done = true
 [projects.{trusted}]
 trust_level = "trusted"
 "#,
@@ -506,24 +508,52 @@ fn wait_for_active_continuation(root: &Path, thread: &str, turn: &str) -> Value 
     }
 }
 
+/// Reads every native turn of one thread through the paginated RPC the
+/// installed app-server actually implements. `thread/read includeTurns`
+/// reaches its unimplemented `list_turns` path (-32601, "list_turns is not
+/// supported yet"), so completion and source-prefix checks must not depend on
+/// it.
+fn thread_turns(owner: &mut Client, thread: &str) -> Vec<Value> {
+    let mut turns = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..64 {
+        let mut params = json!({
+            "threadId": thread,
+            "itemsView": "full",
+            "sortDirection": "asc",
+            "limit": 100,
+        });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = owner.request("thread/turns/list", params);
+        turns.extend(page["data"].as_array().cloned().unwrap_or_default());
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            return turns;
+        }
+    }
+    panic!("thread/turns/list did not terminate for {thread}");
+}
+
 fn wait_for_turn_completion(owner: &mut Client, thread: &str, turn: &str) -> Value {
     let until = Instant::now() + WAIT;
     loop {
-        let state = owner.request(
-            "thread/read",
-            json!({"threadId": thread, "includeTurns": true}),
-        );
-        let completed = state["thread"]["turns"].as_array().is_some_and(|turns| {
-            turns
-                .iter()
-                .any(|candidate| candidate["id"] == turn && candidate["status"] == "completed")
-        });
+        let state = owner.request("thread/read", json!({"threadId": thread}));
+        let turns = thread_turns(owner, thread);
+        let completed = turns
+            .iter()
+            .any(|candidate| candidate["id"] == turn && candidate["status"] == "completed");
+        let returned = json!({"thread": {
+            "status": state["thread"]["status"].clone(),
+            "turns": turns,
+        }});
         if completed && state["thread"]["status"]["type"] == "idle" {
-            return state;
+            return returned;
         }
         assert!(
             Instant::now() < until,
-            "the original active turn {turn} did not complete after its tool was released: {state}"
+            "the original active turn {turn} did not complete after its tool was released: {returned}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -601,6 +631,414 @@ fn lead_message_reaches_the_native_owning_thread() {
     drop(fixture.job);
 }
 
+/// Canned controls use the same shell and patch tools as the read-only fork.
+/// The writable source proves the operations are valid; the fork must retain
+/// its permitted read while both mutations are refused. No real model runs.
+fn reflection_probe_response(request: &Value, proof: &Path) -> Value {
+    let reflection = contains_payload(request, "Bounded read-only executor self-reflection.");
+    let probing = reflection || contains_payload(request, "accepted executor work");
+    let prefix = if reflection { "reflection" } else { "source" };
+    let shell_call = format!("{prefix}-read-only-proof");
+    let write_call = format!("{prefix}-write-proof");
+    let patch_call = format!("{prefix}-patch-proof");
+    let completed = |call: &str| {
+        request["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("function_call_output" | "custom_tool_call_output")
+                ) && item["call_id"] == call
+            })
+        })
+    };
+    if probing && (!completed(&shell_call) || !completed(&write_call)) {
+        let reading = !completed(&shell_call);
+        let target = if reflection {
+            proof.to_path_buf()
+        } else {
+            proof.with_file_name("writable-control.txt")
+        };
+        let path = native_path(&target).to_string_lossy().replace('\'', "''");
+        let command = if reading {
+            format!("Get-Content -LiteralPath '{path}' -Raw")
+        } else {
+            format!(
+                "Set-Content -LiteralPath '{path}' -Value 'forbidden-write' -NoNewline -ErrorAction Stop"
+            )
+        };
+        let arguments = serde_json::to_string(&json!({
+            "cmd":command,
+            "shell":control_responses::owned_pwsh(),
+            "login":false,
+            "yield_time_ms":10000,
+            "max_output_tokens":1000,
+        }))
+        .unwrap();
+        return json!({
+            "type":"custom_tool_call", "call_id":if reading { shell_call } else { write_call },
+            "namespace":"functions", "name":"exec",
+            "input":format!("const result = await tools.exec_command({arguments}); text(result);"),
+        });
+    }
+    if probing && !completed(&patch_call) {
+        let target = proof.with_file_name(format!("{prefix}-patch-proof.txt"));
+        let path = native_path(&target).to_string_lossy().replace('\\', "/");
+        let patch = format!("*** Begin Patch\n*** Add File: {path}\n+patch-write\n*** End Patch");
+        let input = serde_json::to_string(&patch).unwrap();
+        return json!({
+            "type":"custom_tool_call", "call_id":patch_call,
+            "namespace":"functions", "name":"exec",
+            "input":format!("const result = await tools.apply_patch({input}); text(result);"),
+        });
+    }
+    json!({"type":"message","id":"msg-native-reflection","role":"assistant",
+        "content":[{"type":"output_text","text":"NO FINDING"}]})
+}
+
+/// The checkout's real self-reflection entry point against the installed native
+/// app-server and frontend. Only Responses are canned; source threads, forks,
+/// tool catalogues, retained turns and delivery use native components.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE and native frontend; owned canned Responses and MCP; no live model"]
+fn self_reflection_forks_use_native_read_only_catalogues_and_return_to_the_lead() {
+    let owned_root = BrokerRoot::prepare().unwrap().keep();
+    let proof = owned_root.path().join("workspace/readonly-proof.txt");
+    let provider_proof = proof.clone();
+    let responses =
+        control_responses::Responses::routed(owned_root.path().into(), move |request| {
+            reflection_probe_response(request, &provider_proof)
+        });
+    let fixture = fixture_with_responses(owned_root, responses);
+    let root = fixture.root.path();
+    let home = root.join("home");
+    let checkout = native_path(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap(),
+    );
+    println!("native reflection evidence: {}", root.display());
+    let proof_contents = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+    fs::write(&proof, &proof_contents).unwrap();
+    fs::write(
+        proof.with_file_name("writable-control.txt"),
+        &proof_contents,
+    )
+    .unwrap();
+    let config_path = home.join("config.toml");
+    let unrelated = skill_catalog_responses::unrelated_probe_mcp(&home).replace(
+        "mcp_servers.unrelated_probe",
+        "mcp_servers.\"unrelated.probe\"",
+    );
+    let original_config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        // This isolated home uses the native restricted-token backend without
+        // provisioning machine-wide users. Installed elevated-backend acceptance
+        // remains a separate check; no owner sandbox configuration is changed.
+        format!("{original_config}\n{unrelated}\n[windows]\nsandbox = \"unelevated\"\n[profiles.reflection_fixture]\nmodel = \"gpt-6-astra\"\nmodel_provider = \"control_fixture\"\nmodel_reasoning_effort = \"low\"\n"),
+    ).unwrap();
+    let config_before = fs::read(&config_path).unwrap();
+    let mcp_config: toml::Table = unrelated.parse().unwrap();
+    let mut owner = Client::connect(fixture.port, &fixture.token);
+    let mut sources = Vec::new();
+    for label in ["accepted executor work", "lead acceptance"] {
+        let source = owner.request(
+            "thread/start",
+            json!({
+                "cwd": fixture.workspace,
+                "model":"gpt-6-astra", "modelProvider":"control_fixture",
+                "allowProviderModelFallback":false, "approvalPolicy":"never",
+                "sandbox":"danger-full-access", "config":mcp_config,
+            }),
+        );
+        let thread = source["thread"]["id"].as_str().unwrap().to_owned();
+        let turn = owner.request(
+            "turn/start",
+            json!({
+                "threadId":thread,
+                "input":[{"type":"text","text":label}],
+            }),
+        )["turn"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let completed = wait_for_turn_completion(&mut owner, &thread, &turn);
+        let catalogue = owner.request(
+            "mcpServerStatus/list",
+            json!({
+                "threadId":thread, "detail":"toolsAndAuthOnly",
+            }),
+        );
+        assert!(
+            catalogue["data"].as_array().unwrap().iter().any(|server| {
+                server["name"] == "unrelated.probe"
+                    && server["tools"]
+                        .as_object()
+                        .is_some_and(|tools| !tools.is_empty())
+            }),
+            "source must expose the actual MCP before suppression: {catalogue}"
+        );
+        // A paused goal is ordinary live source state. The reflection fork must
+        // leave the source goal and its turns untouched, and its own goal
+        // exposure must stay suppressed so no automatic continuation starts.
+        let goal = owner.request(
+            "thread/goal/set",
+            json!({
+                "threadId":thread,
+                "objective":format!("preserve the accepted {label} source work"),
+                "status":"paused",
+            }),
+        )["goal"]
+            .clone();
+        assert_eq!(goal["status"], "paused", "{goal}");
+        let after_goal = thread_turns(&mut owner, &thread);
+        assert_eq!(
+            Value::Array(after_goal),
+            completed["thread"]["turns"],
+            "setting a paused goal started an automatic continuation"
+        );
+        sources.push((thread, turn, completed["thread"]["turns"].clone(), goal));
+    }
+    assert_eq!(
+        fs::read_to_string(proof.with_file_name("writable-control.txt")).unwrap(),
+        "forbidden-write",
+        "the ordinary native source must execute the writable shell control"
+    );
+    assert_eq!(
+        fs::read_to_string(proof.with_file_name("source-patch-proof.txt"))
+            .unwrap()
+            .trim(),
+        "patch-write",
+        "the ordinary native source must execute the writable patch control"
+    );
+    let endpoint_dir = record_native_lead(&fixture, &sources[1].0, "native-reflection-return");
+    let state_dir = root.join("reflection-state");
+    let stage = |role: harness_core::role_context::Role| {
+        let resolved = harness_core::role_context::resolve(&checkout, role).unwrap();
+        json!({
+            "role":role.label(), "revision":resolved.revision,
+            "profile":"reflection_fixture", "model":"gpt-6-astra",
+            "provider":"control_fixture", "effort":"low",
+            "checkout":fixture.workspace, "title":format!("native model-free {}", role.label()),
+        })
+    };
+    let request = json!({
+        "schema":1, "task":"owned accepted task", "run":"native-reflection-chain",
+        "acceptance":"owned native completed checkpoints", "source":checkout,
+        "codexHome":home, "launcher":fixture.exe, "stateDir":state_dir,
+        "executorSource":{"thread":sources[0].0,"lastTurn":sources[0].1},
+        "leadSource":{"thread":sources[1].0,"lastTurn":sources[1].1},
+        "executorStage":stage(harness_core::role_context::Role::ExecutorSelfReflection),
+        "leadStage":stage(harness_core::role_context::Role::LeadSelfReflection),
+        "leadReturn":{"endpoint":endpoint_dir.join("lead-endpoint-1.json"),"thread":sources[1].0},
+        "boundSeconds":45,
+    });
+    let request_path = root.join("reflection-request.json");
+    fs::write(&request_path, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+    let mut spec = command(
+        Path::new(env!("CARGO_BIN_EXE_codex-harness")),
+        &home,
+        &fixture.workspace,
+    );
+    spec.args = vec![
+        "self-reflection".into(),
+        "--request".into(),
+        request_path.into_os_string(),
+    ];
+    for key in [
+        "HARNESS_REFLECTION_SESSION",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_CONTEXT_ROLE",
+        "HARNESS_CONTEXT_REVISION",
+        "WT_SESSION",
+    ] {
+        spec.env.insert(key.into(), None);
+    }
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let outcome = session
+        .wait(
+            Deadline::after(Duration::from_secs(150)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    fs::write(root.join("reflection-terminal.txt"), &outcome.transcript).unwrap();
+    assert_eq!(
+        outcome.outcome.exit_code,
+        0,
+        "native reflection failed; evidence {}: {}",
+        root.display(),
+        outcome.transcript
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    for (index, label) in ["executor", "lead"].into_iter().enumerate() {
+        let retained: Value =
+            read_json(&state_dir.join(format!("{label}-stage.json"))).expect("retained stage");
+        assert_eq!(retained["result"], "NO FINDING", "{retained}");
+        let fork = &retained["fork"];
+        let fork_id = fork["forkThread"].as_str().unwrap();
+        assert_ne!(fork_id, sources[index].0);
+        assert_eq!(fork["sourcePreserved"], true, "{fork}");
+        let seeded = &sources[index].3;
+        for boundary in ["sourceGoalBefore", "sourceGoalAfter"] {
+            assert_eq!(fork[boundary]["threadId"], sources[index].0, "{fork}");
+            assert_eq!(fork[boundary]["objective"], seeded["objective"], "{fork}");
+            assert_eq!(fork[boundary]["status"], "paused", "{fork}");
+        }
+        assert_eq!(
+            fork["sourceGoalAfter"], fork["sourceGoalBefore"],
+            "the fork changed the live source goal: {fork}"
+        );
+        // The production fork sets `features.goals=false` in its own thread
+        // config. Native `thread/fork` therefore copies the source turns but
+        // exposes no goal on the fork at all, so the fork has no inherited goal
+        // whose continuation could start. A goals-enabled fork of the same
+        // source does inherit the paused goal, which is why the fork-local
+        // switch is the enforced boundary rather than `deferGoalContinuation`
+        // (that forward-compatible field is not in this upstream's schema).
+        assert_eq!(fork["forkGoalBeforeClear"], Value::Null, "{fork}");
+        assert_eq!(fork["forkGoalAfterClear"], Value::Null, "{fork}");
+        assert_eq!(fork["goalCleared"], false, "{fork}");
+        assert_eq!(fork["toolSurface"]["verified"], true, "{fork}");
+        assert_eq!(
+            fork["suppressedMcpServers"],
+            json!(["unrelated.probe"]),
+            "{fork}"
+        );
+        assert_eq!(fork["sourceThread"], sources[index].0, "{fork}");
+        let requests: Vec<Value> = fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+            .map(|entry| read_json(&entry.path()).expect("retained provider request"))
+            .filter(|body| {
+                RequestIdentity::from_request(body).is_ok_and(|identity| identity.thread == fork_id)
+            })
+            .collect();
+        assert!(
+            !requests.is_empty(),
+            "no native provider input for {fork_id}"
+        );
+        if index == 0 {
+            assert!(
+                requests.iter().any(|body| {
+                    body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            matches!(
+                                item["type"].as_str(),
+                                Some("function_call_output" | "custom_tool_call_output")
+                            ) && item["call_id"] == "reflection-read-only-proof"
+                                && contains_payload(&item["output"], &proof_contents)
+                        })
+                    })
+                }),
+                "the native read-only tool must perform a real permitted read; evidence {}",
+                root.display()
+            );
+            assert_eq!(
+                fs::read_to_string(&proof).unwrap(),
+                proof_contents,
+                "the read-only reflection changed its owned proof file"
+            );
+            assert!(
+                !proof.with_file_name("reflection-patch-proof.txt").exists(),
+                "the read-only reflection wrote through apply_patch"
+            );
+            for call in ["reflection-write-proof", "reflection-patch-proof"] {
+                assert!(
+                    requests
+                        .iter()
+                        .any(|body| body["input"].as_array().is_some_and(|items| items
+                            .iter()
+                            .any(|item| matches!(
+                                item["type"].as_str(),
+                                Some("function_call_output" | "custom_tool_call_output")
+                            ) && item["call_id"] == call))),
+                    "the native mutation attempt {call} must return its own result"
+                );
+            }
+        }
+        for body in requests {
+            let surface = control_responses::tool_catalogue::tool_surface(&body.to_string());
+            assert!(
+                !surface.1.is_empty(),
+                "missing native tool surface for {fork_id}"
+            );
+            assert!(
+                !surface.1.contains("unrelated.probe") && !surface.1.contains("unrelated_probe"),
+                "{surface:?}"
+            );
+            assert_eq!(
+                RequestIdentity::from_request(&body).unwrap().turn,
+                retained["turnId"].as_str().unwrap(),
+                "the reflection fork ran a turn other than its recorded stage turn: {body}"
+            );
+        }
+        let fork_turns = thread_turns(&mut owner, fork_id);
+        let copied = sources[index].2.as_array().unwrap();
+        assert_eq!(
+            fork_turns.len(),
+            copied.len() + 1,
+            "the reflection fork ran an automatic continuation: {fork_turns:?}"
+        );
+        assert_eq!(
+            &fork_turns[..copied.len()],
+            copied,
+            "the fork did not preserve the exact source checkpoint: {fork_turns:?}"
+        );
+        assert_eq!(
+            fork_turns.last().unwrap()["id"],
+            retained["turnId"],
+            "{fork_turns:?}"
+        );
+        let turns = thread_turns(&mut owner, &sources[index].0);
+        let original = sources[index].2.as_array().unwrap();
+        assert_eq!(
+            &turns[..original.len()],
+            original,
+            "the source checkpoint prefix moved: {turns:?}"
+        );
+        if index == 0 {
+            assert_eq!(
+                turns.len(),
+                original.len(),
+                "the executor source gained an automatic goal continuation: {turns:?}"
+            );
+        }
+        let catalogue = owner.request(
+            "mcpServerStatus/list",
+            json!({
+                "threadId":sources[index].0, "detail":"toolsAndAuthOnly",
+            }),
+        );
+        assert!(
+            catalogue["data"].as_array().unwrap().iter().any(|server| {
+                server["name"] == "unrelated.probe"
+                    && server["tools"]
+                        .as_object()
+                        .is_some_and(|tools| !tools.is_empty())
+            }),
+            "source MCP must survive the fork: {catalogue}"
+        );
+    }
+    let delivery: Value =
+        read_json(&state_dir.join("lead-delivery.json")).expect("retained delivery");
+    assert_eq!(delivery["state"], "delivered", "{delivery}");
+    assert!(
+        fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+            .map(|entry| read_json(&entry.path()).expect("retained provider request"))
+            .any(|body| RequestIdentity::from_request(&body)
+                .is_ok_and(|identity| identity.thread == sources[1].0)
+                && contains_payload(&body, "native-reflection-chain")),
+        "the actual lead provider input must consume the synthesis"
+    );
+}
+
 fn lead_message_steers_the_active_native_owning_thread_with(harness: &Path, arm: &str) {
     let owned_root = BrokerRoot::prepare().unwrap().keep();
     let evidence = owned_root.path().to_path_buf();
@@ -671,18 +1109,13 @@ fn lead_message_steers_the_active_native_owning_thread_with(harness: &Path, arm:
             .collect::<Vec<_>>(),
         fs::read_to_string(root.join("server-stderr.txt")).unwrap_or_default()
     );
-    let active_state = owner.request(
-        "thread/read",
-        json!({"threadId": thread, "includeTurns": true}),
-    );
-    let active = active_state["thread"]["turns"]
-        .as_array()
-        .unwrap()
+    let active_turns = thread_turns(&mut owner, &thread);
+    let active = active_turns
         .iter()
         .rev()
         .find(|candidate| candidate["status"] == "inProgress")
         .and_then(|candidate| candidate["id"].as_str());
-    assert_eq!(active, Some(turn.as_str()), "{active_state}");
+    assert_eq!(active, Some(turn.as_str()), "{active_turns:?}");
 
     let generation = "generation-native-active-lead";
     record_native_lead(&fixture, &thread, generation);
@@ -3191,6 +3624,8 @@ skill_search = false
 skip_host_skill_discovery = true
 [analytics]
 enabled = false
+[tui]
+screen_reader_detection_done = true
 [projects.{trusted}]
 trust_level = "trusted"
 "#,
@@ -3879,6 +4314,142 @@ fn installed_queue_endpoint_reaches_its_owning_thread() {
 // Managed lead start acceptance
 // ---------------------------------------------------------------------------
 
+/// Enable the lifecycle on a separate owned native board while a real managed
+/// lead is already visible. No accepted task exists, so journal consumption
+/// must start without launching either reflection conversation.
+fn enable_reflection_for_native_lead(
+    entry: &Path,
+    home: &Path,
+    checkout: &Path,
+    evidence: &Path,
+    thread: &str,
+) -> (ProcessIdentity, PathBuf, PathBuf) {
+    assert!(
+        !home.join("harness/delivery-reflection/hosts").exists(),
+        "a mode-off lead must not create a reflection controller"
+    );
+    let project = evidence.join("reflection-consumer");
+    fs::create_dir_all(&project).unwrap();
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    git(&project, &["config", "user.email", "fixture@example.test"]);
+    git(&project, &["config", "user.name", "Fixture"]);
+    fs::write(
+        project.join("README.md"),
+        "owned native reflection lifecycle check\n",
+    )
+    .unwrap();
+    git(&project, &["add", "README.md"]);
+    git(&project, &["commit", "-qm", "seed"]);
+    let init = Command::new("bd.exe")
+        .args([
+            "init",
+            "--skip-agents",
+            "--non-interactive",
+            "--quiet",
+            "--prefix",
+            "rfl",
+        ])
+        .current_dir(&project)
+        .env("BD_NON_INTERACTIVE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    // Both routes are explicit fixture bindings. No job is eligible and no
+    // provider request is permitted from this lifecycle check.
+    fs::write(home.join("ds.config.toml"), "model = \"deepseek-flash\"\nmodel_provider = \"canned_skill_catalog\"\nmodel_reasoning_effort = \"max\"\n").unwrap();
+    let enabled = Command::new(entry)
+        .args(["delivery-improvement", "enable", "--project"])
+        .arg(&project)
+        .arg("--source")
+        .arg(checkout)
+        .arg("--codex-home")
+        .arg(home)
+        .env("CODEX_HOME", home)
+        .env("CODEX_THREAD_ID", thread)
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_REFLECTION_SESSION")
+        .output()
+        .unwrap();
+    assert!(
+        enabled.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&enabled.stdout),
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let path = home.join("harness/delivery-reflection/hosts").join(format!(
+        "{}.json",
+        build_identity::hash_bytes(thread.as_bytes())
+    ));
+    assert!(
+        wait_until(30, || fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| value["state"] == "running")),
+        "the enabled lifecycle created no native controller; evidence {}",
+        evidence.display()
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    fs::write(
+        evidence.join("reflection-host-start.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let process = ProcessIdentity {
+        pid: receipt["process"]["pid"]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        creation_time: receipt["process"]["creationTime"].as_u64().unwrap(),
+    };
+    let program = PathBuf::from(receipt["process"]["program"].as_str().unwrap());
+    assert!(
+        ServiceProcess::inspect(process, &program, &process_service::current_user().unwrap())
+            .unwrap()
+            .is_some()
+    );
+    let status = Command::new(entry)
+        .args(["delivery-improvement", "status", "--project"])
+        .arg(&project)
+        .arg("--source")
+        .arg(checkout)
+        .arg("--codex-home")
+        .arg(home)
+        .env("CODEX_HOME", home)
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_REFLECTION_SESSION")
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["host"]["processLive"], true);
+    assert_eq!(status["pending"], 0);
+    assert_eq!(status["retained"], 0);
+    let lifecycle_file = PathBuf::from(status["stateFile"].as_str().unwrap());
+    assert!(
+        wait_until(20, || fs::read(&lifecycle_file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| value["last_poll"].is_object())),
+        "the running controller never consumed the native journal; evidence {}",
+        evidence.display()
+    );
+    assert!(
+        ServiceProcess::inspect(process, &program, &process_service::current_user().unwrap())
+            .unwrap()
+            .is_some()
+    );
+    (process, program, path)
+}
+
 /// One actual `codex-harness lead start` session: the checkout-built harness
 /// hosts the lead profile in this terminal through one native app-server, its
 /// attached native frontend, the canned local Responses provider and the
@@ -4198,6 +4769,9 @@ fn managed_lead_start_hosts_the_catalogue_without_native_worktree_tools() {
         body.as_object().map(|map| map.keys().collect::<Vec<_>>())
     );
 
+    let (reflection_process, reflection_program, reflection_receipt) =
+        enable_reflection_for_native_lead(&entry, &home, &checkout, &evidence, &thread);
+
     // Ending the frontend ends the host: the exact thread and this host's
     // working files must retire, the app-server child must be gone, and the
     // retired port must refuse the recorded address.
@@ -4260,6 +4834,20 @@ fn managed_lead_start_hosts_the_catalogue_without_native_worktree_tools() {
         &user,
         "the managed lead session left its app-server child running",
     );
+    assert_process_gone(
+        reflection_process,
+        &reflection_program,
+        &user,
+        "the managed lead left an orphaned reflection journal consumer",
+    );
+    let reflection_status: Value =
+        serde_json::from_slice(&fs::read(&reflection_receipt).unwrap()).unwrap();
+    assert_eq!(reflection_status["state"], "stopped");
+    fs::write(
+        evidence.join("reflection-host-stopped.json"),
+        serde_json::to_vec_pretty(&reflection_status).unwrap(),
+    )
+    .unwrap();
     assert!(
         ControlConnection::connect(port, &token, Duration::from_millis(500)).is_err(),
         "the retired endpoint still accepted a connection on port {port}"

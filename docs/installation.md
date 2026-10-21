@@ -131,6 +131,28 @@ Codex and the executor profile work. Connecting the subscription component
 does not authorize a provider or create a user's Z.AI profile. Choose billing
 routes explicitly; see [subscription setup](subscription-models.md).
 
+The shipped orchestration profile also sets `self_reflection_enabled = true`.
+Ordinary interactive `codex` automatically prepares its current session's
+reflection transport and project lifecycle; no separate lead-start or
+`delivery-improvement enable` command is required. Existing unmanaged sessions
+take this update on their next ordinary launch. Finished sessions, historical
+acceptances and their pending stages remain dormant. An omitted key is true
+for compatibility. Set it to `false` to stop new
+reflection stages while ordinary lead, executor and acceptance work continues;
+retained results and pending work are preserved.
+Core delivery installs the distinct `executor-self-reflection` and
+`lead-self-reflection` skills and resolves their role instructions. See
+[accepted-task self-reflection](rust-native.md#accepted-task-self-reflection)
+for automatic activation, delivery and recovery.
+Ordinary acceptance uses the installed kit configuration when its source is a
+consumer project, with or without an explicit `--source`. A selected kit supplies
+its own configuration; consumer pool provenance remains unchanged. Default-true bindings
+omit the field from the legacy-compatible acceptance metadata; false is
+explicit. An acceptance made while false still succeeds, records that
+permission in its receipt, and remains ineligible for reflection if the value is
+re-enabled before the next poll: the closure is consumed as an existing ignored
+event, not a new refusal.
+
 For a first installation, when `codex-harness` is not yet on PATH, bootstrap
 the manager with Cargo's ordinary development profile and let **deploy**
 publish the optimized immutable release build:
@@ -149,6 +171,65 @@ Build output may be quiet while Cargo optimizes: retain the process handle
 and inspect `STATE/staging/<candidate>/cargo.log` when needed. Silence or a
 poll timeout is not evidence that the operation stopped.
 
+Complete the required [Ponytail setup](#ponytail-setup) below after core delivery.
+
+### Handoff to an agent on another PC
+
+The receiving agent runs [first installation](#first-installation-on-a-new-machine)
+on the target PC with that owner's tools, paths, authentication and settings.
+Preparing another Windows account, VM or Sandbox on the development machine is
+not a prerequisite for this handoff. Do not copy the development account's
+package caches, credentials or hook-trust records.
+
+After installation, run the documented Check, open a fresh ordinary Codex
+session outside the harness checkout, and verify discovery and actual use of
+the installed capabilities. Repeat the installation to check that local settings
+survive. Report the selected versions, command results and any remaining native
+trust step. Use [targeted recovery](#completion-and-targeted-recovery) if delivery
+is incomplete; keep target-machine evidence with its owner. A written handoff
+does not claim that the other PC has already passed these checks.
+
+### Ponytail setup
+
+Ponytail is a required part of normal setup and is enabled by default. Install
+the original plugin with Codex's native commands; do not copy its skills or
+rules. The [marketplace declaration](../.agents/plugins/marketplace.json) selects
+the inspected upstream revision. Its MIT license and attribution remain in the
+package. Git and Node must be on PATH. The exercised baseline is Codex CLI
+0.163.0 and Node 24.18.0; this does not establish minimum compatible versions.
+
+First run `codex plugin list --json`. If Ponytail is already installed, keep that
+native installation and inspect its selection instead of adding a duplicate.
+Do not reset deliberate disablement. For a new installation, run these commands
+after the core delivery above (`$kit` is the absolute checkout path):
+
+```powershell
+codex plugin marketplace add $kit --json
+codex plugin add ponytail@coding-agents-harness --json
+codex features enable hooks
+```
+
+Open ordinary Codex and use `/hooks` to review and trust the original Ponytail
+hooks. Then start a fresh session outside the harness checkout. Native plugin
+listing must show Ponytail installed and enabled, and the session must receive
+its guidance and discover the supplied skills, including `ponytail-help`.
+Package presence alone does not prove loading. `codex-harness check` verifies
+the harness connection; use native plugin listing, `/hooks` and the fresh
+session to verify Ponytail. Keep any native error visible and resolve its stated
+cause before claiming setup is complete.
+
+Repeat setup starts with native listing; do not blindly repeat `plugin add`,
+which can reset the enabled choice. The plugin lives in the selected Codex home
+and needs no project-local setup. Updates and removal use Codex's native plugin
+commands and the [upstream guide](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/INSTALL.md).
+
+The original plugin resets mode on resume and can share mode state between
+sessions. On the exercised Codex 0.163.0 host, different projects in the same
+Codex home also used shared fallback state; independent modes are not promised.
+Compaction retains the stored mode in the inspected upstream hooks. Temporary
+mode changes differ from persistent plugin disablement. See the original
+[mode-state implementation](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-runtime.js).
+
 ### Everyday delivery and update
 
 Everyday delivery and update are one command. It builds an immutable
@@ -165,6 +246,23 @@ delivery:
 ```powershell
 codex-harness deploy --source "<absolute-kit-checkout>" [--all] [--reset]
 ```
+
+`deploy --preview` without `--build` first selects an integrity-verified build
+from the same checkout in the manager's owned state (or the explicit `--state`).
+When one is available, planning does not invoke Cargo. The receipt identifies
+the selected directory and digest; `build_selection = verified-existing` records
+this reuse, and `build_check.status` reports whether the source is current or
+`source-stale`. An older intact build can support planning; the preview does not
+certify changed source as compiled, tested or installed. Explicit `--build`
+selection remains authoritative. With no eligible build, including first use,
+the ordinary preparation path and its errors still apply. An applying deploy
+independently prepares and validates its candidate as before.
+
+Preview preserves installation links, settings, build selection and reset
+targets. `--all --preview` reports each component's plan through its existing
+owner; missing prerequisites remain explicit failures and do not disappear
+from the receipt. Avoiding preview compilation establishes this bounded
+behavior, not an end-to-end time or token saving.
 
 For connected code tools, delivery requires real Serena semantic acceptance
 before link changes and through the installed manager afterward. The receipt's

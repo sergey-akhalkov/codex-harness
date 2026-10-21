@@ -26,6 +26,8 @@ mod mcp_cli;
 #[cfg(windows)]
 mod native_read_rpc;
 #[cfg(windows)]
+mod ordinary_lead;
+#[cfg(windows)]
 mod outcome_arm;
 mod outcome_case_fixture;
 mod outcome_discovery;
@@ -35,6 +37,8 @@ mod outcome_prepare;
 mod outcome_report_cli;
 mod outcome_run;
 mod ownership_check_cli;
+#[cfg(windows)]
+mod self_reflection_cli;
 mod skills_cli;
 #[cfg(windows)]
 mod source_diagnostics;
@@ -93,6 +97,12 @@ enum Admission {
 }
 
 fn verify_entrypoint(required: Admission) -> io::Result<()> {
+    #[cfg(windows)]
+    if std::env::var_os(self_reflection_cli::REFLECTION_SESSION_ENV).is_some() {
+        return Err(io::Error::other(
+            "reflection forks are read-only and cannot run codex-harness commands: this process runs inside a self-reflection session (HARNESS_REFLECTION_SESSION is set); return the finding through the reflection result instead of changing project state",
+        ));
+    }
     // Cargo bootstrap has no adjacent receipt. Resolve installed command links
     // before finding the immutable build's identity record.
     let executable = env::current_exe()?.canonicalize()?;
@@ -119,6 +129,11 @@ fn verify_entrypoint(required: Admission) -> io::Result<()> {
 
 fn run() -> io::Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    #[cfg(windows)]
+    if args.first().is_some_and(|arg| arg == "_ordinary-lead") {
+        verify_runtime()?;
+        return ordinary_lead::run(&args[1..]);
+    }
     #[cfg(windows)]
     if args
         .first()
@@ -327,6 +342,12 @@ fn run() -> io::Result<i32> {
             "codex-harness executor message|stop|watch [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N] [--owner ID] (content: --text TEXT, --file FILE or piped stdin)"
         );
         println!(
+            "codex-harness self-reflection --request PATH (two read-only model forks over exact accepted source turns; see self-reflection --help)"
+        );
+        println!(
+            "codex-harness delivery-improvement enable|status|disable|process --project DIRECTORY (accepted-task reflection lifecycle; see delivery-improvement --help)"
+        );
+        println!(
             "codex-harness feedback record|list|ledger|triage|candidates|promote --project DIRECTORY [--bd FILE] [--source CHECKOUT] ... (bd-backed feedback loop; no model calls)"
         );
         println!(
@@ -471,6 +492,16 @@ fn run() -> io::Result<i32> {
     if args[0] == "executor" {
         verify_runtime()?;
         return executor_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "self-reflection" {
+        verify_runtime()?;
+        return self_reflection_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "delivery-improvement" {
+        verify_runtime()?;
+        return self_reflection_cli::lifecycle::run(&args[1..]);
     }
     #[cfg(windows)]
     if args[0] == "worktree" {

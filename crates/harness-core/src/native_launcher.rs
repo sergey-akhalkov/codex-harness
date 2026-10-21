@@ -9,7 +9,9 @@
 //! `--harness-cpu uncapped` is a per-invocation exception: it is not saved, it
 //! does not raise the allowance for other sessions or shared services, and a
 //! caller already inside the allowance relaunches that one payload through the
-//! existing job-free sibling anchor so the exception is not inherited.
+//! existing job-free sibling anchor so the exception is not inherited. The
+//! exception changes only the payload's CPU placement: when ordinary
+//! reflection is enabled, the manager boundary is still selected first.
 //! Independently started kit services are not members of that job.
 use crate::{build_identity, build_selection, launcher};
 use serde::{Deserialize, Serialize};
@@ -84,6 +86,13 @@ fn fail(message: &'static str) -> io::Error {
 }
 
 const DEGRADED_NOTICE: &str = "codex-harness: shared harness unavailable; launching registered Codex without harness overrides";
+/// Internal launches that already belong to another owner must never enter
+/// the ordinary reflection host and recurse back into it.
+const ORDINARY_HOSTING_BYPASS_ENV: &[&str] = &[
+    crate::orchestration_config::EXECUTOR_SESSION_ENV,
+    "HARNESS_REFLECTION_SESSION",
+    "HARNESS_BOUNDED_LEAD_SESSION",
+];
 
 /// Resolve the registered runtime with the single artifact pass this launch
 /// decision performs. The returned digest is the verified launcher image
@@ -423,7 +432,7 @@ fn prepared_command(
     executable: &Path,
     home: &Path,
     args: &[OsString],
-) -> io::Result<(Command, bool, String)> {
+) -> io::Result<(Command, bool, String, bool)> {
     let mut bytes = Vec::new();
     File::open(home.join("harness/native-launch.json"))?
         .take(REGISTRATION_LIMIT + 1)
@@ -608,7 +617,12 @@ fn prepared_command(
         command.env("CODEX_MANAGED_PACKAGE_ROOT", root);
         command.env(variable, "1");
     }
-    Ok((command, registration.task_control, launcher_sha256))
+    Ok((
+        command,
+        registration.task_control,
+        launcher_sha256,
+        shared && !degraded,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,7 +1589,7 @@ mod xai {
 }
 
 pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<Command> {
-    prepared_command(executable, home, args).map(|(command, _, _)| command)
+    prepared_command(executable, home, args).map(|(command, _, _, _)| command)
 }
 
 #[cfg(windows)]
@@ -1628,6 +1642,79 @@ fn interactive_spec(command: &Command) -> io::Result<crate::process::CommandSpec
             .insert(key.to_os_string(), value.map(|value| value.to_os_string()));
     }
     Ok(spec)
+}
+
+/// Ordinary interactive sessions receive one manager boundary when the
+/// declared reflection permission is on. The manager is the verified sibling
+/// `codex-harness.exe`; it receives the already composed native argv and the
+/// prepared environment unchanged, plus the original inherited working
+/// directory. The surrounding session Job and exit handling keep owning this
+/// payload exactly as they own a direct upstream process.
+#[cfg(windows)]
+fn ordinary_manager_command(
+    executable: &Path,
+    home: &Path,
+    harness_ready: bool,
+    prepared: &Command,
+) -> io::Result<Option<Command>> {
+    if !harness_ready
+        || ORDINARY_HOSTING_BYPASS_ENV
+            .iter()
+            .any(|name| env::var_os(name).is_some())
+    {
+        return Ok(None);
+    }
+    let working_directory = env::current_dir()?;
+    let cwd = prepared
+        .get_current_dir()
+        .unwrap_or(working_directory.as_path());
+    let args: Vec<OsString> = prepared.get_args().map(OsString::from).collect();
+    let planning_error = match crate::task_arguments::plan_hosted(&args, cwd, home) {
+        Ok(Some(_)) => None,
+        Ok(None) => return Ok(None),
+        Err(error) => Some(error),
+    };
+    let build = executable
+        .canonicalize()?
+        .parent()
+        .ok_or_else(|| fail("launcher has no build directory"))?
+        .to_path_buf();
+    let record = build_identity::read_record(&build)?;
+    if !record.source_root.is_dir() {
+        return Ok(None);
+    }
+    // An omitted permission defaults on. A declared non-boolean value is an
+    // error, never a quiet false: the launch fails before any native process
+    // starts instead of silently disabling reflection.
+    let enabled = match crate::orchestration_config::load(&record.source_root) {
+        Ok(config) => config.self_reflection_enabled,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
+    if !enabled {
+        return Ok(None);
+    }
+    if let Some(error) = planning_error {
+        return Err(error);
+    }
+    let mut manager = Command::new(build.join("codex-harness.exe"));
+    manager
+        .arg("_ordinary-lead")
+        .arg("--codex-home")
+        .arg(home)
+        .arg("--")
+        .args(prepared.get_args());
+    for (name, value) in prepared.get_envs() {
+        match value {
+            Some(value) => {
+                manager.env(name, value);
+            }
+            None => {
+                manager.env_remove(name);
+            }
+        }
+    }
+    Ok(Some(manager))
 }
 
 // [`crate::heavy_command::SHARED_CPU_ESCAPE_HATCH`] is the per-launch ceiling
@@ -1783,7 +1870,7 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     // loader dialog.
     crate::process::suppress_loader_dialogs();
     let (uncapped, args) = take_uncapped_session_selector(args)?;
-    let (command, task_control, _) = prepared_command(executable, home, &args)?;
+    let (command, task_control, _, harness_ready) = prepared_command(executable, home, &args)?;
     // An xAI session routes only to a verified owned generation of this build.
     // The owner lease lives until this launcher exits, so the generation
     // retires with its sessions instead of being replaced under a live
@@ -1819,6 +1906,22 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     } else {
         (command, None)
     };
+    #[cfg(windows)]
+    // `uncapped` is an outer CPU-placement exception, not a hosting bypass.
+    // The manager boundary below is selected for ordinary reflection exactly
+    // as it is for a capped launch; `launch_uncapped_session` then starts that
+    // selected command outside the shared allowance.
+    let command = if task_control {
+        command
+    } else if let Some(manager) =
+        ordinary_manager_command(executable, home, harness_ready, &command)?
+    {
+        manager
+    } else {
+        command
+    };
+    #[cfg(not(windows))]
+    let _ = harness_ready;
     #[cfg(windows)]
     let _console = ConsoleHandler::install()?;
     #[cfg(windows)]

@@ -36,6 +36,7 @@ never equate token counts or delegation counts with exact weekly quota savings.
 """
 
 [agents]
+# Native in-session children only; harness executors use orchestration.toml.
 max_concurrent_threads_per_session = 2
 
 [features]

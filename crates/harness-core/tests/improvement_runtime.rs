@@ -15,7 +15,9 @@ use harness_core::{
     build_identity, build_selection,
     improvement_experiment::{Arm, prepare_home, prepare_variant, select_variant},
     improvement_runtime::{
-        ArmRequest, ClientInputs, PrivateInput, discard_arm, install_arm, retire_arm, select_arm,
+        AdoptionClaimStatus, ArmRequest, ClientInputs, FileIdentity, PrivateInput,
+        acquire_adoption_claim, discard_arm, install_arm, refresh_arm, require_adoption_claim,
+        retire_arm, select_arm, settle_adoption_claim, verify_adoption_placement,
         verify_consumption, verify_consumption_with_trust,
     },
     outcome_qualification::{LocalRunner, MaterialIdentity},
@@ -975,6 +977,449 @@ fn consumption_authorizes_only_recorded_dispatch_workspaces() {
     verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
 }
 
+/// Native approval of the unchanged token-hook definition appends exactly one
+/// local `hooks.state` record and no other configuration change. That record is
+/// accepted only for this arm's own retained hooks.json and its actual
+/// definition; the frozen configuration, model, authority, hook enablement and
+/// every unrelated edit stay enforced.
+#[test]
+fn native_hook_trust_accepts_only_the_arms_unchanged_definition() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-hook-trust-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let source = kit_source(root, "kit-hook-trust", "hook-trust");
+    for relative in [
+        "crates/harness-rtk/Cargo.toml",
+        "crates/harness-rtk/src/main.rs",
+    ] {
+        let path = source.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, relative.as_bytes()).unwrap();
+    }
+    let hooks = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "harness-rtk.exe hook",
+                    "timeout": 2
+                }]
+            }]
+        }
+    });
+    fs::write(
+        source.join("global/rtk-hooks.json"),
+        serde_json::to_vec(&hooks).unwrap(),
+    )
+    .unwrap();
+    let build = fixture_build(
+        &state,
+        "hook-trust",
+        &source,
+        &fixtures.launcher,
+        "hook-trust",
+    );
+    let home = prepare_home(&root.join("homes/hook-trust")).unwrap();
+    let user_home = prepare_home(&root.join("homes/hook-trust-user")).unwrap();
+    let dependency_user_home = prepare_home(&root.join("homes/hook-trust-dep")).unwrap();
+    let vendor = home.join("harness/rtk/packages/0.48.0/rtk.exe");
+    fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+    fs::write(&vendor, b"staged-rtk-for-hook-trust").unwrap();
+    fs::write(
+        source.join("global/rtk.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": "0.48.0",
+            "executableSha256": build_identity::hash_file(&vendor).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let identity =
+        harness_core::token_workflow_lifecycle::component_source_identity(&source).unwrap();
+    let adapter = home.join(format!("harness/rtk/build/{identity}/harness-rtk.exe"));
+    fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+    fs::write(&adapter, b"staged-adapter-for-hook-trust").unwrap();
+    fs::write(
+        adapter.parent().unwrap().join("build.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "sourceIdentity": identity,
+            "binarySha256": build_identity::hash_file(&adapter).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let catalogue = root.join("model-catalogue.json");
+    fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    let overlay = root.join("qualified-client.config.toml");
+    fs::write(
+        &overlay,
+        "model_context_window = 65536\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\n",
+    )
+    .unwrap();
+    let private_profile = root.join("private/ds.config.toml");
+    fs::create_dir_all(private_profile.parent().unwrap()).unwrap();
+    fs::write(
+        &private_profile,
+        b"sandbox_mode = \"read-only\"\r\nmodel = \"fixture-glyph-1\"\r\nmodel_reasoning_effort = \"high\"\r\napproval_policy = \"never\"\r\n\r\n[features]\r\ncode_mode = false\r\n",
+    )
+    .unwrap();
+    // A retained non-profile private input keeps its exact frozen bytes; the
+    // native profile's consent normalization must never apply to it.
+    let private_notes = root.join("private/notes.txt");
+    fs::write(&private_notes, b"reviewer notes\r\nline two\r\n").unwrap();
+    let request = ArmRequest {
+        variant: prepare_variant(&state, Arm::Baseline, "H", &build).unwrap(),
+        home: home.clone(),
+        user_home,
+        dependency_user_home,
+        upstream: fixtures.upstream.clone(),
+        timeout: Duration::from_secs(60),
+        client: Some(local_client(&catalogue, Some(&overlay))),
+        private_inputs: vec![
+            PrivateInput {
+                source: private_profile,
+                destination: "ds.config.toml".into(),
+            },
+            PrivateInput {
+                source: private_notes,
+                destination: "notes.txt".into(),
+            },
+        ],
+        protected: Vec::new(),
+    };
+    let mut runtime = install_arm(&request).unwrap();
+    verify_consumption(&runtime).unwrap();
+    let private_profile = runtime.home.join("ds.config.toml");
+    let prepared_private = fs::read(&private_profile).unwrap();
+    let profile_private = runtime
+        .private
+        .iter()
+        .find(|input| input.destination == "ds.config.toml")
+        .expect("the native profile private input is retained");
+    assert_eq!(
+        profile_private.sha256,
+        build_identity::hash_bytes(&prepared_private),
+        "the frozen private profile identity is unchanged"
+    );
+    let private_notes = runtime.home.join("notes.txt");
+    let prepared_notes = fs::read(&private_notes).unwrap();
+    let notes_private = runtime
+        .private
+        .iter()
+        .find(|input| input.destination == "notes.txt")
+        .expect("the non-profile private input is retained");
+    assert_eq!(
+        notes_private.sha256,
+        build_identity::hash_bytes(&prepared_notes),
+        "the frozen non-profile private identity is unchanged"
+    );
+    let config = runtime.configuration.as_ref().unwrap().path.clone();
+    let installed = fs::read(&config).unwrap();
+    let installed_text = std::str::from_utf8(&installed).unwrap();
+    assert!(
+        installed_text.contains("approval_policy = \"never\""),
+        "the prepared arm records its authority: {installed_text}"
+    );
+    assert!(
+        installed_text.contains("hooks = true"),
+        "the prepared arm enables the retained token hook: {installed_text}"
+    );
+    // A prepared arm may already end with ordinary trusted-project entries.
+    // They belong to the frozen bytes; only the native approval and the
+    // dispatcher's authorized workspace entry are appended later.
+    let prepared_workspace = root.join("prepared-workspace");
+    let prepared = format!(
+        "{installed_text}\n[projects.'{}']\ntrust_level = \"trusted\"\n",
+        prepared_workspace.to_string_lossy().to_ascii_lowercase()
+    )
+    .into_bytes();
+    fs::write(&config, &prepared).unwrap();
+    runtime.configuration.as_mut().unwrap().sha256 = build_identity::hash_bytes(&prepared);
+    verify_consumption(&runtime).unwrap();
+    let prepared_text = std::str::from_utf8(&prepared).unwrap();
+    let component = runtime
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+        .expect("the token workflow is retained");
+    let link = component
+        .links
+        .iter()
+        .find(|link| link.name == "hooks.json")
+        .expect("the retained hook definition is recorded");
+    assert_eq!(
+        link.sha256,
+        build_identity::hash_file(&link.source).unwrap(),
+        "the retained definition is the source identity"
+    );
+    // The native client derives this digest from the normalized handler; the
+    // value below is the approval its UI records for this exact definition.
+    let known_digest = "sha256:1914caf6f4ea4f558efc894660fb096e808a44e7de9061c688d172c05450f135";
+    let key = format!("{}:pre_tool_use:0:0", link.destination.to_string_lossy());
+    let marker = "# END codex-harness MCP registrations";
+    let native_block =
+        |key: &str, digest: &str| format!("\n[hooks.state.'{key}']\ntrusted_hash = \"{digest}\"\n");
+    let insert_native = |text: &str, key: &str, digest: &str| {
+        let mut text = text.to_owned();
+        let at = text.find(marker).unwrap_or(text.len());
+        text.insert_str(at, &native_block(key, digest));
+        text
+    };
+    let workspace = root.join("checkout-wt1");
+    let workspace_block = format!(
+        "\n[projects.'{}']\ntrust_level = \"trusted\"\n",
+        workspace.to_string_lossy().to_ascii_lowercase()
+    );
+
+    // The native client rewrites this private profile to LF and appends one
+    // exact local approval for the retained hook definition. The frozen
+    // private-input digest still describes the prepared CRLF bytes.
+    let prepared_private_text = std::str::from_utf8(&prepared_private).unwrap();
+    let profile_native = format!(
+        "{}\n[hooks.state]\n\n[hooks.state.'{key}']\ntrusted_hash = \"{known_digest}\"\n",
+        prepared_private_text.replace("\r\n", "\n")
+    );
+    let profile_record =
+        format!("\n[hooks.state]\n\n[hooks.state.'{key}']\ntrusted_hash = \"{known_digest}\"\n");
+    fs::write(&private_profile, &profile_native).unwrap();
+    verify_consumption(&runtime).unwrap();
+    verify_consumption(&runtime).unwrap();
+    assert_eq!(
+        profile_private.sha256,
+        build_identity::hash_bytes(&prepared_private),
+        "native consent does not replace the frozen private profile identity"
+    );
+
+    // The exact accepted block is profile consent only for the native profile
+    // destination. Appended to a retained non-profile input it corrupts that
+    // input and must refuse even though ds.config.toml still verifies.
+    let notes_with_profile_trust = format!(
+        "{}{profile_record}",
+        std::str::from_utf8(&prepared_notes).unwrap()
+    );
+    fs::write(&private_notes, &notes_with_profile_trust).unwrap();
+    let error = verify_consumption(&runtime).unwrap_err().to_string();
+    assert!(
+        error.contains("private runner input notes.txt changed since preparation"),
+        "profile consent was applied to an unrelated private input: {error}"
+    );
+    fs::write(&private_notes, &prepared_notes).unwrap();
+    verify_consumption(&runtime).unwrap();
+
+    let mut profile_counterexamples: Vec<(&str, String)> = Vec::new();
+    profile_counterexamples.push((
+        "a wrong private hook digest",
+        profile_native.replace(
+            known_digest,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    ));
+    profile_counterexamples.push((
+        "a foreign private hook path",
+        profile_native.replace(
+            &key,
+            &format!(
+                "{}:pre_tool_use:0:0",
+                root.join("foreign-hooks.json").display()
+            ),
+        ),
+    ));
+    profile_counterexamples.push((
+        "a different private handler index",
+        profile_native.replace(":pre_tool_use:0:0", ":pre_tool_use:0:1"),
+    ));
+    profile_counterexamples.push((
+        "an extra private trust field",
+        profile_native.replace(
+            &format!("trusted_hash = \"{known_digest}\""),
+            &format!("trusted_hash = \"{known_digest}\"\nenabled = true"),
+        ),
+    ));
+    profile_counterexamples.push((
+        "a duplicate private trust record",
+        format!("{profile_native}{profile_record}"),
+    ));
+    profile_counterexamples.push((
+        "a missing private trust parent header",
+        format!(
+            "{}\n[hooks.state.'{key}']\ntrusted_hash = \"{known_digest}\"\n",
+            prepared_private_text.replace("\r\n", "\n")
+        ),
+    ));
+    profile_counterexamples.push((
+        "private model drift",
+        profile_native.replace("fixture-glyph-1", "fixture-glyph-2"),
+    ));
+    profile_counterexamples.push((
+        "private authority drift",
+        profile_native.replace(
+            "approval_policy = \"never\"",
+            "approval_policy = \"on-request\"",
+        ),
+    ));
+    profile_counterexamples.push((
+        "a partial private line-ending rewrite",
+        profile_native.replace(
+            "sandbox_mode = \"read-only\"\n",
+            "sandbox_mode = \"read-only\"\r\n",
+        ),
+    ));
+    profile_counterexamples.push((
+        "an unowned private setting",
+        format!("{profile_native}\n[fixture-extra]\nvalue = 1\n"),
+    ));
+    for (name, text) in profile_counterexamples {
+        assert_ne!(
+            text, profile_native,
+            "{name} did not change the private bytes"
+        );
+        fs::write(&private_profile, text).unwrap();
+        let error = verify_consumption(&runtime).unwrap_err().to_string();
+        assert!(
+            error.contains("private runner input ds.config.toml changed since preparation"),
+            "{name}: {error}"
+        );
+    }
+    fs::write(&private_profile, &profile_native).unwrap();
+    verify_consumption(&runtime).unwrap();
+
+    // The native approval alone is accepted without inventing workspace
+    // authority; the dispatch's own workspace entry then needs its recorded
+    // authorization exactly as before.
+    let hook_only = insert_native(prepared_text, &key, known_digest);
+    fs::write(&config, &hook_only).unwrap();
+    verify_consumption(&runtime).unwrap();
+    let approved = format!("{hook_only}{workspace_block}");
+    fs::write(&config, &approved).unwrap();
+    assert!(
+        verify_consumption(&runtime).is_err(),
+        "an unrecorded workspace trust entry was accepted by the strict check"
+    );
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+    assert_eq!(fs::read(&config).unwrap(), approved.as_bytes());
+    assert_eq!(
+        runtime.configuration.as_ref().unwrap().sha256,
+        build_identity::hash_bytes(&prepared),
+        "the frozen configuration digest is unchanged"
+    );
+
+    let mut counterexamples: Vec<(&str, String)> = Vec::new();
+    counterexamples.push((
+        "a wrong hook approval digest",
+        approved.replace(
+            known_digest,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    ));
+    counterexamples.push((
+        "a foreign hook definition",
+        approved.replace(
+            &key,
+            &format!(
+                "{}:pre_tool_use:0:0",
+                root.join("foreign-hooks.json").display()
+            ),
+        ),
+    ));
+    counterexamples.push((
+        "a different handler index",
+        approved.replace(":pre_tool_use:0:0", ":pre_tool_use:0:1"),
+    ));
+    counterexamples.push((
+        "an extra trust field",
+        approved.replace(
+            &format!("trusted_hash = \"{known_digest}\""),
+            &format!("trusted_hash = \"{known_digest}\"\nenabled = true"),
+        ),
+    ));
+    counterexamples.push((
+        "a duplicate trust record",
+        insert_native(&approved, &key, known_digest),
+    ));
+    counterexamples.push((
+        "ordinary model drift",
+        approved.replace("fixture-glyph-1", "fixture-glyph-2"),
+    ));
+    counterexamples.push((
+        "authority drift",
+        approved.replace(
+            "approval_policy = \"never\"",
+            "approval_policy = \"on-request\"",
+        ),
+    ));
+    counterexamples.push((
+        "changed hook enablement",
+        approved.replace("hooks = true", "hooks = false"),
+    ));
+    counterexamples.push((
+        "an unrelated configuration addition",
+        format!("{approved}\n[fixture-extra]\nvalue = 1\n"),
+    ));
+    for (name, text) in counterexamples {
+        assert_ne!(text, approved, "{name} did not change the approved bytes");
+        fs::write(&config, text).unwrap();
+        let error = verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("configuration changed since preparation"),
+            "{name}: {error}"
+        );
+    }
+
+    // The definition identity stays authoritative: a changed command refuses
+    // even when the configuration still carries the previously approved hash.
+    let original_definition = fs::read(&link.source).unwrap();
+    let changed = serde_json::to_vec(&serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "harness-rtk.exe changed",
+                    "timeout": 2
+                }]
+            }]
+        }
+    }))
+    .unwrap();
+    fs::write(&link.source, &changed).unwrap();
+    fs::write(&config, &approved).unwrap();
+    let error = verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("changed since preparation"),
+        "a changed hook command was accepted: {error}"
+    );
+    fs::write(&link.source, &original_definition).unwrap();
+
+    // The exact approved bytes remain usable after the counterexamples.
+    fs::write(&config, &approved).unwrap();
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+
+    // Repeat use: preparation may already record this arm's native approval.
+    // A later authorized workspace entry must still match those frozen bytes
+    // instead of requiring the approval to be removed.
+    runtime.configuration.as_mut().unwrap().sha256 =
+        build_identity::hash_bytes(hook_only.as_bytes());
+    fs::write(&config, &approved).unwrap();
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+    runtime.configuration.as_mut().unwrap().sha256 = build_identity::hash_bytes(&prepared);
+    fs::write(&config, &prepared).unwrap();
+    retire_arm(&runtime).unwrap();
+}
+
 /// Refusals: overlap, missing or mismatched inputs, ambient homes and partial
 /// installation state never produce an apparently ready arm.
 #[test]
@@ -1646,4 +2091,573 @@ fn prepared_arm_selection_cycles_without_source_rebuild_or_model_call() {
 
     retire_arm(&baseline_runtime).unwrap();
     retire_arm(&candidate_runtime).unwrap();
+}
+
+#[test]
+fn adoption_claims_are_exclusive_durable_and_same_owner_recoverable() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime_path = root.path().join("runtime.json");
+    let cursor_path = root.path().join("cursor.json");
+    fs::write(&runtime_path, b"retained runtime receipt\n").unwrap();
+    fs::write(&cursor_path, b"completed origin cursor\n").unwrap();
+    let runtime = FileIdentity {
+        path: runtime_path.clone(),
+        sha256: build_identity::hash_file(&runtime_path).unwrap(),
+    };
+    let cursor = FileIdentity {
+        path: cursor_path.clone(),
+        sha256: build_identity::hash_file(&cursor_path).unwrap(),
+    };
+    let spec_a = "a".repeat(64);
+    let spec_b = "b".repeat(64);
+
+    let claimed = acquire_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(claimed.status, AdoptionClaimStatus::Active);
+    assert_eq!(claimed.run, "run-a");
+
+    // An old update timestamp is not a lease expiry: only the owner can settle
+    // or resume the claim.
+    let ledger_path = runtime_path.with_file_name("runtime.json.adoption.json");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    ledger["claims"][0]["updatedMs"] = serde_json::json!(1);
+    fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    let error = acquire_adoption_claim(&runtime, &cursor, "run-b", &spec_b, "ordinary")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("actively adopted by run run-a"), "{error}");
+    assert_eq!(
+        fs::read(&ledger_path).unwrap(),
+        serde_json::to_vec_pretty(&ledger).unwrap()
+    );
+
+    let resumed = require_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(resumed.status, AdoptionClaimStatus::Active);
+    assert!(resumed.updated_ms > 1);
+
+    let stopped = settle_adoption_claim(&runtime, "run-a", AdoptionClaimStatus::Stopped)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, AdoptionClaimStatus::Stopped);
+    assert!(stopped.settled_ms.is_some());
+    let reactivated =
+        require_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(reactivated.status, AdoptionClaimStatus::Active);
+    assert!(reactivated.settled_ms.is_none());
+
+    settle_adoption_claim(&runtime, "run-a", AdoptionClaimStatus::Completed).unwrap();
+    let completed =
+        require_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary").unwrap();
+    assert_eq!(completed.status, AdoptionClaimStatus::Completed);
+    let error = acquire_adoption_claim(&runtime, &cursor, "run-a", &spec_a, "ordinary")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already settled"), "{error}");
+
+    let second = acquire_adoption_claim(&runtime, &cursor, "run-b", &spec_b, "ordinary").unwrap();
+    assert_eq!(second.status, AdoptionClaimStatus::Active);
+    settle_adoption_claim(&runtime, "run-b", AdoptionClaimStatus::Completed).unwrap();
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    assert_eq!(ledger["claims"].as_array().unwrap().len(), 2, "{ledger}");
+    assert!(ledger["claims"].as_array().unwrap().iter().all(|claim| {
+        claim["status"] == "completed" && claim["runtime"]["sha256"] == runtime.sha256
+    }));
+}
+
+#[test]
+fn adoption_placement_admits_an_owned_home_without_weakening_guards() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-adoption-placement-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let fixture = arm_fixture(
+        root,
+        &state,
+        "adoption",
+        Arm::Baseline,
+        "H",
+        "baseline",
+        &fixtures.launcher,
+        &fixtures.upstream,
+    );
+    let runtime = install_arm(&fixture.request).unwrap();
+    let installation_path = runtime.home.join("harness/installation.json");
+    let config_path = runtime.home.join("config.toml");
+    let installation = fs::read(&installation_path).unwrap();
+    let configuration = fs::read(&config_path).unwrap();
+
+    verify_adoption_placement(&runtime, &[]).unwrap();
+    assert_eq!(fs::read(&installation_path).unwrap(), installation);
+    assert_eq!(fs::read(&config_path).unwrap(), configuration);
+
+    let error =
+        verify_adoption_placement(&runtime, &[runtime.home.parent().unwrap().to_path_buf()])
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("protected experiment allocation"), "{error}");
+
+    let ambient = EnvironmentGuard::capture("CODEX_HOME");
+    ambient.set(&runtime.home);
+    let error = verify_adoption_placement(&runtime, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ambient Codex home"), "{error}");
+    drop(ambient);
+
+    let override_path = runtime.home.join("AGENTS.override.md");
+    fs::write(&override_path, "shadow the prepared instructions\n").unwrap();
+    let error = verify_adoption_placement(&runtime, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("AGENTS override"), "{error}");
+    fs::remove_file(&override_path).unwrap();
+
+    let mut missing = runtime.clone();
+    missing.home = prepare_home(&root.join("homes/never-installed")).unwrap();
+    let error = verify_adoption_placement(&missing, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no retained installation record"), "{error}");
+
+    let error = install_arm(&fixture.request).unwrap_err().to_string();
+    assert!(error.contains("already carries an installation"), "{error}");
+    assert_eq!(fs::read(&installation_path).unwrap(), installation);
+    assert_eq!(fs::read(&config_path).unwrap(), configuration);
+}
+
+/// A refresh moves one owned arm to a newly requested immutable build without
+/// requiring the old mutable source to stay frozen. It preserves native hook
+/// approval and unrelated state, returns a fresh verified receipt, and safely
+/// replays when the caller lost the first receipt after native completion.
+#[test]
+fn refresh_arm_updates_changed_build_and_replays_after_lost_receipt() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-refresh-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let source = kit_source(root, "kit-refresh", "refresh-v1");
+    for relative in [
+        "crates/harness-rtk/Cargo.toml",
+        "crates/harness-rtk/src/main.rs",
+    ] {
+        let path = source.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, relative.as_bytes()).unwrap();
+    }
+    fs::write(
+        source.join("global/rtk-hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "harness-rtk.exe hook",
+                        "timeout": 2
+                    }]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let home = prepare_home(&root.join("homes/refresh")).unwrap();
+    let user_home = prepare_home(&root.join("homes/refresh-user")).unwrap();
+    let dependency_user_home = prepare_home(&root.join("homes/refresh-dep")).unwrap();
+    let vendor = home.join("harness/rtk/packages/0.48.0/rtk.exe");
+    fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+    fs::write(&vendor, b"staged-rtk-for-refresh").unwrap();
+    fs::write(
+        source.join("global/rtk.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": "0.48.0",
+            "executableSha256": build_identity::hash_file(&vendor).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let identity =
+        harness_core::token_workflow_lifecycle::component_source_identity(&source).unwrap();
+    let adapter = home.join(format!("harness/rtk/build/{identity}/harness-rtk.exe"));
+    fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+    fs::write(&adapter, b"staged-adapter-for-refresh").unwrap();
+    fs::write(
+        adapter.parent().unwrap().join("build.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "sourceIdentity": identity,
+            "binarySha256": build_identity::hash_file(&adapter).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let build = fixture_build(
+        &state,
+        "refresh-v1",
+        &source,
+        &fixtures.launcher,
+        "refresh-v1",
+    );
+    let catalogue = root.join("model-catalogue.json");
+    fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    let overlay = root.join("qualified-client.config.toml");
+    fs::write(
+        &overlay,
+        "model_context_window = 65536\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\n",
+    )
+    .unwrap();
+    let private_profile_source = root.join("private/ds.config.toml");
+    fs::create_dir_all(private_profile_source.parent().unwrap()).unwrap();
+    fs::write(
+        &private_profile_source,
+        b"sandbox_mode = \"read-only\"\r\nmodel = \"fixture-glyph-1\"\r\nmodel_reasoning_effort = \"high\"\r\napproval_policy = \"never\"\r\n\r\n[features]\r\ncode_mode = false\r\n",
+    )
+    .unwrap();
+    let request = ArmRequest {
+        variant: prepare_variant(&state, Arm::Baseline, "H", &build).unwrap(),
+        home: home.clone(),
+        user_home,
+        dependency_user_home,
+        upstream: fixtures.upstream.clone(),
+        timeout: Duration::from_secs(60),
+        client: Some(local_client(&catalogue, Some(&overlay))),
+        private_inputs: vec![PrivateInput {
+            source: private_profile_source.clone(),
+            destination: "ds.config.toml".into(),
+        }],
+        protected: Vec::new(),
+    };
+    let previous = install_arm(&request).unwrap();
+    verify_consumption(&previous).unwrap();
+
+    let component = previous
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+        .expect("the token workflow is retained");
+    let hooks = component
+        .links
+        .iter()
+        .find(|link| link.name == "hooks.json")
+        .expect("the retained hook definition is recorded");
+    let definition: serde_json::Value =
+        serde_json::from_slice(&fs::read(&hooks.source).unwrap()).unwrap();
+    assert_eq!(
+        definition["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "harness-rtk.exe hook"
+    );
+    let config_path = previous.configuration.as_ref().unwrap().path.clone();
+    let installed = fs::read(&config_path).unwrap();
+    let installed_text = std::str::from_utf8(&installed).unwrap();
+    let hook_digest = "sha256:1914caf6f4ea4f558efc894660fb096e808a44e7de9061c688d172c05450f135";
+    let hook_key = format!("{}:pre_tool_use:0:0", hooks.destination.to_string_lossy());
+    let approval = format!("\n[hooks.state.'{hook_key}']\ntrusted_hash = \"{hook_digest}\"\n");
+    let marker = "# END codex-harness MCP registrations";
+    let at = installed_text.find(marker).unwrap_or(installed_text.len());
+    let approved = format!(
+        "{}{}{}",
+        &installed_text[..at],
+        approval,
+        &installed_text[at..]
+    );
+    fs::write(&config_path, approved.as_bytes()).unwrap();
+    verify_consumption(&previous).unwrap();
+    // Foreign configuration drift in a declared setting is refused before any
+    // native effect; the accepted configuration is then restored exactly.
+    let drifted = approved.replace(
+        "model_reasoning_effort = \"low\"",
+        "model_reasoning_effort = \"high\"",
+    );
+    assert_ne!(drifted, approved, "the drift changed the configuration");
+    fs::write(&config_path, drifted.as_bytes()).unwrap();
+    let error = refresh_arm(&previous, &request).unwrap_err().to_string();
+    assert!(
+        error.contains("existing config.toml does not match"),
+        "{error}"
+    );
+    fs::write(&config_path, approved.as_bytes()).unwrap();
+    verify_consumption(&previous).unwrap();
+    // The native client may rewrite the retained private profile to LF and
+    // append its own approval for the same hook definition. The receipt keeps
+    // the frozen declared digest; consumption accepts only that exact record.
+    let profile_destination = previous.home.join("ds.config.toml");
+    let frozen_profile = fs::read(&profile_destination).unwrap();
+    let retained_profile = previous
+        .private
+        .iter()
+        .find(|input| input.destination == "ds.config.toml")
+        .expect("the private profile is retained");
+    assert_eq!(
+        retained_profile.sha256,
+        build_identity::hash_bytes(&frozen_profile)
+    );
+    let profile_trust_record = format!(
+        "\n[hooks.state]\n\n[hooks.state.'{hook_key}']\ntrusted_hash = \"{hook_digest}\"\n"
+    );
+    let profile_native = format!(
+        "{}{profile_trust_record}",
+        std::str::from_utf8(&frozen_profile)
+            .unwrap()
+            .replace("\r\n", "\n")
+    );
+    fs::write(&profile_destination, &profile_native).unwrap();
+    verify_consumption(&previous).unwrap();
+    let previous_receipt = serde_json::to_vec(&previous).unwrap();
+    let previous_evidence = previous.installation.runtime_evidence.clone();
+    assert!(previous_evidence.is_dir());
+    let unrelated = home.join("unrelated-auth.json");
+    fs::write(&unrelated, b"unrelated-credentials-stand-in").unwrap();
+
+    // The old source is now stale relative to the old immutable build. That
+    // must not be confused with foreign ownership drift in the installed homes.
+    fs::write(source.join("crates/one/src/lib.rs"), "pub fn two() {}\n").unwrap();
+    assert_eq!(
+        build_identity::check(&previous.variant.build, Some(&source)).status,
+        build_identity::Health::SourceStale
+    );
+    let stale = verify_consumption(&previous).unwrap_err().to_string();
+    assert!(
+        stale.contains("no longer a verified unchanged build"),
+        "{stale}"
+    );
+
+    let refreshed_build = fixture_build(
+        &state,
+        "refresh-v2",
+        &source,
+        &fixtures.launcher,
+        "refresh-v2",
+    );
+    let mut refresh_request = request.clone();
+    refresh_request.variant =
+        prepare_variant(&state, Arm::Baseline, "H", &refreshed_build).unwrap();
+    let refreshed = refresh_arm(&previous, &refresh_request).unwrap();
+    assert_eq!(
+        refreshed.variant.record_sha256,
+        refresh_request.variant.record_sha256
+    );
+    assert_eq!(refreshed.home, previous.home);
+    assert_eq!(refreshed.user_home, previous.user_home);
+    assert_eq!(
+        refreshed.dependency_user_home,
+        previous.dependency_user_home
+    );
+    assert_eq!(
+        fs::canonicalize(&refreshed.launcher.source).unwrap(),
+        fs::canonicalize(refreshed_build.join("codex.exe")).unwrap()
+    );
+    assert_eq!(
+        refreshed.installation.runtime_executable_sha256,
+        previous.upstream_sha256
+    );
+    assert!(refreshed.installation.runtime_evidence.is_dir());
+    assert_ne!(refreshed.installation.runtime_evidence, previous_evidence);
+    verify_consumption(&refreshed).unwrap();
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes(),
+        "the native profile approval survived the refresh"
+    );
+    assert_eq!(
+        refreshed
+            .private
+            .iter()
+            .find(|input| input.destination == "ds.config.toml")
+            .unwrap()
+            .sha256,
+        build_identity::hash_bytes(&frozen_profile),
+        "the fresh receipt retains the declared private identity"
+    );
+    let refreshed_config = fs::read(&config_path).unwrap();
+    let refreshed_text = std::str::from_utf8(&refreshed_config).unwrap();
+    assert!(refreshed_text.contains(&approval), "{refreshed_text}");
+    assert!(refreshed_text.contains("hooks = true"), "{refreshed_text}");
+    let refreshed_definition: serde_json::Value =
+        serde_json::from_slice(&fs::read(&hooks.source).unwrap()).unwrap();
+    assert_eq!(
+        refreshed_definition["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "harness-rtk.exe hook"
+    );
+    assert_eq!(
+        fs::read(&unrelated).unwrap(),
+        b"unrelated-credentials-stand-in"
+    );
+    assert!(
+        previous_evidence.is_dir(),
+        "historical native evidence was lost"
+    );
+    assert_eq!(serde_json::to_vec(&previous).unwrap(), previous_receipt);
+
+    // Simulate the caller dying after native completion but before persisting
+    // the fresh receipt: replay exactly the same old receipt and declaration.
+    let replayed = refresh_arm(&previous, &refresh_request).unwrap();
+    assert_eq!(
+        replayed.variant.record_sha256,
+        refresh_request.variant.record_sha256
+    );
+    assert_eq!(replayed.installation.changed_links, 0);
+    assert_ne!(
+        replayed.installation.runtime_evidence,
+        refreshed.installation.runtime_evidence
+    );
+    assert!(replayed.installation.runtime_evidence.is_dir());
+    verify_consumption(&replayed).unwrap();
+    let replayed_text = fs::read_to_string(&config_path).unwrap();
+    assert!(replayed_text.contains(&approval), "{replayed_text}");
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes()
+    );
+    assert_eq!(serde_json::to_vec(&previous).unwrap(), previous_receipt);
+    assert!(previous_evidence.is_dir());
+    assert!(unrelated.is_file());
+
+    // A persisted fresh receipt must chain: its retained private identity is
+    // still the declared bytes even though the live profile carries native
+    // approval. Select a third immutable build and refresh again.
+    let chained_build = fixture_build(
+        &state,
+        "refresh-v3",
+        &source,
+        &fixtures.launcher,
+        "refresh-v3",
+    );
+    let mut chained_request = refresh_request.clone();
+    chained_request.variant = prepare_variant(&state, Arm::Baseline, "H", &chained_build).unwrap();
+    let chained = refresh_arm(&refreshed, &chained_request).unwrap();
+    assert_eq!(
+        chained.variant.record_sha256,
+        chained_request.variant.record_sha256
+    );
+    verify_consumption(&chained).unwrap();
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes()
+    );
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(&approval)
+    );
+    assert_eq!(
+        chained
+            .private
+            .iter()
+            .find(|input| input.destination == "ds.config.toml")
+            .unwrap()
+            .sha256,
+        build_identity::hash_bytes(&frozen_profile)
+    );
+
+    // A request for another home is refused before touching either home.
+    let foreign_home = prepare_home(&root.join("homes/foreign")).unwrap();
+    let mut mismatched = refresh_request.clone();
+    mismatched.home = foreign_home.clone();
+    let error = refresh_arm(&previous, &mismatched).unwrap_err().to_string();
+    assert!(
+        error.contains("retain the previous arm home exactly"),
+        "{error}"
+    );
+    assert!(!foreign_home.join("harness/installation.json").exists());
+
+    // A changed client identity (here the declared runner material) is refused
+    // before any native effect; the installed record stays exactly as it was.
+    let installation_before_authority = fs::read(home.join("harness/installation.json")).unwrap();
+    let mut changed_client = local_client(&catalogue, Some(&overlay));
+    changed_client.runner.identity.weights = Some("sha256:different-weights".into());
+    let mut changed_authority = refresh_request.clone();
+    changed_authority.client = Some(changed_client);
+    let error = refresh_arm(&previous, &changed_authority)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("changes the approved client identity"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(home.join("harness/installation.json")).unwrap(),
+        installation_before_authority
+    );
+
+    // A native update that completes before its post-update component check
+    // fails must name the stage, cause and native recovery status instead of
+    // returning a success receipt. Repeating the same request after restoring
+    // the interrupted component recovers through the same native owner.
+    let chained_receipt = serde_json::to_vec(&chained).unwrap();
+    let adapter_bytes = fs::read(&adapter).unwrap();
+    fs::remove_file(&adapter).unwrap();
+    let recovering_build = fixture_build(
+        &state,
+        "refresh-v4",
+        &source,
+        &fixtures.launcher,
+        "refresh-v4",
+    );
+    let mut recovering_request = chained_request.clone();
+    recovering_request.variant =
+        prepare_variant(&state, Arm::Baseline, "H", &recovering_build).unwrap();
+    let failed = refresh_arm(&chained, &recovering_request)
+        .unwrap_err()
+        .to_string();
+    assert!(failed.contains("native update completed"), "{failed}");
+    assert!(
+        failed.contains("token workflow component was not retained"),
+        "{failed}"
+    );
+    assert!(failed.contains("Native recovery: status="), "{failed}");
+    assert_eq!(serde_json::to_vec(&chained).unwrap(), chained_receipt);
+    fs::write(&adapter, &adapter_bytes).unwrap();
+    let recovered = refresh_arm(&chained, &recovering_request).unwrap();
+    assert_eq!(
+        recovered.variant.record_sha256,
+        recovering_request.variant.record_sha256
+    );
+    assert_eq!(
+        recovered.installation.changed_links, 0,
+        "the failed call must not be mislabeled as having no native effect"
+    );
+    verify_consumption(&recovered).unwrap();
+    assert_eq!(
+        fs::read(&profile_destination).unwrap(),
+        profile_native.as_bytes()
+    );
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(&approval)
+    );
+
+    // Foreign drift in an owned link is rejected by the native ownership check
+    // before the refresh can publish or verify anything.
+    let installation = home.join("harness/installation.json");
+    let installation_bytes = fs::read(&installation).unwrap();
+    let configuration_bytes = fs::read(&config_path).unwrap();
+    let replayed_evidence = replayed.installation.runtime_evidence.clone();
+    let launcher = home.join("harness/bin/codex.exe");
+    fs::remove_file(&launcher).unwrap();
+    fs::write(&launcher, b"foreign-launcher").unwrap();
+    let error = refresh_arm(&previous, &refresh_request)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refresh preflight"), "{error}");
+    assert_eq!(fs::read(&installation).unwrap(), installation_bytes);
+    assert_eq!(fs::read(&config_path).unwrap(), configuration_bytes);
+    assert!(replayed_evidence.is_dir());
+    assert_eq!(serde_json::to_vec(&previous).unwrap(), previous_receipt);
 }

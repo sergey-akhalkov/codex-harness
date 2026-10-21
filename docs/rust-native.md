@@ -40,11 +40,19 @@ The retired script interface and its native equivalent. Selectors, preview
 
 ## Prerequisites and checks
 
-Windows x64, Rust MSVC toolchain (minimum Rust 1.98, currently verified with
-1.98.1), Cargo, the MSVC C++ linker and Windows SDK. Workspace dependencies
-are locked in the root
-`Cargo.lock`. The RTK adapter is a workspace member with no independent
-lockfile. Use the existing toolchain; Check does not install packages.
+Windows x64, Rust MSVC toolchain (workspace MSRV Rust 1.98; the tracked
+`rust-toolchain.toml` pins the supported build toolchain to 1.98.1 with
+`rustfmt` and `clippy`), Cargo, the MSVC C++ linker and Windows SDK. Workspace
+dependencies are locked in the root `Cargo.lock`. The RTK adapter is a
+workspace member with no independent lockfile. Use the existing pinned
+toolchain; Check does not install packages.
+
+The pin applies to every checkout, including sibling worktrees and fresh
+clones. Rustup selects it for ordinary `rustc` and `cargo` commands without a
+`+TOOLCHAIN` argument or a `RUSTUP_TOOLCHAIN` environment variable. A
+machine-local rustup directory override takes precedence, so no checkout needs
+one. The workspace `rust-version = "1.98"` remains the minimum language and
+library contract; it is not a second build selector.
 
 ```powershell
 codex-harness heavy -- cargo build --workspace --locked --jobs 2
@@ -343,6 +351,265 @@ output choice, not an ambient `CARGO_TARGET_DIR` override for native build
 identity. Custom compiler wrappers and ambient Rust build overrides are
 rejected before creating build state.
 
+## Accepted-task self-reflection
+
+The installed harness provides sequential executor and lead self-reflection
+after ordinary task acceptance. Both role skills are delivered globally.
+`self_reflection_enabled = true` in the kit's `global/orchestration.toml`
+automatically prepares the consuming project's lifecycle when ordinary interactive
+`codex` starts, preserving native model, profile, arguments and session selection.
+No separate activation command is needed. The host also observes a
+false-to-true change while running. Inspect the resulting state with:
+
+```powershell
+codex-harness delivery-improvement status --project CHECKOUT
+```
+
+### Ordinary accepted closure ownership and recovery
+
+`executor accept` closes as the authenticated approving lead. Before writing
+acceptance metadata, an open task assigned to another actor is conditionally
+transferred to that lead with `bd update ... --if-assignee ... --if-status ...`.
+The guarded update never uses `--force`; if the claim changed, acceptance fails
+before writing metadata. A task that is already unassigned or assigned to the
+lead needs no ownership write. A successful close is idempotent: replaying the
+same task and run returns `duplicate: true` with the recorded acceptance.
+
+An open task that already carries acceptance metadata is always refused
+automatically. A reopen, cancellation, mismatched metadata and an interrupted
+close after the metadata write can share that visible state, so acceptance
+neither rewrites nor guesses. Inspect `bd show TASK` and
+`bd history TASK --events`. If that inspection verifies an interrupted close,
+the actual approving lead can use the existing guarded board commands to finish
+it, then replay validation. Use the status returned by `bd show` for
+`OBSERVED_STATUS` (it need not be `open`), and pass `--actor LEAD` on each
+command without changing the environment:
+
+```powershell
+bd update TASK --assignee LEAD --if-assignee OLD_ASSIGNEE --if-status OBSERVED_STATUS --actor LEAD --json
+bd close TASK --reason accepted --actor LEAD --json
+codex-harness executor accept TASK --run RECORDED_RUN --project CHECKOUT
+```
+
+The replay must report `status: accepted`, `duplicate: true`, and the unchanged
+acceptance identity. Do not remove or replace metadata, delete history, or use
+`--force`. If history shows a reopen or cancellation, use a fresh task (or an
+explicitly reviewed board correction) rather than treating old work as accepted.
+
+Automatic preparation resolves the kit, configured profiles, roles and registered
+lead address before activating the board's native event journal at its current
+boundary. Ordinary acceptance also prepares the lifecycle before its first close,
+so an acceptance arriving before the host poll is not lost. Repeated preparation
+keeps the existing checkpoint and retained work. The existing `lead start` host
+owns the model-free consumer and ends its contained processes when the lead exits.
+A different lead can take over only after the previous owner's exact process is
+verified inactive; live ownership and unresolved recovery remain protected.
+Automatic reflection applies only to the exact current session and its newly
+accepted work. Finished sessions are never reopened or swept; their historical
+acceptances and retained pending stages cannot trigger new model calls. Explicit
+native resume selects the current conversation without replaying its history.
+The current session's paused stages can continue after re-enabling the flag.
+Status reports the native journal
+checkpoint, pending work, recovery state and the controller's verified process
+liveness and log location. The explicit `enable` command remains an idempotent
+compatibility operation. Administrative `disable` stops the retained lifecycle
+until the next host or flag transition prepares it; use the flag for a persistent
+off setting. Both preserve results and journal configuration, including other
+consumers' use.
+
+`global/orchestration.toml` also carries the default-on
+`self_reflection_enabled` permission. The effective value is read from the
+declared source before each new reflection stage, so a running host observes an
+on-to-off change without restart and the next model stage stops. An already
+running stage may finish and retain its result. `false` blocks new executor and
+lead model calls through manual execution, the owned process, continuation and
+the internal stage runner while ordinary lead, executor and acceptance work
+remains available. A true value activates the supported host without discarding
+results, pending-stage identities, usage or recovery. Closures observed during
+the disabled interval advance the existing event checkpoint without admission,
+so enabling later does not replay or sweep them. Each new ordinary acceptance
+records the effective permission at acceptance time. Without `--source`, it
+reads the recognized kit checkout or the installed kit source recorded by the
+normal installation; the consumer project remains the pool-provenance source
+and is not retargeted. Default-true bindings omit the field on serialization,
+preserving legacy acceptance metadata, while false remains explicit. Accepting
+while false still succeeds and reports `selfReflectionEnabled: false` with
+`automaticTrigger: false`; that closure remains ineligible even if the flag is
+re-enabled before the first poll, so the outcome does not depend on a background
+poll observing the disabled interval. The event evaluator consumes it as its
+normal ignored result; no new refusal or persisted-state variant is added.
+While false, `process` still requires the managed lead and active binding
+before advancing the retained checkpoint, and refuses a foreign lead without
+changing checkpoint or records. Status reports
+`selfReflectionEnabled`, `configPath`, `modelWork` and `modelWorkReason`; enable
+refuses before lifecycle mutation while the value is false. The shipped source
+sets `self_reflection_enabled = true`, and an omitted key also defaults to true
+for compatibility. A non-boolean value fails before model work.
+
+Status distinguishes pending model stages from unfinished work and retained,
+undelivered synthesis. `process` also reconciles an already submitted stage or
+delivery; an empty new-stage queue does not mean that the lead received the
+result. The owned consumer observes queued delivery without repeating either
+reflection. An indeterminate or failed delivery stops automatic processing and
+keeps the existing receipt for explicit reconciliation after its cause is resolved.
+
+`process` may reopen one accepted stage left `Unknown` only when its native
+artifact still names an exact submitted fork and turn and the recorded
+task/run/source/role/model identities still match. It resumes that fork to
+observe the existing turn, issues no new fork or `turn/start`, and re-reads the
+exact turn's rollout accounting. A pre-turn known zero in an older artifact is
+not model cost: measured nonzero usage replaces it, while unavailable usage
+stays explicitly unknown. Reconciliation preserves attempts, observed work,
+cumulative costs and finite limits, so exhausted limits continue to block
+dependent work.
+
+An exact retained native turn already marked `interrupted` with known token
+usage and observed work transitions model-free to the existing budget pause only
+when its settled cost exceeds a current finite stage or record token allowance.
+The native terminal evidence stays unchanged, repeat processing creates no fork
+or turn, and the submitted usage and work are not charged twice. A known
+interruption below both token allowances stays `Unknown` without an automatic
+retry or dependent lead stage. After an exhausted-cost pause, the recorded
+explicit `continue` command may authorize one fresh finite attempt under raised
+allowances while preserving prior attempts and costs.
+
+Recovery is explicit and model-free. After inspecting the reported gap,
+`recover --resolution resume-retained --project CHECKOUT` continues from a
+recorded retained journal floor. For a reconciled source or unjournaled gap,
+use `recover --resolution rebaseline-current --evidence TEXT --project CHECKOUT`;
+the existing owner verifies retained task identities and records the explanation
+before moving to the current head. Neither command retries an unknown model
+outcome. Both require the lifecycle's own live managed lead. After disabling,
+`restore-journal --project CHECKOUT` removes only a setting this lifecycle
+enabled; a preexisting enabled journal remains untouched. Retained results and
+checkpoints survive restoration.
+
+Budget pauses retain the exact acceptance, stage, attempts, measured work and
+cumulative costs. Status supplies the `delivery-improvement continue` command
+for that pause. Run it from the lifecycle's live managed lead with the required
+allowance increases; unchanged limits, a different stage or an already consumed
+delivery refuse before another model turn. Stage and record limits cover
+attempts, turns, tokens, investigations and supplied-context bytes.
+
+When retained native evidence proves that the pause happened before any turn on
+an existing fork, with zero model usage, no investigations, one already-charged
+source context and unchanged role/routing identity, `continue` re-admits that
+exact fork. It starts no replacement fork, preserves the attempt count and
+charges the source context only once. Post-turn or otherwise unproven pauses
+still consume a new finite attempt, and completed, submitted or unknown
+outcomes are never replayed.
+
+If status reports unreconciled usage or work, continuation additionally requires
+the measured missing additions through the paired `--reconcile-usage-turns` /
+`--reconcile-usage-tokens` or `--reconcile-investigations` /
+`--reconcile-context-bytes` options. Do not estimate these values or substitute
+zero for unavailable evidence. Already reconciled amounts cannot be charged
+again. This command does not clear an unknown model outcome or reset prior costs.
+
+Only an eligible accepted ordinary task can start the two visible reflection
+forks. Their exact task, run, source turns, result references, role revisions,
+profiles and return address come from the existing owners. The normal lead
+acceptance producer binds the accepted work; callers must not invent those
+identities to make a task eligible. `delivery-improvement process --project
+CHECKOUT` processes one retained eligible acceptance through the same owner; it
+does not create acceptance. After correcting a native `thread/fork`
+configuration-load rejection, the same live managed lead can run this command
+to continue the retained acceptance. Recovery requires the acknowledged
+`-32600` rejection and evidence that no fork, turn or model work existed.
+It preserves the failed attempt and its artifacts, reconciles only the proven
+zero model usage and work, and consumes the next finite attempt. Automatic
+processing never retries this rejection. Transport failures, incomplete
+evidence and already submitted turns do not qualify for this recovery.
+Other unknown outcomes and source/binding drift require
+reconciliation rather than repeated model calls. An ordinary verified core
+update may retarget the installed `harness/bin/codex.exe` link between the
+rejection and recovery. The accepted `process` route may select that launcher
+in memory only when schema-2 installation ownership, recorded link identities,
+native command targets and build artifact integrity verify for the same
+`CODEX_HOME`; `chain.json` and accepted provenance remain byte-identical. A raw
+request, an arbitrary launcher, or any source, run, role, routing, reference or
+ownership drift still refuses before a fork or accounting change. The
+two reflection skills live under `.agents/skills` and each is the authoritative
+instruction source for its matching role in `global/roles.toml`. The native
+role resolver consumes that same file before model work; discovery does not
+maintain a second copy of its prompt. Their instruction bodies preserve the
+texts exercised by the real sequential fork-and-delivery acceptance. This
+establishes operation, not a comparative benefit or savings claim.
+
+A retained lifecycle can move to a different managed lead after its original
+owner exits. Run this from the live successor conversation:
+
+```powershell
+codex-harness delivery-improvement succeed --project CHECKOUT
+```
+
+The command derives both identities from existing owners: the retained lead and
+its exact app-server process identity come from the lifecycle, and the successor
+comes from the current managed-lead registration. Neither recipient nor old
+owner is caller-supplied. Activation and the ordinary `process`, `continue` and
+`recover` routes retain the exact current managed-lead process identity (pid,
+creation time and program) as lifecycle metadata; accepted provenance is never
+rewritten.
+
+Succession requires that exact retained process to be positively observed as
+exited. A missing registration alone is not exit evidence because normal
+managed-lead shutdown removes it. A live retained process, unreadable,
+malformed, mismatched or process-less registration, missing retained proof, a
+missing or stale successor registration, a stopped lifecycle, pending recovery,
+a changed source scope or branch, and a call from a lead already retired by
+succession all refuse without changing state. Repeating the command as the
+current owner is an idempotent no-op: it writes nothing when the observed
+process identity is unchanged, and refreshes stale proof without transferring
+ownership after a same-conversation restart. `succeed` only transfers control;
+it starts no model work and performs no delivery.
+
+Transfer changes only the lifecycle revision and current control/delivery
+ownership. Accepted provenance (task, run, acceptance identity and the original
+executor/lead source turns), stage artifacts, attempts, cumulative costs,
+purpose and activation boundary stay intact. A later `process` therefore reuses
+a retained executor result, runs only the remaining lead stage once, and
+delivers once to the successor's registered endpoint. Before that continuation
+the existing owners revalidate source scope, purpose, stage routing, role
+revision, profile, model, provider, effort and guidance; drift refuses before a
+new fork. An unknown or indeterminate delivery stays retained for explicit
+reconciliation and is never resent merely because ownership moved. Completed
+effects remain recorded once, and the retired owner fails closed if it returns.
+The successor's conversation is current delivery ownership, never a substitute
+for the immutable accepted source conversation.
+
+To recover, stop or exit the old managed lead and verify its process has ended,
+start or resume the successor so its live `CODEX_THREAD_ID` and process identity
+are registered, then rerun `succeed --project CHECKOUT`. For a legacy lifecycle
+without retained proof, or an unverifiable retained identity, start or resume
+that exact old managed lead with `codex-harness lead start --session THREAD`, run
+`delivery-improvement enable --project CHECKOUT` from it while registered to
+refresh the proof, exit it normally, then retry succession from the successor.
+Do not fabricate or delete identity evidence. Reconcile any reported recovery
+state or retained unknown stage through the existing exact-stage recovery flow
+before attempting succession.
+
+The focused model-free succession checks use synthetic native fixtures and
+loopback endpoints; they do not call a model or establish real-work or installed
+acceptance:
+
+```powershell
+codex-harness heavy -- cargo test -p harness-core --test integration --locked delivery_reflection::succession -- --nocapture --test-threads=1
+codex-harness heavy -- cargo test -p codex-harness --test self_reflection_forks --locked succession:: -- --nocapture --test-threads=1
+```
+
+The native branch-recovery check additionally needs an existing Dolt binary;
+set `HARNESS_DOLT_EXE` to its absolute path before running:
+
+```powershell
+codex-harness heavy -- cargo test -p harness-core --test integration --locked --jobs 1 delivery_reflection::native_branch::native_branch_change_pauses_and_restoration_preserves_pending_acceptance -- --ignored --exact --nocapture --test-threads=1
+```
+
+This opt-in check creates its own temporary board and loopback server, changes
+the actual native database branch, checks the recovery pause and retained
+acceptance, then restores the branch and verifies no duplicate trigger. The
+server is stopped on completion or test failure. It requires no model calls
+and does not inspect or alter an existing project board.
+
 ## Heavy-command budget
 
 `codex-harness heavy -- PROGRAM ARGS` runs one batch command and its descendants
@@ -619,6 +886,40 @@ Dispatch exit zero means the request was accepted; the receipt records completio
 failure or interruption. Model-free fixtures cover dispatch, resume, role mismatch,
 stopping and child failure; measured workflow composition and real-agent equivalence
 require their own acceptance before this route can supply comparison evidence.
+
+### Managed lead host lifetime
+
+`codex-harness lead start` is persistent by default: its native frontend owns
+the lifetime, and the app-server stays addressable between turns for automatic
+reflection delivery. A finite assignment uses the same command with `--once`
+and exactly one of `--exec PROMPT` or `--exec-file FILE`:
+
+```powershell
+codex-harness lead start --source CHECKOUT --codex-home DIRECTORY --exec PROMPT --once
+```
+
+The prompt is submitted only after attachment. The finite host records the
+turn identity returned by that submission and observes that exact turn's
+terminal event; a resumed thread's history and an idle thread are not a new
+result. A completed turn with a nonempty final assistant message is printed,
+then the existing cleanup owner closes the frontend, retires the endpoint and
+ends the app-server this host owns. Failure, interruption, a protocol defect,
+empty or missing output, or a cleanup error exits nonzero; retained partial
+output is labeled as non-success. A missing `--once` prompt is refused before
+any process or endpoint starts.
+
+The model-free `executor_control` fixture covers the exact completed and failed
+turns, the missing-prompt refusal, retained output and owned-resource cleanup.
+It also confirms that the default path stays addressable after a completed turn
+until its frontend ends. Fixture success exercises the native app-server
+protocol and process ownership, not a real model turn or a globally installed
+finite session; those require separate installed acceptance.
+
+```powershell
+codex-harness heavy -- cargo test -p codex-harness --test executor_control a_finite_managed_lead_closes_its_owned_surface_and_endpoint_after_the_assigned_turn --locked -- --nocapture --test-threads=1
+codex-harness heavy -- cargo test -p codex-harness --test executor_control a_finite_managed_lead_reports_a_failed_assigned_turn_and_retires_its_owned_state --locked -- --nocapture --test-threads=1
+codex-harness heavy -- cargo test -p codex-harness --test executor_control the_default_managed_lead_stays_addressable_after_a_turn_until_its_frontend_ends --locked -- --nocapture --test-threads=1
+```
 
 ### Native worktree tool suppression
 
@@ -997,8 +1298,47 @@ codex-harness improve status --run DIRECTORY [--json]
 codex-harness improve select --run DIRECTORY --variant baseline|candidate
 codex-harness improve stop   --run DIRECTORY [--reason TEXT]
 codex-harness improve resume --run DIRECTORY
+codex-harness improve review --prepare --review DIRECTORY --declaration FILE
+codex-harness improve review --resume  --review DIRECTORY [--declaration FILE]
 codex-harness improve prepare-runtime --source DIRECTORY --state DIRECTORY --output FILE
 ```
+
+`review` consumes one retained ordinary completion without a qualification
+run and without prewritten action sidecars. Its declaration is the existing
+schema-1 `OrdinaryReviewDeclaration`: `schema`, `review`, `task`,
+`task_prompt`, `completion` (`codex_home`, `run_generation`,
+`executor_profile`), `lead_session`, `action_evidence_root` and
+`semantic_review`. On first preparation it resolves the recorded pool slot's
+native receipt through the existing pool state resolver and requires its
+generation, slot, owner, session and completed turn to match the retained
+completion before copying the bounded visible stream into the ordinary-owned
+evidence root. The locator rule is fixed: the sidecar is
+`<action_evidence_root>/<run_generation>.json`, the retained stream is
+`<action_evidence_root>/<run_generation>.jsonl`, the sidecar attempt is the
+run generation and its role is `executor`. A retained sidecar pair is
+immutable; repeated preparation never rereads a possibly reused pool slot. A
+lost, mismatched, live, truncated or otherwise partial stream remains an
+explicit gap or refusal before any reviewer dispatch. `--resume` reuses the
+frozen declaration, packet and captured evidence.
+
+To keep an already prepared reviewer's homes, declare optional
+`reviewer_runtime` as the exact prior native `ArmRuntime` file identity
+(`path` and `sha256`). Preparation updates those same homes to the explicitly
+requested build through the existing installation owner and writes a new
+runtime receipt under the new review directory. It preserves native hook
+approval and unrelated settings; it never edits the prior receipt or cursor.
+The frozen `semantic_review.runtime.native_config` remains required, and the
+installed configuration must also satisfy the native read-only reviewer
+contract. Refresh preserves the installed configuration rather than copying
+the frozen file over it. The ordinary and reviewer homes must stay separate.
+Qualification's `runtime.reuse` is a different, immutable adoption contract
+and is refused here instead of silently selecting a fresh home.
+
+An interrupted recorded refresh can resume before the first reviewer dispatch,
+including when the native update completed before the new receipt was saved.
+A missing receipt after preparation or dispatch remains a refusal; it never
+authorizes another installation or a repeated review. Keep the prior runtime,
+the frozen declaration and the new review directory for recovery.
 
 `start` validates the strict schema-1 run inputs (project, board, OpenSpec
 change, base revision, writable scope, runner profile, evidence root, oracle,
@@ -1027,6 +1367,182 @@ work. A run that declares the explicit comparison inputs additionally prepares
 and drives the sequential measured pair (baseline before candidate, one
 measured conversation at a time); without them the run stops at
 `candidate-ready`.
+
+The `baseline_qualification` input prepares one ordinary control workflow
+separately from the two-arm comparison. It freezes the task instructions as
+`task_prompt: {path, sha256}` and takes exactly one implementation runtime
+route: the existing local `client`, or `native_config: {path, sha256}` with
+explicit lead and executor profiles. Native configuration is copied only into
+a fresh owned home before installation; explicitly named `private_inputs`
+use the runtime owner's existing validation and identity records. A changed
+task, configuration or participant binding refuses further dispatch.
+
+`improve start --prepare-only --run DIRECTORY --spec FILE` is the model-free
+boundary for a `baseline_qualification` run. It is valid only in single-step
+supervision: omitting `--supervision` defaults to `once` for this mode, while
+`--supervision continuous` is refused before the run directory or any effect is
+created. By default it installs and verifies the ordinary runtime and any declared
+separate reviewer runtime, freezes the task copy, prepares the independent
+oracle workspace, persists the unchanged gates and participant bindings,
+reports the exact homes, checkout, task and workspace plus the resume command,
+and dispatches no model attempt. `improve resume` then continues the same run
+through the existing lead/executor/reviewer path. Preparation is not acceptance
+and does not trust native hooks: each isolated home may still show its native
+first-use or hook-consent prompt on the first actual launch.
+
+If the independent checker cannot acquire its shared heavy-command slot before
+the declared deadline, qualification remains incomplete. After capacity is
+available, `improve resume --run DIRECTORY` makes at most one new attempt when
+the retained native evidence proves that the previous checker never started.
+It preserves the prior admission wait and its costs, the frozen inputs and
+completed model turns. Recovery of an older mistaken rejection also retains
+the exact old row in `row-unstarted.json`; the replacement row names the new
+checker result. A checker that actually ran and failed remains a final failure.
+An unknown start refuses replay and requires recovery of the original checker
+evidence; neither an empty run list nor a missing result proves nonexecution.
+
+A subsequent qualification may instead adopt completed native runtimes at their
+existing home paths. Add `reuse` to each runtime declaration:
+
+```json
+"reuse": {
+  "runtime": {"path": "C:/runs/completed/baseline-qualification/runtime.json", "sha256": "<exact digest>"},
+  "cursor": {"path": "C:/runs/completed/cursor.json", "sha256": "<exact digest>"}
+}
+```
+
+When an independent reviewer is declared, both roles must adopt their own
+runtime receipts; they may name the same completed origin cursor. The origin
+must have a completed workflow, retained acceptance row and no in-flight or
+unknown attempts. Frozen non-reuse runtime inputs, role, model and effort must
+match. Preparation verifies the retained configuration, native hook trust and
+workspace provenance through the existing consumption owner. It does not
+install, connect, copy configuration or write hook approval. Task checkouts,
+reports, oracle artifacts and conversations remain fresh for the new run.
+
+A durable exclusive claim beside each runtime receipt prevents concurrent
+adoption. The same run can recover its claim after interruption or explicit
+stop; another run cannot take an active claim because time elapsed. Completion
+or `improve stop` settles the claim without retiring the origin homes or losing
+their evidence. A failed preparation after claiming is recoverable through the
+same run or explicit stop. Changed runtime inputs require fresh preparation.
+
+`--prepare-only` still verifies adoption without model work. To let the normal
+controller advance a new qualification between participant stages, use
+`improve start --supervision continuous --run DIRECTORY --spec FILE` without
+`--prepare-only`. Each model conversation retains its native visible surface;
+the controller preserves ordinary review and independent acceptance gates.
+
+The optional `semantic_review` declaration adds one independent read-only
+reviewer after the ordinary lead `ACCEPT` and the retained final executor
+result. It names its own frozen native runtime and profile; the configuration
+must declare `sandbox_mode = "read-only"` and `approval_policy = "never"`,
+and the selected profile must resolve an explicit model and reasoning effort.
+It also takes an absolute frozen `criteria: {path, sha256}` file, up to 32
+declared relative `sources` reproduced at the submitted revision, and a
+finite `max_corrections` of 0 or 1. Omitting the declaration preserves the
+program-only route and its serialized digest. The reviewer uses its own fresh
+home unless its completed runtime is explicitly adopted as above; the implementation runtime stays writable and shared user
+configuration is never changed. The frozen packet contains the actual task
+prompt, the submitted result, the declared sources, bounded participant/action
+evidence and a manifest with the exact revisions, hashes and physical line
+counts. Expected answers, sibling outcomes and arm identity are withheld, and
+packet content is data rather than authority. The controller snapshots each
+completed participant turn's bounded visible stream before a pool slot can be
+reused and keeps one explicit coverage record per turn. Missing, truncated,
+malformed or unavailable action coverage makes the packet incomplete and
+refuses reviewer dispatch or acceptance; it is never evidence of no effects.
+Declared sources keep their repository-relative packet path when it is
+ordinary. A source under `global/` or at a packet-owned path (`task.txt`,
+`criteria.txt`, `submission.txt`, `actions.json` or `manifest.json`) is
+written under `semantic-review-evidence/` or, when a declared path already
+uses that prefix, the next `semantic-review-evidence-<number>/`. The original
+relative path remains the suffix, so the manifest and reviewer assignment name
+the exact physical evidence path while `global/orchestration.toml` stays
+reviewer configuration. Noncolliding declarations retain their existing
+packet paths and manifest identities.
+Every retained action is bound to its participant attempt, exact session and
+completed native turn. A nonempty action turn that disagrees with the stream's
+terminal turn is a coverage gap, not a retargeted action; only an item that
+truly omits a turn id inherits the exact completed turn. Command, file,
+web-search and MCP actions keep their bounded visible outcome, including MCP
+result content and an error or `result.isError` indication. A completed status
+alone is not a success verdict, and a visible tool-call shape whose outcome
+this stage cannot retain is an explicit gap rather than a bare type.
+A minimal synthetic declaration
+(paths and digests are placeholders):
+
+```json
+{
+  "schema": 1,
+  "runtime": {
+    "state": "D:/qualification/state",
+    "build": "D:/qualification/state/builds/reviewer",
+    "label": "reviewer-runtime",
+    "upstream": "D:/qualification/bin/codex.exe",
+    "native_config": {"path": "D:/qualification/reviewer.toml", "sha256": "<sha256>"},
+    "private_inputs": []
+  },
+  "profile": "ds",
+  "criteria": {"path": "D:/qualification/criteria.txt", "sha256": "<sha256>"},
+  "sources": ["solution.txt"],
+  "max_corrections": 1
+}
+```
+
+The reviewer returns only `{"run_id": ..., "findings": [...],
+"unresolved_issues": [...]}`. Each finding names a declared path and a
+physical newline line; its `evidence` must contain a declared `path:line` (or
+`path:first-last`) location. A paraphrased or omission-based observation is
+valid without quoting the line. `findings` demonstrate material task
+failures and imply rejection; `unresolved_issues` are obstacles to judging
+and leave the judgment unknown. The parent validates the document identity,
+schema, run id, locations, evidence binding, packet hashes and native
+completion; it derives no acceptance from reviewer prose. One malformed-output
+defect may use the declared same-reviewer correction, which retains both
+attempts and costs and gives no expected-verdict hint.
+
+The workflow opens a visible lead frame, dispatches its structured assignment,
+and continues the same lead for review. A `CORRECT` decision resumes the same
+executor within the declared correction allowance, then returns to that lead
+for another review. Each turn's exact native generation and result are
+retained before dependent work; `resume` does not repeat settled turns. Only
+clean committed changes within the frozen scope reach review. The independent
+task oracle then checks that revision in a fresh owned copy, and the reviewer
+judges the frozen task, submitted result, declared sources and bounded action
+evidence. Final acceptance is the conjunction of lead approval, the passing
+independent program check and a successful semantic judgment. A substantive
+semantic rejection records a complete row with `accepted=false`; `unknown` or
+an unresolved malformed output writes no row and refuses completion. A
+pre-existing output report or changes to the oracle copy refuse further
+effects and preserve those files. An interrupted check with no retained
+outcome remains unknown instead of being automatically repeated; recovery
+requires the original check evidence.
+
+The retained row counts each exact native participant session once, including
+lead, executor, review, correction and reviewer turns. Reviewer usage is
+discovered in the reviewer's own installed home and included in the same
+usage totals, so a declared reviewer is never free. Missing or conflicting
+native usage prevents a complete row instead of becoming zero cost. Repeating
+`resume` reuses the retained row, checks and settled reviewer judgment. A
+native completion or restart settles the same reviewer conversation and does
+not dispatch a duplicate turn.
+
+The ordinary operator entry point is:
+
+```powershell
+codex-harness improve start --run D:/qualification/run --spec D:/qualification/spec.json --supervision once
+codex-harness improve resume --run D:/qualification/run
+```
+
+`start` prepares the run and dispatches the lead frame; each `resume` settles
+the retained terminal turn and dispatches the next declared participant. The
+completed run retains `baseline-qualification/row.json` under the run
+directory, and later `resume` calls reuse that row. This is an ordinary control
+observation only: it records one baseline workflow and refuses candidate
+reflection calls, comparison verdicts or adoption. Broader real-task quality
+still requires the calibrated reviewer inputs and frozen task supplied by the
+consumer.
 
 `select` activates an already prepared baseline or candidate runtime through
 the shared build-selection owner, records the identity it actually consumed
@@ -1798,6 +2314,20 @@ new installed-consumer checks belong to the change that needs them.
 
 `codex-harness.exe outcome-report --input <private-json> [--markdown]` formats
 local attempt accounting without executing anything.
+To freeze an existing comparison policy and evaluate a retained report through
+the same policy owner, use:
+
+```powershell
+codex-harness outcome-report --declare-policy policy.json > declaration.json
+codex-harness outcome-report --input report.json --policy declaration.json
+```
+
+The second command returns the policy evaluation, rebuilding derived accounting
+from the retained attempts and preserving valid corroboration. Neither command
+dispatches a model or publishes an adoption decision. The declaration's digest
+checks its contents; the experiment owner must establish that it was frozen
+before the candidate ran and that the supplied observations are genuine.
+
 `delegation-usage` reads explicit local telemetry without model calls.
 `token-audit` scans rollout sessions through the shared reader with
 `cargo test --locked -p token-audit --jobs 1 -- --test-threads=1`; its

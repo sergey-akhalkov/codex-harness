@@ -387,6 +387,11 @@ fn rust_session_isolates_two_owned_projects_and_preserves_shared_config() {
             json!({"relative_path":"src/lib.rs"}),
         );
         assert!(overview.contains("shared") && overview.contains("local_use"));
+        let startup = fs::read_to_string(session.stderr_path()).unwrap();
+        assert!(
+            startup.contains("'checkOnSave': False"),
+            "the adopted Rust server must consume the automatic-check opt-out: {startup}"
+        );
     }
     let read_a = tool_text(
         &mut alpha,

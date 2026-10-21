@@ -851,7 +851,7 @@ mod windows {
         }
 
         pub fn spawn_suspended(&self, command: &CommandSpec) -> io::Result<SuspendedProcess> {
-            spawn_suspended_in(&self.owning_jobs(), command, None)
+            spawn_suspended_in(&self.owning_jobs(), command, None, false)
         }
 
         /// Outermost job for payload creation. The shared account budget
@@ -870,7 +870,7 @@ mod windows {
             command: &CommandSpec,
             pseudoconsole: isize,
         ) -> io::Result<OwnedProcess> {
-            spawn_suspended_in(&self.owning_jobs(), command, Some(pseudoconsole))?.resume()
+            spawn_suspended_in(&self.owning_jobs(), command, Some(pseudoconsole), false)?.resume()
         }
     }
 
@@ -883,6 +883,7 @@ mod windows {
         jobs: &[HANDLE],
         command: &CommandSpec,
         pseudoconsole: Option<isize>,
+        breakaway: bool,
     ) -> io::Result<SuspendedProcess> {
         if jobs.is_empty() {
             return Err(invalid("process creation requires at least one owning job"));
@@ -1030,6 +1031,11 @@ mod windows {
                 i32::from(streams.is_some() || command.inherit_console),
                 CREATE_SUSPENDED
                     | EXTENDED_STARTUPINFO_PRESENT
+                    | if breakaway {
+                        CREATE_BREAKAWAY_FROM_JOB
+                    } else {
+                        0
+                    }
                     | if console_title.is_some() {
                         CREATE_NEW_CONSOLE
                     } else if command.inherit_console || pseudoconsole.is_some() {
@@ -1075,6 +1081,42 @@ mod windows {
             }
         }
         Ok(suspended)
+    }
+
+    /// Whether the calling process's immediate job grants explicit breakaway.
+    /// A shared account job may not be nested below two different caller
+    /// branches. When the caller permits it, the aggregate path escapes only
+    /// that branch; the payload's complete ordered job list still supplies the
+    /// shared CPU, aggregate and fresh lifecycle jobs. Silent breakaway needs
+    /// no flag because the kernel already excludes its children from the job.
+    fn caller_allows_breakaway() -> io::Result<bool> {
+        let mut in_job = 0;
+        if unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } == 0 {
+            return Err(stage_note(
+                "caller job membership query",
+                io::Error::last_os_error(),
+            ));
+        }
+        if in_job == 0 {
+            return Ok(false);
+        }
+        let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        if unsafe {
+            QueryInformationJobObject(
+                null_mut(),
+                JobObjectExtendedLimitInformation,
+                &mut extended as *mut _ as *mut std::ffi::c_void,
+                size_of_val(&extended) as u32,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(stage_note(
+                "caller job breakaway query",
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(extended.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0)
     }
 
     impl Job {
@@ -1586,7 +1628,7 @@ mod windows {
             lifecycle: &Job,
             command: &CommandSpec,
         ) -> io::Result<SuspendedProcess> {
-            spawn_suspended_in(&self.owning_jobs(lifecycle), command, None)
+            spawn_suspended_in(&self.owning_jobs(lifecycle), command, None, false)
         }
 
         pub fn spawn(&self, lifecycle: &Job, command: &CommandSpec) -> io::Result<OwnedProcess> {
@@ -1604,7 +1646,13 @@ mod windows {
             command: &CommandSpec,
             pseudoconsole: isize,
         ) -> io::Result<OwnedProcess> {
-            spawn_suspended_in(&self.owning_jobs(lifecycle), command, Some(pseudoconsole))?.resume()
+            spawn_suspended_in(
+                &self.owning_jobs(lifecycle),
+                command,
+                Some(pseudoconsole),
+                false,
+            )?
+            .resume()
         }
 
         /// Outermost first: the shared ceiling must stay outside every lifecycle
@@ -1888,7 +1936,18 @@ mod windows {
                 lifecycle.handle.as_raw_handle(),
             ];
             let list = if cpu.is_some() { &jobs[..] } else { &jobs[1..] };
-            spawn_suspended_in(list, command, None)
+            let breakaway = caller_allows_breakaway()?;
+            spawn_suspended_in(list, command, None, breakaway).map_err(|error| {
+                if !breakaway && error.kind() == io::ErrorKind::PermissionDenied {
+                    return io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; the caller is not in a Job that permits JOB_OBJECT_LIMIT_BREAKAWAY_OK. If the shared aggregate is already nested below another caller branch, Windows rejects this join; run the caller from a Job that permits breakaway or serialize this heavy-command account"
+                        ),
+                    );
+                }
+                error
+            })
         }
     }
 }

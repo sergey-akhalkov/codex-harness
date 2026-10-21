@@ -29,6 +29,31 @@ developer guidance and repeated executor briefs:
 | The executor's local implementation/check/correction cycle, base verification, standing return boundaries, feedback waiting and result evidence | [Executor responsibility](../global/roles/executor.md) |
 | Task objective, actual checkout/base, owned paths, invariants, acceptance, consumer, concrete feedback address and additional boundaries | [Assignment renderer](../crates/codex-harness/src/executor_assignment.rs) |
 
+### Ponytail policy ownership
+
+The original [Ponytail rules](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/skills/ponytail/SKILL.md)
+and supplied skills stay in the native plugin. The [installation guide](installation.md#ponytail-setup)
+owns setup and trust; the [marketplace declaration](../.agents/plugins/marketplace.json)
+selects the package. No upstream rule body or fallback skill is copied here.
+
+Consolidation targets repeated instruction blocks and redundant full-text
+loading. Small semantic overlaps that add harness-specific obligations are
+acceptable; eliminating every shared concept is not the goal.
+
+| Concern | Instruction owner |
+| --- | --- |
+| Avoiding speculative abstractions for a local coding task | Ponytail; the equivalent local clause is removed |
+| Research beyond local reuse, total cost and unjustified coupling based on similar code | Retained harness supplements |
+| Scope approval, authority, required acceptance, truthful evidence, recovery and publication boundaries | Retained harness supplements; upstream minimums do not replace them |
+| Review, audit, debt, gain and help workflows supplied by Ponytail | Original upstream skills; no equivalent harness copies |
+| Role coordination, MCP use and distinct specialized workflows | Existing harness owners; similar names alone are not duplication |
+| Externally maintained OpenSpec workflows | Protected external owners, unchanged |
+
+The comparison supports removing only the speculative-abstraction clause, not
+a whole paragraph, role or skill. Actual trusted loading was observed before
+consolidation. Existing instruction limits still apply; removing text does not
+establish a measured token or quality improvement.
+
 The source checker resolves both roles with the runtime's shared Rust resolver
 and rejects missing/escaping sources and unclassified managed skills. The
 common file is limited to 24,576 UTF-8 bytes. Role and developer text, native

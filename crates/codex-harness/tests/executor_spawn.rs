@@ -694,8 +694,8 @@ fn a_required_upstream_fetch_failure_leaves_the_released_slot_untouched() {
 /// consumes the rendered assignment bound to the exact slot, base, source and
 /// owner, completes the controlled conversation and leaves its committed
 /// solution in the slot. The retained continuation then resumes the exact
-/// session with the upstream still unreachable, preserving the slot's tracked
-/// and untracked partial work without fetching or resetting anything.
+/// session with the upstream unreachable and then absent, preserving the
+/// slot's tracked and untracked partial work without fetching or resetting.
 #[test]
 fn an_explicit_local_base_completes_offline_and_continuation_keeps_the_slot_work() {
     let fixture = Fixture::new("entry-native", 1);
@@ -866,6 +866,31 @@ fn an_explicit_local_base_completes_offline_and_continuation_keeps_the_slot_work
             .unwrap()
             .ends_with("carried partial edit\n")
     );
+    // A local-only repository can continue the same bound task as well.
+    // Removing optional upstream metadata must not invalidate its pinned base.
+    git(&fixture.source, &["remote", "remove", "origin"]);
+    let mut command = fixture.resume_command();
+    command.args(["--exec", "continue the same assignment without a remote"]);
+    command.env("HARNESS_EXECUTOR_FIXTURE_MODE", "hang");
+    command.env("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+    command.env_remove("WT_SESSION");
+    let resumed = command.output().unwrap();
+    let text = output_text(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "{text}");
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["control"]["resumeSession"], session, "{receipt}");
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(receipt["slot"]["base"], commit.as_str(), "{receipt}");
+    assert_eq!(
+        fs::read_to_string(slot.join("partial-work.txt")).unwrap(),
+        "partial work\n"
+    );
+    assert!(
+        fs::read_to_string(&readme)
+            .unwrap()
+            .ends_with("carried partial edit\n")
+    );
     let status = git_output(
         &slot,
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -874,7 +899,7 @@ fn an_explicit_local_base_completes_offline_and_continuation_keeps_the_slot_work
     assert!(status.contains("partial-work.txt"), "{status}");
     assert_eq!(fixture.record(1)["base"], commit.as_str());
     assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
-    assert!(git_output(&fixture.source, &["remote", "get-url", "origin"]).contains("gone.git"));
+    assert!(git_output(&fixture.source, &["remote"]).is_empty());
     assert_eq!(
         fs::read_to_string(slot.join("solution.txt")).unwrap(),
         "solved\n"

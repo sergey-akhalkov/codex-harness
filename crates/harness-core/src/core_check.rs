@@ -9,13 +9,31 @@ use crate::{
     installation_lock::InstallationLocks,
     installation_metadata::{InstallationMetadata, InstalledLink},
     installation_path::PathChange,
-    installation_state::{PathScope, normal},
+    installation_state::{PathScope, normal, recorded_path},
     inventory, native_launcher,
     registration::LinkType,
     registration_native as native,
 };
-use serde::Serialize;
-use std::{collections::BTreeSet, fs, io, io::Read, path::Path, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeSet,
+    fs, io,
+    io::Read,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[derive(Deserialize)]
+struct InstallationHeader {
+    settings: InstallationOwners,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallationOwners {
+    user_home: PathBuf,
+    dependency_user_home: PathBuf,
+}
 
 #[derive(Serialize)]
 pub struct CheckReport {
@@ -163,6 +181,78 @@ pub fn check(
         cpu_policy,
         cpu_budget,
     })
+}
+
+/// Verify the launcher selected by the current schema-2 native installation.
+///
+/// The returned path is the canonical target of the owned
+/// `harness/bin/codex.exe` link. Recorded link identities, native command
+/// targets and build artifact integrity are rechecked under the installation
+/// owners' locks. This is read-only and launches no process.
+pub fn verified_installed_launcher(codex_home: &Path) -> io::Result<PathBuf> {
+    let codex_home = recorded_path(codex_home)?;
+    let metadata_path = codex_home.join("harness/installation.json");
+    inventory::ordinary_parents(&metadata_path)?;
+    let header_snapshot = ConfigSnapshot::read(&metadata_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            disconnected("native schema-2 core installation is not connected")
+        } else {
+            error
+        }
+    })?;
+    let header: InstallationHeader =
+        serde_json::from_slice(header_snapshot.contents()).map_err(|_| {
+            disconnected("native core installation metadata is not a connected schema-2 record")
+        })?;
+    let _locks = InstallationLocks::acquire(
+        &header.settings.user_home,
+        &header.settings.dependency_user_home,
+    )?;
+    refuse_pending(&codex_home)?;
+    let metadata = read_native(
+        &codex_home,
+        &header.settings.user_home,
+        &header.settings.dependency_user_home,
+    )?;
+    inspect_links(metadata.links())?;
+    let (launch, launch_snapshot) = inspect_native_launch(&metadata)?;
+    let build = launch
+        .build
+        .as_ref()
+        .ok_or_else(|| disconnected("native-launch registration is not schema 2"))?;
+    normal(build)?;
+    require_native_commands(metadata.links(), build)?;
+    if build_identity::artifacts(build).check().status != build_identity::Health::Healthy {
+        return Err(disconnected(
+            "the current installed native build is missing, altered or incompatible",
+        ));
+    }
+    metadata.verify_unchanged()?;
+    inspect_links(metadata.links())?;
+    launch_snapshot.verify_unchanged()?;
+    let launcher = metadata
+        .links()
+        .iter()
+        .find(|link| link.kind == "native-command" && link.name == "codex")
+        .ok_or_else(|| disconnected("native launcher registration is missing"))?;
+    if !same_path(
+        &launcher.object.path,
+        &codex_home.join("harness/bin/codex.exe"),
+    )? {
+        return Err(disconnected(
+            "recorded native launcher is outside the current installation",
+        ));
+    }
+    let current =
+        launcher.object.target.canonicalize().map_err(|_| {
+            disconnected("the current installed native launcher target is unavailable")
+        })?;
+    if !same_path(&current, &build.join("codex.exe"))? {
+        return Err(disconnected(
+            "recorded native launcher does not select the registered build",
+        ));
+    }
+    Ok(current)
 }
 
 mod cpu_budget {

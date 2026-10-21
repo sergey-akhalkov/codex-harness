@@ -523,7 +523,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(proj.join("Cargo.lock"), "# fixture lock\n").unwrap();
-        for directory in ["global/agents", ".agents/skills/arm-skill"] {
+        for directory in ["global/agents", "global/roles", ".agents/skills/arm-skill"] {
             fs::create_dir_all(proj.join(directory)).unwrap();
         }
         // Git does not track empty directories: keep the agents directory
@@ -559,6 +559,23 @@ impl Fixture {
         fs::write(
             proj.join(".agents/skills/arm-skill/SKILL.md"),
             "---\nname: arm-skill\ndescription: Fixture skill.\n---\n\nfixture skill body\n",
+        )
+        .unwrap();
+        // Role resolution happens inside every real arm conversation; the kit
+        // source therefore carries the same role inputs an installed kit has.
+        fs::write(
+            proj.join("global/roles.toml"),
+            "schema = 1\nshared_skills = [\"arm-skill\"]\n\n[roles.lead]\ninstructions = \"global/roles/lead.md\"\nskills = []\n\n[roles.executor]\ninstructions = \"global/roles/executor.md\"\nskills = []\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("global/roles/lead.md"),
+            "# Lead role\nfixture lead role instructions\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("global/roles/executor.md"),
+            "# Executor role\nfixture executor role instructions\n",
         )
         .unwrap();
         let init = openspec(
@@ -1891,27 +1908,68 @@ pub(super) fn attempt_receipt(fixture: &Fixture, attempt_id: &str) -> PathBuf {
     )
 }
 
-/// Bounded wait until the host's own observation record of one attempt reached
-/// a terminal state. The host writes it while the visible console runs.
+/// Wait for the host's finalized result. A completed turn still needs its
+/// terminal exit status, so a caller cannot overwrite the host's later write.
+/// Startup failure can lack an exit code; it is final only when the exact
+/// recorded host has exited.
 pub(super) fn wait_for_terminal_receipt(receipt: &Path) -> Value {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut last = None;
     loop {
         if let Ok(bytes) = fs::read(receipt)
             && let Ok(record) = serde_json::from_slice::<Value>(&bytes)
-            && matches!(
-                record["observation"]["state"].as_str(),
-                Some("completed" | "failed" | "defect" | "interrupted" | "stopped")
-            )
         {
-            return record;
+            let state = record["observation"]["state"].as_str().unwrap_or_default();
+            let finalized = match state {
+                "completed" => record["observation"]["exitCode"].as_i64().is_some(),
+                "failed" | "defect" => {
+                    record["observation"]["exitCode"].as_i64().is_some()
+                        || failed_host_has_exited(&record)
+                }
+                "interrupted" | "stopped" => true,
+                _ => false,
+            };
+            if finalized {
+                return record;
+            }
+            last = Some(record["observation"].clone());
         }
         assert!(
             std::time::Instant::now() < until,
-            "the control-backed run produced no terminal observation record at {}",
+            "no finalized native observation at {}; last observation: {last:?}",
             receipt.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+fn failed_host_has_exited(record: &Value) -> bool {
+    use harness_core::{
+        process::ProcessIdentity,
+        process_service::{self, ServiceProcess},
+    };
+    let host = &record["observation"]["host"];
+    let (Some(pid), Some(created), Some(program)) = (
+        host["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()),
+        host["created"].as_u64(),
+        host["program"].as_str(),
+    ) else {
+        return false;
+    };
+    let Ok(user) = process_service::current_user() else {
+        return false;
+    };
+    matches!(
+        ServiceProcess::inspect(
+            ProcessIdentity {
+                pid,
+                creation_time: created
+            },
+            Path::new(program),
+            &user
+        ),
+        Ok(None)
+    )
 }
 
 pub(super) fn load_json(path: &Path) -> Value {

@@ -97,9 +97,10 @@ refactoring claims SHALL be checked with current Serena or source evidence.
 The support matrix SHALL record each candidate language and the accepted
 selection separately: retained explicit operations, retained automatic
 diagnostics, disabled, unavailable or retired. The accepted selection retains
-Python and Rust, and includes Pascal/Delphi as a reuse-only conditional row
-when the verified shared pasls installation and its matching FPC prerequisites
-are present. TypeScript, JavaScript, PowerShell, C++, C#, JSON, Markdown,
+Python and Rust, and includes C++, C# and Pascal/Delphi as reuse-only conditional rows
+when the shared clangd installation, matching Roslyn server and compatible .NET host,
+or verified pasls and matching FPC prerequisites are present. TypeScript,
+JavaScript, PowerShell, JSON, Markdown,
 TOML, XML, CMake, Bash and conditional YAML/QML/HTML/CSS remain evaluation
 candidates rather than mandatory LSP installations. Any or all LSP support
 SHALL be allowed to remain disabled or be retired when its outcome benefit is
@@ -137,6 +138,37 @@ operations and passes the same freshness, isolation and delivery checks.
 #### Scenario: The source kit supports an additional language
 - **WHEN** discovery encounters a backend outside the accepted language selection
 - **THEN** it is not provisioned or updated merely because the source kit supports it, and an unrelated existing installation is preserved
+
+### Requirement: Conditional CSharp semantic navigation
+
+The managed connection SHALL support C# through an unambiguous reusable Roslyn installation and compatible existing .NET host. Discovery SHALL remain read-only and session startup SHALL use the adopted command without provisioning or updating dependencies. Missing, incompatible and ambiguous installations SHALL remain explicitly unavailable. Project SDK selection, other language selections and unrelated installations SHALL be preserved.
+
+#### Scenario: Existing compatible CSharp installation
+
+- **WHEN** explicit discovery observes the expected Roslyn server, matching metadata and compatible runtime
+- **THEN** the normal code-tools lifecycle records its pinned launch command and actual solution navigation can be verified through Serena
+
+#### Scenario: Missing or ambiguous CSharp dependency
+
+- **WHEN** the server, matching metadata or runtime is missing, incompatible or ambiguous
+- **THEN** discovery withholds adoption and activation refuses without downloading or selecting an arbitrary installation
+
+#### Scenario: Actual semantic acceptance
+
+- **WHEN** C# support is reported as working
+- **THEN** actual project symbol discovery, a symbol body and references have succeeded and explicit diagnostic availability and freshness are reported separately from compilation acceptance
+
+### Requirement: Managed C++ navigation reuses shared clangd
+
+The managed selection SHALL adopt an unambiguous existing shared clangd installation without downloading or updating it. CMake and Visual C++ project declarations SHALL select Serena's C++ backend. Missing adopted executables SHALL fail before backend startup. Discovery fingerprints and version labels SHALL NOT count as upstream integrity or semantic readiness. Delivery SHALL exercise symbols, cross-file references and disposable semantic edits through the managed consumer; real projects SHALL supply applicable compilation flags and headers. Automatic diagnostics SHALL remain disabled.
+
+#### Scenario: An existing C++ toolchain is usable
+- **WHEN** clangd is adopted and a C++ project supplies its compilation database
+- **THEN** the managed Serena route uses that executable and supports verified semantic navigation without a second installation
+
+#### Scenario: The backend is missing or ambiguous
+- **WHEN** no unambiguous existing clangd executable is available
+- **THEN** C++ admission remains unavailable and neither discovery nor a session installs a backend
 
 ### Requirement: Managed Pascal navigation reuses the verified shared pasls installation
 

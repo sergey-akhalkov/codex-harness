@@ -5,6 +5,21 @@
 //! session that the harness can serve by pairing its own "codex app-server"
 //! process with the native TUI in "--remote" mode.
 //!
+//! [plan_hosted](fn.plan_hosted.html) is the ordinary-launch variant. It
+//! keeps an explicit "--profile/-p" in the native frontend arguments (the
+//! native CLI owns that selection) and resolves the same profile's config
+//! layer into the app-server backend as "-c" overrides, because the
+//! app-server has no profile flag of its own. Legacy [plan] keeps its
+//! profile bypass unchanged for the task-control caller.
+//!
+//! [plan_hosted] leaves native-only frontend choices to the installed
+//! frontend: "--oss" (including native provider discovery),
+//! "--local-provider", "--search" and "--dangerously-bypass-hook-trust"
+//! stay in `tui` without synthesized backend configuration. The app-server
+//! accepts no corresponding command-line flags, while the remote frontend
+//! carries their effect through thread/start, thread/resume and thread/fork.
+//! Legacy [plan] keeps its existing rejection of these flags.
+//!
 //! * ManagedArguments::tui keeps the caller's arguments verbatim. The caller
 //!   owns adding its "--remote <ADDR>" endpoint, which must be inserted
 //!   before any "--" separator.
@@ -24,8 +39,9 @@
 //!   from the original "cwd"; starting it from the resolved cwd would apply
 //!   a relative "-C" twice.
 //!
-//! "Ok(None)" keeps the existing native bypass: explicit "--remote" or
-//! "--profile/-p", help/version, and every noninteractive subcommand.
+//! "Ok(None)" keeps the existing native bypass: explicit "--remote",
+//! help/version, and every noninteractive subcommand. [plan] additionally
+//! keeps its legacy "--profile/-p" bypass; [plan_hosted] hosts it.
 //! "Err" asks the caller to fall back to an ordinary native launch:
 //! "ErrorKind::InvalidInput" mirrors argv shapes the native CLI itself
 //! rejects, and "ErrorKind::Unsupported" names recognized flags whose
@@ -34,7 +50,7 @@
 //! TUI arguments verbatim; the caller owns making its owned endpoint accept
 //! that token.
 //!
-//! The recognized surface is bounded to the inspected "codex-cli" 0.154.0
+//! The recognized surface is bounded to the inspected "codex-cli" 0.163.0
 //! help and argv probes: "--full-auto" does not exist there and "-a"
 //! accepts only "on-request" and "never".
 
@@ -56,10 +72,11 @@ pub struct ManagedArguments {
     /// session flags.
     pub backend: Vec<OsString>,
     /// The caller's arguments, verbatim, for the native remote TUI. Prompt
-    /// words, "--" separators, image values and TUI-only flags
-    /// ("--worktree", "--no-alt-screen", "--last", ...) stay exactly as
-    /// given; "-C/--cd" also stays, so the TUI must start from the original
-    /// "cwd" (see ManagedArguments::cwd).
+    /// words, "--" separators, image values and native-frontend flags
+    /// ("--oss", "--local-provider", "--search",
+    /// "--dangerously-bypass-hook-trust", "--worktree", "--no-alt-screen",
+    /// "--last", ...) stay exactly as given; "-C/--cd" also stays, so the TUI
+    /// must start from the original "cwd" (see ManagedArguments::cwd).
     pub tui: Vec<OsString>,
     /// TUI arguments for attaching to a newly controller-created thread.
     /// Permission options are already applied by `backend`; remote resume
@@ -71,6 +88,9 @@ pub struct ManagedArguments {
     pub cwd: PathBuf,
     /// Ordinary new interaction; resume/fork keep their native selection flow.
     pub new_session: bool,
+    /// Explicit native profile preserved in `tui`. `backend` carries its
+    /// resolved config layer instead of this flag.
+    pub profile: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -137,6 +157,7 @@ struct Session {
     bypass_sandbox: bool,
     add_dirs: Vec<String>,
     cd: Option<OsString>,
+    profile: Option<String>,
 }
 
 struct Parser<'a> {
@@ -149,6 +170,9 @@ struct Parser<'a> {
     kind: Option<SessionKind>,
     positionals: usize,
     separator: bool,
+    /// Whether an explicit profile selects a managed hosted session instead
+    /// of the native bypass. Legacy plan leaves this false.
+    hosted: bool,
 }
 
 /// Classifies a native "codex" argv (without the program name) for a
@@ -160,6 +184,32 @@ struct Parser<'a> {
 /// app-server plus remote TUI pair; everything else keeps its existing
 /// native behavior as described in the module documentation.
 pub fn plan(args: &[OsString], cwd: &Path) -> io::Result<Option<ManagedArguments>> {
+    plan_session(args, cwd, None)
+}
+
+/// Plans the launcher-prepared arguments of an ordinary interactive launch.
+///
+/// Unlike [plan], an explicit native "--profile/-p" remains a hosted
+/// session: `tui` keeps the flag verbatim for the visible frontend, while
+/// `backend` starts with that profile's resolved "-c" layer instead. The
+/// app-server accepts no profile flag, and starting it on the base
+/// configuration would silently replace the selected model or provider.
+/// Native OSS, search and hook-trust selections also stay in `tui`; the
+/// frontend carries them through the remote thread contract. Legacy callers
+/// keep [plan] unchanged.
+pub fn plan_hosted(
+    args: &[OsString],
+    cwd: &Path,
+    codex_home: &Path,
+) -> io::Result<Option<ManagedArguments>> {
+    plan_session(args, cwd, Some(codex_home))
+}
+
+fn plan_session(
+    args: &[OsString],
+    cwd: &Path,
+    codex_home: Option<&Path>,
+) -> io::Result<Option<ManagedArguments>> {
     let mut parser = Parser {
         args,
         attachment: Vec::new(),
@@ -170,13 +220,28 @@ pub fn plan(args: &[OsString], cwd: &Path) -> io::Result<Option<ManagedArguments
         kind: None,
         positionals: 0,
         separator: false,
+        hosted: codex_home.is_some(),
     };
     if !parser.run()? {
         return Ok(None);
     }
     let session = take(&mut parser.session);
-    let (backend, directory) = finalize(&session, cwd)?;
-    if parser.kind == Some(SessionKind::Resume) && parser.attachment.len() != args.len() {
+    let (mut backend, directory) = finalize(&session, cwd)?;
+    if let (Some(home), Some(profile)) = (codex_home, session.profile.as_deref()) {
+        // The profile layer is lower precedence than the caller's "-c"
+        // entries, exactly as native configuration layering applies it.
+        let mut layered = Vec::new();
+        for value in crate::orchestration_config::profile_config_overrides(home, profile)? {
+            layered.push(OsString::from("-c"));
+            layered.push(OsString::from(value));
+        }
+        layered.extend(backend);
+        backend = layered;
+    }
+    if !parser.hosted
+        && parser.kind == Some(SessionKind::Resume)
+        && parser.attachment.len() != args.len()
+    {
         return Err(unsupported(
             "native remote resume rejects permission overrides; preserve the ordinary native resume path",
         ));
@@ -202,6 +267,7 @@ pub fn plan(args: &[OsString], cwd: &Path) -> io::Result<Option<ManagedArguments
         attachment: parser.attachment,
         cwd: directory,
         new_session,
+        profile: session.profile,
     }))
 }
 
@@ -264,7 +330,9 @@ impl Parser<'_> {
                 | "--approve-for-me"
                 | "--dangerously-bypass-approvals-and-sandbox"
                 | "--add-dir"
-        ) || (!flag.starts_with("--") && (flag.starts_with("-s") || flag.starts_with("-a")))
+                | "--profile"
+        ) || (!flag.starts_with("--")
+            && (flag.starts_with("-s") || flag.starts_with("-a") || flag.starts_with("-p")))
         {
             return;
         }
@@ -343,7 +411,7 @@ impl Parser<'_> {
                 reject_attached(name, attached)?;
                 Ok(false)
             }
-            "remote" | "profile" => {
+            "remote" => {
                 let value = match attached {
                     Some(value) => OsString::from(value),
                     None => self.take_value(args, i, &format!("--{name}"))?,
@@ -354,6 +422,22 @@ impl Parser<'_> {
                     )));
                 }
                 Ok(false)
+            }
+            "profile" => {
+                let value = match attached {
+                    Some(value) => OsString::from(value),
+                    None => self.take_value(args, i, "--profile")?,
+                };
+                if !self.hosted {
+                    if value.to_str().is_none() {
+                        return Err(invalid(
+                            "the native CLI rejects this argv: --profile requires a UTF-8 value",
+                        ));
+                    }
+                    return Ok(false);
+                }
+                self.session.profile = Some(utf8_owned(value, "--profile")?);
+                Ok(true)
             }
             "config" => {
                 let value = match attached {
@@ -446,27 +530,41 @@ impl Parser<'_> {
             }
             "local-provider" => {
                 let value = self.utf8_value(attached, args, i, "--local-provider")?;
-                Err(unsupported(format!(
-                    "--local-provider '{value}' selects an open-source provider; no verified app-server config mapping exists for codex-cli 0.154.0"
-                )))
+                if !self.hosted {
+                    return Err(unsupported(format!(
+                        "--local-provider '{value}' selects an open-source provider; legacy task-control planning keeps its existing native path"
+                    )));
+                }
+                Ok(true)
             }
             "oss" => {
                 reject_attached(name, attached)?;
-                Err(unsupported(
-                    "--oss selects the open-source provider; no verified app-server config mapping exists for codex-cli 0.154.0",
-                ))
+                if !self.hosted {
+                    return Err(unsupported(
+                        "--oss selects the open-source provider; legacy task-control planning keeps its existing native path",
+                    ));
+                }
+                Ok(true)
             }
             "search" => {
                 reject_attached(name, attached)?;
-                Err(unsupported(
-                    "--search enables live web search; its config mapping for the app-server is not verified for codex-cli 0.154.0",
-                ))
+                if self.hosted {
+                    Ok(true)
+                } else {
+                    Err(unsupported(
+                        "--search enables live web search; legacy task-control planning keeps its existing native path",
+                    ))
+                }
             }
             "dangerously-bypass-hook-trust" => {
                 reject_attached(name, attached)?;
-                Err(unsupported(
-                    "--dangerously-bypass-hook-trust changes hook-trust handling for this invocation; its effect on a harness-owned app-server is not established",
-                ))
+                if self.hosted {
+                    Ok(true)
+                } else {
+                    Err(unsupported(
+                        "--dangerously-bypass-hook-trust changes hook-trust handling; legacy task-control planning keeps its existing native path",
+                    ))
+                }
             }
             "last" | "all"
                 if matches!(self.kind, Some(SessionKind::Resume | SessionKind::Fork)) =>
@@ -492,8 +590,12 @@ impl Parser<'_> {
             match flag {
                 'h' | 'V' => return Ok(false),
                 'p' => {
-                    let _ = self.attached_or_next_value(rest, args, i, "-p")?;
-                    return Ok(false);
+                    let value = self.attached_or_next_value(rest, args, i, "-p")?;
+                    if !self.hosted {
+                        return Ok(false);
+                    }
+                    self.session.profile = Some(utf8_owned(value, "-p")?);
+                    return Ok(true);
                 }
                 'c' => {
                     let value = self.attached_or_next_value(rest, args, i, "-c")?;
@@ -794,6 +896,7 @@ fn toml_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn argv(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -804,6 +907,13 @@ mod tests {
         plan(&args, Path::new("D:/base"))
             .expect("ordinary session arguments should plan")
             .expect("ordinary session arguments should be managed")
+    }
+
+    fn plan_hosted_managed(list: &[&str]) -> ManagedArguments {
+        let args = argv(list);
+        plan_hosted(&args, Path::new("D:/base"), Path::new("D:/base-home"))
+            .expect("hosted session arguments should plan")
+            .expect("hosted session arguments should be managed")
     }
 
     fn bypasses(list: &[&str]) {
@@ -1096,6 +1206,174 @@ mod tests {
     }
 
     #[test]
+    fn hosted_plan_keeps_the_explicit_native_profile_in_the_frontend() {
+        for list in [
+            vec!["-p", "work", "hello"],
+            vec!["--profile", "work", "hello"],
+            vec!["--profile=work", "hello"],
+            vec!["-pwork", "hello"],
+        ] {
+            let planned = plan_hosted_managed(&list);
+            assert_eq!(planned.profile.as_deref(), Some("work"), "{list:?}");
+            assert_eq!(planned.tui, argv(&list), "{list:?}");
+            assert!(
+                !planned
+                    .backend
+                    .iter()
+                    .any(|arg| arg == "--profile" || arg == "-p" || arg == "work"),
+                "the app-server must not receive a profile flag: {list:?}"
+            );
+            assert!(
+                !planned
+                    .waiting_attachment
+                    .iter()
+                    .any(|arg| arg == "--profile" || arg == "-p" || arg == "work"),
+                "profile options must not be retained as attachment arguments: {list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_profile_layer_precedes_user_config_overrides() {
+        let home = tempfile::TempDir::new().unwrap();
+        fs::write(
+            home.path().join("work.config.toml"),
+            "model = \"profile-model\"\nmodel_provider = \"profile-provider\"\n",
+        )
+        .unwrap();
+        let args = argv(&["--profile", "work", "-c", "model=\"cli-model\"", "hello"]);
+        let planned = plan_hosted(&args, Path::new("D:/base"), home.path())
+            .unwrap()
+            .expect("an explicit profile stays hosted");
+        assert_eq!(planned.profile.as_deref(), Some("work"));
+        assert_eq!(planned.tui, args);
+        let profile_model = planned
+            .backend
+            .windows(2)
+            .position(|pair| pair[0] == "-c" && pair[1] == "model=\"profile-model\"")
+            .expect("the profile model must reach the backend");
+        let user_model = planned
+            .backend
+            .windows(2)
+            .position(|pair| pair[0] == "-c" && pair[1] == "model=\"cli-model\"")
+            .expect("the caller's -c override must reach the backend");
+        assert!(
+            profile_model < user_model,
+            "the caller's override must win over the profile layer: {:?}",
+            planned.backend
+        );
+        assert!(
+            planned
+                .backend
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == "model_provider=\"profile-provider\""),
+            "{:?}",
+            planned.backend
+        );
+    }
+
+    #[test]
+    fn hosted_oss_selection_stays_in_the_native_frontend() {
+        let cases: [(Vec<&str>, Vec<&str>); 4] = [
+            (vec!["--oss", "hello"], vec![]),
+            (vec!["--oss", "--local-provider", "ollama", "hello"], vec![]),
+            (
+                vec![
+                    "--oss",
+                    "--local-provider",
+                    "lmstudio",
+                    "-m",
+                    "custom",
+                    "hello",
+                ],
+                vec!["-c", "model=\"custom\""],
+            ),
+            (vec!["--local-provider", "ollama", "hello"], vec![]),
+        ];
+        for (list, expected_backend) in cases {
+            let args = argv(&list);
+            let planned = plan_hosted(&args, Path::new("D:/base"), Path::new("D:/base-home"))
+                .unwrap()
+                .expect("native OSS selection stays hosted");
+            assert_eq!(planned.tui, args, "{list:?}");
+            assert_eq!(
+                planned.backend,
+                argv(&expected_backend),
+                "the native frontend owns OSS selection; only an explicit -m maps to the backend: {list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_search_and_hook_trust_stay_in_the_native_frontend() {
+        for list in [
+            vec!["--search", "hello"],
+            vec!["--dangerously-bypass-hook-trust", "hello"],
+            vec!["--search", "--dangerously-bypass-hook-trust", "hello"],
+        ] {
+            let args = argv(&list);
+            let planned = plan_hosted(&args, Path::new("D:/base"), Path::new("D:/base-home"))
+                .unwrap()
+                .expect("native frontend flags stay hosted");
+            assert_eq!(planned.tui, args, "{list:?}");
+            assert!(
+                planned.backend.is_empty(),
+                "the native frontend carries these flags through its remote contract: {list:?}: {:?}",
+                planned.backend
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_local_provider_without_oss_keeps_the_native_noop_behavior() {
+        let home = tempfile::TempDir::new().unwrap();
+        let args = argv(&["--local-provider", "ollama", "hello"]);
+        let planned = plan_hosted(&args, Path::new("D:/base"), home.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(planned.tui, args);
+        assert!(
+            planned.backend.is_empty(),
+            "the native CLI ignores --local-provider without --oss: {:?}",
+            planned.backend
+        );
+    }
+
+    #[test]
+    fn hosted_plan_keeps_remote_and_noninteractive_bypasses() {
+        for list in [
+            vec!["--remote", "ws://127.0.0.1:1", "hello"],
+            vec!["exec", "do work"],
+            vec!["app-server"],
+            vec!["--help"],
+            vec!["-V"],
+            vec!["--oss", "--remote", "ws://127.0.0.1:1", "hello"],
+            vec!["--oss", "exec", "do work"],
+        ] {
+            assert!(
+                plan_hosted(
+                    &argv(&list),
+                    Path::new("D:/base"),
+                    Path::new("D:/base-home")
+                )
+                .expect("bypass cases must not be argv errors")
+                .is_none(),
+                "{list:?} should keep its native bypass"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_plan_preserves_resume_and_fork_selection() {
+        let resume = plan_hosted_managed(&["resume", "--last", "continue"]);
+        assert!(!resume.new_session);
+        assert_eq!(resume.tui, argv(&["resume", "--last", "continue"]));
+        let fork = plan_hosted_managed(&["fork", "9b2f", "continue"]);
+        assert!(!fork.new_session);
+        assert_eq!(fork.tui, argv(&["fork", "9b2f", "continue"]));
+    }
+
+    #[test]
     fn help_and_version_bypass_management() {
         bypasses(&["--help"]);
         bypasses(&["-h"]);
@@ -1168,21 +1446,36 @@ mod tests {
     }
 
     #[test]
-    fn flags_without_established_backend_effect_are_reported() {
+    fn legacy_plan_keeps_the_existing_search_and_hook_trust_rejection() {
         for list in [
-            vec!["--oss", "hello"],
             vec!["--search", "hello"],
-            vec!["--local-provider", "ollama", "hello"],
             vec!["--dangerously-bypass-hook-trust", "hello"],
         ] {
             let error = plan(&argv(&list), Path::new("D:/base"))
-                .expect_err(&format!("{list:?} should report its uncertain mapping"));
+                .expect_err(&format!("{list:?} should keep its legacy rejection"));
             assert_eq!(error.kind(), ErrorKind::Unsupported, "{list:?}");
             let message = error.to_string();
             let flag = list[0];
             assert!(
                 message.contains(flag),
                 "the error should name {flag}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_plan_keeps_the_existing_oss_rejection() {
+        for list in [
+            vec!["--oss", "hello"],
+            vec!["--local-provider", "ollama", "hello"],
+        ] {
+            let error = plan(&argv(&list), Path::new("D:/base"))
+                .expect_err(&format!("{list:?} should keep its legacy rejection"));
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{list:?}");
+            assert!(
+                error.to_string().contains(list[0]),
+                "the legacy error should name {}: {error}",
+                list[0]
             );
         }
     }

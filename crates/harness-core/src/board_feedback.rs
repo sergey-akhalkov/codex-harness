@@ -33,6 +33,7 @@ pub const KIT_FORWARDED_LABEL: &str = "kit-forwarded";
 pub const KIT_FEEDBACK_LABEL: &str = "kit-feedback";
 
 const VOTE_PREFIX: &str = "feedback-vote v1";
+const DERIVED_PREFIX: &str = "feedback-derived v1";
 const MERGE_PREFIX: &str = "feedback-merge v1";
 const ROUTE_PREFIX: &str = "feedback-route v1";
 const PROMOTE_PREFIX: &str = "feedback-promote v1";
@@ -182,6 +183,28 @@ pub struct VoteRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedRecord {
+    /// The feedback item whose episode this analysis restates.
+    pub source: String,
+    pub source_reporter: String,
+    pub source_kind: ReporterKind,
+    /// The reflection that produced the analysis.
+    pub reporter: String,
+    pub episode: String,
+    pub parent_id: String,
+    pub analysis: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedFeedbackReceipt {
+    pub record: DerivedRecord,
+    /// The item that received the analysis comment. It is the source itself
+    /// until the source has been merged, then its canonical item.
+    pub target_id: String,
+    pub written: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeRecord {
     pub from: String,
     pub into: String,
@@ -190,6 +213,7 @@ pub struct MergeRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteLedger {
     pub votes: Vec<VoteRecord>,
+    pub derived: Vec<DerivedRecord>,
     pub merges: Vec<MergeRecord>,
     pub routes: Vec<RouteRecord>,
     pub promotions: Vec<PromotionRecord>,
@@ -354,6 +378,97 @@ pub enum PromotionEvidence {
     /// Lead consequence override for material correctness, integrity or safety
     /// evidence. Both fields are recorded verbatim.
     ConsequenceOverride { consequence: String, reason: String },
+    /// One verified correction within the current real lead's active mandate.
+    VerifiedImprovement(VerifiedImprovementRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedImprovementRequest {
+    codex_home: std::path::PathBuf,
+    lead_session: String,
+    work: String,
+    reason: String,
+}
+
+impl VerifiedImprovementRequest {
+    /// Capture the calling conversation; callers cannot supply another lead.
+    /// Promotion revalidates this identity and the active accepted work.
+    pub fn for_current_lead(codex_home: &Path, work: &str, reason: &str) -> io::Result<Self> {
+        let lead_session = std::env::var("CODEX_THREAD_ID").map_err(|_| {
+            invalid("verified improvement requires the current real lead conversation")
+        })?;
+        Ok(Self {
+            codex_home: codex_home.to_path_buf(),
+            lead_session: require_field("current lead session", &lead_session, MAX_REASON)?,
+            work: require_field("accepted work", work, MAX_REASON)?,
+            reason: require_field("improvement reason", reason, MAX_REASON)?,
+        })
+    }
+}
+
+/// Admission provenance stays on the consuming board, including for kit routing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedImprovementRecord {
+    pub binding: String,
+    pub revision: u64,
+    pub lead: String,
+    pub acceptance: String,
+    pub reason: String,
+}
+
+fn verify_improvement_request(
+    bd: &Path,
+    project: &Path,
+    request: &VerifiedImprovementRequest,
+) -> io::Result<VerifiedImprovementRecord> {
+    if std::env::var("CODEX_THREAD_ID").ok().as_deref() != Some(request.lead_session.as_str()) {
+        return Err(invalid(
+            "verified improvement belongs to another lead conversation",
+        ));
+    }
+    let controller =
+        crate::delivery_reflection::ReflectionController::new(bd, project, &request.codex_home);
+    let check = controller.check_active_binding(&request.lead_session, Some(&request.work))?;
+    if !check.is_active() {
+        return Err(invalid(format!(
+            "verified improvement refused: {}",
+            check.detail
+        )));
+    }
+    Ok(VerifiedImprovementRecord {
+        binding: check
+            .binding_id
+            .ok_or_else(|| invalid("active reflection binding has no identity"))?,
+        revision: check.revision,
+        lead: request.lead_session.clone(),
+        acceptance: check
+            .matched_acceptance_id
+            .ok_or_else(|| invalid("verified improvement has no exact accepted work"))?,
+        reason: request.reason.clone(),
+    })
+}
+
+fn promotion_basis(override_used: bool, verified: bool) -> &'static str {
+    if verified {
+        "verified-improvement"
+    } else if override_used {
+        "override"
+    } else {
+        "votes"
+    }
+}
+
+impl PromotionOutcome {
+    pub fn basis(&self) -> &'static str {
+        promotion_basis(self.override_used, self.verified.is_some())
+    }
+}
+
+impl PromotionRecord {
+    pub fn basis(&self) -> &'static str {
+        promotion_basis(self.override_used, self.verified.is_some())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +479,7 @@ pub struct PromotionOutcome {
     pub target: Option<String>,
     pub counted: usize,
     pub override_used: bool,
+    pub verified: Option<VerifiedImprovementRecord>,
     /// True when the board already recorded this exact promotion and the
     /// outcome is confirmed from that history: no promotion record was
     /// written, and only labels a partial run missed may have been reconciled.
@@ -382,6 +498,7 @@ pub struct PromotionRecord {
     pub route: PromotionRoute,
     pub counted: usize,
     pub override_used: bool,
+    pub verified: Option<VerifiedImprovementRecord>,
     pub target: Option<String>,
 }
 
@@ -502,12 +619,15 @@ pub fn decide_vote(existing: &[VoteRecord], candidate: &VoteCandidate) -> VoteDe
 
 pub fn parse_ledger(comments: &[String]) -> VoteLedger {
     let mut votes = Vec::new();
+    let mut derived = Vec::new();
     let mut merges = Vec::new();
     let mut routes = Vec::new();
     let mut promotions = Vec::new();
     for comment in comments {
         if let Some(vote) = parse_vote_comment(comment) {
             votes.push(vote);
+        } else if let Some(record) = parse_derived_comment(comment) {
+            derived.push(record);
         } else if let Some(merge) = parse_merge_comment(comment) {
             merges.push(merge);
         } else if let Some(route) = parse_route_comment(comment) {
@@ -518,6 +638,7 @@ pub fn parse_ledger(comments: &[String]) -> VoteLedger {
     }
     VoteLedger {
         votes,
+        derived,
         merges,
         routes,
         promotions,
@@ -532,6 +653,19 @@ pub fn format_vote_comment(candidate: &VoteCandidate, decision: &VoteDecision) -
         candidate.kind.as_str(),
         if decision.counted { "true" } else { "false" },
         decision.reason.as_str()
+    )
+}
+
+fn format_derived_comment(record: &DerivedRecord) -> String {
+    format!(
+        "{DERIVED_PREFIX} source={} source_reporter={} source_kind={} reporter={} episode={} parent={} analysis={}",
+        record.source,
+        record.source_reporter,
+        record.source_kind.as_str(),
+        record.reporter,
+        record.episode,
+        record.parent_id,
+        record.analysis
     )
 }
 
@@ -573,6 +707,106 @@ pub fn record_feedback(
         ],
     )?;
     string_field(&created, "id")
+}
+
+/// Records bounded reflection analysis against its originating feedback item.
+///
+/// The source is read before any write: it must be an existing bounded
+/// feedback record, and it must not itself be derived evidence. Episode and
+/// source identity come from that record, not from the reflection's assertions.
+/// The analysis is appended as a `feedback-derived` comment, so it creates no
+/// feedback card and no vote. If the source has already been merged, the
+/// comment is attached to its canonical item; later merges copy any existing
+/// derived comments through the ordinary triage seam.
+pub fn record_derived_feedback(
+    bd: &Path,
+    project: &Path,
+    source_id: &str,
+    reporter: &str,
+    analysis: &str,
+) -> io::Result<DerivedFeedbackReceipt> {
+    let source_id = require_token("source feedback", source_id, MAX_PARENT)?;
+    let reporter = require_token("reporter", reporter, MAX_REPORTER)?;
+    let analysis = require_field("analysis", analysis, MAX_OBSERVATION)?;
+    let source = load_snapshot(bd, project, &source_id)?;
+    let source = source.ok_or_else(|| {
+        invalid(format!(
+            "source feedback {source_id} is missing; pass --source-feedback naming an existing feedback item"
+        ))
+    })?;
+    let feedback = source.feedback.ok_or_else(|| {
+        invalid(format!(
+            "source feedback {source_id} is not a bounded feedback record; pass --source-feedback naming an existing feedback item"
+        ))
+    })?;
+    if feedback.kind == ReporterKind::DerivedEvidence {
+        return Err(invalid(format!(
+            "source feedback {source_id} is itself derived evidence; link the primary feedback item"
+        )));
+    }
+    let target_id = canonical_feedback_target(bd, project, &source_id, source.duplicates)?;
+    let record = DerivedRecord {
+        source: source_id,
+        source_reporter: feedback.reporter,
+        source_kind: feedback.kind,
+        reporter,
+        episode: feedback.episode,
+        parent_id: feedback.parent_id,
+        analysis,
+    };
+    let comment = format_derived_comment(&record);
+    let comments = list_comments(bd, project, &target_id)?;
+    let written = if comments.iter().any(|existing| existing == &comment) {
+        false
+    } else {
+        json_ok(bd, project, &["comment", &target_id, "--json", &comment])?;
+        true
+    };
+    Ok(DerivedFeedbackReceipt {
+        record,
+        target_id,
+        written,
+    })
+}
+
+/// Follows the board's existing duplicate dependency to the canonical item.
+/// The source metadata stays bound to the original feedback record; only the
+/// comment target moves. A cycle is corrupt board state and refuses the write.
+fn canonical_feedback_target(
+    bd: &Path,
+    project: &Path,
+    source_id: &str,
+    mut duplicate: Option<String>,
+) -> io::Result<String> {
+    let mut current = source_id.to_owned();
+    let mut seen = vec![current.clone()];
+    while let Some(next) = duplicate {
+        if seen.iter().any(|id| id == &next) {
+            return Err(invalid(format!(
+                "source feedback duplicate chain is cyclic at {next}"
+            )));
+        }
+        seen.push(next.clone());
+        let snapshot = load_snapshot(bd, project, &next)?;
+        let snapshot = snapshot.ok_or_else(|| {
+            invalid(format!(
+                "source feedback {source_id} points to missing duplicate target {next}"
+            ))
+        })?;
+        let feedback = snapshot.feedback.ok_or_else(|| {
+            invalid(format!(
+                "source feedback {source_id} points to {next}, which is not a bounded feedback record"
+            ))
+        })?;
+        if feedback.kind == ReporterKind::DerivedEvidence {
+            return Err(invalid(format!(
+                "source feedback {source_id} points to {next}, which is itself derived evidence"
+            )));
+        }
+        current = next;
+        duplicate = snapshot.duplicates;
+    }
+    Ok(current)
 }
 
 pub fn list_feedback(bd: &Path, project: &Path) -> io::Result<Vec<FeedbackRow>> {
@@ -940,6 +1174,7 @@ fn apply_action_kind(
                     ],
                 )?;
             }
+            copy_derived_evidence(bd, project, &action.feedback_id, canonical)?;
             let (vote, ledger) = record_vote(bd, project, canonical, &candidate)?;
             let applied = AppliedAction {
                 feedback_id: action.feedback_id.clone(),
@@ -1136,6 +1371,12 @@ pub fn promote_item(
             "kit concerns promote through promote_kit_concern so private consuming-project data stays off the kit board",
         ));
     }
+    let verified = match evidence {
+        PromotionEvidence::VerifiedImprovement(request) => {
+            Some(verify_improvement_request(bd, project, request)?)
+        }
+        _ => None,
+    };
     let snapshot = load_snapshot(bd, project, item_id)?
         .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
     let ledger = inspect_ledger(bd, project, item_id)?;
@@ -1181,13 +1422,18 @@ pub fn promote_item(
         counted,
         threshold: match evidence {
             PromotionEvidence::Votes { threshold } => Some(*threshold),
-            PromotionEvidence::ConsequenceOverride { .. } => None,
+            PromotionEvidence::ConsequenceOverride { .. }
+            | PromotionEvidence::VerifiedImprovement(_) => None,
         },
         target: target.as_deref(),
         override_note: override_note.as_ref(),
+        verified: verified.as_ref(),
     }
     .format();
     json_ok(bd, project, &["comment", item_id, "--json", &comment])?;
+    if verified.is_some() {
+        mark_improvement_purpose(bd, project, item_id, None)?;
+    }
     json_ok(
         bd,
         project,
@@ -1204,6 +1450,7 @@ pub fn promote_item(
         target,
         counted,
         override_used: override_note.is_some(),
+        verified,
         already_recorded: false,
     })
 }
@@ -1219,6 +1466,12 @@ pub fn promote_kit_concern(
     concern: &KitConcern,
     evidence: &PromotionEvidence,
 ) -> io::Result<PromotionOutcome> {
+    let verified = match evidence {
+        PromotionEvidence::VerifiedImprovement(request) => {
+            Some(verify_improvement_request(bd, project, request)?)
+        }
+        _ => None,
+    };
     let snapshot = load_snapshot(bd, project, item_id)?
         .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
     let ledger = inspect_ledger(bd, project, item_id)?;
@@ -1242,19 +1495,27 @@ pub fn promote_kit_concern(
     let (counted, override_note) = validate_evidence(&ledger, evidence)?;
     let concern = concern.bounded()?;
     let kit_id = create_kit_item(bd, kit_project, &concern)?;
+    if verified.is_some() {
+        mark_improvement_purpose(bd, kit_project, &kit_id, Some(KIT_ROUTING_ACTOR))?;
+    }
     let target = format!("kit:{kit_id}");
     let comment = PromotionComment {
         route: PromotionRoute::KitBacklog,
         counted,
         threshold: match evidence {
             PromotionEvidence::Votes { threshold } => Some(*threshold),
-            PromotionEvidence::ConsequenceOverride { .. } => None,
+            PromotionEvidence::ConsequenceOverride { .. }
+            | PromotionEvidence::VerifiedImprovement(_) => None,
         },
         target: Some(target.as_str()),
         override_note: override_note.as_ref(),
+        verified: verified.as_ref(),
     }
     .format();
     json_ok(bd, project, &["comment", item_id, "--json", &comment])?;
+    if verified.is_some() {
+        mark_improvement_purpose(bd, project, item_id, None)?;
+    }
     json_ok(
         bd,
         project,
@@ -1277,6 +1538,7 @@ pub fn promote_kit_concern(
         target: Some(target),
         counted,
         override_used: override_note.is_some(),
+        verified,
         already_recorded: false,
     })
 }
@@ -1395,15 +1657,12 @@ struct PromotionComment<'a> {
     threshold: Option<u32>,
     target: Option<&'a str>,
     override_note: Option<&'a (String, String)>,
+    verified: Option<&'a VerifiedImprovementRecord>,
 }
 
 impl PromotionComment<'_> {
     fn format(&self) -> String {
-        let basis = if self.override_note.is_some() {
-            "override"
-        } else {
-            "votes"
-        };
+        let basis = promotion_basis(self.override_note.is_some(), self.verified.is_some());
         let threshold = match self.threshold {
             Some(value) => value.to_string(),
             None => "none".to_owned(),
@@ -1417,6 +1676,11 @@ impl PromotionComment<'_> {
         if let Some((consequence, reason)) = self.override_note {
             text.push_str(&format!(" consequence={consequence} reason={reason}"));
         }
+        if let Some(verified) = self.verified {
+            let receipt = serde_json::to_string(verified)
+                .expect("promotion receipt contains only strings and an integer");
+            text.push_str(&format!(" verified={receipt}"));
+        }
         text
     }
 }
@@ -1427,6 +1691,8 @@ fn validate_evidence(
 ) -> io::Result<(usize, Option<(String, String)>)> {
     let counted = ledger.counted();
     match evidence {
+        // The promotion owner validates the live mandate before any effects.
+        PromotionEvidence::VerifiedImprovement(_) => Ok((counted, None)),
         PromotionEvidence::Votes { threshold } => {
             if *threshold < 2 {
                 return Err(invalid("vote threshold must be at least 2"));
@@ -1495,6 +1761,25 @@ fn require_open_incubator_snapshot(snapshot: &IssueSnapshot, item_id: &str) -> i
     Ok(())
 }
 
+fn mark_improvement_purpose(
+    bd: &Path,
+    project: &Path,
+    item: &str,
+    actor: Option<&str>,
+) -> io::Result<()> {
+    let metadata = format!(
+        "{}={}",
+        crate::delivery_reflection::PURPOSE_METADATA,
+        crate::delivery_reflection::Purpose::Improvement.as_str()
+    );
+    let args = ["update", item, "--set-metadata", &metadata, "--json"];
+    match actor {
+        Some(actor) => json_ok_actor(bd, project, actor, &args)?,
+        None => json_ok(bd, project, &args)?,
+    };
+    Ok(())
+}
+
 /// Completes a promotion whose record is already on the board. The recorded
 /// history is authoritative: the outcome is returned as recorded and only the
 /// label operations a partial run may have missed are reconciled, so a retry
@@ -1525,6 +1810,9 @@ fn reconcile_promotion(
             record.target.as_deref().unwrap_or("none")
         )));
     }
+    if record.verified.is_some() {
+        mark_improvement_purpose(bd, project, item_id, None)?;
+    }
     let incubating = labels.iter().any(|label| label == INCUBATOR_LABEL);
     let routed = labels.iter().any(|label| label == record.route.label());
     if incubating {
@@ -1547,6 +1835,7 @@ fn reconcile_promotion(
         target: record.target.clone(),
         counted: record.counted,
         override_used: record.override_used,
+        verified: record.verified.clone(),
         already_recorded: true,
     })
 }
@@ -1727,6 +2016,31 @@ fn bounded_slug(value: &str) -> String {
     slug.trim_matches('-').to_owned()
 }
 
+/// Carries derived-analysis comments from a merged feedback item to its
+/// canonical item. Existing comments are compared exactly, so an interrupted
+/// or retried merge applies only the comments still missing.
+fn copy_derived_evidence(
+    bd: &Path,
+    project: &Path,
+    incoming: &str,
+    canonical: &str,
+) -> io::Result<()> {
+    if incoming == canonical {
+        return Ok(());
+    }
+    let mut existing = list_comments(bd, project, canonical)?;
+    for comment in list_comments(bd, project, incoming)? {
+        if parse_derived_comment(&comment).is_none()
+            || existing.iter().any(|present| present == &comment)
+        {
+            continue;
+        }
+        json_ok(bd, project, &["comment", canonical, "--json", &comment])?;
+        existing.push(comment);
+    }
+    Ok(())
+}
+
 fn record_vote(
     bd: &Path,
     project: &Path,
@@ -1765,7 +2079,17 @@ struct IssueSnapshot {
 fn load_snapshot(bd: &Path, project: &Path, id: &str) -> io::Result<Option<IssueSnapshot>> {
     let shown = json_ok(bd, project, &["show", id, "--json"])?;
     let issue = issue_object(&shown, id)?;
-    let feedback = parse_description(issue_description(issue)).ok();
+    let mut feedback = parse_description(issue_description(issue)).ok();
+    // The bounded description does not repeat the parent; the board stores it
+    // as the issue's structural parent, which is the authoritative provenance.
+    if let Some(feedback) = feedback.as_mut()
+        && let Some(parent) = issue
+            .get("parent")
+            .and_then(Value::as_str)
+            .filter(|parent| !parent.is_empty())
+    {
+        feedback.parent_id = parent.to_owned();
+    }
     Ok(Some(IssueSnapshot {
         status: issue_status(issue),
         labels: issue_labels(issue),
@@ -1888,6 +2212,40 @@ fn parse_vote_comment(comment: &str) -> Option<VoteRecord> {
     })
 }
 
+fn parse_derived_comment(comment: &str) -> Option<DerivedRecord> {
+    let rest = comment.strip_prefix(DERIVED_PREFIX)?.trim_start();
+    let (head, analysis) = rest.split_once(" analysis=")?;
+    let mut source = None;
+    let mut source_reporter = None;
+    let mut source_kind = None;
+    let mut reporter = None;
+    let mut episode = None;
+    let mut parent_id = None;
+    for part in head.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "source" => source = Some(value.to_owned()),
+            "source_reporter" => source_reporter = Some(value.to_owned()),
+            "source_kind" => source_kind = ReporterKind::parse(value).ok(),
+            "reporter" => reporter = Some(value.to_owned()),
+            "episode" => episode = Some(value.to_owned()),
+            "parent" => parent_id = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    Some(DerivedRecord {
+        source: source?,
+        source_reporter: source_reporter?,
+        source_kind: source_kind?,
+        reporter: reporter?,
+        episode: episode?,
+        parent_id: parent_id?,
+        analysis: analysis.to_owned(),
+    })
+}
+
 fn parse_merge_comment(comment: &str) -> Option<MergeRecord> {
     let rest = comment.strip_prefix(MERGE_PREFIX)?.trim();
     let mut from = None;
@@ -1935,7 +2293,11 @@ fn parse_promotion_comment(comment: &str) -> Option<PromotionRecord> {
     let rest = comment.strip_prefix(PROMOTE_PREFIX)?.trim();
     // Free-text override fields follow the structured tokens and may contain
     // spaces, so only the head before them is parsed.
-    let head = rest.split(" consequence=").next()?;
+    let head = rest
+        .split(" consequence=")
+        .next()?
+        .split(" verified=")
+        .next()?;
     let mut route = None;
     let mut basis = None;
     let mut counted = None;
@@ -1957,10 +2319,25 @@ fn parse_promotion_comment(comment: &str) -> Option<PromotionRecord> {
             _ => {}
         }
     }
+    let basis = basis?;
+    let verified = match basis.as_str() {
+        "votes" | "override" => None,
+        "verified-improvement" => {
+            let (_, receipt) = rest.split_once(" verified=")?;
+            let record: VerifiedImprovementRecord = serde_json::from_str(receipt).ok()?;
+            require_field("binding", &record.binding, MAX_REASON).ok()?;
+            require_field("lead", &record.lead, MAX_REASON).ok()?;
+            require_field("acceptance", &record.acceptance, MAX_REASON).ok()?;
+            require_field("reason", &record.reason, MAX_REASON).ok()?;
+            Some(record)
+        }
+        _ => return None,
+    };
     Some(PromotionRecord {
         route: route?,
         counted: counted?,
-        override_used: basis? == "override",
+        override_used: basis == "override",
+        verified,
         target,
     })
 }
@@ -2230,6 +2607,23 @@ mod tests {
     }
 
     #[test]
+    fn derived_comment_round_trip_retains_source_and_never_counts_as_a_vote() {
+        let record = DerivedRecord {
+            source: "bdct-1.1.2".to_owned(),
+            source_reporter: "exec-b".to_owned(),
+            source_kind: ReporterKind::Executor,
+            reporter: "reflection-a".to_owned(),
+            episode: "e2".to_owned(),
+            parent_id: "bdct-1.1".to_owned(),
+            analysis: "the wait follows the tool result".to_owned(),
+        };
+        let ledger = parse_ledger(&[format_derived_comment(&record)]);
+        assert_eq!(ledger.derived, vec![record]);
+        assert_eq!(ledger.votes.len(), 0);
+        assert_eq!(ledger.counted(), 0);
+    }
+
+    #[test]
     fn kit_batch_limit_matches_orchestration_knob() {
         let text = include_str!("../../../global/orchestration.toml");
         assert!(text.contains("feedback_batch_limit = 8"));
@@ -2241,6 +2635,8 @@ mod tests {
         let board = include_str!("../../../.agents/skills/board-workflow/SKILL.md");
         let lead = include_str!("../../../.agents/skills/team-lead/SKILL.md");
         assert!(board.contains("codex-harness feedback record"));
+        assert!(board.contains("--source-feedback"));
+        assert!(board.contains("feedback-derived v1"));
         assert!(board.contains("Do not use `bd find-duplicates`"));
         assert!(board.contains("codex-harness feedback triage"));
         assert!(board.contains("codex-harness feedback promote"));
@@ -2730,6 +3126,7 @@ mod tests {
             threshold: Some(3),
             target: None,
             override_note: None,
+            verified: None,
         }
         .format();
         assert!(comment.contains("basis=votes"));
@@ -2740,6 +3137,7 @@ mod tests {
                 route: PromotionRoute::BacklogTask,
                 counted: 3,
                 override_used: false,
+                verified: None,
                 target: None,
             }
         );
@@ -2754,6 +3152,7 @@ mod tests {
             threshold: None,
             target: Some("kit:prb-1"),
             override_note: Some(&note),
+            verified: None,
         }
         .format();
         assert!(
@@ -2762,6 +3161,32 @@ mod tests {
         let ledger = parse_ledger(&[comment]);
         assert!(ledger.promotions[0].override_used);
         assert_eq!(ledger.promotions[0].target.as_deref(), Some("kit:prb-1"));
+
+        let verified = VerifiedImprovementRecord {
+            binding: "binding-fixture".into(),
+            revision: 1,
+            lead: "lead-fixture".into(),
+            acceptance: "acceptance-fixture".into(),
+            reason: "fix a verified wait; target=unrelated is only reason text".into(),
+        };
+        let comment = PromotionComment {
+            route: PromotionRoute::BacklogTask,
+            counted: 1,
+            threshold: None,
+            target: None,
+            override_note: None,
+            verified: Some(&verified),
+        }
+        .format();
+        let ledger = parse_ledger(&[comment]);
+        assert_eq!(ledger.promotions.len(), 1);
+        assert_eq!(ledger.promotions[0].basis(), "verified-improvement");
+        assert_eq!(ledger.promotions[0].verified.as_ref(), Some(&verified));
+        assert_eq!(ledger.promotions[0].target, None);
+        assert!(!ledger.promotions[0].override_used);
+        assert!(parse_promotion_comment(
+            "feedback-promote v1 route=backlog-task basis=verified-improvement counted=1 threshold=none target=none"
+        ).is_none());
 
         let ledger = parse_ledger(&[]);
         let error =
@@ -3508,6 +3933,16 @@ mod tests {
             ReporterKind::Lead,
             &parent,
         );
+        let derived = record_derived_feedback(
+            &bd,
+            &project,
+            &second,
+            "reflection-private",
+            "private analysis of the dispatch naming mismatch",
+        )
+        .unwrap();
+        assert!(derived.written);
+        assert_eq!(derived.target_id, second);
         apply_routed_triage(
             &bd,
             &project,
@@ -3531,6 +3966,12 @@ mod tests {
             DEFAULT_FEEDBACK_BATCH_LIMIT,
         )
         .unwrap();
+        // The merge carries the derived analysis to the canonical private
+        // item; promotion must not carry it into the kit board.
+        let private_ledger = inspect_ledger(&bd, &project, &first).unwrap();
+        assert_eq!(private_ledger.derived.len(), 1);
+        assert_eq!(private_ledger.derived[0].source, second);
+        assert_eq!(private_ledger.counted(), 3);
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let threshold = crate::orchestration_config::load(&root)
@@ -3578,9 +4019,23 @@ mod tests {
             description.contains("board-workflow skill: document promotion and hygiene labels")
         );
         assert!(description.contains("scope: kit skill: board-workflow"));
-        for private in [observation, "exec-k", "e7", &parent] {
+        for private in [
+            observation,
+            "exec-k",
+            "e7",
+            &parent,
+            "private analysis of the dispatch naming mismatch",
+            "reflection-private",
+            second.as_str(),
+        ] {
             assert!(!description.contains(private), "kit item leaked {private}");
         }
+        let kit_comments = list_comments(&bd, &kit_project, &kit_id).unwrap();
+        assert!(
+            !kit_comments
+                .iter()
+                .any(|comment| comment.starts_with("feedback-derived v1"))
+        );
         assert!(
             issue_labels(kit_item)
                 .iter()

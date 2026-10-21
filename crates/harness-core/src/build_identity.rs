@@ -492,6 +492,20 @@ mod tests {
     }
 
     #[test]
+    fn toolchain_selector_is_a_native_input_and_invalidates_prior_builds() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, build) = build_fixture(temp.path());
+        assert_eq!(check(&build, None).status, Health::Healthy);
+        let selector = root.join("rust-toolchain.toml");
+        fs::write(&selector, "[toolchain]\nchannel = \"1.98.1\"\n").unwrap();
+        let pinned = source_identity(&root).unwrap();
+        assert!(pinned.files.contains_key("rust-toolchain.toml"));
+        assert_eq!(check(&build, None).status, Health::SourceStale);
+        fs::write(&selector, "[toolchain]\nchannel = \"1.98.0\"\n").unwrap();
+        assert_ne!(source_identity(&root).unwrap(), pinned);
+    }
+
+    #[test]
     fn nested_module_names_and_compiled_text_are_native_inputs() {
         let temp = tempfile::tempdir().unwrap();
         source(temp.path());

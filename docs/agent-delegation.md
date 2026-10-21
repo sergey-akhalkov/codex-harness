@@ -59,7 +59,7 @@ profile or a non-positive limit without substituting another route. `default`
 is the native session with no `--profile` flag. Other names must exist as
 `CODEX_HOME/<name>.config.toml` or `[profiles.<name>]`. Pool capacity comes
 from `worktree_pool_size`, independent of `max_concurrent_executors`; the
-shipped default is four for each, and `worktree_limit` stays
+shipped default is six for each, and `worktree_limit` stays
 compatibility-only. Install and update materialize the explicit setting for a
 configuration written before the capacity split - including a checkout still
 carrying the old shipped defaults - writing its former effective capacity
@@ -72,8 +72,8 @@ schema = 1
 lead_profile = "default"
 successor_lead_profile = "default"
 executor_profiles = ["ds"]
-max_concurrent_executors = 4
-worktree_pool_size = 4
+max_concurrent_executors = 6
+worktree_pool_size = 6
 ```
 
 Dispatch an executor with the installed launcher:
@@ -409,6 +409,13 @@ codex-harness executor watch --receipt FILE [--json]
 
 Keep one watcher per run. Short tool yields continue that watcher; at the supervision boundary use one compact `executor pool` snapshot and, only if progress is unclear, inspect the latest bounded evidence once. Process existence, log growth, elapsed time, silence and a missing patch prove neither progress nor a stall.
 
+For that diagnostic inspection, `detailTruncated=true` means the detail stream
+retains an initial prefix. Its tail can contain old commands while the receipt's
+`updatedMs` continues advancing. Check the event identity and freshness before
+acting. When current detail is missing, inspect bounded visible tool events
+from the exact native session; preserve the gap and leave the completion watcher
+running. Never interpret opaque reasoning or compaction state as activity.
+
 `executor run --file` is the visible host. It propagates the launcher outcome, treats an empty completion as an output defect, and never presents a completion record as proof that claimed checks passed. Exact-session recovery is the worktree resume command; cache loss uses the fresh restart below.
 
 An attachment timeout includes at most 4096 UTF-8 bytes of visible console text,
@@ -422,6 +429,8 @@ original timeout or changing its cleanup.
 Steer a continuing run by piping content into `codex-harness executor message`; a short `--text` or explicit UTF-8 `--file` remains a fallback. With one live run the command resolves and verifies checkout, home, slot, owner and exact session itself; several runs produce a bounded listing that names `--slot`. Oversized piped input spills automatically and is reported as spill evidence, never confused with model delivery. Message only to add a fact, resolve a request or correct an established mistake—not for status, hurry or repetition without new facts.
 
 An executor asks through `codex-harness lead message` from piped/text/file input; `--notify` sends a no-reply notice. The request reference lets the lead answer with `codex-harness executor message --reply-to MESSAGE_ID`, continuing the same conversation without reconstructing an address or resuming. `lead start` registers the lead endpoint that spawn inherits; that managed endpoint steers an active turn and starts an idle one on the exact thread. When a dispatch recorded no per-spawn endpoint, the command resolves only the managed registry record for that exact originating thread under the lead home recorded at dispatch, which `lead start --session THREAD` publishes after resuming the same thread. It never starts a second conversation or listener, never uses a registry record from another home or for another thread, and never replaces a malformed, mismatched or stale per-spawn endpoint.
+
+The default `codex-harness lead start` host remains persistent: it keeps its visible native frontend and owned app-server alive after a turn so asynchronous reflection delivery can reach the idle thread. For one finite assignment, pass `--once` with exactly one of `--exec PROMPT` or `--exec-file FILE`. The prompt is submitted after the frontend attaches, and only the newly assigned turn's terminal result can end the host; a resumed thread's earlier completion, frontend exit, silence or elapsed time is not completion. On a completed turn with a nonempty final assistant message, the command prints the result, closes its owned frontend and app-server, retires its endpoint and exits zero only when cleanup is confirmed. Failure, interruption, a protocol defect, empty or missing output, or unconfirmed cleanup exits nonzero; any partial output remains visible and is labeled as not a success. `--once` without a prompt refuses before starting anything.
 
 New control endpoints name the child's resolved executable image, not the
 mutable `harness/bin/codex.exe` link. A record written by an older build can
@@ -595,7 +604,12 @@ is no mandatory escalation ladder.
 ## Global connection and limits
 
 The [harness profile](../global/harness.config.toml) contains a short standing
-policy and a limit of two concurrent child threads.
+policy and a limit of two concurrent native in-session child threads. Harness
+`executor spawn` launches separate sessions governed by
+`max_concurrent_executors` in [orchestration.toml](../global/orchestration.toml);
+the lead is not included in that executor count. Apply each limit only to its
+dispatch mechanism, as specified by the
+[lead responsibility](../global/roles/lead.md#assignment-and-routing).
 The [former Astra source directory](../global/agents/README.md) remains linked
 at `~/.codex/agents/codex-harness` for installer compatibility and contains no
 presets. OpenCodex routing, including its subscription middle, is retired;

@@ -53,6 +53,26 @@ codex-harness feedback record --project <project> --parent <feature> --observati
 Do not paste transcripts. `--kind diagnostic` records the observation but must
 not count as a vote.
 
+A reflection's restatement is derived analysis, not another report or vote.
+The real lead records it against the existing feedback item whose episode it
+analyzes; reflection forks do not write to the board:
+
+```powershell
+codex-harness feedback record --project <project> --source-feedback <item> --observation "bounded analysis" --reporter reflection-a --kind derived-evidence
+```
+
+`--source-feedback` is required for derived intake and is only valid with
+`--kind derived-evidence`. Omit `--episode`, `--scope` and `--parent`: the
+source board record owns them. The command validates the source before writing,
+then records a `feedback-derived v1` comment on that item (or its canonical
+item after a merge). It creates no feedback card and no vote. Identical replay
+returns `record=already-recorded`. A missing, non-feedback or already-derived
+source is refused before any board write. `feedback ledger` reports
+`derived=<n>` with each retained source and reflection; merge triage copies
+derived comments to the canonical item once, so retries and partial failures
+preserve attribution without counting another episode. Derived analysis stays
+private consuming-project provenance and is not kit-ready wording.
+
 ## Batch triage
 
 The lead selects similarity and kind at a safe boundary. Inspect
@@ -122,6 +142,24 @@ or tools go to the kit's own board with kit-level wording only - no reporter,
 episode, project path or raw observation. Promotion keeps every vote, merge and
 route comment as history and confers eligibility for planning, not
 implementation authority; it never writes a skill package.
+
+An active reflection mandate also permits one evidenced bounded correction
+without waiting for repeated reports. The real lead uses
+`feedback promote --project <project> --item <id> --verified-work <accepted-work> --improvement-reason "evidence and correction"`
+with the appropriate route above. The command derives the caller from
+`CODEX_THREAD_ID`, checks the current project/lead binding and live accepted
+work, and refuses missing, unrelated, reopened or stale work before writing.
+The reason is bounded to 160 UTF-8 bytes. Reflection forks cannot use the
+real lead's binding. This is `basis=verified-improvement`, separate from votes
+and the material-consequence override; the two flag pairs cannot be combined.
+
+Promotion retains the existing votes, records the work binding on the private
+source item and marks the remedy `harness.purpose=improvement`. A kit remedy
+receives only its explicit public summary/scope, improvement purpose and the
+neutral routing actor; private work/lead references stay on the source board.
+Retries reuse the recorded promotion and repair incomplete source labels/purpose
+without another task or vote. This admission does not waive ordinary routing,
+OpenSpec, skill evaluation, acceptance or the benefit gate below.
 
 Lead consequence override: with material correctness, integrity or safety
 evidence, pass both `--override-consequence TEXT` and `--override-reason TEXT`.
@@ -215,6 +253,38 @@ Custom status `lead_review` (wip): configure with
 On a new lead session: read the board first (`lead_review`, assignee `lead`,
 ready work). Create new tasks for new situation; do not re-open completed
 verification.
+
+### Structured acceptance
+
+After reviewing a structured executor result, accept it from the real managed
+lead conversation:
+
+```powershell
+codex-harness executor accept <task> --project <project>
+```
+
+Add the common `--source <checkout>` or `--codex-home <directory>` only when
+they differ from the project/default home. The command authenticates the current
+native lead endpoint, derives the assignment, result, executor session/turn and
+current lead turn from the retained completion, then records acceptance and
+closes through the board owner. Do not hand-author identity or request JSON, and
+do not substitute a plain close when that structured completion should be
+accepted.
+
+Use `--run <generation>` only to resolve an explicitly reported ambiguous
+selection. It never bypasses a newer retained completion or an unresolved
+same-task correction that is active, starting or awaiting review; resolve or
+accept the newest result instead. A repeat for the same accepted result is a
+no-op. Foreign leads, stale board scope or purpose, a stale explicit run,
+changed results, cancelled/unrelated closures, and missing or ambiguous exact
+turns are refused before board effects.
+
+Automatic reflection requires an active reflection binding, ordinary purpose,
+and exact executor and lead turns. Improvement work and a mode-off binding
+close normally and run no reflection. A legacy accepted record without exact
+turn provenance still repeats but reports reflection ineligibility. Tasks
+without a structured retained completion keep the existing ordinary `bd close`
+workflow.
 
 For a requested continuous improvement loop, use `self-improvement-loop` and
 the [sequential comparison record guide](references/self-improvement.md).

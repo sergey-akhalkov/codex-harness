@@ -20,7 +20,8 @@
 //! reservation-less session slot whose recorded session is not live; a slot
 //! holding unreviewed work, and any slot holding a task binding, stays held
 //! until the lead merges it, records an explicit discard or releases the task.
-use crate::build_identity::hash_bytes;
+use crate::build_identity::{hash_bytes, hash_file};
+use crate::delivery_reflection::{Purpose, SourceIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -478,6 +479,110 @@ pub enum ReservationLiveness {
     Uncertain,
 }
 
+/// The verified consumer-board task one ordinary assignment executes, retained
+/// with the slot and dispatch receipt. The board scope, issue and assignment
+/// content hash are the binding identity; the board revision is the observation
+/// taken at resolution. An absent `purpose` is explicitly unknown and never
+/// becomes ordinary by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SlotAssignmentBinding {
+    pub source: SourceIdentity,
+    pub issue: String,
+    pub assignment_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    pub purpose_source: String,
+}
+
+impl SlotAssignmentBinding {
+    /// The effective purpose, or `None` when the declaration and its known
+    /// board lineage left it unknown.
+    pub fn effective_purpose(&self) -> io::Result<Option<Purpose>> {
+        self.purpose.as_deref().map(Purpose::parse).transpose()
+    }
+
+    /// Acceptance and reflection eligibility require a validated purpose.
+    /// Unknown is retained as unknown, not silently treated as eligible.
+    pub fn purpose_known(&self) -> bool {
+        self.purpose.is_some()
+    }
+
+    /// The identity that makes a repeated dispatch the same binding. Board
+    /// revision churn and provenance wording do not create a new binding;
+    /// a different board scope, issue, assignment content or effective
+    /// purpose is a conflict.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.source.same_scope(&other.source)
+            && self.issue == other.issue
+            && self.assignment_sha256 == other.assignment_sha256
+            && self.purpose == other.purpose
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        for (field, value) in [
+            ("project_id", &self.source.project_id),
+            ("beads_dir", &self.source.beads_dir),
+            ("database", &self.source.database),
+            ("repo_root", &self.source.repo_root),
+            ("branch", &self.source.branch),
+            ("commit", &self.source.commit),
+            ("issue", &self.issue),
+            ("purpose_source", &self.purpose_source),
+        ] {
+            if value.trim().is_empty() {
+                return Err(pool_error(&format!(
+                    "assignment binding has an empty {field}; the lead resolves or removes the record"
+                )));
+            }
+        }
+        if self.assignment_sha256.len() != 64
+            || !self
+                .assignment_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(pool_error(
+                "assignment binding has no sha256 assignment content identity; the lead resolves or removes the record",
+            ));
+        }
+        if self.issue.chars().any(char::is_whitespace) {
+            return Err(pool_error(
+                "assignment binding issue id contains whitespace; the lead resolves or removes the record",
+            ));
+        }
+        let source_valid = match self.purpose_source.as_str() {
+            "declared" | "board" | "unknown" => true,
+            source => source
+                .strip_prefix("ancestor:")
+                .is_some_and(|ancestor| !ancestor.is_empty()),
+        };
+        if !source_valid {
+            return Err(pool_error(
+                "assignment binding has an unrecognized purpose source; the lead resolves or removes the record",
+            ));
+        }
+        match self.purpose.as_deref() {
+            Some(raw) => {
+                Purpose::parse(raw)?;
+                if self.purpose_source == "unknown" {
+                    return Err(pool_error(
+                        "assignment binding records a known purpose with unknown provenance; the lead resolves or removes the record",
+                    ));
+                }
+            }
+            None => {
+                if self.purpose_source != "unknown" {
+                    return Err(pool_error(
+                        "assignment binding records unknown purpose with a known provenance; the lead resolves or removes the record",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Kit-local task-state record of one pool slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -511,6 +616,10 @@ pub struct SlotRecord {
     /// records written before startup reservations, which keep session liveness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup: Option<StartupReservation>,
+    /// Verified consumer-board task and assignment identity of the run this
+    /// binding holds. Absent on legacy records and unbound dispatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<Box<SlotAssignmentBinding>>,
 }
 
 /// Private slot state root shared by every checkout of one repository. The
@@ -528,6 +637,606 @@ pub fn pool_state_dir(codex_home: &Path, source: &Path) -> io::Result<PathBuf> {
         // per-path directory so status commands stay total.
         Err(_) => Ok(state_dir(codex_home, file_name_of(&source), &source)),
     }
+}
+
+/// Version of the retained per-run completion manifest.
+pub const COMPLETION_SCHEMA: u32 = 1;
+
+/// The assignment identity a run actually submitted, retained beside its
+/// completion facts. Acceptance needs this explicit marker: a board-bound slot
+/// can also be continued with free text or a restart handoff, and neither may
+/// silently read as the bound structured ordinary assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssignmentSubmission {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_sha256: Option<String>,
+}
+
+impl AssignmentSubmission {
+    pub const STRUCTURED: &'static str = "structured";
+    pub const FREE_TEXT: &'static str = "freeText";
+    pub const RESTART: &'static str = "restart";
+
+    pub fn structured(assignment_sha256: impl Into<String>) -> Self {
+        Self {
+            kind: Self::STRUCTURED.to_owned(),
+            assignment_sha256: Some(assignment_sha256.into()),
+        }
+    }
+
+    pub fn free_text() -> Self {
+        Self {
+            kind: Self::FREE_TEXT.to_owned(),
+            assignment_sha256: None,
+        }
+    }
+
+    pub fn restart() -> Self {
+        Self {
+            kind: Self::RESTART.to_owned(),
+            assignment_sha256: None,
+        }
+    }
+}
+
+/// Stable copy of one run's result, retained with the run generation rather
+/// than the slot index a later dispatch overwrites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionResult {
+    pub locator: PathBuf,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// Source observation taken at the completion boundary: the exact checkout
+/// revision that produced the result and whether that checkout carried
+/// uncommitted or untracked work. A missing observation stays explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Whether the retained facts may feed ordinary lead acceptance and automatic
+/// reflection. Every reason is an observed fact, never a guessed status; a
+/// run with any reason stays retrievable for review but is not eligible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionEligibility {
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+}
+
+/// One terminal run's retained acceptance facts. The run generation is the
+/// identity; the slot index is provenance only and may be reused afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedCompletion {
+    pub schema: u32,
+    pub run_generation: String,
+    pub recorded_ms: u64,
+    pub slot: u32,
+    pub owner: String,
+    pub checkout: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<SlotAssignmentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_assignment: Option<AssignmentSubmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CompletionResult>,
+    pub source: CompletionSource,
+    pub eligibility: CompletionEligibility,
+}
+
+/// The terminal facts the native run owner hands to the completion artifact
+/// owner. The result path is the run's own per-slot final message; this owner
+/// copies it into the run-generation directory before any slot reuse.
+#[derive(Debug, Clone)]
+pub struct CompletionFacts {
+    pub run_generation: String,
+    pub slot: u32,
+    pub owner: String,
+    pub checkout: PathBuf,
+    pub task: Option<String>,
+    pub handle: Option<String>,
+    pub assignment: Option<SlotAssignmentBinding>,
+    pub submitted_assignment: Option<AssignmentSubmission>,
+    pub role: Option<String>,
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub session: Option<String>,
+    pub turn: Option<String>,
+    pub result: Option<PathBuf>,
+}
+
+/// Retains one terminal run's exact acceptance facts beside the pool state.
+///
+/// The result bytes are copied into `completions/<run-generation>/` before the
+/// manifest is written, so releasing and reusing the slot index cannot replace
+/// the acceptance input. A generation is retained once: repeating the call
+/// returns the existing manifest instead of overwriting it. Ineligible runs
+/// are retained too, with their observed reasons, so refusal is reviewable and
+/// ordinary output and partial work stay untouched.
+pub fn retain_completion(
+    state_dir: &Path,
+    facts: &CompletionFacts,
+) -> io::Result<RetainedCompletion> {
+    let dir = completion_generation_dir(state_dir, &facts.run_generation)?;
+    let manifest = dir.join("completion.json");
+    if manifest.is_file() {
+        let retained = read_completion_manifest(&manifest)?;
+        if retained.run_generation != facts.run_generation {
+            return Err(pool_error(&format!(
+                "retained completion {} names run generation '{}' instead of '{}'; refusing to replace a prior run's acceptance input",
+                manifest.display(),
+                retained.run_generation,
+                facts.run_generation
+            )));
+        }
+        return Ok(retained);
+    }
+    fs::create_dir_all(&dir)?;
+    let (result, result_reason) = retain_completion_result(&dir, facts.result.as_deref())?;
+    let source = observe_completion_source(&facts.checkout);
+    let mut reasons = Vec::new();
+    if let Some(reason) = result_reason {
+        reasons.push(reason);
+    }
+    reasons.extend(completion_ineligibility_reasons(
+        facts,
+        result.is_some(),
+        &source,
+    ));
+    let retained = RetainedCompletion {
+        schema: COMPLETION_SCHEMA,
+        run_generation: facts.run_generation.clone(),
+        recorded_ms: completion_now_ms(),
+        slot: facts.slot,
+        owner: facts.owner.clone(),
+        checkout: facts.checkout.clone(),
+        task: facts.task.clone(),
+        handle: facts.handle.clone(),
+        assignment: facts.assignment.clone(),
+        submitted_assignment: facts.submitted_assignment.clone(),
+        role: facts.role.clone(),
+        state: facts.state.clone(),
+        exit_code: facts.exit_code,
+        session: facts.session.clone(),
+        turn: facts.turn.clone(),
+        result,
+        source,
+        eligibility: CompletionEligibility {
+            eligible: reasons.is_empty(),
+            reasons,
+        },
+    };
+    write_completion_manifest(&manifest, &retained)?;
+    Ok(retained)
+}
+
+/// Loads one run generation's retained completion without consulting the
+/// current slot record, so a released or reused slot cannot change what the
+/// completed run observed. The retained result is re-hashed and an altered or
+/// missing copy downgrades eligibility with an explicit reason.
+pub fn load_retained_completion(
+    codex_home: &Path,
+    repository: &Path,
+    run_generation: &str,
+) -> io::Result<Option<RetainedCompletion>> {
+    let state_dir = pool_state_dir(codex_home, repository)?;
+    let dir = completion_generation_dir(&state_dir, run_generation)?;
+    let manifest = dir.join("completion.json");
+    if !manifest.is_file() {
+        return Ok(None);
+    }
+    let mut retained = read_completion_manifest(&manifest)?;
+    if retained.run_generation != run_generation {
+        return Err(pool_error(&format!(
+            "retained completion {} names run generation '{}' instead of '{}'",
+            manifest.display(),
+            retained.run_generation,
+            run_generation
+        )));
+    }
+    verify_retained_result(&mut retained);
+    Ok(Some(retained))
+}
+
+/// Lists every retained completion for one consumer-board task, oldest first.
+/// Ineligible records are included with their reasons; callers choose among
+/// eligible ones by their own exact criteria instead of reconstructing facts
+/// from slot-indexed files that may already belong to another run.
+pub fn retained_completions_for_task(
+    codex_home: &Path,
+    repository: &Path,
+    issue: &str,
+) -> io::Result<Vec<RetainedCompletion>> {
+    let state_dir = pool_state_dir(codex_home, repository)?;
+    let root = state_dir.join("completions");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut retained = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(generation) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if completion_generation_dir(&state_dir, &generation).is_err() {
+            continue;
+        }
+        let manifest = entry.path().join("completion.json");
+        if !manifest.is_file() {
+            continue;
+        }
+        let mut record = read_completion_manifest(&manifest)?;
+        if record.run_generation != generation {
+            return Err(pool_error(&format!(
+                "retained completion {} names run generation '{}' instead of its directory '{}'",
+                manifest.display(),
+                record.run_generation,
+                generation
+            )));
+        }
+        verify_retained_result(&mut record);
+        if record
+            .assignment
+            .as_ref()
+            .is_some_and(|binding| binding.issue == issue)
+        {
+            retained.push(record);
+        }
+    }
+    retained.sort_by(|left, right| {
+        left.recorded_ms
+            .cmp(&right.recorded_ms)
+            .then_with(|| left.run_generation.cmp(&right.run_generation))
+    });
+    Ok(retained)
+}
+
+fn completion_generation_dir(state_dir: &Path, generation: &str) -> io::Result<PathBuf> {
+    if generation.is_empty()
+        || generation.len() > 128
+        || !generation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(pool_error(&format!(
+            "run generation {generation:?} is not one safe completion directory name; the lead reviews the receipt instead of guessing a path"
+        )));
+    }
+    Ok(state_dir.join("completions").join(generation))
+}
+
+fn retain_completion_result(
+    dir: &Path,
+    result: Option<&Path>,
+) -> io::Result<(Option<CompletionResult>, Option<String>)> {
+    let Some(result) = result else {
+        return Ok((
+            None,
+            Some("the run records no result artifact locator".to_owned()),
+        ));
+    };
+    let metadata = match fs::symlink_metadata(result) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Ok((
+                None,
+                Some(format!(
+                    "the result artifact {} is unavailable: {error}",
+                    result.display()
+                )),
+            ));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Ok((
+            None,
+            Some(format!(
+                "the result artifact {} is not a regular file",
+                result.display()
+            )),
+        ));
+    }
+    if metadata.len() == 0 {
+        return Ok((
+            None,
+            Some(format!("the result artifact {} is empty", result.display())),
+        ));
+    }
+    let sha256 = hash_file(result)?;
+    let locator = dir.join("result.txt");
+    if locator.is_file() {
+        let retained = hash_file(&locator)?;
+        if retained != sha256 {
+            return Err(pool_error(&format!(
+                "retained result {} already exists with a different hash; refusing to overwrite a prior acceptance input",
+                locator.display()
+            )));
+        }
+    } else {
+        let mut input = fs::File::open(result)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&locator)?;
+        io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        let copied = hash_file(&locator)?;
+        if copied != sha256 {
+            let _ = fs::remove_file(&locator);
+            return Err(pool_error(&format!(
+                "the retained result {} does not hash to the source artifact {sha256}; the partial copy was removed",
+                locator.display()
+            )));
+        }
+    }
+    let bytes = fs::metadata(&locator)?.len();
+    Ok((
+        Some(CompletionResult {
+            locator,
+            sha256,
+            bytes,
+        }),
+        None,
+    ))
+}
+
+fn observe_completion_source(checkout: &Path) -> CompletionSource {
+    match git_bytes(checkout, &["rev-parse", "HEAD"]) {
+        Ok(bytes) => {
+            let revision = String::from_utf8_lossy(&bytes).trim().to_owned();
+            match git_bytes(
+                checkout,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            ) {
+                Ok(status) => CompletionSource {
+                    revision: Some(revision),
+                    dirty: Some(!status.is_empty()),
+                    error: None,
+                },
+                Err(error) => CompletionSource {
+                    revision: Some(revision),
+                    dirty: None,
+                    error: Some(format!(
+                        "the checkout clean/dirty state is unavailable: {error}"
+                    )),
+                },
+            }
+        }
+        Err(error) => CompletionSource {
+            revision: None,
+            dirty: None,
+            error: Some(format!("the source revision is unavailable: {error}")),
+        },
+    }
+}
+
+fn completion_ineligibility_reasons(
+    facts: &CompletionFacts,
+    result_present: bool,
+    source: &CompletionSource,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    match facts.role.as_deref() {
+        Some("executor") => {}
+        Some(role) => reasons.push(format!(
+            "the run role is '{role}', not an ordinary executor"
+        )),
+        None => reasons.push(
+            "the receipt records no run role; an unrecorded role is never an ordinary executor"
+                .to_owned(),
+        ),
+    }
+    if facts.state != "completed" {
+        reasons.push(format!(
+            "the terminal state is '{}', not completed",
+            facts.state
+        ));
+    }
+    match facts.exit_code {
+        Some(0) => {}
+        Some(code) => reasons.push(format!("the run exited with code {code}, not 0")),
+        None => reasons.push("the run records no observed exit code".to_owned()),
+    }
+    if facts.task.as_deref().is_none_or(str::is_empty) {
+        reasons.push("the run records no durable task binding".to_owned());
+    }
+    if facts.handle.as_deref().is_none_or(str::is_empty) {
+        reasons.push("the run records no non-reusable task generation handle".to_owned());
+    }
+    match facts.assignment.as_ref() {
+        None => reasons.push(
+            "the run records no verified consumer-board assignment; unbound work never becomes ordinary board work"
+                .to_owned(),
+        ),
+        Some(binding) => {
+            // The durable task label and the board issue are distinct
+            // identities: the label names the executor-owned slot binding,
+            // while the board assignment names the consumer task it serves.
+            match binding.effective_purpose() {
+                Ok(Some(Purpose::Ordinary)) => {}
+                Ok(Some(purpose)) => reasons.push(format!(
+                    "board task '{}' purpose '{}' is not ordinary",
+                    binding.issue,
+                    purpose.as_str()
+                )),
+                Ok(None) => reasons.push(format!(
+                    "board task '{}' records no purpose; unknown purpose never becomes ordinary",
+                    binding.issue
+                )),
+                Err(error) => reasons.push(format!(
+                    "board task '{}' records an invalid purpose: {error}",
+                    binding.issue
+                )),
+            }
+            match facts.submitted_assignment.as_ref() {
+                None => reasons.push(
+                    "the receipt records no submitted-assignment identity; a legacy or unrecorded run is not the bound structured assignment"
+                        .to_owned(),
+                ),
+                Some(submitted) if submitted.kind != AssignmentSubmission::STRUCTURED => {
+                    reasons.push(format!(
+                        "the submitted assignment kind is '{}', not the bound structured assignment '{}'",
+                        submitted.kind, binding.issue
+                    ));
+                }
+                Some(submitted) => match submitted.assignment_sha256.as_deref() {
+                    None => reasons.push(
+                        "the submitted structured assignment records no content hash".to_owned(),
+                    ),
+                    Some(hash) if hash != binding.assignment_sha256 => reasons.push(format!(
+                        "the submitted assignment {hash} does not match the bound assignment {}",
+                        binding.assignment_sha256
+                    )),
+                    Some(_) => {}
+                },
+            }
+        }
+    }
+    if facts
+        .session
+        .as_deref()
+        .is_none_or(|session| session.trim().is_empty())
+    {
+        reasons.push("the run records no exact native executor session".to_owned());
+    }
+    if facts
+        .turn
+        .as_deref()
+        .is_none_or(|turn| turn.trim().is_empty())
+    {
+        reasons.push(
+            "the run records no exact completed native turn; a turn is never inferred from recency"
+                .to_owned(),
+        );
+    }
+    if !result_present {
+        reasons
+            .push("the run retains no readable nonempty result artifact for acceptance".to_owned());
+    }
+    if source
+        .revision
+        .as_deref()
+        .is_none_or(|revision| revision.trim().is_empty())
+    {
+        reasons.push(
+            source
+                .error
+                .clone()
+                .unwrap_or_else(|| "the source revision is unavailable".to_owned()),
+        );
+    }
+    match source.dirty {
+        Some(false) => {}
+        Some(true) => reasons.push(
+            "the checkout has uncommitted or untracked work; dirty work is not acceptance-eligible"
+                .to_owned(),
+        ),
+        None => reasons.push(
+            source
+                .error
+                .clone()
+                .unwrap_or_else(|| "the checkout clean/dirty state is unavailable".to_owned()),
+        ),
+    }
+    reasons
+}
+
+fn verify_retained_result(retained: &mut RetainedCompletion) {
+    let Some(result) = retained.result.as_ref() else {
+        return;
+    };
+    let valid = match fs::metadata(&result.locator) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == result.bytes => {
+            hash_file(&result.locator).is_ok_and(|hash| hash == result.sha256)
+        }
+        _ => false,
+    };
+    if !valid {
+        retained.eligibility.eligible = false;
+        retained.eligibility.reasons.push(format!(
+            "the retained result artifact {} is missing or changed since retention; altered evidence is not accepted",
+            result.locator.display()
+        ));
+    }
+}
+
+fn read_completion_manifest(path: &Path) -> io::Result<RetainedCompletion> {
+    let bytes = fs::read(path)?;
+    let retained: RetainedCompletion = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "retained completion {} is not readable: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if retained.schema != COMPLETION_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "retained completion {} uses schema {}, not {COMPLETION_SCHEMA}",
+                path.display(),
+                retained.schema
+            ),
+        ));
+    }
+    Ok(retained)
+}
+
+fn write_completion_manifest(path: &Path, retained: &RetainedCompletion) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(retained).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("retained completion is not serializable: {error}"),
+        )
+    })?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temp, bytes)?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+fn completion_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Directory a build without pool identity used for one checkout path. Kept as
@@ -734,6 +1443,15 @@ fn validate_slot_record(path: &Path, index: u32, record: &SlotRecord) -> io::Res
             )));
         }
         (None, None) => {}
+    }
+    if let Some(assignment) = &record.assignment {
+        if record.task.is_none() {
+            return Err(pool_error(&format!(
+                "slot record {} records an assignment binding without a durable task; the lead resolves or removes the record",
+                path.display()
+            )));
+        }
+        assignment.validate()?;
     }
     Ok(())
 }
@@ -1000,6 +1718,7 @@ pub fn claim_slot_for(
             disposition: None,
             reason: None,
             startup: startup.cloned(),
+            assignment: None,
         };
         if create_slot_record(&record_path, &claim)? {
             return Ok(SlotClaim::Claimed(claim));
@@ -1478,6 +2197,7 @@ fn release_slot_with(
                 owner: None,
                 task: None,
                 handle: None,
+                assignment: None,
                 base: Some(commit.clone()),
                 disposition: Some(disposition),
                 reason: Some(reason.to_owned()),
@@ -1996,6 +2716,22 @@ pub struct TaskSlot {
     pub disposition: Option<SlotDisposition>,
     /// Why the slot is preserved, or why the last operation aborted.
     pub reason: Option<String>,
+}
+
+/// One slot still holding a board-bound task. Acceptance uses this durable
+/// ownership view to distinguish a retained completion from a later dispatch
+/// of the same board issue that has no completion manifest yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAssignment {
+    pub slot: u32,
+    pub state: SlotState,
+    pub task: String,
+    pub handle: String,
+    pub assignment: SlotAssignmentBinding,
+    /// A startup reservation means the slot's run receipt may still describe
+    /// the prior generation. Until the host lease is published, a retained
+    /// completion for this binding cannot prove the current run is finished.
+    pub starting: bool,
 }
 
 impl TaskSlot {
@@ -2628,6 +3364,57 @@ pub fn handoff_task_to_session(
     )))
 }
 
+/// Attach the verified consumer-board task and assignment identity to one
+/// held durable slot binding. The task and generation handle must still own
+/// the slot. Repeating the exact binding is idempotent; a different binding
+/// for the same held task is refused with the record untouched, so an
+/// ordinary dispatch cannot silently replace the work it continues.
+pub fn bind_slot_assignment(
+    codex_home: &Path,
+    source: &Path,
+    index: u32,
+    task: &str,
+    handle: &str,
+    assignment: SlotAssignmentBinding,
+) -> io::Result<SlotRecord> {
+    assignment.validate()?;
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let _lock = lock_slot(codex_home, &root, index)?;
+    refuse_record_conflict(&layout, index)?;
+    let record = load_record_at(&layout, index)?.ok_or_else(|| {
+        pool_error(&format!(
+            "slot {index} has no durable task binding to attach board task '{}' to",
+            assignment.issue
+        ))
+    })?;
+    if record.task.as_deref() != Some(task) || record.handle.as_deref() != Some(handle) {
+        return Err(pool_error(&format!(
+            "slot {index} is no longer bound to task '{task}' generation {handle}; the board binding was not written"
+        )));
+    }
+    if let Some(recorded) = &record.assignment {
+        if recorded.same_binding(&assignment) {
+            return Ok(record);
+        }
+        return Err(pool_error(&format!(
+            "slot {index} task '{task}' is already bound to board task '{}' with assignment {} and purpose {}; refusing board task '{}' with assignment {} and purpose {}",
+            recorded.issue,
+            recorded.assignment_sha256,
+            recorded.purpose.as_deref().unwrap_or("unknown"),
+            assignment.issue,
+            assignment.assignment_sha256,
+            assignment.purpose.as_deref().unwrap_or("unknown")
+        )));
+    }
+    let bound = SlotRecord {
+        assignment: Some(Box::new(assignment)),
+        ..record
+    };
+    write_slot_record(&layout.resolved(index), &bound)?;
+    Ok(bound)
+}
+
 // Public release API kept arity-compatible with its existing callers.
 #[allow(clippy::too_many_arguments)]
 pub fn release_task(
@@ -2701,6 +3488,62 @@ pub fn task_inventory(codex_home: &Path, source: &Path, size: u32) -> io::Result
         slots.push(slot);
     }
     Ok(slots)
+}
+
+/// Lists every non-released pool binding for one board issue. A record in
+/// occupied, startup or awaiting-review state still owns work for that issue;
+/// a released record has already cleared its task and assignment and is not a
+/// reason to keep an older completed result from being accepted.
+pub fn unresolved_assignments_for_issue(
+    codex_home: &Path,
+    source: &Path,
+    issue: &str,
+) -> io::Result<Vec<UnresolvedAssignment>> {
+    if issue.trim().is_empty() {
+        return Err(pool_error(
+            "an unresolved-assignment lookup requires a non-empty board issue",
+        ));
+    }
+    let root = pool_root(source)?;
+    let layout = slot_state_layout(codex_home, &root)?;
+    let mut unresolved = Vec::new();
+    for index in recorded_indexes(&layout)? {
+        let Some(record) = load_record_at(&layout, index)? else {
+            continue;
+        };
+        refuse_record_conflict(&layout, index)?;
+        if !same_repository(&record.source, &root) {
+            return Err(pool_error(&format!(
+                "slot record {index} belongs to another source checkout {}; unresolved board assignments cannot be verified",
+                record.source.display()
+            )));
+        }
+        let Some(assignment) = record.assignment.as_deref() else {
+            continue;
+        };
+        if assignment.issue != issue
+            || matches!(record.state, SlotState::Free | SlotState::Released)
+        {
+            continue;
+        }
+        let task = record
+            .task
+            .as_deref()
+            .expect("validated assignment record has a task");
+        let handle = record
+            .handle
+            .as_deref()
+            .expect("validated assignment record has a handle");
+        unresolved.push(UnresolvedAssignment {
+            slot: index,
+            state: record.state,
+            task: task.to_owned(),
+            handle: handle.to_owned(),
+            assignment: assignment.clone(),
+            starting: record.startup.is_some(),
+        });
+    }
+    Ok(unresolved)
 }
 
 /// Recorded bindings beyond a proposed pool size. A capacity reduction is
@@ -2907,6 +3750,7 @@ fn claim_task_slot(
             disposition: None,
             reason: None,
             startup: startup.cloned(),
+            assignment: None,
         };
         if create_slot_record(&record_path, &claim)? {
             return Ok(TaskSlotClaim::Claimed(claim));
@@ -3150,6 +3994,11 @@ fn abort_task_claim(
             disposition: None,
             reason: Some(format!("task acquisition aborted: {cause}")),
             startup: None,
+            assignment: if retained {
+                record.assignment.clone()
+            } else {
+                None
+            },
             ..record
         },
     )
@@ -3359,6 +4208,7 @@ fn abort_claim(
         SlotContent::Reusable => SlotState::Free,
         SlotContent::Unreviewed(_) | SlotContent::Missing(_) => SlotState::AwaitingReview,
     };
+    let retained = state == SlotState::AwaitingReview;
     write_slot_record(
         &layout.resolved(index),
         &SlotRecord {
@@ -3367,6 +4217,11 @@ fn abort_claim(
             disposition: None,
             reason: Some(format!("dispatch aborted: {cause}")),
             startup: None,
+            assignment: if retained {
+                record.assignment.clone()
+            } else {
+                None
+            },
             ..record
         },
     )
@@ -3386,6 +4241,7 @@ fn free_slot_record(pool: &Pool, slot: &PoolSlot) -> SlotRecord {
         disposition: None,
         reason: None,
         startup: None,
+        assignment: None,
     }
 }
 
@@ -4363,7 +5219,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// same path, or two linked worktrees of one Git repository. Legacy records
 /// written from a linked checkout keep their old `source` path and are still
 /// this repository's records; they are normalized on their next mutation.
-fn same_repository(left: &Path, right: &Path) -> bool {
+pub fn same_repository(left: &Path, right: &Path) -> bool {
     if same_path(left, right) {
         return true;
     }
@@ -4405,6 +5261,125 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_completion_refuses_missing_turn_result_source_and_dirty_work() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("completion-state");
+        let result = root.path().join("result.txt");
+        fs::write(&result, "ordinary fixture output\n").unwrap();
+        let sha256 = "a".repeat(64);
+        let facts = CompletionFacts {
+            run_generation: "generation-partial".to_owned(),
+            slot: 3,
+            owner: "exec-fixture".to_owned(),
+            checkout: root.path().join("missing-checkout"),
+            task: Some("exec-fixture".to_owned()),
+            handle: Some("handle-fixture".to_owned()),
+            assignment: Some(SlotAssignmentBinding {
+                source: SourceIdentity {
+                    project_id: "project-fixture".to_owned(),
+                    beads_dir: root.path().join(".beads").display().to_string(),
+                    database: "fixture".to_owned(),
+                    repo_root: root.path().display().to_string(),
+                    branch: "main".to_owned(),
+                    commit: "board-commit-fixture".to_owned(),
+                },
+                issue: "task-fixture".to_owned(),
+                assignment_sha256: sha256.clone(),
+                purpose: Some("ordinary".to_owned()),
+                purpose_source: "declared".to_owned(),
+            }),
+            submitted_assignment: Some(AssignmentSubmission::structured(sha256)),
+            role: Some("executor".to_owned()),
+            state: "completed".to_owned(),
+            exit_code: Some(0),
+            session: Some("session-fixture".to_owned()),
+            turn: None,
+            result: Some(result.clone()),
+        };
+
+        let retained = retain_completion(&state, &facts).unwrap();
+        assert!(!retained.eligibility.eligible);
+        assert_eq!(retained.source.dirty, None);
+        for expected in [
+            "no exact completed native turn",
+            "source revision is unavailable",
+        ] {
+            assert!(
+                retained
+                    .eligibility
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains(expected)),
+                "missing reason {expected:?}: {:?}",
+                retained.eligibility.reasons
+            );
+        }
+        // Useful output survives the refusal: the result is retained and
+        // readable even though the run cannot be accepted.
+        let stored = retained.result.as_ref().expect("retained result");
+        assert_eq!(
+            fs::read_to_string(&stored.locator).unwrap(),
+            "ordinary fixture output\n"
+        );
+        assert_eq!(stored.sha256, hash_file(&result).unwrap());
+
+        let missing_result = retain_completion(
+            &state,
+            &CompletionFacts {
+                run_generation: "generation-missing-result".to_owned(),
+                turn: Some("turn-fixture".to_owned()),
+                result: None,
+                ..facts.clone()
+            },
+        )
+        .unwrap();
+        assert!(!missing_result.eligibility.eligible);
+        assert!(
+            missing_result
+                .eligibility
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("no result artifact locator")),
+            "{:?}",
+            missing_result.eligibility.reasons
+        );
+        assert!(missing_result.result.is_none());
+
+        // A committed source with untracked work is observed as dirty and
+        // refused, while its ordinary result stays retained.
+        let dirty_checkout = repo(root.path());
+        fs::write(dirty_checkout.join("partial.txt"), "partial\n").unwrap();
+        let dirty = retain_completion(
+            &state,
+            &CompletionFacts {
+                run_generation: "generation-dirty".to_owned(),
+                checkout: dirty_checkout,
+                turn: Some("turn-fixture".to_owned()),
+                result: Some(result.clone()),
+                ..facts.clone()
+            },
+        )
+        .unwrap();
+        assert!(!dirty.eligibility.eligible);
+        assert_eq!(dirty.source.dirty, Some(true));
+        assert!(
+            dirty
+                .eligibility
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("dirty work is not acceptance-eligible")),
+            "{:?}",
+            dirty.eligibility.reasons
+        );
+        assert!(
+            dirty
+                .result
+                .as_ref()
+                .is_some_and(|stored| stored.locator.is_file())
+        );
+    }
 
     #[test]
     fn audit_counts_the_authoritative_worktree_inventory() {
@@ -5517,6 +6492,7 @@ mod tests {
             disposition: None,
             reason: None,
             startup: None,
+            assignment: None,
         };
         let legacy = SlotRecord {
             source: linked.clone(),
@@ -6394,6 +7370,7 @@ mod tests {
             disposition: None,
             reason: None,
             startup: None,
+            assignment: None,
         };
         fs::write(&path, serde_json::to_vec_pretty(&in_flight).unwrap()).unwrap();
         // The same task is already being acquired elsewhere: the caller gets
@@ -6444,6 +7421,7 @@ mod tests {
                 created: 1,
                 program: std::env::current_exe().unwrap(),
             }),
+            assignment: None,
         };
         fs::write(&path, serde_json::to_vec_pretty(&abandoned).unwrap()).unwrap();
         // The reservation never admitted work (clean tree at the exact base),

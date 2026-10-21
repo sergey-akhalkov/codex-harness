@@ -56,6 +56,7 @@ fn spec_fixture(root: &Path, name: &str) -> RunSpec {
         local_runner: None,
         qualification: None,
         comparison: None,
+        baseline_qualification: None,
         publication_scope: vec![PublicationStage::Experiment],
         oracle: "outcome-oracle:private-request".to_owned(),
         removal: None,
@@ -985,6 +986,7 @@ fn binding_fixture() -> DispatchBinding {
         receipt: PathBuf::from(r"C:\pool\spawn-1.json"),
         session: None,
         host: None,
+        pre_submission: None,
     }
 }
 
@@ -1453,6 +1455,7 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
             revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             name: "workload-b".to_owned(),
             writable_scope: vec!["crates/one".to_owned()],
+            read_only: false,
         },
         runtimes: RuntimeInputs {
             state: state.clone(),
@@ -1480,6 +1483,7 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
         },
         observation_inputs: Vec::new(),
         observation_auth: None,
+        workflow: None,
     });
     spec
 }
@@ -1585,8 +1589,10 @@ fn comparison_inputs_are_validated_before_preparation() {
             implementation_seconds: 1.0,
             evaluation_seconds: 1.0,
             maintenance_seconds_per_task: 0.0,
+            token_accounting: None,
         },
         conjunction: None,
+        payback: None,
     };
     let policy_path = spec.comparison.as_ref().unwrap().policy.clone();
     fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
@@ -1882,6 +1888,58 @@ fn dispatch_gate_applies_configured_bounded_backoff_to_refused_dispatches() {
     assert_eq!(
         dispatch_gate(&doubling, AttemptRole::Investigator, &facts),
         DispatchGate::Ready
+    );
+}
+
+#[test]
+fn accepted_generation_is_retried_only_with_explicit_pre_submission_evidence() {
+    let mut cursor = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    cursor.retry = RetryPolicy {
+        initial_ms: 1_000,
+        factor_percent: 200,
+        max_ms: 4_000,
+    };
+    let now = now_ms();
+
+    let mut submitted = attempt("lead-frame-1", AttemptRole::LeadFrame, AttemptState::Failed);
+    submitted.binding = Some(binding_fixture());
+    assert!(
+        !submitted.failed_before_submission(),
+        "an accepted dispatch without explicit evidence may have submitted a turn"
+    );
+    submitted.binding.as_mut().unwrap().pre_submission = Some(PreSubmissionEvidence::NativeMarker);
+    assert!(submitted.failed_before_submission());
+    cursor.push_attempt(submitted).unwrap();
+
+    let mut legacy = attempt("lead-frame-2", AttemptRole::LeadFrame, AttemptState::Failed);
+    let mut legacy_binding = binding_fixture();
+    legacy_binding.pre_submission = Some(PreSubmissionEvidence::LegacyFrontendAttachment);
+    legacy.binding = Some(legacy_binding);
+    legacy.updated_ms = now.saturating_sub(500);
+    assert!(legacy.failed_before_submission());
+    cursor.push_attempt(legacy).unwrap();
+    let backoff = cursor
+        .dispatch_backoff(AttemptRole::LeadFrame, now)
+        .expect("two consecutive verified pre-submission failures are bounded");
+    assert_eq!(backoff.failures, 2);
+    assert_eq!(backoff.delay_ms, 1_000);
+
+    // A later accepted dispatch without the evidence ends the chain: a
+    // possible turn is never replayed, so it imposes no retry window.
+    let mut submitted = attempt("lead-frame-3", AttemptRole::LeadFrame, AttemptState::Failed);
+    submitted.binding = Some(binding_fixture());
+    submitted.updated_ms = now.saturating_sub(100);
+    cursor.push_attempt(submitted).unwrap();
+    assert!(
+        cursor
+            .dispatch_backoff(AttemptRole::LeadFrame, now)
+            .is_none(),
+        "a failed accepted generation without pre-submission evidence is unknown, not retriable"
     );
 }
 
@@ -2206,4 +2264,290 @@ fn configured_retry_is_frozen_in_private_state_without_route_details() {
     assert!(!text.contains("127.0.0.1"), "{text}");
     assert!(!text.contains("http"), "{text}");
     assert!(!text.contains("synthetic-local"), "{text}");
+}
+
+fn workflow_fixture(corrections: u32, capacity: u32) -> WorkflowInputs {
+    WorkflowInputs {
+        schema: 1,
+        lead_profile: "default".to_owned(),
+        executor_profile: "ds".to_owned(),
+        max_corrections: corrections,
+        capacity,
+    }
+}
+
+fn participant(slot: u32, owner: &str, session: &str, profile: &str) -> WorkflowParticipant {
+    WorkflowParticipant {
+        slot,
+        owner: owner.to_owned(),
+        session: session.to_owned(),
+        profile: profile.to_owned(),
+    }
+}
+
+#[test]
+fn the_workflow_declaration_plans_every_declared_correction_and_review() {
+    let declared = workflow_fixture(2, 4);
+    declared.validate().unwrap();
+    assert_eq!(declared.planned_turns(), 7);
+    assert_eq!(declared.effective_capacity(), 4);
+    let omitted = workflow_fixture(0, 0);
+    omitted.validate().unwrap();
+    assert_eq!(omitted.planned_turns(), 3);
+    assert_eq!(omitted.effective_capacity(), 2);
+
+    let mut one_slot = workflow_fixture(0, 1);
+    assert!(one_slot.validate().is_err());
+    one_slot.capacity = 33;
+    assert!(one_slot.validate().is_err());
+    let mut same_profile = workflow_fixture(0, 2);
+    same_profile.executor_profile = same_profile.lead_profile.clone();
+    assert!(same_profile.validate().is_err());
+    let mut unbounded = workflow_fixture(u32::MAX, 2);
+    assert!(unbounded.validate().is_err());
+    unbounded.max_corrections = 0;
+    unbounded.schema = 2;
+    assert!(unbounded.validate().is_err());
+}
+
+#[test]
+fn a_review_decision_is_read_from_the_first_meaningful_line_only() {
+    assert_eq!(
+        parse_review_decision("ACCEPT: the artifact satisfies the assignment").unwrap(),
+        ReviewDecision::Accept
+    );
+    assert_eq!(
+        parse_review_decision("\n\n  correct - redo the bounded check\n").unwrap(),
+        ReviewDecision::Correct
+    );
+    assert_eq!(
+        parse_review_decision("Reject\nno evidence").unwrap(),
+        ReviewDecision::Reject
+    );
+    // Prose that never states a decision is not acceptance.
+    let error = parse_review_decision("reviewed the executor artifact; no work committed")
+        .expect_err("prose must not be read as acceptance");
+    assert!(error.to_string().contains("never infers a decision"));
+    assert!(parse_review_decision("   \n").is_err());
+}
+
+#[test]
+fn acceptance_finishes_without_a_confirmation_turn_and_each_correction_reviews_again() {
+    let declared = workflow_fixture(2, 3);
+    let mut state = WorkflowArmState::default();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Frame
+    );
+
+    state.lead = Some(participant(1, "lead-1", "session-lead", "default"));
+    state.lead_frame = Some("lframe-1".to_owned());
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Execute
+    );
+
+    state.executor = Some(participant(2, "exec-1", "session-exec", "ds"));
+    state.executor_attempt = Some("exec-1".to_owned());
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Review
+    );
+
+    state
+        .record_review("lreview-1", ReviewDecision::Correct)
+        .unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Correct
+    );
+    state.record_correction("corr-1", &declared).unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Review,
+        "a correction never counts as its own review"
+    );
+
+    state
+        .record_review("lreview-2", ReviewDecision::Correct)
+        .unwrap();
+    state.record_correction("corr-2", &declared).unwrap();
+    state
+        .record_review("lreview-3", ReviewDecision::Correct)
+        .unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Exhausted,
+        "the finite allowance ends the observation instead of dispatching another correction"
+    );
+    // The same review replayed after a controller crash does not duplicate the
+    // decision or require another confirmation-only lead turn.
+    state
+        .record_review("lreview-3", ReviewDecision::Accept)
+        .unwrap();
+    assert_eq!(state.lead_accepted, Some(true));
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Finalize
+    );
+    state.record_completion(true);
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Finalize
+    );
+}
+
+#[test]
+fn a_rejecting_review_ends_without_a_further_lead_turn() {
+    let declared = workflow_fixture(1, 2);
+    let mut state = WorkflowArmState {
+        lead: Some(participant(1, "lead-1", "session-lead", "default")),
+        executor: Some(participant(2, "exec-1", "session-exec", "ds")),
+        lead_frame: Some("lframe-1".to_owned()),
+        executor_attempt: Some("exec-1".to_owned()),
+        ..WorkflowArmState::default()
+    };
+    state
+        .record_review("lreview-1", ReviewDecision::Reject)
+        .unwrap();
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Rejected
+    );
+    state.record_completion(false);
+    assert_eq!(
+        state.next_step(&declared).unwrap(),
+        QualificationStep::Rejected
+    );
+    assert_eq!(state.lead_accepted, Some(false));
+}
+
+#[test]
+fn qualification_phases_do_not_require_the_comparison_owner() {
+    assert!(!Phase::BaselineQualification.requires_comparison_owner());
+    assert!(!Phase::BaselineQualificationRecorded.requires_comparison_owner());
+    assert!(Phase::BaselineAttempt.requires_comparison_owner());
+    assert!(Phase::Acceptance.requires_comparison_owner());
+}
+
+#[test]
+fn baseline_qualification_requires_frozen_task_and_one_explicit_runtime_route() {
+    use crate::improvement_runtime::FileIdentity;
+    let root = fixture_root("qualification-inputs");
+    let mut spec = comparison_spec(root.path(), "qualification-inputs");
+    let comparison = spec.comparison.take().unwrap();
+    let local = spec.local_runner.take();
+    spec.qualification = None;
+    let prompt = root.path().join("task.txt");
+    fs::write(
+        &prompt,
+        "Implement the declared task and preserve its acceptance.",
+    )
+    .unwrap();
+    let config = root.path().join("native.toml");
+    fs::write(&config, "model='gpt-6-astra'\nmodel_reasoning_effort='xhigh'\n[profiles.ds]\nmodel='deepseek-flash'\nmodel_reasoning_effort='max'\n").unwrap();
+    let identity = |path: &Path| FileIdentity {
+        path: path.to_path_buf(),
+        sha256: crate::build_identity::hash_file(path).unwrap(),
+    };
+    spec.baseline_qualification = Some(BaselineQualificationInputs {
+        schema: BASELINE_QUALIFICATION_SCHEMA,
+        task: comparison.task,
+        task_prompt: identity(&prompt),
+        runtime: QualificationRuntimeInputs {
+            state: comparison.runtimes.state,
+            build: comparison.runtimes.baseline_build,
+            label: "accepted-control".to_owned(),
+            upstream: comparison.runtimes.upstream,
+            client: None,
+            native_config: Some(identity(&config)),
+            private_inputs: Vec::new(),
+            reuse: None,
+        },
+        acceptance: comparison.acceptance,
+        workflow: workflow_fixture(1, 2),
+        semantic_review: None,
+        report: root.path().join("result.txt"),
+    });
+    spec.validate().unwrap();
+    let frozen = spec
+        .baseline_qualification
+        .as_ref()
+        .unwrap()
+        .digest()
+        .unwrap();
+    let mut ambiguous = spec.clone();
+    ambiguous
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .client = Some(comparison.runtimes.client.clone());
+    assert!(ambiguous.validate().is_err());
+    let mut alternate = spec.clone();
+    alternate.local_runner = local.clone();
+    assert!(alternate.validate().is_err());
+    let mut missing = spec.clone();
+    missing
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .native_config = None;
+    assert!(missing.validate().is_err());
+    let mut changed = spec.clone();
+    changed
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .task_prompt
+        .sha256 = "0".repeat(64);
+    assert!(changed.validate().is_err());
+    let mut changed_route = spec.clone();
+    changed_route
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .native_config
+        .as_mut()
+        .unwrap()
+        .sha256 = "0".repeat(64);
+    assert!(changed_route.validate().is_err());
+    fs::write(&prompt, "").unwrap();
+    let mut empty = spec.clone();
+    empty.baseline_qualification.as_mut().unwrap().task_prompt = identity(&prompt);
+    assert!(empty.validate().is_err());
+    fs::write(
+        &prompt,
+        "Implement the declared task and preserve its acceptance.",
+    )
+    .unwrap();
+    assert_eq!(
+        spec.baseline_qualification
+            .as_ref()
+            .unwrap()
+            .digest()
+            .unwrap(),
+        frozen
+    );
+
+    let mut local_spec = spec.clone();
+    local_spec.local_runner = local;
+    local_spec.qualification = Some(root.path().join("qualification.json"));
+    let runtime = &mut local_spec.baseline_qualification.as_mut().unwrap().runtime;
+    runtime.native_config = None;
+    runtime.client = Some(comparison.runtimes.client);
+    local_spec.validate().unwrap();
+    local_spec
+        .baseline_qualification
+        .as_mut()
+        .unwrap()
+        .runtime
+        .client
+        .as_mut()
+        .unwrap()
+        .runner
+        .model = "different".to_owned();
+    assert!(local_spec.validate().is_err());
 }
