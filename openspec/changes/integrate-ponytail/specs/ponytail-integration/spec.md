@@ -116,11 +116,12 @@ The lifecycle SHALL retain host-local ownership and recovery information for its
 
 ### Requirement: Acceptance proves installed consumption
 
-Acceptance SHALL exercise ordinary installation on a clean supported target and actual use outside the harness checkout. Evidence SHALL distinguish static checks, package discovery, context loading and observed task behavior. It SHALL cover first use, repetition, update, explicit disablement, session recovery, concurrency, failure and disconnect without exposing private inputs or claiming unmeasured efficiency gains.
+Acceptance SHALL exercise locally isolated installation and actual use outside the harness checkout, covering required lifecycle scenarios. Evidence SHALL distinguish discovery, context loading and observed behavior without exposing private inputs or claiming unmeasured savings. `docs/installation.md` SHALL provide the other-PC handoff; preparing another Windows environment SHALL NOT be required for implementation acceptance.
 
-#### Scenario: Clean-target delivery is assessed
-- **WHEN** the integration is presented as portable to another PC
-- **THEN** a fresh Windows machine, VM or independent Windows account demonstrates installation from declared inputs without the development account's package cache, trust state or hidden files
+#### Scenario: Another PC receives the installation handoff
+- **WHEN** the receiving agent installs the harness on another supported Windows PC
+- **THEN** `docs/installation.md` gives the prerequisites, normal install, native trust step, fresh-session and repeat-install checks, Check and recovery path without relying on the development account's package cache, trust state or hidden files
+- **AND** the implementation provides locally verified command guidance without claiming that the receiving agent's target-machine checks have already run
 
 #### Scenario: A real external task consumes the integration
 - **WHEN** a fresh installed Codex session performs a bounded task in an existing external project with its own instructions

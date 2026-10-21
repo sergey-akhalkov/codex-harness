@@ -168,6 +168,35 @@ Build output may be quiet while Cargo optimizes: retain the process handle
 and inspect `STATE/staging/<candidate>/cargo.log` when needed. Silence or a
 poll timeout is not evidence that the operation stopped.
 
+### Handoff to an agent on another PC
+
+The receiving agent runs [first installation](#first-installation-on-a-new-machine)
+on the target PC with that owner's tools, paths, authentication and settings.
+Preparing another Windows account, VM or Sandbox on the development machine is
+not a prerequisite for this handoff. Do not copy the development account's
+package caches, credentials or hook-trust records.
+
+After installation, run the documented Check, open a fresh ordinary Codex
+session outside the harness checkout, and verify discovery and actual use of
+the installed capabilities. Repeat the installation to check that local settings
+survive. Report the selected versions, command results and any remaining native
+trust step. Use [targeted recovery](#completion-and-targeted-recovery) if delivery
+is incomplete; keep target-machine evidence with its owner. A written handoff
+does not claim that the other PC has already passed these checks.
+
+Ponytail automatic delivery is still being implemented under
+[`integrate-ponytail`](../openspec/changes/integrate-ponytail/proposal.md).
+Do not work around it by copying upstream rules or skills into the harness.
+The inspected original 5.3.2 candidate at
+`09c434ab73ca43761c5d8b0c5d341926c2fba710` requires Node on PATH and native
+`/hooks` trust review. Isolated hook execution on Node 24.18.0 confirmed that
+resume resets the selected mode and a second session in the same project can
+overwrite the first session's mode. Native Codex consumption of this candidate
+remains unverified; it is not an accepted integration baseline. These findings
+are reproducible from the pinned
+[activation hook](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-activate.js)
+and [mode-state owner](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-runtime.js).
+
 ### Everyday delivery and update
 
 Everyday delivery and update are one command. It builds an immutable
