@@ -124,11 +124,11 @@ Acceptance SHALL exercise locally isolated installation and actual use outside t
 - **THEN** `docs/installation.md` gives the prerequisites, normal install, native trust step, fresh-session and repeat-install checks, Check and recovery path without relying on the development account's package cache, trust state or hidden files
 - **AND** the implementation provides locally verified command guidance without claiming that the receiving agent's target-machine checks have already run
 
-#### Scenario: A real external task consumes the integration
-- **WHEN** a fresh installed Codex session performs a bounded task in an existing external project with its own instructions
-- **THEN** retained native evidence identifies the selected package, effective guidance and relevant skill use, and independent checks establish the task result
+#### Scenario: Read-only use in an existing external project consumes the integration
+- **WHEN** a fresh installed Codex session inspects integration loading in the user-selected existing external project with its own instructions
+- **THEN** retained native evidence identifies the selected package, composed guidance and relevant Ponytail skill/resource consumption without performing project tasks or changing project files
 - **AND** a neutral working directory verifies global loading while disposable fixtures remain supplemental rather than replacing the real consumer
 
 #### Scenario: Only discovery or text checks have passed
-- **WHEN** no actual external task or required lifecycle case has been exercised
+- **WHEN** no actual external-project consumption or required lifecycle case has been exercised
 - **THEN** those checks remain explicitly unfinished and the integration is not declared delivered
