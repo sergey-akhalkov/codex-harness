@@ -36,6 +36,10 @@ and supplied skills stay in the native plugin. The [installation guide](installa
 owns setup and trust; the [marketplace declaration](../.agents/plugins/marketplace.json)
 selects the package. No upstream rule body or fallback skill is copied here.
 
+Consolidation targets repeated instruction blocks and redundant full-text
+loading. Small semantic overlaps that add harness-specific obligations are
+acceptable; eliminating every shared concept is not the goal.
+
 | Concern | Instruction owner |
 | --- | --- |
 | Avoiding speculative abstractions for a local coding task | Ponytail; the equivalent local clause is removed |
