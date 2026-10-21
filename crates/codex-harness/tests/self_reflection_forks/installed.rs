@@ -81,6 +81,266 @@ fn installed_acceptance_drives_reflections_disables_and_preserves_restored_state
 }
 
 #[test]
+fn installed_flag_activation_skips_preactivation_and_predecessor_lifetime_work() {
+    let workspace = Workspace::new("reflection-installed-current", LeadMode::Delivered);
+    let installed = InstalledReflection::connect(&workspace);
+    let source = lifecycle::source_fixture(&workspace, "reflection-installed-current", false);
+    let (controller, _) = accepted::prepare(&workspace);
+
+    let preactivation = lifecycle::prepare_additional_ordinary_acceptance(
+        &workspace,
+        &installed.manager,
+        &source,
+        LEAD_THREAD,
+        "installed-preactivation-run",
+        1,
+    );
+    {
+        let mut lead = workspace.lead_state.lock().unwrap();
+        lead.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
+        lead.source_turn_active = true;
+    }
+    let accepted = preactivation.accept(&workspace);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["selfReflectionEnabled"], false,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], false,
+        "{accepted}"
+    );
+    assert_eq!(
+        lifecycle::show_task(&workspace, &preactivation.task)["status"],
+        "closed"
+    );
+    let preactivation_acceptance = accepted["acceptanceId"].as_str().unwrap().to_owned();
+    assert!(
+        controller.stored_state().unwrap().is_none(),
+        "an acceptance before activation must not create a lifecycle"
+    );
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+
+    // The first flag-true acceptance must prepare the lifecycle itself. Remove
+    // the prior journal ownership so activation, rather than the fixture,
+    // proves that it enabled event access at the current boundary.
+    accepted::native(&workspace, "bd.exe", &["config", "unset", "events-journal"]);
+    lifecycle::set_source_enabled(&source, true);
+    {
+        let mut lead = workspace.lead_state.lock().unwrap();
+        lead.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
+        lead.source_turn_active = true;
+    }
+    let first = lifecycle::prepare_additional_ordinary_acceptance(
+        &workspace,
+        &installed.manager,
+        &source,
+        LEAD_THREAD,
+        "installed-activation-run",
+        2,
+    );
+    let accepted = first.accept(&workspace);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["selfReflectionEnabled"], true,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], true,
+        "{accepted}"
+    );
+    assert_eq!(
+        lifecycle::show_task(&workspace, &first.task)["status"],
+        "closed"
+    );
+    let first_acceptance = accepted["acceptanceId"].as_str().unwrap().to_owned();
+    let activated = controller.stored_state().unwrap().unwrap_or_else(|| {
+        panic!("the first flag-true acceptance did not activate reflection: {accepted}")
+    });
+    assert_eq!(activated.lifecycle, LifecycleStatus::Active);
+    assert_eq!(activated.binding.lead_session, LEAD_THREAD);
+    assert_eq!(activated.journal, JournalOwnership::EnabledByController);
+    assert!(activated.records.is_empty(), "{activated:?}");
+    assert_eq!(
+        accepted["reflection"]["bindingId"].as_str(),
+        Some(activated.binding.id.as_str()),
+        "{accepted}"
+    );
+
+    // Retain only the executor stage so the activated lifetime ends with a
+    // pending lead stage. The one-shot installed consumer is the actual host
+    // processing route, without a separate enable command.
+    workspace.lead_state.lock().unwrap().source_turn = None;
+    let first_session = wait_session(
+        ConsoleSession::spawn(ConsoleSpec::new(lifecycle::process_spec_from_source(
+            &workspace,
+            &installed.manager,
+            &source,
+            LEAD_THREAD,
+            "process",
+        )))
+        .unwrap(),
+    );
+    assert_ne!(
+        first_session.outcome.exit_code, 0,
+        "{}",
+        first_session.transcript
+    );
+    assert!(
+        first_session
+            .transcript
+            .contains("exact accepting lead turn"),
+        "{}",
+        first_session.transcript
+    );
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    let retained = controller.record(&first_acceptance).unwrap().unwrap();
+    assert_eq!(retained.executor.state, StageState::Retained);
+    assert_eq!(retained.lead.state, StageState::Pending);
+    assert_eq!(retained.delivery, DeliveryState::Pending);
+    let retained_dir = controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(&first_acceptance);
+    let executor_before = fs::read(retained_dir.join("executor-stage.json")).unwrap();
+    let chain_before = fs::read(retained_dir.join("chain.json")).unwrap();
+
+    // The same conversation resumes under a new app-server process. The next
+    // ordinary acceptance is the only activation input; it must establish the
+    // new current-session boundary without an enable command.
+    let owner = workspace.spawn_owner_process();
+    workspace.set_endpoint_process(&workspace.endpoint, &owner);
+    fs::copy(
+        &workspace.endpoint,
+        workspace
+            .home
+            .join("harness/lead-endpoints")
+            .join(format!("{LEAD_THREAD}.json")),
+    )
+    .unwrap();
+    {
+        let mut lead = workspace.lead_state.lock().unwrap();
+        lead.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
+        lead.source_turn_active = true;
+    }
+    let current = lifecycle::prepare_additional_ordinary_acceptance(
+        &workspace,
+        &installed.manager,
+        &source,
+        LEAD_THREAD,
+        "installed-current-run",
+        3,
+    );
+    let accepted = current.accept(&workspace);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], true,
+        "{accepted}"
+    );
+    let current_acceptance = accepted["acceptanceId"].as_str().unwrap().to_owned();
+    let boundary = controller.stored_state().unwrap().unwrap();
+    assert!(
+        boundary
+            .current_session_floor
+            .is_some_and(|floor| floor >= retained.event_seq),
+        "the new app-server lifetime did not advance the boundary: {boundary:?}"
+    );
+    assert!(!boundary.record_in_current_session(&retained));
+    assert_eq!(boundary.records[&first_acceptance], retained);
+    assert!(
+        !boundary.records.contains_key(&current_acceptance),
+        "the current acceptance must wait for the installed consumer poll"
+    );
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+
+    begin_reflection_fixture_lifetime(&workspace);
+    workspace.lead_state.lock().unwrap().source_turn_active = false;
+    let current_session = wait_session(
+        ConsoleSession::spawn(ConsoleSpec::new(lifecycle::process_spec_from_source(
+            &workspace,
+            &installed.manager,
+            &source,
+            LEAD_THREAD,
+            "process",
+        )))
+        .unwrap(),
+    );
+    assert_eq!(
+        current_session.outcome.exit_code, 0,
+        "{}",
+        current_session.transcript
+    );
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
+    let current_record = controller.record(&current_acceptance).unwrap().unwrap();
+    assert_eq!(current_record.executor.state, StageState::Retained);
+    assert_eq!(current_record.lead.state, StageState::Retained);
+    assert_eq!(current_record.delivery, DeliveryState::Consumed);
+    assert_eq!(
+        controller.record(&first_acceptance).unwrap().unwrap(),
+        retained
+    );
+    assert_eq!(
+        fs::read(retained_dir.join("executor-stage.json")).unwrap(),
+        executor_before
+    );
+    assert_eq!(
+        fs::read(retained_dir.join("chain.json")).unwrap(),
+        chain_before
+    );
+
+    // A later installed poll with no current work must exit normally and leave
+    // both the predecessor's pending stage and the preactivation closure alone.
+    let completed = controller.stored_state().unwrap().unwrap();
+    assert!(!completed.records.contains_key(&preactivation_acceptance));
+    let completed_json = serde_json::to_value(&completed).unwrap();
+    let replay = wait_session(
+        ConsoleSession::spawn(ConsoleSpec::new(lifecycle::process_spec_from_source(
+            &workspace,
+            &installed.manager,
+            &source,
+            LEAD_THREAD,
+            "process",
+        )))
+        .unwrap(),
+    );
+    assert_eq!(replay.outcome.exit_code, 0, "{}", replay.transcript);
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
+    let mut replay_state =
+        serde_json::to_value(controller.stored_state().unwrap().unwrap()).unwrap();
+    replay_state["last_poll"] = completed_json["last_poll"].clone();
+    assert_eq!(replay_state, completed_json);
+    assert_eq!(
+        controller.record(&first_acceptance).unwrap().unwrap(),
+        retained
+    );
+    assert_eq!(
+        controller.record(&current_acceptance).unwrap().unwrap(),
+        current_record
+    );
+    installed.assert_installed(&workspace);
+    installed.assert_app_servers(&workspace.checkout);
+}
+
+/// Starts a new synthetic app-server lifetime for the canned reflection
+/// transports. Only their fork/turn deduplication markers are cleared; board,
+/// lifecycle, acceptance and retained-stage history are untouched.
+
+fn begin_reflection_fixture_lifetime(workspace: &Workspace) {
+    for stage in ["executor-self-reflection", "lead-self-reflection"] {
+        for prefix in ["fork-", "turn-"] {
+            let marker = workspace.fixture_dir.join(format!("{prefix}{stage}.json"));
+            if marker.exists() {
+                fs::remove_file(marker).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn installed_in_flight_disable_and_failed_install_changes_preserve_pending_work() {
     let workspace = Workspace::new("reflection-installed-pending", LeadMode::Delivered);
     let installed = InstalledReflection::connect(&workspace);
