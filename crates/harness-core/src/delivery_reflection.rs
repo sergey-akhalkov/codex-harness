@@ -1005,6 +1005,11 @@ pub struct CurrentThreadSelection {
     /// selected thread. It must match the retained lifecycle proof exactly,
     /// including the program path, and is revalidated while holding the lock.
     pub backend_process: RetainedOwnerProcess,
+    /// The host has stopped or terminated the old owned LeadLifecycle and
+    /// verified that it can no longer launch a stage. Current-session
+    /// in-flight work is then recorded as Unknown instead of being reported as
+    /// completed; historical unresolved records are always ignored.
+    pub quiesced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1466,13 +1471,16 @@ impl ReflectionController {
         self.succeed_inner(request, true, true)
     }
 
-    /// Switches the current conversation within one verified app-server
-    /// backend. The supplied backend must exactly match the process proof
-    /// retained for the current owner and must still be live; this operation
-    /// therefore cannot silently become ordinary cross-owner succession. A new
-    /// event floor is established before the selected thread can accept work,
-    /// leaving predecessor records retained but outside the current session.
-    /// Repeating the same selection is a no-op.
+    /// Switches the current conversation within one verified app-server backend.
+    /// The supplied backend must exactly match the process proof retained for the
+    /// current owner and must still be live; this operation therefore cannot
+    /// silently become ordinary cross-owner succession. The host must first stop
+    /// or terminate its old owned LeadLifecycle and pass `quiesced = true` when
+    /// current-session work may be in flight. Such work is retained as Unknown,
+    /// never reported as completed, and the new event floor excludes both it and
+    /// every historical record before the selected thread can accept work.
+    /// Historical unresolved records do not block selection. Repeating the same
+    /// selection is a no-op; an administrative stop remains stopped.
     pub fn select_current_thread(
         &self,
         request: &CurrentThreadSelection,
@@ -1496,11 +1504,6 @@ impl ReflectionController {
         if normalize(&state.source.branch) != normalize(&source.branch) {
             return Err(recovery_error(
                 "source branch changed; reconcile the retained lifecycle before switching the current thread",
-            ));
-        }
-        if state.lifecycle != LifecycleStatus::Active {
-            return Err(conflict(
-                "delivery reflection is stopped; resume it before switching the current thread",
             ));
         }
         if let Some(recovery) = &state.recovery {
@@ -1542,7 +1545,14 @@ impl ReflectionController {
                 changed: false,
             });
         }
-        if state.records.values().any(|record| {
+        let current_ids: Vec<String> = state
+            .records
+            .iter()
+            .filter(|(_, record)| state.record_in_current_session(record))
+            .map(|(acceptance, _)| acceptance.clone())
+            .collect();
+        let current_unresolved = current_ids.iter().any(|acceptance| {
+            let record = &state.records[acceptance];
             matches!(
                 record.executor.state,
                 StageState::InFlight | StageState::Unknown
@@ -1550,10 +1560,28 @@ impl ReflectionController {
                 record.lead.state,
                 StageState::InFlight | StageState::Unknown
             )
-        }) {
+        });
+        if current_unresolved && !request.quiesced {
             return Err(conflict(
-                "a reflection stage is in flight or unknown; reconcile it before switching the current thread",
+                "current-session reflection work is in flight or unknown; stop the old owned consumer and retry the selection with quiesced=true; historical records do not block selection and nothing was changed",
             ));
+        }
+        if request.quiesced {
+            for acceptance in &current_ids {
+                let record = state.records.get_mut(acceptance).unwrap();
+                for stage in [Stage::Executor, Stage::Lead] {
+                    let slot = stage_slot(record, stage);
+                    if slot.state == StageState::InFlight {
+                        slot.state = StageState::Unknown;
+                        slot.usage_reconciled = false;
+                        slot.work_reconciled = false;
+                        slot.usage.last_error = Some(
+                            "reflection was interrupted by a native conversation switch; retained outside the new session"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
         }
         let revision = state
             .binding

@@ -1963,6 +1963,7 @@ fn same_backend_thread_selection_advances_boundary_and_stays_idempotent() {
             expected_lead_session: LEAD.to_owned(),
             selected_lead_session: SUCCESSOR.to_owned(),
             backend_process: live_self(),
+            quiesced: false,
         })
         .unwrap_err();
     assert!(
@@ -1978,6 +1979,7 @@ fn same_backend_thread_selection_advances_boundary_and_stays_idempotent() {
             expected_lead_session: LEAD.to_owned(),
             selected_lead_session: SUCCESSOR.to_owned(),
             backend_process: owner_process.clone(),
+            quiesced: false,
         })
         .unwrap();
     assert!(receipt.changed);
@@ -2008,6 +2010,7 @@ fn same_backend_thread_selection_advances_boundary_and_stays_idempotent() {
             expected_lead_session: SUCCESSOR.to_owned(),
             selected_lead_session: SUCCESSOR.to_owned(),
             backend_process: owner_process.clone(),
+            quiesced: false,
         })
         .unwrap();
     assert!(!repeated.changed);
@@ -2041,6 +2044,7 @@ fn same_backend_thread_selection_advances_boundary_and_stays_idempotent() {
             expected_lead_session: SUCCESSOR.to_owned(),
             selected_lead_session: LEAD.to_owned(),
             backend_process: owner_process.clone(),
+            quiesced: false,
         })
         .unwrap();
     assert!(back.changed);
@@ -2070,6 +2074,7 @@ fn same_backend_thread_selection_advances_boundary_and_stays_idempotent() {
             expected_lead_session: LEAD.to_owned(),
             selected_lead_session: LEAD.to_owned(),
             backend_process: owner_process,
+            quiesced: false,
         })
         .unwrap();
     assert!(!repeated_back.changed);
@@ -2096,6 +2101,95 @@ fn same_backend_thread_selection_advances_boundary_and_stays_idempotent() {
             .state,
         StageState::Pending
     );
+    stop_owner(&mut owner);
+}
+
+#[test]
+fn thread_selection_quiesces_current_work_and_ignores_historical_unresolved_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Selected switch in flight", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "selected-switch-in-flight"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+    controller
+        .begin_stage(&acceptance, Stage::Executor)
+        .unwrap();
+
+    let in_flight = controller.stored_state().unwrap().unwrap();
+    assert_eq!(
+        in_flight.records[&acceptance].executor.state,
+        StageState::InFlight
+    );
+    let settled = fs::read(controller.state_file().unwrap()).unwrap();
+    let refusal = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: LEAD.to_owned(),
+            selected_lead_session: "middle-thread".to_owned(),
+            backend_process: owner_process.clone(),
+            quiesced: false,
+        })
+        .unwrap_err();
+    assert!(refusal.to_string().contains("quiesced=true"), "{refusal}");
+    assert_eq!(fs::read(controller.state_file().unwrap()).unwrap(), settled);
+
+    let first = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: LEAD.to_owned(),
+            selected_lead_session: "middle-thread".to_owned(),
+            backend_process: owner_process.clone(),
+            quiesced: true,
+        })
+        .unwrap();
+    assert!(first.changed);
+    let quiesced = controller.stored_state().unwrap().unwrap();
+    let record = &quiesced.records[&acceptance];
+    assert!(!quiesced.record_in_current_session(record));
+    assert!(quiesced.current_session_floor.unwrap() >= record.event_seq);
+    assert_eq!(record.executor.state, StageState::Unknown);
+    assert_eq!(record.lead.state, StageState::Pending);
+    assert_eq!(record.binding.lead_session, LEAD);
+    assert_eq!(record.binding.acceptance_id().unwrap(), acceptance);
+    assert!(!record.executor.usage_reconciled);
+    assert!(!record.executor.work_reconciled);
+    assert!(
+        record
+            .executor
+            .usage
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("native conversation switch")),
+        "{record:?}"
+    );
+    assert!(controller.pending_jobs().unwrap().is_empty());
+
+    // The previous selection made this unresolved record historical. A second
+    // explicit host selection must not require reconciliation of work that is
+    // already outside the current session floor.
+    let historical = record.clone();
+    let second = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: "middle-thread".to_owned(),
+            selected_lead_session: SUCCESSOR.to_owned(),
+            backend_process: owner_process,
+            quiesced: false,
+        })
+        .unwrap();
+    assert!(second.changed);
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.records[&acceptance], historical);
+    assert!(!after.record_in_current_session(&historical));
+    assert!(after.current_session_floor.unwrap() >= historical.event_seq);
+    assert!(controller.pending_jobs().unwrap().is_empty());
     stop_owner(&mut owner);
 }
 

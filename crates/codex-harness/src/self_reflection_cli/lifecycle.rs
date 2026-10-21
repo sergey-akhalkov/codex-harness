@@ -421,21 +421,27 @@ pub(crate) fn prepare_automatic(
 /// Prepares a host-confirmed switch between conversations in the exact same
 /// app-server backend. The host must leave the prior registry record in place
 /// and stage the selected thread's registry record with that same verified
-/// process before calling this function; it retires the prior record only
-/// after this returns `Active`. The core transition refuses unmatched backend
+/// process before calling this function; after any successful return it
+/// retires the prior record. The core transition refuses unmatched backend
 /// proof, so this path never weakens ordinary succession's live-owner guard.
+///
+/// Selection is also an ownership transfer while the feature flag is false:
+/// the new event floor is published before the selected thread can accept
+/// work, and a later false-to-true transition activates that selected thread
+/// through `prepare_automatic`. The wrapper starts no consumer and performs no
+/// model work. `quiesced` must be true after the host has stopped its old owned
+/// `LeadLifecycle`; current-session in-flight work is then retained as unknown
+/// outside the new floor. A stopped lifecycle remains stopped.
 pub(crate) fn prepare_selected_thread(
     home: &Path,
     source: &Path,
     project: &Path,
     expected_lead: &str,
     selected_lead: &str,
+    quiesced: bool,
 ) -> io::Result<Preparation> {
     let source = canonical_dir(source, "kit source")?;
     let config = orchestration_config::load(&source)?;
-    if !config.self_reflection_enabled {
-        return Ok(Preparation::Disabled);
-    }
     let expected_lead = expected_lead.trim();
     let selected_lead = selected_lead.trim();
     if expected_lead.is_empty() || selected_lead.is_empty() {
@@ -453,7 +459,9 @@ pub(crate) fn prepare_selected_thread(
         recovery: None,
         continuation: None,
     };
-    declarations(&options, &config)?;
+    if config.self_reflection_enabled {
+        declarations(&options, &config)?;
+    }
     if !home.join("harness/bin/codex.exe").is_file() {
         return Err(invalid(
             "the installed Codex launcher is missing; repair the installation before preparing reflection",
@@ -461,11 +469,26 @@ pub(crate) fn prepare_selected_thread(
     }
     let backend_process = managed_lead_owner(&home, selected_lead)?;
     let controller = options.controller()?;
+    if controller.stored_state()?.is_none() {
+        // There is no retained ownership to transfer yet. A later ordinary
+        // preparation creates the lifecycle for whichever thread is current.
+        return Ok(Preparation::Disabled);
+    }
     controller.select_current_thread(&CurrentThreadSelection {
         expected_lead_session: expected_lead.to_owned(),
         selected_lead_session: selected_lead.to_owned(),
         backend_process,
+        quiesced,
     })?;
+    if !config.self_reflection_enabled {
+        return Ok(Preparation::Disabled);
+    }
+    let state = controller.stored_state()?.ok_or_else(|| {
+        invalid("the selected reflection lifecycle disappeared after a successful selection")
+    })?;
+    if state.lifecycle != LifecycleStatus::Active {
+        return Ok(Preparation::Stopped);
+    }
     Ok(Preparation::Active)
 }
 
@@ -1402,6 +1425,316 @@ fn serve(options: &Options) -> io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::delivery_reflection::{AcceptanceBinding, Purpose, acceptance_metadata};
+    use std::process::Command;
+
+    const OLD_THREAD: &str = "selection-old";
+    const NEW_THREAD: &str = "selection-new";
+
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn kit_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .canonicalize()
+            .expect("canonical workspace root")
+    }
+
+    fn set_source_enabled(source: &Path, enabled: bool) {
+        let path = source.join("global/orchestration.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        let (from, to) = if enabled {
+            (
+                "self_reflection_enabled = false",
+                "self_reflection_enabled = true",
+            )
+        } else {
+            (
+                "self_reflection_enabled = true",
+                "self_reflection_enabled = false",
+            )
+        };
+        if !text.contains(to) {
+            assert_eq!(text.matches(from).count(), 1, "{}", path.display());
+            fs::write(path, text.replace(from, to)).unwrap();
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn live_owner() -> RetainedOwnerProcess {
+        let program = std::env::current_exe().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = harness_core::process_service::ServiceProcess::observe(
+            std::process::id(),
+            &program,
+            0,
+            &user,
+        )
+        .unwrap()
+        .identity();
+        RetainedOwnerProcess { identity, program }
+    }
+
+    fn install_registry(home: &Path, thread: &str, owner: &RetainedOwnerProcess) {
+        let path = control::lead_endpoint_path(home, thread).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": 1,
+                "port": 1,
+                "token": "a".repeat(64),
+                "threadId": thread,
+                "process": {
+                    "pid": owner.identity.pid,
+                    "creationTime": owner.identity.creation_time,
+                    "program": owner.program,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn bd_json(bd: &Path, project: &Path, args: &[&str]) -> Value {
+        let output = Command::new(bd)
+            .args(args)
+            .current_dir(project)
+            .env("BD_NON_INTERACTIVE", "1")
+            .env("BEADS_ACTOR", "selection-fixture")
+            .output()
+            .expect("bd runs");
+        assert!(
+            output.status.success(),
+            "bd {args:?}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn close_task(bd: &Path, project: &Path, title: &str, lead: &str, suffix: &str) -> String {
+        let created = bd_json(bd, project, &["create", title, "--type", "task", "--json"]);
+        let task = created["id"].as_str().unwrap().to_owned();
+        let binding = AcceptanceBinding::new(
+            &task,
+            format!("run-{suffix}"),
+            format!("assignment-{suffix}"),
+            format!("result-{suffix}"),
+            format!("revision-{suffix}"),
+            vec!["executor-selection-fixture".to_owned()],
+            lead,
+            "selection-fixture",
+            Purpose::Ordinary,
+        );
+        harness_core::board_cli::close_accepted(
+            bd,
+            project,
+            "selection-fixture",
+            &task,
+            &acceptance_metadata(&binding).unwrap(),
+        )
+        .unwrap();
+        task
+    }
+
+    #[test]
+    fn disabled_selected_thread_transfers_then_reopens_without_historical_work() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let source = root.path().join("source");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        copy_tree(&kit_root().join("global"), &source.join("global"));
+        copy_tree(
+            &kit_root().join(".agents/skills"),
+            &source.join(".agents/skills"),
+        );
+        set_source_enabled(&source, false);
+        fs::write(
+            home.join("config.toml"),
+            "model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"xhigh\"\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("ds.config.toml"),
+            "model = \"deepseek-flash\"\nmodel_provider = \"deepseek\"\nmodel_reasoning_effort = \"max\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(home.join("harness/bin")).unwrap();
+        fs::write(home.join("harness/bin/codex.exe"), b"fixture").unwrap();
+        git(&project, &["init", "-q", "--initial-branch=main"]);
+        git(&project, &["config", "user.email", "fixture@example.test"]);
+        git(&project, &["config", "user.name", "Fixture"]);
+        fs::write(project.join("README.md"), "synthetic selection board\n").unwrap();
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-qm", "seed"]);
+        let bd = crate::feedback_cli::discover_bd_in(&home).unwrap();
+        let init = Command::new(&bd)
+            .args(["init", "--skip-agents", "--non-interactive", "--quiet"])
+            .current_dir(&project)
+            .env("BD_NON_INTERACTIVE", "1")
+            .env("BEADS_ACTOR", "selection-fixture")
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "bd init: {} {}",
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let owner = live_owner();
+        install_registry(&home, OLD_THREAD, &owner);
+        install_registry(&home, NEW_THREAD, &owner);
+        let controller = ReflectionController::new(&bd, &project, &home);
+        controller
+            .activate_with_owner_process(
+                &ActivationRequest {
+                    lead_session: OLD_THREAD.to_owned(),
+                    run: None,
+                    boundary: None,
+                    journal: JournalPolicy::EnableIfMissing,
+                    limits: None,
+                },
+                &owner,
+            )
+            .unwrap();
+        let historical = close_task(
+            &bd,
+            &project,
+            "Historical selection work",
+            OLD_THREAD,
+            "historical",
+        );
+        let before_selection = controller.stored_state().unwrap().unwrap();
+
+        assert_eq!(
+            prepare_selected_thread(&home, &source, &project, OLD_THREAD, NEW_THREAD, true)
+                .unwrap(),
+            Preparation::Disabled
+        );
+        let selected = controller.stored_state().unwrap().unwrap();
+        assert_eq!(selected.binding.lead_session, NEW_THREAD);
+        assert_eq!(selected.lifecycle, LifecycleStatus::Active);
+        let floor = selected.current_session_floor.unwrap();
+        assert!(floor > before_selection.checkpoint);
+        assert_eq!(selected.records, before_selection.records);
+        assert!(controller.pending_jobs().unwrap().is_empty());
+        assert!(controller.record(&historical).unwrap().is_none());
+
+        let disabled = close_task(
+            &bd,
+            &project,
+            "Disabled-period selection work",
+            NEW_THREAD,
+            "disabled",
+        );
+        poll_disabled_boundary(&home, &source, &project).unwrap();
+        assert!(controller.record(&disabled).unwrap().is_none());
+        assert!(controller.pending_jobs().unwrap().is_empty());
+
+        set_source_enabled(&source, true);
+        assert_eq!(
+            prepare_automatic(
+                &home,
+                &source,
+                &project,
+                NEW_THREAD,
+                PreparationTrigger::Host
+            )
+            .unwrap(),
+            Preparation::Active
+        );
+        let reopened = controller.stored_state().unwrap().unwrap();
+        assert_eq!(reopened.binding.lead_session, NEW_THREAD);
+        assert_eq!(reopened.lifecycle, LifecycleStatus::Active);
+        assert_eq!(reopened.current_session_floor, Some(floor));
+        assert_eq!(reopened.records, before_selection.records);
+        assert!(controller.pending_jobs().unwrap().is_empty());
+
+        let current = close_task(
+            &bd,
+            &project,
+            "Selected current work",
+            NEW_THREAD,
+            "current",
+        );
+        let polled = controller.poll().unwrap();
+        assert_eq!(polled.accepted, 1, "{polled:?}");
+        assert_eq!(polled.jobs.len(), 1, "{polled:?}");
+        assert_eq!(polled.jobs[0].task_id, current);
+        let current_acceptance = polled.jobs[0].acceptance_id.clone();
+        let current_record = controller.record(&current_acceptance).unwrap().unwrap();
+        assert!(reopened.record_in_current_session(&current_record));
+        assert!(current_record.event_seq > floor);
+        assert_eq!(current_record.binding.lead_session, NEW_THREAD);
+        assert!(controller.record(&historical).unwrap().is_none());
+        assert!(controller.record(&disabled).unwrap().is_none());
+        let repeated_poll = controller.poll().unwrap();
+        assert_eq!(repeated_poll.accepted, 0, "{repeated_poll:?}");
+
+        let settled = fs::read(controller.state_file().unwrap()).unwrap();
+        assert_eq!(
+            prepare_selected_thread(&home, &source, &project, NEW_THREAD, NEW_THREAD, true)
+                .unwrap(),
+            Preparation::Active
+        );
+        assert_eq!(fs::read(controller.state_file().unwrap()).unwrap(), settled);
+
+        controller.stop().unwrap();
+        assert_eq!(
+            prepare_selected_thread(&home, &source, &project, NEW_THREAD, OLD_THREAD, true)
+                .unwrap(),
+            Preparation::Stopped
+        );
+        let stopped = controller.stored_state().unwrap().unwrap();
+        assert_eq!(stopped.binding.lead_session, OLD_THREAD);
+        assert_eq!(stopped.lifecycle, LifecycleStatus::Stopped);
+        assert!(controller.pending_jobs().unwrap().is_empty());
+        assert_eq!(
+            prepare_automatic(
+                &home,
+                &source,
+                &project,
+                OLD_THREAD,
+                PreparationTrigger::Host
+            )
+            .unwrap(),
+            Preparation::Active
+        );
+        assert_eq!(
+            controller.stored_state().unwrap().unwrap().lifecycle,
+            LifecycleStatus::Active
+        );
+        assert!(controller.pending_jobs().unwrap().is_empty());
+    }
 
     #[test]
     fn native_default_provider_does_not_require_editing_the_ordinary_lead_profile() {
