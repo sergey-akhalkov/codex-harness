@@ -10,4 +10,4 @@
 ## 2. Delivery
 
 - [x] 2.1 Run affected native lifecycle/acceptance regression checks and required static checks; retain truthful scope and any pre-existing failures.
-- [ ] 2.2 Deploy the immutable candidate globally and verify installed automatic activation and acceptance outside the kit checkout, preserving unrelated settings and retained work.
+- [x] 2.2 Deploy the immutable candidate globally and verify installed automatic activation and acceptance outside the kit checkout, preserving unrelated settings and retained work.
