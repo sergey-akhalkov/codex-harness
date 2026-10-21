@@ -3,11 +3,14 @@
 //! loopback lead endpoints; model turns remain synthetic fixture responses.
 
 use super::*;
+use harness_core::board_cli;
 use harness_core::delivery_reflection::{
-    DeliveryState, LifecycleStatus, ReflectionController, StageState,
+    AcceptanceBinding, ActivationRequest, DeliveryState, JournalPolicy, LifecycleStatus, Purpose,
+    ReflectionController, StageState, acceptance_metadata,
 };
 
 const NO_FINDING: &str = "NO FINDING";
+const REFLECTION_ACTOR: &str = "reflection-fixture-lead";
 
 fn registry(workspace: &Workspace, thread: &str) -> PathBuf {
     workspace
@@ -108,17 +111,54 @@ fn succeed(workspace: &Workspace, thread: &str) -> Value {
     lifecycle::success(lifecycle::command(workspace, "succeed", Some(thread)))
 }
 
-/// Activates the shared acceptance fixture, then records the exact live owner
-/// process through the ordinary current-owner lifecycle route. The endpoint
-/// file is updated before it is installed in the managed-lead registry, so
-/// removing that record later is distinct from the process exiting.
+/// Activates and accepts under the exact live owner process, as the automatic
+/// acceptance boundary does. The endpoint file is updated before it is
+/// installed in the managed-lead registry, so removing that record later is
+/// distinct from the process exiting.
 fn accepted_with_owner(workspace: &Workspace) -> (ReflectionController, String) {
-    let (controller, _request, acceptance) = accepted::accepted(workspace);
+    let (controller, task) = accepted::prepare(workspace);
     let owner = workspace.spawn_owner_process();
     workspace.set_endpoint_process(&workspace.endpoint, &owner);
     controller
-        .retain_owner_process(LEAD_THREAD, &owner)
+        .activate_with_owner_process(
+            &ActivationRequest {
+                lead_session: LEAD_THREAD.to_owned(),
+                run: None,
+                boundary: None,
+                journal: JournalPolicy::RequireExisting,
+                limits: None,
+            },
+            &owner,
+        )
         .unwrap();
+    let binding = AcceptanceBinding::new(
+        &task,
+        "accepted-run",
+        "accepted-assignment",
+        "accepted-result",
+        "accepted-revision",
+        vec![EXECUTOR_SOURCE.to_owned()],
+        LEAD_THREAD,
+        REFLECTION_ACTOR,
+        Purpose::Ordinary,
+    )
+    .with_turns(
+        Some(EXECUTOR_SOURCE.to_owned()),
+        Some(EXECUTOR_SOURCE_TURN.to_owned()),
+        Some(LEAD_SOURCE_TURN.to_owned()),
+    );
+    board_cli::close_accepted(
+        Path::new("bd.exe"),
+        &workspace.checkout,
+        REFLECTION_ACTOR,
+        &task,
+        &acceptance_metadata(&binding).unwrap(),
+    )
+    .unwrap();
+    let polled = controller.poll().unwrap();
+    assert_eq!(polled.accepted, 1, "{polled:?}");
+    let acceptance = polled.jobs[0].acceptance_id.clone();
+    workspace.lead_state.lock().unwrap().source_turn = Some(LEAD_SOURCE_TURN.to_owned());
     (controller, acceptance)
 }
 
@@ -153,6 +193,17 @@ fn successor_turn_available(workspace: &Workspace) {
     let mut state = workspace.successor_state.lock().unwrap();
     state.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
     state.source_turn_active = true;
+}
+
+fn begin_reflection_fixture_lifetime(workspace: &Workspace) {
+    for stage in ["executor-self-reflection", "lead-self-reflection"] {
+        for prefix in ["fork-", "turn-"] {
+            let marker = workspace.fixture_dir.join(format!("{prefix}{stage}.json"));
+            if marker.exists() {
+                fs::remove_file(marker).unwrap();
+            }
+        }
+    }
 }
 
 fn acceptance_dir(controller: &ReflectionController, acceptance: &str) -> PathBuf {
@@ -225,35 +276,10 @@ fn successor_completes_current_work_while_finished_predecessors_pending_stage_st
     assert_eq!(state_bytes(&controller), settled_before_succession);
     assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
 
-    // A real exit plus the absent registration is the positive proof.
+    // The next ordinary acceptance is the automatic preparation boundary: the
+    // departed owner is verified inactive, the successor takes ownership, and
+    // the predecessor's pending stage is retained outside the new lifetime.
     workspace.stop_owner_process();
-    let receipt = succeed(&workspace, SUCCESSOR_THREAD);
-    assert_eq!(receipt["changed"], true);
-    assert_eq!(receipt["previous_lead_session"], LEAD_THREAD);
-    assert_eq!(receipt["lead_session"], SUCCESSOR_THREAD);
-    assert_eq!(receipt["revision"], lifecycle_before.binding.revision + 1);
-
-    // The predecessor is verifiably finished, but its exact pending lead stage
-    // is still present. A successor host poll must not select that stage even
-    // when the predecessor's source conversation is available to the fixture.
-    let dormant = process(&workspace, SUCCESSOR_THREAD);
-    assert_eq!(dormant.outcome.exit_code, 0, "{}", dormant.transcript);
-    assert_eq!(
-        request_counts(&workspace),
-        (1, 1, 0, 0),
-        "the successor started the finished predecessor's pending stage: {}",
-        dormant.transcript
-    );
-    assert_eq!(lead_dispatches(&workspace.lead), 0);
-    assert_eq!(lead_dispatches(&workspace.successor), 0);
-    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), retained);
-    assert_eq!(
-        acceptance_files(&controller, &acceptance),
-        predecessor_files
-    );
-
-    // A fresh acceptance in the current successor activation is still ordinary
-    // work and must complete the entire chain exactly once.
     let source = lifecycle::source_fixture(&workspace, "succession-current-only", true);
     successor_turn_available(&workspace);
     let current = lifecycle::prepare_additional_ordinary_acceptance(
@@ -276,8 +302,21 @@ fn successor_completes_current_work_while_finished_predecessors_pending_stage_st
     let transferred = controller.stored_state().unwrap().unwrap();
     assert_eq!(transferred.binding.id, lifecycle_before.binding.id);
     assert_eq!(transferred.binding.lead_session, SUCCESSOR_THREAD);
+    assert_eq!(
+        transferred.binding.revision,
+        lifecycle_before.binding.revision + 1
+    );
     assert_eq!(transferred.records[&acceptance], retained);
+    assert!(!transferred.record_in_current_session(&retained));
+    assert!(
+        transferred
+            .retired_leads
+            .iter()
+            .any(|lead| lead == LEAD_THREAD)
+    );
 
+    // The fresh acceptance completes the entire chain exactly once.
+    begin_reflection_fixture_lifetime(&workspace);
     let completed = process_current(&workspace, SUCCESSOR_THREAD, "complete");
     assert_eq!(completed.outcome.exit_code, 0, "{}", completed.transcript);
     assert_eq!(
@@ -292,6 +331,20 @@ fn successor_completes_current_work_while_finished_predecessors_pending_stage_st
         acceptance_stage(&controller, &acceptance, "executor-stage"),
         executor_before
     );
+    assert_eq!(
+        acceptance_files(&controller, &acceptance),
+        predecessor_files
+    );
+
+    // With the current chain consumed, the verifiably finished predecessor's
+    // pending lead stage is still present and its source is available. A
+    // successor host poll must ignore it and exit normally.
+    let dormant = process(&workspace, SUCCESSOR_THREAD);
+    assert_eq!(dormant.outcome.exit_code, 0, "{}", dormant.transcript);
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
+    assert_eq!(lead_dispatches(&workspace.lead), 0);
+    assert_eq!(lead_dispatches(&workspace.successor), 1);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), retained);
     assert_eq!(
         acceptance_files(&controller, &acceptance),
         predecessor_files
