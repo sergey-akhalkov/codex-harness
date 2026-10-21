@@ -876,6 +876,7 @@ const INSTALLED_PROVIDER: &str = "control_fixture";
 #[path = "fixtures/control_responses.rs"]
 mod installed_responses;
 #[path = "fixtures/synthetic_role_build.rs"]
+#[allow(dead_code)]
 mod installed_role_build;
 
 #[test]
@@ -1078,7 +1079,7 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
     assert_eq!(lifecycle["lifecycle"], "active");
     assert!(
         installed_wait(Duration::from_secs(60), || {
-            installed_marker_visible(&home, &session, INSTALLED_FINAL)
+            installed_marker_visible(&session, INSTALLED_FINAL)
         }),
         "the canned ordinary response was not visible: {}\n{}",
         session.transcript(),
@@ -1105,11 +1106,42 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
         "the ordinary host log did not name the selected thread: {}",
         installed_logs(&home)
     );
-    let retained = installed_active_lifecycle(&home, &thread).expect(
-        "the automatic reflection lifecycle was not retained as active after the ordinary host exited",
+    let host_status = installed_host_status(&home, &thread);
+    let retained = installed_active_lifecycle(&home, &thread).unwrap_or_else(|| {
+        panic!(
+            "the automatic reflection lifecycle was not retained as active for {thread} after the ordinary host exited: {}\nhost status: {host_status:?}",
+            installed_logs(&home)
+        )
+    });
+    let owned = retained["binding"]["lead_session"] == thread.as_str();
+    let retired = retained["retired_leads"].as_array().is_some_and(|retired| {
+        retired
+            .iter()
+            .any(|lead| lead.as_str() == Some(thread.as_str()))
+    });
+    assert!(
+        owned || retired,
+        "the retained reflection lifecycle no longer identifies {thread}: {retained}\nhost status: {host_status:?}\n{}",
+        installed_logs(&home)
     );
-    assert_eq!(retained["binding"]["lead_session"], thread.as_str());
-    assert_eq!(retained["lifecycle"], "active");
+    assert_eq!(retained["lifecycle"], "active", "{retained}");
+    assert!(
+        retained["stopped_at"].is_null(),
+        "the retained reflection lifecycle recorded a stop: {retained}"
+    );
+    let host = host_status.unwrap_or_else(|| {
+        panic!(
+            "the ordinary host retained no exact stopped status for {thread}: {}",
+            installed_logs(&home)
+        )
+    });
+    assert_eq!(host["lead"], thread.as_str(), "{host}");
+    assert_eq!(host["state"], "stopped", "{host}");
+    assert_eq!(
+        host["detail"],
+        "the owning lead host ended; retained results and pending work are preserved",
+        "{host}"
+    );
 }
 
 fn installed_input(name: &str) -> PathBuf {
@@ -1347,7 +1379,31 @@ fn installed_active_lifecycle(home: &Path, thread: &str) -> Option<Value> {
         let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        if value["lifecycle"] == "active" && value["binding"]["lead_session"] == thread {
+        let owned = value["binding"]["lead_session"] == thread;
+        let retired = value["retired_leads"]
+            .as_array()
+            .is_some_and(|retired| retired.iter().any(|lead| lead.as_str() == Some(thread)));
+        if value["lifecycle"] == "active" && (owned || retired) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn installed_host_status(home: &Path, thread: &str) -> Option<Value> {
+    let entries = fs::read_dir(home.join("harness/delivery-reflection/hosts")).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if value["lead"] == thread {
             return Some(value);
         }
     }
@@ -1373,25 +1429,8 @@ fn installed_provider_requested(evidence: &Path, prompt: &str) -> bool {
     false
 }
 
-fn installed_marker_visible(home: &Path, session: &ConsoleSession, marker: &str) -> bool {
-    session.transcript().contains(marker) || installed_marker_in(&home.join("sessions"), marker)
-}
-
-fn installed_marker_in(path: &Path, marker: &str) -> bool {
-    let Ok(entries) = fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            if installed_marker_in(&path, marker) {
-                return true;
-            }
-        } else if fs::read_to_string(&path).is_ok_and(|text| text.contains(marker)) {
-            return true;
-        }
-    }
-    false
+fn installed_marker_visible(session: &ConsoleSession, marker: &str) -> bool {
+    session.transcript().contains(marker)
 }
 
 fn installed_host_log_contains(home: &Path, needle: &str) -> bool {
