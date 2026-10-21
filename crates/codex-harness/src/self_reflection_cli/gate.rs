@@ -54,14 +54,14 @@ impl ReflectionGate {
         let Some(state) = state else {
             return (
                 "stopped",
-                "self_reflection_enabled = true, but no reflection lifecycle is active; enable one explicitly"
+                "self_reflection_enabled = true, but no reflection lifecycle has been prepared; the supported managed lead prepares it automatically, and ordinary acceptance prepares it before its first close"
                     .to_owned(),
             );
         };
         if state.lifecycle != LifecycleStatus::Active {
             return (
                 "stopped",
-                "self_reflection_enabled = true, but the retained reflection lifecycle is stopped; enable it explicitly"
+                "self_reflection_enabled = true, but the retained reflection lifecycle is administratively stopped; a new managed lead host for the retained lead or a false-to-true flag transition prepares it again"
                     .to_owned(),
             );
         }
@@ -76,7 +76,7 @@ impl ReflectionGate {
         }
         (
             "permitted",
-            "self_reflection_enabled = true and the explicitly activated lifecycle is active"
+            "self_reflection_enabled = true and the prepared reflection lifecycle is active"
                 .to_owned(),
         )
     }

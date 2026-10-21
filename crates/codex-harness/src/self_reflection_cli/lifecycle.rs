@@ -285,26 +285,135 @@ impl Options {
         let thread = std::env::var("CODEX_THREAD_ID").ok()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| invalid("CODEX_THREAD_ID is missing; run this command from the managed lead conversation"))?;
-        match control::registered_lead(&self.home, &thread) {
-            control::RegisteredLead::Live(endpoint) => {
-                let process = endpoint.process.as_ref().ok_or_else(|| invalid(format!(
-                    "the real lead '{thread}' is registered without an app-server process identity; start or resume it with `codex-harness lead start --session THREAD`"
-                )))?;
-                Ok((
-                    thread,
-                    RetainedOwnerProcess {
-                        identity: harness_core::process::ProcessIdentity {
-                            pid: process.pid,
-                            creation_time: process.creation_time,
-                        },
-                        program: process.program.clone(),
-                    },
-                ))
+        Ok((thread.clone(), managed_lead_owner(&self.home, &thread)?))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Preparation {
+    Disabled,
+    Stopped,
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparationTrigger {
+    Host,
+    Acceptance,
+}
+
+/// Prepare the existing reflection lifecycle from the configuration permission
+/// and an already-authenticated managed lead. The caller supplies every
+/// identity explicitly: a host must pass its own thread rather than inheriting
+/// one from a child environment. A retained owner is refreshed without
+/// changing its checkpoint or records; another owner is transferred only
+/// through the existing verified-inactive succession path.
+pub(crate) fn prepare_automatic(
+    home: &Path,
+    source: &Path,
+    project: &Path,
+    lead: &str,
+    trigger: PreparationTrigger,
+) -> io::Result<Preparation> {
+    let source = canonical_dir(source, "kit source")?;
+    let config = orchestration_config::load(&source)?;
+    if !config.self_reflection_enabled {
+        return Ok(Preparation::Disabled);
+    }
+    let lead = lead.trim();
+    if lead.is_empty() {
+        return Err(invalid(
+            "automatic reflection preparation requires the managed lead identity",
+        ));
+    }
+    let home = canonical_dir(home, "CODEX_HOME")?;
+    let project = canonical_dir(project, "consumer project")?;
+    let options = Options {
+        command: "enable".to_owned(),
+        project: project.clone(),
+        source: source.clone(),
+        home: home.clone(),
+        recovery: None,
+        continuation: None,
+    };
+    declarations(&options, &config)?;
+    if !home.join("harness/bin/codex.exe").is_file() {
+        return Err(invalid(
+            "the installed Codex launcher is missing; repair the installation before preparing reflection",
+        ));
+    }
+    let owner_process = managed_lead_owner(&home, lead)?;
+    let controller = options.controller()?;
+    if let Some(state) = controller.stored_state()? {
+        let retained = state.binding.lead_session.trim();
+        if retained != lead {
+            if state.lifecycle != LifecycleStatus::Active {
+                return Err(invalid(format!(
+                    "automatic reflection preparation found a stopped lifecycle retained by lead '{retained}', not '{lead}'; a different owner is transferred only through verified succession of an active lifecycle. Restart or resume the retained lead while self_reflection_enabled = true, then repeat preparation from its successor; no ownership or lifecycle state was changed"
+                )));
             }
-            control::RegisteredLead::Unavailable(reason) => Err(invalid(format!(
-                "the real lead is unavailable: {reason}; start or resume it with `codex-harness lead start --session THREAD`"
-            ))),
+            match retained_owner(&home, retained, state.owner_process.as_ref())? {
+                RetainedOwner::Inactive => {}
+                RetainedOwner::Live => {
+                    return Err(invalid(format!(
+                        "the retained lead '{retained}' is still live; automatic preparation will not replace it with '{lead}'. Stop or exit that managed lead, verify the process has ended, then let the successor prepare; no ownership or lifecycle state was changed"
+                    )));
+                }
+                RetainedOwner::Unverifiable(reason) => {
+                    return Err(invalid(format!(
+                        "{reason}; automatic preparation will not replace '{retained}' with '{lead}' until its exact managed-lead process exit is verifiable; no ownership or lifecycle state was changed"
+                    )));
+                }
+            }
+            controller.succeed(&SuccessionRequest {
+                expected_lead_session: retained.to_owned(),
+                successor_lead: lead.to_owned(),
+                successor_process: owner_process,
+            })?;
+            return Ok(Preparation::Active);
         }
+        if state.lifecycle != LifecycleStatus::Active && trigger == PreparationTrigger::Acceptance {
+            // Acceptance preserves an explicit administrative stop. Only a
+            // fresh host or a false-to-true transition resumes it.
+            return Ok(Preparation::Stopped);
+        }
+    }
+    controller.activate_with_owner_process(
+        &ActivationRequest {
+            lead_session: lead.to_owned(),
+            run: None,
+            boundary: None,
+            journal: JournalPolicy::EnableIfMissing,
+            limits: config.reflection_limits,
+        },
+        &owner_process,
+    )?;
+    Ok(Preparation::Active)
+}
+
+fn managed_lead_owner(home: &Path, thread: &str) -> io::Result<RetainedOwnerProcess> {
+    let thread = thread.trim();
+    if thread.is_empty() {
+        return Err(invalid(
+            "the managed lead identity is missing; preparation needs the lead's own registered thread",
+        ));
+    }
+    match control::registered_lead(home, thread) {
+        control::RegisteredLead::Live(endpoint) => {
+            let process = endpoint.process.as_ref().ok_or_else(|| invalid(format!(
+                "the real lead '{thread}' is registered without an app-server process identity; start or resume it with `codex-harness lead start --session THREAD`"
+            )))?;
+            Ok(RetainedOwnerProcess {
+                identity: harness_core::process::ProcessIdentity {
+                    pid: process.pid,
+                    creation_time: process.creation_time,
+                },
+                program: process.program.clone(),
+            })
+        }
+        control::RegisteredLead::Unavailable(reason) => Err(invalid(format!(
+            "the real lead is unavailable: {reason}; start or resume it with `codex-harness lead start --session THREAD`"
+        ))),
     }
 }
 
@@ -597,11 +706,11 @@ enum RetainedOwner {
 }
 
 fn retained_owner(
-    options: &Options,
+    home: &Path,
     thread: &str,
     retained: Option<&RetainedOwnerProcess>,
 ) -> io::Result<RetainedOwner> {
-    let path = control::lead_endpoint_path(&options.home, thread).map_err(|error| {
+    let path = control::lead_endpoint_path(home, thread).map_err(|error| {
         invalid(format!(
             "the retained lead identity '{thread}' cannot name a managed registry record: {error}; verify the managed-lead registry and repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; no ownership or lifecycle state was changed"
         ))
@@ -695,7 +804,7 @@ fn succession(options: &Options, controller: &ReflectionController) -> io::Resul
     }
     let previous = state.binding.lead_session.clone();
     if successor != previous {
-        match retained_owner(options, &previous, state.owner_process.as_ref())? {
+        match retained_owner(&options.home, &previous, state.owner_process.as_ref())? {
             RetainedOwner::Live => {
                 return Err(invalid(format!(
                     "the retained lead '{previous}' is still live; stop or exit that managed lead, verify the process has ended, then repeat `codex-harness delivery-improvement succeed --project DIRECTORY` from the successor; no ownership or lifecycle state was changed"

@@ -65,6 +65,20 @@ fn status_path(home: &Path, lead: &str) -> PathBuf {
         .join(format!("{}.json", digest(lead)))
 }
 
+fn kit_source(home: &Path, candidate: &Path) -> io::Result<PathBuf> {
+    if candidate.join("global/roles.toml").is_file() {
+        return Ok(candidate.to_owned());
+    }
+    crate::feedback_cli::installed_kit_source_in(home)
+        .ok_or_else(|| invalid("the managed lead has no installed kit source"))
+}
+
+fn board_initialized(project: &Path) -> bool {
+    project
+        .ancestors()
+        .any(|directory| directory.join(".beads/config.yaml").is_file())
+}
+
 pub(super) fn status(home: &Path, lead: &str) -> io::Result<Value> {
     let path = status_path(home, lead);
     if !path.is_file() {
@@ -100,6 +114,7 @@ pub(crate) struct LeadLifecycle {
     job: Option<Job>,
     child: Option<OwnedProcess>,
     next_poll: Instant,
+    observed_enabled: Option<bool>,
     last_attempt: Option<String>,
     failed: bool,
 }
@@ -113,6 +128,7 @@ impl LeadLifecycle {
             job: None,
             child: None,
             next_poll: Instant::now(),
+            observed_enabled: None,
             last_attempt: None,
             failed: false,
         }
@@ -134,17 +150,60 @@ impl LeadLifecycle {
     }
 
     fn tick_inner(&mut self) -> io::Result<()> {
-        if let Some(child) = &self.child {
+        let child_running = if let Some(child) = &self.child {
             if child.is_running()? {
-                return Ok(());
+                true
+            } else {
+                let code = child.exit_code()?.unwrap_or(1);
+                self.child = None;
+                if let Some(job) = self.job.take() {
+                    job.terminate(1, Duration::from_secs(5))?;
+                }
+                self.record(if code == 0 { "stopped" } else { "failed" }, None,
+                    &format!("controller exited with code {code}; see the retained log before disable/enable or source recovery"))?;
+                false
             }
-            let code = child.exit_code()?.unwrap_or(1);
-            self.child = None;
-            if let Some(job) = self.job.take() {
-                job.terminate(1, Duration::from_secs(5))?;
+        } else {
+            false
+        };
+        if !board_initialized(&self.source) {
+            // A managed lead may start before its project's native board
+            // is initialized. Keep the existing poll boundary and retry
+            // once the board owner writes its configuration; no error is
+            // recorded and no daemon or model probe is introduced.
+            return Ok(());
+        }
+        let source = kit_source(&self.home, &self.source)?;
+        let gate = gate::ReflectionGate::load(&source)?;
+        if !gate.enabled {
+            self.observed_enabled = Some(false);
+            // A later true observation is a new preparation transition and may
+            // start the model-free consumer even for the same retained binding.
+            self.last_attempt = None;
+            return Ok(());
+        }
+        if self.observed_enabled != Some(true) {
+            match lifecycle::prepare_automatic(
+                &self.home,
+                &source,
+                &self.source,
+                &self.lead,
+                lifecycle::PreparationTrigger::Host,
+            )? {
+                lifecycle::Preparation::Active => {
+                    self.observed_enabled = Some(true);
+                }
+                lifecycle::Preparation::Disabled | lifecycle::Preparation::Stopped => {
+                    self.observed_enabled = Some(false);
+                    self.last_attempt = None;
+                    return Ok(());
+                }
             }
-            self.record(if code == 0 { "stopped" } else { "failed" }, None,
-                &format!("controller exited with code {code}; see the retained log before disable/enable or source recovery"))?;
+        }
+        if child_running {
+            // The existing consumer re-reads the gate for every stage. Keep the
+            // host's transition state current without launching a duplicate.
+            return Ok(());
         }
         let boards = active_boards(&self.home, &self.lead)?;
         if boards.is_empty() {
@@ -159,13 +218,6 @@ impl LeadLifecycle {
             return Ok(());
         }
         self.last_attempt = Some(generation);
-        let source = if self.source.join("global/roles.toml").is_file() {
-            self.source.clone()
-        } else {
-            crate::feedback_cli::installed_kit_source_in(&self.home).ok_or_else(|| {
-                invalid("the enabled reflection lifecycle has no installed kit source")
-            })?
-        };
         let path = status_path(&self.home, &self.lead);
         fs::create_dir_all(path.parent().unwrap())?;
         let log = fs::OpenOptions::new()
@@ -243,3 +295,21 @@ impl LeadLifecycle {
 }
 
 pub(super) const POLL_INTERVAL: Duration = JOURNAL_POLL;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn board_initialization_is_found_from_a_nested_project() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("workspace/project/subdirectory");
+        fs::create_dir_all(&project).unwrap();
+
+        assert!(!board_initialized(&project));
+
+        fs::create_dir_all(root.path().join("workspace/.beads")).unwrap();
+        fs::write(root.path().join("workspace/.beads/config.yaml"), "").unwrap();
+        assert!(board_initialized(&project));
+    }
+}

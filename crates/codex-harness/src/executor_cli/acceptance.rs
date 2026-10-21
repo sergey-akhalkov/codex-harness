@@ -137,11 +137,10 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
     let issue = board_cli::show_issue(&bd, &request.project, &request.task)?;
     let purpose = board_purpose(&issue, &request.task)?;
 
-    let controller = ReflectionController::new(&bd, &request.project, &home);
-    let reflection = controller.check_active_binding(&lead.thread, None)?;
-    refuse_unusable_reflection(&reflection)?;
-
     if issue.get("status").and_then(serde_json::Value::as_str) == Some("closed") {
+        let controller = ReflectionController::new(&bd, &request.project, &home);
+        let reflection = controller.check_active_binding(&lead.thread, None)?;
+        refuse_unusable_reflection(&reflection)?;
         let binding = recorded_acceptance(&issue, &request.task)?;
         let accepted = validate_recorded_acceptance(
             &home,
@@ -171,6 +170,22 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
     };
     let self_reflection_enabled =
         orchestration_config::load(&config_source)?.self_reflection_enabled;
+    if self_reflection_enabled {
+        // Prepare before observing the binding and before the board close. The
+        // activation checkpoint is therefore at or before the accepted event,
+        // so a fast first acceptance remains eligible for exactly one
+        // reflection instead of starting the journal at a later head.
+        crate::self_reflection_cli::lifecycle::prepare_automatic(
+            &home,
+            &config_source,
+            &request.project,
+            &lead.thread,
+            crate::self_reflection_cli::lifecycle::PreparationTrigger::Acceptance,
+        )?;
+    }
+    let controller = ReflectionController::new(&bd, &request.project, &home);
+    let reflection = controller.check_active_binding(&lead.thread, None)?;
+    refuse_unusable_reflection(&reflection)?;
 
     // Dispatch preparation publishes its claim and startup reservation under
     // the pool-wide admission lock; assignment binding and the run receipt
