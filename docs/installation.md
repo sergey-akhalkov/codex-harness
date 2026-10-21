@@ -189,7 +189,10 @@ Ponytail automatic delivery is still being implemented under
 Do not work around it by copying upstream rules or skills into the harness.
 The inspected original 5.3.2 candidate at
 `09c434ab73ca43761c5d8b0c5d341926c2fba710` requires Node on PATH and native
-`/hooks` trust review. Isolated hook execution on Node 24.18.0 confirmed that
+`/hooks` trust review. Its MIT license and attribution stay in the original
+package. It declares no npm runtime dependencies; the native hooks invoke Node
+for `SessionStart`, `UserPromptSubmit` and `SubagentStart` and use the supplied
+resources. Isolated hook execution on Node 24.18.0 confirmed that
 resume resets the selected mode and a second session in the same project can
 overwrite the first session's mode. Hosts without project context use shared
 fallback state; compaction retains the current stored mode. The integration
