@@ -464,6 +464,82 @@ struct NativeFixture {
 }
 
 #[test]
+#[ignore = "requires explicit native CLI; owned app-server and terminal, no model requests"]
+fn native_hosted_resume_accepts_permission_configuration() {
+    let fixture = native_fixture_with_arguments(
+        true,
+        false,
+        &[
+            "-c",
+            "approval_policy=\"on-request\"",
+            "-c",
+            "sandbox_mode=\"read-only\"",
+        ],
+    );
+    let root = fixture.root.path();
+    let mut owner = Client::connect(fixture.port, &fixture.token, root, "resume-owner");
+    let started = owner.request("thread/start", json!({"cwd":fixture.workspace}));
+    let id = started["thread"]["id"].as_str().unwrap();
+    assert_eq!(started["approvalPolicy"], "on-request");
+    assert_eq!(started["sandbox"]["type"], "readOnly");
+    owner.request(
+        "thread/name/set",
+        json!({"threadId":id,"name":"Owned permission resume"}),
+    );
+    let arguments = [
+        "-c",
+        "approval_policy=\"on-request\"",
+        "--config=sandbox_mode=\"read-only\"",
+        "--no-alt-screen",
+        "resume",
+        id,
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect::<Vec<_>>();
+    let planned =
+        harness_core::task_arguments::plan_hosted(&arguments, &fixture.workspace, &fixture.home)
+            .unwrap()
+            .unwrap();
+    let mut tui = command(&fixture.exe, &fixture.home, &fixture.workspace);
+    tui.args = vec![
+        "--remote".into(),
+        format!("ws://127.0.0.1:{}", fixture.port).into(),
+        "--remote-auth-token-env".into(),
+        "HARNESS_CONTROL_TOKEN".into(),
+    ];
+    tui.args.extend(planned.tui);
+    tui.env.insert(
+        "HARNESS_CONTROL_TOKEN".into(),
+        Some(fixture.token.clone().into()),
+    );
+    let session = ConsoleSession::spawn(ConsoleSpec::new(tui)).unwrap();
+    let until = Instant::now() + WAIT;
+    while !session.transcript().contains("Owned permission resume")
+        && !session
+            .transcript()
+            .contains("Permission overrides are not supported")
+        && Instant::now() < until
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let transcript = session.transcript();
+    fs::write(root.join("hosted-resume-terminal.txt"), &transcript).unwrap();
+    assert!(
+        !transcript.contains("Permission overrides are not supported"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("Owned permission resume"),
+        "{transcript}"
+    );
+    let resumed = owner.request("thread/resume", json!({"threadId":id}));
+    assert_eq!(resumed["approvalPolicy"], "on-request");
+    assert_eq!(resumed["sandbox"]["type"], "readOnly");
+    assert!(!root.join("provider-1.json").exists());
+}
+
+#[test]
 #[ignore = "requires explicit native CLI; owned protocol and synthetic responses"]
 fn native_named_empty_thread_can_be_attached() {
     let fixture = native_fixture(true);

@@ -627,7 +627,14 @@ fn new_selection_is_registered_before_the_frontend_turn_and_retired_after_exit()
 #[test]
 fn resume_keeps_the_native_source_and_registers_the_returned_selection() {
     let fixture = Fixture::new();
-    let native = ["--no-alt-screen", "resume", RESUME_THREAD];
+    let native = [
+        "-c",
+        "approval_policy=\"never\"",
+        "--config=sandbox_mode=\"read-only\"",
+        "--no-alt-screen",
+        "resume",
+        RESUME_THREAD,
+    ];
     let session = spawn(fixture.command("resume", RESUME_THREAD, Some(RESUME_THREAD), &native));
     wait_for(&fixture.selected(), "the resumed thread identity", &session);
     wait_for(
@@ -644,7 +651,7 @@ fn resume_keeps_the_native_source_and_registers_the_returned_selection() {
     let frontend_argv = lines(&fixture.argv());
     assert_eq!(
         &frontend_argv[4..],
-        native,
+        ["--no-alt-screen", "resume", RESUME_THREAD],
         "the explicit native resume selection changed"
     );
     fixture.release();
