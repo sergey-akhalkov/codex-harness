@@ -1274,28 +1274,32 @@ mod tests {
 
     #[test]
     fn hosted_oss_selection_stays_in_the_native_frontend() {
-        for list in [
-            vec!["--oss", "hello"],
-            vec!["--oss", "--local-provider", "ollama", "hello"],
-            vec![
-                "--oss",
-                "--local-provider",
-                "lmstudio",
-                "-m",
-                "custom",
-                "hello",
-            ],
-            vec!["--local-provider", "ollama", "hello"],
-        ] {
+        let cases: [(Vec<&str>, Vec<&str>); 4] = [
+            (vec!["--oss", "hello"], vec![]),
+            (vec!["--oss", "--local-provider", "ollama", "hello"], vec![]),
+            (
+                vec![
+                    "--oss",
+                    "--local-provider",
+                    "lmstudio",
+                    "-m",
+                    "custom",
+                    "hello",
+                ],
+                vec!["-c", "model=\"custom\""],
+            ),
+            (vec!["--local-provider", "ollama", "hello"], vec![]),
+        ];
+        for (list, expected_backend) in cases {
             let args = argv(&list);
             let planned = plan_hosted(&args, Path::new("D:/base"), Path::new("D:/base-home"))
                 .unwrap()
                 .expect("native OSS selection stays hosted");
             assert_eq!(planned.tui, args, "{list:?}");
-            assert!(
-                planned.backend.is_empty(),
-                "the native frontend owns OSS selection and model defaults: {list:?}: {:?}",
-                planned.backend
+            assert_eq!(
+                planned.backend,
+                argv(&expected_backend),
+                "the native frontend owns OSS selection; only an explicit -m maps to the backend: {list:?}"
             );
         }
     }
