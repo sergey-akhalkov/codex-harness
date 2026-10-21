@@ -202,8 +202,11 @@ fallback state; compaction retains the current stored mode. The integration
 preserves this original behavior and does not promise independent session modes.
 Temporary Ponytail mode changes differ from disabling the plugin persistently.
 Native Codex CLI 0.163.0 installation at the exact revision, repeat installation
-and removal/reinstall were exercised in isolated state. Native trusted context
-consumption remains unverified. These findings
+and removal/reinstall were exercised in isolated state. Native `/hooks` review,
+full policy injection and actual core/help skill reads passed in a fresh managed
+native session outside this checkout, with the external project's instructions
+present and its files unchanged. This qualifies the original package; the final
+harness delivery and lifecycle checks remain unfinished. These findings
 are reproducible from the pinned
 [activation hook](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-activate.js)
 and [mode-state owner](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-runtime.js).

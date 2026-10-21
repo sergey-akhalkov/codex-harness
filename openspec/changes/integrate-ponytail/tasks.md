@@ -5,7 +5,7 @@ Implementation follows [design.md](design.md). The first native-consumer proof p
 ## 1. Qualify the upstream package through native Codex
 
 - [x] 1.1 Evaluate the exact Ponytail candidate, its license, hook entry points and invoked resources, runtime requirements and relevant dependency risks; verify immutable source identity and document the supported Codex/Node baseline in `docs/installation.md` without claiming unexecuted compatibility.
-- [ ] 1.2 Install that original package through a native marketplace in an owned isolated target, complete native hook trust through the supported review path, and start ordinary Codex outside this checkout; verify the resolved revision, actual Ponytail context and all supplied skill/resource routes without changing the live principles.
+- [x] 1.2 Install that original package through a native marketplace in an owned isolated target, complete native hook trust through the supported review path, and start ordinary Codex outside this checkout; verify the resolved revision, actual Ponytail context and all supplied skill/resource routes without changing the live principles.
 - [ ] 1.3 Exercise fresh start, resume, compaction, executor startup and explicit mode changes with concurrent sessions in the same and different repositories; retain native observations of context and upstream mode scope, document resume reset and shared-state limitations, and distinguish temporary modes from persistent plugin disablement without claiming independent session modes.
 
 ## 2. Deliver Ponytail through the existing installation owner
