@@ -85,3 +85,19 @@ The installed configuration SHALL define `self_reflection_enabled`, a boolean de
 #### Scenario: The permission has an invalid type
 - **WHEN** the configuration supplies a string, integer or other non-boolean value
 - **THEN** configuration loading fails before model work or lifecycle mutation
+
+### Requirement: Recovery preserves ownership and partial work
+
+Stop, interruption, lead succession and recovery SHALL preserve outcomes, task references and executor work without duplicate reflection, delivery or assignments. Lead shutdown SHALL prevent orphaned launches. Reactivation SHALL verify scope, purpose, source boundaries, actual model and effective guidance before continuation. Automatic model work SHALL remain limited to the current session's eligible work; retained records from finished sessions SHALL remain dormant.
+
+#### Scenario: Stop occurs between reflection stages
+- **WHEN** executor reflection is retained, lead reflection has not finished and the same session remains current
+- **THEN** recovery resumes from the retained stage identity without rerunning accepted executor work or duplicating its reflection
+
+#### Scenario: The lead is replaced
+- **WHEN** a supported successor takes ownership after the prior session finishes
+- **THEN** records and results remain intact through the existing lifecycle without two active owners, but the predecessor's pending stages do not launch automatically
+
+#### Scenario: The user disables the feature
+- **WHEN** stopping occurs during reflection or implementation
+- **THEN** new reflection and improvement assignments stop while in-flight effects and partial implementation follow the user's stop scope and existing recovery

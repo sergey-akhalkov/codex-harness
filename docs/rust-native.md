@@ -356,8 +356,9 @@ rejected before creating build state.
 The installed harness provides sequential executor and lead self-reflection
 after ordinary task acceptance. Both role skills are delivered globally.
 `self_reflection_enabled = true` in the kit's `global/orchestration.toml`
-automatically prepares the consuming project's lifecycle in its managed lead
-session. No separate activation command is needed. The host also observes a
+automatically prepares the consuming project's lifecycle when ordinary interactive
+`codex` starts, preserving native model, profile, arguments and session selection.
+No separate activation command is needed. The host also observes a
 false-to-true change while running. Inspect the resulting state with:
 
 ```powershell
@@ -403,6 +404,11 @@ keeps the existing checkpoint and retained work. The existing `lead start` host
 owns the model-free consumer and ends its contained processes when the lead exits.
 A different lead can take over only after the previous owner's exact process is
 verified inactive; live ownership and unresolved recovery remain protected.
+Automatic reflection applies only to the exact current session and its newly
+accepted work. Finished sessions are never reopened or swept; their historical
+acceptances and retained pending stages cannot trigger new model calls. Explicit
+native resume selects the current conversation without replaying its history.
+The current session's paused stages can continue after re-enabling the flag.
 Status reports the native journal
 checkpoint, pending work, recovery state and the controller's verified process
 liveness and log location. The explicit `enable` command remains an idempotent
