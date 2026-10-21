@@ -37,9 +37,9 @@ instructions = "global/roles/executor.md"
 skills = []
 
 [roles.executor-self-reflection]
-instructions = "global/roles/executor-reflection.md"
-skills = []
+instructions = ".agents/skills/executor-self-reflection/SKILL.md"
+skills = ["executor-self-reflection"]
 
 [roles.lead-self-reflection]
-instructions = "global/roles/lead-reflection.md"
-skills = []
+instructions = ".agents/skills/lead-self-reflection/SKILL.md"
+skills = ["lead-self-reflection"]

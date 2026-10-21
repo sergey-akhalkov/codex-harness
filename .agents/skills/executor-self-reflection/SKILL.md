@@ -1,3 +1,8 @@
+---
+name: executor-self-reflection
+description: Analyze accepted executor work in a designated reflection fork, identifying avoidable mistakes, unclear task framing and useful improvements for lead synthesis. Skip implementation, ordinary status reporting and automatic reflection of improvement work.
+---
+
 # Executor self-reflection
 
 This session is a bounded, read-only retrospective over one accepted executor

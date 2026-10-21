@@ -516,9 +516,12 @@ native command targets and build artifact integrity verify for the same
 `CODEX_HOME`; `chain.json` and accepted provenance remain byte-identical. A raw
 request, an arbitrary launcher, or any source, run, role, routing, reference or
 ownership drift still refuses before a fork or accounting change. The
-independent skill drafts remain outside discovery in `.agents/skill-candidates`
-until evaluation allows publication. No comparison benefit is established by
-the model-free checks.
+two reflection skills live under `.agents/skills` and each is the authoritative
+instruction source for its matching role in `global/roles.toml`. The native
+role resolver consumes that same file before model work; discovery does not
+maintain a second copy of its prompt. Their instruction bodies preserve the
+texts exercised by the real sequential fork-and-delivery acceptance. This
+establishes operation, not a comparative benefit or savings claim.
 
 A retained lifecycle can move to a different managed lead after its original
 owner exits. Run this from the live successor conversation:

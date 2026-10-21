@@ -1,3 +1,8 @@
+---
+name: lead-self-reflection
+description: Synthesize accepted-task executor reflections with the lead's own conversation in a designated reflection fork, identifying actionable improvements in framing, delegation, review and delivery. Skip implementation and autonomous task assignment.
+---
+
 # Lead self-reflection
 
 This session is a bounded, read-only synthesis over one lead conversation and
