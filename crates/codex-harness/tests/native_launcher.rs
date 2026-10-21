@@ -507,6 +507,70 @@ fn ordinary_reflection_rejects_unsupported_native_arguments_before_starting_a_pa
     let marker = f.root.path().join("unsupported-argument-started");
     let output = f
         .command()
+        .args(["--search", "hello"])
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &marker)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--search"), "{stderr}");
+    assert!(stderr.contains("live web search"), "{stderr}");
+    assert!(
+        !marker.exists(),
+        "an unsupported argument must start no payload"
+    );
+}
+
+#[test]
+fn ordinary_reflection_forwards_oss_provider_selection_to_manager() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let args = vec![
+        OsString::from("--oss"),
+        OsString::from("--local-provider"),
+        OsString::from("ollama"),
+        OsString::from("hello"),
+    ];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    let expected = args
+        .iter()
+        .map(|arg| json!(arg.to_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert!(
+        manager_args.ends_with(&expected),
+        "the manager must receive the OSS selection unchanged: {manager_args:?}"
+    );
+}
+
+#[test]
+fn ordinary_reflection_reads_the_declared_oss_provider_before_manager_entry() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    fs::write(f.home.join("config.toml"), "oss_provider = \"lmstudio\"\n").unwrap();
+    let (code, report) = launch_report(&f, &[OsString::from("--oss"), OsString::from("hello")]);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    assert!(
+        manager_args.ends_with(&[json!("--oss"), json!("hello")]),
+        "the manager must receive the declared OSS selection unchanged: {manager_args:?}"
+    );
+}
+
+#[test]
+fn ordinary_reflection_reports_missing_oss_provider_before_starting_a_payload() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let marker = f.root.path().join("missing-provider-started");
+    let output = f
+        .command()
         .args(["--oss", "hello"])
         .env("HARNESS_LAUNCH_FIXTURE_STARTED", &marker)
         .stdin(Stdio::null())
@@ -514,11 +578,31 @@ fn ordinary_reflection_rejects_unsupported_native_arguments_before_starting_a_pa
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--oss"), "{stderr}");
-    assert!(stderr.contains("open-source provider"), "{stderr}");
+    assert!(stderr.contains("--local-provider"), "{stderr}");
+    assert!(stderr.contains("oss_provider"), "{stderr}");
     assert!(
         !marker.exists(),
-        "an unsupported argument must start no payload"
+        "a missing OSS provider must start no payload"
+    );
+}
+
+#[test]
+fn ordinary_reflection_keeps_uncapped_cpu_selection_on_the_manager_path() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    let args = vec![
+        OsString::from("--harness-cpu"),
+        OsString::from("uncapped"),
+        OsString::from("hello"),
+    ];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    assert!(
+        manager_args.ends_with(&[json!("hello")]),
+        "the CPU selector is consumed by the launcher; the prepared argv is unchanged: {manager_args:?}"
     );
 }
 

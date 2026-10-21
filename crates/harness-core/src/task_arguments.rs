@@ -12,6 +12,14 @@
 //! app-server has no profile flag of its own. Legacy [plan] keeps its
 //! profile bypass unchanged for the task-control caller.
 //!
+//! [plan_hosted] also carries native OSS provider selection. "--oss" and
+//! "--local-provider" stay in the frontend arguments while the backend
+//! receives the equivalent "model_provider" override and, when no "-m" is
+//! given, the selected provider's native default model. The app-server has
+//! no OSS flag. A request that would need the native local-provider
+//! discovery is reported before a payload starts instead of choosing a provider
+//! on the caller's behalf; legacy [plan] keeps its existing OSS rejection.
+//!
 //! * ManagedArguments::tui keeps the caller's arguments verbatim. The caller
 //!   owns adding its "--remote <ADDR>" endpoint, which must be inserted
 //!   before any "--" separator.
@@ -47,6 +55,7 @@
 //! accepts only "on-request" and "never".
 
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, ErrorKind};
 use std::mem::take;
 use std::path::{Path, PathBuf};
@@ -149,6 +158,8 @@ struct Session {
     add_dirs: Vec<String>,
     cd: Option<OsString>,
     profile: Option<String>,
+    oss: bool,
+    local_provider: Option<String>,
 }
 
 struct Parser<'a> {
@@ -226,6 +237,11 @@ fn plan_session(
         }
         layered.extend(backend);
         backend = layered;
+    }
+    if let Some(home) = codex_home
+        && session.oss
+    {
+        apply_oss_provider(&session, home, &mut backend)?;
     }
     if !parser.hosted
         && parser.kind == Some(SessionKind::Resume)
@@ -519,15 +535,23 @@ impl Parser<'_> {
             }
             "local-provider" => {
                 let value = self.utf8_value(attached, args, i, "--local-provider")?;
-                Err(unsupported(format!(
-                    "--local-provider '{value}' selects an open-source provider; no verified app-server config mapping exists for codex-cli 0.154.0"
-                )))
+                if !self.hosted {
+                    return Err(unsupported(format!(
+                        "--local-provider '{value}' selects an open-source provider; legacy task-control planning keeps its existing native path"
+                    )));
+                }
+                self.session.local_provider = Some(value);
+                Ok(true)
             }
             "oss" => {
                 reject_attached(name, attached)?;
-                Err(unsupported(
-                    "--oss selects the open-source provider; no verified app-server config mapping exists for codex-cli 0.154.0",
-                ))
+                if !self.hosted {
+                    return Err(unsupported(
+                        "--oss selects the open-source provider; legacy task-control planning keeps its existing native path",
+                    ));
+                }
+                self.session.oss = true;
+                Ok(true)
             }
             "search" => {
                 reject_attached(name, attached)?;
@@ -787,6 +811,135 @@ fn push_override(backend: &mut Vec<OsString>, key: &str, toml_value: &str) {
     backend.push(format!("{key}={toml_value}").into());
 }
 
+/// Native OSS startup resolves a provider before the app-server exists: an
+/// explicit `--local-provider` wins, otherwise the effective `oss_provider`
+/// value comes from the local configuration layers. The backend receives that
+/// provider and, when the caller gave no `-m`, the provider's native default
+/// model. An undeclared provider would require native local-provider discovery,
+/// which cannot precede this backend, so it is reported instead of guessed.
+fn apply_oss_provider(
+    session: &Session,
+    home: &Path,
+    backend: &mut Vec<OsString>,
+) -> io::Result<()> {
+    let provider = resolve_oss_provider(session, home)?.ok_or_else(|| {
+        unsupported(
+            "--oss was requested without a local provider; the native CLI would run local provider discovery, including an interactive lmstudio/ollama picker when detection cannot choose, but that startup step cannot run before the managed app-server starts; pass --local-provider lmstudio|ollama or set oss_provider in the native configuration",
+        )
+    })?;
+    // The flag-selected provider is a native CLI override: it wins over the
+    // caller's generic `-c` entries, so it is appended after finalize's user
+    // layer and the profile layer.
+    push_override(backend, "model_provider", &toml_string(&provider));
+    if session.model.is_none()
+        && let Some(model) = oss_default_model(&provider)
+    {
+        push_override(backend, "model", &toml_string(model));
+    }
+    Ok(())
+}
+
+fn resolve_oss_provider(session: &Session, home: &Path) -> io::Result<Option<String>> {
+    if let Some(provider) = &session.local_provider {
+        return Ok(Some(provider.clone()));
+    }
+    let mut provider = config_oss_provider(&home.join("config.toml"))?;
+    if let Some(profile) = session.profile.as_deref() {
+        let table = crate::orchestration_config::profile_config(home, profile)?;
+        if let Some(selected) = table_oss_provider(
+            &table,
+            &format!("the native profile configuration '{profile}'"),
+        )? {
+            provider = Some(selected);
+        }
+    }
+    for value in &session.config_values {
+        if let Some(selected) = override_oss_provider(value)? {
+            provider = Some(selected);
+        }
+    }
+    Ok(provider)
+}
+
+fn config_oss_provider(path: &Path) -> io::Result<Option<String>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        invalid(format!(
+            "the native configuration {} cannot be inspected as UTF-8",
+            path.display()
+        ))
+    })?;
+    let table: toml::Table = toml::from_str(text).map_err(|error| {
+        invalid(format!(
+            "the native configuration {} cannot be parsed: {error}",
+            path.display()
+        ))
+    })?;
+    table_oss_provider(
+        &table,
+        &format!("the native configuration {}", path.display()),
+    )
+}
+
+fn table_oss_provider(table: &toml::Table, source: &str) -> io::Result<Option<String>> {
+    match table.get("oss_provider") {
+        None => Ok(None),
+        Some(toml::Value::String(provider)) => Ok(Some(provider.clone())),
+        Some(value) => Err(invalid(format!(
+            "{source} sets oss_provider to a {}; it must be a string",
+            toml_kind(value)
+        ))),
+    }
+}
+
+fn override_oss_provider(value: &str) -> io::Result<Option<String>> {
+    let Some((key, raw)) = value.split_once('=') else {
+        return Ok(None);
+    };
+    if key.trim() != "oss_provider" {
+        return Ok(None);
+    }
+    let raw = raw.trim();
+    let parsed = toml::from_str::<toml::Table>(&format!("value = {raw}"))
+        .ok()
+        .and_then(|mut table| table.remove("value"));
+    match parsed {
+        Some(toml::Value::String(provider)) => Ok(Some(provider)),
+        Some(other) => Err(invalid(format!(
+            "the -c override '{value}' sets oss_provider to a {}; it must be a string",
+            toml_kind(&other)
+        ))),
+        None => Ok(Some(raw.to_owned())),
+    }
+}
+
+fn toml_kind(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "string",
+        toml::Value::Integer(_) => "integer",
+        toml::Value::Float(_) => "float",
+        toml::Value::Boolean(_) => "boolean",
+        toml::Value::Datetime(_) => "datetime",
+        toml::Value::Array(_) => "array",
+        toml::Value::Table(_) => "table",
+    }
+}
+
+/// The native defaults applied when `--oss` has no explicit `-m`. An unknown
+/// provider keeps the caller's configured model; the harness does not
+/// substitute a model or provider.
+fn oss_default_model(provider: &str) -> Option<&'static str> {
+    match provider {
+        "lmstudio" => Some("openai/gpt-oss-20b"),
+        "ollama" => Some("gpt-oss:20b"),
+        _ => None,
+    }
+}
+
 fn utf8_owned(value: OsString, flag: &str) -> io::Result<String> {
     value.into_string().map_err(|_| {
         invalid(format!(
@@ -904,6 +1057,13 @@ mod tests {
         plan(&argv(list), Path::new("D:/base"))
             .expect_err(&format!("{list:?} should be rejected"))
             .kind()
+    }
+
+    fn backend_has(planned: &ManagedArguments, expected: &str) -> bool {
+        planned
+            .backend
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1].to_str() == Some(expected))
     }
 
     #[test]
@@ -1248,6 +1408,175 @@ mod tests {
     }
 
     #[test]
+    fn hosted_oss_carries_an_explicit_provider_and_the_native_default_model() {
+        let home = tempfile::TempDir::new().unwrap();
+        for (provider, model) in [
+            ("ollama", "gpt-oss:20b"),
+            ("lmstudio", "openai/gpt-oss-20b"),
+        ] {
+            let args = argv(&["--oss", "--local-provider", provider, "hello"]);
+            let planned = plan_hosted(&args, Path::new("D:/base"), home.path())
+                .unwrap()
+                .expect("an explicit OSS provider stays hosted");
+            assert_eq!(planned.tui, args, "{provider}");
+            assert!(
+                backend_has(&planned, &format!("model_provider=\"{provider}\"")),
+                "{provider}: {:?}",
+                planned.backend
+            );
+            assert!(
+                backend_has(&planned, &format!("model=\"{model}\"")),
+                "{provider}: {:?}",
+                planned.backend
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_oss_keeps_an_explicit_model() {
+        let home = tempfile::TempDir::new().unwrap();
+        let planned = plan_hosted(
+            &argv(&[
+                "--oss",
+                "--local-provider",
+                "lmstudio",
+                "-m",
+                "custom",
+                "hello",
+            ]),
+            Path::new("D:/base"),
+            home.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(backend_has(&planned, "model_provider=\"lmstudio\""));
+        assert!(backend_has(&planned, "model=\"custom\""));
+        assert!(
+            !backend_has(&planned, "model=\"openai/gpt-oss-20b\""),
+            "an explicit -m must replace the provider default: {:?}",
+            planned.backend
+        );
+    }
+
+    #[test]
+    fn hosted_oss_uses_configuration_and_cli_override_precedence() {
+        let home = tempfile::TempDir::new().unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "oss_provider = \"lmstudio\"\n",
+        )
+        .unwrap();
+        let planned = plan_hosted(
+            &argv(&["--oss", "hello"]),
+            Path::new("D:/base"),
+            home.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(backend_has(&planned, "model_provider=\"lmstudio\""));
+        assert!(backend_has(&planned, "model=\"openai/gpt-oss-20b\""));
+
+        fs::write(
+            home.path().join("work.config.toml"),
+            "oss_provider = \"ollama\"\n",
+        )
+        .unwrap();
+        let planned = plan_hosted(
+            &argv(&["--profile", "work", "--oss", "hello"]),
+            Path::new("D:/base"),
+            home.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(backend_has(&planned, "model_provider=\"ollama\""));
+        assert!(backend_has(&planned, "model=\"gpt-oss:20b\""));
+
+        let planned = plan_hosted(
+            &argv(&["--oss", "-c", "oss_provider=\"lmstudio\"", "hello"]),
+            Path::new("D:/base"),
+            home.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            backend_has(&planned, "model_provider=\"lmstudio\""),
+            "the CLI oss_provider override should win: {:?}",
+            planned.backend
+        );
+        assert!(backend_has(&planned, "model=\"openai/gpt-oss-20b\""));
+    }
+
+    #[test]
+    fn hosted_oss_without_a_provider_reports_the_selection_boundary() {
+        let home = tempfile::TempDir::new().unwrap();
+        let error = plan_hosted(
+            &argv(&["--oss", "hello"]),
+            Path::new("D:/base"),
+            home.path(),
+        )
+        .expect_err("the managed backend cannot open the native provider picker");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(message.contains("--local-provider"), "{message}");
+        assert!(message.contains("oss_provider"), "{message}");
+    }
+
+    #[test]
+    fn hosted_oss_rejects_a_nonstring_provider_configuration() {
+        let home = tempfile::TempDir::new().unwrap();
+        fs::write(home.path().join("config.toml"), "oss_provider = 1\n").unwrap();
+        let error = plan_hosted(
+            &argv(&["--oss", "hello"]),
+            Path::new("D:/base"),
+            home.path(),
+        )
+        .expect_err("a non-string OSS provider is invalid native configuration");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("oss_provider"), "{error}");
+    }
+
+    #[test]
+    fn hosted_oss_does_not_invent_a_model_for_an_unknown_provider() {
+        let home = tempfile::TempDir::new().unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "oss_provider = \"custom\"\nmodel = \"configured\"\n",
+        )
+        .unwrap();
+        let planned = plan_hosted(
+            &argv(&["--oss", "hello"]),
+            Path::new("D:/base"),
+            home.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(backend_has(&planned, "model_provider=\"custom\""));
+        assert!(
+            !planned.backend.windows(2).any(|pair| pair[0] == "-c"
+                && pair[1]
+                    .to_str()
+                    .is_some_and(|value| value.starts_with("model="))),
+            "an unknown provider must keep the configured model: {:?}",
+            planned.backend
+        );
+    }
+
+    #[test]
+    fn hosted_local_provider_without_oss_keeps_the_native_noop_behavior() {
+        let home = tempfile::TempDir::new().unwrap();
+        let args = argv(&["--local-provider", "ollama", "hello"]);
+        let planned = plan_hosted(&args, Path::new("D:/base"), home.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(planned.tui, args);
+        assert!(
+            planned.backend.is_empty(),
+            "the native CLI ignores --local-provider without --oss: {:?}",
+            planned.backend
+        );
+    }
+
+    #[test]
     fn hosted_plan_keeps_remote_and_noninteractive_bypasses() {
         for list in [
             vec!["--remote", "ws://127.0.0.1:1", "hello"],
@@ -1255,6 +1584,8 @@ mod tests {
             vec!["app-server"],
             vec!["--help"],
             vec!["-V"],
+            vec!["--oss", "--remote", "ws://127.0.0.1:1", "hello"],
+            vec!["--oss", "exec", "do work"],
         ] {
             assert!(
                 plan_hosted(
@@ -1354,9 +1685,7 @@ mod tests {
     #[test]
     fn flags_without_established_backend_effect_are_reported() {
         for list in [
-            vec!["--oss", "hello"],
             vec!["--search", "hello"],
-            vec!["--local-provider", "ollama", "hello"],
             vec!["--dangerously-bypass-hook-trust", "hello"],
         ] {
             let error = plan(&argv(&list), Path::new("D:/base"))
@@ -1367,6 +1696,23 @@ mod tests {
             assert!(
                 message.contains(flag),
                 "the error should name {flag}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_plan_keeps_the_existing_oss_rejection() {
+        for list in [
+            vec!["--oss", "hello"],
+            vec!["--local-provider", "ollama", "hello"],
+        ] {
+            let error = plan(&argv(&list), Path::new("D:/base"))
+                .expect_err(&format!("{list:?} should keep its legacy rejection"));
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{list:?}");
+            assert!(
+                error.to_string().contains(list[0]),
+                "the legacy error should name {}: {error}",
+                list[0]
             );
         }
     }

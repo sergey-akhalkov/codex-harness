@@ -9,7 +9,9 @@
 //! `--harness-cpu uncapped` is a per-invocation exception: it is not saved, it
 //! does not raise the allowance for other sessions or shared services, and a
 //! caller already inside the allowance relaunches that one payload through the
-//! existing job-free sibling anchor so the exception is not inherited.
+//! existing job-free sibling anchor so the exception is not inherited. The
+//! exception changes only the payload's CPU placement: when ordinary
+//! reflection is enabled, the manager boundary is still selected first.
 //! Independently started kit services are not members of that job.
 use crate::{build_identity, build_selection, launcher};
 use serde::{Deserialize, Serialize};
@@ -1905,7 +1907,11 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
         (command, None)
     };
     #[cfg(windows)]
-    let command = if task_control || uncapped {
+    // `uncapped` is an outer CPU-placement exception, not a hosting bypass.
+    // The manager boundary below is selected for ordinary reflection exactly
+    // as it is for a capped launch; `launch_uncapped_session` then starts that
+    // selected command outside the shared allowance.
+    let command = if task_control {
         command
     } else if let Some(manager) =
         ordinary_manager_command(executable, home, harness_ready, &command)?
