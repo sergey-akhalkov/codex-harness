@@ -187,15 +187,18 @@ One clear, attributable bottleneck should produce a bounded correction promptly.
 wait for repeated episodes, votes or statistical proof when the available facts
 already support the remedy. Investigate only uncertainty that changes the
 decision, and verify the result proportionately through its actual use. Keep
-the reflection mechanism's adoption comparison separate from the handling of each
+the reflection mechanism's release acceptance separate from the handling of each
 finding; preserve required acceptance and scope boundaries. The active change
 owns this [single-observation admission](../openspec/changes/add-delivery-improvement/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
 
-The user also authorized isolated candidate implementation in parallel with
-comparison preparation to shorten delivery. The candidate remains inactive;
-the [evaluation and acceptance gates](../openspec/changes/add-delivery-improvement/design.md#parallel-candidate-implementation-and-predeclared-evaluation)
-remain required as declared by the active change. This accepts possible unused implementation, not a lower
-acceptance standard.
+Release acceptance requires one real sequential executor-fork reflection,
+lead-fork synthesis receiving its result, and verified consumption and disposition
+by the current live lead, plus applicable regression and global installation checks.
+The live lead may delegate a useful recommendation through the ordinary executor
+process; neither a completed improvement nor a comparative campaign blocks release.
+The active change owns the [real-chain acceptance](../openspec/changes/add-delivery-improvement/design.md#9-release-acceptance-uses-the-real-sequential-chain).
+This does not establish savings or waive the user's cost/payback requirements
+when deciding whether to adopt individual improvements.
 
 Deliver a quality, verified end-to-end MVP through real components as early as
 possible, then complete the whole agreed result. Small transparent operating

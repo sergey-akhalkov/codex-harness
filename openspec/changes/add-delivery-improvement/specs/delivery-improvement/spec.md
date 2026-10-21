@@ -308,7 +308,7 @@ Reflection and improvement work SHALL retain available stage identity, usage, co
 
 #### Scenario: A completed stage records its costs
 - **WHEN** a reflection stage retains a completed result
-- **THEN** its available source identity, usage and limitations remain with the result, and copied source context is not invented or charged as new work
+- **THEN** its available source identity, usage and limitations remain with the result; historical source-session usage is not counted again as new reflection usage, while actual new fork input, including inherited context, remains charged as reported by the native runtime
 
 #### Scenario: Usage is missing or an allowance is exceeded
 - **WHEN** native usage is unavailable or the measured work exceeds its admission limit

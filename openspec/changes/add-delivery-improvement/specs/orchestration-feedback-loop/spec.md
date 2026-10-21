@@ -110,7 +110,7 @@ An installed command SHALL expose feedback recording, agent-selected triage, led
 
 ### Requirement: Verified improvement admission has an explicit basis
 
-While `delivery-improvement` is active, the lead SHALL be able to admit a bounded correction from one attributable observation without votes. The existing item SHALL retain mandate, evidence, cause, owned remedy, relevant use and acceptance, including applicable specification, skill-evaluation and verification requirements. Admission SHALL preserve honest cost accounting but SHALL NOT require a comparative benefit evaluation or establish a savings claim. An assertion alone SHALL NOT qualify.
+While `delivery-improvement` is active, the lead SHALL be able to admit a bounded correction from one attributable observation without votes. The item SHALL retain mandate, evidence, cause, remedy, relevant use and applicable acceptance. An assertion alone SHALL NOT qualify. Admission SHALL preserve cost accounting without making a comparative campaign a release gate. Individual improvement adoption SHALL obey the cost/payback scenarios below.
 
 #### Scenario: A single reproduced failure has a bounded remedy
 - **WHEN** the lead verifies a recurring preparation defect, identifies its owning tool and accepts an in-scope checkable correction
@@ -130,7 +130,11 @@ While `delivery-improvement` is active, the lead SHALL be able to admit a bounde
 
 #### Scenario: One observation supports a lasting improvement
 - **WHEN** current evidence supports a bounded correction that reduces future change or maintenance cost while preserving quality and timely useful delivery
-- **THEN** the lead can admit it with a concise reason and material trade-offs without a new score or repeated-proof quota; any benefit statement remains evidence-based and unmeasured savings are not asserted
+- **THEN** the lead can admit it with a concise reason and material trade-offs without a new score or repeated-proof quota; adoption of the improvement still requires nonincreasing full token cost or supported observable payback for an increase, and unmeasured savings are not asserted
+
+#### Scenario: An individual improvement increases token spending
+- **WHEN** adopting a recommendation would increase full token cost
+- **THEN** the lead requires a concrete payback mechanism, observable benefit measures and a bounded relevant-use horizon supported by actual use and checks; qualitative confidence alone cannot justify cumulative token cost drift
 
 #### Scenario: A reflection finding requires a release decision
 - **WHEN** an attributable finding exposes a concrete incident risk in a pending release

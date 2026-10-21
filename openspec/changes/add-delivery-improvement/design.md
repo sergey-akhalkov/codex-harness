@@ -94,7 +94,7 @@ The user's release decision makes one successful real sequential chain sufficien
 
 The previous failed executor reflection is not success. Model-free tests, fixtures, retained plans and a printed final message do not establish semantic success or current-lead consumption. A successful retry or a new real accepted chain may satisfy the chain evidence. The live lead may choose a standard executor assignment for an actionable recommendation, but no recommendation, improvement task or comparative campaign is required for release.
 
-Optional later evaluation may assess whether recommendations improve subsequent work. It is not a release gate, does not authorize a savings claim, and does not retroactively improve the accepted source task.
+Optional later evaluation may assess whether recommendations improve subsequent work. It is not a release gate, does not authorize a savings claim, and does not retroactively improve the accepted source task. The release decision does not waive the user's requirements for adopting individual improvements: prefer lower full token and maintenance costs, and justify increased token spending with observable payback over a bounded relevant-use horizon. Added code, tools, instructions and context burden must earn their ongoing cost; ungrounded confidence and repeated polishing are not benefits.
 
 ## Risks / Trade-offs
 
