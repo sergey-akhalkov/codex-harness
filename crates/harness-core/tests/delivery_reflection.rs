@@ -4,10 +4,10 @@
 
 use harness_core::delivery_reflection::{
     ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, BindingStatus, DeliveryState,
-    EventRefusal, Finding, JournalOwnership, JournalPolicy, PURPOSE_METADATA, PollReceipt, Purpose,
-    RecoveryKind, ReflectionController, ReflectionLimits, RefusalCode, RetainedOwnerProcess, Stage,
-    StageOutcome, StageWork, SubmittedAccounting, SuccessionRequest, TaskBindingStatus, UsageDelta,
-    acceptance_metadata,
+    EventRefusal, Finding, JournalOwnership, JournalPolicy, LifecycleStatus, PURPOSE_METADATA,
+    PollReceipt, Purpose, RecoveryKind, ReflectionController, ReflectionLimits, RefusalCode,
+    RetainedOwnerProcess, Stage, StageOutcome, StageState, StageWork, SubmittedAccounting,
+    SuccessionRequest, TaskBindingStatus, UsageDelta, acceptance_metadata,
 };
 use serde_json::{Value, json};
 use std::{
@@ -1433,6 +1433,7 @@ fn succession_preserves_retained_work_and_refuses_retired_owner_reclaim() {
     assert_eq!(after.source, before.source);
     assert_eq!(after.journal, before.journal);
     assert_eq!(after.checkpoint, before.checkpoint);
+    assert_eq!(after.current_session_floor, before.current_session_floor);
     assert_eq!(after.records, before.records);
     assert_eq!(
         after.records.get(&acceptance).unwrap().binding.lead_session,
@@ -1548,6 +1549,611 @@ fn succession_refuses_stopped_and_recovery_pending_lifecycles() {
         .to_string();
     assert!(error.contains("reflection recovery is pending"), "{error}");
     assert_eq!(fs::read(&state_file).unwrap(), pending);
+}
+
+#[test]
+fn stopped_current_session_succession_retains_predecessor_work_without_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Stopped succession work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "stopped-succession"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+
+    // This predecessor closure is committed but deliberately never polled.
+    // Automatic succession must consume it without creating historical work.
+    let historical = board.create_task("Unpolled predecessor work", Some(Purpose::Ordinary), None);
+    let historical_binding = binding(&historical, Purpose::Ordinary, "unpolled-predecessor");
+    board.set_binding(&historical, &historical_binding);
+    board.close(&historical);
+    let historical_acceptance = historical_binding.acceptance_id().unwrap();
+
+    controller.stop().unwrap();
+    let before = controller.stored_state().unwrap().unwrap();
+    assert_eq!(before.lifecycle, LifecycleStatus::Stopped);
+    assert!(before.stopped_at.is_some());
+    stop_owner(&mut owner);
+
+    let state_file = controller.state_file().unwrap();
+    let receipt = controller
+        .succeed_current_session(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap();
+    assert!(receipt.changed);
+    assert_eq!(receipt.previous_lead_session, LEAD);
+    assert_eq!(receipt.lead_session, SUCCESSOR);
+    assert_eq!(receipt.binding_id, before.binding.id);
+    assert_eq!(receipt.revision, before.binding.revision + 1);
+
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.lifecycle, LifecycleStatus::Active);
+    assert_eq!(after.stopped_at, None);
+    assert_eq!(after.binding.lead_session, SUCCESSOR);
+    assert_eq!(after.binding.run, before.binding.run);
+    assert_eq!(after.source, before.source);
+    assert_eq!(after.journal, before.journal);
+    assert_eq!(after.checkpoint, before.checkpoint);
+    let floor = after.current_session_floor.unwrap();
+    assert!(
+        floor > before.checkpoint,
+        "the boundary must include the unpolled predecessor closure: floor {floor}, checkpoint {}",
+        before.checkpoint
+    );
+    assert_eq!(after.records, before.records);
+    assert_eq!(
+        after.records.get(&acceptance).unwrap().binding.lead_session,
+        LEAD,
+        "accepted provenance keeps the original lead"
+    );
+    assert_eq!(after.limits, before.limits);
+    assert_eq!(after.recovery, before.recovery);
+    assert_eq!(after.last_poll, before.last_poll);
+    assert_eq!(after.refusals, before.refusals);
+    assert_eq!(after.last_recovery_evidence, before.last_recovery_evidence);
+    assert_eq!(after.retired_leads, vec![LEAD.to_owned()]);
+    assert_eq!(
+        controller
+            .check_active_binding(SUCCESSOR, Some(&acceptance))
+            .unwrap()
+            .status,
+        BindingStatus::Active
+    );
+    assert!(
+        controller.pending_jobs().unwrap().is_empty(),
+        "predecessor work must remain retained but not dispatchable"
+    );
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending
+    );
+
+    let settled = fs::read(&state_file).unwrap();
+    let repeat = controller
+        .succeed_current_session(&SuccessionRequest {
+            expected_lead_session: SUCCESSOR.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap();
+    assert!(!repeat.changed);
+    assert_eq!(repeat.revision, receipt.revision);
+    assert_eq!(fs::read(&state_file).unwrap(), settled);
+
+    let skipped = controller.poll().unwrap();
+    assert_eq!(skipped.accepted, 0, "{skipped:?}");
+    assert!(skipped.ignored >= 1, "{skipped:?}");
+    assert!(
+        controller.record(&historical_acceptance).unwrap().is_none(),
+        "an unpolled predecessor closure was backfilled"
+    );
+    assert!(controller.stored_state().unwrap().unwrap().checkpoint >= floor);
+
+    let current = board.create_task("Current-session work", Some(Purpose::Ordinary), None);
+    let mut current_binding = binding(&current, Purpose::Ordinary, "current-session");
+    current_binding.lead_session = SUCCESSOR.to_owned();
+    board.set_binding(&current, &current_binding);
+    board.close(&current);
+    let polled = controller.poll().unwrap();
+    assert_eq!(polled.accepted, 1, "{polled:?}");
+    assert_eq!(polled.jobs.len(), 1, "{polled:?}");
+    let current_acceptance = acceptance_for_task(&polled, &current);
+    assert_eq!(polled.jobs[0].acceptance_id, current_acceptance);
+    assert_ne!(current_acceptance, acceptance);
+    let after_current = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after_current.current_session_floor, Some(floor));
+    assert!(after_current.records.contains_key(&acceptance));
+    assert_eq!(
+        after_current.records[&acceptance].executor.state,
+        StageState::Pending,
+        "retained predecessor history is unchanged"
+    );
+    assert_eq!(
+        controller.pending_jobs().unwrap()[0].acceptance_id,
+        current_acceptance
+    );
+}
+
+#[test]
+fn active_current_session_succession_sets_the_no_backfill_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Active succession work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "active-current-session"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+    let before = controller.stored_state().unwrap().unwrap();
+    assert_eq!(before.lifecycle, LifecycleStatus::Active);
+    stop_owner(&mut owner);
+
+    let receipt = controller
+        .succeed_current_session(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap();
+    assert!(receipt.changed);
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.current_session_floor, Some(before.checkpoint));
+    assert_eq!(after.records, before.records);
+    assert!(controller.pending_jobs().unwrap().is_empty());
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending
+    );
+}
+
+#[test]
+fn same_owner_resume_consumes_the_stopped_interval_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Current session work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "same-owner-resume"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+
+    controller.stop().unwrap();
+    let stopped = board.create_task("Stopped interval work", Some(Purpose::Ordinary), None);
+    let stopped_binding = binding(&stopped, Purpose::Ordinary, "stopped-interval");
+    board.set_binding(&stopped, &stopped_binding);
+    board.close(&stopped);
+    let stopped_acceptance = stopped_binding.acceptance_id().unwrap();
+    let before = controller.stored_state().unwrap().unwrap();
+
+    // The retained app-server process stays the same, so false-to-true is a
+    // resume of the current session rather than a new lifetime. The stopped
+    // interval is consumed, but the pending acceptance remains dispatchable.
+    let receipt = controller
+        .activate_after_stop_with_owner_process(
+            &ActivationRequest {
+                lead_session: LEAD.to_owned(),
+                run: Some("run-main".to_owned()),
+                boundary: None,
+                journal: JournalPolicy::EnableIfMissing,
+                limits: None,
+            },
+            &owner_process,
+        )
+        .unwrap();
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.lifecycle, LifecycleStatus::Active);
+    assert_eq!(after.stopped_at, None);
+    assert!(after.checkpoint > before.checkpoint);
+    assert_eq!(receipt.checkpoint, after.checkpoint);
+    assert_eq!(after.records, before.records);
+    assert_eq!(after.current_session_floor, before.current_session_floor);
+    assert!(controller.record(&stopped_acceptance).unwrap().is_none());
+    assert_eq!(
+        controller.pending_jobs().unwrap()[0].acceptance_id,
+        acceptance
+    );
+    let polled = controller.poll().unwrap();
+    assert_eq!(polled.accepted, 0, "{polled:?}");
+    assert!(controller.record(&stopped_acceptance).unwrap().is_none());
+    stop_owner(&mut owner);
+}
+
+#[test]
+fn new_process_lifetime_activation_keeps_predecessor_work_dormant() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Predecessor active work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "predecessor-active"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+
+    // The predecessor leaves a committed but never-polled closure behind.
+    let historical = board.create_task("Unpolled predecessor work", Some(Purpose::Ordinary), None);
+    let historical_binding = binding(&historical, Purpose::Ordinary, "unpolled-active");
+    board.set_binding(&historical, &historical_binding);
+    board.close(&historical);
+    let historical_acceptance = historical_binding.acceptance_id().unwrap();
+
+    let before = controller.stored_state().unwrap().unwrap();
+    assert_eq!(before.lifecycle, LifecycleStatus::Active);
+    let head = board.event_head(before.checkpoint);
+    assert!(
+        head > before.checkpoint,
+        "head {head}, checkpoint {}",
+        before.checkpoint
+    );
+    stop_owner(&mut owner);
+
+    // Native resume keeps the same lead thread but creates a new app-server
+    // process lifetime. The same thread id alone must not revive predecessor
+    // records or unpolled predecessor events.
+    let receipt = controller
+        .activate_with_owner_process(
+            &ActivationRequest {
+                lead_session: LEAD.to_owned(),
+                run: Some("run-main".to_owned()),
+                boundary: None,
+                journal: JournalPolicy::RequireExisting,
+                limits: None,
+            },
+            &live_self(),
+        )
+        .unwrap();
+    assert!(receipt.reused);
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.lifecycle, LifecycleStatus::Active);
+    assert_eq!(after.binding.lead_session, LEAD);
+    assert_eq!(after.owner_process, Some(live_self()));
+    assert_eq!(after.checkpoint, before.checkpoint);
+    assert_eq!(after.records, before.records);
+    let floor = after
+        .current_session_floor
+        .expect("a new process lifetime establishes the session boundary");
+    assert!(floor >= head, "floor {floor}, head {head}");
+    assert!(floor > before.checkpoint);
+    assert!(
+        controller.pending_jobs().unwrap().is_empty(),
+        "predecessor work must remain retained but not dispatchable"
+    );
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending
+    );
+
+    let skipped = controller.poll().unwrap();
+    assert_eq!(skipped.accepted, 0, "{skipped:?}");
+    assert!(skipped.ignored >= 1, "{skipped:?}");
+    assert!(
+        controller.record(&historical_acceptance).unwrap().is_none(),
+        "an unpolled predecessor closure was backfilled"
+    );
+    assert!(controller.stored_state().unwrap().unwrap().checkpoint >= floor);
+
+    // Work accepted during the new lifetime remains eligible exactly once.
+    let current = board.create_task("New-lifetime work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &current,
+        &binding(&current, Purpose::Ordinary, "new-lifetime"),
+    );
+    board.close(&current);
+    let polled = controller.poll().unwrap();
+    assert_eq!(polled.accepted, 1, "{polled:?}");
+    assert_eq!(polled.jobs.len(), 1, "{polled:?}");
+    let current_acceptance = acceptance_for_task(&polled, &current);
+    assert_eq!(polled.jobs[0].acceptance_id, current_acceptance);
+    assert_ne!(current_acceptance, acceptance);
+    let after_current = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after_current.current_session_floor, Some(floor));
+    assert!(after_current.records.contains_key(&acceptance));
+    assert_eq!(
+        after_current.records[&acceptance].executor.state,
+        StageState::Pending,
+        "retained predecessor history is unchanged"
+    );
+    assert_eq!(
+        controller.pending_jobs().unwrap()[0].acceptance_id,
+        current_acceptance
+    );
+}
+
+#[test]
+fn retain_owner_process_establishes_a_new_lifetime_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Retained predecessor work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "retained-predecessor"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+
+    let historical = board.create_task("Unpolled retained work", Some(Purpose::Ordinary), None);
+    let historical_binding = binding(&historical, Purpose::Ordinary, "unpolled-retained");
+    board.set_binding(&historical, &historical_binding);
+    board.close(&historical);
+    let historical_acceptance = historical_binding.acceptance_id().unwrap();
+    let before = controller.stored_state().unwrap().unwrap();
+    let head = board.event_head(before.checkpoint);
+    assert!(
+        head > before.checkpoint,
+        "head {head}, checkpoint {}",
+        before.checkpoint
+    );
+    stop_owner(&mut owner);
+
+    // This is the manual continuation/first-process route: the same lead thread
+    // is observed under a new app-server lifetime without going through
+    // activation. Refreshing its proof must establish the same session boundary.
+    controller.retain_owner_process(LEAD, &live_self()).unwrap();
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.lifecycle, LifecycleStatus::Active);
+    assert_eq!(after.binding.lead_session, LEAD);
+    assert_eq!(after.owner_process, Some(live_self()));
+    assert_eq!(after.checkpoint, before.checkpoint);
+    assert_eq!(after.records, before.records);
+    let floor = after
+        .current_session_floor
+        .expect("a new process lifetime establishes the session boundary");
+    assert!(floor >= head, "floor {floor}, head {head}");
+    assert!(controller.pending_jobs().unwrap().is_empty());
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending,
+        "retained predecessor history is unchanged"
+    );
+
+    let state_file = controller.state_file().unwrap();
+    let settled = fs::read(&state_file).unwrap();
+    controller.retain_owner_process(LEAD, &live_self()).unwrap();
+    assert_eq!(
+        fs::read(&state_file).unwrap(),
+        settled,
+        "an unchanged process identity is a no-op"
+    );
+
+    let skipped = controller.poll().unwrap();
+    assert_eq!(skipped.accepted, 0, "{skipped:?}");
+    assert!(skipped.ignored >= 1, "{skipped:?}");
+    assert!(controller.record(&historical_acceptance).unwrap().is_none());
+
+    let current = board.create_task("New retained-lifetime work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &current,
+        &binding(&current, Purpose::Ordinary, "new-retained-lifetime"),
+    );
+    board.close(&current);
+    let polled = controller.poll().unwrap();
+    assert_eq!(polled.accepted, 1, "{polled:?}");
+    let current_acceptance = acceptance_for_task(&polled, &current);
+    assert_eq!(polled.jobs[0].acceptance_id, current_acceptance);
+    assert_eq!(
+        controller.pending_jobs().unwrap()[0].acceptance_id,
+        current_acceptance
+    );
+}
+
+#[test]
+fn new_process_lifetime_stopped_resume_keeps_predecessor_work_dormant() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Predecessor stopped work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "predecessor-stopped"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+
+    controller.stop().unwrap();
+    let stopped = board.create_task("Stopped interval work", Some(Purpose::Ordinary), None);
+    let stopped_binding = binding(&stopped, Purpose::Ordinary, "stopped-new-lifetime");
+    board.set_binding(&stopped, &stopped_binding);
+    board.close(&stopped);
+    let stopped_acceptance = stopped_binding.acceptance_id().unwrap();
+    let before = controller.stored_state().unwrap().unwrap();
+    assert_eq!(before.lifecycle, LifecycleStatus::Stopped);
+    let head = board.event_head(before.checkpoint);
+    assert!(
+        head > before.checkpoint,
+        "head {head}, checkpoint {}",
+        before.checkpoint
+    );
+    stop_owner(&mut owner);
+
+    // The same lead thread resumes under a new app-server lifetime while the
+    // lifecycle is stopped. Host activation may resume the lifecycle, but it
+    // consumes both the stopped interval and the predecessor session as
+    // retained history instead of dispatching either one.
+    let receipt = controller
+        .activate_after_stop_with_owner_process(
+            &ActivationRequest {
+                lead_session: LEAD.to_owned(),
+                run: Some("run-main".to_owned()),
+                boundary: None,
+                journal: JournalPolicy::RequireExisting,
+                limits: None,
+            },
+            &live_self(),
+        )
+        .unwrap();
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.lifecycle, LifecycleStatus::Active);
+    assert_eq!(after.stopped_at, None);
+    assert_eq!(after.binding.lead_session, LEAD);
+    assert_eq!(after.binding.revision, before.binding.revision + 1);
+    assert_eq!(after.checkpoint, head);
+    assert_eq!(receipt.checkpoint, after.checkpoint);
+    assert_eq!(after.records, before.records);
+    let floor = after
+        .current_session_floor
+        .expect("a new process lifetime establishes the session boundary");
+    assert!(floor >= head, "floor {floor}, head {head}");
+    assert!(
+        controller.pending_jobs().unwrap().is_empty(),
+        "predecessor work must remain retained but not dispatchable"
+    );
+    assert!(controller.record(&stopped_acceptance).unwrap().is_none());
+
+    let skipped = controller.poll().unwrap();
+    assert_eq!(skipped.accepted, 0, "{skipped:?}");
+    assert_eq!(
+        skipped.events_seen, 0,
+        "the activation checkpoint atomically consumed the stopped interval: {skipped:?}"
+    );
+    assert!(controller.record(&stopped_acceptance).unwrap().is_none());
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending
+    );
+    assert!(controller.stored_state().unwrap().unwrap().checkpoint >= floor);
+
+    let current = board.create_task("New-lifetime stopped work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &current,
+        &binding(&current, Purpose::Ordinary, "new-lifetime-stopped"),
+    );
+    board.close(&current);
+    let polled = controller.poll().unwrap();
+    assert_eq!(polled.accepted, 1, "{polled:?}");
+    assert_eq!(polled.jobs.len(), 1, "{polled:?}");
+    let current_acceptance = acceptance_for_task(&polled, &current);
+    assert_eq!(polled.jobs[0].acceptance_id, current_acceptance);
+    assert_eq!(
+        controller.pending_jobs().unwrap()[0].acceptance_id,
+        current_acceptance
+    );
+}
+
+#[test]
+fn stopped_succession_refuses_live_or_unverifiable_owner_without_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    controller.stop().unwrap();
+    let state_file = controller.state_file().unwrap();
+    let stopped = fs::read(&state_file).unwrap();
+
+    let live = controller
+        .succeed_current_session(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(live.contains("still live"), "{live}");
+    assert_eq!(fs::read(&state_file).unwrap(), stopped);
+
+    let mut mismatched = owner_process.clone();
+    mismatched.program = std::env::current_exe().unwrap();
+    rewrite_state(&controller, |value| {
+        value["owner_process"] = serde_json::to_value(&mismatched).unwrap();
+    });
+    let unverifiable = fs::read(&state_file).unwrap();
+    let error = controller
+        .succeed_current_session(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot be verified"), "{error}");
+    assert_eq!(fs::read(&state_file).unwrap(), unverifiable);
+
+    rewrite_state(&controller, |value| {
+        value.as_object_mut().unwrap().remove("owner_process");
+    });
+    let legacy = fs::read(&state_file).unwrap();
+    let error = controller
+        .succeed_current_session(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: live_self(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no exact managed-lead process identity"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&state_file).unwrap(), legacy);
+    stop_owner(&mut owner);
 }
 
 #[test]

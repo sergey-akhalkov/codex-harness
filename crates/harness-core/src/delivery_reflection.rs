@@ -917,6 +917,14 @@ pub struct ReflectionState {
     pub source: SourceIdentity,
     pub journal: JournalOwnership,
     pub checkpoint: u64,
+    /// Highest event sequence that belonged to a predecessor session at an
+    /// automatic ownership transfer or a verified app-server lifetime change.
+    /// Records at or below this boundary remain retained evidence, but are
+    /// never dispatched as reflection work for the current session. Manual
+    /// succession preserves its historical behavior and does not move this
+    /// boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_floor: Option<u64>,
     pub limits: ReflectionLimits,
     pub records: BTreeMap<String, ReflectionRecord>,
     pub recovery: Option<RecoveryState>,
@@ -937,6 +945,15 @@ pub struct ReflectionState {
     /// current ownership metadata, never accepted source provenance.
     #[serde(default)]
     pub owner_process: Option<RetainedOwnerProcess>,
+}
+
+impl ReflectionState {
+    /// Whether this record belongs to work admitted after the retained session
+    /// boundary. Legacy state without a boundary retains every record eligible.
+    pub fn record_in_current_session(&self, record: &ReflectionRecord) -> bool {
+        self.current_session_floor
+            .is_none_or(|floor| record.event_seq > floor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1195,25 +1212,47 @@ impl ReflectionController {
     }
 
     pub fn activate(&self, request: &ActivationRequest) -> io::Result<ActivationReceipt> {
-        self.activate_inner(request, None)
+        self.activate_inner(request, None, false)
     }
 
     /// Activates the lifecycle with the exact managed-lead process observed by
     /// the caller through the lead registry. The process is revalidated here
     /// before any lifecycle write; it is retained as succession metadata, not
-    /// as an acceptance identity.
+    /// as an acceptance identity. A verified change of the retained app-server
+    /// process identity starts a new current-session lifetime at the current
+    /// journal head: retained records remain evidence, but predecessor work is
+    /// no longer dispatchable. Activation prepared before the first acceptance
+    /// is journaled therefore leaves that acceptance beyond the boundary.
     pub fn activate_with_owner_process(
         &self,
         request: &ActivationRequest,
         owner_process: &RetainedOwnerProcess,
     ) -> io::Result<ActivationReceipt> {
-        self.activate_inner(request, Some(owner_process))
+        self.activate_inner(request, Some(owner_process), false)
+    }
+
+    /// Resumes the same retained owner after an administrative stop. The
+    /// stopped interval is consumed atomically with activation: the checkpoint
+    /// advances to the current journal head, while retained records, usage,
+    /// and recovery remain unchanged. A matching process identity preserves the
+    /// current-session boundary so pending work may resume; a different
+    /// verified app-server lifetime also advances that boundary to the same
+    /// head, leaving the predecessor's pending work retained but dormant. This
+    /// prevents a concurrently running consumer from admitting work accepted
+    /// before the host observed the flag or lifecycle as stopped.
+    pub fn activate_after_stop_with_owner_process(
+        &self,
+        request: &ActivationRequest,
+        owner_process: &RetainedOwnerProcess,
+    ) -> io::Result<ActivationReceipt> {
+        self.activate_inner(request, Some(owner_process), true)
     }
 
     fn activate_inner(
         &self,
         request: &ActivationRequest,
         owner_process: Option<&RetainedOwnerProcess>,
+        consume_stopped_interval: bool,
     ) -> io::Result<ActivationReceipt> {
         require_text("lead_session", &request.lead_session, MAX_TEXT_BYTES)?;
         if let Some(run) = &request.run {
@@ -1243,6 +1282,26 @@ impl ReflectionController {
         let path = self.state_path(&source);
         let _lock = self.lock(&path)?;
         let existing = self.read_state_at(&path)?;
+        if consume_stopped_interval
+            && !existing
+                .as_ref()
+                .is_some_and(|state| state.lifecycle == LifecycleStatus::Stopped)
+        {
+            return Err(conflict(
+                "the retained lifecycle is no longer stopped; an automatic resume consumes a stopped interval only while that exact state remains retained; nothing was changed",
+            ));
+        }
+        // Process identity is the session-lifetime boundary. The lead thread
+        // id survives native resume, so comparing it alone would revive a
+        // finished app-server's pending records under the new process. Missing
+        // retained proof is not treated as a matching lifetime.
+        let new_process_lifetime = match (existing.as_ref(), owner_process) {
+            (Some(state), Some(current)) => state
+                .owner_process
+                .as_ref()
+                .is_none_or(|retained| retained.identity != current.identity),
+            _ => false,
+        };
         if let Some(state) = &existing {
             if !state.source.same_scope(&source) {
                 return Err(conflict(&format!(
@@ -1326,6 +1385,13 @@ impl ReflectionController {
                 state.stopped_at = None;
                 state.source = source.clone();
                 state.journal = journal;
+                if new_process_lifetime {
+                    state.current_session_floor =
+                        Some(state.current_session_floor.unwrap_or(0).max(head));
+                }
+                if consume_stopped_interval {
+                    state.checkpoint = head;
+                }
                 state
             }
             None => ReflectionState {
@@ -1341,6 +1407,7 @@ impl ReflectionController {
                 source: source.clone(),
                 journal,
                 checkpoint: head,
+                current_session_floor: None,
                 limits: request.limits.clone().unwrap_or_default(),
                 records: BTreeMap::new(),
                 recovery: None,
@@ -1366,6 +1433,30 @@ impl ReflectionController {
     }
 
     pub fn succeed(&self, request: &SuccessionRequest) -> io::Result<SuccessionReceipt> {
+        self.succeed_inner(request, false, false)
+    }
+
+    /// Transfers ownership to the current automatically-prepared session. The
+    /// same locked transition verifies the predecessor's exit and all existing
+    /// source, recovery, retired-lead and successor-liveness guards. It also
+    /// establishes the current journal head as the session boundary while
+    /// leaving the retained checkpoint unchanged, so predecessor records and
+    /// unpolled predecessor events remain evidence but cannot be dispatched.
+    /// Unlike manual `succeed`, this path may resume an administrative stop;
+    /// the host is its only automatic stopped-state caller.
+    pub fn succeed_current_session(
+        &self,
+        request: &SuccessionRequest,
+    ) -> io::Result<SuccessionReceipt> {
+        self.succeed_inner(request, true, true)
+    }
+
+    fn succeed_inner(
+        &self,
+        request: &SuccessionRequest,
+        resume_stopped: bool,
+        establish_current_session: bool,
+    ) -> io::Result<SuccessionReceipt> {
         let expected = request.expected_lead_session.trim();
         let successor = request.successor_lead.trim();
         require_text("expected lead_session", expected, MAX_TEXT_BYTES)?;
@@ -1378,7 +1469,7 @@ impl ReflectionController {
                 "delivery reflection is inactive; enable it under the retained lead before succession",
             )
         })?;
-        if state.lifecycle != LifecycleStatus::Active {
+        if state.lifecycle != LifecycleStatus::Active && !resume_stopped {
             return Err(conflict(
                 "delivery reflection is stopped; enable the retained lifecycle before succession",
             ));
@@ -1424,10 +1515,28 @@ impl ReflectionController {
             )));
         }
         if successor == previous {
+            if state.lifecycle != LifecycleStatus::Active {
+                return Err(conflict(&format!(
+                    "delivery reflection is stopped under the same retained lead '{previous}'; a new managed-lead host resumes that owner directly, while succession requires a different verified successor; nothing was changed"
+                )));
+            }
             // A repeated call by the current owner writes nothing when the
             // observed process identity is unchanged. If that owner restarted
-            // under the same conversation, refresh the proof instead of
-            // leaving a stale identity for a later succession.
+            // under the same conversation, refresh the proof and, for the
+            // automatic path, establish the new lifetime's boundary instead of
+            // leaving the predecessor's pending work dispatchable.
+            let same_lifetime = state
+                .owner_process
+                .as_ref()
+                .is_some_and(|retained| retained.identity == request.successor_process.identity);
+            if establish_current_session && !same_lifetime {
+                state.current_session_floor = Some(
+                    state
+                        .current_session_floor
+                        .unwrap_or(0)
+                        .max(self.probe_head(state.checkpoint)?),
+                );
+            }
             if state.owner_process.as_ref() != Some(&request.successor_process) {
                 state.owner_process = Some(request.successor_process.clone());
                 self.write_state_at(&path, &state)?;
@@ -1472,12 +1581,25 @@ impl ReflectionController {
             .revision
             .checked_add(1)
             .ok_or_else(|| conflict("reflection lifecycle revision cannot be advanced"))?;
+        if establish_current_session {
+            // Include events already committed by the predecessor but not yet
+            // polled. The checkpoint stays unchanged; admission advances it
+            // through this boundary without creating historical records.
+            state.current_session_floor = Some(
+                state
+                    .current_session_floor
+                    .unwrap_or(0)
+                    .max(self.probe_head(state.checkpoint)?),
+            );
+        }
         state.retired_leads.retain(|retired| retired != &previous);
         state.retired_leads.push(previous.clone());
         state.binding.revision = revision;
         state.binding.lead_session = successor.to_owned();
         state.binding.activated_at = now();
         state.owner_process = Some(request.successor_process.clone());
+        state.lifecycle = LifecycleStatus::Active;
+        state.stopped_at = None;
         let receipt = SuccessionReceipt {
             binding_id: state.binding.id.clone(),
             previous_lead_session: previous,
@@ -1491,8 +1613,11 @@ impl ReflectionController {
 
     /// Refreshes the exact managed-lead process proof for the current owner.
     /// This is model-free lifecycle metadata: it changes no accepted
-    /// provenance, stage, delivery or cost. A concurrent ownership change is
-    /// refused so a retired owner cannot refresh proof after succession.
+    /// provenance, stage, delivery or cost. A verified change of the retained
+    /// app-server process identity starts a new current-session lifetime at the
+    /// current journal head; retained records remain evidence, but predecessor
+    /// work is no longer dispatchable. A concurrent ownership change is refused
+    /// so a retired owner cannot refresh proof after succession.
     pub fn retain_owner_process(
         &self,
         lead: &str,
@@ -1533,6 +1658,10 @@ impl ReflectionController {
         if state.owner_process.as_ref() == Some(owner_process) {
             return Ok(());
         }
+        let same_lifetime = state
+            .owner_process
+            .as_ref()
+            .is_some_and(|retained| retained.identity == owner_process.identity);
         // The proof is verified while the lifecycle lock is held, immediately
         // before it is written, so a process that exited or changed between the
         // caller's observation and this refresh is never retained as live.
@@ -1548,6 +1677,14 @@ impl ReflectionController {
                     "the current managed-lead process identity for '{lead}' cannot be verified: {error}; its identity cannot be retained"
                 )));
             }
+        }
+        if !same_lifetime {
+            state.current_session_floor = Some(
+                state
+                    .current_session_floor
+                    .unwrap_or(0)
+                    .max(self.probe_head(state.checkpoint)?),
+            );
         }
         state.owner_process = Some(owner_process.clone());
         self.write_state_at(&path, &state)
@@ -1727,7 +1864,7 @@ impl ReflectionController {
                         low = mid;
                     }
                 }
-                return Ok(low);
+                return Ok(high);
             }
             high = high.checked_mul(2).unwrap_or(i64::MAX as u64);
             if high >= i64::MAX as u64 {
@@ -1954,6 +2091,17 @@ impl ReflectionController {
                     Some(event.seq),
                 )?;
                 break;
+            }
+            if state
+                .current_session_floor
+                .is_some_and(|floor| event.seq <= floor)
+            {
+                // Retained predecessor events remain in board history, but the
+                // automatic session boundary consumes them without admission.
+                ignored += 1;
+                state.checkpoint = event.seq;
+                expected = event.seq.saturating_add(1);
+                continue;
             }
             match if admit {
                 self.evaluate_event(&state, &event)
@@ -4033,6 +4181,9 @@ fn stage_receipt(
 fn pending_jobs_from_state(state: &ReflectionState) -> Vec<ReflectionJob> {
     let mut jobs = Vec::new();
     for record in state.records.values() {
+        if !state.record_in_current_session(record) {
+            continue;
+        }
         if record.executor.state == StageState::Pending {
             jobs.push(reflection_job(state, record, Stage::Executor));
         }

@@ -180,6 +180,11 @@ impl LeadLifecycle {
             // A later true observation is a new preparation transition and may
             // start the model-free consumer even for the same retained binding.
             self.last_attempt = None;
+            if !child_running {
+                // Consume the disabled interval without admitting its events.
+                // A running consumer already performs this model-free poll.
+                lifecycle::poll_disabled_boundary(&self.home, &source, &self.source)?;
+            }
             return Ok(());
         }
         if self.observed_enabled != Some(true) {

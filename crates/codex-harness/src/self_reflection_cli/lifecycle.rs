@@ -298,6 +298,8 @@ pub(crate) enum Preparation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreparationTrigger {
+    /// A supported host preparing on startup or after a false-to-true flag
+    /// observation. The disabled interval is consumed at the host boundary.
     Host,
     Acceptance,
 }
@@ -306,8 +308,12 @@ pub(crate) enum PreparationTrigger {
 /// and an already-authenticated managed lead. The caller supplies every
 /// identity explicitly: a host must pass its own thread rather than inheriting
 /// one from a child environment. A retained owner is refreshed without
-/// changing its checkpoint or records; another owner is transferred only
-/// through the existing verified-inactive succession path.
+/// changing its checkpoint or records, while a verified app-server lifetime
+/// change makes the predecessor's work dormant. Another owner is transferred
+/// only through the existing verified-inactive succession path. A host may
+/// also use that path to resume an administrative stop; acceptance never does.
+/// An automatic transfer retains predecessor records but does not dispatch
+/// them.
 pub(crate) fn prepare_automatic(
     home: &Path,
     source: &Path,
@@ -344,12 +350,15 @@ pub(crate) fn prepare_automatic(
     }
     let owner_process = managed_lead_owner(&home, lead)?;
     let controller = options.controller()?;
+    let mut resuming_stop = false;
     if let Some(state) = controller.stored_state()? {
         let retained = state.binding.lead_session.trim();
         if retained != lead {
-            if state.lifecycle != LifecycleStatus::Active {
+            if state.lifecycle != LifecycleStatus::Active
+                && trigger == PreparationTrigger::Acceptance
+            {
                 return Err(invalid(format!(
-                    "automatic reflection preparation found a stopped lifecycle retained by lead '{retained}', not '{lead}'; a different owner is transferred only through verified succession of an active lifecycle. Restart or resume the retained lead while self_reflection_enabled = true, then repeat preparation from its successor; no ownership or lifecycle state was changed"
+                    "automatic reflection preparation found a stopped lifecycle retained by lead '{retained}', not '{lead}'; ordinary acceptance does not resume an administrative stop. Start a managed-lead host for '{lead}' so it can transfer ownership after the retained owner's exact exit is verified; no ownership or lifecycle state was changed"
                 )));
             }
             match retained_owner(&home, retained, state.owner_process.as_ref())? {
@@ -365,11 +374,17 @@ pub(crate) fn prepare_automatic(
                     )));
                 }
             }
-            controller.succeed(&SuccessionRequest {
+            let request = SuccessionRequest {
                 expected_lead_session: retained.to_owned(),
                 successor_lead: lead.to_owned(),
                 successor_process: owner_process,
-            })?;
+            };
+            // A new host is the only automatic caller allowed to resume an
+            // administrative stop. The locked core transition verifies the
+            // predecessor exit, recovery, source and retired-owner guards,
+            // changes lifecycle and ownership in one write, and establishes
+            // the current journal head as the current-session boundary.
+            controller.succeed_current_session(&request)?;
             return Ok(Preparation::Active);
         }
         if state.lifecycle != LifecycleStatus::Active && trigger == PreparationTrigger::Acceptance {
@@ -377,18 +392,53 @@ pub(crate) fn prepare_automatic(
             // fresh host or a false-to-true transition resumes it.
             return Ok(Preparation::Stopped);
         }
+        resuming_stop = state.lifecycle != LifecycleStatus::Active;
     }
-    controller.activate_with_owner_process(
-        &ActivationRequest {
-            lead_session: lead.to_owned(),
-            run: None,
-            boundary: None,
-            journal: JournalPolicy::EnableIfMissing,
-            limits: config.reflection_limits,
-        },
-        &owner_process,
-    )?;
+    let activation = ActivationRequest {
+        lead_session: lead.to_owned(),
+        run: None,
+        boundary: None,
+        journal: JournalPolicy::EnableIfMissing,
+        limits: config.reflection_limits,
+    };
+    if resuming_stop {
+        // The stop resume consumes the stopped interval in the same locked
+        // activation write. Matching app-server identity preserves pending
+        // current-session records; a new lifetime also advances the boundary
+        // that keeps predecessor work dormant. No event accepted during the
+        // stop can be admitted either way.
+        controller.activate_after_stop_with_owner_process(&activation, &owner_process)?;
+    } else {
+        // Ordinary current-owner activation refreshes the proof. If the lead
+        // thread survived a native resume under a new app-server process, the
+        // locked core transition establishes the current journal head as the
+        // new lifetime's no-backfill boundary.
+        controller.activate_with_owner_process(&activation, &owner_process)?;
+    }
     Ok(Preparation::Active)
+}
+
+/// Consume the disabled interval at the model-free journal boundary. The host
+/// calls this while it observes the permission false and has no consumer child,
+/// so a later true value cannot admit events accepted during the disabled
+/// period. Retained records and every stage identity remain untouched.
+pub(crate) fn poll_disabled_boundary(home: &Path, source: &Path, project: &Path) -> io::Result<()> {
+    let options = Options {
+        command: "process".to_owned(),
+        project: canonical_dir(project, "consumer project")?,
+        source: canonical_dir(source, "kit source")?,
+        home: canonical_dir(home, "CODEX_HOME")?,
+        recovery: None,
+        continuation: None,
+    };
+    let controller = options.controller()?;
+    let Some(state) = controller.stored_state()? else {
+        return Ok(());
+    };
+    if state.lifecycle == LifecycleStatus::Active {
+        controller.poll_without_admission()?;
+    }
+    Ok(())
 }
 
 fn managed_lead_owner(home: &Path, thread: &str) -> io::Result<RetainedOwnerProcess> {
@@ -886,15 +936,23 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
         // restart must still observe an already submitted turn or synthesis;
         // absence of a new-stage job never proves that delivery finished.
         controller.stored_state()?.and_then(|state| {
-            state.records.into_values().find(|record| {
-                record.executor.state == RecordedStageState::InFlight
-                    || record.lead.state == RecordedStageState::InFlight
-                    || retained_delivery(record)
-                    || (!quiet
-                        && (accepted::retained_pre_fork_rejection(controller, record).is_some()
-                            || accepted::retained_submitted_reconciliation(controller, record)
-                                .is_some()))
-            })
+            state
+                .records
+                .values()
+                .find(|record| {
+                    state.record_in_current_session(record)
+                        && (record.executor.state == RecordedStageState::InFlight
+                            || record.lead.state == RecordedStageState::InFlight
+                            || retained_delivery(record)
+                            || (!quiet
+                                && (accepted::retained_pre_fork_rejection(controller, record)
+                                    .is_some()
+                                    || accepted::retained_submitted_reconciliation(
+                                        controller, record,
+                                    )
+                                    .is_some())))
+                })
+                .cloned()
         })
     };
     let Some(record) = record else {
@@ -970,6 +1028,15 @@ fn continuation(
             "delivery reflection is stopped; retained results are preserved, but continuing a paused stage requires the active lifecycle; nothing was changed",
         ));
     }
+    if state
+        .records
+        .get(acceptance)
+        .is_some_and(|record| !state.record_in_current_session(record))
+    {
+        return Err(invalid(format!(
+            "acceptance '{acceptance}' belongs to a predecessor session at the automatic ownership boundary; its retained history is preserved, but historical reflection is not backfilled; nothing was changed"
+        )));
+    }
     let checked = controller.check_active_binding(lead, Some(acceptance))?;
     if !checked.is_active() {
         return Err(invalid(format!(
@@ -994,6 +1061,9 @@ fn continuation(
         invalid("the reflection lifecycle disappeared during continuation; nothing was changed")
     })?;
     if let Some((other, other_stage)) = state.records.iter().find_map(|(id, record)| {
+        if !state.record_in_current_session(record) {
+            return None;
+        }
         [Stage::Executor, Stage::Lead]
             .into_iter()
             .find_map(|stage| {
@@ -1013,6 +1083,11 @@ fn continuation(
             "acceptance '{acceptance}' is not retained by this lifecycle; run delivery-improvement status; nothing was changed"
         ))
     })?;
+    if !state.record_in_current_session(&record) {
+        return Err(invalid(format!(
+            "acceptance '{acceptance}' belongs to a predecessor session at the automatic ownership boundary; its retained history is preserved, but historical reflection is not backfilled; nothing was changed"
+        )));
+    }
     if record.delivery == RecordedDeliveryState::Consumed {
         return Err(invalid(format!(
             "acceptance '{acceptance}' delivery is already consumed; no stage may run again; nothing was changed"
