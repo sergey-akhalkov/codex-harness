@@ -351,11 +351,13 @@ output choice, not an ambient `CARGO_TARGET_DIR` override for native build
 identity. Custom compiler wrappers and ambient Rust build overrides are
 rejected before creating build state.
 
-## Accepted-task reflection candidate
+## Accepted-task self-reflection
 
-The `add-delivery-improvement` implementation remains inactive pending its
-qualification, installed delivery and real-work acceptance. These commands
-describe the candidate, not a claim that an existing installation provides it:
+The installed harness provides sequential executor and lead self-reflection
+after ordinary task acceptance. Both role skills are delivered globally.
+Enable the lifecycle from the current managed lead conversation for the
+consuming project; the default-on `self_reflection_enabled` permission alone
+does not activate it:
 
 ```powershell
 codex-harness delivery-improvement enable --project CHECKOUT
