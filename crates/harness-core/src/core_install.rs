@@ -642,7 +642,9 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
     };
     let mut configs: Vec<ConfigChange> = Vec::new();
     let mut creations = Vec::new();
-    if !keep_hooks {
+    if !keep_hooks
+        && !feature_edit::ponytail_selected(config.as_ref().map_or(&[], ConfigSnapshot::contents))?
+    {
         let edit = feature_edit::prepare_feature(
             &plan.upstream,
             config.as_ref().map_or(&[], ConfigSnapshot::contents),
@@ -2006,7 +2008,11 @@ mod tests {
             fs::create_dir_all(home.join("harness")).unwrap();
             let token = home.join("harness/token-workflow.json");
             let subscriptions = home.join("harness/subscription-routing.json");
-            fs::write(&token, b"{\"enabled\":true}").unwrap();
+            fs::write(&token, b"{\"enabled\":false}").unwrap();
+            fs::write(
+                home.join("config.toml"),
+                b"[features]\nhooks = true\n[plugins.\"ponytail@coding-agents-harness\"]\nenabled = true\n",
+            ).unwrap();
             fs::write(
                 &subscriptions,
                 b"{\"owner\":\"codex-harness-subscriptions\"}",
@@ -2024,6 +2030,13 @@ mod tests {
             let second = connect(&fixture.request, false).unwrap();
             assert_eq!(second.status, "connected");
             assert!(second.runtime.unwrap().passed);
+            let config: toml::Value =
+                toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+            assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+            assert_eq!(
+                config["plugins"]["ponytail@coding-agents-harness"]["enabled"].as_bool(),
+                Some(true)
+            );
             let checked = crate::core_check::check(
                 &home,
                 &fixture.request.user_home,

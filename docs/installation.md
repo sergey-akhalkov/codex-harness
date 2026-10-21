@@ -171,6 +171,8 @@ Build output may be quiet while Cargo optimizes: retain the process handle
 and inspect `STATE/staging/<candidate>/cargo.log` when needed. Silence or a
 poll timeout is not evidence that the operation stopped.
 
+Complete the required [Ponytail setup](#ponytail-setup) below after core delivery.
+
 ### Handoff to an agent on another PC
 
 The receiving agent runs [first installation](#first-installation-on-a-new-machine)
@@ -187,31 +189,46 @@ trust step. Use [targeted recovery](#completion-and-targeted-recovery) if delive
 is incomplete; keep target-machine evidence with its owner. A written handoff
 does not claim that the other PC has already passed these checks.
 
-Ponytail automatic delivery is still being implemented under
-[`integrate-ponytail`](../openspec/changes/integrate-ponytail/proposal.md).
-Do not work around it by copying upstream rules or skills into the harness.
-The inspected original 5.3.2 candidate at
-`09c434ab73ca43761c5d8b0c5d341926c2fba710` requires Node on PATH and native
-`/hooks` trust review. Its MIT license and attribution stay in the original
-package. It declares no npm runtime dependencies; the native hooks invoke Node
-for `SessionStart`, `UserPromptSubmit` and `SubagentStart` and use the supplied
-resources. Isolated hook execution on Node 24.18.0 confirmed that
-resume resets the selected mode and a second session in the same project can
-overwrite the first session's mode. Hosts without project context use shared
-fallback state. The verified Codex 0.163.0 neutral and external-project sessions
-both used that fallback in the same Codex home, so do not assume mode isolation
-across projects there. Compaction retains the current stored mode. The integration
-preserves this original behavior and does not promise independent session modes.
-Temporary Ponytail mode changes differ from disabling the plugin persistently.
-Native Codex CLI 0.163.0 installation at the exact revision, repeat installation
-and removal/reinstall were exercised in isolated state. Native `/hooks` review,
-full policy injection and actual core/help skill reads passed in a fresh managed
-native session outside this checkout, with the external project's instructions
-present and its files unchanged. This qualifies the original package; the final
-harness delivery and lifecycle checks remain unfinished. These findings
-are reproducible from the pinned
-[activation hook](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-activate.js)
-and [mode-state owner](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-runtime.js).
+### Ponytail setup
+
+Ponytail is a required part of normal setup and is enabled by default. Install
+the original plugin with Codex's native commands; do not copy its skills or
+rules. The [marketplace declaration](../.agents/plugins/marketplace.json) selects
+the inspected upstream revision. Its MIT license and attribution remain in the
+package. Git and Node must be on PATH. The exercised baseline is Codex CLI
+0.163.0 and Node 24.18.0; this does not establish minimum compatible versions.
+
+First run `codex plugin list --json`. If Ponytail is already installed, keep that
+native installation and inspect its selection instead of adding a duplicate.
+Do not reset deliberate disablement. For a new installation, run these commands
+after the core delivery above (`$kit` is the absolute checkout path):
+
+```powershell
+codex plugin marketplace add $kit --json
+codex plugin add ponytail@coding-agents-harness --json
+codex features enable hooks
+```
+
+Open ordinary Codex and use `/hooks` to review and trust the original Ponytail
+hooks. Then start a fresh session outside the harness checkout. Native plugin
+listing must show Ponytail installed and enabled, and the session must receive
+its guidance and discover the supplied skills, including `ponytail-help`.
+Package presence alone does not prove loading. `codex-harness check` verifies
+the harness connection; use native plugin listing, `/hooks` and the fresh
+session to verify Ponytail. Keep any native error visible and resolve its stated
+cause before claiming setup is complete.
+
+Repeat setup starts with native listing; do not blindly repeat `plugin add`,
+which can reset the enabled choice. The plugin lives in the selected Codex home
+and needs no project-local setup. Updates and removal use Codex's native plugin
+commands and the [upstream guide](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/INSTALL.md).
+
+The original plugin resets mode on resume and can share mode state between
+sessions. On the exercised Codex 0.163.0 host, different projects in the same
+Codex home also used shared fallback state; independent modes are not promised.
+Compaction retains the stored mode in the inspected upstream hooks. Temporary
+mode changes differ from persistent plugin disablement. See the original
+[mode-state implementation](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-runtime.js).
 
 ### Everyday delivery and update
 

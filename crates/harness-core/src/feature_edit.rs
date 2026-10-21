@@ -32,6 +32,25 @@ impl Feature {
     }
 }
 
+/// Native Ponytail selection owns its hooks independently of the RTK toggle.
+/// Preserve the current hooks feature, including deliberate suspension.
+pub(crate) fn ponytail_selected(config: &[u8]) -> io::Result<bool> {
+    let text = std::str::from_utf8(config)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Codex configuration"))?;
+    let value: toml::Value = toml::from_str(text)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Codex configuration"))?;
+    Ok(value
+        .get("plugins")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|plugins| {
+            plugins.iter().any(|(id, settings)| {
+                id.split_once('@').is_some_and(|(name, marketplace)| {
+                    name == "ponytail" && !marketplace.is_empty()
+                }) && settings.get("enabled").and_then(toml::Value::as_bool) == Some(true)
+            })
+        }))
+}
+
 pub struct FeatureEdit {
     pub before_sha256: String,
     pub after_sha256: String,
@@ -439,5 +458,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn native_ponytail_selection_preserves_disable_and_unrelated_plugins() {
+        for marketplace in ["ponytail", "coding-agents-harness"] {
+            let selected = format!("[plugins.\"ponytail@{marketplace}\"]\nenabled = true\n");
+            assert!(ponytail_selected(selected.as_bytes()).unwrap());
+            let disabled = selected.replace("true", "false");
+            assert!(!ponytail_selected(disabled.as_bytes()).unwrap());
+        }
+        for config in [
+            "",
+            "[plugins.\"unrelated@market\"]\nenabled = true",
+            "[plugins.\"not-ponytail@market\"]\nenabled = true",
+            "[plugins.\"ponytail@\"]\nenabled = true",
+            "[plugins.\"ponytail@market\"]\n",
+        ] {
+            assert!(!ponytail_selected(config.as_bytes()).unwrap());
+        }
+        assert!(ponytail_selected(b"[invalid").is_err());
+        assert!(ponytail_selected(&[255]).is_err());
     }
 }
