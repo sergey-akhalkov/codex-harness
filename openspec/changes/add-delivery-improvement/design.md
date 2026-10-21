@@ -8,7 +8,7 @@ Reusable owners include `executor_control.rs`, `executor_observation.rs`, `execu
 
 Local contract inspection established native Codex fork, model/profile and sandbox overrides, plus a fork schema with source turn boundaries and goal-continuation control. This is interface evidence, not proof of safe fork execution or cross-provider context compatibility. Beads exposes `events tail`, ordered committed mutations and explicit truncation errors. The journal is optional, local to a replica and branch, and does not cover raw SQL mutations or changes imported by sync. Setup and recovery must account for these boundaries.
 
-The current implementation resolves the executor reflection stage from the configured executor profile (`ds` in the shipped kit) and the lead stage from `lead_profile`. A prior real executor-reflection attempt failed and is being recovered. No successful two-stage chain, current live-lead consumption or global installation is yet proven.
+The current implementation resolves the executor reflection stage from the configured executor profile (`ds` in the shipped kit) and the lead stage from `lead_profile`. Recovery of a real accepted task completed both stages in order and delivered synthesis to its current live lead, which recorded a disposition. Earlier failures and costs remain retained. The canonical role skills preserve the instruction bodies exercised by that chain; global installation verification remains open.
 
 ## Goals / Non-Goals
 
