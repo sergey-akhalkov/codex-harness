@@ -15,6 +15,12 @@
 //! `executor message` and `executor stop` address keeps pointing at the real
 //! app-server, and the host's own control connection is never relayed.
 //!
+//! An opt-in observed start leaves the conversation unknown until the native
+//! frontend's own new/resume/fork selection succeeds. The host callback
+//! registers that exact thread before the selection response is released, and
+//! only the successfully registered thread's turns pass the relay. The fixed
+//! start and its warning delivery remain unchanged.
+//!
 //! Nothing here is a client-to-server warning request: the installed protocol
 //! has none, and no shape outside the captured notification is ever written.
 //! A delivery failure is recorded state, never a terminal outcome for healthy
@@ -494,6 +500,9 @@ impl WarningQueue {
 
 // --------------------------------------------------------------------- relay
 
+/// Host callback that registers a successful native thread selection.
+pub type SelectionObserver = Arc<dyn Fn(&str) -> io::Result<()> + Send + Sync>;
+
 /// The frontend-facing warning relay of one conversation.
 ///
 /// It serves only the native frontend's own connection; the host's control
@@ -511,10 +520,41 @@ impl Relay {
     /// serving `upstream_port`, authenticating frontends with the same
     /// capability token and addressing warnings to `thread_id`.
     pub fn start(upstream_port: u16, token: &str, thread_id: &str) -> io::Result<Self> {
-        if upstream_port == 0 || !capability_token(token) || thread_id.is_empty() {
+        if thread_id.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the native warning relay needs the conversation's capability endpoint and exact thread",
+            ));
+        }
+        Self::start_with(
+            upstream_port,
+            token,
+            ThreadPolicy::Fixed(thread_id.to_owned()),
+        )
+    }
+
+    /// Starts the relay without a known conversation. The frontend keeps its
+    /// own new/resume/fork choice; a successful upstream selection is passed to
+    /// `observer` before its response reaches the frontend, and only turns for
+    /// that successfully observed thread are forwarded.
+    ///
+    /// The observer is the host's registration boundary. It must publish the
+    /// verified app-server/process proof and return without waiting for model
+    /// work. Warnings stay queued until an observed selection succeeds.
+    #[allow(dead_code)] // The ordinary host consumes this boundary in its own slice.
+    pub fn start_observed(
+        upstream_port: u16,
+        token: &str,
+        observer: SelectionObserver,
+    ) -> io::Result<Self> {
+        Self::start_with(upstream_port, token, ThreadPolicy::Observed(observer))
+    }
+
+    fn start_with(upstream_port: u16, token: &str, threads: ThreadPolicy) -> io::Result<Self> {
+        if upstream_port == 0 || !capability_token(token) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the native warning relay needs the conversation's capability endpoint",
             ));
         }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -527,7 +567,7 @@ impl Relay {
             listener,
             upstream_port,
             token: token.to_owned(),
-            thread_id: thread_id.to_owned(),
+            threads,
             queue: queue.clone(),
             stop: Arc::clone(&stop),
             sessions: Arc::clone(&sessions),
@@ -587,13 +627,31 @@ impl Drop for Relay {
     }
 }
 
+/// How this relay learns the conversation it serves.
+#[allow(dead_code)] // The observed variant is exercised by the relay tests before host integration.
+enum ThreadPolicy {
+    /// The warning-only relay already knows the exact conversation.
+    Fixed(String),
+    /// The frontend's own successful selection registers the conversation.
+    Observed(SelectionObserver),
+}
+
+/// What one relayed record needs before it reaches the other peer.
+enum Traffic {
+    Forward,
+    /// A truthful JSON-RPC refusal written by the relay instead of forwarding
+    /// a selection or turn that cannot be verified.
+    Answer(Value),
+    Close,
+}
+
 /// Everything one relay needs: the listener, the conversation it fronts, and
 /// the state its sessions share.
 struct Transport {
     listener: TcpListener,
     upstream_port: u16,
     token: String,
-    thread_id: String,
+    threads: ThreadPolicy,
     queue: WarningQueue,
     stop: Arc<AtomicBool>,
     sessions: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -658,9 +716,21 @@ impl Transport {
             match read_ready(&mut frontend) {
                 Ok(message) => {
                     active = true;
-                    observe_request(&message, &self.thread_id, &mut frontend_state.awaiting);
-                    if upstream.send(message).is_err() {
-                        break;
+                    match self.frontend_action(&message, &mut frontend_state) {
+                        Traffic::Forward => {
+                            if upstream.send(message).is_err() {
+                                break;
+                            }
+                        }
+                        Traffic::Answer(record) => {
+                            if frontend
+                                .send(Message::Text(record.to_string().into()))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Traffic::Close => break,
                     }
                 }
                 Err(error) if would_block(&error) => {}
@@ -669,9 +739,21 @@ impl Transport {
             match read_ready(&mut upstream) {
                 Ok(message) => {
                     active = true;
-                    observe_response(&message, &mut frontend_state);
-                    if frontend.send(message).is_err() {
-                        break;
+                    match self.upstream_action(&message, &mut frontend_state) {
+                        Traffic::Forward => {
+                            if frontend.send(message).is_err() {
+                                break;
+                            }
+                        }
+                        Traffic::Answer(record) => {
+                            if frontend
+                                .send(Message::Text(record.to_string().into()))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Traffic::Close => break,
                     }
                 }
                 Err(error) if would_block(&error) => {}
@@ -679,11 +761,11 @@ impl Transport {
             }
             // Append warnings after exact-thread initialization and before
             // later upstream records, preserving the existing delivery state.
-            if frontend_state.initialized {
+            if let Some(thread_id) = self.warning_thread(&frontend_state).map(str::to_owned) {
                 deliver(
                     &mut frontend,
                     &self.queue,
-                    &self.thread_id,
+                    &thread_id,
                     &mut frontend_state.buffered,
                 );
             }
@@ -696,6 +778,38 @@ impl Transport {
         let _ = frontend.close(None);
         let _ = upstream.close(None);
     }
+
+    fn frontend_action(&self, message: &Message, state: &mut FrontendState) -> Traffic {
+        match &self.threads {
+            ThreadPolicy::Fixed(thread_id) => {
+                observe_request(message, thread_id, &mut state.awaiting);
+                Traffic::Forward
+            }
+            ThreadPolicy::Observed(_) => observe_selection_request(message, state),
+        }
+    }
+
+    fn upstream_action(&self, message: &Message, state: &mut FrontendState) -> Traffic {
+        match &self.threads {
+            ThreadPolicy::Fixed(_) => {
+                observe_response(message, state);
+                Traffic::Forward
+            }
+            ThreadPolicy::Observed(observer) => {
+                observe_selection_response(message, state, observer.as_ref())
+            }
+        }
+    }
+
+    fn warning_thread<'a>(&'a self, state: &'a FrontendState) -> Option<&'a str> {
+        match &self.threads {
+            ThreadPolicy::Fixed(thread_id) => state.initialized.then_some(thread_id.as_str()),
+            ThreadPolicy::Observed(_) => state
+                .initialized
+                .then_some(state.selected.as_deref())
+                .flatten(),
+        }
+    }
 }
 
 /// What one frontend connection has told this relay so far.
@@ -703,8 +817,10 @@ impl Transport {
 struct FrontendState {
     /// The frontend initialized or resumed the exact thread on this connection.
     initialized: bool,
-    /// Request ids of thread-naming requests awaiting their answer.
+    /// Request ids of thread-naming or selection requests awaiting their answer.
     awaiting: BTreeSet<String>,
+    /// The latest thread whose selection the host successfully observed.
+    selected: Option<String>,
     /// A diagnostic is already serialized in the socket's own write buffer.
     buffered: bool,
 }
@@ -790,6 +906,124 @@ fn connect_upstream(port: u16, token: &str) -> io::Result<WebSocket<TcpStream>> 
     Ok(socket)
 }
 
+/// The observed frontend keeps its own selection choice. Only a request id that
+/// belongs to a new/resume/fork request can carry the upstream answer into the
+/// host registration boundary.
+fn observe_selection_request(message: &Message, state: &mut FrontendState) -> Traffic {
+    let Message::Text(text) = message else {
+        return Traffic::Forward;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(text.as_str()) else {
+        return Traffic::Forward;
+    };
+    let Some(method) = record.get("method").and_then(Value::as_str) else {
+        return Traffic::Forward;
+    };
+    if matches!(method, "thread/start" | "thread/resume" | "thread/fork") {
+        let Some(id) = record.get("id").filter(|id| !id.is_null()) else {
+            // A selection without a request id cannot be correlated, so it
+            // cannot become a registered conversation.
+            return Traffic::Close;
+        };
+        let key = id.to_string();
+        if state.awaiting.contains(&key) {
+            return Traffic::Answer(rpc_error(
+                id,
+                -32600,
+                "the relay already correlates this selection request id",
+            ));
+        }
+        if state.awaiting.len() >= MAX_AWAITING {
+            return Traffic::Answer(rpc_error(
+                id,
+                -32600,
+                "the relay cannot correlate another thread selection",
+            ));
+        }
+        state.awaiting.insert(key);
+        return Traffic::Forward;
+    }
+    if method == "turn/start" {
+        let Some(id) = record.get("id").filter(|id| !id.is_null()) else {
+            return Traffic::Close;
+        };
+        let requested = record
+            .get("params")
+            .and_then(|params| params.get("threadId"))
+            .and_then(Value::as_str);
+        if requested.is_some_and(|thread_id| state.selected.as_deref() == Some(thread_id)) {
+            return Traffic::Forward;
+        }
+        return Traffic::Answer(rpc_error(
+            id,
+            -32602,
+            "turn/start names no thread that the host has registered",
+        ));
+    }
+    Traffic::Forward
+}
+
+/// A successful selection response is released only after the host observed and
+/// accepted the exact returned thread. Failed selections and unsolicited
+/// notifications cannot establish ownership.
+fn observe_selection_response(
+    message: &Message,
+    state: &mut FrontendState,
+    observer: &(dyn Fn(&str) -> io::Result<()> + Send + Sync),
+) -> Traffic {
+    let Message::Text(text) = message else {
+        return Traffic::Forward;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(text.as_str()) else {
+        return Traffic::Forward;
+    };
+    let Some(id) = record.get("id").filter(|id| !id.is_null()) else {
+        return Traffic::Forward;
+    };
+    if !state.awaiting.remove(&id.to_string()) {
+        return Traffic::Forward;
+    }
+    if record.get("error").is_some() {
+        return Traffic::Forward;
+    }
+    let Some(selected) = record
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+    else {
+        return Traffic::Answer(rpc_error(
+            id,
+            -32603,
+            "the app-server selected no native thread identity",
+        ));
+    };
+    if !native_thread_id(selected) {
+        return Traffic::Answer(rpc_error(
+            id,
+            -32603,
+            "the app-server selected an invalid native thread identity",
+        ));
+    }
+    match observer(selected) {
+        Ok(()) => {
+            state.selected = Some(selected.to_owned());
+            state.initialize();
+            Traffic::Forward
+        }
+        Err(_) => Traffic::Answer(rpc_error(
+            id,
+            -32603,
+            "the host could not register the selected native thread",
+        )),
+    }
+}
+
+/// A JSON-RPC refusal in the shape this app-server protocol uses.
+fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
+    json!({"id": id, "error": {"code": code, "message": message}})
+}
+
 /// A thread-naming request: the frontend asks the app-server for the exact
 /// thread. Any other request, or a request that names another thread, cannot
 /// make this connection the one a warning may be appended to.
@@ -843,6 +1077,17 @@ fn names_thread(value: &Value, thread_id: &str) -> bool {
         Value::Object(fields) => fields.values().any(|value| names_thread(value, thread_id)),
         _ => false,
     }
+}
+
+/// Only the native token shape accepted by the current frontend boundary is a
+/// usable thread identity; a response cannot turn a path or oversized value
+/// into registry authority.
+fn native_thread_id(thread_id: &str) -> bool {
+    !thread_id.is_empty()
+        && thread_id.len() <= 128
+        && thread_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// Writes every queued diagnostic, oldest first, as the captured notification.
