@@ -198,7 +198,9 @@ for `SessionStart`, `UserPromptSubmit` and `SubagentStart` and use the supplied
 resources. Isolated hook execution on Node 24.18.0 confirmed that
 resume resets the selected mode and a second session in the same project can
 overwrite the first session's mode. Hosts without project context use shared
-fallback state; compaction retains the current stored mode. The integration
+fallback state. The verified Codex 0.163.0 neutral and external-project sessions
+both used that fallback in the same Codex home, so do not assume mode isolation
+across projects there. Compaction retains the current stored mode. The integration
 preserves this original behavior and does not promise independent session modes.
 Temporary Ponytail mode changes differ from disabling the plugin persistently.
 Native Codex CLI 0.163.0 installation at the exact revision, repeat installation
