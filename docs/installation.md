@@ -191,8 +191,13 @@ The inspected original 5.3.2 candidate at
 `09c434ab73ca43761c5d8b0c5d341926c2fba710` requires Node on PATH and native
 `/hooks` trust review. Isolated hook execution on Node 24.18.0 confirmed that
 resume resets the selected mode and a second session in the same project can
-overwrite the first session's mode. Native Codex consumption of this candidate
-remains unverified; it is not an accepted integration baseline. These findings
+overwrite the first session's mode. Hosts without project context use shared
+fallback state; compaction retains the current stored mode. The integration
+preserves this original behavior and does not promise independent session modes.
+Temporary Ponytail mode changes differ from disabling the plugin persistently.
+Native Codex CLI 0.163.0 installation at the exact revision, repeat installation
+and removal/reinstall were exercised in isolated state. Native trusted context
+consumption remains unverified. These findings
 are reproducible from the pinned
 [activation hook](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-activate.js)
 and [mode-state owner](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/hooks/ponytail-runtime.js).

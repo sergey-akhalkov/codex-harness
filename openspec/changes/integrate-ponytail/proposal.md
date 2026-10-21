@@ -26,6 +26,8 @@ A normal harness installation on another PC should deliver Ponytail as an active
 
 ## Impact
 
+Use the original Ponytail mode behavior with documented limitations: resume resets to the default, and concurrent sessions can share mode state. The user selected this scope instead of correcting or forking Ponytail. Persistent plugin disablement remains protected by the harness lifecycle.
+
 The implementation affects the native installation routing and core connection, installation metadata and checks, the portable dependency/plugin declaration, and the applicable source-accounting checks. Instruction consolidation covers the common principles, shared developer guidance, responsibility fragments, owned skills and generated assignment guidance where they duplicate Ponytail. Protected external OpenSpec workflows remain unchanged.
 
 Operational documentation changes belong in the existing installation, global-instructions and project-decisions guides. Ponytail remains third-party code; maintained harness integration and tests remain Rust. The supported delivery target remains Windows with Codex CLI; this does not add support claims for other agents or Ponytail's Claude-specific UI.

@@ -70,20 +70,21 @@ Repeated lifecycle operations SHALL preserve user disablement, unrelated plugins
 
 ### Requirement: Context survives the ordinary session lifecycle
 
-Ponytail guidance SHALL reach supported lead and executor sessions before dependent work, including fresh starts and applicable resume or compaction boundaries. Starting, resuming or ending another session SHALL NOT silently disable or change a working session's effective policy. Supported mode controls SHALL expose their actual scope and preserve explicit choices; a hidden shared-state race SHALL NOT count as acceptable concurrency support.
+Ponytail guidance SHALL reach supported lead and executor sessions before dependent work, including fresh starts and applicable resume or compaction boundaries. The integration SHALL preserve original upstream mode behavior and document its observed scope and limitations in `docs/installation.md`. It SHALL NOT promise session-isolated modes or mode preservation beyond what the pinned upstream provides.
 
 #### Scenario: Resume or compaction occurs
 - **WHEN** an active managed session resumes or crosses its supported compaction boundary
-- **THEN** subsequent work retains the selected Ponytail guidance together with harness supplements and applicable project instructions
+- **THEN** subsequent work receives Ponytail guidance together with harness supplements and applicable project instructions; resume uses the upstream default mode and compaction uses its current stored mode
 - **AND** recovery does not require manually pasting upstream rules
 
 #### Scenario: Work runs concurrently
 - **WHEN** a lead and executor, or two ordinary sessions, work concurrently in the same or different repositories
-- **THEN** all receive their required guidance, and another session's startup, resume or exit does not silently change that guidance
+- **THEN** all receive the original plugin and harness supplements; documentation explains that same-project sessions share mode state and that hosts without project context share a fallback state
+- **AND** documentation warns that another session's startup or resume can reset that shared mode; independent mode isolation is not claimed
 
 #### Scenario: A mode is changed explicitly
 - **WHEN** the user uses a supported Ponytail mode control during concurrent work
-- **THEN** its advertised scope matches the observed effect, other sessions are not silently changed outside that scope, and later lifecycle operations preserve the applicable explicit choice
+- **THEN** the observed upstream effect and shared-state scope are documented, including reset on resume and possible effects on concurrent sessions; installation-level plugin disablement remains distinct from a temporary upstream mode change
 
 ### Requirement: Loading failures remain visible and recoverable
 
