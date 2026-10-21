@@ -131,7 +131,7 @@ to the real lead, who owns decisions and assignments. Reflection and improvement
 work, including its descendants, does not trigger another automatic reflection.
 Use durable native events and retained stage identities, not model polling or
 a separate transcript feed. This is the selected design, not a delivery claim;
-the active [change](../openspec/changes/add-delivery-improvement/proposal.md)
+the [self-reflection specification](../openspec/specs/delivery-improvement/spec.md)
 owns implementation and acceptance.
 
 **2026-10-19, revised:** the purpose of post-acceptance self-reflection is to
@@ -188,15 +188,15 @@ wait for repeated episodes, votes or statistical proof when the available facts
 already support the remedy. Investigate only uncertainty that changes the
 decision, and verify the result proportionately through its actual use. Keep
 the reflection mechanism's release acceptance separate from the handling of each
-finding; preserve required acceptance and scope boundaries. The active change
-owns this [single-observation admission](../openspec/changes/add-delivery-improvement/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
+finding; preserve required acceptance and scope boundaries. The feedback specification
+owns this [single-observation admission](../openspec/specs/orchestration-feedback-loop/spec.md#requirement-verified-improvement-admission-has-an-explicit-basis).
 
 Release acceptance requires one real sequential executor-fork reflection,
 lead-fork synthesis receiving its result, and verified consumption and disposition
 by the current live lead, plus applicable regression and global installation checks.
 The live lead may delegate a useful recommendation through the ordinary executor
 process; neither a completed improvement nor a comparative campaign blocks release.
-The active change owns the [real-chain acceptance](../openspec/changes/add-delivery-improvement/design.md#9-release-acceptance-uses-the-real-sequential-chain).
+The self-reflection specification owns the [real-chain acceptance](../openspec/specs/delivery-improvement/spec.md#requirement-real-sequential-chain-gates-release).
 This does not establish savings or waive the user's cost/payback requirements
 when deciding whether to adopt individual improvements.
 
