@@ -14,7 +14,9 @@ Share activation preparation between the host and ordinary acceptance. The host 
 
 Reuse verified succession for a previous inactive owner rather than overwriting a binding. A live or unverifiable owner remains a reported conflict. Existing recovery and unknown-result rules remain authoritative.
 
-Only a managed lead supplies the authenticated return transport used by ordinary acceptance and reflection. This change does not fabricate an endpoint for an already-running unmanaged conversation.
+The user confirmed that ordinary `codex` must also prepare this transport automatically. Reuse the installed launcher's already composed native command and the current managed app-server/frontend owners, rather than the legacy task runtime: that runtime requires an explicit provider base URL and rejects resume/fork. Keep the native frontend in its current terminal. Preserve the native argv, effective model/profile/configuration and session selection. Internal app-server, executor/reflection, help and noninteractive commands must not recurse into the ordinary host.
+
+The ordinary host receives the launcher's prepared native arguments through a narrow manager entrypoint, authenticates its registered upstream and owns one app-server/frontend lifetime. Reuse existing native argument planning for backend options. Keep native new/resume/fork selection in the native frontend; observe its exact selected thread before publishing the existing process-backed lead registration. If notification observation needs the existing frontend relay, share that owner rather than inventing another transport. Publish before a first submitted turn can run tools, retire registrations on every exit path, and use the existing reflection host after registration. An already-open unmanaged conversation cannot acquire an app-server transport from a thread id; it takes the update on its next ordinary launch.
 
 ## Risks / Trade-offs
 

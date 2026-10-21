@@ -1,3 +1,29 @@
+## ADDED Requirements
+
+### Requirement: Ordinary Codex starts reflection transport automatically
+
+When the flag is true, the installed ordinary interactive `codex` entrypoint SHALL prepare the transport needed by reflection without a separate lead or enable command. It SHALL preserve the selected model, provider, effort, profile, configuration, working directory, native terminal and session selection. Internal and noninteractive commands SHALL retain their existing behavior without recursive hosting.
+
+#### Scenario: Ordinary interactive launch
+- **WHEN** the user starts ordinary `codex` with the flag true and normal default-provider authentication
+- **THEN** the visible native conversation has its own verified lead registration, and its first eligible acceptance starts reflection without another setup command
+
+#### Scenario: Explicit preferences and resumed conversation
+- **WHEN** ordinary interactive startup selects a model, profile, configuration or existing conversation through native arguments
+- **THEN** the same choices reach the managed transport and visible conversation, including native resume/fork selection, without silent replacement or dropped parameters
+
+#### Scenario: Internal and noninteractive invocation
+- **WHEN** Codex runs help, a noninteractive subcommand, an explicit remote attachment or an owned executor/reflection/backend invocation
+- **THEN** it retains its appropriate native owner and does not recursively start an ordinary lead host
+
+#### Scenario: Existing unmanaged frontend
+- **WHEN** an unmanaged conversation was already open when the new launcher was installed
+- **THEN** its work remains intact and the update applies on its next ordinary launch; status does not pretend that its thread id is an active transport
+
+#### Scenario: Failed attachment or session exit
+- **WHEN** the native frontend cannot attach or its owned session exits
+- **THEN** the host retires only its own registrations and processes and retains any unfinished reflection work with truthful failure and recovery information
+
 ## MODIFIED Requirements
 
 ### Requirement: Explicit activation with a bounded mandate
