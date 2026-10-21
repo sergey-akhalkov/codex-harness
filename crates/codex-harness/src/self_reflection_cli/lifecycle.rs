@@ -5,7 +5,7 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    ActivationRequest, BindingStatus, BudgetLimit, BudgetPause,
+    ActivationRequest, BindingStatus, BudgetLimit, BudgetPause, CurrentThreadSelection,
     DeliveryState as RecordedDeliveryState, JournalPolicy, LifecycleStatus, ReflectionController,
     ReflectionLimits, ReflectionRecord, RetainedOwnerProcess, Stage, StageRecord,
     StageState as RecordedStageState, StageWork, SuccessionRequest, UsageDelta,
@@ -415,6 +415,57 @@ pub(crate) fn prepare_automatic(
         // new lifetime's no-backfill boundary.
         controller.activate_with_owner_process(&activation, &owner_process)?;
     }
+    Ok(Preparation::Active)
+}
+
+/// Prepares a host-confirmed switch between conversations in the exact same
+/// app-server backend. The host must leave the prior registry record in place
+/// and stage the selected thread's registry record with that same verified
+/// process before calling this function; it retires the prior record only
+/// after this returns `Active`. The core transition refuses unmatched backend
+/// proof, so this path never weakens ordinary succession's live-owner guard.
+pub(crate) fn prepare_selected_thread(
+    home: &Path,
+    source: &Path,
+    project: &Path,
+    expected_lead: &str,
+    selected_lead: &str,
+) -> io::Result<Preparation> {
+    let source = canonical_dir(source, "kit source")?;
+    let config = orchestration_config::load(&source)?;
+    if !config.self_reflection_enabled {
+        return Ok(Preparation::Disabled);
+    }
+    let expected_lead = expected_lead.trim();
+    let selected_lead = selected_lead.trim();
+    if expected_lead.is_empty() || selected_lead.is_empty() {
+        return Err(invalid(
+            "selecting a current conversation requires both the expected and selected managed-lead identities",
+        ));
+    }
+    let home = canonical_dir(home, "CODEX_HOME")?;
+    let project = canonical_dir(project, "consumer project")?;
+    let options = Options {
+        command: "enable".to_owned(),
+        project: project.clone(),
+        source: source.clone(),
+        home: home.clone(),
+        recovery: None,
+        continuation: None,
+    };
+    declarations(&options, &config)?;
+    if !home.join("harness/bin/codex.exe").is_file() {
+        return Err(invalid(
+            "the installed Codex launcher is missing; repair the installation before preparing reflection",
+        ));
+    }
+    let backend_process = managed_lead_owner(&home, selected_lead)?;
+    let controller = options.controller()?;
+    controller.select_current_thread(&CurrentThreadSelection {
+        expected_lead_session: expected_lead.to_owned(),
+        selected_lead_session: selected_lead.to_owned(),
+        backend_process,
+    })?;
     Ok(Preparation::Active)
 }
 

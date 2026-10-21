@@ -3,11 +3,12 @@
 //! and makes no model calls.
 
 use harness_core::delivery_reflection::{
-    ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, BindingStatus, DeliveryState,
-    EventRefusal, Finding, JournalOwnership, JournalPolicy, LifecycleStatus, PURPOSE_METADATA,
-    PollReceipt, Purpose, RecoveryKind, ReflectionController, ReflectionLimits, RefusalCode,
-    RetainedOwnerProcess, Stage, StageOutcome, StageState, StageWork, SubmittedAccounting,
-    SuccessionRequest, TaskBindingStatus, UsageDelta, acceptance_metadata,
+    ACCEPTANCE_METADATA, AcceptanceBinding, ActivationRequest, BindingStatus,
+    CurrentThreadSelection, DeliveryState, EventRefusal, Finding, JournalOwnership, JournalPolicy,
+    LifecycleStatus, PURPOSE_METADATA, PollReceipt, Purpose, RecoveryKind, ReflectionController,
+    ReflectionLimits, RefusalCode, RetainedOwnerProcess, Stage, StageOutcome, StageState,
+    StageWork, SubmittedAccounting, SuccessionRequest, TaskBindingStatus, UsageDelta,
+    acceptance_metadata,
 };
 use serde_json::{Value, json};
 use std::{
@@ -1903,6 +1904,199 @@ fn new_process_lifetime_activation_keeps_predecessor_work_dormant() {
         controller.pending_jobs().unwrap()[0].acceptance_id,
         current_acceptance
     );
+}
+
+#[test]
+fn same_backend_thread_selection_advances_boundary_and_stays_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let board = Board::new(temp.path());
+    board.json(&["config", "set", "events-journal", "true", "--json"]);
+    let controller = board.controller();
+    let (mut owner, owner_process) = spawn_owner();
+    activate_with_process(&controller, JournalPolicy::RequireExisting, &owner_process);
+    let task = board.create_task("Selected thread predecessor", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &task,
+        &binding(&task, Purpose::Ordinary, "selected-predecessor"),
+    );
+    board.close(&task);
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    let acceptance = acceptance_for_task(&poll, &task);
+
+    let historical = board.create_task(
+        "Unpolled selected-thread predecessor",
+        Some(Purpose::Ordinary),
+        None,
+    );
+    let historical_binding = binding(&historical, Purpose::Ordinary, "unpolled-selected");
+    board.set_binding(&historical, &historical_binding);
+    board.close(&historical);
+    let historical_acceptance = historical_binding.acceptance_id().unwrap();
+
+    let before = controller.stored_state().unwrap().unwrap();
+    let head = board.event_head(before.checkpoint);
+    assert!(
+        head > before.checkpoint,
+        "head {head}, checkpoint {}",
+        before.checkpoint
+    );
+
+    let live_owner_refusal = controller
+        .succeed_current_session(&SuccessionRequest {
+            expected_lead_session: LEAD.to_owned(),
+            successor_lead: SUCCESSOR.to_owned(),
+            successor_process: owner_process.clone(),
+        })
+        .unwrap_err();
+    assert!(
+        live_owner_refusal
+            .to_string()
+            .contains("process is still live"),
+        "{live_owner_refusal}"
+    );
+    let state_file = controller.state_file().unwrap();
+    assert_eq!(controller.stored_state().unwrap().unwrap(), before);
+
+    let wrong_backend = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: LEAD.to_owned(),
+            selected_lead_session: SUCCESSOR.to_owned(),
+            backend_process: live_self(),
+        })
+        .unwrap_err();
+    assert!(
+        wrong_backend
+            .to_string()
+            .contains("does not exactly match the retained process proof"),
+        "{wrong_backend}"
+    );
+    assert_eq!(controller.stored_state().unwrap().unwrap(), before);
+
+    let receipt = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: LEAD.to_owned(),
+            selected_lead_session: SUCCESSOR.to_owned(),
+            backend_process: owner_process.clone(),
+        })
+        .unwrap();
+    assert!(receipt.changed);
+    assert_eq!(receipt.previous_lead_session, LEAD);
+    assert_eq!(receipt.lead_session, SUCCESSOR);
+    assert_eq!(receipt.revision, before.binding.revision + 1);
+    let after = controller.stored_state().unwrap().unwrap();
+    let floor = after.current_session_floor.unwrap();
+    assert!(floor >= head, "floor {floor}, head {head}");
+    assert_eq!(after.binding.lead_session, SUCCESSOR);
+    assert_eq!(after.owner_process, Some(owner_process.clone()));
+    assert_eq!(after.retired_leads, vec![LEAD.to_owned()]);
+    assert_eq!(after.records, before.records);
+    assert!(controller.pending_jobs().unwrap().is_empty());
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending
+    );
+
+    let settled = fs::read(&state_file).unwrap();
+    let repeated = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: SUCCESSOR.to_owned(),
+            selected_lead_session: SUCCESSOR.to_owned(),
+            backend_process: owner_process.clone(),
+        })
+        .unwrap();
+    assert!(!repeated.changed);
+    assert_eq!(repeated.revision, receipt.revision);
+    assert_eq!(fs::read(&state_file).unwrap(), settled);
+
+    let skipped = controller.poll().unwrap();
+    assert_eq!(skipped.accepted, 0, "{skipped:?}");
+    assert!(skipped.ignored >= 1, "{skipped:?}");
+    assert!(controller.record(&historical_acceptance).unwrap().is_none());
+
+    let current = board.create_task("Selected thread current", Some(Purpose::Ordinary), None);
+    let mut current_binding = binding(&current, Purpose::Ordinary, "selected-current");
+    current_binding.lead_session = SUCCESSOR.to_owned();
+    board.set_binding(&current, &current_binding);
+    board.close(&current);
+    let polled = controller.poll().unwrap();
+    assert_eq!(polled.accepted, 1, "{polled:?}");
+    let current_acceptance = acceptance_for_task(&polled, &current);
+    assert_ne!(current_acceptance, acceptance);
+    assert_eq!(
+        controller.pending_jobs().unwrap()[0].acceptance_id,
+        current_acceptance
+    );
+
+    // Returning to the previous conversation is allowed, but it is another
+    // current activation boundary: the selected thread's old pending work is
+    // retained evidence, not work revived by the switch.
+    let back = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: SUCCESSOR.to_owned(),
+            selected_lead_session: LEAD.to_owned(),
+            backend_process: owner_process.clone(),
+        })
+        .unwrap();
+    assert!(back.changed);
+    assert_eq!(back.previous_lead_session, SUCCESSOR);
+    assert_eq!(back.lead_session, LEAD);
+    let after_back = controller.stored_state().unwrap().unwrap();
+    assert!(
+        after_back
+            .retired_leads
+            .iter()
+            .any(|lead| lead == SUCCESSOR)
+    );
+    assert!(!after_back.retired_leads.iter().any(|lead| lead == LEAD));
+    assert!(controller.pending_jobs().unwrap().is_empty());
+    assert_eq!(
+        controller
+            .record(&current_acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending
+    );
+    let settled_back = fs::read(&state_file).unwrap();
+    let repeated_back = controller
+        .select_current_thread(&CurrentThreadSelection {
+            expected_lead_session: LEAD.to_owned(),
+            selected_lead_session: LEAD.to_owned(),
+            backend_process: owner_process,
+        })
+        .unwrap();
+    assert!(!repeated_back.changed);
+    assert_eq!(fs::read(&state_file).unwrap(), settled_back);
+
+    let final_work = board.create_task("Returned thread work", Some(Purpose::Ordinary), None);
+    board.set_binding(
+        &final_work,
+        &binding(&final_work, Purpose::Ordinary, "returned-thread"),
+    );
+    board.close(&final_work);
+    let final_poll = controller.poll().unwrap();
+    assert_eq!(final_poll.accepted, 1, "{final_poll:?}");
+    assert_eq!(
+        controller.pending_jobs().unwrap()[0].acceptance_id,
+        acceptance_for_task(&final_poll, &final_work)
+    );
+    assert_eq!(
+        controller
+            .record(&acceptance)
+            .unwrap()
+            .unwrap()
+            .executor
+            .state,
+        StageState::Pending
+    );
+    stop_owner(&mut owner);
 }
 
 #[test]

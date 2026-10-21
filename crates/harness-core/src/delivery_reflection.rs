@@ -992,6 +992,21 @@ pub struct SuccessionRequest {
     pub successor_process: RetainedOwnerProcess,
 }
 
+/// Host-confirmed selection of a different conversation inside the exact
+/// app-server process that already owns reflection. This is deliberately
+/// separate from succession: the prior owner remains live, so the ordinary
+/// succession path must continue to refuse it. The host verifies the selected
+/// thread and stages its registry record before calling this operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentThreadSelection {
+    pub expected_lead_session: String,
+    pub selected_lead_session: String,
+    /// Exact managed-lead process observed by the host for both the prior and
+    /// selected thread. It must match the retained lifecycle proof exactly,
+    /// including the program path, and is revalidated while holding the lock.
+    pub backend_process: RetainedOwnerProcess,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SuccessionReceipt {
     pub binding_id: String,
@@ -1449,6 +1464,125 @@ impl ReflectionController {
         request: &SuccessionRequest,
     ) -> io::Result<SuccessionReceipt> {
         self.succeed_inner(request, true, true)
+    }
+
+    /// Switches the current conversation within one verified app-server
+    /// backend. The supplied backend must exactly match the process proof
+    /// retained for the current owner and must still be live; this operation
+    /// therefore cannot silently become ordinary cross-owner succession. A new
+    /// event floor is established before the selected thread can accept work,
+    /// leaving predecessor records retained but outside the current session.
+    /// Repeating the same selection is a no-op.
+    pub fn select_current_thread(
+        &self,
+        request: &CurrentThreadSelection,
+    ) -> io::Result<SuccessionReceipt> {
+        let expected = request.expected_lead_session.trim();
+        let selected = request.selected_lead_session.trim();
+        require_text("expected lead_session", expected, MAX_TEXT_BYTES)?;
+        require_text("selected lead_session", selected, MAX_TEXT_BYTES)?;
+        let source = self.current_source()?;
+        let path = self.state_path(&source);
+        let _lock = self.lock(&path)?;
+        let mut state = self.read_state_at(&path)?.ok_or_else(|| {
+            conflict("delivery reflection is inactive; there is no current thread to switch")
+        })?;
+        if !state.source.same_scope(&source) {
+            return Err(conflict(&format!(
+                "reflection state is bound to project {} / {}, not the current board scope; preserve it and use the matching project",
+                state.source.project_id, state.source.beads_dir
+            )));
+        }
+        if normalize(&state.source.branch) != normalize(&source.branch) {
+            return Err(recovery_error(
+                "source branch changed; reconcile the retained lifecycle before switching the current thread",
+            ));
+        }
+        if state.lifecycle != LifecycleStatus::Active {
+            return Err(conflict(
+                "delivery reflection is stopped; resume it before switching the current thread",
+            ));
+        }
+        if let Some(recovery) = &state.recovery {
+            return Err(recovery_error(&format!(
+                "reflection recovery is pending ({:?}: {}); reconcile it before switching the current thread",
+                recovery.kind, recovery.detail
+            )));
+        }
+        if state.binding.lead_session.trim() != expected {
+            return Err(conflict(&format!(
+                "reflection ownership changed: the caller verified '{expected}', but the current retained owner is '{}'; nothing was changed",
+                state.binding.lead_session
+            )));
+        }
+        if state.owner_process.as_ref() != Some(&request.backend_process) {
+            return Err(conflict(&format!(
+                "the verified backend for the current thread switch does not exactly match the retained process proof for '{expected}'; no ownership or lifecycle state was changed"
+            )));
+        }
+        match request.backend_process.inspect() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(conflict(&format!(
+                    "the verified app-server backend retained for '{expected}' is no longer live; start or resume the managed lead before switching the current thread"
+                )));
+            }
+            Err(error) => {
+                return Err(conflict(&format!(
+                    "the verified app-server backend retained for '{expected}' cannot be inspected: {error}; no ownership or lifecycle state was changed"
+                )));
+            }
+        }
+        if selected == expected {
+            return Ok(SuccessionReceipt {
+                binding_id: state.binding.id,
+                previous_lead_session: expected.to_owned(),
+                lead_session: selected.to_owned(),
+                revision: state.binding.revision,
+                changed: false,
+            });
+        }
+        if state.records.values().any(|record| {
+            matches!(
+                record.executor.state,
+                StageState::InFlight | StageState::Unknown
+            ) || matches!(
+                record.lead.state,
+                StageState::InFlight | StageState::Unknown
+            )
+        }) {
+            return Err(conflict(
+                "a reflection stage is in flight or unknown; reconcile it before switching the current thread",
+            ));
+        }
+        let revision = state
+            .binding
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| conflict("reflection lifecycle revision cannot be advanced"))?;
+        let boundary = self.probe_head(state.checkpoint)?;
+        state.current_session_floor = Some(state.current_session_floor.unwrap_or(0).max(boundary));
+        state
+            .retired_leads
+            .retain(|retired| retired.trim() != selected);
+        if !state
+            .retired_leads
+            .iter()
+            .any(|retired| retired.trim() == expected)
+        {
+            state.retired_leads.push(expected.to_owned());
+        }
+        state.binding.revision = revision;
+        state.binding.lead_session = selected.to_owned();
+        state.binding.activated_at = now();
+        self.write_state_at(&path, &state)?;
+        Ok(SuccessionReceipt {
+            binding_id: state.binding.id,
+            previous_lead_session: expected.to_owned(),
+            lead_session: selected.to_owned(),
+            revision,
+            changed: true,
+        })
     }
 
     fn succeed_inner(
