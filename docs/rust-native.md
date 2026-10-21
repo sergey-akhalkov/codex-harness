@@ -355,14 +355,13 @@ rejected before creating build state.
 
 The installed harness provides sequential executor and lead self-reflection
 after ordinary task acceptance. Both role skills are delivered globally.
-Enable the lifecycle from the current managed lead conversation for the
-consuming project; the default-on `self_reflection_enabled` permission alone
-does not activate it:
+`self_reflection_enabled = true` in the kit's `global/orchestration.toml`
+automatically prepares the consuming project's lifecycle in its managed lead
+session. No separate activation command is needed. The host also observes a
+false-to-true change while running. Inspect the resulting state with:
 
 ```powershell
-codex-harness delivery-improvement enable --project CHECKOUT
 codex-harness delivery-improvement status --project CHECKOUT
-codex-harness delivery-improvement disable --project CHECKOUT
 ```
 
 ### Ordinary accepted closure ownership and recovery
@@ -396,15 +395,21 @@ acceptance identity. Do not remove or replace metadata, delete history, or use
 `--force`. If history shows a reopen or cancellation, use a fresh task (or an
 explicitly reviewed board correction) rather than treating old work as accepted.
 
-Enable runs inside the real managed lead conversation. It resolves the kit,
-configured profiles, roles and registered lead address before activating the
-board's native event journal at its current boundary. Repeated activation keeps
-the existing checkpoint and retained work. The existing `lead start` host
-starts its model-free consumer only for an enabled lifecycle, and ends its
-contained processes when the lead exits. Status reports the native journal
+Automatic preparation resolves the kit, configured profiles, roles and registered
+lead address before activating the board's native event journal at its current
+boundary. Ordinary acceptance also prepares the lifecycle before its first close,
+so an acceptance arriving before the host poll is not lost. Repeated preparation
+keeps the existing checkpoint and retained work. The existing `lead start` host
+owns the model-free consumer and ends its contained processes when the lead exits.
+A different lead can take over only after the previous owner's exact process is
+verified inactive; live ownership and unresolved recovery remain protected.
+Status reports the native journal
 checkpoint, pending work, recovery state and the controller's verified process
-liveness and log location. Disable prevents new stages and preserves retained
-results and journal configuration, including other consumers' use.
+liveness and log location. The explicit `enable` command remains an idempotent
+compatibility operation. Administrative `disable` stops the retained lifecycle
+until the next host or flag transition prepares it; use the flag for a persistent
+off setting. Both preserve results and journal configuration, including other
+consumers' use.
 
 `global/orchestration.toml` also carries the default-on
 `self_reflection_enabled` permission. The effective value is read from the
@@ -413,7 +418,7 @@ on-to-off change without restart and the next model stage stops. An already
 running stage may finish and retain its result. `false` blocks new executor and
 lead model calls through manual execution, the owned process, continuation and
 the internal stage runner while ordinary lead, executor and acceptance work
-remains available. It does not activate a project and does not discard retained
+remains available. A true value activates the supported host without discarding
 results, pending-stage identities, usage or recovery. Closures observed during
 the disabled interval advance the existing event checkpoint without admission,
 so enabling later does not replay or sweep them. Each new ordinary acceptance

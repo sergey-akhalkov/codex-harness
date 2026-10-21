@@ -115,6 +115,12 @@ Other consuming projects are not reconfigured by that local language addition.
 
 ## Outcome, quality and speed
 
+**2026-10-21, confirmed:** `self_reflection_enabled` is the ordinary activation
+control for accepted-work self-reflection. True must prepare the supported lead's
+project lifecycle automatically; a second manual enable step is not acceptable.
+False blocks new model stages while preserving retained work. The host owns
+routine preparation, first-event capture and verified ownership transitions.
+
 **2026-09-13, confirmed:** during sustained work, improve the execution method
 as well as the product. Act on repeated expensive stages without waiting for
 the user to intervene. Invest incrementally in shorter feedback, valid prepared

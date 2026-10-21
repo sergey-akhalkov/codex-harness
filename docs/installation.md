@@ -132,15 +132,15 @@ does not authorize a provider or create a user's Z.AI profile. Choose billing
 routes explicitly; see [subscription setup](subscription-models.md).
 
 The shipped orchestration profile also sets `self_reflection_enabled = true`.
-This is a permission gate for new accepted-work reflection model calls, not an
-activation: a project still requires an explicit `delivery-improvement enable`.
-An omitted key is true for compatibility. Set it to `false` to stop new
+The managed lead automatically prepares its project's reflection lifecycle;
+no separate `delivery-improvement enable` is required. An omitted key is true
+for compatibility. Set it to `false` to stop new
 reflection stages while ordinary lead, executor and acceptance work continues;
 retained results and pending work are preserved.
 Core delivery installs the distinct `executor-self-reflection` and
 `lead-self-reflection` skills and resolves their role instructions. See
 [accepted-task self-reflection](rust-native.md#accepted-task-self-reflection)
-for project activation, delivery and recovery.
+for automatic activation, delivery and recovery.
 Ordinary acceptance uses the installed kit configuration when its source is a
 consumer project, with or without an explicit `--source`. A selected kit supplies
 its own configuration; consumer pool provenance remains unchanged. Default-true bindings
