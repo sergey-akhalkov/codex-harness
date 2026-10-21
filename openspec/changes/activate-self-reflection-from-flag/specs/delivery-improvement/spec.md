@@ -20,6 +20,14 @@ When the flag is true, the installed ordinary interactive `codex` entrypoint SHA
 - **WHEN** an unmanaged conversation was already open when the new launcher was installed
 - **THEN** its work remains intact and the update applies on its next ordinary launch; status does not pretend that its thread id is an active transport
 
+#### Scenario: Completed sessions remain dormant
+- **WHEN** the flag becomes true or a new ordinary conversation starts while completed sessions exist
+- **THEN** only the exact current foreground session can receive automatic reflection; the harness does not reopen completed sessions, backfill their acceptances or dispatch their retained pending reflection stages
+
+#### Scenario: Explicitly resumed session
+- **WHEN** the user explicitly resumes an existing conversation through the native frontend
+- **THEN** that selected conversation becomes current, and only work accepted during its current activation is eligible; historical acceptances are not replayed
+
 #### Scenario: Failed attachment or session exit
 - **WHEN** the native frontend cannot attach or its owned session exits
 - **THEN** the host retires only its own registrations and processes and retains any unfinished reflection work with truthful failure and recovery information
@@ -48,7 +56,7 @@ The installed managed lead SHALL automatically enable the two-stage reflection c
 
 #### Scenario: A new lead resumes the project
 - **WHEN** the previous owner is verifiably inactive and a supported successor starts with the flag true
-- **THEN** the harness transfers current control through the existing verified succession path without requiring a separate command or rewriting retained acceptance identities
+- **THEN** the harness transfers current control through the existing verified succession path without requiring a separate command or rewriting retained acceptance identities, and pending stages belonging to the finished predecessor remain dormant
 
 #### Scenario: The retained owner is live or unverifiable
 - **WHEN** automatic preparation encounters another live owner or cannot establish its exit
@@ -67,7 +75,7 @@ The installed configuration SHALL define `self_reflection_enabled`, a boolean de
 - **THEN** no new executor or lead reflection model call starts from manual, automatic, continuation or internal dispatch, enable refuses before lifecycle mutation, and ordinary acceptance still completes
 
 #### Scenario: The flag changes between stages
-- **WHEN** a host has retained an executor reflection and the flag changes from true to false before the lead stage
+- **WHEN** a still-current host has retained an executor reflection and the flag changes from true to false before the lead stage
 - **THEN** the executor result, identity, usage and pending lead stage remain retained, no lead model call starts, and a later true value resumes the retained lead stage without repeating the executor or requiring enable
 
 #### Scenario: Status explains stopped model work

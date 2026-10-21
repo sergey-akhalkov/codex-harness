@@ -120,6 +120,11 @@ control for accepted-work self-reflection. True must prepare the supported lead'
 project lifecycle automatically; a second manual enable step is not acceptable.
 False blocks new model stages while preserving retained work. The host owns
 routine preparation, first-event capture and verified ownership transitions.
+Ordinary interactive `codex` must prepare the transport automatically. Reflection
+is restricted to current or new sessions: enabling the flag must never reopen
+finished sessions, backfill historical acceptances or run their pending stages.
+Retain their history without dispatch. Explicit native resume makes only that
+selected conversation current and does not replay its historical acceptances.
 
 **2026-09-13, confirmed:** during sustained work, improve the execution method
 as well as the product. Act on repeated expensive stages without waiting for
