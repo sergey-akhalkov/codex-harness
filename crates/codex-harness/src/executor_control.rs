@@ -1743,17 +1743,14 @@ impl Conversation {
     /// Adopts the thread the native frontend selected on this backend. The
     /// ordinary host starts no thread of its own: selection is observed from
     /// the frontend's exact `result.thread.id`, then the same app-server is
-    /// driven for that conversation.
+    /// driven for that conversation. Changing the addressed thread is allowed
+    /// only after its selection callback has completed the verified ownership
+    /// transfer; this object can never cross to another app-server.
     pub(crate) fn adopt_thread(&mut self, thread_id: &str) -> io::Result<()> {
         let key = lead_key(thread_id)?;
         if key != thread_id {
             return Err(invalid(
                 "the selected native thread identity is not an exact registry key",
-            ));
-        }
-        if !self.thread_id.is_empty() && self.thread_id != key {
-            return Err(invalid(
-                "this app-server is already addressed to another native thread",
             ));
         }
         self.thread_id = key.clone();

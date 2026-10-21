@@ -12,7 +12,10 @@ use crate::executor_cli::{
     },
     end_owned_child, note_log, retire_stale_endpoint,
 };
-use crate::self_reflection_cli::host::LeadLifecycle;
+use crate::self_reflection_cli::{
+    host::LeadLifecycle,
+    lifecycle::{self, Preparation},
+};
 use harness_core::{
     process::{Job, Limits},
     task_arguments::{self, ManagedArguments},
@@ -110,8 +113,18 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             ),
         );
     }
+    let observed = Arc::new(Mutex::new(SelectionState::default()));
+    let lifecycle = Arc::new(Mutex::new(None::<LeadLifecycle>));
     if let Err(error) = conversation.endpoint().record(&plan.paths.endpoint) {
-        let (_, notes) = release(&plan, job, None, None, &conversation, None, &launcher);
+        let (_, notes) = release(
+            &plan,
+            job,
+            None,
+            &lifecycle,
+            &observed,
+            &conversation,
+            &launcher,
+        );
         for note in notes {
             eprintln!("ordinary lead note: {note}");
         }
@@ -120,17 +133,26 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         )));
     }
 
-    let observed = Arc::new(Mutex::new(SelectionState::default()));
     let observer = observer(
         Arc::clone(&observed),
+        Arc::clone(&lifecycle),
         home.clone(),
+        backend_cwd.clone(),
         conversation.endpoint().clone(),
     );
     let frontend =
         match attach_observed_frontend(&plan, &original_cwd, &tui, &conversation, observer) {
             Ok(frontend) => frontend,
             Err(error) => {
-                let (_, notes) = release(&plan, job, None, None, &conversation, None, &launcher);
+                let (_, notes) = release(
+                    &plan,
+                    job,
+                    None,
+                    &lifecycle,
+                    &observed,
+                    &conversation,
+                    &launcher,
+                );
                 for note in notes {
                     eprintln!("ordinary lead note: {note}");
                 }
@@ -151,8 +173,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         ),
     );
 
-    let mut selection: Option<Selected> = None;
-    let mut lifecycle: Option<LeadLifecycle> = None;
+    let mut adopted: Option<String> = None;
     let mut failure: Option<String> = None;
     let mut deadline: Option<Instant> = None;
     loop {
@@ -180,31 +201,28 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             ));
             deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
         }
-        if selection.is_none()
-            && let Some(selected_now) = selected_now
-        {
-            selection = Some(selected_now.clone());
-            match start_selected(
-                &selected_now,
-                &mut conversation,
-                &home,
-                &backend_cwd,
-                &plan.paths.log,
-            ) {
-                Ok(started) => lifecycle = Some(started),
-                Err(error) => {
-                    failure.get_or_insert_with(|| {
-                        format!(
-                            "the selected native thread could not be adopted by the same app-server: {error}"
-                        )
-                    });
-                    deadline.get_or_insert_with(|| Instant::now() + FRONTEND_TAIL_GRACE);
+        // Only an observation that saw the frontend still running may adopt
+        // its selection or drive the reflection lifecycle. After exit the
+        // host owns cleanup only; it never starts a stage for a dead surface.
+        if running {
+            if let Some(selected_now) = selected_now.as_ref()
+                && adopted.as_deref() != Some(selected_now.thread.as_str())
+            {
+                match adopt_selected(selected_now, &mut conversation, &plan.paths.log) {
+                    Ok(()) => adopted = Some(selected_now.thread.clone()),
+                    Err(error) => {
+                        adopted = None;
+                        failure.get_or_insert_with(|| {
+                            format!(
+                                "the selected native thread could not be adopted by the same app-server: {error}"
+                            )
+                        });
+                        deadline.get_or_insert_with(|| Instant::now() + FRONTEND_TAIL_GRACE);
+                    }
                 }
             }
-        }
-        if lifecycle.is_some() {
             if failure.is_none()
-                && running
+                && adopted.is_some()
                 && let Err(error) = conversation.pump()
             {
                 failure = Some(format!(
@@ -212,10 +230,15 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 ));
                 deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
             }
-            if let Some(started) = lifecycle.as_mut()
-                && let Err(error) = started.tick()
-            {
-                note_log(&plan.paths.log, &format!("reflection lifecycle: {error}"));
+            if adopted.is_some() {
+                let mut owned = lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(started) = owned.as_mut()
+                    && let Err(error) = started.tick()
+                {
+                    note_log(&plan.paths.log, &format!("reflection lifecycle: {error}"));
+                }
             }
         }
         if !running {
@@ -224,23 +247,18 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         if failure.is_some() && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
-        thread::sleep(if selection.is_some() {
+        thread::sleep(if adopted.is_some() {
             control::DEFAULT_POLL
         } else {
             IDLE_POLL
         });
     }
 
-    // The frontend can finish immediately after the relay accepted its native
-    // selection. Re-read the callback state after process exit so that a
-    // selection observed at that boundary is still adopted, prepared and
-    // cleaned up rather than left registered.
-    let (late_selected, late_error) = {
-        let state = observed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (state.selected.clone(), state.callback_error.clone())
-    };
+    // The frontend can finish while the relay is still completing its native
+    // selection. Close the acceptance boundary before waiting so a callback
+    // that finishes late retires what it staged instead of publishing it. A
+    // late selection is never adopted, prepared or ticked.
+    let (_, late_error) = begin_release(&observed);
     if failure.is_none()
         && let Some(error) = late_error
     {
@@ -248,35 +266,14 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "the native frontend's thread selection was not registered: {error}"
         ));
     }
-    if selection.is_none()
-        && let Some(selected_now) = late_selected
-    {
-        selection = Some(selected_now.clone());
-        match start_selected(
-            &selected_now,
-            &mut conversation,
-            &home,
-            &backend_cwd,
-            &plan.paths.log,
-        ) {
-            Ok(started) => lifecycle = Some(started),
-            Err(error) => {
-                failure.get_or_insert_with(|| {
-                    format!(
-                        "the selected native thread could not be adopted by the same app-server: {error}"
-                    )
-                });
-            }
-        }
-    }
 
     let (frontend_code, notes) = release(
         &plan,
         job,
         Some(frontend),
-        lifecycle.as_mut(),
+        &lifecycle,
+        &observed,
         &conversation,
-        selection.as_ref(),
         &launcher,
     );
     for note in &notes {
@@ -301,13 +298,11 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
-fn start_selected(
+fn adopt_selected(
     selected: &Selected,
     conversation: &mut Conversation,
-    home: &Path,
-    backend_cwd: &Path,
     log: &Path,
-) -> io::Result<LeadLifecycle> {
+) -> io::Result<()> {
     conversation.adopt_thread(&selected.thread)?;
     note_log(
         log,
@@ -317,11 +312,7 @@ fn start_selected(
             selected.path.display()
         ),
     );
-    let mut lifecycle = LeadLifecycle::new(home, backend_cwd, &selected.thread);
-    if let Err(error) = lifecycle.tick() {
-        note_log(log, &format!("reflection lifecycle: {error}"));
-    }
-    Ok(lifecycle)
+    Ok(())
 }
 
 fn parse(args: &[OsString]) -> io::Result<(PathBuf, &[OsString])> {
@@ -352,26 +343,73 @@ struct Selected {
 struct SelectionState {
     selected: Option<Selected>,
     callback_error: Option<String>,
+    /// The thread whose registration callback is still completing.
+    registering: Option<String>,
+    /// Release has begun; no selection may be published after this point.
+    closing: bool,
+    /// Cleanup gaps discovered after a selection had already been accepted.
+    cleanup_errors: Vec<String>,
 }
 
-fn observer(state: Arc<Mutex<SelectionState>>, home: PathBuf, base: Endpoint) -> SelectionObserver {
+fn observer(
+    state: Arc<Mutex<SelectionState>>,
+    owned_lifecycle: Arc<Mutex<Option<LeadLifecycle>>>,
+    home: PathBuf,
+    project: PathBuf,
+    base: Endpoint,
+) -> SelectionObserver {
     Arc::new(move |thread| {
+        {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected.thread == thread)
+            {
+                return Ok(());
+            }
+            if let Some(registering) = state.registering.as_deref() {
+                if registering == thread {
+                    return Ok(());
+                }
+                let error = invalid(format!(
+                    "the native frontend selected thread {thread} while thread {registering} was still being registered on the same app-server"
+                ));
+                state.callback_error = Some(error.to_string());
+                return Err(error);
+            }
+            state.registering = Some(thread.to_owned());
+        }
+        let result = select_thread(&state, &owned_lifecycle, &home, &project, &base, thread);
         let mut state = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(selected) = state.selected.as_ref() {
-            if selected.thread == thread {
-                return Ok(());
-            }
-            let error = invalid(format!(
-                "the native frontend selected thread {thread} after thread {} on the same app-server; same-backend native selection switching requires a verified current-lifetime transfer and is an unfinished dependency",
-                selected.thread
-            ));
-            state.callback_error = Some(error.to_string());
-            return Err(error);
-        }
-        match register_selection(&home, &base, thread) {
+        state.registering = None;
+        match result {
             Ok(selected) => {
+                if state.closing {
+                    // The host began release while this callback owned the
+                    // staged registration. Never publish it afterwards; retire
+                    // only what this callback staged and drop any lifecycle
+                    // object created for it before it could ever tick.
+                    if let Err(cleanup) = retire_owned_registry(&selected) {
+                        state.cleanup_errors.push(cleanup.to_string());
+                    }
+                    let owned = owned_lifecycle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(mut lifecycle) = owned
+                        && let Err(cleanup) = lifecycle.stop()
+                    {
+                        state
+                            .cleanup_errors
+                            .push(format!("reflection lifecycle cleanup: {cleanup}"));
+                    }
+                    return Ok(());
+                }
                 state.selected = Some(selected);
                 Ok(())
             }
@@ -381,6 +419,205 @@ fn observer(state: Arc<Mutex<SelectionState>>, home: PathBuf, base: Endpoint) ->
             }
         }
     })
+}
+
+/// Resolves one observed thread to the exact registry record this host owns.
+/// The first selection installs the host's lifecycle object; a different
+/// selection on the same app-server performs the verified current-lifetime
+/// transfer before the relay releases the native response.
+fn select_thread(
+    state: &Arc<Mutex<SelectionState>>,
+    owned_lifecycle: &Arc<Mutex<Option<LeadLifecycle>>>,
+    home: &Path,
+    project: &Path,
+    base: &Endpoint,
+    thread: &str,
+) -> io::Result<Selected> {
+    let (previous, closing) = {
+        let state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.selected.clone(), state.closing)
+    };
+    let staged = register_selection(home, base, thread)?;
+    if closing || is_closing(state) {
+        return Ok(staged);
+    }
+    let result = match previous {
+        None => match selection_gate() {
+            // The gate can outlive the native frontend. Re-read the release
+            // boundary before creating any lifecycle object for this thread.
+            Ok(()) if !is_closing(state) => {
+                *owned_lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(LeadLifecycle::new(home, project, &staged.thread));
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        },
+        Some(previous) => {
+            transfer_selection(state, owned_lifecycle, home, project, &previous, &staged)
+        }
+    };
+    if let Err(error) = result {
+        // A failed transfer or first registration retires only the record this
+        // callback staged; the prior registry and retained work stay intact.
+        if let Err(cleanup) = retire_owned_registry(&staged) {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cleanup_errors
+                .push(cleanup.to_string());
+        }
+        return Err(error);
+    }
+    Ok(staged)
+}
+
+fn transfer_selection(
+    state: &Arc<Mutex<SelectionState>>,
+    owned_lifecycle: &Arc<Mutex<Option<LeadLifecycle>>>,
+    home: &Path,
+    project: &Path,
+    previous: &Selected,
+    staged: &Selected,
+) -> io::Result<()> {
+    if is_closing(state) {
+        return Ok(());
+    }
+    let source = kit_source(home, project)?;
+    // Quiesce and drop the old owned lifecycle before asking the core to move
+    // current control. The object is taken under the lock, then stopped
+    // outside it, so it can never tick again and the observer is not blocked.
+    let previous_lifecycle = owned_lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(mut lifecycle) = previous_lifecycle
+        && let Err(error) = lifecycle.stop()
+    {
+        return Err(error);
+    }
+    // The frontend may have ended while the old lifecycle was quiescing.
+    // Leave the retained binding untouched rather than moving current control
+    // for a surface that is already gone.
+    if is_closing(state) {
+        return Ok(());
+    }
+    let preparation = lifecycle::prepare_selected_thread(
+        home,
+        &source,
+        project,
+        &previous.thread,
+        &staged.thread,
+        true,
+    )?;
+    match preparation {
+        // An administrative stop stays stopped until a genuinely fresh host
+        // starts. A transferred selection never resumes it implicitly.
+        Preparation::Stopped => {}
+        Preparation::Active | Preparation::Disabled => {
+            *owned_lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(LeadLifecycle::new(home, project, &staged.thread));
+        }
+    }
+    // The core transition has succeeded, so the prior record is now inert.
+    // A retirement failure is a cleanup gap, not a reason to refuse the
+    // already-transferred native selection.
+    if let Err(error) = retire_owned_registry(previous) {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cleanup_errors
+            .push(error.to_string());
+    }
+    Ok(())
+}
+
+/// The managed host resolves the kit source exactly as its lifecycle owner
+/// does: a checkout containing `global/roles.toml`, otherwise the installed
+/// kit source recorded for this CODEX_HOME.
+fn kit_source(home: &Path, candidate: &Path) -> io::Result<PathBuf> {
+    if candidate.join("global/roles.toml").is_file() {
+        return Ok(candidate.to_owned());
+    }
+    crate::feedback_cli::installed_kit_source_in(home)
+        .ok_or_else(|| invalid("the managed lead has no installed kit source"))
+}
+
+/// Fixture synchronization for the exit-boundary check. Unset in ordinary
+/// use; when set, the callback publishes its registry record and then waits
+/// so a check can make the frontend exit before the selection becomes current.
+fn selection_gate() -> io::Result<()> {
+    let Some(path) = env::var_os("HARNESS_ORDINARY_LEAD_FIXTURE_SELECTION_GATE").map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let until = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < until {
+        if path.is_file() {
+            return Ok(());
+        }
+        thread::sleep(IDLE_POLL);
+    }
+    Err(invalid(format!(
+        "the fixture selection gate {} was not released",
+        path.display()
+    )))
+}
+
+/// Waits, bounded, for an in-flight selection registration and returns the
+/// settled observation. The run loop uses this after exit so a callback that
+/// was already completing is cleaned up rather than activated.
+fn settled_selection(state: &Arc<Mutex<SelectionState>>) -> (Option<Selected>, Option<String>) {
+    let until = Instant::now() + FRONTEND_TAIL_GRACE;
+    loop {
+        let (selected, error, registering) = {
+            let state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                state.selected.clone(),
+                state.callback_error.clone(),
+                state.registering.is_some(),
+            )
+        };
+        if !registering {
+            return (selected, error);
+        }
+        if Instant::now() >= until {
+            return (
+                None,
+                Some(
+                    "the native frontend's thread selection was still being registered when its process ended; the staged record requires repair"
+                        .to_owned(),
+                ),
+            );
+        }
+        thread::sleep(IDLE_POLL);
+    }
+}
+
+/// Ends the window in which a relay callback may publish a selection, then
+/// waits for any in-flight registration. A callback that observes this close
+/// retires only the record it staged. The host never adopts that late record.
+fn begin_release(state: &Arc<Mutex<SelectionState>>) -> (Option<Selected>, Option<String>) {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .closing = true;
+    settled_selection(state)
+}
+
+fn is_closing(state: &Arc<Mutex<SelectionState>>) -> bool {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .closing
 }
 
 fn register_selection(home: &Path, base: &Endpoint, thread: &str) -> io::Result<Selected> {
@@ -429,12 +666,23 @@ fn release(
     plan: &ControlPlan,
     job: Job,
     frontend: Option<executor_cli::OwnedFrontend>,
-    lifecycle: Option<&mut LeadLifecycle>,
+    lifecycle: &Arc<Mutex<Option<LeadLifecycle>>>,
+    observed: &Arc<Mutex<SelectionState>>,
     conversation: &Conversation,
-    selection: Option<&Selected>,
     launcher: &Path,
 ) -> (Option<u32>, Vec<String>) {
     let mut notes = Vec::new();
+    let (selection, cleanup_errors) = {
+        let mut state = observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closing = true;
+        (
+            state.selected.clone(),
+            std::mem::take(&mut state.cleanup_errors),
+        )
+    };
+    notes.extend(cleanup_errors);
     let frontend_code = match frontend.as_ref() {
         Some(frontend) => match frontend.exit_code() {
             Ok(code) => code,
@@ -447,7 +695,11 @@ fn release(
         },
         None => None,
     };
-    if let Some(lifecycle) = lifecycle
+    let owned = lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(mut lifecycle) = owned
         && let Err(error) = lifecycle.stop()
     {
         notes.push(format!("reflection lifecycle cleanup: {error}"));
@@ -458,7 +710,7 @@ fn release(
         notes.push(format!("the native frontend could not be ended: {error}"));
     }
     if let Some(selection) = selection
-        && let Err(error) = retire_owned_registry(selection)
+        && let Err(error) = retire_owned_registry(&selection)
     {
         notes.push(error.to_string());
     }

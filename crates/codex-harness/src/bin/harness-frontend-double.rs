@@ -5,7 +5,7 @@
 //! the host uses as attachment evidence, and waits until the test releases it.
 //! The production path launches the native Codex TUI instead.
 //!
-//! `HARNESS_FRONTEND_PROTOCOL_MODE=new|resume|fork` opts into one native
+//! `HARNESS_FRONTEND_PROTOCOL_MODE=new|resume|fork|transfer` opts into one native
 //! frontend flow against the endpoint named by the actual `--remote` argument.
 //! It authenticates with the capability token named by
 //! `--remote-auth-token-env`, initializes the connection, selects the thread
@@ -15,6 +15,11 @@
 //! release lifetime. `HARNESS_FRONTEND_THREAD` supplies the explicit source id
 //! for resume and fork. The mode never lists or opens unrelated sessions and
 //! never contacts a model: checks point it at their own canned endpoint.
+//! `transfer` selects the source, completes its first turn, repeats the same
+//! selection, waits for the check to inspect the retained lifecycle, forks the
+//! explicit `HARNESS_FRONTEND_FORK_THREAD`, and waits again before that new
+//! thread's first turn. `HARNESS_FRONTEND_EXIT_ON_FILE` makes the double exit
+//! after that marker appears, so the host's late-selection cleanup is observed.
 
 use harness_core::task_control::ControlConnection;
 use serde_json::{Value, json};
@@ -27,10 +32,17 @@ use std::{
 
 const PROTOCOL_MODE_ENV: &str = "HARNESS_FRONTEND_PROTOCOL_MODE";
 const PROTOCOL_THREAD_ENV: &str = "HARNESS_FRONTEND_THREAD";
+const PROTOCOL_FORK_THREAD_ENV: &str = "HARNESS_FRONTEND_FORK_THREAD";
+const EXIT_ON_FILE_ENV: &str = "HARNESS_FRONTEND_EXIT_ON_FILE";
 const REMOTE_ARG: &str = "--remote";
 const TOKEN_ENV_ARG: &str = "--remote-auth-token-env";
 const SELECTED_FILE: &str = "frontend-selected-thread.txt";
 const REGISTRY_FILE: &str = "frontend-registry-before-turn.txt";
+const TRANSFER_REPEAT_FILE: &str = "frontend-transfer-repeat.txt";
+const TRANSFER_BEFORE_FORK_FILE: &str = "frontend-transfer-before-fork";
+const TRANSFER_TURN_GATE_FILE: &str = "frontend-transfer-turn-gate";
+const TRANSFER_TURN_FILE: &str = "frontend-transfer-turn-started.txt";
+const EXIT_MARKER_FILE: &str = "frontend-exit-triggered.txt";
 /// The one synthetic assignment this fixture submits after selecting its
 /// thread. It contains no user data and no task identity.
 const SYNTHETIC_INPUT: &str = "harness frontend double: synthetic protocol turn";
@@ -45,6 +57,7 @@ enum Mode {
     New,
     Resume,
     Fork,
+    Transfer,
 }
 
 fn main() {
@@ -78,6 +91,7 @@ fn main() {
     let Some(home) = home else {
         std::process::exit(2);
     };
+    install_exit_trigger(&home);
 
     let _protocol = match protocol_mode() {
         Ok(None) => None,
@@ -117,10 +131,30 @@ fn protocol_mode() -> Result<Option<Mode>, String> {
         "new" => Ok(Some(Mode::New)),
         "resume" => Ok(Some(Mode::Resume)),
         "fork" => Ok(Some(Mode::Fork)),
+        "transfer" => Ok(Some(Mode::Transfer)),
         other => Err(format!(
-            "unsupported {PROTOCOL_MODE_ENV} value {other:?}; expected new, resume or fork"
+            "unsupported {PROTOCOL_MODE_ENV} value {other:?}; expected new, resume, fork or transfer"
         )),
     }
+}
+
+/// Test-only exit path: when the check names a marker, this double exits as
+/// soon as that file appears. The marker the double writes first lets the check
+/// distinguish "frontend has begun exiting" from a slow protocol step.
+fn install_exit_trigger(home: &Path) {
+    let Some(trigger) = env::var_os(EXIT_ON_FILE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let marker = home.join(EXIT_MARKER_FILE);
+    thread::spawn(move || {
+        loop {
+            if trigger.is_file() {
+                let _ = fs::write(marker, b"exiting");
+                std::process::exit(0);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
 }
 
 /// Performs the one opted-in frontend flow and returns the live connection so
@@ -136,7 +170,7 @@ fn run_protocol(home: &Path, mode: Mode) -> Result<ControlConnection, String> {
         format!("the capability environment {token_env} is unavailable: {error}")
     })?;
     let source = match mode {
-        Mode::New => None,
+        Mode::New | Mode::Transfer => None,
         Mode::Resume | Mode::Fork => Some(
             env::var(PROTOCOL_THREAD_ENV)
                 .map_err(|error| format!("{PROTOCOL_THREAD_ENV} is unavailable: {error}"))?,
@@ -164,6 +198,10 @@ fn run_protocol(home: &Path, mode: Mode) -> Result<ControlConnection, String> {
         .send(&json!({"method": "initialized"}), IO_TIMEOUT)
         .map_err(|error| format!("initialized notification failed: {error}"))?;
 
+    if mode == Mode::Transfer {
+        return run_transfer(home, connection);
+    }
+
     let (method, params) = match mode {
         Mode::New => {
             let cwd = env::current_dir().map_err(|error| {
@@ -179,6 +217,7 @@ fn run_protocol(home: &Path, mode: Mode) -> Result<ControlConnection, String> {
             "thread/fork",
             json!({"threadId": source.as_deref().unwrap_or_default()}),
         ),
+        Mode::Transfer => unreachable!("transfer returns before the single-selection flow"),
     };
     let selected = call(&mut connection, 2, method, params)?;
     let selected = selected
@@ -221,6 +260,127 @@ fn run_protocol(home: &Path, mode: Mode) -> Result<ControlConnection, String> {
         return Err("turn/start result has no turn.id".to_owned());
     }
     Ok(connection)
+}
+
+/// Exercises the ordinary host's current-selection transfer with the same
+/// native operations a frontend uses: resume old, repeat the same selection,
+/// then fork a new thread for the next turn. The two gates keep the check able
+/// to observe the retained lifecycle before the next native selection begins.
+fn run_transfer(
+    home: &Path,
+    mut connection: ControlConnection,
+) -> Result<ControlConnection, String> {
+    let source = env::var(PROTOCOL_THREAD_ENV)
+        .map_err(|error| format!("{PROTOCOL_THREAD_ENV} is unavailable: {error}"))?;
+    let fork = env::var(PROTOCOL_FORK_THREAD_ENV)
+        .map_err(|error| format!("{PROTOCOL_FORK_THREAD_ENV} is unavailable: {error}"))?;
+    validate_thread_id(&source, PROTOCOL_THREAD_ENV)?;
+    validate_thread_id(&fork, PROTOCOL_FORK_THREAD_ENV)?;
+
+    let selected = select(
+        &mut connection,
+        2,
+        "thread/resume",
+        json!({"threadId": source}),
+        home,
+    )?;
+    start_turn(&mut connection, 3, &selected)?;
+
+    // Repeating the same selection must be an idempotent host no-op rather
+    // than a second registry write or lifecycle transfer.
+    let repeated = select(
+        &mut connection,
+        4,
+        "thread/resume",
+        json!({"threadId": source}),
+        home,
+    )?;
+    if repeated != selected {
+        return Err(format!(
+            "repeating the same resume selected {repeated} instead of {selected}"
+        ));
+    }
+    fs::write(home.join(TRANSFER_REPEAT_FILE), &repeated)
+        .map_err(|error| format!("the repeated selection could not be recorded: {error}"))?;
+    wait_for_file(&home.join(TRANSFER_BEFORE_FORK_FILE), "before-fork gate")?;
+
+    let forked = select(
+        &mut connection,
+        5,
+        "thread/fork",
+        json!({"threadId": source}),
+        home,
+    )?;
+    if forked != fork {
+        return Err(format!("thread/fork selected {forked} instead of {fork}"));
+    }
+    wait_for_file(&home.join(TRANSFER_TURN_GATE_FILE), "new-turn gate")?;
+    start_turn(&mut connection, 6, &forked)?;
+    fs::write(home.join(TRANSFER_TURN_FILE), &forked)
+        .map_err(|error| format!("the new turn could not be recorded: {error}"))?;
+    Ok(connection)
+}
+
+/// Selects one thread through the actual request and records the exact result
+/// plus the point-in-time host registry readiness used by the existing checks.
+fn select(
+    connection: &mut ControlConnection,
+    id: u64,
+    method: &str,
+    params: Value,
+    home: &Path,
+) -> Result<String, String> {
+    let selected = call(connection, id, method, params)?;
+    let selected = selected
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{method} result has no thread.id"))?;
+    validate_thread_id(selected, &format!("{method} result thread.id"))?;
+    fs::write(home.join(SELECTED_FILE), selected)
+        .map_err(|error| format!("the selected thread could not be recorded: {error}"))?;
+    let registry = home
+        .join("harness")
+        .join("lead-endpoints")
+        .join(format!("{selected}.json"));
+    fs::write(
+        home.join(REGISTRY_FILE),
+        if registry.is_file() { "true" } else { "false" },
+    )
+    .map_err(|error| format!("the registry readiness could not be recorded: {error}"))?;
+    Ok(selected.to_owned())
+}
+
+fn start_turn(connection: &mut ControlConnection, id: u64, thread: &str) -> Result<(), String> {
+    let started = call(
+        connection,
+        id,
+        "turn/start",
+        json!({
+            "threadId": thread,
+            "input": [{"type": "text", "text": SYNTHETIC_INPUT}],
+        }),
+    )?;
+    if started
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err("turn/start result has no turn.id".to_owned());
+    }
+    Ok(())
+}
+
+fn wait_for_file(path: &Path, name: &str) -> Result<(), String> {
+    let until = Instant::now() + REQUEST_TIMEOUT;
+    while Instant::now() < until {
+        if path.is_file() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err(format!("the {name} {} did not appear", path.display()))
 }
 
 /// Reads one option from the actual argv, accepting both the separated and

@@ -16,6 +16,7 @@ use std::{
     fs,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +36,8 @@ const PROVIDER: &str = "fixture-provider";
 const EFFORT: &str = "max";
 const NEW_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
 const RESUME_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
+const FORK_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f6";
+const TRANSFER_NEW_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f7";
 const PROMPT: &str = "ordinary native prompt";
 const WAIT: Duration = Duration::from_secs(30);
 const CLEANUP: Duration = Duration::from_secs(10);
@@ -44,6 +47,7 @@ struct Fixture {
     home: PathBuf,
     project: PathBuf,
     record: PathBuf,
+    kit: PathBuf,
 }
 
 impl Fixture {
@@ -81,10 +85,75 @@ impl Fixture {
         fs::write(home.join("frontend-title.txt"), "ordinary lead fixture").unwrap();
         Self {
             record: root.path().join("backend-record.json"),
+            kit: root.path().join("kit"),
             _root: root,
             home,
             project,
         }
+    }
+
+    /// Adds the board, git and kit metadata the real reflection lifecycle reads.
+    /// Existing entrypoint checks keep their smaller fixture unchanged.
+    fn reflection(&mut self) {
+        git(&self.project, &["init", "-q", "--initial-branch=main"]);
+        git(
+            &self.project,
+            &["config", "user.email", "fixture@example.test"],
+        );
+        git(&self.project, &["config", "user.name", "Fixture"]);
+        fs::write(self.project.join("README.md"), "synthetic ordinary lead\n").unwrap();
+        git(&self.project, &["add", "."]);
+        git(&self.project, &["commit", "-qm", "seed"]);
+        let bd = bd_executable();
+        let init = Command::new(&bd)
+            .args([
+                "init",
+                "--skip-agents",
+                "--non-interactive",
+                "--quiet",
+                "--prefix",
+                "bdol",
+            ])
+            .current_dir(&self.project)
+            .env("BD_NON_INTERACTIVE", "1")
+            .env("BEADS_ACTOR", "ordinary-lead-fixture")
+            .output()
+            .expect("bd init runs");
+        assert!(
+            init.status.success(),
+            "bd init: {} {}",
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let bin = self.home.join("harness/bin");
+        fs::copy(&bd, bin.join("bd.exe")).unwrap();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        copy_tree(&workspace.join("global"), &self.kit.join("global"));
+        copy_tree(
+            &workspace.join(".agents/skills"),
+            &self.kit.join(".agents/skills"),
+        );
+        // The workspace kit routes the executor-side reflection stage through
+        // this explicit profile. The synthetic home provides the same binding
+        // shape an installed profile file would.
+        fs::write(
+            self.home.join("ds.config.toml"),
+            format!(
+                "model = \"{MODEL}\"\nmodel_provider = \"{PROVIDER}\"\nmodel_reasoning_effort = \"{EFFORT}\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            self.home.join("harness/installation.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "settings": {"sourceRoot": self.kit}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     fn command(
@@ -163,6 +232,53 @@ impl Fixture {
 
     fn release(&self) {
         fs::write(self.home.join("frontend-release"), b"release").unwrap();
+    }
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn bd_executable() -> PathBuf {
+    if let Some(value) = std::env::var_os("HARNESS_BD_EXE") {
+        return PathBuf::from(value);
+    }
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        let candidate = PathBuf::from(home).join("harness/bin/bd.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("bd.exe");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    panic!("bd is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
     }
 }
 
@@ -343,6 +459,61 @@ fn process_alive(identity: ProcessIdentity) -> bool {
     result == WAIT_TIMEOUT
 }
 
+fn wait_for_content(path: &Path, expected: &str, what: &str, session: &ConsoleSession) {
+    let until = Instant::now() + WAIT;
+    while Instant::now() < until {
+        if fs::read_to_string(path).ok().as_deref() == Some(expected) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{what} did not become {expected:?} at {}: {}",
+        path.display(),
+        session.transcript()
+    );
+}
+
+/// Reads the one retained lifecycle state the real board source produced.
+fn reflection_state(fixture: &Fixture) -> Option<Value> {
+    let dir = fixture.home.join("harness/delivery-reflection");
+    for entry in fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            return serde_json::from_slice(&fs::read(path).ok()?).ok();
+        }
+    }
+    None
+}
+
+fn wait_reflection_binding(fixture: &Fixture, expected: &str, session: &ConsoleSession) -> Value {
+    let until = Instant::now() + WAIT;
+    while Instant::now() < until {
+        if let Some(state) = reflection_state(fixture)
+            && state["binding"]["lead_session"].as_str() == Some(expected)
+        {
+            return state;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "reflection state never bound {expected}: {}",
+        session.transcript()
+    );
+}
+
+fn host_logs(fixture: &Fixture) -> String {
+    fs::read_dir(fixture.home.join("harness/lead-endpoints/host"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .collect()
+}
+
 #[test]
 fn new_selection_is_registered_before_the_frontend_turn_and_retired_after_exit() {
     let fixture = Fixture::new();
@@ -481,6 +652,171 @@ fn resume_keeps_the_native_source_and_registers_the_returned_selection() {
     let transcript = text(&finished);
     assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
     assert_cleanup(&fixture, backend, RESUME_THREAD);
+}
+
+#[test]
+fn fork_selection_registers_the_returned_thread_before_its_turn() {
+    let fixture = Fixture::new();
+    let mut spec = fixture.command("fork", FORK_THREAD, None, &["--no-alt-screen"]);
+    spec.env
+        .insert("HARNESS_FRONTEND_THREAD".into(), Some(NEW_THREAD.into()));
+    spec.env.insert(
+        "HARNESS_IMPROVEMENT_FIXTURE_FORK_SESSION".into(),
+        Some(FORK_THREAD.into()),
+    );
+    let session = spawn(spec);
+    wait_for_content(
+        &fixture.selected(),
+        FORK_THREAD,
+        "the fork-selected thread",
+        &session,
+    );
+    wait_for(
+        &fixture.readiness(),
+        "the forked pre-turn registry check",
+        &session,
+    );
+    assert_eq!(fs::read_to_string(fixture.readiness()).unwrap(), "true");
+    let registered: Value =
+        serde_json::from_slice(&fs::read(fixture.registry(FORK_THREAD)).unwrap()).unwrap();
+    assert_eq!(registered["threadId"], FORK_THREAD);
+    assert!(
+        !fixture.registry(NEW_THREAD).exists(),
+        "the fork source was registered instead of its returned thread"
+    );
+    let backend = backend_identity(&fixture.home, &session.transcript());
+    fixture.release();
+    let finished = wait_session(session);
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert_cleanup(&fixture, backend, FORK_THREAD);
+}
+
+#[test]
+fn current_selection_transfer_completes_before_the_new_thread_turn() {
+    let mut fixture = Fixture::new();
+    fixture.reflection();
+    let mut spec = fixture.command("transfer", NEW_THREAD, None, &["--no-alt-screen"]);
+    spec.env
+        .insert("HARNESS_FRONTEND_THREAD".into(), Some(NEW_THREAD.into()));
+    spec.env.insert(
+        "HARNESS_FRONTEND_FORK_THREAD".into(),
+        Some(TRANSFER_NEW_THREAD.into()),
+    );
+    spec.env.insert(
+        "HARNESS_IMPROVEMENT_FIXTURE_FORK_SESSION".into(),
+        Some(TRANSFER_NEW_THREAD.into()),
+    );
+    let session = spawn(spec);
+    wait_for(
+        &fixture.home.join("frontend-transfer-repeat.txt"),
+        "the repeated current selection",
+        &session,
+    );
+    let before = wait_reflection_binding(&fixture, NEW_THREAD, &session);
+    let initial_revision = before["binding"]["revision"].as_u64().unwrap();
+    assert!(fixture.registry(NEW_THREAD).is_file());
+
+    fs::write(fixture.home.join("frontend-transfer-before-fork"), b"fork").unwrap();
+    wait_for_content(
+        &fixture.selected(),
+        TRANSFER_NEW_THREAD,
+        "the transferred thread selection",
+        &session,
+    );
+    let after = wait_reflection_binding(&fixture, TRANSFER_NEW_THREAD, &session);
+
+    // The real selection operation ran inside the relay callback, so both its
+    // state and ownership retirement are complete before the frontend receives
+    // the fork result and may submit the next turn.
+    assert_eq!(
+        after["binding"]["revision"].as_u64(),
+        Some(initial_revision + 1),
+        "the repeat selection was not idempotent or the transfer did not run once: {after}"
+    );
+    assert!(
+        after["retired_leads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|retired| retired.as_str() == Some(NEW_THREAD)),
+        "{after}"
+    );
+    assert!(
+        !fixture.registry(NEW_THREAD).exists(),
+        "the transferred source registry survived the completed transfer"
+    );
+    assert!(fixture.registry(TRANSFER_NEW_THREAD).is_file());
+
+    fs::write(fixture.home.join("frontend-transfer-turn-gate"), b"turn").unwrap();
+    wait_for(
+        &fixture.home.join("frontend-transfer-turn-started.txt"),
+        "the transferred thread's first turn",
+        &session,
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.home.join("frontend-transfer-turn-started.txt")).unwrap(),
+        TRANSFER_NEW_THREAD
+    );
+    assert!(fixture.registry(TRANSFER_NEW_THREAD).is_file());
+
+    let backend = backend_identity(&fixture.home, &session.transcript());
+    fixture.release();
+    let finished = wait_session(session);
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert_cleanup(&fixture, backend, TRANSFER_NEW_THREAD);
+}
+
+#[test]
+fn frontend_exit_before_selection_publication_cleans_up_without_reflection() {
+    let mut fixture = Fixture::new();
+    fixture.reflection();
+    let release = fixture.home.join("frontend-selection-release");
+    let exit = fixture.home.join("frontend-exit-trigger");
+    let mut spec = fixture.command("new", NEW_THREAD, None, &["--no-alt-screen"]);
+    spec.env.insert(
+        "HARNESS_ORDINARY_LEAD_FIXTURE_SELECTION_GATE".into(),
+        Some(release.as_os_str().to_owned()),
+    );
+    spec.env.insert(
+        "HARNESS_FRONTEND_EXIT_ON_FILE".into(),
+        Some(exit.as_os_str().to_owned()),
+    );
+    let session = spawn(spec);
+    wait_for(
+        &fixture.registry(NEW_THREAD),
+        "the staged selection registry",
+        &session,
+    );
+    fs::write(&exit, b"exit").unwrap();
+    wait_for(
+        &fixture.home.join("frontend-exit-triggered.txt"),
+        "the frontend exit trigger",
+        &session,
+    );
+    // Let the host observe the native process exit while its relay callback is
+    // still staged at the selection gate; only then release that callback.
+    thread::sleep(Duration::from_millis(300));
+    fs::write(&release, b"release").unwrap();
+
+    let finished = wait_session(session);
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        !fixture.registry(NEW_THREAD).exists(),
+        "the late staged registry was not retired"
+    );
+    assert!(
+        reflection_state(&fixture).is_none(),
+        "a reflection lifecycle was prepared after the frontend had exited"
+    );
+    assert!(
+        !host_logs(&fixture).contains("reflection lifecycle:"),
+        "the host ticked a reflection lifecycle after frontend exit"
+    );
+    let backend = backend_identity(&fixture.home, &finished.transcript);
+    assert_cleanup(&fixture, backend, NEW_THREAD);
 }
 
 #[test]

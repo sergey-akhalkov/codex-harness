@@ -20,6 +20,9 @@
 //!
 //! Mode switches (all optional, all explicit):
 //! - `HARNESS_IMPROVEMENT_FIXTURE_SESSION`: the thread identity to serve;
+//! - `HARNESS_IMPROVEMENT_FIXTURE_FORK_SESSION`: when present, answer
+//!   `thread/fork` for the existing native fork entrypoint with this exact
+//!   selected identity; absent keeps the ordinary route fork-free;
 //! - `HARNESS_IMPROVEMENT_FIXTURE_CONTROL`: what the controlled agent does
 //!   once the host submitted its assignment: `complete` (default) finishes the
 //!   turn, `protocol-defect` records an item without a type before the normal
@@ -255,6 +258,7 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
     let resumed_model = route.model.clone();
     let resumed_provider = route.provider.clone();
     let resumed_effort = route.effort.clone();
+    let fork_session = env::var("HARNESS_IMPROVEMENT_FIXTURE_FORK_SESSION").ok();
     let server = Arc::new(Server::start_on_with(
         port,
         Bearer::File(token_file),
@@ -282,6 +286,19 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                 "reasoningEffort": resumed_effort,
             })),
         );
+            // The ordinary host observes the native frontend's own fork and
+            // switches the same app-server only after its lifecycle transfer.
+            // This canned answer exists solely for that already agreed native
+            // selection path; without the explicit identity the route stays
+            // fork-free.
+            if let Some(fork_session) = fork_session {
+                server.answer(
+                    "thread/fork",
+                    Answer::Result(json!({
+                        "thread": {"id": fork_session.clone(), "cwd": env::current_dir().ok(), "turns": []},
+                    })),
+                );
+            }
             server.answer("thread/name/set", Answer::Result(json!({})));
             server.answer(
                 "turn/start",
