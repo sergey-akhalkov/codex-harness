@@ -3,7 +3,9 @@
 //! loopback lead endpoints; model turns remain synthetic fixture responses.
 
 use super::*;
-use harness_core::delivery_reflection::{DeliveryState, ReflectionController, StageState};
+use harness_core::delivery_reflection::{
+    DeliveryState, LifecycleStatus, ReflectionController, StageState,
+};
 
 const NO_FINDING: &str = "NO FINDING";
 
@@ -97,6 +99,25 @@ fn command_failure(output: std::process::Output) -> String {
 
 fn state_bytes(controller: &ReflectionController) -> Vec<u8> {
     fs::read(controller.state_file().unwrap()).unwrap()
+}
+
+fn lifecycle_files(workspace: &Workspace) -> Vec<PathBuf> {
+    let directory = workspace.home.join("harness/delivery-reflection");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|value| value == "json"))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn successor_turn_available(workspace: &Workspace) {
+    let mut state = workspace.successor_state.lock().unwrap();
+    state.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
+    state.source_turn_active = true;
 }
 
 fn acceptance_dir(controller: &ReflectionController, acceptance: &str) -> PathBuf {
@@ -547,4 +568,98 @@ fn successor_refuses_an_incomplete_retired_source_checkpoint_before_any_lead_for
     let record = controller.record(&acceptance).unwrap().unwrap();
     assert_eq!(record.executor.state, StageState::Retained);
     assert_ne!(record.delivery, DeliveryState::Consumed);
+}
+
+#[test]
+fn successor_acceptance_automatically_transfers_an_inactive_owners_lifecycle() {
+    let workspace = Workspace::new("succession-automatic-inactive", LeadMode::Delivered);
+    let (controller, retained_acceptance) = accepted_with_owner(&workspace);
+    lifecycle::install_fixture(&workspace);
+    install_successor_registry(&workspace);
+    successor_turn_available(&workspace);
+
+    let before = controller.stored_state().unwrap().unwrap();
+    assert_eq!(before.lifecycle, LifecycleStatus::Active, "{before:?}");
+    assert_eq!(before.binding.lead_session, LEAD_THREAD, "{before:?}");
+    assert_eq!(before.records.len(), 1, "{before:?}");
+    let retained_record = before.records[&retained_acceptance].clone();
+    let source = lifecycle::source_fixture(&workspace, "succession-automatic-inactive", true);
+    let pending = lifecycle::prepare_additional_ordinary_acceptance(
+        &workspace,
+        &manager(),
+        &source,
+        SUCCESSOR_THREAD,
+        "successor-accepted-run",
+        2,
+    );
+
+    // Remove the old registration and positively end its exact retained owner.
+    // The successor is already registered, so accepting ordinary work is the
+    // only activation input and must use the verified succession path.
+    remove_old_registry(&workspace);
+    workspace.stop_owner_process();
+    let accepted = pending.accept(&workspace);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], true,
+        "{accepted}"
+    );
+    assert_eq!(
+        lifecycle::show_task(&workspace, &pending.task)["status"],
+        "closed"
+    );
+
+    let after = controller.stored_state().unwrap().unwrap();
+    assert_eq!(after.lifecycle, LifecycleStatus::Active, "{after:?}");
+    assert_eq!(after.binding.id, before.binding.id, "{after:?}");
+    assert_eq!(after.binding.lead_session, SUCCESSOR_THREAD, "{after:?}");
+    assert_eq!(
+        after.binding.revision,
+        before.binding.revision + 1,
+        "{after:?}"
+    );
+    assert_eq!(after.checkpoint, before.checkpoint, "{after:?}");
+    assert_eq!(after.records, before.records, "{after:?}");
+    assert_eq!(after.journal, before.journal, "{after:?}");
+    assert!(before.source.same_scope(&after.source), "{after:?}");
+    assert!(
+        after.retired_leads.iter().any(|lead| lead == LEAD_THREAD),
+        "the inactive owner was not retired: {after:?}"
+    );
+    assert_eq!(after.records[&retained_acceptance], retained_record);
+    assert_eq!(
+        lifecycle_files(&workspace),
+        vec![controller.state_file().unwrap()]
+    );
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
+}
+
+#[test]
+fn successor_acceptance_refuses_a_live_owner_before_closing_the_new_task() {
+    let workspace = Workspace::new("succession-automatic-live", LeadMode::Delivered);
+    let (controller, _acceptance) = accepted_with_owner(&workspace);
+    lifecycle::install_fixture(&workspace);
+    install_successor_registry(&workspace);
+    successor_turn_available(&workspace);
+
+    let before = state_bytes(&controller);
+    let source = lifecycle::source_fixture(&workspace, "succession-automatic-live", true);
+    let pending = lifecycle::prepare_additional_ordinary_acceptance(
+        &workspace,
+        &manager(),
+        &source,
+        SUCCESSOR_THREAD,
+        "live-owner-run",
+        2,
+    );
+    let failure = command_failure(pending.accept_raw(&workspace));
+    assert!(
+        failure.to_lowercase().contains("live"),
+        "the refusal did not name the retained live owner: {failure}"
+    );
+    assert_eq!(state_bytes(&controller), before);
+    let shown = lifecycle::show_task(&workspace, &pending.task);
+    assert_eq!(shown["status"], "open", "{shown}");
+    assert_eq!(request_counts(&workspace), (0, 0, 0, 0));
 }

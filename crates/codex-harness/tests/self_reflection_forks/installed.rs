@@ -6,7 +6,7 @@
 use super::reflection_install::{InstalledReflection, PRESERVED};
 use super::*;
 use harness_core::delivery_reflection::{
-    DeliveryState, LifecycleStatus, ReflectionController, StageState,
+    DeliveryState, JournalOwnership, LifecycleStatus, ReflectionController, StageState,
 };
 use std::os::windows::fs::OpenOptionsExt;
 
@@ -15,12 +15,21 @@ fn installed_acceptance_drives_reflections_disables_and_preserves_restored_state
     let workspace = Workspace::new("reflection-installed", LeadMode::Delivered);
     let installed = InstalledReflection::connect(&workspace);
 
-    let (task, acceptance) = lifecycle::normal_acceptance(&workspace, &installed.manager);
+    let (task, acceptance, activated) =
+        lifecycle::normal_acceptance(&workspace, &installed.manager);
+    assert_eq!(activated.lifecycle, LifecycleStatus::Active);
+    assert_eq!(activated.binding.lead_session, LEAD_THREAD);
+    assert_eq!(activated.journal, JournalOwnership::EnabledByController);
+    assert_eq!(activated.records.len(), 1);
     assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
     installed.assert_app_servers(&workspace.checkout);
 
     let controller = ReflectionController::new("bd.exe", &workspace.checkout, &workspace.home);
     let state = controller.stored_state().unwrap().unwrap();
+    assert_eq!(state.lifecycle, LifecycleStatus::Stopped);
+    assert_eq!(state.binding, activated.binding);
+    assert_eq!(state.checkpoint, activated.checkpoint);
+    assert_eq!(state.journal, activated.journal);
     assert_eq!(state.records.len(), 1);
     let record = state.records.get(&acceptance).unwrap().clone();
     assert_eq!(record.delivery, DeliveryState::Consumed);

@@ -2,8 +2,8 @@
 
 use super::*;
 use harness_core::delivery_reflection::{
-    AcceptanceBinding, DeliveryState, LifecycleStatus, ReflectionController, StageState,
-    acceptance_metadata,
+    AcceptanceBinding, DeliveryState, JournalOwnership, LifecycleStatus, ReflectionController,
+    ReflectionState, StageState, acceptance_metadata,
 };
 
 pub(super) fn install_fixture(workspace: &Workspace) {
@@ -577,6 +577,180 @@ fn normal_accept_command_drives_owned_consumer_after_exact_lead_turn_completes()
 }
 
 #[test]
+fn flag_true_first_ordinary_acceptance_activates_reflection_without_enable() {
+    let workspace = Workspace::new("first-accept-activation", LeadMode::Delivered);
+    install_fixture(&workspace);
+    let source = source_fixture(&workspace, "first-accept-activation", true);
+    let prepared = prepare_ordinary_acceptance_setup_unprepared(&workspace, &manager(), &source);
+    assert!(
+        prepared.controller.stored_state().unwrap().is_none(),
+        "the fixture must not prepare reflection before the first acceptance"
+    );
+
+    let accepted = prepared.accept(&workspace);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    let state = prepared
+        .controller
+        .stored_state()
+        .unwrap()
+        .unwrap_or_else(|| panic!("flag true did not prepare the first acceptance: {accepted}"));
+    assert_eq!(state.lifecycle, LifecycleStatus::Active, "{state:?}");
+    assert_eq!(state.binding.lead_session, LEAD_THREAD, "{state:?}");
+    assert_eq!(
+        state.journal,
+        JournalOwnership::EnabledByController,
+        "{state:?}"
+    );
+    assert!(state.records.is_empty(), "{state:?}");
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], true,
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["bindingId"].as_str(),
+        Some(state.binding.id.as_str()),
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["reflection"]["revision"].as_u64(),
+        Some(state.binding.revision),
+        "{accepted}"
+    );
+    let shown = show_task(&workspace, &prepared.task);
+    assert_eq!(shown["status"], "closed", "{shown}");
+    assert_eq!(shown["close_reason"], "accepted", "{shown}");
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        1
+    );
+
+    let acceptance = accepted["acceptanceId"].as_str().unwrap();
+    let repeated = prepared.accept(&workspace);
+    assert_eq!(repeated["duplicate"], true, "{repeated}");
+    assert_eq!(repeated["acceptanceId"], acceptance, "{repeated}");
+    let after_repeat = prepared.controller.stored_state().unwrap().unwrap();
+    assert_eq!(after_repeat.binding, state.binding);
+    assert_eq!(after_repeat.checkpoint, state.checkpoint);
+    assert_eq!(after_repeat.journal, state.journal);
+    assert_eq!(after_repeat.records, state.records);
+    assert_eq!(
+        accepted_closures(&history_events(&workspace, &prepared.task)),
+        1,
+        "a repeated acceptance must not duplicate the closure"
+    );
+
+    let spec = process_spec_from_source(&workspace, &manager(), &source, LEAD_THREAD, "_serve");
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let until = Instant::now() + Duration::from_secs(90);
+    loop {
+        if prepared
+            .controller
+            .record(acceptance)
+            .unwrap()
+            .is_some_and(|record| record.executor.state == StageState::Retained)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "the first automatically activated acceptance retained no executor result: {:?}; requests={:?}",
+            prepared.controller.record(acceptance).unwrap(),
+            request_counts(&workspace)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    assert_eq!(
+        prepared
+            .controller
+            .record(acceptance)
+            .unwrap()
+            .unwrap()
+            .lead
+            .state,
+        StageState::Pending
+    );
+    let state_dir = prepared
+        .controller
+        .state_file()
+        .unwrap()
+        .with_extension("")
+        .join(acceptance);
+    let executor_before = fs::read(state_dir.join("executor-stage.json")).unwrap();
+    let chain_before = read_json(&state_dir.join("chain.json"));
+
+    set_source_enabled(&source, false);
+    workspace.lead_state.lock().unwrap().source_turn_active = false;
+    std::thread::sleep(Duration::from_millis(3_000));
+    assert_eq!(request_counts(&workspace), (1, 1, 0, 0));
+    let paused = prepared.controller.record(acceptance).unwrap().unwrap();
+    assert_eq!(paused.executor.state, StageState::Retained);
+    assert_eq!(paused.lead.state, StageState::Pending);
+    assert_eq!(
+        fs::read(state_dir.join("executor-stage.json")).unwrap(),
+        executor_before
+    );
+    assert_eq!(read_json(&state_dir.join("chain.json")), chain_before);
+
+    set_source_enabled(&source, true);
+    loop {
+        if prepared
+            .controller
+            .record(acceptance)
+            .unwrap()
+            .unwrap()
+            .delivery
+            == DeliveryState::Consumed
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "the retained lead stage did not resume without enable: {:?}",
+            prepared.controller.record(acceptance).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(
+        fs::read(state_dir.join("executor-stage.json")).unwrap(),
+        executor_before
+    );
+    let chain_after = read_json(&state_dir.join("chain.json"));
+    assert_eq!(
+        chain_after["executorSource"],
+        chain_before["executorSource"]
+    );
+    assert_eq!(chain_after["executorStage"], chain_before["executorStage"]);
+    assert_eq!(chain_after["acceptance"], chain_before["acceptance"]);
+    let completed = prepared.controller.stored_state().unwrap().unwrap();
+    assert_eq!(completed.binding, state.binding);
+    assert_eq!(completed.records.len(), 1);
+    assert_eq!(
+        prepared
+            .controller
+            .record(acceptance)
+            .unwrap()
+            .unwrap()
+            .binding,
+        prepared.binding
+    );
+
+    success(command_from_source(
+        &manager(),
+        &workspace,
+        &source,
+        "disable",
+        None,
+        &[],
+    ));
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+}
+
+#[test]
 fn ordinary_acceptance_reassigns_executor_task_and_closes_exactly_once() {
     let workspace = Workspace::new("ordinary-assignment", LeadMode::Delivered);
     install_fixture(&workspace);
@@ -1008,21 +1182,25 @@ fn running_host_observes_disable_between_stages_and_reuses_executor_after_reenab
 /// The ordinary accepted-work lifecycle, independent of where the manager and
 /// launcher were installed. The producer is the public retained completion and
 /// the only acceptance identity is the board's exact native acceptance.
-pub(super) fn normal_acceptance(workspace: &Workspace, manager: &Path) -> (String, String) {
+pub(super) fn normal_acceptance(
+    workspace: &Workspace,
+    manager: &Path,
+) -> (String, String, ReflectionState) {
     normal_acceptance_with_source(workspace, manager, &kit_root())
 }
 
-struct PreparedOrdinaryAcceptance {
-    controller: ReflectionController,
-    task: String,
+pub(super) struct PreparedOrdinaryAcceptance {
+    pub(super) controller: ReflectionController,
+    pub(super) task: String,
     retained_result: String,
-    binding: AcceptanceBinding,
+    pub(super) binding: AcceptanceBinding,
     manager: PathBuf,
     accept_source: Option<PathBuf>,
+    lead_session: String,
 }
 
 impl PreparedOrdinaryAcceptance {
-    fn accept_raw(&self, workspace: &Workspace) -> std::process::Output {
+    pub(super) fn accept_raw(&self, workspace: &Workspace) -> std::process::Output {
         let mut command = Command::new(&self.manager);
         command
             .args(["executor", "accept", &self.task, "--project"])
@@ -1035,7 +1213,7 @@ impl PreparedOrdinaryAcceptance {
             .arg(&workspace.home)
             .current_dir(&workspace.checkout)
             .env("CODEX_HOME", &workspace.home)
-            .env("CODEX_THREAD_ID", LEAD_THREAD)
+            .env("CODEX_THREAD_ID", &self.lead_session)
             .env_remove("HARNESS_REFLECTION_SESSION")
             .env_remove("HARNESS_EXECUTOR_SESSION")
             .env_remove("HARNESS_BOUNDED_LEAD_SESSION")
@@ -1043,12 +1221,12 @@ impl PreparedOrdinaryAcceptance {
             .unwrap()
     }
 
-    fn accept(&self, workspace: &Workspace) -> Value {
+    pub(super) fn accept(&self, workspace: &Workspace) -> Value {
         success(self.accept_raw(workspace))
     }
 }
 
-fn show_task(workspace: &Workspace, task: &str) -> Value {
+pub(super) fn show_task(workspace: &Workspace, task: &str) -> Value {
     let shown = accepted::native(workspace, "bd.exe", &["show", task, "--json"]);
     let mut value: Value = serde_json::from_slice(&shown.stdout).unwrap();
     if let Value::Array(rows) = &value {
@@ -1091,29 +1269,89 @@ fn prepare_ordinary_acceptance_setup(
     disable_before_accept: bool,
     accept_source: Option<&Path>,
 ) -> PreparedOrdinaryAcceptance {
-    use harness_core::{
-        board_cli,
-        delivery_reflection::{Purpose, board_source_identity},
-        task_worktree::{self, AssignmentSubmission, CompletionFacts, SlotAssignmentBinding},
-    };
+    prepare_ordinary_acceptance_setup_inner(
+        workspace,
+        manager,
+        source,
+        Some(disable_before_accept),
+        accept_source,
+    )
+}
 
+fn prepare_ordinary_acceptance_setup_unprepared(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+) -> PreparedOrdinaryAcceptance {
+    prepare_ordinary_acceptance_setup_inner(workspace, manager, source, None, Some(source))
+}
+
+fn prepare_ordinary_acceptance_setup_inner(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+    disable_before_accept: Option<bool>,
+    accept_source: Option<&Path>,
+) -> PreparedOrdinaryAcceptance {
     let (controller, task) = accepted::prepare(workspace);
     {
         let mut lead = workspace.lead_state.lock().unwrap();
         lead.source_turn = Some(LEAD_SOURCE_TURN.to_owned());
         lead.source_turn_active = true;
     }
-    success(command_from_source(
-        manager,
-        workspace,
-        source,
-        "enable",
-        Some(LEAD_THREAD),
-        &[],
-    ));
-    if disable_before_accept {
-        set_source_enabled(source, false);
+    if let Some(disable_before_accept) = disable_before_accept {
+        success(command_from_source(
+            manager,
+            workspace,
+            source,
+            "enable",
+            Some(LEAD_THREAD),
+            &[],
+        ));
+        if disable_before_accept {
+            set_source_enabled(source, false);
+        }
+    } else {
+        // This is the ordinary first-accept path: no lifecycle has prepared
+        // event access yet. Removing the journal makes activation, not the
+        // fixture, responsible for observing the accepted closure.
+        accepted::native(workspace, "bd.exe", &["config", "unset", "events-journal"]);
+        assert!(
+            controller.stored_state().unwrap().is_none(),
+            "the first-accept fixture must start without a reflection lifecycle"
+        );
     }
+
+    prepare_ordinary_acceptance_completion(
+        workspace,
+        controller,
+        task,
+        "accepted-run",
+        1,
+        LEAD_THREAD,
+        manager,
+        accept_source,
+        disable_before_accept.is_none_or(|disable| !disable),
+    )
+}
+
+fn prepare_ordinary_acceptance_completion(
+    workspace: &Workspace,
+    controller: ReflectionController,
+    task: String,
+    run: &str,
+    slot: u32,
+    lead_session: &str,
+    manager: &Path,
+    accept_source: Option<&Path>,
+    enabled: bool,
+) -> PreparedOrdinaryAcceptance {
+    use harness_core::{
+        board_cli,
+        delivery_reflection::{Purpose, board_source_identity},
+        task_worktree::{self, AssignmentSubmission, CompletionFacts, SlotAssignmentBinding},
+    };
+
     board_cli::set_purpose_metadata(
         Path::new("bd.exe"),
         &workspace.checkout,
@@ -1127,11 +1365,13 @@ fn prepare_ordinary_acceptance_setup(
         "git",
         &["commit", "--allow-empty", "-qm", "fixture board ready"],
     );
-    let assignment = harness_core::build_identity::hash_bytes(b"synthetic structured assignment");
-    let result = workspace.root().join("executor-result.txt");
+    let assignment = harness_core::build_identity::hash_bytes(
+        format!("synthetic structured assignment {run}").as_bytes(),
+    );
+    let result = workspace.root().join(format!("executor-result-{run}.txt"));
     fs::write(
         &result,
-        "Synthetic accepted executor result with completed checks.",
+        format!("Synthetic accepted executor result for {run} with completed checks."),
     )
     .unwrap();
     let pool_source = accept_source.unwrap_or(&workspace.checkout);
@@ -1140,12 +1380,12 @@ fn prepare_ordinary_acceptance_setup(
     let retained = task_worktree::retain_completion(
         &pool,
         &CompletionFacts {
-            run_generation: "accepted-run".to_owned(),
-            slot: 1,
-            owner: "fixture-ordinary-executor".to_owned(),
+            run_generation: run.to_owned(),
+            slot,
+            owner: format!("fixture-{run}-executor"),
             checkout: workspace.checkout.clone(),
-            task: Some("fixture-durable-task".to_owned()),
-            handle: Some("fixture-task-handle".to_owned()),
+            task: Some(format!("fixture-durable-task-{run}")),
+            handle: Some(format!("fixture-task-handle-{run}")),
             assignment: Some(SlotAssignmentBinding {
                 source: board_source_identity(Path::new("bd.exe"), &workspace.checkout).unwrap(),
                 issue: task.clone(),
@@ -1167,7 +1407,7 @@ fn prepare_ordinary_acceptance_setup(
     let retained_result = retained.result.as_ref().unwrap().sha256.clone();
     let binding = AcceptanceBinding::new(
         task.clone(),
-        "accepted-run".to_owned(),
+        run.to_owned(),
         retained
             .assignment
             .as_ref()
@@ -1177,8 +1417,8 @@ fn prepare_ordinary_acceptance_setup(
         retained_result.clone(),
         retained.source.revision.clone().unwrap(),
         vec![EXECUTOR_SOURCE.to_owned()],
-        LEAD_THREAD.to_owned(),
-        LEAD_THREAD.to_owned(),
+        lead_session.to_owned(),
+        lead_session.to_owned(),
         Purpose::Ordinary,
     )
     .with_turns(
@@ -1186,7 +1426,7 @@ fn prepare_ordinary_acceptance_setup(
         Some(EXECUTOR_SOURCE_TURN.to_owned()),
         Some(LEAD_SOURCE_TURN.to_owned()),
     )
-    .with_self_reflection_enabled(!disable_before_accept);
+    .with_self_reflection_enabled(enabled);
     PreparedOrdinaryAcceptance {
         controller,
         task,
@@ -1194,7 +1434,40 @@ fn prepare_ordinary_acceptance_setup(
         binding,
         manager: manager.to_path_buf(),
         accept_source: accept_source.map(Path::to_path_buf),
+        lead_session: lead_session.to_owned(),
     }
+}
+
+/// Builds another ordinary acceptance on an already initialized board. The
+/// caller owns the current lead's endpoint turn state; this helper only uses
+/// the existing native board, retained-completion and acceptance owners.
+pub(super) fn prepare_additional_ordinary_acceptance(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+    lead_session: &str,
+    run: &str,
+    slot: u32,
+) -> PreparedOrdinaryAcceptance {
+    let controller = ReflectionController::new("bd.exe", &workspace.checkout, &workspace.home);
+    let title = format!("Accepted ordinary task {run}");
+    let output = accepted::native(
+        workspace,
+        "bd.exe",
+        &["create", &title, "--type", "task", "--json"],
+    );
+    let task: Value = serde_json::from_slice(&output.stdout).unwrap();
+    prepare_ordinary_acceptance_completion(
+        workspace,
+        controller,
+        task["id"].as_str().unwrap().to_owned(),
+        run,
+        slot,
+        lead_session,
+        manager,
+        Some(source),
+        true,
+    )
 }
 
 fn prepare_ordinary_acceptance(
@@ -1211,6 +1484,23 @@ fn prepare_ordinary_acceptance(
         disable_before_accept,
         accept_source,
     );
+    finish_ordinary_acceptance(workspace, prepared, !disable_before_accept)
+}
+
+fn prepare_unprepared_ordinary_acceptance(
+    workspace: &Workspace,
+    manager: &Path,
+    source: &Path,
+) -> (ReflectionController, String, String, String, Value) {
+    let prepared = prepare_ordinary_acceptance_setup_unprepared(workspace, manager, source);
+    finish_ordinary_acceptance(workspace, prepared, true)
+}
+
+fn finish_ordinary_acceptance(
+    workspace: &Workspace,
+    prepared: PreparedOrdinaryAcceptance,
+    expected_permission: bool,
+) -> (ReflectionController, String, String, String, Value) {
     let accepted = prepared.accept(workspace);
     assert_eq!(accepted["duplicate"], false);
     assert_eq!(accepted["status"], "accepted", "{accepted}");
@@ -1235,7 +1525,6 @@ fn prepare_ordinary_acceptance(
             "acceptance receipt lost {field}: {accepted}"
         );
     }
-    let expected_permission = !disable_before_accept;
     assert_eq!(
         accepted["reflection"]["selfReflectionEnabled"], expected_permission,
         "{accepted}"
@@ -1273,9 +1562,9 @@ fn normal_acceptance_with_source(
     workspace: &Workspace,
     manager: &Path,
     source: &Path,
-) -> (String, String) {
+) -> (String, String, ReflectionState) {
     let (controller, task, acceptance, retained_result, _accepted) =
-        prepare_ordinary_acceptance(workspace, manager, source, false, Some(source));
+        prepare_unprepared_ordinary_acceptance(workspace, manager, source);
     let acceptance = acceptance.as_str();
 
     let spec = process_spec_from_source(workspace, manager, source, LEAD_THREAD, "_serve");
@@ -1318,6 +1607,11 @@ fn normal_acceptance_with_source(
     let record = controller.record(acceptance).unwrap().unwrap();
     assert_eq!(record.binding.result, retained_result);
     assert_eq!(record.binding.lead_turn.as_deref(), Some(LEAD_SOURCE_TURN));
+    let activated = controller.stored_state().unwrap().unwrap();
+    assert_eq!(activated.lifecycle, LifecycleStatus::Active);
+    assert_eq!(activated.binding.lead_session, LEAD_THREAD);
+    assert_eq!(activated.journal, JournalOwnership::EnabledByController);
+    assert_eq!(activated.records.len(), 1);
     success(command_from_source(
         manager,
         workspace,
@@ -1328,13 +1622,18 @@ fn normal_acceptance_with_source(
     ));
     let finished = wait_session(session);
     assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
-    assert_eq!(controller.stored_state().unwrap().unwrap().records.len(), 1);
+    let stopped = controller.stored_state().unwrap().unwrap();
+    assert_eq!(stopped.lifecycle, LifecycleStatus::Stopped);
+    assert_eq!(stopped.binding, activated.binding);
+    assert_eq!(stopped.journal, activated.journal);
+    assert_eq!(stopped.checkpoint, activated.checkpoint);
+    assert_eq!(stopped.records, activated.records);
     assert_eq!(request_counts(workspace), (1, 1, 1, 1));
     assert!(
         !workspace.request.exists(),
         "the installed chain must derive its identity without a caller-authored request"
     );
-    (task, acceptance.to_owned())
+    (task, acceptance.to_owned(), activated)
 }
 
 #[test]

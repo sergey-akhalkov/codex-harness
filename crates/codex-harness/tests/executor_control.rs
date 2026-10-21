@@ -27,6 +27,9 @@ use executor_control::{
 use harness_core::{
     build_identity,
     console::{ConsoleOutcome, ConsoleSession, ConsoleSpec},
+    delivery_reflection::{
+        JournalOwnership, LifecycleStatus, ReflectionController, ReflectionState,
+    },
     orchestration_config::ProfileBinding,
     process::{Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity},
     process_service::{self, ServiceProcess},
@@ -54,6 +57,7 @@ const PROVIDER: &str = "deepseek-fixture";
 const EFFORT: &str = "max";
 const FIXTURE: &str = env!("CARGO_BIN_EXE_harness-executor-fixture");
 const WAIT: Duration = Duration::from_secs(10);
+const REFLECTION_WAIT: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------- endpoint
 
@@ -3723,6 +3727,74 @@ impl ManagedLead {
         }
     }
 
+    /// Gives the synthetic checkout a real native board and the complete role
+    /// set. The reflection roles use their own instruction files so the role
+    /// resolver can identify each source, but no reflection model is hosted.
+    fn prepare_reflection_board(&self, enabled: bool) {
+        git(&self.source, &["init", "-q", "--initial-branch=main"]);
+        git(
+            &self.source,
+            &["config", "user.email", "fixture@example.test"],
+        );
+        git(&self.source, &["config", "user.name", "Fixture"]);
+        fs::write(
+            self.source.join("global/roles.toml"),
+            "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n[roles.executor-self-reflection]\ninstructions = 'global/executor-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/lead-reflection.md'\nskills = []\n",
+        )
+        .unwrap();
+        fs::write(
+            self.source.join("global/executor-reflection.md"),
+            "Fixture executor reflection responsibility",
+        )
+        .unwrap();
+        fs::write(
+            self.source.join("global/lead-reflection.md"),
+            "Fixture lead reflection responsibility",
+        )
+        .unwrap();
+        self.set_reflection_flag(enabled);
+        let board = Command::new("bd.exe")
+            .args([
+                "init",
+                "--skip-agents",
+                "--non-interactive",
+                "--quiet",
+                "--prefix",
+                "rfl",
+            ])
+            .current_dir(&self.source)
+            .env("BD_NON_INTERACTIVE", "1")
+            .env("BEADS_ACTOR", "reflection-host-fixture")
+            .output()
+            .unwrap();
+        assert!(
+            board.status.success(),
+            "bd init: {}\n{}",
+            String::from_utf8_lossy(&board.stdout),
+            String::from_utf8_lossy(&board.stderr)
+        );
+        git(&self.source, &["add", "-A"]);
+        git(&self.source, &["commit", "-qm", "reflection board fixture"]);
+    }
+
+    fn set_reflection_flag(&self, enabled: bool) {
+        let path = self.source.join("global/orchestration.toml");
+        let mut config = fs::read_to_string(&path)
+            .unwrap_or_else(|_| "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"default\"]\nmax_concurrent_executors = 1\n".to_owned());
+        let mut lines = config
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("self_reflection_enabled"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        lines.push(format!("self_reflection_enabled = {enabled}"));
+        config = format!("{}\n", lines.join("\n"));
+        fs::write(path, config).unwrap();
+    }
+
+    fn reflection_controller(&self) -> ReflectionController {
+        ReflectionController::new("bd.exe", &self.source, &self.home)
+    }
+
     /// The documented command in its own console. `--once` is the finite
     /// assignment; without it the default persistent host stays until the
     /// frontend ends.
@@ -3816,6 +3888,55 @@ impl ManagedLead {
                 ),
             }
         }
+    }
+}
+
+fn reflection_state_files(home: &Path) -> Vec<PathBuf> {
+    let directory = home.join("harness/delivery-reflection");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|value| value == "json"))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn host_status_files(home: &Path) -> Vec<PathBuf> {
+    let directory = home.join("harness/delivery-reflection/hosts");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|value| value == "json"))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn wait_for_reflection_state(lead: &ManagedLead, session: &ConsoleSession) -> ReflectionState {
+    let controller = lead.reflection_controller();
+    let until = Instant::now() + REFLECTION_WAIT;
+    loop {
+        match controller.stored_state() {
+            Ok(Some(state)) => return state,
+            Ok(None) => {}
+            Err(error) => panic!(
+                "the reflection lifecycle became unreadable while the managed lead was starting: {error}\n{}",
+                session.transcript()
+            ),
+        }
+        if Instant::now() >= until {
+            panic!(
+                "self_reflection_enabled = true did not activate reflection through managed lead startup: {}\n{}",
+                controller.state_file().unwrap().display(),
+                session.transcript()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -4042,6 +4163,118 @@ fn the_default_managed_lead_stays_addressable_after_a_turn_until_its_frontend_en
         &process.program,
         "the persistent host's app-server survived its frontend's exit",
     );
+}
+
+#[test]
+fn true_flag_activates_reflection_during_managed_lead_startup_without_enable() {
+    let lead = ManagedLead::new();
+    lead.prepare_reflection_board(true);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(lead.command(false, "complete"))).unwrap();
+
+    // No delivery-improvement enable command runs: the real lead host and its
+    // configuration are the only activation inputs.
+    let state = wait_for_reflection_state(&lead, &session);
+    assert_eq!(state.lifecycle, LifecycleStatus::Active, "{state:?}");
+    assert_eq!(state.binding.lead_session, LEAD_THREAD, "{state:?}");
+    assert_eq!(state.binding.revision, 1, "{state:?}");
+    assert_eq!(
+        state.journal,
+        JournalOwnership::EnabledByController,
+        "{state:?}"
+    );
+    assert!(state.records.is_empty(), "{state:?}");
+    assert!(
+        state.owner_process.is_some(),
+        "automatic activation must retain the exact managed-lead process for recovery: {state:?}"
+    );
+    let controller = lead.reflection_controller();
+    let state_file = controller.state_file().unwrap();
+    assert_eq!(reflection_state_files(&lead.home), vec![state_file]);
+
+    wait_for(
+        || !host_status_files(&lead.home).is_empty(),
+        "the managed lead host did not record its reflection consumer",
+    );
+    let status_files = host_status_files(&lead.home);
+    assert_eq!(status_files.len(), 1, "{status_files:?}");
+    let status: Value = serde_json::from_slice(&fs::read(&status_files[0]).unwrap()).unwrap();
+    assert_eq!(status["state"], "running", "{status}");
+
+    wait_for(
+        || lead.rollout_path().is_file(),
+        "the persistent host did not complete its assigned fixture turn",
+    );
+    fs::write(lead.home.join("frontend-release"), b"release").unwrap();
+    let finished = console_wait(session);
+    let transcript = finished.transcript.replace("\r\n", "\n");
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        transcript.contains("lead session: ended thread"),
+        "{transcript}"
+    );
+}
+
+#[test]
+fn false_startup_then_flag_true_activates_one_lifecycle_and_preserves_identity() {
+    let lead = ManagedLead::new();
+    lead.prepare_reflection_board(false);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(lead.command(false, "complete"))).unwrap();
+    wait_for(
+        || lead.rollout_path().is_file(),
+        "the persistent host did not complete its assigned fixture turn",
+    );
+
+    // The first host polls ran with the flag false. No lifecycle may exist.
+    thread::sleep(Duration::from_secs(3));
+    assert!(reflection_state_files(&lead.home).is_empty());
+    assert!(
+        lead.reflection_controller()
+            .stored_state()
+            .unwrap()
+            .is_none()
+    );
+
+    lead.set_reflection_flag(true);
+    let activated = wait_for_reflection_state(&lead, &session);
+    assert_eq!(
+        activated.lifecycle,
+        LifecycleStatus::Active,
+        "{activated:?}"
+    );
+    assert_eq!(activated.binding.lead_session, LEAD_THREAD, "{activated:?}");
+    assert_eq!(
+        activated.journal,
+        JournalOwnership::EnabledByController,
+        "{activated:?}"
+    );
+    let state_file = lead.reflection_controller().state_file().unwrap();
+    assert_eq!(reflection_state_files(&lead.home), vec![state_file.clone()]);
+    wait_for(
+        || host_status_files(&lead.home).len() == 1,
+        "the managed lead host did not start exactly one reflection consumer",
+    );
+
+    // A second poll interval must reuse the same owner, checkpoint and
+    // records. The timestamp of a poll is allowed to advance; activation
+    // identity is not.
+    thread::sleep(Duration::from_secs(3));
+    let settled = lead
+        .reflection_controller()
+        .stored_state()
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.lifecycle, LifecycleStatus::Active, "{settled:?}");
+    assert_eq!(settled.binding, activated.binding);
+    assert_eq!(settled.checkpoint, activated.checkpoint);
+    assert_eq!(settled.journal, activated.journal);
+    assert_eq!(settled.records, activated.records);
+    assert_eq!(reflection_state_files(&lead.home), vec![state_file]);
+    assert_eq!(host_status_files(&lead.home).len(), 1);
+
+    fs::write(lead.home.join("frontend-release"), b"release").unwrap();
+    let finished = console_wait(session);
+    let transcript = finished.transcript.replace("\r\n", "\n");
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
 }
 
 #[test]
