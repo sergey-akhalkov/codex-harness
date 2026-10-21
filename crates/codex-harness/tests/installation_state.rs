@@ -144,6 +144,169 @@ fn deploy_reset_rejects_a_foreign_source_build_before_removing_owned_links() {
 }
 
 #[test]
+fn deploy_preview_reuses_verified_build_without_compiling_or_changing_installation() {
+    use harness_core::build_identity;
+
+    let fixture = Fixture::new();
+    let source = synthetic_role_build::kit_source(fixture.root.path());
+    let schema = source.join(build_identity::INSPECTION_SCHEMA);
+    fs::create_dir_all(schema.parent().unwrap()).unwrap();
+    fs::write(schema, "fixture").unwrap();
+    for path in ["global/hooks.json", "global/token-hooks.json"] {
+        fs::write(source.join(path), "{}").unwrap();
+    }
+    let native_state = fixture.root.path().join("native-state");
+    let builds = native_state.join("builds");
+    fs::create_dir_all(&builds).unwrap();
+    fs::write(
+        native_state.join("owner"),
+        "codex-harness-native-state-v1\n",
+    )
+    .unwrap();
+    let build = builds.join("0123456789abcdef-1000-1");
+    fs::rename(
+        synthetic_role_build::recorded_build(fixture.root.path(), &source),
+        &build,
+    )
+    .unwrap();
+    let record = fs::read(build.join("build.json")).unwrap();
+    fs::create_dir_all(&fixture.home).unwrap();
+    fs::create_dir_all(&fixture.user).unwrap();
+    let config = fixture.home.join("config.toml");
+    fs::write(&config, "model = 'owned-setting'\n").unwrap();
+    let foreign = fixture.user.join("preserve.txt");
+    fs::write(&foreign, "unrelated user data").unwrap();
+    let selection = native_state.join("active-build.json");
+    fs::write(&selection, "preserve existing selection").unwrap();
+    let marker = fixture.root.path().join("compiler-started");
+    let upstream = fixture.root.path().join("upstream.exe");
+    fs::write(&upstream, "explicit preview upstream").unwrap();
+    let run = |preview: bool, extra: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command.arg("deploy");
+        if preview {
+            command.arg("--preview");
+        }
+        command
+            .arg("--source")
+            .arg(&source)
+            .arg("--state")
+            .arg(&native_state)
+            .arg("--codex-home")
+            .arg(&fixture.home)
+            .arg("--user-home")
+            .arg(&fixture.user)
+            .arg("--upstream")
+            .arg(&upstream)
+            .args(["--path-scope", "Process", "--cargo"])
+            .arg(env!("CARGO_BIN_EXE_harness-launch-fixture"))
+            .args(extra)
+            .env("HARNESS_LAUNCH_FIXTURE_STARTED", &marker)
+            .env("HARNESS_LAUNCH_FIXTURE_MODE", "report")
+            .output()
+            .unwrap()
+    };
+    let unchanged = || {
+        assert!(!marker.exists(), "preview invoked the compiler");
+        assert_eq!(fs::read(&config).unwrap(), b"model = 'owned-setting'\n");
+        assert_eq!(fs::read(&foreign).unwrap(), b"unrelated user data");
+        assert_eq!(
+            fs::read(&selection).unwrap(),
+            b"preserve existing selection"
+        );
+        assert_eq!(fs::read(build.join("build.json")).unwrap(), record);
+        assert!(!fixture.state.exists());
+        assert!(!fixture.home.join("AGENTS.md").exists());
+        assert!(!fixture.home.join("harness/bin").exists());
+    };
+    let output = run(true, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["build_check"]["status"], "healthy");
+    unchanged();
+    fs::write(source.join("crates/one/src/lib.rs"), "changed source").unwrap();
+
+    for extra in [
+        vec![],
+        vec!["--reset"],
+        vec!["--build", build.to_str().unwrap()],
+    ] {
+        let output = run(true, &extra);
+        assert!(
+            output.status.success(),
+            "stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["status"], "preview");
+        assert_eq!(PathBuf::from(report["build"].as_str().unwrap()), build);
+        assert_eq!(report["build_check"]["status"], "source-stale");
+        assert_eq!(report["build_check"]["runtime_allowed"], true);
+        assert_eq!(
+            report["build_selection"],
+            if extra.first() == Some(&"--build") {
+                "explicit"
+            } else {
+                "verified-existing"
+            }
+        );
+        unchanged();
+    }
+
+    // Missing component prerequisites remain visible, including every requested
+    // plan. Preview must not silently omit --all or perform installation.
+    let output = run(true, &["--all"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["components"].as_array().unwrap().len(), 4);
+    assert_eq!(report["status"], "partial");
+    assert!(!output.status.success());
+    unchanged();
+
+    // Explicit selection remains authoritative even when an implicit candidate
+    // is available.
+    let missing = fixture.root.path().join("missing-build");
+    assert!(
+        !run(true, &["--build", missing.to_str().unwrap()])
+            .status
+            .success()
+    );
+    unchanged();
+
+    // Applying the changed source independently prepares a current candidate.
+    let output = run(false, &[]);
+    assert!(!output.status.success());
+    assert!(marker.exists(), "applying skipped preparation: {output:?}");
+    fs::remove_file(&marker).unwrap();
+    unchanged();
+
+    // An altered build cannot be reused or treated as an explicit verified
+    // candidate. The ordinary implicit preparation path invokes the compiler.
+    fs::write(build.join(build_identity::BINARIES[0]), "altered").unwrap();
+    assert!(
+        !run(true, &["--build", build.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(!marker.exists());
+    let output = run(true, &[]);
+    assert!(!output.status.success());
+    assert!(marker.exists(), "missing normal preparation: {:?}", output);
+    fs::remove_file(&marker).unwrap();
+    fs::rename(&build, fixture.root.path().join("retained-altered-build")).unwrap();
+    let output = run(true, &[]);
+    assert!(!output.status.success());
+    assert!(
+        marker.exists(),
+        "missing first-build preparation: {:?}",
+        output
+    );
+    assert_eq!(fs::read(&config).unwrap(), b"model = 'owned-setting'\n");
+    assert_eq!(fs::read(&foreign).unwrap(), b"unrelated user data");
+    assert!(!fixture.state.exists());
+}
+
+#[test]
 fn actual_command_preserves_absent_homes_and_legacy_adoption_after_relocation() {
     let f = Fixture::new();
     let absent = f.run();

@@ -7,7 +7,7 @@ An observed `deploy --preview` without `--build` entered immutable build prepara
 - Reuse an eligible existing verified build for an implicit-build deployment preview through the existing selection owner, without compiling merely to inspect the plan.
 - Show the selected build identity and its relationship to the requested source so a preview cannot masquerade as verification or delivery of newly compiled code.
 - Preserve explicit build selection, ordinary deployment checks, component previews, ownership guards and the existing preparation path when no eligible build is available.
-- Measure the change on the separately specified executor-watch workload before deciding whether to adopt it. Include preparation and checking costs and retain an inconclusive or rejected result when reuse does not help.
+- Integrate and deliver the behavior after direct native acceptance proves verified reuse, truthful source/build reporting and unchanged deployment safeguards. A model-backed comparison is not required for this change; no end-to-end efficiency claim follows from avoiding compilation during preview.
 
 ## Capabilities
 
@@ -21,4 +21,4 @@ None.
 
 ## Impact
 
-The affected owner is native deployment/build selection, principally `crates/codex-harness/src/install_cli.rs`, its existing native deployment tests, the `harness-deploy` skill and the installation guide. This adds no dependency or model/provider change. Experimental implementation and the benefit decision remain separate from mainline integration and live publication.
+The affected owner is native deployment/build selection, principally `crates/codex-harness/src/install_cli.rs`, its existing native deployment tests, the `harness-deploy` skill and the installation guide. This adds no dependency or model/provider change. Recover applicable retained implementation before adding missing work, then use the ordinary checked integration and installation lifecycle.

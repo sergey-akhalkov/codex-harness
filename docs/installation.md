@@ -185,6 +185,23 @@ delivery:
 codex-harness deploy --source "<absolute-kit-checkout>" [--all] [--reset]
 ```
 
+`deploy --preview` without `--build` first selects an integrity-verified build
+from the same checkout in the manager's owned state (or the explicit `--state`).
+When one is available, planning does not invoke Cargo. The receipt identifies
+the selected directory and digest; `build_selection = verified-existing` records
+this reuse, and `build_check.status` reports whether the source is current or
+`source-stale`. An older intact build can support planning; the preview does not
+certify changed source as compiled, tested or installed. Explicit `--build`
+selection remains authoritative. With no eligible build, including first use,
+the ordinary preparation path and its errors still apply. An applying deploy
+independently prepares and validates its candidate as before.
+
+Preview preserves installation links, settings, build selection and reset
+targets. `--all --preview` reports each component's plan through its existing
+owner; missing prerequisites remain explicit failures and do not disappear
+from the receipt. Avoiding preview compilation establishes this bounded
+behavior, not an end-to-end time or token saving.
+
 For connected code tools, delivery requires real Serena semantic acceptance
 before link changes and through the installed manager afterward. The receipt's
 `verification.serena.status` must be `semantic-ready`; `not-connected` records

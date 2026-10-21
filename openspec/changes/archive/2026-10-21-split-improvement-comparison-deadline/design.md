@@ -12,24 +12,19 @@ The intermediate 36-test a target finished in 1671.50 s, over the 1500 s budget,
 
 A complete-green attempt on 2026-10-13 (readiness fix 465691e, same heavy account) was terminated by the 1800 s command deadline after 28 of the 29 a tests passed, the last in flight; all seven former poison cascades executed for real and passed. The failed-run numbers above therefore understate the green cost: under that load the complete green a run did not finish inside the 1800 s command deadline (test time alone exceeded 1769 s), so it cannot meet the 1500 s budget. Re-derive the boundary from per-target green timings; if the two-target green total stays >=3000 s, <1500 s per target is infeasible for two targets and the split shape needs a lead decision.
 
-No measured run of the pre-split single target is retained from this session; that baseline remains open and no history is reconstructed.
+No measured run of the pre-split single target is retained from this session; no comparison result is reconstructed or claimed.
 
 Boundary re-derivation (2026-10-13, lead decision): the old A boundary exceeded its deadline, so three targets were selected to provide measured headroom without another diagnostic full run. No complete two-target green total was measured. The suite was re-split into `improvement_comparison_a` (16 tests), `improvement_comparison_b` (21) and `improvement_comparison_c` (13 moved tests) with byte-identical bodies; coverage parity re-verified (50 = 16+21+13; 0 duplicates, 0 missing, 0 extra, 0 body mismatches) and the workflow plus `ci_workflow` equality contract list all three. Complete green runs recorded 2026-10-13 on candidate 730b599 (default heavy account, serialized): a finished 16 passed in 895.07 s, c 13 passed in 933.31 s and b 21 passed in 1201.51 s; every whole target stayed under the 1500 s budget.
 
-## Experiment selection
+## Acceptance scope
 
-Method: paired-implementations
-Claim: local-operation
-Outcome: workload acceptance wall time
-Rationale: the per-command deadline overrun manifests deterministically whenever the workload agent verifies against the full comparison coverage, so a paired same-task implementation measures the effect on real agent work
-Controls: unchanged frozen task inputs and oracle, one measured attempt per arm, serialized arms, nuisance plan frozen before results
-Projection: removes one forced split plus one repeated setup and queue wait per full-suite verification
-Baseline: the unsplit target at the same base revision
-Stopping: one predeclared matched pair, failures retained without retry
+On 2026-10-21 the owner explicitly removed the paired-implementation experiment from this change and requested archival based on the completed technical acceptance. The experiment was not performed and is not marked complete. Required acceptance remains the complete green native targets within the deadline margin, preservation of every pre-split test exactly once, and CI target-list parity.
+
+The recorded acceptance applies to candidate 730b599 on 2026-10-13. Later additions to the test targets are not covered by those timings; archiving this change does not assert a fresh measurement of the current suite or an end-to-end agent-work speedup.
 
 ## Risks
 
-- Split boundary hides a cross-module shared-state dependency -> all three targets still run in CI and the full local set; the workload oracle requires the complete set green.
+- Split boundary hides a cross-module shared-state dependency -> all three targets still run in CI and the full local set; acceptance requires the complete set green.
 - CI target list drift -> the equality contract test fails on any mismatch.
 
 ## Migration Plan
@@ -38,6 +33,6 @@ Stopping: one predeclared matched pair, failures retained without retry
 2. Move tests across the boundary; keep names identical.
 3. Update the workflow and equality contract; run all three targets end-to-end under heavy.
 
-## Open Questions
+## Acceptance outcome
 
-The target boundary is verified by the three complete green runs. The predeclared paired-implementation experiment above remains open: these native checks do not establish an end-to-end agent-work cost comparison against the unsplit baseline. Failed historical runs remain evidence of their actual exercised scope.
+The three complete green runs, coverage parity and CI contract checks satisfy the agreed technical scope at the recorded candidate. No comparative experiment remains required under the scope decision above. Failed historical runs remain evidence of their actual exercised scope.

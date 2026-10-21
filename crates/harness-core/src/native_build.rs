@@ -674,10 +674,14 @@ pub fn freshest_verified(state: &Path) -> io::Result<PathBuf> {
         })
 }
 
-/// The freshest verified build published from exactly this source. A build
-/// from another checkout, or one whose recorded source no longer matches the
-/// live files, is never selected for delivery.
-fn freshest_for_source(state: &Path, source: &Path) -> io::Result<Option<PathBuf>> {
+/// Select within the existing integrity-verified publication history. Applying
+/// delivery requires current source; a planning preview may use an older build
+/// from the same checkout and reports its source relationship separately.
+fn freshest_for_source(
+    state: &Path,
+    source: &Path,
+    require_current_source: bool,
+) -> io::Result<Option<PathBuf>> {
     let source = source.canonicalize()?;
     Ok(candidate_builds(state)?
         .into_iter()
@@ -687,9 +691,18 @@ fn freshest_for_source(state: &Path, source: &Path) -> io::Result<Option<PathBuf
                 .ok()
                 .and_then(|record| record.source_root.canonicalize().ok())
                 .is_some_and(|root| root == source)
-                && build_identity::check(path, Some(&source)).status
-                    == build_identity::Health::Healthy
+                && (!require_current_source
+                    || build_identity::check(path, Some(&source)).status
+                        == build_identity::Health::Healthy)
         }))
+}
+
+/// A planning-only selection from an already owned state, without preparing
+/// or activating anything. The caller retains normal preparation when no
+/// eligible build is available.
+pub fn preview_build(state: &Path, source: &Path) -> io::Result<Option<PathBuf>> {
+    verify_owned_state(state)?;
+    freshest_for_source(state, source, false)
 }
 
 /// The build delivered by an Install/Update that names none: the freshest
@@ -718,7 +731,7 @@ fn delivery_from(executable: &Path, source: &Path) -> io::Result<PathBuf> {
         return Err(outside());
     }
     let state = builds.parent().ok_or_else(outside)?;
-    freshest_for_source(state, source)?
+    freshest_for_source(state, source, true)?
         .ok_or_else(|| {
             io::Error::other(
                 "No integrity-verified native build matches the selected source; run an explicit build first.",
@@ -1536,12 +1549,21 @@ mod tests {
         let from_second = published_from(&state, "bbbb0000bbbb0000-2500-2", &second, BINARIES);
         assert_eq!(freshest_verified(&state).unwrap(), from_second);
         assert_eq!(
-            freshest_for_source(&state, &first).unwrap(),
+            freshest_for_source(&state, &first, true).unwrap(),
             Some(from_first.clone())
         );
         // A build whose live source no longer matches is not deliverable.
         fs::write(first.join("crates/one/src/lib.rs"), "changed").unwrap();
-        assert_eq!(freshest_for_source(&state, &first).unwrap(), None);
+        assert_eq!(freshest_for_source(&state, &first, true).unwrap(), None);
+        assert_eq!(
+            preview_build(&state, &first).unwrap(),
+            Some(from_first.clone())
+        );
+        fs::write(from_first.join(BINARIES[0]), "altered").unwrap();
+        assert_eq!(preview_build(&state, &first).unwrap(), None);
+        let missing = temp.path().join("missing");
+        assert!(preview_build(&missing, &first).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]

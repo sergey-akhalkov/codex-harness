@@ -4,9 +4,9 @@
 - [x] 1.2 Split the tests at the measured boundary into three deadline-sized targets, keeping every test name and body unchanged; the three targets compile and each serialized run finishes under 1500 s on this machine.
 - [x] 1.3 Update `.github/workflows/windows-installed-integration.yml` and the `ci_workflow` equality contract to the new target set; run all three targets end-to-end through `codex-harness heavy` and record actual durations.
 
-## 2. Complete the agreed comparison
+## Scope
 
-- [ ] 2.1 Execute the paired-implementation experiment already specified in `design.md`, preserving frozen inputs, the complete acceptance oracle, the unsplit baseline, serialized arms and the predeclared stopping rule. Retain failed or inconclusive outcomes honestly; the three green native targets establish the technical split, not this comparison.
+Former task 2.1 (the paired-implementation experiment) was removed from scope by the [owner's decision](design.md#acceptance-scope). It was not performed or marked complete. All three retained implementation and verification tasks are complete on the recorded candidate.
 
 ## Evidence (recorded 2026-10-13)
 

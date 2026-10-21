@@ -183,6 +183,14 @@ trade-offs in the existing decision owner, without new paperwork or proof quotas
 This supersedes mandatory dual savings and strict quality improvement for this
 change; it does not rewrite frozen policies of other experiments.
 
+**2026-10-21, deployment preview:** the user removed the mandatory model-backed
+comparison and benefit gate from `reuse-verified-build-for-deployment-preview`.
+Complete that change through direct native behavior acceptance, current-source
+integration and installed delivery verification. Preserve integrity, freshness
+and ownership checks and retained historical evidence. Avoiding compilation for
+an eligible preview does not establish overall time or token savings. This scoped
+decision does not close the executor-watch workload or parent improvement loop.
+
 One clear, attributable bottleneck should produce a bounded correction promptly. Do not
 wait for repeated episodes, votes or statistical proof when the available facts
 already support the remedy. Investigate only uncertainty that changes the

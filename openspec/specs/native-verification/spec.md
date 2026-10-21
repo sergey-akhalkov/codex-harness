@@ -1,4 +1,10 @@
-## ADDED Requirements
+# native-verification Specification
+
+## Purpose
+
+Keep native integration verification complete and runnable within shared command deadlines, with matching coverage in local execution and CI.
+
+## Requirements
 
 ### Requirement: Comparison suite targets fit the heavy deadline
 
