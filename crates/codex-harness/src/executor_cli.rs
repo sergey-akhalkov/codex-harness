@@ -64,6 +64,7 @@ use observation::{
     COVERAGE_NATIVE, ControlOutcome, RunObservation, RunTracker, STATE_ACCEPTED, STATE_COMPLETED,
     STATE_DEFECT, STATE_FAILED, STATE_INTERRUPTED, STATE_STARTED,
 };
+pub(crate) use warning::SelectionObserver;
 use warning::{Relay, WarningQueue};
 
 const USAGE: &str = concat!(
@@ -6048,7 +6049,7 @@ impl OwnedFrontend {
     }
 
     /// The frontend's own exit code, when it already exited.
-    fn exit_code(&self) -> io::Result<Option<u32>> {
+    pub(crate) fn exit_code(&self) -> io::Result<Option<u32>> {
         self.process.exit_code()
     }
 
@@ -6152,7 +6153,7 @@ fn write_frontend_record(
     )
 }
 
-fn note_log(log: &Path, line: &str) {
+pub(crate) fn note_log(log: &Path, line: &str) {
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log) {
         let _ = writeln!(file, "{line}");
     }
@@ -6162,7 +6163,7 @@ fn note_log(log: &Path, line: &str) {
 /// Message and stop resolve the slot's endpoint file; leaving the previous
 /// port, token or process in place would let that address act on the successor.
 /// A missing file is the first run of the slot.
-fn retire_stale_endpoint(path: &Path) -> io::Result<()> {
+pub(crate) fn retire_stale_endpoint(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -6304,6 +6305,95 @@ pub(crate) fn attach_owned_frontend(
         process,
         program: upstream,
         relay,
+    })
+}
+
+/// Attaches the native frontend without choosing its thread. The relay learns
+/// the exact identity from the frontend's own successful new/resume/fork
+/// response and runs `observer` before releasing that success to the frontend.
+/// The prepared TUI arguments, including a native profile, prompt and `--`
+/// separator, stay verbatim after the relay address; no resume target or model
+/// override is synthesized here.
+pub(crate) fn attach_observed_frontend(
+    plan: &ControlPlan,
+    frontend_cwd: &Path,
+    tui: &[OsString],
+    conversation: &Conversation,
+    observer: SelectionObserver,
+) -> io::Result<OwnedFrontend> {
+    if !io::stdout().is_terminal() || harness_core::task_control::console_caption()?.is_none() {
+        return Err(invalid(
+            "this host has no live terminal surface for the native frontend; run it in its own terminal instead of a redirected pipe",
+        ));
+    }
+    let upstream = upstream_executable(&plan.home).map_err(|error| {
+        invalid(&format!(
+            "native frontend attachment is unavailable ({error}). Remedy: restore harness/native-launch.json for this CODEX_HOME and retry"
+        ))
+    })?;
+    if !upstream.is_file() {
+        return Err(invalid(&format!(
+            "the registered native Codex frontend is missing: {}; restore the installed upstream and retry",
+            upstream.display()
+        )));
+    }
+    let relay = Relay::start_observed(
+        conversation.endpoint().port(),
+        conversation.endpoint().token(),
+        observer,
+    )
+    .map_err(|error| {
+        invalid(&format!(
+            "the native selection relay could not front this conversation: {error}; the frontend was not started and the selected thread was not registered"
+        ))
+    })?;
+    let mut spec = CommandSpec::new(&upstream);
+    spec.inherit_console = true;
+    spec.current_dir = Some(frontend_cwd.to_owned());
+    let mut args = vec![
+        OsString::from("--remote"),
+        OsString::from(format!("ws://127.0.0.1:{}", relay.port())),
+        OsString::from("--remote-auth-token-env"),
+        OsString::from(FRONTEND_TOKEN_ENV),
+    ];
+    args.extend(tui.iter().cloned());
+    spec.args = args;
+    spec.env.insert(
+        "CODEX_HOME".into(),
+        Some(plan.home.as_os_str().to_os_string()),
+    );
+    spec.env.insert(
+        FRONTEND_TOKEN_ENV.into(),
+        Some(conversation.endpoint().token().into()),
+    );
+    if let Some(Some(path)) = plan.env.get(&OsString::from("PATH")) {
+        spec.env.insert("PATH".into(), Some(path.clone()));
+    }
+    for name in INHERITED_SESSION_ENV {
+        spec.env.insert((*name).into(), None);
+    }
+    spec.env.insert(EXECUTOR_SESSION_ENV.into(), None);
+    spec.env.insert(control::EXECUTOR_RUN_ENV.into(), None);
+    spec.env.insert(BOUNDED_LEAD_SESSION_ENV.into(), None);
+    spec.env.insert(
+        crate::self_reflection_cli::REFLECTION_SESSION_ENV.into(),
+        None,
+    );
+    spec.env
+        .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
+    spec.env
+        .insert("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE".into(), None);
+    let job = Job::new(Limits::default())?;
+    let process = job.spawn(&spec).map_err(|error| {
+        invalid(&format!(
+            "the native frontend did not start: {error}; the selected thread was not registered"
+        ))
+    })?;
+    Ok(OwnedFrontend {
+        job: Some(job),
+        process,
+        program: upstream,
+        relay: Some(relay),
     })
 }
 
@@ -7221,7 +7311,11 @@ fn fail_control(
 /// session's remaining members keep their own lifetime exactly as they do
 /// after an ordinary launcher exit on the JSONL route. The child is ended only
 /// when its live identity matches the one this host spawned.
-fn end_owned_child(job: Job, conversation: &Conversation, program: &Path) -> io::Result<()> {
+pub(crate) fn end_owned_child(
+    job: Job,
+    conversation: &Conversation,
+    program: &Path,
+) -> io::Result<()> {
     let Some(child) = conversation.process() else {
         return Ok(());
     };

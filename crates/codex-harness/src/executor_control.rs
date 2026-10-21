@@ -788,6 +788,21 @@ impl Endpoint {
         self.port
     }
 
+    /// This endpoint addressed to the thread the native frontend selected.
+    /// The process proof, address and bearer are unchanged; only the registry
+    /// identity is attached.
+    pub(crate) fn for_thread(&self, thread_id: &str) -> io::Result<Self> {
+        let key = lead_key(thread_id)?;
+        if key != thread_id {
+            return Err(invalid(
+                "the selected native thread identity is not an exact registry key",
+            ));
+        }
+        let mut endpoint = self.clone();
+        endpoint.thread_id = Some(key);
+        Ok(endpoint)
+    }
+
     /// Writes the record where the lead reads it: beside the dispatch receipt,
     /// replacing any previous record of the same slot in one step.
     pub fn record(&self, path: &Path) -> io::Result<()> {
@@ -1565,7 +1580,7 @@ impl Conversation {
         Ok(conversation)
     }
 
-    fn open(job: &Job, plan: &ControlPlan) -> io::Result<Self> {
+    pub(crate) fn open(job: &Job, plan: &ControlPlan) -> io::Result<Self> {
         if plan.launcher.as_os_str().is_empty() || plan.slot.as_os_str().is_empty() {
             return Err(invalid(
                 "a control session requires the launcher, the kit home and the bound slot",
@@ -1723,6 +1738,27 @@ impl Conversation {
     /// The bound native thread every control request addresses.
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    /// Adopts the thread the native frontend selected on this backend. The
+    /// ordinary host starts no thread of its own: selection is observed from
+    /// the frontend's exact `result.thread.id`, then the same app-server is
+    /// driven for that conversation.
+    pub(crate) fn adopt_thread(&mut self, thread_id: &str) -> io::Result<()> {
+        let key = lead_key(thread_id)?;
+        if key != thread_id {
+            return Err(invalid(
+                "the selected native thread identity is not an exact registry key",
+            ));
+        }
+        if !self.thread_id.is_empty() && self.thread_id != key {
+            return Err(invalid(
+                "this app-server is already addressed to another native thread",
+            ));
+        }
+        self.thread_id = key.clone();
+        self.endpoint.thread_id = Some(key);
+        Ok(())
     }
 
     /// The identity the started thread was verified against, when this session

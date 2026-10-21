@@ -26,6 +26,8 @@ mod mcp_cli;
 #[cfg(windows)]
 mod native_read_rpc;
 #[cfg(windows)]
+mod ordinary_lead;
+#[cfg(windows)]
 mod outcome_arm;
 mod outcome_case_fixture;
 mod outcome_discovery;
@@ -127,6 +129,11 @@ fn verify_entrypoint(required: Admission) -> io::Result<()> {
 
 fn run() -> io::Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    #[cfg(windows)]
+    if args.first().is_some_and(|arg| arg == "_ordinary-lead") {
+        verify_runtime()?;
+        return ordinary_lead::run(&args[1..]);
+    }
     #[cfg(windows)]
     if args
         .first()
