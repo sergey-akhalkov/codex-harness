@@ -41,6 +41,19 @@ fn process(workspace: &Workspace, thread: &str) -> ConsoleOutcome {
 }
 
 fn process_with(workspace: &Workspace, thread: &str, lead_outcome: &str) -> ConsoleOutcome {
+    process_with_source(workspace, thread, LEAD_THREAD, lead_outcome)
+}
+
+/// Runs the real process command as `host_thread` while serving the native
+/// source conversation named by the retained record. Existing succession
+/// fixtures use this split to prove that a successor cannot complete a
+/// predecessor's pending stage even when the predecessor's source is present.
+fn process_with_source(
+    workspace: &Workspace,
+    host_thread: &str,
+    source_thread: &str,
+    lead_outcome: &str,
+) -> ConsoleOutcome {
     let mut spec = CommandSpec::new(manager());
     spec.args = vec![
         "delivery-improvement".into(),
@@ -56,17 +69,39 @@ fn process_with(workspace: &Workspace, thread: &str, lead_outcome: &str) -> Cons
     apply_fixture_env(
         workspace,
         &mut spec,
-        LEAD_THREAD,
+        source_thread,
         "complete",
         lead_outcome,
         NO_FINDING,
         LEAD_RESULT,
     );
     spec.env
-        .insert("HARNESS_REFLECTION_HOST".into(), Some(thread.into()));
+        .insert("HARNESS_REFLECTION_HOST".into(), Some(host_thread.into()));
     spec.env
-        .insert("CODEX_THREAD_ID".into(), Some(thread.into()));
+        .insert("CODEX_THREAD_ID".into(), Some(host_thread.into()));
     wait_session(ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap())
+}
+
+/// Runs the real process command for a current owner whose accepted source
+/// thread is the same as the host thread.
+fn process_current(workspace: &Workspace, thread: &str, lead_outcome: &str) -> ConsoleOutcome {
+    process_with_source(workspace, thread, thread, lead_outcome)
+}
+
+fn acceptance_files(controller: &ReflectionController, acceptance: &str) -> Vec<(String, Vec<u8>)> {
+    let directory = acceptance_dir(controller, acceptance);
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            files.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            ));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
 }
 
 fn succeed(workspace: &Workspace, thread: &str) -> Value {
@@ -154,7 +189,7 @@ fn lead_dispatches(server: &Server) -> usize {
 }
 
 #[test]
-fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() {
+fn successor_completes_current_work_while_finished_predecessors_pending_stage_stays_dormant() {
     let workspace = Workspace::new("succession-delivery", LeadMode::Delivered);
     let (controller, acceptance) = accepted_with_owner(&workspace);
     lifecycle::install_fixture(&workspace);
@@ -173,6 +208,7 @@ fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() 
     let lifecycle_before = controller.stored_state().unwrap().unwrap();
     let executor_before = acceptance_stage(&controller, &acceptance, "executor-stage");
     let chain_before = read_json(&chain_path(&controller, &acceptance));
+    let predecessor_files = acceptance_files(&controller, &acceptance);
     assert_eq!(chain_before["leadSource"]["thread"], LEAD_THREAD);
     assert_eq!(chain_before["leadReturn"]["thread"], LEAD_THREAD);
 
@@ -197,33 +233,90 @@ fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() 
     assert_eq!(receipt["lead_session"], SUCCESSOR_THREAD);
     assert_eq!(receipt["revision"], lifecycle_before.binding.revision + 1);
 
-    let completed = process(&workspace, SUCCESSOR_THREAD);
+    // The predecessor is verifiably finished, but its exact pending lead stage
+    // is still present. A successor host poll must not select that stage even
+    // when the predecessor's source conversation is available to the fixture.
+    let dormant = process(&workspace, SUCCESSOR_THREAD);
+    assert_eq!(
+        request_counts(&workspace),
+        (1, 1, 0, 0),
+        "the successor started the finished predecessor's pending stage: {}",
+        dormant.transcript
+    );
+    assert_eq!(lead_dispatches(&workspace.lead), 0);
+    assert_eq!(lead_dispatches(&workspace.successor), 0);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), retained);
+    assert_eq!(
+        acceptance_files(&controller, &acceptance),
+        predecessor_files
+    );
+
+    // A fresh acceptance in the current successor activation is still ordinary
+    // work and must complete the entire chain exactly once.
+    let source = lifecycle::source_fixture(&workspace, "succession-current-only", true);
+    successor_turn_available(&workspace);
+    let current = lifecycle::prepare_additional_ordinary_acceptance(
+        &workspace,
+        &manager(),
+        &source,
+        SUCCESSOR_THREAD,
+        "successor-current-run",
+        2,
+    );
+    let accepted = current.accept(&workspace);
+    workspace.successor_state.lock().unwrap().source_turn_active = false;
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["modelCalls"], 0, "{accepted}");
+    assert_eq!(
+        accepted["reflection"]["automaticTrigger"], true,
+        "{accepted}"
+    );
+    let current_acceptance = accepted["acceptanceId"].as_str().unwrap().to_owned();
+    let transferred = controller.stored_state().unwrap().unwrap();
+    assert_eq!(transferred.binding.id, lifecycle_before.binding.id);
+    assert_eq!(transferred.binding.lead_session, SUCCESSOR_THREAD);
+    assert_eq!(transferred.records[&acceptance], retained);
+
+    let completed = process_current(&workspace, SUCCESSOR_THREAD, "complete");
     assert_eq!(completed.outcome.exit_code, 0, "{}", completed.transcript);
-    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(
+        request_counts(&workspace),
+        (2, 2, 1, 1),
+        "the current acceptance did not complete exactly once: {}",
+        completed.transcript
+    );
     assert_eq!(lead_dispatches(&workspace.lead), 0);
     assert_eq!(lead_dispatches(&workspace.successor), 1);
     assert_eq!(
         acceptance_stage(&controller, &acceptance, "executor-stage"),
         executor_before
     );
-
-    let record = controller.record(&acceptance).unwrap().unwrap();
-    assert_eq!(record.executor.state, StageState::Retained);
-    assert_eq!(record.lead.state, StageState::Retained);
-    assert_eq!(record.delivery, DeliveryState::Consumed);
-    assert_eq!(record.binding.lead_session, LEAD_THREAD);
     assert_eq!(
-        record.executor.outcome.as_ref().unwrap().summary,
+        acceptance_files(&controller, &acceptance),
+        predecessor_files
+    );
+
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), retained);
+    let current_record = controller.record(&current_acceptance).unwrap().unwrap();
+    assert_eq!(current_record.executor.state, StageState::Retained);
+    assert_eq!(current_record.lead.state, StageState::Retained);
+    assert_eq!(current_record.delivery, DeliveryState::Consumed);
+    assert_eq!(current_record.binding.lead_session, SUCCESSOR_THREAD);
+    assert_eq!(
+        current_record.executor.outcome.as_ref().unwrap().summary,
         NO_FINDING
     );
-    assert_eq!(record.lead.outcome.as_ref().unwrap().summary, LEAD_RESULT);
+    assert_eq!(
+        current_record.lead.outcome.as_ref().unwrap().summary,
+        LEAD_RESULT
+    );
 
     let lead_fork = fixture_requests(&workspace, "lead-self-reflection", "thread/fork");
     assert_eq!(lead_fork.len(), 1, "{lead_fork:?}");
-    assert_eq!(lead_fork[0]["params"]["threadId"], LEAD_THREAD);
+    assert_eq!(lead_fork[0]["params"]["threadId"], SUCCESSOR_THREAD);
     assert_eq!(lead_fork[0]["params"]["lastTurnId"], LEAD_SOURCE_TURN);
 
-    let delivery = read_json(&delivery_path(&controller, &acceptance));
+    let delivery = read_json(&delivery_path(&controller, &current_acceptance));
     assert_eq!(delivery["state"], "delivered");
     {
         let successor = workspace.successor_state.lock().unwrap();
@@ -242,18 +335,24 @@ fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() 
         );
     }
 
-    let chain_after = read_json(&chain_path(&controller, &acceptance));
-    assert_eq!(chain_after["leadSource"], chain_before["leadSource"]);
-    assert_eq!(chain_after["acceptedWork"], chain_before["acceptedWork"]);
-    let mut expected_chain = chain_before;
-    expected_chain["leadReturn"] = chain_after["leadReturn"].clone();
-    assert_eq!(chain_after, expected_chain);
+    assert_eq!(
+        read_json(&chain_path(&controller, &acceptance)),
+        chain_before
+    );
+    assert_eq!(
+        acceptance_files(&controller, &acceptance),
+        predecessor_files
+    );
 
-    let replay = process(&workspace, SUCCESSOR_THREAD);
+    let replay = process_current(&workspace, SUCCESSOR_THREAD, "complete");
     assert_eq!(replay.outcome.exit_code, 0, "{}", replay.transcript);
-    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
     assert_eq!(lead_dispatches(&workspace.successor), 1);
-    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), record);
+    assert_eq!(controller.record(&acceptance).unwrap().unwrap(), retained);
+    assert_eq!(
+        controller.record(&current_acceptance).unwrap().unwrap(),
+        current_record
+    );
     let settled = state_bytes(&controller);
 
     install_live_old_registry(&workspace);
@@ -263,10 +362,10 @@ fn successor_reuses_retained_executor_work_and_delivers_once_to_the_new_owner() 
         "{}",
         old_process.transcript
     );
-    assert_eq!(request_counts(&workspace), (1, 1, 1, 1));
+    assert_eq!(request_counts(&workspace), (2, 2, 1, 1));
     assert_eq!(lead_dispatches(&workspace.successor), 1);
     assert_eq!(
-        read_json(&delivery_path(&controller, &acceptance)),
+        read_json(&delivery_path(&controller, &current_acceptance)),
         delivery
     );
 
