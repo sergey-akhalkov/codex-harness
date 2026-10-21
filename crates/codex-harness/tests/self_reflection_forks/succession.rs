@@ -237,6 +237,7 @@ fn successor_completes_current_work_while_finished_predecessors_pending_stage_st
     // is still present. A successor host poll must not select that stage even
     // when the predecessor's source conversation is available to the fixture.
     let dormant = process(&workspace, SUCCESSOR_THREAD);
+    assert_eq!(dormant.outcome.exit_code, 0, "{}", dormant.transcript);
     assert_eq!(
         request_counts(&workspace),
         (1, 1, 0, 0),
