@@ -587,6 +587,9 @@ fn ordinary_reflection_forwards_bare_oss_selection_to_manager() {
 #[test]
 fn ordinary_reflection_keeps_uncapped_cpu_selection_on_the_manager_path() {
     let f = Fixture::new();
+    // The uncapped payload verifies that it left this account's shared budget
+    // by name. Keep the fixture's memberless budget alive for that lookup.
+    let _budget = SharedCpuBudget::acquire(&f.account, SHARED_CPU_PERCENT).unwrap();
     f.install_manager();
     f.set_reflection(Some(true));
     let args = vec![
