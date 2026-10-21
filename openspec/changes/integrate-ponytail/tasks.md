@@ -10,9 +10,9 @@ The user confirmed native installation, default enablement, installation documen
 ## 2. Deliver the normal setup
 
 - [x] 2.1 Update `docs/installation.md` with verified native plugin commands, prerequisites, trust, default enablement, existing-installation handling and accepted mode limitations, usable on another PC without copied account state.
-- [ ] 2.2 Verify Ponytail through the installed ordinary entry point and existing hook selection. Correct only a demonstrated RTK/Ponytail collision in its current owner; run relevant existing checks and real native loading.
+- [x] 2.2 Verify Ponytail through the installed ordinary entry point and existing hook selection. Correct only a demonstrated RTK/Ponytail collision in its current owner; run relevant existing checks and real native loading.
 
 ## 3. Consolidate and verify
 
 - [x] 3.1 Publish the reviewed ownership map and remove only equivalent harness instructions after plugin availability. Preserve additional obligations and protected workflows; verify the scoped diff and existing source/size checks.
-- [ ] 3.2 Observe final guidance and relevant resources in a fresh outside-checkout session and the selected external project read-only, without project tasks. Verify the handoff, links and strict OpenSpec validation; do not claim unexecuted other-PC checks or unmeasured savings.
+- [x] 3.2 Observe final guidance and relevant resources in a fresh outside-checkout session and the selected external project read-only, without project tasks. Verify the handoff, links and strict OpenSpec validation; do not claim unexecuted other-PC checks or unmeasured savings.
