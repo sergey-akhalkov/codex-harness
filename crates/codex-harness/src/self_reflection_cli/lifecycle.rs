@@ -951,6 +951,16 @@ fn succession(options: &Options, controller: &ReflectionController) -> io::Resul
     Ok(0)
 }
 
+/// A normal administrative stop may land after a consumer has observed the
+/// lifecycle as active. For that consumer the stop is the same typed no-op as
+/// an already-stopped lifecycle: no stage is admitted and retained records are
+/// untouched. A refusal that leaves the lifecycle active still surfaces.
+fn stopped_since_observation(controller: &ReflectionController) -> io::Result<bool> {
+    Ok(controller
+        .stored_state()?
+        .is_none_or(|state| state.lifecycle != LifecycleStatus::Active))
+}
+
 fn process(options: &Options, controller: &ReflectionController, quiet: bool) -> io::Result<i32> {
     let gate = gate::ReflectionGate::load(&options.source)?;
     let idle = || {
@@ -983,13 +993,30 @@ fn process(options: &Options, controller: &ReflectionController, quiet: bool) ->
         // active binding above. No model work, stage admission, retained result
         // or other lifecycle state changes; re-enabling sees only work retained
         // before the gate closed.
-        controller.poll_without_admission()?;
+        if let Err(error) = controller.poll_without_admission() {
+            // An administrative stop may land after the active observation
+            // above. Stopping is a typed no-op for this model-free consumer,
+            // not a failed poll; retained work is untouched.
+            if stopped_since_observation(controller)? {
+                return idle();
+            }
+            return Err(error);
+        }
         return idle();
     }
     // This is the ordinary current-owner route. Refresh the exact process
     // proof while the registration is available so a later retirement of the
     // registry record can still distinguish exit from an unreadable absence.
-    controller.retain_owner_process(&lead, &owner_process)?;
+    if let Err(error) = controller.retain_owner_process(&lead, &owner_process) {
+        // The same stop can land between the active observation and this
+        // refresh. The consumer must exit idle exactly as it does when it
+        // observes the stop itself; no stage was admitted and no record
+        // changed. Every refusal that leaves the lifecycle active surfaces.
+        if stopped_since_observation(controller)? {
+            return idle();
+        }
+        return Err(error);
+    }
     let Some(polled) = controller.poll_if_active()? else {
         return idle();
     };
