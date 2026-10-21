@@ -1698,11 +1698,16 @@ tool result. The controller must first resume the named empty thread by ID:
 attaching the TUI directly by its rollout path otherwise fails with missing
 source history on the tested CLI. This preparation makes no model request.
 Remote resume rejects CLI permission overrides even when they match
-the thread. For a new managed thread those options remain on the backend and
-are omitted from the attaching TUI; prompt, model, effort and presentation
-options remain. An explicit resume that requests changed permissions keeps the
-ordinary native path, with a diagnostic, until equivalent managed behavior is
-verified. Observers of TUI-created threads must subscribe after
+the thread. For a new managed thread and ordinary hosted `codex resume`, those
+options remain on the backend and are omitted from the attaching TUI; prompt,
+model, effort, profile and presentation options retain their ordinary routing.
+`native_hosted_resume_accepts_permission_configuration` exercises the installed
+native frontend with an owned named thread, verifies read-only/on-request
+permissions survive attachment, and makes no model requests. Run it through the
+`task_control_contract` target with `HARNESS_CONTROL_CODEX_EXE` set and
+`-- --ignored --exact --nocapture`. The legacy task-control planner still rejects
+explicit resume permission changes so its caller can retain the native path.
+Observers of TUI-created threads must subscribe after
 the first active turn; global thread-start events alone do not subscribe them
 to final turn events. The new visible-console option retains Job ownership
 and gives the new window its own standard devices.

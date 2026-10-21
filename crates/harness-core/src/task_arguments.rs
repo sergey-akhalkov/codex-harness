@@ -20,7 +20,8 @@
 //! carries their effect through thread/start, thread/resume and thread/fork.
 //! Legacy [plan] keeps its existing rejection of these flags.
 //!
-//! * ManagedArguments::tui keeps the caller's arguments verbatim. The caller
+//! * ManagedArguments::tui keeps the caller's arguments verbatim, except that
+//!   hosted resume keeps permission overrides on the backend only. The caller
 //!   owns adding its "--remote <ADDR>" endpoint, which must be inserted
 //!   before any "--" separator.
 //! * ManagedArguments::backend lists the arguments to pass after the
@@ -71,7 +72,8 @@ pub struct ManagedArguments {
     /// in encounter order, followed by the mapped overrides for the native
     /// session flags.
     pub backend: Vec<OsString>,
-    /// The caller's arguments, verbatim, for the native remote TUI. Prompt
+    /// The caller's arguments for the native remote TUI. Hosted resume omits
+    /// permission overrides, which remain on the backend. Prompt
     /// words, "--" separators, image values and native-frontend flags
     /// ("--oss", "--local-provider", "--search",
     /// "--dangerously-bypass-hook-trust", "--worktree", "--no-alt-screen",
@@ -162,6 +164,7 @@ struct Session {
 
 struct Parser<'a> {
     args: &'a [OsString],
+    resume_tui: Vec<OsString>,
     attachment: Vec<OsString>,
     waiting_attachment: Vec<OsString>,
     prompt: Option<String>,
@@ -212,6 +215,7 @@ fn plan_session(
 ) -> io::Result<Option<ManagedArguments>> {
     let mut parser = Parser {
         args,
+        resume_tui: Vec::new(),
         attachment: Vec::new(),
         waiting_attachment: Vec::new(),
         prompt: None,
@@ -263,7 +267,11 @@ fn plan_session(
         initial_input,
         waiting_attachment: parser.waiting_attachment,
         backend,
-        tui: args.to_vec(),
+        tui: if parser.hosted && parser.kind == Some(SessionKind::Resume) {
+            parser.resume_tui
+        } else {
+            args.to_vec()
+        },
         attachment: parser.attachment,
         cwd: directory,
         new_session,
@@ -289,11 +297,13 @@ impl Parser<'_> {
                     return Ok(false);
                 }
                 self.attachment.push(arg.clone());
+                self.resume_tui.push(arg.clone());
                 continue;
             }
             if text == "--" {
                 self.separator = true;
                 self.attachment.push(arg.clone());
+                self.resume_tui.push(arg.clone());
                 continue;
             }
             if let Some(long) = text.strip_prefix("--") {
@@ -314,6 +324,7 @@ impl Parser<'_> {
                 return Ok(false);
             }
             self.attachment.push(arg.clone());
+            self.resume_tui.push(arg.clone());
         }
         Ok(true)
     }
@@ -323,6 +334,10 @@ impl Parser<'_> {
         // an image value that merely looks like a flag.
         let flag = options[0].to_str().unwrap();
         let name = flag.split('=').next().unwrap();
+        if name == "--profile" || (!flag.starts_with("--") && flag.starts_with("-p")) {
+            self.resume_tui.extend_from_slice(options);
+            return;
+        }
         if matches!(
             name,
             "--sandbox"
@@ -330,9 +345,7 @@ impl Parser<'_> {
                 | "--approve-for-me"
                 | "--dangerously-bypass-approvals-and-sandbox"
                 | "--add-dir"
-                | "--profile"
-        ) || (!flag.starts_with("--")
-            && (flag.starts_with("-s") || flag.starts_with("-a") || flag.starts_with("-p")))
+        ) || (!flag.starts_with("--") && (flag.starts_with("-s") || flag.starts_with("-a")))
         {
             return;
         }
@@ -355,6 +368,7 @@ impl Parser<'_> {
                 return;
             }
         }
+        self.resume_tui.extend_from_slice(options);
         self.attachment.extend_from_slice(options);
         let first = options[0].to_string_lossy();
         if first == "--image" || first == "-i" {
@@ -1557,6 +1571,85 @@ mod tests {
                 .backend
                 .contains(&"sandbox_workspace_write.writable_roots=[\"D:/owned\"]".into())
         );
+    }
+
+    #[test]
+    fn hosted_resume_keeps_permissions_on_the_backend() {
+        for selection in [
+            vec!["resume"],
+            vec!["resume", "--last"],
+            vec!["resume", "saved-id"],
+        ] {
+            let mut args = argv(&[
+                "-c",
+                "approval_policy=\"never\"",
+                "--config=sandbox_mode=\"read-only\"",
+                "-cmodel_reasoning_effort=\"xhigh\"",
+                "--no-alt-screen",
+            ]);
+            args.extend(argv(&selection));
+            args.extend(argv(&["--", "--sandbox=workspace-write"]));
+            let planned = plan_hosted(&args, Path::new("D:/base"), Path::new("D:/base-home"))
+                .unwrap()
+                .unwrap();
+            let mut expected = argv(&["-cmodel_reasoning_effort=\"xhigh\"", "--no-alt-screen"]);
+            expected.extend(argv(&selection));
+            expected.extend(argv(&["--", "--sandbox=workspace-write"]));
+            assert_eq!(planned.tui, expected);
+            assert!(
+                planned
+                    .backend
+                    .contains(&"approval_policy=\"never\"".into())
+            );
+            assert!(
+                planned
+                    .backend
+                    .contains(&"sandbox_mode=\"read-only\"".into())
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_resume_preserves_profile_and_option_looking_image_values() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[profiles.work]\nmodel='gpt-6-astra'\n",
+        )
+        .unwrap();
+        let args = argv(&[
+            "-pwork",
+            "-sread-only",
+            "-anever",
+            "--add-dir=D:/owned",
+            "--image=--sandbox=picture.png",
+            "resume",
+            "--last",
+        ]);
+        let planned = plan_hosted(&args, Path::new("D:/base"), home.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            planned.tui,
+            argv(&[
+                "-pwork",
+                "--image=--sandbox=picture.png",
+                "resume",
+                "--last"
+            ])
+        );
+        for value in [
+            "model=\"gpt-6-astra\"",
+            "sandbox_mode=\"read-only\"",
+            "approval_policy=\"never\"",
+            "sandbox_workspace_write.writable_roots=[\"D:/owned\"]",
+        ] {
+            assert!(
+                planned.backend.contains(&value.into()),
+                "{:?}",
+                planned.backend
+            );
+        }
     }
 
     #[test]
