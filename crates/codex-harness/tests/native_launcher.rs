@@ -500,25 +500,26 @@ fn ordinary_reflection_bypasses_nonordinary_and_owned_sessions() {
 }
 
 #[test]
-fn ordinary_reflection_rejects_unsupported_native_arguments_before_starting_a_payload() {
+fn ordinary_reflection_forwards_native_frontend_flags_to_manager() {
     let f = Fixture::new();
     f.install_manager();
     f.set_reflection(Some(true));
-    let marker = f.root.path().join("unsupported-argument-started");
-    let output = f
-        .command()
-        .args(["--search", "hello"])
-        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &marker)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--search"), "{stderr}");
-    assert!(stderr.contains("live web search"), "{stderr}");
+    let args = vec![
+        OsString::from("--search"),
+        OsString::from("--dangerously-bypass-hook-trust"),
+        OsString::from("hello"),
+    ];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    let expected = args
+        .iter()
+        .map(|arg| json!(arg.to_str().unwrap()))
+        .collect::<Vec<_>>();
     assert!(
-        !marker.exists(),
-        "an unsupported argument must start no payload"
+        manager_args.ends_with(&expected),
+        "the manager must receive native frontend choices unchanged: {manager_args:?}"
     );
 }
 
@@ -548,7 +549,7 @@ fn ordinary_reflection_forwards_oss_provider_selection_to_manager() {
 }
 
 #[test]
-fn ordinary_reflection_reads_the_declared_oss_provider_before_manager_entry() {
+fn ordinary_reflection_leaves_declared_oss_provider_to_native_frontend() {
     let f = Fixture::new();
     f.install_manager();
     f.set_reflection(Some(true));
@@ -564,25 +565,22 @@ fn ordinary_reflection_reads_the_declared_oss_provider_before_manager_entry() {
 }
 
 #[test]
-fn ordinary_reflection_reports_missing_oss_provider_before_starting_a_payload() {
+fn ordinary_reflection_forwards_bare_oss_selection_to_manager() {
     let f = Fixture::new();
     f.install_manager();
     f.set_reflection(Some(true));
-    let marker = f.root.path().join("missing-provider-started");
-    let output = f
-        .command()
-        .args(["--oss", "hello"])
-        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &marker)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--local-provider"), "{stderr}");
-    assert!(stderr.contains("oss_provider"), "{stderr}");
+    let args = vec![OsString::from("--oss"), OsString::from("hello")];
+    let (code, report) = launch_report(&f, &args);
+    assert_eq!(code, 19);
+    let manager_args = report["args"].as_array().unwrap();
+    assert_eq!(manager_args[0], "_ordinary-lead");
+    let expected = args
+        .iter()
+        .map(|arg| json!(arg.to_str().unwrap()))
+        .collect::<Vec<_>>();
     assert!(
-        !marker.exists(),
-        "a missing OSS provider must start no payload"
+        manager_args.ends_with(&expected),
+        "the manager must leave bare OSS discovery to the native frontend: {manager_args:?}"
     );
 }
 
