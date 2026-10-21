@@ -31,7 +31,7 @@ Each observation SHALL be classified before it competes as an incubator vote. A 
 - **THEN** the observation is handed to skill-evolution instead of accumulating incubator votes for authoring that skill
 
 #### Scenario: Orchestration friction stays in the incubator
-- **WHEN** an executor reports process, quota or dispatch friction without a reusable owned procedure or a qualified explicit admission
+- **WHEN** an executor reports process, quota or dispatch friction without a reusable owned procedure or a verified explicit admission
 - **THEN** the item remains in the incubator and is not turned into a skill candidate by this loop
 
 #### Scenario: Kit skill demand does not write the package
@@ -60,7 +60,7 @@ The incubator SHALL contain unique improvement items only. During triage, the le
 
 ### Requirement: Vote threshold promotes to backlog
 
-A configurable vote threshold, defaulting to promotion after more than two votes, SHALL move an incubator item into the implementation backlog. Promotion SHALL route by consequence: small improvements become backlog tasks assignable to the lead or an executor; changes to accepted behavior or requirements SHALL become OpenSpec changes; items concerning kit instructions, skills or tools SHALL promote to the kit's own backlog without private consuming-project data. Promotion makes work eligible for planning; it SHALL NOT silently authorize implementation without the applicable workflow. Qualified verified-improvement admission under active `delivery-improvement` SHALL be an additional explicit route without votes; it SHALL NOT lower the threshold for ordinary observations or turn unverified hypotheses into authorized implementation.
+A configurable vote threshold, defaulting to promotion after more than two votes, SHALL move an incubator item into the implementation backlog. Promotion SHALL route by consequence: small improvements become backlog tasks assignable to the lead or an executor; changes to accepted behavior or requirements SHALL become OpenSpec changes; items concerning kit instructions, skills or tools SHALL promote to the kit's own backlog without private consuming-project data. Promotion makes work eligible for planning; it SHALL NOT silently authorize implementation without the applicable workflow. Verified-improvement admission under active `delivery-improvement` SHALL be an additional explicit route without votes; it SHALL NOT lower the threshold for ordinary observations or turn unverified hypotheses into authorized implementation.
 
 #### Scenario: A third distinct vote promotes an item
 - **WHEN** an incubator item reaches the configured threshold from distinct counted observations
@@ -110,7 +110,7 @@ An installed command SHALL expose feedback recording, agent-selected triage, led
 
 ### Requirement: Verified improvement admission has an explicit basis
 
-While `delivery-improvement` is active, the lead SHALL be able to admit a bounded correction from one attributable observation without votes. The existing item SHALL retain mandate, evidence, cause, owned remedy, relevant use and acceptance, including specification and evaluation gates. Admission SHALL NOT waive full token-cost coverage or observable payback for increased spending at adoption. An assertion alone SHALL NOT qualify.
+While `delivery-improvement` is active, the lead SHALL be able to admit a bounded correction from one attributable observation without votes. The existing item SHALL retain mandate, evidence, cause, owned remedy, relevant use and acceptance, including applicable specification, skill-evaluation and verification requirements. Admission SHALL preserve honest cost accounting but SHALL NOT require a comparative benefit evaluation or establish a savings claim. An assertion alone SHALL NOT qualify.
 
 #### Scenario: A single reproduced failure has a bounded remedy
 - **WHEN** the lead verifies a recurring preparation defect, identifies its owning tool and accepts an in-scope checkable correction
@@ -130,7 +130,7 @@ While `delivery-improvement` is active, the lead SHALL be able to admit a bounde
 
 #### Scenario: One observation supports a lasting improvement
 - **WHEN** current evidence supports a bounded correction that reduces future change or maintenance cost while preserving quality and timely useful delivery
-- **THEN** the lead can admit it with a concise reason and material trade-offs even without time/token savings, without a new score or repeated-proof quota; adoption still requires nonincreasing full token cost or supported payback for an increase
+- **THEN** the lead can admit it with a concise reason and material trade-offs without a new score or repeated-proof quota; any benefit statement remains evidence-based and unmeasured savings are not asserted
 
 #### Scenario: A reflection finding requires a release decision
 - **WHEN** an attributable finding exposes a concrete incident risk in a pending release

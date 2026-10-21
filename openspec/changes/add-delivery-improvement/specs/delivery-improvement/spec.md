@@ -148,7 +148,7 @@ A retained executor-reflection outcome SHALL automatically make the correspondin
 
 ### Requirement: Forks have bounded reflection authority
 
-Before model work, each fork SHALL have the intended reflection role, declared model binding and read-only analysis capabilities. Inherited source goals SHALL NOT continue automatically. Forking SHALL preserve the source session and work. The system SHALL NOT decode opaque reasoning or claim that a fork guarantees complete historical input or free context reuse.
+Before model work, each fork SHALL have the intended reflection role and read-only analysis capabilities, with inherited source goals suppressed. Executor reflection SHALL use the configured executor profile (`ds` in the shipped kit) and lead reflection SHALL use the lead profile. Forking SHALL preserve the source session and work and SHALL NOT claim complete historical input or free context reuse.
 
 #### Scenario: The source has an active goal and write tools
 - **WHEN** a reflection fork is prepared
@@ -159,7 +159,7 @@ Before model work, each fork SHALL have the intended reflection role, declared m
 - **THEN** the reflection uses bounded authorized visible-source references or reports the missing coverage rather than reconstructing opaque state or asserting a complete review
 
 #### Scenario: Effective routing differs from the declaration
-- **WHEN** fork model, provider, effort or role context does not match the bound configuration
+- **WHEN** executor reflection does not resolve the configured executor profile, lead reflection does not resolve the lead profile, or model, provider, effort or role context differs from the bound configuration
 - **THEN** dependent model work refuses with the cause and remedy instead of substituting another model or billing route
 
 ### Requirement: Evidence remains attributable to accepted work
@@ -302,33 +302,21 @@ Implementation, integration, publication and consumption SHALL remain distinguis
 - **WHEN** installation passes but intended consumption is unobserved
 - **THEN** that stage remains unverified rather than being reported as improved agent behavior
 
-### Requirement: Improvement claims retain complete outcome evidence
+### Requirement: Cost and benefit claims remain honest
 
-Correctness SHALL be verified through the real affected entry point. Benefit SHALL include both reflections, source context, coordination, implementation, checks, rework and displaced delivery, with time and tokens assessed separately. Agent behavior claims SHALL retain real-agent/skill evaluation. Supported, adverse and inconclusive outcomes SHALL remain distinct.
+Reflection and improvement work SHALL retain available stage identity, usage, coverage and cost evidence. Recorded usage SHALL remain distinct from estimates or reservations, missing data SHALL remain unknown, and an unmeasured run SHALL NOT be reported as evidence of savings. An optional later evaluation MAY assess whether recommendations improve subsequent work; it SHALL NOT be a release prerequisite or proof of savings.
 
-#### Scenario: A deterministic defect is fixed
-- **WHEN** its original failure and relevant counterexamples can be exercised directly
-- **THEN** proportionate native acceptance suffices for the fix without imposing unrelated whole-task experiments
+#### Scenario: A completed stage records its costs
+- **WHEN** a reflection stage retains a completed result
+- **THEN** its available source identity, usage and limitations remain with the result, and copied source context is not invented or charged as new work
 
-#### Scenario: Messages decrease but quality worsens
-- **WHEN** a guidance change reduces messages while missing a requirement
-- **THEN** it is rejected as a demonstrated improvement and prior accepted guidance remains recoverable
+#### Scenario: Usage is missing or an allowance is exceeded
+- **WHEN** native usage is unavailable or the measured work exceeds its admission limit
+- **THEN** status preserves the unknown or overrun, enforces remaining admission, and makes no exact savings claim
 
-#### Scenario: Post-acceptance reflection is evaluated
-- **WHEN** comparison measures the proposed automatic chain
-- **THEN** the declared horizon includes relevant work after the trigger, counts complete seed/reflection/improvement costs and does not credit reflection for the source task's earlier success
-
-#### Scenario: The experiment is not qualified
-- **WHEN** baseline evidence, frozen identities, the benefit mechanism and relevant use to examine, quality acceptance and horizon, complete cost coverage or stopping conditions are missing
-- **THEN** candidate model dispatch, evaluation and adoption are held; planning validity or working transport cannot substitute
-
-#### Scenario: Isolated implementation proceeds during qualification
-- **WHEN** model-free work is independent of qualification
-- **THEN** authoring, builds and native checks can proceed with the candidate inactive and outside accepted delivery, preserving all product and comparison acceptance
-
-#### Scenario: The matched benefit gate fails
-- **WHEN** the complete comparison rejects the treatment or remains inconclusive
-- **THEN** the candidate stays outside accepted source/installation, baseline behavior is restored and verified, and inactive patches, all costs and adverse evidence are retained without favorable-result retries
+#### Scenario: A later evaluation is optional
+- **WHEN** meaningful outcomes are assessed after the real chain
+- **THEN** the evaluation may inform future work but its absence or uncertainty neither blocks release nor establishes benefit
 
 ### Requirement: Recovery preserves ownership and partial work
 
@@ -346,62 +334,42 @@ Stop, interruption, lead succession and recovery SHALL preserve outcomes, task r
 - **WHEN** stopping occurs during reflection or implementation
 - **THEN** new reflection and improvement assignments stop while in-flight effects and partial implementation follow the user's stop scope and existing recovery
 
-### Requirement: Installed use proves the complete loop
+### Requirement: Real sequential chain gates release
 
-Global delivery SHALL include both skills, purpose metadata, event trigger, native fork chain, real-lead decisions and recovery while preserving unrelated settings. Acceptance SHALL exercise real installed roles outside the kit checkout from accepted ordinary work through an applied and consumed improvement. Fixtures, reports and planning labels alone SHALL NOT prove delivery or benefit.
+Harness release SHALL require one real sequential installed chain: an accepted ordinary task's executor reflection completes, its retained result is supplied to lead reflection, and that synthesis is consumed by the current live lead. Applicable current regression checks and global installation verification SHALL pass. A failed attempt, fixture, plan or model-free check SHALL NOT substitute for this evidence.
 
-#### Scenario: A consumer completes an improvement
-- **WHEN** an enabled installed lead accepts ordinary executor work
-- **THEN** actual closure causes executor reflection, then lead synthesis, verified return, a real lead decision and accepted improvement consumption, with unchanged original task acceptance
+#### Scenario: The real chain completes
+- **WHEN** an accepted ordinary task closes through the installed event path
+- **THEN** executor reflection completes under its configured role and `ds` executor route, lead reflection receives the retained executor result under its distinct lead role, and the current live lead consumes the synthesis
 
-#### Scenario: Improvement completion does not recurse
-- **WHEN** that improvement and its implementation descendants complete
-- **THEN** the installed event path produces no further automatic reflections while normal acceptance remains enforced
+#### Scenario: The executor result precedes lead reflection
+- **WHEN** executor reflection has not produced a retained result
+- **THEN** lead reflection does not start, and a printed or final-looking message alone is not treated as the retained result
 
-#### Scenario: Update or activation fails
-- **WHEN** an owned installation or activation cannot complete
-- **THEN** prior accepted behavior can be restored without erasing boards, retained results, unrelated settings or unfinished executor work
+#### Scenario: The prior attempt failed
+- **WHEN** an earlier real executor-reflection attempt did not complete successfully
+- **THEN** release remains pending and recovery or another real accepted chain must produce the required sequential evidence without relabeling the failure as success
 
-### Requirement: Adoption preserves quality and lowers the cost of future work
+#### Scenario: Model-free checks pass without the real chain
+- **WHEN** fixtures and native tests pass but no real sequential chain has been observed
+- **THEN** mechanical scope may be recorded as verified while release acceptance remains incomplete
 
-Adoption SHALL preserve quality against the control, with no P0/P1 or per-unit regression, and require grounded lead judgment that lasting benefit justifies full costs and risks. The objective SHALL be cheaper future changes and maintenance with timely useful delivery. Benefits SHALL NOT be a closed checklist or mandatory savings percentage; decisive uncertainty SHALL remain inconclusive. The token-cost requirement below SHALL also apply.
+#### Scenario: Global installation is verified
+- **WHEN** the installed kit is exercised outside the source checkout
+- **THEN** both skills, distinct roles, `ds` executor routing, lead routing, visible surfaces, switch, delivery and recovery remain available without erasing unrelated boards, settings or retained work
 
-#### Scenario: The control already accepts every task
-- **WHEN** both arms independently satisfy every task and neither has a quality regression within the frozen horizon
-- **THEN** equal success satisfies the quality condition, while adoption still requires a concrete justified benefit and all other applicable acceptance checks
+### Requirement: The live lead owns recommendation disposition
 
-#### Scenario: Maintenance improves without immediate savings
-- **WHEN** real use and checks support easier future changes or maintenance without immediate savings and full token cost does not increase
-- **THEN** the lead can accept the change with its concrete benefit, full costs, trade-offs and forecast limits recorded in the existing decision owner, without a numeric savings prerequisite, score or assertion of confidence substituting for grounded judgment
+After receiving synthesis, the current live lead SHALL record whether any recommendation warrants normal follow-up. No finding, standard improvement-executor assignment, implemented improvement or comparative benefit threshold SHALL be required for release. Reflection SHALL NOT be a routine release gate; only a concrete incident risk may justify a lead-owned hold with a reason and checkable condition.
 
-#### Scenario: An improvement adds more burden than value
-- **WHEN** added machinery, context burden, operating friction or delayed useful delivery outweighs the supported benefit
-- **THEN** the lead rejects or simplifies the change despite passing functional checks, retaining evidence and restoring accepted behavior on rejection
+#### Scenario: No finding is returned
+- **WHEN** synthesis reports no attributable recommendation worth pursuing
+- **THEN** the live lead records that disposition and release is not delayed for a manufactured finding or implementation
 
-#### Scenario: Improvements proceed alongside ordinary delivery
-- **WHEN** reflection and improvement implementation have available capacity and no blocking dependency on ordinary work
-- **THEN** they can proceed in parallel without routinely gating ordinary acceptance or delivery; accounting retains all participant costs, counts overlapping elapsed spans once and distinguishes actual interference from background duration
+#### Scenario: A recommendation is actionable
+- **WHEN** synthesis returns an attributable recommendation with an owned remedy
+- **THEN** the live lead may assign a standard executor under the existing improvement purpose, defer it, reject it or decide no action is warranted, and release does not require the chosen follow-up to be completed
 
-#### Scenario: Reflection exposes a release incident risk
-- **WHEN** reflection identifies a concrete potential incident relevant to a pending release
-- **THEN** the responsible lead assesses impact, likelihood, exposure, mitigation and delay cost and can hold the affected release with a recorded reason and checkable release condition, without requiring the incident to occur or giving the reflection authority to impose or lift the hold
-
-### Requirement: Added token spending has observable payback
-
-Adoption SHALL account for full accepted-result token cost and cumulative changes against the retained baseline. Increased spending SHALL require a predeclared payback mechanism, observable benefit measures and a bounded relevant-use horizon, supported by actual use and checks. Forecast-only benefit or missing usage SHALL NOT establish payback or nonincrease. Admission to bounded investigation SHALL NOT authorize adoption.
-
-#### Scenario: Larger instructions prevent correction cycles
-- **WHEN** a bounded guidance change adds recurring input tokens but actual use shows fewer returns for correction or other declared benefits
-- **THEN** the lead evaluates full costs including reflection, implementation, checks, coordination, failed attempts and rework, allowing adoption at nonincreasing token cost or with supported payback for an increase; instruction length alone neither accepts nor rejects the change
-
-#### Scenario: Added token spending has no demonstrated return
-- **WHEN** full token cost increases and the claimed return is only qualitative confidence, forecast-only benefit or an unobserved metric
-- **THEN** the change is not adopted; decisive uncertainty remains inconclusive and evidence against payback supports rejection, without relabeling the increase as a maintenance benefit
-
-#### Scenario: Added spending has observable payback
-- **WHEN** increased full token cost is covered and actual use and checks support the predeclared return in relevant observable measures within the bounded horizon
-- **THEN** the lead may adopt with the concrete trade-off and limits recorded, preserving independent quality acceptance and every other applicable check without requiring an arbitrary savings percentage
-
-#### Scenario: Small improvements accumulate token cost drift
-- **WHEN** successive adopted changes each appear small but their combined full token cost exceeds the retained baseline
-- **THEN** the lead evaluates cumulative spending and supported payback; changing the local comparison point or starting another reflection does not erase earlier costs or authorize unexplained drift
+#### Scenario: A concrete incident risk is found
+- **WHEN** synthesis exposes a concrete potential incident in a pending release
+- **THEN** the responsible lead may hold the affected release with a recorded reason and checkable condition; reflection cannot impose or lift the hold by itself
