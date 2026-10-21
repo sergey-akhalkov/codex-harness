@@ -1,6 +1,6 @@
 # Tasks
 
-Implementation follows [design.md](design.md). The first native-consumer proof precedes instruction removal; the final acceptance uses the consolidated sources. All tasks below are unfinished implementation work. Planning and schema validation do not satisfy them.
+Implementation follows [design.md](design.md). The first native-consumer proof precedes instruction removal; the final acceptance uses the consolidated sources. Unchecked tasks remain unfinished implementation work. Planning and schema validation do not satisfy them.
 
 ## 1. Qualify the upstream package through native Codex
 
