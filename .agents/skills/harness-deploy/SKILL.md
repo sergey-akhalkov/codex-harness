@@ -60,16 +60,18 @@ it. Do not hand-build, edit or delete fast-target entries; the full ownership,
 foreign-state and retirement lifecycle belongs to the
 [installation guide](../../../docs/installation.md#fast-local-delivery).
 
-Fast uses four Cargo jobs; release remains at one pending task 7.1. Retained
+Both profiles now use four Cargo jobs after matched no-contention measurements
+(release 1/2/4 jobs: 531/442/408 s phase sum, 3.10/2.54/2.62 GiB peak). Retained
 2026-10-22 single runs: 4.2 s unchanged verified reuse without Cargo; 117.7 s
 four-job fast cold matrix and 119.3 s real four-job fast deployment; 410.8 s
 earlier one-job fast; 675.4 s two-phase fallback. The four-job samples meet the
 360 s cold target but are not repeatability proof or evidence for the 120 s
 leaf or 20-60 s single-binary targets. Fast compiled-input reuse for
 noncompiled test/documentation changes is implemented; release still requires
-the full source identity. Release job/test measurements remain under tasks
-7.1-7.2. Applied delivery with both profiles present, interruption/recovery
-and delivery outside the checkout remain unvalidated.
+the full source identity. Test-feedback measurement found no benefit from a
+runner or scoped serialization and retained one deterministic pre-existing
+token-audit failure. Applied delivery with both profiles present,
+interruption/recovery and delivery outside the checkout remain unvalidated.
 
 Preview and applying delivery keep their source, build, profile and ownership
 checks; `--fast --all --preview` reports the fast core and component plans

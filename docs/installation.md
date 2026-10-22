@@ -323,13 +323,16 @@ guessed, omitted or silently widened.
 
 Retained observations from 2026-10-22, on one Windows x64 host with
 rustc/cargo 1.98.1, `x86_64-pc-windows-msvc` and the shared heavy budget. The
-current native command uses four Cargo jobs for `delivery-fast` and one for
-release; release job counts remain under task 7.1. These are single runs and
-foundation evidence, not matched repeatability:
+current native command uses four Cargo jobs for both profiles, selected from
+matched no-contention runs. These are single runs and foundation evidence, not
+matched repeatability:
 
 | Route | Retained observation |
 | --- | --- |
 | Release baseline at source `4bd9ea12` | 617.757813 s wall (phase 1 518 s, phase 2 96 s); outer-Job peak 3,256,029,184 bytes; seven artifacts 35,290,624 bytes total; manager 27,249,664 bytes |
+| Release matched, one Cargo job | 531.344 s phase sum; 532.006 s heavy payload; 3.1047 GiB peak; seven artifacts 35,405,312 bytes |
+| Release matched, two Cargo jobs | 442.122 s phase sum; 443.775 s heavy payload; 2.5392 GiB peak; seven artifacts 35,405,312 bytes |
+| Release matched, four Cargo jobs | 408.376 s phase sum; 409.979 s heavy payload; 2.6239 GiB peak; seven artifacts 35,405,312 bytes |
 | `delivery-fast` foundation at source `f96fe382`, two Cargo jobs | 2m34s cold; manager 29,714,944 bytes; opt-level 3, LTO off, 16 codegen units and stripped symbols |
 | Fast matrix, cold, four Cargo jobs | 117.715 s wall; 117.500 s payload; 2.683 GiB peak; seven artifacts 40,254,464 bytes |
 | Real fast deployment, four Cargo jobs | 119.339 s; seven declared binaries; candidate healthy |
@@ -360,8 +363,12 @@ Release candidates still require the full checkout identity. The reused
 candidate is not rewritten: a content-addressed selection record references the
 same verified binary hashes and the current checkout relationship.
 
-Release job-count and test-feedback measurements remain under tasks 7.1-7.2; no
-larger release job count has been adopted yet.
+The matched release comparison adopted four Cargo jobs: 22.937% lower heavy
+payload than one job, with a 5.3761 GiB memory margin. The test-feedback
+measurement separated 98.645 s of warm-target compilation from 1532.633 s of
+execution across 1,716 selected cases; it retained 64 ignored conditions and one
+deterministic pre-existing token-audit failure, and adopted no test runner or
+serialization change.
 
 For a test- or fixture-only change that does not exercise delivery, run the
 focused [Cargo feedback route](rust-native.md#development-feedback-without-a-publication-build)

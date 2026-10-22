@@ -44,14 +44,16 @@ fallback and seven-day inactivity retirement; release preparation never
 acquires it. A valid source-owned delivery declaration builds the exact set in
 one Cargo invocation for either profile, with the existing two-phase
 manager-query fallback when the declaration is missing or invalid. Fast uses
-four Cargo jobs; release remains at one pending task 7.1.
+four Cargo jobs; both profiles now use four after the matched release matrix.
 
 Test-only feedback stays on Cargo unless delivery or installed behavior is
 under test. Fast compiled-input candidate reuse is implemented; release
-candidates still require the full source identity. Release-concurrency and
-test-feedback measurements remain under tasks 7.1-7.2. The retained single-run
-observations do not establish the leaf-rebuild or single-binary targets, and
-applied/interrupted installed delivery remains unvalidated. Commands,
+candidates still require the full source identity. The release matrix adopted
+four jobs; test-feedback measurement found no benefit from a runner or scoped
+serialization and retained one deterministic pre-existing token-audit failure.
+The retained single-run observations do not establish the leaf-rebuild or
+single-binary targets, and applied/interrupted installed delivery remains
+unvalidated. Commands,
 measurement scope, cache lifecycle and current limitations live in the
 [installation guide](installation.md#fast-local-delivery); implementation
 mechanics live in the

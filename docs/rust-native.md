@@ -138,9 +138,9 @@ serve a release request, and an unavailable fast candidate is an error rather
 than a release fallback. The user-facing choice, retained measurements and
 their scope are owned by [installation](installation.md#fast-local-delivery).
 
-Release currently compiles with one Cargo job; `delivery-fast` uses four Cargo
-jobs, selected from the matched no-contention matrix. Fast preparation may
-reuse one persistent target per key under the owned short
+Both profiles currently compile with four Cargo jobs, selected from matched
+no-contention matrices. Fast preparation may reuse one persistent target per
+key under the owned short
 `%TEMP%\chx` root. The key hashes the rustc/cargo version strings, target
 triple, profile and build-affecting inputs: root and member manifests,
 `Cargo.lock`, build scripts, toolchain selectors and Cargo host configuration.
@@ -268,6 +268,13 @@ installed path; it is not a prerequisite for ordinary feedback. Measured
 | Warm full package suite (`cargo test -p harness-core --lib`) | 745 passed in 397 s; 422 s payload |
 | Cold development target (fresh `--target-dir`, `--no-run` for the two affected packages) | 326 s (5 min 26 s), peak 1.84 GiB in the heavy job |
 | Previous `--bins` publication (three packages, seven delivered programs, real `codex-harness build`) | 448 s end to end, peak 1.88 GiB; the compile step alone is 447 s |
+
+Measured 2026-10-22 on the integrated checkout with four Cargo jobs: workspace
+test compilation took 98.645 s on a warm checkout target, and execution took
+1532.633 s across 1,716 selected cases (1,651 passed, 64 ignored, one
+deterministic pre-existing token-audit failure). Five shared-heavy cases passed
+5/5 both with default parallelism (0.586 s) and scoped serialization (0.933 s);
+neither a test runner nor a serialization change was adopted.
 
 The smallest sufficient loop after an edit is `cargo fmt --all`, then the
 focused unit filter for changed logic, then the affected integration target
