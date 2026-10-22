@@ -1511,13 +1511,6 @@ fn publication_cargo(
     profile: Profile,
 ) -> io::Result<CommandSpec> {
     let mut command = CommandSpec::new(resolve_tool(cargo)?);
-    // Retained matched fast-profile evidence: four jobs, while release keeps
-    // its fresh-target single-job publication limit.
-    let jobs = if profile == Profile::DeliveryFast {
-        "4"
-    } else {
-        "1"
-    };
     command.args = [
         "build",
         "--profile",
@@ -1525,8 +1518,9 @@ fn publication_cargo(
         "--locked",
         // Cargo otherwise scales rustc concurrency to host CPU count, which
         // does not reflect the fixed memory budget of the compiler job.
+        // Matched release evidence accepted four jobs; fast already used four.
         "--jobs",
-        jobs,
+        "4",
         "--target",
         TARGET,
         "-p",
@@ -2165,7 +2159,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_jobs_are_four_for_fast_and_one_for_release() {
+    fn publication_jobs_are_four_for_fast_and_release() {
         let source = Path::new("D:/source");
         let target = Path::new("D:/target");
         let jobs = |profile| {
@@ -2179,7 +2173,7 @@ mod tests {
                 .find(|pair| pair[0] == "--jobs")
                 .map(|pair| pair[1].clone())
         };
-        assert_eq!(jobs(Profile::Release).as_deref(), Some("1"));
+        assert_eq!(jobs(Profile::Release).as_deref(), Some("4"));
         assert_eq!(jobs(Profile::DeliveryFast).as_deref(), Some("4"));
     }
 
