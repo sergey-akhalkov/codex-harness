@@ -1074,8 +1074,7 @@ mod tests {
                 .codex_home
                 .join("harness/native-launch.json");
             let launch_before = fs::read(&launch).unwrap();
-            let launch_value: serde_json::Value =
-                serde_json::from_slice(&launch_before).unwrap();
+            let launch_value: serde_json::Value = serde_json::from_slice(&launch_before).unwrap();
             assert_eq!(launch_value["schema"], 3);
             assert_eq!(launch_value["goal_recovery"], true);
             let instruction_link = fixture.request.codex_home.join("AGENTS.md");

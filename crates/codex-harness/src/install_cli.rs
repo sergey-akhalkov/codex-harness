@@ -68,13 +68,15 @@ fn optional(values: &BTreeMap<OsString, OsString>, name: &str) -> Option<PathBuf
 fn goal_recovery(values: &BTreeMap<OsString, OsString>) -> io::Result<Option<bool>> {
     values
         .get(&OsString::from("--goal-recovery"))
-        .map(|value| match value.to_str().map(str::to_ascii_lowercase).as_deref() {
-            Some("enabled") => Ok(true),
-            Some("disabled") => Ok(false),
-            _ => Err(io::Error::other(
-                "--goal-recovery must be enabled or disabled",
-            )),
-        })
+        .map(
+            |value| match value.to_str().map(str::to_ascii_lowercase).as_deref() {
+                Some("enabled") => Ok(true),
+                Some("disabled") => Ok(false),
+                _ => Err(io::Error::other(
+                    "--goal-recovery must be enabled or disabled",
+                )),
+            },
+        )
         .transpose()
 }
 

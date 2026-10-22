@@ -160,13 +160,15 @@ impl Installed {
                 })
                 .collect::<BTreeMap<_, _>>(),
         };
-        fs::write(build.join("build.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::write(
+            build.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
         prepare_user_profile(&user_home);
         fs::create_dir_all(root_path.join("provider")).unwrap();
-        let provider = control_responses::Responses::with_server_overload(
-            root_path.join("provider"),
-            2,
-        );
+        let provider =
+            control_responses::Responses::with_server_overload(root_path.join("provider"), 2);
         let upstream = PathBuf::from(
             std::env::var_os("HARNESS_CONTROL_CODEX_EXE")
                 .expect("explicit native Codex executable"),
@@ -250,8 +252,10 @@ trust_level = "trusted"
             "model_reasoning_effort=\"low\"".into(),
             "--no-alt-screen".into(),
         ];
-        spec.env
-            .insert("CODEX_HOME".into(), Some(self.codex_home.clone().into_os_string()));
+        spec.env.insert(
+            "CODEX_HOME".into(),
+            Some(self.codex_home.clone().into_os_string()),
+        );
         spec.env.insert(
             "USERPROFILE".into(),
             Some(self.user_home.clone().into_os_string()),
@@ -314,12 +318,7 @@ fn installed_ordinary_session_recovers_a_blocked_goal_after_overload() {
     eprintln!("installed goal recovery evidence: {}", root.display());
     let session = installed.session();
     let until = Instant::now() + WAIT;
-    wait_visible(
-        &session,
-        &terminal,
-        &["GPT-6-Astra"],
-        until,
-    );
+    wait_visible(&session, &terminal, &["GPT-6-Astra"], until);
     std::thread::sleep(Duration::from_secs(1));
     session.send(&format!("/goal {OBJECTIVE}")).unwrap();
     std::thread::sleep(Duration::from_millis(500));
@@ -382,10 +381,7 @@ fn installed_ordinary_session_recovers_a_blocked_goal_after_overload() {
             Duration::from_secs(5),
         )
         .unwrap();
-    assert!(
-        outcome.outcome.reason == StopReason::Exited,
-        "{outcome:?}"
-    );
+    assert!(outcome.outcome.reason == StopReason::Exited, "{outcome:?}");
     fs::write(
         root.join("installed-result.json"),
         serde_json::to_vec_pretty(&json!({

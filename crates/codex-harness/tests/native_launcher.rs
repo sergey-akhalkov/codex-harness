@@ -176,13 +176,9 @@ impl Fixture {
     }
     fn set_goal_recovery(&self, enabled: bool) {
         let path = self.home.join("harness/native-launch.json");
-        let mut registration: Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut registration: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         registration["schema"] = json!(3);
-        registration
-            .as_object_mut()
-            .unwrap()
-            .remove("state");
+        registration.as_object_mut().unwrap().remove("state");
         registration["build"] = json!(self.launcher.parent().unwrap());
         registration["goal_recovery"] = json!(enabled);
         fs::write(&path, serde_json::to_vec_pretty(&registration).unwrap()).unwrap();
