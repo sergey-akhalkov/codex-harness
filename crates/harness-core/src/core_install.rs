@@ -35,6 +35,9 @@ pub struct Request {
     pub upstream: Option<PathBuf>,
     pub timeout: Duration,
     pub path_scope: Option<PathScope>,
+    /// Explicit recovery choice. An update without it retains the recorded
+    /// setting; a new installation uses the accepted bounded default.
+    pub goal_recovery: Option<bool>,
 }
 
 /// Native commands owned by the core component. The RTK adapter link belongs
@@ -444,9 +447,14 @@ impl Plan {
                 connection: Connection::Missing,
             });
         }
+        let goal_recovery = request
+            .goal_recovery
+            .or_else(|| previous.as_ref().map(|settings| settings.goal_recovery))
+            .unwrap_or(true);
         let launch_bytes = serde_json::to_vec_pretty(&native_launcher::Registration {
             task_control: false,
-            schema: 2,
+            goal_recovery,
+            schema: 3,
             state: None,
             build: Some(request.build.clone()),
             upstream: selection,
@@ -532,18 +540,24 @@ impl Plan {
             + changes.len()
             + usize::from(reused_launch.is_none());
         let (path, added) = PathChange::prepend(scope, &request.codex_home.join("harness/bin"))?;
+        let retained_recovery = previous.as_ref().map(|settings| settings.goal_recovery);
         let mut settings = previous.unwrap_or(Settings {
             source_root: request.source.clone(),
             codex_home: request.codex_home.clone(),
             user_home: request.user_home.clone(),
             dependency_user_home: request.dependency_user_home.clone(),
             codex_command: upstream.clone(),
+            goal_recovery: retained_recovery.unwrap_or(true),
             path_scope: scope,
             path_added: false,
             versions: BTreeMap::new(),
         });
         settings.source_root = request.source.clone();
         settings.codex_command = upstream.clone();
+        settings.goal_recovery = request
+            .goal_recovery
+            .or(retained_recovery)
+            .unwrap_or(true);
         settings.path_added |= added;
         settings
             .versions
@@ -910,6 +924,7 @@ mod tests {
                     upstream: Some(upstream),
                     timeout: Duration::from_secs(45),
                     path_scope: None,
+                    goal_recovery: None,
                 },
                 root,
             };
@@ -1822,6 +1837,7 @@ mod tests {
             upstream: value["upstream"].as_str().map(PathBuf::from),
             timeout: Duration::from_millis(value["timeout_ms"].as_u64().unwrap()),
             path_scope: Some(PathScope::Process),
+            goal_recovery: None,
         };
         connect(&request, false).expect("owned connect should hang in runtime verification");
         panic!("runtime interruption was not reached");
@@ -2609,6 +2625,7 @@ mod tests {
                 dependency_user_home: root.join("dependency"),
                 timeout: Duration::from_secs(60),
                 path_scope: None,
+                goal_recovery: None,
             };
             println!("full native core evidence: {}", root.display());
             let before_path = UserPathSnapshot::for_registration()

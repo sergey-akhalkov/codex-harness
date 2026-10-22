@@ -129,6 +129,7 @@ impl InstalledReflection {
             upstream: Some(self.upstream.clone()),
             timeout: Duration::from_secs(120),
             path_scope: Some(PathScope::Process),
+            goal_recovery: None,
         }
     }
 

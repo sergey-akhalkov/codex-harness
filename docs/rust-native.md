@@ -2404,6 +2404,48 @@ block (including removal of retired owned registrations), and
 Retired CodeGraph, Codebase Memory and Graphify commands no longer exist;
 host residue is inert.
 
+## Ordinary goal recovery
+
+An ordinary interactive `codex` or `codex resume` session hosted by
+`_ordinary-lead` now keeps one bounded recovery owner for its selected thread.
+The owner reacts only when the latest completed turn failed with native
+`serverOverloaded` and the same goal is `blocked`. It schedules at most five
+automatic resumes per consecutive episode with exponential waits (4s doubling to
+a 60s cap plus bounded jitter), then reports exhaustion without a sixth attempt.
+Observation and user-action handling stay deterministic in
+`harness-core::task_recovery`; the host only supplies native goal reads,
+control requests and timing.
+
+Recovery sends status-only `thread/goal/set` with `origin: "automatic"` and no
+objective, budget, model or provider. It never resends the prompt, starts a
+turn, recreates the thread or writes a native database. The existing goal's
+identity, objective, budget, accounting and tool/process state stay intact.
+The native scheduler starts the continuation.
+
+The frontend relay is the ordering boundary: a user-mutation request
+(`/goal pause`, `/goal clear`, new input, interruption or replacement) is
+forwarded under the same gate the owner holds while dispatching. A mutation
+admitted before dispatch therefore wins; a later one keeps its native
+semantics and cancels further automatic attempts. The owner also cancels on
+goal updates, non-overload errors, frontend/owner exit and session closure.
+An unconfirmed acknowledgement is never resent: the owner reconciles the goal
+read, reports the uncertain outcome and requires a manual `/goal resume` when
+the goal is still blocked.
+
+The relay's `warning` surface shows the scheduled attempt and delay, recovery,
+cancellation, exhaustion and observation failure in the same terminal. A
+private recovery checkpoint is evidence only; a new host ignores stale state
+and never reopens a blocked goal. The policy is delivered through the
+installation lifecycle (`--goal-recovery enabled|disabled`), recorded in the
+schema-3 launch registration, and reported by `codex-harness check --core-only`
+as `goalRecovery.configured`/`support` with `exercised: false`.
+
+The model-free native contract tests are
+`native_overload_blocks_goal_and_status_only_resume_recovers` and
+`native_stale_automatic_resume_wins_after_user_pause` in
+`goal_recovery_contract`; the state machine's deterministic tests run with
+`cargo test -p harness-core --lib task_recovery`.
+
 ## Outcome, usage and helpers
 
 Installed tool-workflow qualification for the retired graph tools was removed

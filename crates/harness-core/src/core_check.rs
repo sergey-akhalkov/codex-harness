@@ -41,6 +41,9 @@ pub struct CheckReport {
     pub model_calls: u32,
     pub links: usize,
     pub runtime: core_runtime::RuntimeReceipt,
+    /// Declarative recovery policy from the launch registration. `exercised`
+    /// stays false: this read-only check never runs an overload recovery.
+    pub goal_recovery: GoalRecoveryCheck,
     /// Loop delivery report: configured roles and limits, the guidance skills
     /// a fresh session discovers the workflow through, and the board tool.
     pub orchestration: crate::orchestration_lifecycle::CheckReport,
@@ -51,6 +54,14 @@ pub struct CheckReport {
     /// Readback is configuration, not measured consumption. Inspection does not
     /// write policy, create a job, sample CPU, or write a protocol stream.
     pub cpu_budget: CpuBudgetStatus,
+}
+
+#[derive(Serialize)]
+pub struct GoalRecoveryCheck {
+    pub configured: bool,
+    /// `declared` for a schema-3 registration, `legacy` for schema 2.
+    pub support: &'static str,
+    pub exercised: bool,
 }
 
 /// Observe an existing native schema-2 core installation. Pending recovery is
@@ -76,6 +87,15 @@ pub fn check(
     let settings = metadata.settings();
     inspect_links(metadata.links())?;
     let (launch, launch_snapshot) = inspect_native_launch(&metadata)?;
+    let goal_recovery = GoalRecoveryCheck {
+        configured: launch.goal_recovery,
+        support: if launch.schema >= 3 {
+            "declared"
+        } else {
+            "legacy"
+        },
+        exercised: false,
+    };
     let build = launch
         .build
         .as_ref()
@@ -147,6 +167,7 @@ pub fn check(
     let (launch_after, _) = inspect_native_launch(&metadata)?;
     if launch_after.schema != launch.schema
         || launch_after.build != launch.build
+        || launch_after.goal_recovery != launch.goal_recovery
         || launch_after.upstream.executable != launch.upstream.executable
         || launch_after.upstream.sha256 != launch.upstream.sha256
     {
@@ -177,6 +198,7 @@ pub fn check(
         model_calls: 0,
         links: metadata.links().len(),
         runtime,
+        goal_recovery,
         orchestration,
         cpu_policy,
         cpu_budget,
@@ -1799,8 +1821,10 @@ fn inspect_native_launch(
     let snapshot = ConfigSnapshot::read(&link.object.target)?;
     let launch: native_launcher::Registration = serde_json::from_slice(snapshot.contents())
         .map_err(|_| disconnected("native-launch registration is invalid"))?;
-    if launch.schema != 2 || launch.state.is_some() || launch.build.is_none() {
-        return Err(disconnected("native-launch registration is not schema 2"));
+    if !matches!(launch.schema, 2 | 3) || launch.state.is_some() || launch.build.is_none() {
+        return Err(disconnected(
+            "native-launch registration is not a supported native schema",
+        ));
     }
     Ok((launch, snapshot))
 }
@@ -1966,7 +1990,7 @@ mod tests {
             fs::write(
                 &launch_source,
                 serde_json::to_vec_pretty(&native_launcher::Registration {
-                    task_control: false,
+                    task_control: false, goal_recovery: false,
                     schema: 2,
                     state: None,
                     build: Some(build.clone()),
@@ -2025,6 +2049,7 @@ mod tests {
                     user_home: user,
                     dependency_user_home: dependency,
                     codex_command: upstream,
+                    goal_recovery: true,
                     path_scope,
                     path_added: false,
                     versions: BTreeMap::new(),

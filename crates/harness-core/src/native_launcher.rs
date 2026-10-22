@@ -42,6 +42,10 @@ pub struct Registration {
     pub build: Option<PathBuf>,
     #[serde(default)]
     pub task_control: bool,
+    /// Bounded automatic goal recovery for ordinary sessions. Schema 2
+    /// registrations predate this policy and therefore default to disabled.
+    #[serde(default)]
+    pub goal_recovery: bool,
     pub upstream: Upstream,
 }
 
@@ -114,7 +118,7 @@ fn registered_runtime(registration: &Registration) -> io::Result<(PathBuf, bool,
             }
             Err(error) => schema_one_build(state).ok_or(error)?,
         },
-        (2, None, Some(build)) if build.is_absolute() => build.clone(),
+        (2 | 3, None, Some(build)) if build.is_absolute() => build.clone(),
         _ => return Err(fail("unsupported native launch registration")),
     };
     // Launch admission follows recorded artifact integrity: a stale or
@@ -432,7 +436,7 @@ fn prepared_command(
     executable: &Path,
     home: &Path,
     args: &[OsString],
-) -> io::Result<(Command, bool, String, bool)> {
+) -> io::Result<(Command, bool, bool, String, bool)> {
     let mut bytes = Vec::new();
     File::open(home.join("harness/native-launch.json"))?
         .take(REGISTRATION_LIMIT + 1)
@@ -447,6 +451,7 @@ fn prepared_command(
     if selected.join("codex.exe").canonicalize()? != executable {
         return Err(fail("this launcher is not the selected native build"));
     }
+    let goal_recovery = registration.goal_recovery;
     let upstream = registration.upstream;
     if !upstream.executable.is_absolute()
         || !upstream
@@ -620,6 +625,7 @@ fn prepared_command(
     Ok((
         command,
         registration.task_control,
+        goal_recovery,
         launcher_sha256,
         shared && !degraded,
     ))
@@ -1589,7 +1595,7 @@ mod xai {
 }
 
 pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<Command> {
-    prepared_command(executable, home, args).map(|(command, _, _, _)| command)
+    prepared_command(executable, home, args).map(|(command, _, _, _, _)| command)
 }
 
 #[cfg(windows)]
@@ -1655,6 +1661,7 @@ fn ordinary_manager_command(
     executable: &Path,
     home: &Path,
     harness_ready: bool,
+    goal_recovery: bool,
     prepared: &Command,
 ) -> io::Result<Option<Command>> {
     if !harness_ready
@@ -1686,12 +1693,12 @@ fn ordinary_manager_command(
     // An omitted permission defaults on. A declared non-boolean value is an
     // error, never a quiet false: the launch fails before any native process
     // starts instead of silently disabling reflection.
-    let enabled = match crate::orchestration_config::load(&record.source_root) {
+    let reflection = match crate::orchestration_config::load(&record.source_root) {
         Ok(config) => config.self_reflection_enabled,
         Err(error) if error.kind() == io::ErrorKind::NotFound => true,
         Err(error) => return Err(error),
     };
-    if !enabled {
+    if !goal_recovery && !reflection {
         return Ok(None);
     }
     if let Some(error) = planning_error {
@@ -1870,7 +1877,8 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     // loader dialog.
     crate::process::suppress_loader_dialogs();
     let (uncapped, args) = take_uncapped_session_selector(args)?;
-    let (command, task_control, _, harness_ready) = prepared_command(executable, home, &args)?;
+    let (command, task_control, goal_recovery, _, harness_ready) =
+        prepared_command(executable, home, &args)?;
     // An xAI session routes only to a verified owned generation of this build.
     // The owner lease lives until this launcher exits, so the generation
     // retires with its sessions instead of being replaced under a live
@@ -1914,7 +1922,7 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     let command = if task_control {
         command
     } else if let Some(manager) =
-        ordinary_manager_command(executable, home, harness_ready, &command)?
+        ordinary_manager_command(executable, home, harness_ready, goal_recovery, &command)?
     {
         manager
     } else {
@@ -3353,7 +3361,7 @@ mod tests {
                     schema: 2,
                     state: None,
                     build: Some(build.clone()),
-                    task_control: false,
+                    task_control: false, goal_recovery: false,
                     upstream: Upstream {
                         executable: upstream.clone(),
                         sha256: build_identity::hash_file(&upstream).unwrap(),

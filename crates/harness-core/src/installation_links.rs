@@ -377,6 +377,7 @@ mod tests {
                 user_home: user.clone(),
                 dependency_user_home: user.clone(),
                 codex_command: root.join("upstream.exe"),
+                goal_recovery: true,
                 path_scope: PathScope::User,
                 path_added: false,
                 versions: BTreeMap::new(),

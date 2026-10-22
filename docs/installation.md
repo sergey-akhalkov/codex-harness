@@ -284,6 +284,24 @@ owner; missing prerequisites remain explicit failures and do not disappear
 from the receipt. Avoiding preview compilation establishes this bounded
 behavior, not an end-to-end time or token saving.
 
+### Goal recovery policy
+
+`install` and `update` with `--core-only` accept
+`--goal-recovery enabled|disabled`. New installations use the accepted bounded
+default (enabled); an update without the option retains the recorded choice, so
+an explicit `disabled` survives later updates until it is explicitly changed.
+The choice is recorded in `installation.json` and in the generated
+`native-launch.json` registration. Registration schema 3 carries the policy;
+an existing schema-2 registration is legacy and stays recovery-disabled until
+an update writes schema 3.
+
+`codex-harness check --core-only` reports `goalRecovery.configured` and
+`goalRecovery.support` (`declared` for schema 3, `legacy` for schema 2) with
+`exercised: false`. The read-only check establishes configuration and declared
+support, not that an overload recovery ran. Disabling recovery affects new
+sessions; an already-running session keeps its owner. Rollback restores the
+previous registration and settings and never reopens a blocked goal.
+
 ### Fast local delivery
 
 `deploy` without `--fast` is the release/publication route: a fresh target,

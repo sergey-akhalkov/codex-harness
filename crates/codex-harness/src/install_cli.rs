@@ -315,6 +315,7 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
             "--upstream",
             "--timeout-seconds",
             "--path-scope",
+            "--goal-recovery",
         ],
         true,
     )?;
@@ -365,6 +366,18 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
                                 _ => Err(io::Error::other("PATH scope must be User or Process")),
                             },
                         )
+                        .transpose()?,
+                    goal_recovery: options
+                        .values
+                        .get(&OsString::from("--goal-recovery"))
+                        .map(|value| match value.to_str().map(str::to_ascii_lowercase).as_deref()
+                        {
+                            Some("enabled") => Ok(true),
+                            Some("disabled") => Ok(false),
+                            _ => Err(io::Error::other(
+                                "--goal-recovery must be enabled or disabled",
+                            )),
+                        })
                         .transpose()?,
                 },
                 options.preview,
@@ -714,6 +727,7 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
                     },
                 )
                 .transpose()?,
+            goal_recovery: None,
         },
         preview,
         profile,

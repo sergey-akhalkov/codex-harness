@@ -63,7 +63,7 @@ impl Fixture {
             schema: 2,
             state: None,
             build: None,
-            task_control: false,
+            task_control: false, goal_recovery: false,
             upstream: Upstream {
                 executable: frontend.clone(),
                 sha256: build_identity::hash_file(&frontend).unwrap(),
@@ -1122,7 +1122,7 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
         schema: 2,
         state: None,
         build: Some(installed_build.clone()),
-        task_control: false,
+        task_control: false, goal_recovery: false,
         upstream: Upstream {
             executable: native.clone(),
             sha256: build_identity::hash_file(&native).unwrap(),

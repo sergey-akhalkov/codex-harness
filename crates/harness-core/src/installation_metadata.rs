@@ -102,9 +102,17 @@ pub(crate) struct Settings {
     pub user_home: PathBuf,
     pub dependency_user_home: PathBuf,
     pub codex_command: PathBuf,
+    /// Bounded automatic goal recovery for ordinary sessions. Lifecycle
+    /// updates retain this choice; a missing value on an old record defaults on.
+    #[serde(default = "goal_recovery_default")]
+    pub goal_recovery: bool,
     pub path_scope: PathScope,
     pub path_added: bool,
     pub versions: BTreeMap<String, String>,
+}
+
+fn goal_recovery_default() -> bool {
+    true
 }
 
 impl Settings {
@@ -2014,6 +2022,7 @@ mod tests {
                 user_home: user.clone(),
                 dependency_user_home: user.clone(),
                 codex_command: root.join("upstream.exe"),
+                goal_recovery: true,
                 path_scope: PathScope::User,
                 path_added: false,
                 versions: BTreeMap::new(),

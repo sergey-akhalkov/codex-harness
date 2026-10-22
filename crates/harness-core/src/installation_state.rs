@@ -150,6 +150,7 @@ impl LegacyInstallation {
                 .clone()
                 .unwrap_or_else(|| self.state.user_home.clone()),
             codex_command: self.state.codex_command.clone(),
+            goal_recovery: true,
             path_scope: self.state.path_scope,
             path_added: self.state.path_added,
             versions: self.state.versions.clone(),

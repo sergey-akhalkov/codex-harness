@@ -67,7 +67,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     )
     .unwrap();
 
-    let request = core_install::Request {
+    let mut request = core_install::Request {
         source: source.clone(),
         build,
         codex_home: codex_home.clone(),
@@ -76,6 +76,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         upstream: Some(upstream.clone()),
         timeout: Duration::from_secs(45),
         path_scope: Some(PathScope::Process),
+        goal_recovery: None,
     };
     let _path = PathRestore::capture();
     let preview = core_install::connect(&request, true).unwrap();
@@ -110,6 +111,43 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     let report = core_install::connect(&request, false).unwrap();
     assert_eq!(report.status, "connected");
     assert!(report.runtime.unwrap().passed);
+    let launch_path = codex_home.join("harness/native-launch.json");
+    let launch: serde_json::Value =
+        serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+    assert_eq!(launch["schema"], 3);
+    assert_eq!(
+        launch["goal_recovery"], true,
+        "a new install uses the bounded recovery default"
+    );
+    let before_preview = fs::read(&launch_path).unwrap();
+    request.goal_recovery = Some(false);
+    assert_eq!(
+        core_install::connect(&request, true).unwrap().status,
+        "preview"
+    );
+    assert_eq!(
+        fs::read(&launch_path).unwrap(),
+        before_preview,
+        "a recovery-policy preview performs no writes"
+    );
+    assert_eq!(
+        core_install::connect(&request, false).unwrap().status,
+        "connected"
+    );
+    let launch: serde_json::Value =
+        serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+    assert_eq!(launch["goal_recovery"], false);
+    request.goal_recovery = None;
+    assert_eq!(
+        core_install::connect(&request, false).unwrap().status,
+        "connected"
+    );
+    let launch: serde_json::Value =
+        serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+    assert_eq!(
+        launch["goal_recovery"], false,
+        "an update without the option retains the explicit opt-out"
+    );
     assert_eq!(
         fs::read_link(codex_home.join("AGENTS.md")).unwrap(),
         source.join("global/principles-of-work.md")
@@ -594,6 +632,9 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         serde_json::from_slice(&installed_check.stdout).unwrap();
     assert_eq!(installed_check["status"], "connected");
     assert_eq!(installed_check["model_calls"], 0);
+    assert_eq!(installed_check["goal_recovery"]["configured"], false);
+    assert_eq!(installed_check["goal_recovery"]["support"], "declared");
+    assert_eq!(installed_check["goal_recovery"]["exercised"], false);
     let orchestration = &installed_check["orchestration"];
     assert_eq!(orchestration["status"], "Orchestration connected");
     assert_eq!(orchestration["model_calls"], 0);

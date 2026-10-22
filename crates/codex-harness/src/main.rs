@@ -28,6 +28,8 @@ mod native_read_rpc;
 #[cfg(windows)]
 mod ordinary_lead;
 #[cfg(windows)]
+mod ordinary_recovery;
+#[cfg(windows)]
 mod outcome_arm;
 mod outcome_case_fixture;
 mod outcome_discovery;
@@ -308,7 +310,7 @@ fn run() -> io::Result<i32> {
             "codex-harness disconnect|recover --code-tools-only|--subscriptions-only|--token-workflow-only|--board-only --codex-home DIRECTORY --user-home DIRECTORY --source CHECKOUT [--dependency-user-home DIRECTORY] [--preview]"
         );
         println!(
-            "codex-harness install|update --core-only|--code-tools-only --source CHECKOUT [--build DIRECTORY] --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--preview]"
+            "codex-harness install|update --core-only|--code-tools-only --source CHECKOUT [--build DIRECTORY] --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--goal-recovery enabled|disabled] [--preview]"
         );
         println!(
             "codex-harness deploy --source CHECKOUT [--codex-home DIRECTORY] [--user-home DIRECTORY] [--build DIRECTORY] [--state DIRECTORY] [--reset] [--all] [--preview] [--fast]"

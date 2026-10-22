@@ -998,6 +998,7 @@ impl Plan {
             upstream: Some(self.upstream.clone()),
             timeout: self.timeout,
             path_scope: Some(PathScope::Process),
+            goal_recovery: None,
         }
     }
 }
@@ -2677,7 +2678,7 @@ fn observe(plan: &Plan, facts: InstallationFacts) -> io::Result<ArmRuntime> {
         .build
         .as_ref()
         .ok_or_else(|| invalid("the launch registration does not name a build"))?;
-    if registration.schema != 2
+    if !matches!(registration.schema, 2 | 3)
         || registration.state.is_some()
         || registration.task_control
         || !same_place(registered, &plan.build)?
@@ -2954,7 +2955,7 @@ pub fn verify_consumption_with_trust(
     }
     let registration: LaunchRegistration = serde_json::from_slice(&launch_bytes)
         .map_err(|_| invalid("invalid launch registration"))?;
-    if registration.schema != 2
+    if !matches!(registration.schema, 2 | 3)
         || registration.state.is_some()
         || registration.task_control
         || !registration

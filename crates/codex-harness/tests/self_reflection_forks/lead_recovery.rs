@@ -138,7 +138,7 @@ fn write_registration(home: &Path, build: &Path, upstream: &Path) {
         schema: 2,
         state: None,
         build: Some(build.to_path_buf()),
-        task_control: false,
+        task_control: false, goal_recovery: false,
         upstream: native_launcher::Upstream {
             executable: upstream.to_path_buf(),
             sha256: build_identity::hash_file(upstream).unwrap(),

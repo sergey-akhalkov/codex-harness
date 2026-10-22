@@ -7171,6 +7171,7 @@ fn installed_removal_gates_and_restoration_outside_checkout() {
         upstream: Some(upstream.clone()),
         timeout: Duration::from_secs(45),
         path_scope: Some(PathScope::Process),
+        goal_recovery: None,
     };
     let preview = core_install::connect(&request, true).unwrap();
     assert_eq!(preview.status, "preview");

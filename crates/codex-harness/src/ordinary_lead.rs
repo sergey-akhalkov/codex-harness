@@ -16,6 +16,7 @@ use crate::self_reflection_cli::{
     host::LeadLifecycle,
     lifecycle::{self, Preparation},
 };
+use crate::ordinary_recovery::RecoveryHost;
 use harness_core::{
     process::{Job, Limits},
     task_arguments::{self, ManagedArguments},
@@ -176,6 +177,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     let mut adopted: Option<String> = None;
     let mut failure: Option<String> = None;
     let mut deadline: Option<Instant> = None;
+    let mut recovery: Option<RecoveryHost> = None;
     loop {
         let running = match frontend.is_running() {
             Ok(running) => running,
@@ -220,7 +222,20 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 && adopted.as_deref() != Some(selected_now.thread.as_str())
             {
                 match adopt_selected(selected_now, &mut conversation, &plan.paths.log) {
-                    Ok(()) => adopted = Some(selected_now.thread.clone()),
+                    Ok(()) => {
+                        adopted = Some(selected_now.thread.clone());
+                        if recovery.is_none()
+                            && let Some((gate, warnings)) = frontend.recovery_surface()
+                        {
+                            recovery = Some(RecoveryHost::new(
+                                selected_now.thread.clone(),
+                                gate,
+                                warnings,
+                                plan.paths.log.with_extension("recovery.json"),
+                                plan.paths.log.clone(),
+                            ));
+                        }
+                    }
                     Err(error) => {
                         adopted = None;
                         failure.get_or_insert_with(|| {
@@ -232,14 +247,35 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                     }
                 }
             }
+            if failure.is_none() && adopted.is_some() {
+                match conversation.pump() {
+                    Ok(events) => {
+                        if let Some(host) = recovery.as_mut() {
+                            for event in events {
+                                if failure.is_some() {
+                                    break;
+                                }
+                                if let Err(error) =
+                                    host.on_event(&mut conversation, &event.raw)
+                                {
+                                    host.observation_failed(&error.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(format!(
+                            "the ordinary app-server control connection ended while the native frontend was attached: {error}"
+                        ));
+                        deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
+                    }
+                }
+            }
             if failure.is_none()
                 && adopted.is_some()
-                && let Err(error) = conversation.pump()
+                && let Some(host) = recovery.as_mut()
             {
-                failure = Some(format!(
-                    "the ordinary app-server control connection ended while the native frontend was attached: {error}"
-                ));
-                deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
+                host.tick(&mut conversation);
             }
             if adopted.is_some() {
                 let mut owned = lifecycle
@@ -263,6 +299,10 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         } else {
             IDLE_POLL
         });
+    }
+
+    if let Some(mut host) = recovery.take() {
+        host.shutdown();
     }
 
     // The frontend can finish while the relay is still completing its native

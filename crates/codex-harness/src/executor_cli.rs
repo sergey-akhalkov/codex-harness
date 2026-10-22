@@ -54,7 +54,7 @@ pub(crate) mod reflection_admission;
 // degraded diagnostic to. It is not a second backend address, and `executor
 // message` and `executor stop` never resolve a run through it.
 #[path = "executor_warning.rs"]
-mod warning;
+pub(crate) mod warning;
 
 use control::{
     BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, FinalMessage, Lifecycle,
@@ -6041,11 +6041,19 @@ impl OwnedFrontend {
     /// The native warning surface of this frontend: the relay's queue when the
     /// frontend is fronted by one, and the honest no-consumer surface
     /// otherwise. A send through it never becomes a terminal outcome here.
-    fn warnings(&self) -> WarningQueue {
+    pub(crate) fn warnings(&self) -> WarningQueue {
         self.relay
             .as_ref()
             .map(Relay::warnings)
             .unwrap_or_else(WarningQueue::without_consumer)
+    }
+
+    /// The relay's ordering gate and warning surface when this frontend is
+    /// hosted through one. Recovery owns both for the session lifetime.
+    pub(crate) fn recovery_surface(&self) -> Option<(warning::FrontendGate, WarningQueue)> {
+        self.relay
+            .as_ref()
+            .map(|relay| (relay.gate(), relay.warnings()))
     }
 
     /// The frontend's own exit code, when it already exited.

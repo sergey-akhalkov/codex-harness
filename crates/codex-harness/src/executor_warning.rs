@@ -511,6 +511,8 @@ pub type SelectionObserver = Arc<dyn Fn(&str) -> io::Result<()> + Send + Sync>;
 pub struct Relay {
     port: u16,
     queue: WarningQueue,
+    #[allow(dead_code)] // Read by the ordinary recovery host; the relay test target has no host.
+    gate: FrontendGate,
     stop: Arc<AtomicBool>,
     sessions: Arc<Mutex<Vec<JoinHandle<()>>>>,
     worker: Option<JoinHandle<()>>,
@@ -562,6 +564,7 @@ impl Relay {
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let queue = WarningQueue::attached();
+        let gate = FrontendGate::default();
         let stop = Arc::new(AtomicBool::new(false));
         let sessions = Arc::new(Mutex::new(Vec::new()));
         let transport = Arc::new(Transport {
@@ -570,6 +573,7 @@ impl Relay {
             token: token.to_owned(),
             threads,
             queue: queue.clone(),
+            gate: gate.clone(),
             stop: Arc::clone(&stop),
             sessions: Arc::clone(&sessions),
         });
@@ -577,6 +581,7 @@ impl Relay {
         Ok(Self {
             port,
             queue,
+            gate,
             stop,
             sessions,
             worker: Some(worker),
@@ -592,6 +597,14 @@ impl Relay {
     /// The host-owned queue of degraded diagnostics this relay presents.
     pub fn warnings(&self) -> WarningQueue {
         self.queue.clone()
+    }
+
+    /// The ordered boundary shared by frontend mutations and host dispatch.
+    /// A host that dispatches a goal resume holds this gate so a user pause
+    /// already admitted by the relay is forwarded first.
+    #[allow(dead_code)] // Read by the ordinary recovery host; the relay test target has no host.
+    pub(crate) fn gate(&self) -> FrontendGate {
+        self.gate.clone()
     }
 
     /// Stops accepting, ends every relayed session and waits, bounded, for the
@@ -654,6 +667,7 @@ struct Transport {
     token: String,
     threads: ThreadPolicy,
     queue: WarningQueue,
+    gate: FrontendGate,
     stop: Arc<AtomicBool>,
     sessions: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -719,6 +733,12 @@ impl Transport {
                     active = true;
                     match self.frontend_action(&message, &mut frontend_state) {
                         Traffic::Forward => {
+                            // Hold the ordering gate from before the frontend
+                            // mutation reaches the app-server until it is sent.
+                            // A recovery dispatch takes the same gate, so a
+                            // user pause admitted here cannot be overtaken.
+                            let mut gate = self.gate.lock();
+                            record_frontend_mutation(&message, &mut gate);
                             if upstream.send(message).is_err() {
                                 break;
                             }
@@ -810,6 +830,113 @@ impl Transport {
                 .then_some(state.selected.as_deref())
                 .flatten(),
         }
+    }
+}
+
+/// The ordering boundary between a native frontend's own requests and a host
+/// recovery dispatch. Every frontend message forwarded upstream holds it; a
+/// user mutation increments the revision under the same lock.
+#[derive(Clone, Default)]
+pub(crate) struct FrontendGate {
+    state: Arc<Mutex<GateState>>,
+}
+
+#[derive(Default)]
+pub(crate) struct GateState {
+    revision: u64,
+    /// The conversation whose user mutations cancel recovery.
+    thread: Option<String>,
+}
+
+impl GateState {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+impl FrontendGate {
+    #[allow(dead_code)] // Read by the ordinary recovery host; the relay test target has no host.
+    pub(crate) fn bind(&self, thread: &str) {
+        self.lock().thread = Some(thread.to_owned());
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .revision
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Only requests that change what the user owns count as ordering authority.
+/// Reads and native server notifications never invalidate a scheduled resume.
+fn record_frontend_mutation(message: &Message, state: &mut GateState) {
+    let Message::Text(text) = message else {
+        return;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(text.as_str()) else {
+        return;
+    };
+    let Some(method) = record.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    if matches!(
+        method,
+        "thread/goal/set"
+            | "thread/goal/clear"
+            | "turn/start"
+            | "turn/steer"
+            | "turn/interrupt"
+            | "thread/compact/start"
+    ) && record["params"]["threadId"].as_str() == state.thread.as_deref()
+    {
+        state.revision = state.revision.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn text(value: Value) -> Message {
+        Message::Text(value.to_string().into())
+    }
+
+    #[test]
+    fn only_the_bound_threads_user_mutations_bump_the_recovery_gate() {
+        let gate = FrontendGate::default();
+        gate.bind("thread-a");
+        assert_eq!(gate.revision(), 0);
+
+        let mut state = gate.lock();
+        record_frontend_mutation(
+            &text(json!({"method":"thread/goal/set","params":{"threadId":"thread-a"}})),
+            &mut state,
+        );
+        assert_eq!(state.revision(), 1);
+        record_frontend_mutation(
+            &text(json!({"method":"thread/goal/get","params":{"threadId":"thread-a"}})),
+            &mut state,
+        );
+        assert_eq!(state.revision(), 1, "reads never cancel recovery");
+        record_frontend_mutation(
+            &text(json!({"method":"turn/start","params":{"threadId":"thread-b"}})),
+            &mut state,
+        );
+        assert_eq!(state.revision(), 1, "another conversation is not this goal");
+        record_frontend_mutation(
+            &text(json!({"method":"turn/interrupt","params":{"threadId":"thread-a"}})),
+            &mut state,
+        );
+        assert_eq!(state.revision(), 2);
+        record_frontend_mutation(&Message::Text("not json".into()), &mut state);
+        assert_eq!(state.revision(), 2);
     }
 }
 
