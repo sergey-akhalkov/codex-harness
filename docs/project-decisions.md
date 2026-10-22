@@ -34,6 +34,17 @@ backtraces. Full debugger information, including dependency types and variables,
 is an explicit separate profile. Required tests, assertions, publication
 integrity and the existing machine resource budgets remain intact.
 
+**2026-10-22, confirmed:** native delivery has two explicit compiler choices.
+Ordinary `deploy` remains the release/publication route with a fresh target and
+fat LTO. `deploy --fast` is an explicit local-iteration choice; it never falls
+back to release, and fast and release candidates cannot be selected
+interchangeably. Test-only feedback stays on Cargo unless delivery or installed
+behavior is under test. The persistent fast target, compiled-input-only reuse
+and one-invocation delivery remain planned and are not current behavior.
+Commands, retained measurement scope and current limitations live in the
+[installation guide](installation.md#fast-local-delivery) and
+[native guide](rust-native.md#fast-local-delivery-profile).
+
 Use the existing `cargo-fast` skill to carry measured, portable practices to
 other Rust projects. Optional caches, test runners, target consolidation and
 concurrency changes need evidence for their workload; no universal savings are

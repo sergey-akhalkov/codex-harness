@@ -27,6 +27,10 @@ Formatting belongs in the loop only where the project gates on it. Keep `--locke
 
 Cold compilation, warm reuse (unchanged sources), edit feedback (one small source change) and test execution are separate workloads with separate bottlenecks. Measure them separately, before and after, with matched inputs (toolchain, features, profile, target root). Compare wall or compiler time (`cargo build --timings`, shell timing) and logical bytes of the target roots you own. A scoped pair supports a scoped claim, never a universal number.
 
+## Separate local iteration from publication
+
+Make a fast delivery profile an explicit command, not a changed release default. Record the selected profile in build evidence and receipts, reject an unavailable fast profile or candidate instead of falling back to release, and never publish a local fast artifact as the release candidate. In this kit, `deploy --fast` selects `delivery-fast`; ordinary `deploy` remains release/fat-LTO. The retained 2026-10-22 measurement scope, fresh-target limitation and unavailable persistent-target/one-invocation work are owned by the [installation guide](../../../docs/installation.md#fast-local-delivery) and [native guide](../../../docs/rust-native.md#fast-local-delivery-profile). Do not run a delivery build for test-only feedback that focused Cargo checks can answer, and do not treat a profile-level benchmark as a command-level promise: match jobs, toolchain, target root and source first.
+
 ## Profiles: compact development, explicit full debugging
 
 The official build-performance recipe, with one addition for dependency backtraces:

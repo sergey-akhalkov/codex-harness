@@ -24,6 +24,9 @@ absolute. Read the receipt: `status`, `build_identity`, and
 `verification.executor_probe_ok` must reflect the new build before you call
 the delivery done.
 
+- Ordinary `deploy` is the release/publication route (fresh target, fat LTO).
+  Never use its candidate for a `--fast` request or a fast candidate for
+  publication.
 - `--all` also chains the scoped component updates (code tools, token
   workflow, board, subscriptions) and reports each one.
 - `--preview` plans without changing the installation. Without `--build`, it
@@ -31,6 +34,28 @@ the delivery done.
   otherwise normal preparation applies. Check `build_selection` and
   `build_check` in the receipt: an older build's plan does not verify new source.
 - `--build`/`--state` pin or place the candidate explicitly.
+
+## Local fast delivery
+
+Use the explicit fast profile only for local iteration:
+
+```powershell
+codex-harness deploy --source <ABSOLUTE-KIT-CHECKOUT> --fast
+```
+
+The receipt's top-level `profile` must be `delivery-fast`; ordinary deployment
+must report `release`. Fast and release candidates do not substitute for each
+other, and an unavailable fast candidate or mismatched explicit build is an
+error before installation changes. The retained 2026-10-22 cold scope was a
+617.8 s release baseline and 2m34s for the fast profile at two Cargo jobs;
+the current native command uses one job, so these are not a matched
+same-job promise. This revision has no persistent fast target or
+one-invocation delivery. Preview and applying delivery keep their source,
+build, profile and ownership checks; preview does not certify changed source.
+For a test- or fixture-only change, run focused Cargo checks; deploy only when
+delivery or installed behavior is under test.
+Measured scope, cache lifecycle, limitations and the test-only no-deploy rule
+are owned by the [installation guide](../../../docs/installation.md#fast-local-delivery).
 
 ## Repairing a blocked installation
 

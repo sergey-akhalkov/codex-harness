@@ -264,6 +264,67 @@ owner; missing prerequisites remain explicit failures and do not disappear
 from the receipt. Avoiding preview compilation establishes this bounded
 behavior, not an end-to-end time or token saving.
 
+### Fast local delivery
+
+`deploy` without `--fast` is the release/publication route: a fresh target,
+fat LTO and the complete delivery and runtime checks. Use it for final
+delivery and for any candidate another person or machine will consume. For an
+explicit local iteration candidate, add `--fast`:
+
+```powershell
+codex-harness deploy --source "<absolute-kit-checkout>" --fast [--all] [--preview]
+```
+
+`--fast` selects the maintained `delivery-fast` profile (opt-level 3 inherited
+from release, `strip = true`, `lto = "off"` and `codegen-units = 16`). It does
+not change ordinary `deploy`, and it never falls back to release: an
+unavailable fast profile or candidate, or a `--build` for another profile,
+fails before installation links change. The receipt's top-level `profile` must
+be `delivery-fast` for this choice and `release` for ordinary deployment. Fast
+and release candidates are not interchangeable, even when both exist for the
+same source. Keep fast candidates on the local developer installation; release
+candidates remain the publication output.
+
+Retained cold-build observations from 2026-10-22, with rustc/cargo 1.98.1 on
+`x86_64-pc-windows-msvc`, one host and adjacent source revisions under the
+shared heavy budget:
+
+| Route | Retained observation |
+| --- | --- |
+| Release baseline at source `4bd9ea12` | 617.757813 s wall (phase 1 518 s, phase 2 96 s); outer-Job peak 3,256,029,184 bytes; seven artifacts 35,290,624 bytes total; manager 27,249,664 bytes |
+| `delivery-fast` foundation at source `f96fe382` | 2m34s cold at two Cargo jobs; manager 29,714,944 bytes |
+
+These are scoped planning expectations, not a matched same-job speedup claim:
+the fast foundation used two Cargo jobs, while the native command currently
+uses one job for either profile and has no deploy job-count option. Queue
+conditions, source, toolchain, target and machine changes invalidate transfer;
+the leaf-rebuild and single-binary reuse targets have not been measured as
+current command times.
+
+This revision has no persistent fast compiler target. Both profiles prepare a
+fresh leased scratch target under `%TEMP%\chx`, so a changed-source deployment
+recompiles dependencies again. Unchanged exact source can reuse an intact,
+verified immutable candidate without Cargo. The scratch ownership, recovery
+and cleanup details belong to the
+[native build lifecycle](rust-native.md#manager-inventory-and-core-connection).
+A persistent installation-owned fast target, its freshness and foreign-state
+handling, compiled-input-only candidate reuse, and one-invocation delivery are
+planned and not available; do not hand-build or assume such a cache.
+
+For a test- or fixture-only change that does not exercise delivery, run the
+focused [Cargo feedback route](rust-native.md#development-feedback-without-a-publication-build)
+instead of deploying. Deployment is not a test runner and is needed only when
+the task itself exercises compilation, installation, the receipt, the launcher
+or installed runtime behavior. The current full-checkout source identity means
+a test-only edit invalidates the existing candidate; that is a reason to avoid
+an unnecessary deployment, not to call an older candidate current.
+
+Preview and applying delivery retain their source, build, profile and ownership
+checks; applying additionally verifies the installed launcher. A preview may
+select an older verified build and report it as source-stale; it does not
+certify changed source as compiled, tested or accepted, and it grants no
+authority to the later applying step.
+
 For connected code tools, delivery requires real Serena semantic acceptance
 before link changes and through the installed manager afterward. The receipt's
 `verification.serena.status` must be `semantic-ready`; `not-connected` records
@@ -323,7 +384,7 @@ Install the remaining components with the same candidate:
 ### Completion and targeted recovery
 
 Read the final delivery receipt: require `status = deployed`, the intended
-`build_identity`, every requested component's `ok = true`,
+`profile`, the intended `build_identity`, every requested component's `ok = true`,
 `verification.executor_probe_ok = true`, and, with code tools connected,
 `verification.serena.status = semantic-ready`. A `partial` receipt means
 installation has changed state but verification is unfinished. Preserve that

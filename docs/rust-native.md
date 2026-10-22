@@ -127,6 +127,36 @@ download-cache GC does not collect target artifacts; repeatedly cleaning the
 active root trades disk space for a new cold build. The portable diagnosis and
 comparison procedure belongs to [cargo-fast](../.agents/skills/cargo-fast/SKILL.md).
 
+### Fast local delivery profile
+
+The maintained `delivery-fast` profile inherits `release` with `strip = true`,
+`lto = "off"` and `codegen-units = 16`. `deploy --fast` selects it explicitly;
+ordinary `deploy` selects `release`, which keeps fat LTO and one codegen unit.
+The build record stores the profile, and candidate preparation, preview,
+reuse, validation and installation all filter on it. A fast candidate cannot
+serve a release request, and an unavailable fast candidate is an error rather
+than a release fallback. The user-facing choice, retained measurements and
+their scope are owned by [installation](installation.md#fast-local-delivery).
+
+Both profiles currently compile with the native one-Cargo-job limit. Fast
+preparation in this revision still uses a fresh leased scratch target under
+`%TEMP%\chx`; it keeps no compiler target between candidates, so a
+changed-source fast deployment pays dependency compilation again. Exact
+unchanged source can reuse an immutable verified candidate without Cargo. The
+scratch lease, reclamation and recovery behavior is described in
+[Manager, inventory and core connection](#manager-inventory-and-core-connection);
+do not treat that scratch root as a reusable user cache.
+
+A persistent installation-owned fast target is planned but not available:
+its toolchain/target/profile/lockfile/manifest/configuration key, ownership
+record, lease, conservative freshness fallback and inactivity retirement do
+not exist in this revision. One-invocation delivery and compiled-input-only
+reuse for test-only changes are also planned. Current preparation still
+bootstraps the source manager, queries its delivery set and runs the
+completion phase, while full-checkout identity governs reuse. Keep test-only
+feedback on its [Cargo route](#development-feedback-without-a-publication-build)
+unless delivery or installed behavior is what needs verification.
+
 ### Integration targets and compilation parallelism
 
 `harness-core` now has one integration executable. The original files remain
@@ -220,17 +250,21 @@ without coverage. A narrower publication key was evaluated and **not**
 adopted: exclusion by path category is either unsafe (a fixture can be a
 real compiler input) or unnecessary, while a dep-info-derived key exists only
 after a build and would need retained compiled-input evidence; no measured
-safe benefit justified the change. The release profile (`lto = true`,
+safe benefit justified the change. The planned fast-only reuse would retain
+that evidence; it is not implemented and does not change release publication.
+The release profile (`lto = true`,
 `codegen-units = 1`) was compared once against thin LTO with 16 codegen
 units under identical source and toolchain conditions: the candidate built
 slower (532 s vs 448 s), produced 5.4% larger binaries, and showed equal
 startup and runtime behavior within measurement noise, so the accepted
-profile is retained. A persistent compiler target was rejected for the same
-reason the route already uses fresh targets: Cargo's freshness check trusts
-timestamps, so a changed input with a preserved timestamp silently reuses a
-stale artifact, while an unchanged identity is already served by verified
-artifact reuse (a full live-identity and integrity validation measured
-114-138 ms) without running Cargo at all.
+profile is retained. The release route continues to reject a persistent
+compiler target because Cargo's freshness check trusts timestamps: a changed
+input with a preserved timestamp could silently reuse a stale artifact. A
+fast-only target remains planned rather than implemented and would need the
+separate conservative freshness guard; no fast target exists in this revision.
+Unchanged identity is already
+served by verified artifact reuse (a full live-identity and integrity
+validation measured 114-138 ms) without running Cargo at all.
 
 Publication now bootstraps the requested source's manager, asks it for its
 declared delivery programs, and completes exactly those binaries in the same
@@ -2070,7 +2104,7 @@ leadership transfer, recovery after controller restart or measured quota benefit
 ## Manager, inventory and core connection
 
 ```powershell
-codex-harness deploy --source CHECKOUT [--codex-home DIRECTORY] [--user-home DIRECTORY] [--build DIRECTORY] [--state DIRECTORY] [--reset] [--all] [--preview]
+codex-harness deploy --source CHECKOUT [--codex-home DIRECTORY] [--user-home DIRECTORY] [--build DIRECTORY] [--state DIRECTORY] [--reset] [--all] [--preview] [--fast]
 cargo run --release --locked -p codex-harness -- build --source . --state "$env:LOCALAPPDATA/codex-harness-native"
 codex-harness.exe check --build <directory> [--source <checkout>]
 codex-harness.exe inventory --source <checkout> --codex-home <directory> --user-home <directory>
