@@ -30,9 +30,9 @@
 
 ## 6. Compiled-input identity and test-only reuse
 
-- [ ] 6.1 Extend the build record with the union of actual compiled inputs from every delivered binary's dep-info plus build-affecting identities; verify missing, changed or ambiguous evidence cannot authorize reuse.
-- [ ] 6.2 Permit fast reuse when every compiled input and build-affecting input matches while only noncompiled test or documentation files changed; verify a new selection record references the same verified binary hashes and reports the current checkout relationship without rewriting the prior build.
-- [ ] 6.3 Verify a fixture or documentation-like file that is actually compiled invalidates the candidate, an unrelated new file does not by itself force a rebuild, and any lockfile, manifest, toolchain or Cargo configuration change requires compatible new evidence.
+- [x] 6.1 Extend the build record with the union of actual compiled inputs from every delivered binary's dep-info plus build-affecting identities; verify missing, changed or ambiguous evidence cannot authorize reuse.
+- [x] 6.2 Permit fast reuse when every compiled input and build-affecting input matches while only noncompiled test or documentation files changed; verify a new selection record references the same verified binary hashes and reports the current checkout relationship without rewriting the prior build.
+- [x] 6.3 Verify a fixture or documentation-like file that is actually compiled invalidates the candidate, an unrelated new file does not by itself force a rebuild, and any lockfile, manifest, toolchain or Cargo configuration change requires compatible new evidence.
 
 ## 7. Release concurrency and test feedback
 
