@@ -2417,6 +2417,86 @@ mod tests {
     }
 
     #[test]
+    fn compiled_input_evidence_requires_nonempty_binary_paths_and_exact_union() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = source_fixture(temp.path(), "source")
+            .canonicalize()
+            .unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let target = temp.path().join("target");
+        let extra = source.join("crates/one/unrelated.txt");
+        fs::write(&extra, "unused source data").unwrap();
+        let (build, evidence) = build_with_compiled_evidence(
+            &state,
+            "aaaa0000aaaa0000-1500-1",
+            &source,
+            &target,
+            Profile::DeliveryFast,
+            &[],
+        );
+        let record = build_identity::read_record(&build).unwrap();
+        let evidence_path = build.join(build_identity::COMPILED_INPUTS_FILE);
+        let original = fs::read(&evidence_path).unwrap();
+        let refused = |candidate: &build_identity::CompiledInputs, label: &str| {
+            assert!(
+                candidate.validate_against(&build, &record).is_err(),
+                "{label} must be refused"
+            );
+            fs::write(&evidence_path, serde_json::to_vec(candidate).unwrap()).unwrap();
+            let identity = build_identity::source_identity(&source).unwrap();
+            assert!(
+                reusable_candidates(
+                    &state,
+                    &source,
+                    "fixture",
+                    "fixture",
+                    &identity,
+                    Profile::DeliveryFast,
+                )
+                .unwrap()
+                .is_empty(),
+                "{label} must not authorize reuse"
+            );
+        };
+
+        let mut empty_binary = evidence.clone();
+        empty_binary.binaries.get_mut("codex.exe").unwrap().clear();
+        refused(&empty_binary, "an empty per-binary path list");
+
+        let mut empty_files = evidence.clone();
+        for paths in empty_files.binaries.values_mut() {
+            paths.clear();
+        }
+        empty_files.files.clear();
+        refused(&empty_files, "empty per-binary and union evidence");
+
+        let mut extra_file = evidence.clone();
+        extra_file.files.insert(
+            "crates/one/unrelated.txt".into(),
+            build_identity::hash_file(&extra).unwrap(),
+        );
+        refused(&extra_file, "an unreferenced union entry");
+
+        fs::write(&evidence_path, original).unwrap();
+        assert!(evidence.validate_against(&build, &record).is_ok());
+        let identity = build_identity::source_identity(&source).unwrap();
+        assert_eq!(
+            reusable_candidates(
+                &state,
+                &source,
+                "fixture",
+                "fixture",
+                &identity,
+                Profile::DeliveryFast,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn fast_reuse_records_same_binaries_for_the_current_checkout_without_rewriting_the_build() {
         let temp = tempfile::tempdir().unwrap();
         let source = source_fixture(temp.path(), "source")

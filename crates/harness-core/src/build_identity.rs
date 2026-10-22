@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
 };
@@ -140,26 +140,37 @@ impl CompiledInputs {
                 .binaries
                 .keys()
                 .any(|binary| !self.binaries.contains_key(binary))
-            || self.binaries.values().any(|paths| !strictly_sorted(paths))
+            || self
+                .binaries
+                .values()
+                .any(|paths| paths.is_empty() || !strictly_sorted(paths))
             || self.files.keys().any(|path| !safe_relative_key(path))
             || self.files.values().any(|digest| !is_sha256(digest))
         {
             return Err(invalid());
         }
+        let mut referenced = BTreeSet::new();
         for paths in self.binaries.values() {
             for path in paths {
                 if self.files.get(path) != record.source.files.get(path) {
                     return Err(invalid());
                 }
+                referenced.insert(path.as_str());
             }
         }
-        if self.files.iter().any(|(path, digest)| {
-            record
-                .source
+        if referenced.len() != self.files.len()
+            || self
                 .files
-                .get(path)
-                .is_none_or(|source| source != digest)
-        }) || self.build_affecting != build_affecting_identity(&record.source.files)
+                .keys()
+                .any(|path| !referenced.contains(path.as_str()))
+            || self.files.iter().any(|(path, digest)| {
+                record
+                    .source
+                    .files
+                    .get(path)
+                    .is_none_or(|source| source != digest)
+            })
+            || self.build_affecting != build_affecting_identity(&record.source.files)
         {
             return Err(invalid());
         }
