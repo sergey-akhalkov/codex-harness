@@ -155,7 +155,7 @@ pub(super) fn finalize(request_path: &Path) -> io::Result<()> {
     validate_paths(request_path, &request)?;
     let current = build_identity::source_identity(&request.source)?;
     known_before(&current, &request.before)?;
-    verify_compiled_inputs(&request.target, &request.source, &current, profile)?;
+    let mut compiled = verify_compiled_inputs(&request.target, &request.source, &current, profile)?;
     let mut binaries = BTreeMap::new();
     for name in BINARIES {
         let built = request
@@ -191,7 +191,21 @@ pub(super) fn finalize(request_path: &Path) -> io::Result<()> {
         binaries,
     };
     let record_bytes = serde_json::to_vec_pretty(&record)?;
+    compiled.bind_record(&record_bytes)?;
+    let compiled_bytes = serde_json::to_vec_pretty(&compiled)?;
     write_new(&request.staging.join("build.json"), &record_bytes)?;
+    write_new(
+        &request.staging.join(build_identity::COMPILED_INPUTS_FILE),
+        &compiled_bytes,
+    )?;
+    if build_identity::read_compiled_inputs(&request.staging)?
+        .validate_against(&request.staging, &record)
+        .is_err()
+    {
+        return Err(io::Error::other(
+            "Fresh compiled-input evidence is incomplete; staging retained.",
+        ));
+    }
     if build_identity::source_identity(&request.source)? != current
         || bounded_bytes(request_path)? != request_bytes
         || !build_identity::check_profile(&request.staging, Some(&request.source), profile)

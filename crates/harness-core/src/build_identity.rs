@@ -35,6 +35,9 @@ pub(crate) mod test_probe {
 }
 
 pub const SCHEMA: u32 = 1;
+pub const COMPILED_INPUT_SCHEMA: u32 = 1;
+pub const COMPILED_INPUTS_FILE: &str = "compiled-inputs.json";
+const MAX_COMPILED_INPUTS: u64 = 8 * 1024 * 1024;
 pub const BINARIES: &[&str] = &[
     "codex-harness.exe",
     "codex.exe",
@@ -89,6 +92,128 @@ fn release_profile() -> String {
 pub struct SourceIdentity {
     pub sha256: String,
     pub files: BTreeMap<String, String>,
+}
+
+/// Complete compiled-input evidence for one immutable build.
+///
+/// `files` is the union of source-relative paths named by every delivered
+/// binary's dep-info. `binaries` preserves which binary named each input;
+/// `build_affecting` retains the manifest, lockfile, toolchain, build-script
+/// and Cargo configuration identities that can change without being compiled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledInputs {
+    pub schema: u32,
+    pub source_sha256: String,
+    pub build_record_sha256: String,
+    pub binaries: BTreeMap<String, Vec<String>>,
+    pub files: BTreeMap<String, String>,
+    pub build_affecting: BTreeMap<String, String>,
+}
+
+impl CompiledInputs {
+    pub fn bind_record(&mut self, record_bytes: &[u8]) -> io::Result<()> {
+        if self.schema != COMPILED_INPUT_SCHEMA || self.binaries.is_empty() {
+            return Err(io::Error::other(
+                "Missing or incompatible compiled-input evidence.",
+            ));
+        }
+        self.build_record_sha256 = hash_bytes(record_bytes);
+        Ok(())
+    }
+
+    /// Reject incomplete, ambiguous or tampered evidence before it can
+    /// authorize reuse. The record's own source inventory remains the
+    /// authoritative hash source.
+    pub fn validate_against(&self, build: &Path, record: &BuildRecord) -> io::Result<()> {
+        let invalid = || io::Error::other("Incomplete or ambiguous compiled-input evidence.");
+        if self.schema != COMPILED_INPUT_SCHEMA
+            || !is_sha256(&self.source_sha256)
+            || !is_sha256(&self.build_record_sha256)
+            || self.source_sha256 != record.source.sha256
+            || self.build_record_sha256 != hash_file(&build.join("build.json"))?
+            || BINARIES
+                .iter()
+                .any(|binary| !self.binaries.contains_key(*binary))
+            || self.binaries.len() != record.binaries.len()
+            || record
+                .binaries
+                .keys()
+                .any(|binary| !self.binaries.contains_key(binary))
+            || self.binaries.values().any(|paths| !strictly_sorted(paths))
+            || self.files.keys().any(|path| !safe_relative_key(path))
+            || self.files.values().any(|digest| !is_sha256(digest))
+        {
+            return Err(invalid());
+        }
+        for paths in self.binaries.values() {
+            for path in paths {
+                if self.files.get(path) != record.source.files.get(path) {
+                    return Err(invalid());
+                }
+            }
+        }
+        if self.files.iter().any(|(path, digest)| {
+            record
+                .source
+                .files
+                .get(path)
+                .is_none_or(|source| source != digest)
+        }) || self.build_affecting != build_affecting_identity(&record.source.files)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    /// Reuse compares data, never path categories. Any compiled or
+    /// build-affecting path added, removed or changed fails this check.
+    pub fn matches(&self, current: &SourceIdentity) -> bool {
+        self.build_affecting == build_affecting_identity(&current.files)
+            && self
+                .files
+                .iter()
+                .all(|(path, digest)| current.files.get(path) == Some(digest))
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn strictly_sorted(paths: &[String]) -> bool {
+    paths.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn safe_relative_key(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Inputs whose bytes can change the compiler invocation or dependency graph
+/// without appearing in a delivered binary's dep-info.
+pub(crate) fn build_affecting_path(path: &str) -> bool {
+    path == "Cargo.toml"
+        || path == "Cargo.lock"
+        || path.ends_with("/Cargo.toml")
+        || path == "build.rs"
+        || path.ends_with("/build.rs")
+        || path == "rust-toolchain"
+        || path == "rust-toolchain.toml"
+        || path.starts_with(".cargo/")
+        || path.starts_with("cargo-host-config/")
+}
+
+pub(crate) fn build_affecting_identity(
+    files: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .filter(|(path, _)| build_affecting_path(path))
+        .map(|(path, digest)| (path.clone(), digest.clone()))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +394,19 @@ pub fn read_record(build: &Path) -> io::Result<BuildRecord> {
     if file.metadata()?.len() > 4 * 1024 * 1024 {
         return Err(io::Error::other("build record too large"));
     }
+    serde_json::from_reader(file).map_err(io::Error::other)
+}
+
+pub fn read_compiled_inputs(build: &Path) -> io::Result<CompiledInputs> {
+    ordinary(build)?;
+    let path = build.join(COMPILED_INPUTS_FILE);
+    ordinary(&path)?;
+    if fs::metadata(&path)?.len() > MAX_COMPILED_INPUTS {
+        return Err(io::Error::other(
+            "Compiled-input evidence is missing or oversized.",
+        ));
+    }
+    let file = fs::File::open(path)?;
     serde_json::from_reader(file).map_err(io::Error::other)
 }
 

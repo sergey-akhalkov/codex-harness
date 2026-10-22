@@ -39,6 +39,9 @@ const FAST_SCHEMA: u32 = 1;
 /// not this age, decides whether a target is currently active.
 const FAST_INACTIVITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DELIVERY_SELECTION_FILE: &str = "delivery-selection.json";
+pub const COMPILED_INPUT_SELECTIONS: &str = "compiled-input-selections";
+const COMPILED_INPUT_RELATIONSHIP: &str = "compiled-inputs-match";
+const CURRENT_CHECKOUT_RELATIONSHIP: &str = "current-checkout";
 
 #[path = "native_handoff.rs"]
 mod handoff;
@@ -159,48 +162,69 @@ fn write_delivery_selection(staging: &Path, declaration: Option<&[String]>) -> i
     )
 }
 
+fn dep_info_paths(path: &Path) -> io::Result<Vec<String>> {
+    ordinary_ancestors(path)?;
+    if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
+        return Err(io::Error::other(
+            "Compiled-input evidence is missing or oversized.",
+        ));
+    }
+    let dependencies = fs::read_to_string(path)?;
+    let dependencies = dependencies.replace("\\\r\n", "").replace("\\\n", "");
+    let mut lines = dependencies.lines().filter(|line| !line.trim().is_empty());
+    let line = lines
+        .next()
+        .ok_or_else(|| io::Error::other("Missing Cargo compiled-input evidence."))?;
+    if lines.next().is_some() {
+        return Err(io::Error::other(
+            "Ambiguous Cargo dep-info; candidate not accepted.",
+        ));
+    }
+    let (_, paths) = line
+        .split_once(": ")
+        .ok_or_else(|| io::Error::other("Unrecognized Cargo dep-info; candidate not accepted."))?;
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut chars = paths.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if (ch == '\\' && chars.peek().is_some_and(|c| c.is_whitespace() || *c == '#'))
+            || (ch == '$' && chars.peek() == Some(&'$'))
+        {
+            token.push(chars.next().unwrap());
+        } else if ch.is_whitespace() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    if tokens.is_empty() {
+        return Err(io::Error::other("Missing Cargo compiled-input evidence."));
+    }
+    Ok(tokens)
+}
+
 fn verify_compiled_inputs(
     target: &Path,
     source: &Path,
     inputs: &build_identity::SourceIdentity,
     profile: Profile,
-) -> io::Result<()> {
+) -> io::Result<build_identity::CompiledInputs> {
     let canonical_target = target.canonicalize()?;
+    let mut binaries = BTreeMap::new();
+    let mut files = BTreeMap::new();
     for binary in BINARIES {
         let depfile = target
             .join(TARGET)
             .join(profile.output_dir())
             .join(binary)
             .with_extension("d");
-        ordinary_ancestors(&depfile)?;
-        let dependencies = fs::read_to_string(depfile)?;
-        let line = dependencies.lines().next().unwrap_or("");
-        let (_, paths) = line.split_once(": ").ok_or_else(|| {
-            io::Error::other("Unrecognized Cargo dep-info; candidate not accepted.")
-        })?;
-        let mut tokens = Vec::new();
-        let mut token = String::new();
-        let mut chars = paths.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if (ch == '\\' && chars.peek().is_some_and(|c| c.is_whitespace() || *c == '#'))
-                || (ch == '$' && chars.peek() == Some(&'$'))
-            {
-                token.push(chars.next().unwrap());
-            } else if ch.is_whitespace() {
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-            } else {
-                token.push(ch);
-            }
-        }
-        if !token.is_empty() {
-            tokens.push(token);
-        }
-        if tokens.is_empty() {
-            return Err(io::Error::other("Missing Cargo compiled-input evidence."));
-        }
-        for token in tokens {
+        let mut source_inputs = BTreeSet::new();
+        for token in dep_info_paths(&depfile)? {
             let path = PathBuf::from(token);
             let path = if path.is_absolute() {
                 path
@@ -216,14 +240,27 @@ fn verify_compiled_inputs(
                         "Compiled input {key} is outside the native input inventory; place executable resources under the crate's src directory before explicit build."
                     )));
                 }
+                files.insert(key.clone(), inputs.files[&key].clone());
+                source_inputs.insert(key);
             } else if !path.starts_with(&canonical_target) {
                 return Err(io::Error::other(
                     "Compiled input is outside owned source/build roots; candidate not accepted.",
                 ));
             }
         }
+        binaries.insert(
+            (*binary).to_owned(),
+            source_inputs.into_iter().collect::<Vec<_>>(),
+        );
     }
-    Ok(())
+    Ok(build_identity::CompiledInputs {
+        schema: build_identity::COMPILED_INPUT_SCHEMA,
+        source_sha256: inputs.sha256.clone(),
+        build_record_sha256: String::new(),
+        binaries,
+        files,
+        build_affecting: build_identity::build_affecting_identity(&inputs.files),
+    })
 }
 
 /// Serialize mutations without adopting an unknown or missing state directory.
@@ -261,6 +298,24 @@ pub struct PreparedBuild {
     pub build: PathBuf,
     pub reused: bool,
     pub source_identity: String,
+}
+
+/// An immutable record of why a verified fast candidate is still applicable
+/// to the current checkout. It references the original build; it never
+/// rewrites its record or binaries.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledInputSelection {
+    pub schema: u32,
+    pub build: String,
+    pub profile: String,
+    pub build_record_sha256: String,
+    pub binaries: BTreeMap<String, String>,
+    pub compiled_inputs_sha256: String,
+    pub source_root: PathBuf,
+    pub source_sha256: String,
+    pub built_source_sha256: String,
+    pub relationship: String,
 }
 
 fn tool_version(tool: &OsStr, args: &[&str], source: &Path) -> io::Result<String> {
@@ -700,20 +755,6 @@ impl FastTarget {
     }
 }
 
-/// Key build-affecting inputs while leaving ordinary source bytes to Cargo's
-/// incremental rebuild. The manifest itself carries the delivery declaration.
-fn fast_key_input(path: &str) -> bool {
-    path == "Cargo.toml"
-        || path == "Cargo.lock"
-        || path.ends_with("/Cargo.toml")
-        || path == "build.rs"
-        || path.ends_with("/build.rs")
-        || path == "rust-toolchain"
-        || path == "rust-toolchain.toml"
-        || path.starts_with(".cargo/")
-        || path.starts_with("cargo-host-config/")
-}
-
 fn fast_target_key(
     identity: &build_identity::SourceIdentity,
     rustc: &str,
@@ -723,7 +764,7 @@ fn fast_target_key(
     let files: BTreeMap<_, _> = identity
         .files
         .iter()
-        .filter(|(path, _)| fast_key_input(path))
+        .filter(|(path, _)| build_identity::build_affecting_path(path))
         .map(|(path, hash)| (path.clone(), hash.clone()))
         .collect();
     Ok(build_identity::hash_bytes(&serde_json::to_vec(
@@ -1155,24 +1196,9 @@ fn delivery_from(executable: &Path, source: &Path) -> io::Result<PathBuf> {
         })
 }
 
-/// A file covered by both the recorded and the live identity whose content
-/// differs: such a record can never match, whichever producer version wrote
-/// it. Coverage that exists on only one side may come from another producer
-/// version's identity rules and is left to that build's own consumer check.
-fn shared_content_differs(
-    recorded: &build_identity::SourceIdentity,
-    live: &build_identity::SourceIdentity,
-) -> bool {
-    recorded.files.iter().any(|(path, digest)| {
-        live.files
-            .get(path)
-            .is_some_and(|current| current != digest)
-    })
-}
-
-/// Candidate records that already match the established source/toolchain/
-/// target identity. A candidate with definitely changed content is rejected
-/// here before any consumer validation is started.
+/// Release candidates require the full checkout identity. Fast candidates
+/// additionally require complete compiled-input evidence bound to the same
+/// immutable record.
 fn reusable_candidates(
     state: &Path,
     source: &Path,
@@ -1197,8 +1223,20 @@ fn reusable_candidates(
             || record.cargo != cargo
             || record.target != TARGET
             || build_identity::record_profile(&record).ok() != Some(profile)
-            || shared_content_differs(&record.source, expected)
         {
+            continue;
+        }
+        if profile == Profile::Release {
+            if record.source != *expected {
+                continue;
+            }
+            candidates.push((path, record));
+            continue;
+        }
+        let Ok(evidence) = build_identity::read_compiled_inputs(&path) else {
+            continue;
+        };
+        if evidence.validate_against(&path, &record).is_err() || !evidence.matches(expected) {
             continue;
         }
         candidates.push((path, record));
@@ -1214,18 +1252,122 @@ fn find_reusable(
     expected: &build_identity::SourceIdentity,
     profile: Profile,
 ) -> io::Result<Option<PreparedBuild>> {
+    find_reusable_with(state, source, rustc, cargo, expected, profile, |path| {
+        consumer_check(path, Some(source)).map(|check| reusable_status(profile, &check.status))
+    })
+}
+
+fn reusable_status(profile: Profile, status: &build_identity::Health) -> bool {
+    *status == build_identity::Health::Healthy
+        || (profile == Profile::DeliveryFast && *status == build_identity::Health::SourceStale)
+}
+
+fn find_reusable_with(
+    state: &Path,
+    source: &Path,
+    rustc: &str,
+    cargo: &str,
+    expected: &build_identity::SourceIdentity,
+    profile: Profile,
+    mut verify: impl FnMut(&Path) -> io::Result<bool>,
+) -> io::Result<Option<PreparedBuild>> {
     for (path, record) in reusable_candidates(state, source, rustc, cargo, expected, profile)? {
-        if consumer_check(&path, Some(source))
-            .is_ok_and(|check| check.status == build_identity::Health::Healthy)
-        {
+        if !verify(&path).is_ok_and(|verified| verified) {
+            continue;
+        }
+        if profile == Profile::DeliveryFast {
+            let current = build_identity::source_identity(source)?;
+            if current != *expected {
+                continue;
+            }
+            let Ok(record) = build_identity::verify_record_integrity(&path) else {
+                continue;
+            };
+            let Ok(evidence) = build_identity::read_compiled_inputs(&path) else {
+                continue;
+            };
+            if evidence.validate_against(&path, &record).is_err() || !evidence.matches(&current) {
+                continue;
+            }
+            record_reuse_selection(state, source, &path, &record, &current)?;
             return Ok(Some(PreparedBuild {
                 build: path,
                 reused: true,
                 source_identity: record.source.sha256,
             }));
         }
+        return Ok(Some(PreparedBuild {
+            build: path,
+            reused: true,
+            source_identity: record.source.sha256,
+        }));
     }
     Ok(None)
+}
+
+fn record_reuse_selection(
+    state: &Path,
+    source: &Path,
+    build: &Path,
+    record: &build_identity::BuildRecord,
+    current: &build_identity::SourceIdentity,
+) -> io::Result<PathBuf> {
+    let selection = CompiledInputSelection {
+        schema: 1,
+        build: build
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("Non-Unicode build directory"))?
+            .into(),
+        profile: build_identity::record_profile(record)?.as_str().into(),
+        build_record_sha256: build_identity::hash_file(&build.join("build.json"))?,
+        binaries: record.binaries.clone(),
+        compiled_inputs_sha256: build_identity::hash_file(
+            &build.join(build_identity::COMPILED_INPUTS_FILE),
+        )?,
+        source_root: source.canonicalize()?,
+        source_sha256: current.sha256.clone(),
+        built_source_sha256: record.source.sha256.clone(),
+        relationship: if current.sha256 == record.source.sha256 {
+            CURRENT_CHECKOUT_RELATIONSHIP
+        } else {
+            COMPILED_INPUT_RELATIONSHIP
+        }
+        .into(),
+    };
+    let bytes = serde_json::to_vec_pretty(&selection)?;
+    let selections = state.join(COMPILED_INPUT_SELECTIONS);
+    directory(&selections)?;
+    let destination = selections.join(format!("{}.json", build_identity::hash_bytes(&bytes)));
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            build_identity::ordinary(&destination)?;
+            if fs::read(&destination)? != bytes {
+                return Err(io::Error::other(
+                    "Compiled-input selection record conflict; preserving it.",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            let temporary = selections.join(format!(".{}-{stamp}.tmp", std::process::id()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            if let Err(error) = fs::rename(&temporary, &destination) {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(destination)
 }
 
 /// Run an integrity-verified candidate's model-free Check during explicit
@@ -1369,6 +1511,13 @@ fn publication_cargo(
     profile: Profile,
 ) -> io::Result<CommandSpec> {
     let mut command = CommandSpec::new(resolve_tool(cargo)?);
+    // Retained matched fast-profile evidence: four jobs, while release keeps
+    // its fresh-target single-job publication limit.
+    let jobs = if profile == Profile::DeliveryFast {
+        "4"
+    } else {
+        "1"
+    };
     command.args = [
         "build",
         "--profile",
@@ -1377,7 +1526,7 @@ fn publication_cargo(
         // Cargo otherwise scales rustc concurrency to host CPU count, which
         // does not reflect the fixed memory budget of the compiler job.
         "--jobs",
-        "1",
+        jobs,
         "--target",
         TARGET,
         "-p",
@@ -1860,6 +2009,71 @@ mod tests {
         published_from(state, name, &source, binaries)
     }
 
+    fn dep_token(path: &Path) -> String {
+        let mut token = String::new();
+        for character in path.to_string_lossy().chars() {
+            if character == '$' {
+                token.push_str("$$");
+            } else {
+                if character.is_whitespace() || character == '#' {
+                    token.push('\\');
+                }
+                token.push(character);
+            }
+        }
+        token
+    }
+
+    fn write_dep_files(
+        target: &Path,
+        source: &Path,
+        profile: Profile,
+        overrides: &[(&str, PathBuf)],
+    ) {
+        let directory = target.join(TARGET).join(profile.output_dir());
+        fs::create_dir_all(&directory).unwrap();
+        for name in BINARIES {
+            let input = overrides
+                .iter()
+                .find(|(binary, _)| *binary == *name)
+                .map(|(_, path)| path.clone())
+                .unwrap_or_else(|| source.join("crates/one/src/lib.rs"));
+            let binary = directory.join(name);
+            fs::write(
+                binary.with_extension("d"),
+                format!("{}: {}\n", dep_token(&binary), dep_token(&input)),
+            )
+            .unwrap();
+        }
+    }
+
+    fn build_with_compiled_evidence(
+        state: &Path,
+        name: &str,
+        source: &Path,
+        target: &Path,
+        profile: Profile,
+        overrides: &[(&str, PathBuf)],
+    ) -> (PathBuf, build_identity::CompiledInputs) {
+        write_dep_files(target, source, profile, overrides);
+        let build = published_from_profile(state, name, source, BINARIES, profile);
+        let record_bytes = fs::read(build.join("build.json")).unwrap();
+        let mut evidence = verify_compiled_inputs(
+            target,
+            source,
+            &build_identity::source_identity(source).unwrap(),
+            profile,
+        )
+        .unwrap();
+        evidence.bind_record(&record_bytes).unwrap();
+        fs::write(
+            build.join(build_identity::COMPILED_INPUTS_FILE),
+            serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+        (build, evidence)
+    }
+
     #[test]
     fn delivery_uses_the_freshest_verified_published_build() {
         let temp = tempfile::tempdir().unwrap();
@@ -1951,6 +2165,37 @@ mod tests {
     }
 
     #[test]
+    fn publication_jobs_are_four_for_fast_and_one_for_release() {
+        let source = Path::new("D:/source");
+        let target = Path::new("D:/target");
+        let jobs = |profile| {
+            let command = publication_cargo(source, target, OsStr::new("cargo"), profile).unwrap();
+            let args: Vec<_> = command
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            args.windows(2)
+                .find(|pair| pair[0] == "--jobs")
+                .map(|pair| pair[1].clone())
+        };
+        assert_eq!(jobs(Profile::Release).as_deref(), Some("1"));
+        assert_eq!(jobs(Profile::DeliveryFast).as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn fast_reuse_accepts_source_stale_but_release_does_not() {
+        use build_identity::Health;
+        assert!(reusable_status(Profile::DeliveryFast, &Health::Healthy));
+        assert!(reusable_status(Profile::DeliveryFast, &Health::SourceStale));
+        assert!(!reusable_status(Profile::Release, &Health::SourceStale));
+        assert!(!reusable_status(
+            Profile::DeliveryFast,
+            &Health::SourceUnavailable
+        ));
+    }
+
+    #[test]
     fn reuse_selection_rejects_nonmatching_candidates_before_consumer_validation() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
@@ -2009,8 +2254,11 @@ mod tests {
             Profile::DeliveryFast,
         )
         .unwrap();
-        assert_eq!(fast_candidates.len(), 1);
-        assert_eq!(fast_candidates[0].0, fast);
+        assert!(
+            fast_candidates.is_empty(),
+            "missing compiled-input evidence must force a fast build"
+        );
+        assert!(fast.join("build.json").is_file());
         // A candidate whose record is intact but whose recorded bytes changed
         // still reaches consumer validation: filtering is identity, not trust.
         fs::write(matching.join("harness-rtk.exe"), "changed").unwrap();
@@ -2109,6 +2357,263 @@ mod tests {
             refused.contains("outside owned source/build roots"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn compiled_input_evidence_covers_every_binary_and_refuses_missing_or_ambiguous_dep_info() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = source_fixture(temp.path(), "source")
+            .canonicalize()
+            .unwrap();
+        let target = temp.path().join("target");
+        let identity = build_identity::source_identity(&source).unwrap();
+        write_dep_files(&target, &source, Profile::DeliveryFast, &[]);
+        let release = target.join(TARGET).join("delivery-fast");
+        let evidence =
+            verify_compiled_inputs(&target, &source, &identity, Profile::DeliveryFast).unwrap();
+        assert_eq!(evidence.binaries.len(), BINARIES.len());
+        assert!(
+            BINARIES
+                .iter()
+                .all(|binary| evidence.binaries.contains_key(*binary))
+        );
+        assert!(evidence.binaries.values().all(|paths| !paths.is_empty()));
+        assert_eq!(
+            evidence.files.get("crates/one/src/lib.rs"),
+            identity.files.get("crates/one/src/lib.rs")
+        );
+        assert_eq!(
+            evidence.build_affecting,
+            build_identity::build_affecting_identity(&identity.files)
+        );
+
+        let missing = release.join("codex.exe").with_extension("d");
+        fs::remove_file(&missing).unwrap();
+        assert!(
+            verify_compiled_inputs(&target, &source, &identity, Profile::DeliveryFast).is_err(),
+            "missing dep-info must not authorize reuse"
+        );
+        write_dep_files(&target, &source, Profile::DeliveryFast, &[]);
+        fs::write(&missing, "not dep-info\n").unwrap();
+        assert!(
+            verify_compiled_inputs(&target, &source, &identity, Profile::DeliveryFast).is_err(),
+            "malformed dep-info must not authorize reuse"
+        );
+        fs::write(
+            &missing,
+            format!(
+                "{}: {}\n{}: {}\n",
+                release.join("codex.exe").display(),
+                source.join("crates/one/src/lib.rs").display(),
+                release.join("second.exe").display(),
+                source.join("crates/one/src/lib.rs").display()
+            ),
+        )
+        .unwrap();
+        let ambiguous = verify_compiled_inputs(&target, &source, &identity, Profile::DeliveryFast)
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("Ambiguous"), "{ambiguous}");
+    }
+
+    #[test]
+    fn fast_reuse_records_same_binaries_for_the_current_checkout_without_rewriting_the_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = source_fixture(temp.path(), "source")
+            .canonicalize()
+            .unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let target = temp.path().join("target");
+        let test_file = source.join("crates/one/tests/only_test.rs");
+        fs::create_dir_all(test_file.parent().unwrap()).unwrap();
+        fs::write(&test_file, "first").unwrap();
+        let prior = build_identity::source_identity(&source).unwrap();
+        let release = published_from(&state, "aaaa0000aaaa0000-1500-1", &source, BINARIES);
+        let (build, _) = build_with_compiled_evidence(
+            &state,
+            "bbbb0000bbbb0000-2500-2",
+            &source,
+            &target,
+            Profile::DeliveryFast,
+            &[],
+        );
+        let record = build_identity::read_record(&build).unwrap();
+        let record_bytes = fs::read(build.join("build.json")).unwrap();
+        let evidence_bytes = fs::read(build.join(build_identity::COMPILED_INPUTS_FILE)).unwrap();
+        let binaries = record.binaries.clone();
+
+        fs::write(&test_file, "second").unwrap();
+        let current = build_identity::source_identity(&source).unwrap();
+        assert_ne!(
+            current, prior,
+            "the test-only change must alter the checkout"
+        );
+        assert!(
+            reusable_candidates(
+                &state,
+                &source,
+                "fixture",
+                "fixture",
+                &current,
+                Profile::Release,
+            )
+            .unwrap()
+            .iter()
+            .all(|(path, _)| path != &release),
+            "release selection must keep requiring the full checkout identity"
+        );
+
+        let reused = find_reusable_with(
+            &state,
+            &source,
+            "fixture",
+            "fixture",
+            &current,
+            Profile::DeliveryFast,
+            |_| Ok(true),
+        )
+        .unwrap()
+        .expect("matching compiled inputs permit fast reuse");
+        assert!(reused.reused);
+        assert_eq!(reused.build, build);
+
+        let selections = state.join(COMPILED_INPUT_SELECTIONS);
+        let entries: Vec<_> = fs::read_dir(&selections).unwrap().collect();
+        assert_eq!(entries.len(), 1, "one immutable reuse-selection record");
+        let selection: CompiledInputSelection =
+            serde_json::from_slice(&fs::read(entries[0].as_ref().unwrap().path()).unwrap())
+                .unwrap();
+        assert_eq!(
+            selection.build,
+            build.file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(selection.profile, Profile::DeliveryFast.as_str());
+        assert_eq!(selection.binaries, binaries);
+        assert_eq!(selection.source_root, source);
+        assert_eq!(selection.source_sha256, current.sha256);
+        assert_eq!(selection.built_source_sha256, prior.sha256);
+        assert_eq!(
+            selection.build_record_sha256,
+            build_identity::hash_bytes(&record_bytes)
+        );
+        assert_eq!(
+            selection.compiled_inputs_sha256,
+            build_identity::hash_bytes(&evidence_bytes)
+        );
+        assert_eq!(selection.relationship, COMPILED_INPUT_RELATIONSHIP);
+
+        assert_eq!(
+            fs::read(build.join("build.json")).unwrap(),
+            record_bytes,
+            "the prior build record must not be rewritten"
+        );
+        assert_eq!(
+            fs::read(build.join(build_identity::COMPILED_INPUTS_FILE)).unwrap(),
+            evidence_bytes
+        );
+        for (name, digest) in binaries {
+            assert_eq!(
+                build_identity::hash_file(&build.join(name)).unwrap(),
+                digest
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_and_build_affecting_changes_invalidate_fast_reuse_but_unrelated_files_do_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = source_fixture(temp.path(), "source")
+            .canonicalize()
+            .unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let target = temp.path().join("target");
+        let compiled_doc = source.join("crates/one/src/fixture.md");
+        fs::write(&compiled_doc, "compiled resource").unwrap();
+        let (build, _) = build_with_compiled_evidence(
+            &state,
+            "aaaa0000aaaa0000-1500-1",
+            &source,
+            &target,
+            Profile::DeliveryFast,
+            &[("codex.exe", compiled_doc.clone())],
+        );
+        let evidence_path = build.join(build_identity::COMPILED_INPUTS_FILE);
+        let evidence = fs::read(&evidence_path).unwrap();
+        let candidates = || {
+            let identity = build_identity::source_identity(&source).unwrap();
+            reusable_candidates(
+                &state,
+                &source,
+                "fixture",
+                "fixture",
+                &identity,
+                Profile::DeliveryFast,
+            )
+            .unwrap()
+        };
+        assert_eq!(candidates().len(), 1, "baseline compiled evidence matches");
+
+        fs::write(&compiled_doc, "changed compiled resource").unwrap();
+        assert!(
+            candidates().is_empty(),
+            "a compiled documentation-like file must invalidate"
+        );
+        fs::write(&compiled_doc, "compiled resource").unwrap();
+        assert_eq!(candidates().len(), 1);
+
+        let unrelated = source.join("crates/one/unrelated.txt");
+        fs::write(&unrelated, "not compiled").unwrap();
+        assert_eq!(
+            candidates().len(),
+            1,
+            "an unrelated new file must not force a build"
+        );
+        fs::remove_file(&unrelated).unwrap();
+
+        fs::remove_file(&evidence_path).unwrap();
+        assert!(
+            candidates().is_empty(),
+            "missing compiled-input evidence must force a build"
+        );
+        fs::write(&evidence_path, &evidence).unwrap();
+        let mut tampered: serde_json::Value = serde_json::from_slice(&evidence).unwrap();
+        tampered["binaries"]
+            .as_object_mut()
+            .unwrap()
+            .remove("codex.exe");
+        fs::write(&evidence_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(
+            candidates().is_empty(),
+            "incomplete per-binary evidence must force a build"
+        );
+        fs::write(&evidence_path, &evidence).unwrap();
+
+        for path in ["Cargo.lock", "Cargo.toml"] {
+            let file = source.join(path);
+            let original = fs::read(&file).unwrap();
+            fs::write(&file, b"changed build input").unwrap();
+            assert!(
+                candidates().is_empty(),
+                "{path} must require new compatible evidence"
+            );
+            fs::write(&file, original).unwrap();
+            assert_eq!(candidates().len(), 1);
+        }
+
+        let toolchain = source.join("rust-toolchain.toml");
+        fs::write(&toolchain, "[toolchain]\nchannel='stable'\n").unwrap();
+        assert!(candidates().is_empty(), "toolchain identity changed");
+        fs::remove_file(&toolchain).unwrap();
+        assert_eq!(candidates().len(), 1);
+
+        let cargo_config = source.join(".cargo/config.toml");
+        fs::create_dir_all(cargo_config.parent().unwrap()).unwrap();
+        fs::write(&cargo_config, "[build]\nrustflags=[]\n").unwrap();
+        assert!(candidates().is_empty(), "Cargo host configuration changed");
+        fs::remove_dir_all(cargo_config.parent().unwrap()).unwrap();
+        assert_eq!(candidates().len(), 1);
     }
 
     #[test]
