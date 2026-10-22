@@ -2471,6 +2471,15 @@ The model-free native contract tests are
 `goal_recovery_contract`; the state machine's deterministic tests run with
 `cargo test -p harness-core --lib task_recovery`.
 
+The installed ordinary-session acceptance in `goal_recovery_installed` runs the
+installed launcher, manager, relay and real native TUI against the synthetic
+provider. It covers first use, pause before dispatch, five-attempt exhaustion, a
+second goal in the same thread and closure before dispatch; each case asserts the
+provider/automatic-set counts, goal state, one owned effect and cleanup. The
+`ordinary_lead` host tests cover the ordered fake-server cases: recovery, pause
+between the final read and send, a lost acknowledgement, a native goal
+observation failure and closure.
+
 `native_overload_preserves_background_terminal_while_recovering` adds in-flight
 work to that contract: a yielded long-lived terminal stays in
 `thread/backgroundTerminals/list` across the blocked goal and the same-thread
