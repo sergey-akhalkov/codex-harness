@@ -1783,6 +1783,16 @@ fn recovery_session(
     pause_gate: bool,
     observation_failure: bool,
 ) -> ConsoleSession {
+    recovery_session_with_limit(fixture, drop_ack, pause_gate, observation_failure, None)
+}
+
+fn recovery_session_with_limit(
+    fixture: &Fixture,
+    drop_ack: bool,
+    pause_gate: bool,
+    observation_failure: bool,
+    limit: Option<&str>,
+) -> ConsoleSession {
     let native = recovery_native();
     let mut spec = fixture.command("new", NEW_THREAD, None, &native);
     spec.env.insert(
@@ -1803,6 +1813,12 @@ fn recovery_session(
         spec.env.insert(
             "HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_OBSERVE".into(),
             Some("fail".into()),
+        );
+    }
+    if let Some(limit) = limit {
+        spec.env.insert(
+            "HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_LIMIT".into(),
+            Some(limit.into()),
         );
     }
     if pause_gate {
@@ -2154,6 +2170,86 @@ fn ordinary_host_user_pause_wins_before_dispatch() {
         "the paused goal was activated after cancellation"
     );
     release_and_assert_cleanup(&fixture, session, backend);
+}
+
+fn assert_limit_cancellation(limit: &str, warning: &str) {
+    let fixture = Fixture::new();
+    let session = recovery_session_with_limit(&fixture, false, false, false, Some(limit));
+    wait_for(
+        &fixture.selected(),
+        "the frontend-selected thread",
+        &session,
+    );
+    wait_transcript(
+        &session,
+        "Automatic recovery attempt 1/5 is scheduled",
+        "the scheduled-attempt warning",
+        RECOVERY_WAIT,
+    );
+    let backend = backend_identity(&fixture.home, &session.transcript());
+    wait_transcript(
+        &session,
+        warning,
+        "the limit cancellation warning",
+        RECOVERY_WAIT,
+    );
+    let entries = wait_recovery(
+        &session,
+        &fixture,
+        "the native limited goal",
+        RECOVERY_WAIT,
+        |entries| recovery_goal(entries, limit).is_some(),
+    );
+    assert_eq!(
+        recovery_goal(&entries, limit).expect("limited goal")["threadId"],
+        NEW_THREAD
+    );
+    assert!(
+        automatic_goal_sets(&entries).is_empty(),
+        "the host activated a goal after its native limit changed"
+    );
+    assert_eq!(
+        recovery_requests(&entries, "turn/start").len(),
+        1,
+        "the limit change resent the prompt or turn"
+    );
+    let checkpoint = wait_checkpoint(&session, &fixture, "the limit cancellation", |value| {
+        value["status"] == "cancelled"
+    });
+    assert_eq!(checkpoint["threadId"], NEW_THREAD);
+    assert_eq!(checkpoint["attempt"], 0, "{checkpoint}");
+
+    thread::sleep(RECOVERY_SETTLE);
+    let later = recovery_entries(&fixture);
+    assert!(
+        automatic_goal_sets(&later).is_empty(),
+        "a delayed activation survived the limit change"
+    );
+    assert_eq!(
+        recovery_goal(&later, limit).expect("retained limit")["status"],
+        limit
+    );
+    assert!(
+        recovery_goal(&later, "active").is_none(),
+        "the limited goal was activated"
+    );
+    release_and_assert_cleanup(&fixture, session, backend);
+}
+
+#[test]
+fn ordinary_host_cancels_when_usage_changes_during_the_wait() {
+    assert_limit_cancellation(
+        "usageLimited",
+        "Automatic recovery cancelled (usage limit); the goal keeps its native state. Wait for the reset, then run /goal resume.",
+    );
+}
+
+#[test]
+fn ordinary_host_cancels_when_the_budget_changes_during_the_wait() {
+    assert_limit_cancellation(
+        "budgetLimited",
+        "Automatic recovery cancelled (budget limit); the goal keeps its native state. Adjust the goal budget, then run /goal resume.",
+    );
 }
 
 #[test]

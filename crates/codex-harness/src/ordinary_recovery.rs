@@ -342,6 +342,14 @@ impl RecoveryHost {
                 self.notify("Goal completed; automatic recovery is no longer needed.".to_owned());
                 self.save("complete", None);
             }
+            Decision::Cancelled { reason } if reason == "usage limit" => {
+                self.notify("Automatic recovery cancelled (usage limit); the goal keeps its native state. Wait for the reset, then run /goal resume.".to_owned());
+                self.save("cancelled", None);
+            }
+            Decision::Cancelled { reason } if reason == "budget limit" => {
+                self.notify("Automatic recovery cancelled (budget limit); the goal keeps its native state. Adjust the goal budget, then run /goal resume.".to_owned());
+                self.save("cancelled", None);
+            }
             Decision::Cancelled { reason } => {
                 self.notify(format!(
                     "Automatic recovery cancelled ({reason}); the goal keeps its native state."

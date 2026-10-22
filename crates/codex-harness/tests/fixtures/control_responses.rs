@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, OpenOptions},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[path = "tool_catalogue.rs"]
@@ -47,6 +47,14 @@ enum Quota {
     Handoff,
 }
 
+#[derive(Clone, Copy)]
+enum RecoveryScript {
+    Single { overload_at: usize },
+    Background,
+    Exhaust,
+    Repeat,
+}
+
 /// The owner's PowerShell 7 executable for fabricated owned native actions:
 /// the same resolution order the accepted desktop helpers use, so the request
 /// never names Windows PowerShell 5.1.
@@ -70,6 +78,36 @@ pub fn owned_pwsh() -> String {
         return found.to_string_lossy().into_owned();
     }
     panic!("owner PowerShell 7 (pwsh.exe) is required for the owned native action")
+}
+
+fn tool_item(request: &Value, call_id: &str, cmd: &str, yield_time_ms: u64) -> Value {
+    let arguments = serde_json::to_string(&json!({
+        "cmd": cmd,
+        "shell": owned_pwsh(),
+        "yield_time_ms": yield_time_ms
+    }))
+    .unwrap();
+    let custom_exec = request["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["type"] == "custom" && tool["name"] == "exec")
+    });
+    if custom_exec {
+        json!({"type":"custom_tool_call","call_id":call_id,"name":"exec",
+            "input":format!("const result = await tools.exec_command({arguments}); text(result);")})
+    } else {
+        json!({"type":"function_call","call_id":call_id,"name":"exec_command","arguments":arguments})
+    }
+}
+
+fn goal_complete(call_id: &str) -> Value {
+    json!({"type":"function_call","call_id":call_id,"name":"update_goal",
+        "arguments":serde_json::to_string(&json!({"status":"complete"})).unwrap()})
+}
+
+fn final_message() -> Value {
+    json!({"type":"message","id":"msg-recovered","role":"assistant",
+        "content":[{"type":"output_text","text":FINAL}]})
 }
 
 pub struct Responses {
@@ -109,7 +147,7 @@ impl Responses {
     /// session's existing result rather than restart the process.
     #[allow(dead_code)]
     pub fn with_server_overload_background(evidence: PathBuf) -> Self {
-        Self::overload_script(evidence, 2, true)
+        Self::overload_script(evidence, RecoveryScript::Background)
     }
 
     /// Serves a finite native goal-recovery sequence. Overload at 2 returns one
@@ -120,18 +158,30 @@ impl Responses {
     /// continue across the overload.
     #[allow(dead_code)]
     pub fn with_server_overload(evidence: PathBuf, overload_at: usize) -> Self {
-        Self::overload_script(evidence, overload_at, false)
-    }
-
-    fn overload_script(evidence: PathBuf, overload_at: usize, background: bool) -> Self {
         assert!(
             matches!(overload_at, 1 | 2),
             "the finite owned script overloads on its first or post-tool request"
         );
-        assert!(
-            !background || overload_at == 2,
-            "the background script overloads after its terminal result"
-        );
+        Self::overload_script(evidence, RecoveryScript::Single { overload_at })
+    }
+
+    /// Serves the initial effect and then a terminal overload for every
+    /// automatic recovery turn. Extra requests are retained and refused so a
+    /// bug that attempts a sixth resume is observable rather than hanging.
+    #[allow(dead_code)]
+    pub fn with_server_overload_exhaustion(evidence: PathBuf) -> Self {
+        Self::overload_script(evidence, RecoveryScript::Exhaust)
+    }
+
+    /// Completes two successive goals on the same thread. Each goal performs
+    /// exactly one owned file effect, then overloads, recovers, completes, and
+    /// returns its final result.
+    #[allow(dead_code)]
+    pub fn with_server_overload_repeat(evidence: PathBuf) -> Self {
+        Self::overload_script(evidence, RecoveryScript::Repeat)
+    }
+
+    fn overload_script(evidence: PathBuf, script: RecoveryScript) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -191,22 +241,38 @@ impl Responses {
                     &request_body,
                 )
                 .unwrap();
+                let timestamp = json!({
+                    "sequence": sequence,
+                    "atUnixMs": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|value| value.as_millis())
+                        .unwrap_or_default(),
+                });
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(evidence.join("provider-requests.jsonl"))
+                {
+                    let _ = writeln!(file, "{timestamp}");
+                }
                 let tool_result = request["input"].as_array().unwrap().iter().any(|item| {
                     matches!(
                         item["type"].as_str(),
                         Some("function_call_output" | "custom_tool_call_output")
                     ) && item["call_id"] == "control-tool-1"
                 });
-                let goal_result = request["input"].as_array().unwrap().iter().any(|item| {
-                    item["type"] == "function_call_output" && item["call_id"] == "goal-complete-1"
+                let second_tool_result = request["input"].as_array().unwrap().iter().any(|item| {
+                    matches!(
+                        item["type"].as_str(),
+                        Some("function_call_output" | "custom_tool_call_output")
+                    ) && item["call_id"] == "control-tool-2"
                 });
-                if sequence == overload_at {
-                    if overload_at == 2 {
-                        assert!(
-                            tool_result,
-                            "the overload must follow the owned tool result"
-                        );
-                    }
+                let goal_result = |call_id: &str| {
+                    request["input"].as_array().unwrap().iter().any(|item| {
+                        item["type"] == "function_call_output" && item["call_id"] == call_id
+                    })
+                };
+                let overload = |stream: &mut TcpStream| {
                     let body = json!({
                         "error": {
                             "message": "Synthetic terminal server overload.",
@@ -218,7 +284,7 @@ impl Responses {
                     .to_string();
                     fs::write(evidence.join("overload-response.json"), &body).unwrap();
                     send_response(
-                        &mut stream,
+                        stream,
                         &evidence,
                         &headers,
                         &request_body,
@@ -228,84 +294,216 @@ impl Responses {
                         ),
                         sequence,
                     );
-                    continue;
-                }
-                assert_ne!(
-                    overload_at, 1,
-                    "the overload-at-one script has no successful request"
-                );
-                let item = if sequence == 1 {
-                    assert!(!tool_result);
-                    assert!(
-                        request["input"]
-                            .to_string()
-                            .contains("Perform the owned proof command"),
-                        "the initial turn must carry the explicit owned prompt"
-                    );
-                    let (cmd, yield_time_ms) = if background {
-                        (
-                            "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-terminal); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-terminal)) { throw 'owned terminal release deadline' }; Get-Content proof.txt",
-                            1000,
-                        )
-                    } else {
-                        (
-                            "[IO.File]::AppendAllText('proof.txt', 'one'); Get-Content proof.txt",
-                            10000,
-                        )
-                    };
-                    let arguments = serde_json::to_string(&json!({
-                        "cmd": cmd,
-                        "shell": owned_pwsh(),
-                        "yield_time_ms": yield_time_ms
-                    }))
-                    .unwrap();
-                    let custom_exec = request["tools"].as_array().is_some_and(|tools| {
-                        tools
-                            .iter()
-                            .any(|tool| tool["type"] == "custom" && tool["name"] == "exec")
-                    });
-                    if custom_exec {
-                        json!({"type":"custom_tool_call","call_id":"control-tool-1","name":"exec",
-                            "input":format!("const result = await tools.exec_command({arguments}); text(result);")})
-                    } else {
-                        json!({"type":"function_call","call_id":"control-tool-1","name":"exec_command","arguments":arguments})
-                    }
-                } else if sequence == overload_at + 1 {
-                    assert!(
-                        tool_result,
-                        "the continuation must consume the existing tool result"
-                    );
-                    if background {
-                        let output = request["input"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .find(|item| {
-                                matches!(
-                                    item["type"].as_str(),
-                                    Some("function_call_output" | "custom_tool_call_output")
-                                ) && item["call_id"] == "control-tool-1"
-                            })
-                            .and_then(|item| item["output"].as_str())
-                            .expect("the recovered request must carry the running terminal result");
-                        assert!(
-                            output.contains("Process running with session ID"),
-                            "the recovered request must consume the same running session: {output}"
+                };
+                let item = match script {
+                    RecoveryScript::Single { overload_at } => {
+                        if sequence == overload_at {
+                            if overload_at == 2 {
+                                assert!(
+                                    tool_result,
+                                    "the overload must follow the owned tool result"
+                                );
+                            }
+                            overload(&mut stream);
+                            continue;
+                        }
+                        assert_ne!(
+                            overload_at, 1,
+                            "the overload-at-one script has no successful request"
                         );
+                        if sequence == 1 {
+                            assert!(!tool_result);
+                            assert!(
+                                request["input"]
+                                    .to_string()
+                                    .contains("Perform the owned proof command"),
+                                "the initial turn must carry the explicit owned prompt"
+                            );
+                            tool_item(
+                                &request,
+                                "control-tool-1",
+                                &format!(
+                                    "[IO.File]::AppendAllText('proof.txt', 'one'); Get-Content proof.txt"
+                                ),
+                                10_000,
+                            )
+                        } else if sequence == overload_at + 1 {
+                            assert!(
+                                tool_result,
+                                "the continuation must consume the existing tool result"
+                            );
+                            goal_complete("goal-complete-1")
+                        } else if sequence == overload_at + 2 {
+                            assert!(
+                                goal_result("goal-complete-1"),
+                                "the final response must follow goal completion"
+                            );
+                            final_message()
+                        } else {
+                            panic!(
+                                "unexpected provider request {sequence}; the finite recovery script ended"
+                            );
+                        }
                     }
-                    json!({"type":"function_call","call_id":"goal-complete-1","name":"update_goal",
-                        "arguments":serde_json::to_string(&json!({"status":"complete"})).unwrap()})
-                } else if sequence == overload_at + 2 {
-                    assert!(
-                        goal_result,
-                        "the final response must follow goal completion"
-                    );
-                    json!({"type":"message","id":"msg-recovered","role":"assistant",
-                        "content":[{"type":"output_text","text":FINAL}]})
-                } else {
-                    panic!(
-                        "unexpected provider request {sequence}; the finite recovery script ended"
-                    );
+                    RecoveryScript::Background => {
+                        if sequence == 2 {
+                            assert!(
+                                tool_result,
+                                "the overload must follow the owned tool result"
+                            );
+                            overload(&mut stream);
+                            continue;
+                        }
+                        if sequence == 1 {
+                            assert!(!tool_result);
+                            tool_item(
+                                &request,
+                                "control-tool-1",
+                                "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-terminal); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-terminal)) { throw 'owned terminal release deadline' }; Get-Content proof.txt",
+                                1_000,
+                            )
+                        } else if sequence == 3 {
+                            assert!(
+                                tool_result,
+                                "the continuation must consume the existing tool result"
+                            );
+                            let output = request["input"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|item| {
+                                    matches!(
+                                        item["type"].as_str(),
+                                        Some("function_call_output" | "custom_tool_call_output")
+                                    ) && item["call_id"] == "control-tool-1"
+                                })
+                                .and_then(|item| item["output"].as_str())
+                                .expect(
+                                    "the recovered request must carry the running terminal result",
+                                );
+                            assert!(
+                                output.contains("Process running with session ID"),
+                                "the recovered request must consume the same running session: {output}"
+                            );
+                            goal_complete("goal-complete-1")
+                        } else if sequence == 4 {
+                            assert!(
+                                goal_result("goal-complete-1"),
+                                "the final response must follow goal completion"
+                            );
+                            final_message()
+                        } else {
+                            panic!(
+                                "unexpected provider request {sequence}; the finite background recovery script ended"
+                            );
+                        }
+                    }
+                    RecoveryScript::Exhaust => {
+                        if sequence == 1 {
+                            assert!(!tool_result);
+                            assert!(
+                                request["input"]
+                                    .to_string()
+                                    .contains("Perform the owned proof command"),
+                                "the initial turn must carry the explicit owned prompt"
+                            );
+                            tool_item(
+                                &request,
+                                "control-tool-1",
+                                "[IO.File]::AppendAllText('proof.txt', 'one'); Get-Content proof.txt",
+                                10_000,
+                            )
+                        } else {
+                            assert!(
+                                tool_result,
+                                "every exhausted continuation retains the completed tool result"
+                            );
+                            overload(&mut stream);
+                            continue;
+                        }
+                    }
+                    RecoveryScript::Repeat => match sequence {
+                        1 => {
+                            assert!(!tool_result);
+                            assert!(
+                                request["input"]
+                                    .to_string()
+                                    .contains("Perform the owned proof command"),
+                                "the first goal must carry its explicit objective"
+                            );
+                            tool_item(
+                                &request,
+                                "control-tool-1",
+                                "[IO.File]::AppendAllText('proof-first.txt', 'one'); Get-Content proof-first.txt",
+                                10_000,
+                            )
+                        }
+                        2 => {
+                            assert!(
+                                tool_result,
+                                "the first overload follows its completed effect"
+                            );
+                            overload(&mut stream);
+                            continue;
+                        }
+                        3 => {
+                            assert!(
+                                tool_result && !second_tool_result,
+                                "the first recovery consumes only the first effect"
+                            );
+                            goal_complete("goal-complete-1")
+                        }
+                        4 => {
+                            assert!(
+                                goal_result("goal-complete-1"),
+                                "the first final response follows completion"
+                            );
+                            final_message()
+                        }
+                        5 => {
+                            assert!(
+                                tool_result && !second_tool_result,
+                                "the second goal starts before its own tool result"
+                            );
+                            assert!(
+                                request["input"]
+                                    .to_string()
+                                    .contains("Complete the second owned proof"),
+                                "the second goal must carry its explicit objective"
+                            );
+                            tool_item(
+                                &request,
+                                "control-tool-2",
+                                "[IO.File]::AppendAllText('proof-second.txt', 'two'); Get-Content proof-second.txt",
+                                10_000,
+                            )
+                        }
+                        6 => {
+                            assert!(
+                                second_tool_result,
+                                "the second overload follows its completed effect"
+                            );
+                            overload(&mut stream);
+                            continue;
+                        }
+                        7 => {
+                            assert!(
+                                second_tool_result,
+                                "the second recovery consumes the second effect"
+                            );
+                            goal_complete("goal-complete-2")
+                        }
+                        8 => {
+                            assert!(
+                                goal_result("goal-complete-2"),
+                                "the second final response follows completion"
+                            );
+                            final_message()
+                        }
+                        _ => panic!(
+                            "unexpected provider request {sequence}; the finite repeat script ended"
+                        ),
+                    },
                 };
                 send_response(
                     &mut stream,

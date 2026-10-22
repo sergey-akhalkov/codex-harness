@@ -6,7 +6,7 @@ mod control_responses;
 
 use harness_core::{
     build_identity::{self, BuildRecord},
-    console::{ConsoleSession, ConsoleSpec},
+    console::{ConsoleOutcome, ConsoleSession, ConsoleSpec},
     core_install,
     installation_state::PathScope,
     process::{Cancellation, CommandSpec, Deadline, StopReason},
@@ -15,12 +15,24 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
+    ops::Deref,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 const WAIT: Duration = Duration::from_secs(90);
+const EXHAUSTION_WAIT: Duration = Duration::from_secs(190);
+const ATTEMPT_GRACE: Duration = Duration::from_secs(9);
+const SETTLE: Duration = Duration::from_secs(5);
 const OBJECTIVE: &str = "Perform the owned proof command and return its consumed result.";
+const OBJECTIVE_TWO: &str = "Complete the second owned proof in the same thread.";
+
+#[derive(Clone, Copy)]
+enum Scenario {
+    Recover,
+    Exhaust,
+    Repeat,
+}
 
 fn visible(transcript: &str) -> String {
     let bytes = transcript.as_bytes();
@@ -118,7 +130,7 @@ struct Installed {
 }
 
 impl Installed {
-    fn new() -> Self {
+    fn new(scenario: Scenario) -> Self {
         let root = tempfile::Builder::new()
             .prefix("goal-recovery-installed-")
             .tempdir()
@@ -167,8 +179,17 @@ impl Installed {
         .unwrap();
         prepare_user_profile(&user_home);
         fs::create_dir_all(root_path.join("provider")).unwrap();
-        let provider =
-            control_responses::Responses::with_server_overload(root_path.join("provider"), 2);
+        let provider = match scenario {
+            Scenario::Recover => {
+                control_responses::Responses::with_server_overload(root_path.join("provider"), 2)
+            }
+            Scenario::Exhaust => control_responses::Responses::with_server_overload_exhaustion(
+                root_path.join("provider"),
+            ),
+            Scenario::Repeat => control_responses::Responses::with_server_overload_repeat(
+                root_path.join("provider"),
+            ),
+        };
         let upstream = PathBuf::from(
             std::env::var_os("HARNESS_CONTROL_CODEX_EXE")
                 .expect("explicit native Codex executable"),
@@ -309,10 +330,261 @@ impl Drop for PathRestore {
     }
 }
 
+struct TuiSession {
+    session: Option<ConsoleSession>,
+    terminal: PathBuf,
+}
+
+impl TuiSession {
+    fn new(installed: &Installed) -> Self {
+        Self {
+            session: Some(installed.session()),
+            terminal: installed.root.join("installed-terminal.txt"),
+        }
+    }
+
+    fn save(&self) {
+        if let Some(session) = &self.session {
+            let transcript = session.transcript();
+            let _ = fs::write(&self.terminal, &transcript);
+            let _ = fs::write(
+                self.terminal
+                    .with_file_name("installed-terminal-before-quit.txt"),
+                transcript,
+            );
+        }
+    }
+
+    fn close(&mut self) -> Option<ConsoleOutcome> {
+        self.save();
+        let session = self.session.take()?;
+        let _ = session.send("/quit");
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = session.send("\r");
+        let outcome = session.wait(
+            Deadline::after(WAIT).ok()?,
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        );
+        if let Ok(finished) = &outcome {
+            let _ = fs::write(&self.terminal, &finished.transcript);
+        }
+        outcome.ok()
+    }
+
+    fn quit(mut self) -> ConsoleOutcome {
+        self.close().expect("the installed TUI did not exit")
+    }
+}
+
+impl Deref for TuiSession {
+    type Target = ConsoleSession;
+
+    fn deref(&self) -> &Self::Target {
+        self.session
+            .as_ref()
+            .expect("the installed TUI is still open")
+    }
+}
+
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn send_enter(session: &TuiSession, text: &str) {
+    session.send(text).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    session.send("\r").unwrap();
+}
+
+fn recovery_checkpoint(installed: &Installed) -> Option<Value> {
+    let path = fs::read_dir(private_root(&installed.codex_home))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".recovery.json"))
+        })?;
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn wait_checkpoint(
+    installed: &Installed,
+    terminal: &Path,
+    what: &str,
+    timeout: Duration,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let until = Instant::now() + timeout;
+    loop {
+        if let Some(checkpoint) = recovery_checkpoint(installed)
+            && predicate(&checkpoint)
+        {
+            return checkpoint;
+        }
+        assert!(
+            Instant::now() < until,
+            "{what} was not recorded within {timeout:?}; checkpoint {:?}; inspect {}",
+            recovery_checkpoint(installed),
+            terminal.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn request_bodies(installed: &Installed) -> Vec<Value> {
+    provider_requests(&installed.root.join("provider"))
+        .into_iter()
+        .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+        .collect()
+}
+
+fn request_times(installed: &Installed) -> Vec<Value> {
+    fs::read_to_string(installed.root.join("provider/provider-requests.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn request_thread(installed: &Installed, requests: &[Value]) -> String {
+    let thread = requests
+        .first()
+        .and_then(|request| request["client_metadata"]["thread_id"].as_str())
+        .expect("the provider request names its thread")
+        .to_owned();
+    for request in requests {
+        assert_eq!(
+            request["client_metadata"]["thread_id"], thread,
+            "recovery changed the native thread"
+        );
+    }
+    let timestamps = request_times(installed);
+    assert_eq!(
+        timestamps.len(),
+        requests.len(),
+        "every provider request must have one retained timestamp"
+    );
+    thread
+}
+
+fn completed_goals(installed: &Installed) -> Vec<Value> {
+    fn files(directory: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                files(&path, found);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                found.push(path);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    files(&installed.codex_home.join("sessions"), &mut paths);
+    paths.sort();
+    paths
+        .into_iter()
+        .flat_map(|path| {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|entry| {
+                    entry["type"] == "response_item"
+                        && entry["payload"]["type"] == "function_call_output"
+                        && entry["payload"]["call_id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("goal-complete-"))
+                })
+                .filter_map(|entry| {
+                    serde_json::from_str::<Value>(entry["payload"]["output"].as_str()?).ok()
+                })
+                .filter_map(|output| output.get("goal").cloned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn endpoint_records(installed: &Installed) -> Vec<PathBuf> {
+    let mut records = Vec::new();
+    let Ok(entries) = fs::read_dir(installed.codex_home.join("harness/lead-endpoints")) else {
+        return records;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(files) = fs::read_dir(path) {
+                records.extend(
+                    files
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.extension()
+                                .is_some_and(|extension| extension == "json")
+                        }),
+                );
+            }
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            records.push(path);
+        }
+    }
+    records
+}
+
+fn write_result(installed: &Installed, name: &str, value: Value) {
+    fs::write(
+        installed.root.join(name),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
+}
+
+fn wait_provider_count(
+    installed: &Installed,
+    terminal: &Path,
+    expected: usize,
+    timeout: Duration,
+) -> Vec<Value> {
+    let until = Instant::now() + timeout;
+    loop {
+        let requests = request_bodies(installed);
+        if requests.len() >= expected {
+            assert_eq!(
+                requests.len(),
+                expected,
+                "unexpected provider request count; inspect {}",
+                terminal.display()
+            );
+            return requests;
+        }
+        assert!(
+            Instant::now() < until,
+            "provider request {expected} was not observed within {timeout:?}; got {}; inspect {}",
+            requests.len(),
+            terminal.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned installed homes and synthetic Responses"]
 fn installed_ordinary_session_recovers_a_blocked_goal_after_overload() {
-    let installed = Installed::new();
+    let installed = Installed::new(Scenario::Recover);
     let root = &installed.root;
     let terminal = root.join("installed-terminal.txt");
     eprintln!("installed goal recovery evidence: {}", root.display());
@@ -408,4 +680,326 @@ fn installed_ordinary_session_recovers_a_blocked_goal_after_overload() {
         .unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned installed homes and synthetic Responses"]
+fn installed_pause_before_dispatch_cancels_recovery() {
+    let installed = Installed::new(Scenario::Recover);
+    eprintln!("installed pause evidence: {}", installed.root.display());
+    let tui = TuiSession::new(&installed);
+    let terminal = tui.terminal.clone();
+    let until = Instant::now() + WAIT;
+    wait_visible(&tui, &terminal, &["GPT-6-Astra"], until);
+    std::thread::sleep(Duration::from_secs(1));
+    send_enter(&tui, &format!("/goal {OBJECTIVE}"));
+    wait_visible(
+        &tui,
+        &terminal,
+        &["Goal stalled (/goal resume)", "Goal set", "Pursuing goal"],
+        until,
+    );
+
+    send_enter(&tui, "/goal pause");
+    wait_visible(&tui, &terminal, &["Goal paused (/goal resume)"], until);
+    let checkpoint = wait_checkpoint(
+        &installed,
+        &terminal,
+        "the cancelled pause",
+        WAIT,
+        |value| value["status"] == "cancelled",
+    );
+    assert_eq!(checkpoint["attempt"], 0, "{checkpoint}");
+
+    std::thread::sleep(ATTEMPT_GRACE);
+    let requests = request_bodies(&installed);
+    assert_eq!(
+        requests.len(),
+        2,
+        "a cancelled recovery sent another provider request"
+    );
+    let thread = request_thread(&installed, &requests);
+    assert_eq!(checkpoint["threadId"], thread);
+    assert_eq!(
+        fs::read_to_string(installed.workspace.join("proof.txt")).unwrap(),
+        "one",
+        "the owned tool effect changed during cancellation"
+    );
+    let transcript = visible(&tui.transcript());
+    assert!(
+        transcript.contains("Goal paused (/goal resume)"),
+        "the TUI did not retain the paused state: {transcript}"
+    );
+    assert!(
+        transcript.contains("warning"),
+        "the TUI did not expose the cancellation badge: {transcript}"
+    );
+
+    let outcome = tui.quit();
+    assert_eq!(outcome.outcome.reason, StopReason::Exited, "{outcome:?}");
+    std::thread::sleep(SETTLE);
+    assert_eq!(request_bodies(&installed).len(), 2);
+    assert!(
+        endpoint_records(&installed).is_empty(),
+        "the paused host left endpoint records"
+    );
+    write_result(
+        &installed,
+        "pause-result.json",
+        json!({
+            "threadId": thread,
+            "providerRequests": 2,
+            "automaticSets": 0,
+            "goalState": "paused",
+            "checkpoint": checkpoint,
+            "requestTimestamps": request_times(&installed),
+            "toolEffect": "one",
+        }),
+    );
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned installed homes and synthetic Responses"]
+fn installed_five_attempt_exhaustion_stops_without_a_sixth() {
+    let installed = Installed::new(Scenario::Exhaust);
+    eprintln!(
+        "installed exhaustion evidence: {}",
+        installed.root.display()
+    );
+    let tui = TuiSession::new(&installed);
+    let terminal = tui.terminal.clone();
+    let until = Instant::now() + WAIT;
+    wait_visible(&tui, &terminal, &["GPT-6-Astra"], until);
+    std::thread::sleep(Duration::from_secs(1));
+    send_enter(&tui, &format!("/goal {OBJECTIVE}"));
+    wait_visible(
+        &tui,
+        &terminal,
+        &["Goal stalled (/goal resume)", "Goal set", "Pursuing goal"],
+        until,
+    );
+
+    let checkpoint = wait_checkpoint(
+        &installed,
+        &terminal,
+        "the fifth exhausted attempt",
+        EXHAUSTION_WAIT,
+        |value| value["status"] == "exhausted",
+    );
+    assert_eq!(checkpoint["attempt"], 5, "{checkpoint}");
+    let requests = wait_provider_count(&installed, &terminal, 7, WAIT);
+    let thread = request_thread(&installed, &requests);
+    assert_eq!(checkpoint["threadId"], thread);
+    assert_eq!(
+        fs::read_to_string(installed.workspace.join("proof.txt")).unwrap(),
+        "one",
+        "the owned effect repeated during exhaustion"
+    );
+    std::thread::sleep(SETTLE);
+    assert_eq!(
+        request_bodies(&installed).len(),
+        7,
+        "a sixth automatic recovery reached the provider"
+    );
+    let transcript = visible(&tui.transcript());
+    assert!(
+        transcript.contains("Goal stalled (/goal resume)"),
+        "the TUI lost the blocked goal state: {transcript}"
+    );
+    assert!(
+        transcript.contains("warning"),
+        "the TUI did not expose the exhaustion badge: {transcript}"
+    );
+
+    let outcome = tui.quit();
+    assert_eq!(outcome.outcome.reason, StopReason::Exited, "{outcome:?}");
+    std::thread::sleep(SETTLE);
+    assert_eq!(request_bodies(&installed).len(), 7);
+    assert!(
+        endpoint_records(&installed).is_empty(),
+        "the exhausted host left endpoint records"
+    );
+    write_result(
+        &installed,
+        "exhaustion-result.json",
+        json!({
+            "threadId": thread,
+            "providerRequests": 7,
+            "automaticSets": 5,
+            "goalState": "blocked",
+            "checkpoint": checkpoint,
+            "requestTimestamps": request_times(&installed),
+            "toolEffect": "one",
+        }),
+    );
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned installed homes and synthetic Responses"]
+fn installed_second_goal_recovers_after_the_first() {
+    let installed = Installed::new(Scenario::Repeat);
+    eprintln!("installed repeat evidence: {}", installed.root.display());
+    let tui = TuiSession::new(&installed);
+    let terminal = tui.terminal.clone();
+    let until = Instant::now() + WAIT;
+    wait_visible(&tui, &terminal, &["GPT-6-Astra"], until);
+    std::thread::sleep(Duration::from_secs(1));
+    send_enter(&tui, &format!("/goal {OBJECTIVE}"));
+    wait_visible(
+        &tui,
+        &terminal,
+        &["Goal stalled (/goal resume)", "Goal set", "Pursuing goal"],
+        until,
+    );
+    wait_visible(&tui, &terminal, &["Goal achieved"], until);
+    wait_visible(&tui, &terminal, &[control_responses::FINAL], until);
+    wait_visible(
+        &tui,
+        &terminal,
+        &["Ask Codex to do anything", "Type a message"],
+        until,
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    let first = wait_checkpoint(
+        &installed,
+        &terminal,
+        "the first completed recovery",
+        WAIT,
+        |value| value["status"] == "complete",
+    );
+    let first_goals = completed_goals(&installed);
+    assert_eq!(first_goals.len(), 1, "{first_goals:?}");
+    assert_eq!(first_goals[0]["objective"], OBJECTIVE);
+
+    send_enter(&tui, "/goal clear");
+    std::thread::sleep(Duration::from_secs(1));
+    send_enter(&tui, "/goal");
+    wait_visible(&tui, &terminal, &["No goal is currently set"], until);
+    send_enter(&tui, &format!("/goal {OBJECTIVE_TWO}"));
+    let requests = wait_provider_count(&installed, &terminal, 8, WAIT);
+    let thread = request_thread(&installed, &requests);
+    assert_eq!(first["threadId"], thread);
+    assert!(
+        requests[4]["input"].to_string().contains(OBJECTIVE_TWO),
+        "the second goal turn did not carry its objective"
+    );
+    let goals = completed_goals(&installed);
+    assert_eq!(goals.len(), 2, "{goals:?}");
+    assert_eq!(goals[0]["objective"], OBJECTIVE);
+    assert_eq!(goals[1]["objective"], OBJECTIVE_TWO);
+    assert_eq!(goals[0]["threadId"], thread);
+    assert_eq!(goals[1]["threadId"], thread);
+    assert_ne!(
+        goals[0]["createdAt"], goals[1]["createdAt"],
+        "the second goal reused the first goal's creation identity"
+    );
+    for goal in &goals {
+        assert_eq!(goal["status"], "complete", "{goal}");
+    }
+    let checkpoint = wait_checkpoint(
+        &installed,
+        &terminal,
+        "the second completed recovery",
+        WAIT,
+        // Completion clears the episode, so attempt is zero in both completed checkpoints.
+        |value| {
+            value["status"] == "complete"
+                && value["savedAtUnixMs"].as_u64() > first["savedAtUnixMs"].as_u64()
+        },
+    );
+    assert_eq!(checkpoint["threadId"], thread);
+    assert_eq!(
+        fs::read_to_string(installed.workspace.join("proof-first.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(
+        fs::read_to_string(installed.workspace.join("proof-second.txt")).unwrap(),
+        "two"
+    );
+    let transcript = visible(&tui.transcript());
+    assert!(
+        transcript.contains("Goal achieved"),
+        "the TUI did not report the second completion: {transcript}"
+    );
+
+    let outcome = tui.quit();
+    assert_eq!(outcome.outcome.reason, StopReason::Exited, "{outcome:?}");
+    std::thread::sleep(SETTLE);
+    assert_eq!(request_bodies(&installed).len(), 8);
+    assert!(
+        endpoint_records(&installed).is_empty(),
+        "the repeated host left endpoint records"
+    );
+    write_result(
+        &installed,
+        "repeat-result.json",
+        json!({
+            "threadId": thread,
+            "providerRequests": 8,
+            "automaticSets": 2,
+            "firstGoal": goals[0],
+            "secondGoal": goals[1],
+            "firstCheckpoint": first,
+            "secondCheckpoint": checkpoint,
+            "requestTimestamps": request_times(&installed),
+            "toolEffects": ["one", "two"],
+        }),
+    );
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned installed homes and synthetic Responses"]
+fn installed_closure_before_dispatch_leaves_no_retry() {
+    let installed = Installed::new(Scenario::Recover);
+    eprintln!("installed closure evidence: {}", installed.root.display());
+    let tui = TuiSession::new(&installed);
+    let terminal = tui.terminal.clone();
+    let until = Instant::now() + WAIT;
+    wait_visible(&tui, &terminal, &["GPT-6-Astra"], until);
+    std::thread::sleep(Duration::from_secs(1));
+    send_enter(&tui, &format!("/goal {OBJECTIVE}"));
+    wait_visible(
+        &tui,
+        &terminal,
+        &["Goal stalled (/goal resume)", "Goal set", "Pursuing goal"],
+        until,
+    );
+    let waiting = wait_checkpoint(
+        &installed,
+        &terminal,
+        "the scheduled recovery before closure",
+        WAIT,
+        |value| value["status"] == "waiting",
+    );
+    assert_eq!(waiting["attempt"], 0, "{waiting}");
+    let before = request_bodies(&installed);
+    assert_eq!(before.len(), 2, "{before:?}");
+    let thread = request_thread(&installed, &before);
+
+    let outcome = tui.quit();
+    assert_eq!(outcome.outcome.reason, StopReason::Exited, "{outcome:?}");
+    std::thread::sleep(ATTEMPT_GRACE);
+    let after = request_bodies(&installed);
+    assert_eq!(after.len(), 2, "a pending attempt ran after the TUI closed");
+    assert!(
+        endpoint_records(&installed).is_empty(),
+        "the closed host left endpoint or checkpoint records"
+    );
+    assert_eq!(
+        fs::read_to_string(installed.workspace.join("proof.txt")).unwrap(),
+        "one"
+    );
+    write_result(
+        &installed,
+        "closure-result.json",
+        json!({
+            "threadId": thread,
+            "providerRequests": 2,
+            "automaticSets": 0,
+            "goalState": "blocked at closure",
+            "checkpointBeforeClosure": waiting,
+            "requestTimestamps": request_times(&installed),
+            "toolEffect": "one",
+        }),
+    );
 }

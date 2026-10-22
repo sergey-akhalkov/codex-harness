@@ -41,6 +41,8 @@
 //!   unconfirmed-acknowledgement path;
 //!   `HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_OBSERVE=fail` makes the goal read
 //!   after the overload return a native error;
+//!   `HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_LIMIT=usageLimited|budgetLimited`
+//!   emits that native goal update after the failed turn while recovery waits;
 //! - `HARNESS_IMPROVEMENT_FIXTURE_MODEL` / `..._EFFORT`: override the model and
 //!   reasoning effort recorded in the native rollout (the wrong-observation
 //!   counterexamples); the default echoes the arm's installed configuration;
@@ -510,6 +512,7 @@ struct RecoveryState {
     failed: bool,
     recovered_turn: bool,
     fail_observation: bool,
+    limit: Option<String>,
     record: Option<PathBuf>,
 }
 
@@ -551,6 +554,11 @@ fn run_recovery_app_server(
         .is_ok_and(|value| value == "drop-first");
     let fail_observation =
         env::var("HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_OBSERVE").is_ok_and(|value| value == "fail");
+    let limit = match env::var("HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_LIMIT") {
+        Ok(value) if matches!(value.as_str(), "usageLimited" | "budgetLimited") => Some(value),
+        Ok(value) => panic!("unsupported recovery fixture limit {value:?}"),
+        Err(_) => None,
+    };
     let record = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_RECORD").map(PathBuf::from);
     let state = Arc::new(Mutex::new(RecoveryState {
         thread: thread.clone(),
@@ -562,6 +570,7 @@ fn run_recovery_app_server(
         failed: false,
         recovered_turn: false,
         fail_observation,
+        limit,
         record,
     }));
     state
@@ -588,6 +597,7 @@ fn recovery_answer(
     drop_ack: bool,
     request: &Value,
 ) -> Answer {
+    let shared = Arc::clone(state);
     let mut state = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -685,6 +695,42 @@ fn recovery_answer(
                 "atMs": unix_ms(),
                 "notification": failed,
             }));
+            if let Some(limit) = state.limit.clone() {
+                let state = Arc::clone(&shared);
+                let notifier = notifier.clone();
+                let thread_id = thread.to_owned();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(500));
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if state.status != "blocked" {
+                        return;
+                    }
+                    state.status = if limit == "usageLimited" {
+                        "usageLimited"
+                    } else {
+                        "budgetLimited"
+                    };
+                    let goal = state.goal();
+                    let updated = json!({
+                        "method": "thread/goal/updated",
+                        "params": {"threadId": thread_id, "goal": goal},
+                    });
+                    notifier.push(updated.clone());
+                    state.record(json!({
+                        "kind": "notification",
+                        "atMs": unix_ms(),
+                        "notification": updated,
+                    }));
+                    state.record(json!({
+                        "kind": "goal",
+                        "atMs": unix_ms(),
+                        "origin": "limit",
+                        "goal": goal,
+                    }));
+                });
+            }
             Answer::Result(json!({
                 "turn": {"id": RECOVERY_TURN, "status": "inProgress"},
             }))
