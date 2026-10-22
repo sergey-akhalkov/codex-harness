@@ -18,8 +18,9 @@
 //! An opt-in observed start leaves the conversation unknown until the native
 //! frontend's own new/resume/fork selection succeeds. The host callback
 //! registers that exact thread before the selection response is released, and
-//! only the successfully registered thread's turns pass the relay. The fixed
-//! start and its warning delivery remain unchanged.
+//! only that thread and confirmed temporary conversations' turns pass the relay.
+//! Side questions and native auxiliary work keep the main registration. The
+//! fixed start and its warning delivery remain unchanged.
 //!
 //! Nothing here is a client-to-server warning request: the installed protocol
 //! has none, and no shape outside the captured notification is ever written.
@@ -812,6 +813,12 @@ impl Transport {
     }
 }
 
+#[derive(Clone)]
+struct EphemeralSelection {
+    main_thread: String,
+    forked_from: Option<String>,
+}
+
 /// What one frontend connection has told this relay so far.
 #[derive(Default)]
 struct FrontendState {
@@ -821,6 +828,10 @@ struct FrontendState {
     awaiting: BTreeSet<String>,
     /// The latest thread whose selection the host successfully observed.
     selected: Option<String>,
+    /// Temporary requests correlated to the registered main conversation.
+    ephemeral_requests: BTreeMap<String, EphemeralSelection>,
+    /// Confirmed temporary conversations belonging to the current main.
+    ephemeral_threads: BTreeMap<String, EphemeralSelection>,
     /// A diagnostic is already serialized in the socket's own write buffer.
     buffered: bool,
 }
@@ -940,6 +951,35 @@ fn observe_selection_request(message: &Message, state: &mut FrontendState) -> Tr
                 "the relay cannot correlate another thread selection",
             ));
         }
+        let params = record.get("params");
+        let requested = params
+            .and_then(|params| params.get("threadId"))
+            .and_then(Value::as_str);
+        if let Some(main_thread) = state.selected.as_ref() {
+            let ephemeral = params
+                .and_then(|params| params.get("ephemeral"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let selection = match method {
+                "thread/start" if ephemeral => Some(EphemeralSelection {
+                    main_thread: main_thread.clone(),
+                    forked_from: None,
+                }),
+                "thread/fork" if ephemeral && requested == Some(main_thread.as_str()) => {
+                    Some(EphemeralSelection {
+                        main_thread: main_thread.clone(),
+                        forked_from: Some(main_thread.clone()),
+                    })
+                }
+                "thread/resume" => requested
+                    .and_then(|thread| state.ephemeral_threads.get(thread))
+                    .cloned(),
+                _ => None,
+            };
+            if let Some(selection) = selection {
+                state.ephemeral_requests.insert(key.clone(), selection);
+            }
+        }
         state.awaiting.insert(key);
         return Traffic::Forward;
     }
@@ -951,7 +991,10 @@ fn observe_selection_request(message: &Message, state: &mut FrontendState) -> Tr
             .get("params")
             .and_then(|params| params.get("threadId"))
             .and_then(Value::as_str);
-        if requested.is_some_and(|thread_id| state.selected.as_deref() == Some(thread_id)) {
+        if requested.is_some_and(|thread_id| {
+            state.selected.as_deref() == Some(thread_id)
+                || state.ephemeral_threads.contains_key(thread_id)
+        }) {
             return Traffic::Forward;
         }
         return Traffic::Answer(rpc_error(
@@ -983,6 +1026,7 @@ fn observe_selection_response(
     if !state.awaiting.remove(&id.to_string()) {
         return Traffic::Forward;
     }
+    let ephemeral = state.ephemeral_requests.remove(&id.to_string());
     if record.get("error").is_some() {
         return Traffic::Forward;
     }
@@ -1005,8 +1049,30 @@ fn observe_selection_response(
             "the app-server selected an invalid native thread identity",
         ));
     }
+    if let Some(selection) = ephemeral {
+        let thread = &record["result"]["thread"];
+        if state.selected.as_deref() != Some(selection.main_thread.as_str())
+            || thread["ephemeral"] != true
+            || thread["forkedFromId"].as_str() != selection.forked_from.as_deref()
+            || selected == selection.main_thread
+        {
+            return Traffic::Answer(rpc_error(
+                id,
+                -32603,
+                "the app-server did not return the expected temporary conversation",
+            ));
+        }
+        // Temporary conversations must not take the main reflection ownership.
+        state
+            .ephemeral_threads
+            .insert(selected.to_owned(), selection);
+        return Traffic::Forward;
+    }
     match observer(selected) {
         Ok(()) => {
+            if state.selected.as_deref() != Some(selected) {
+                state.ephemeral_threads.clear();
+            }
             state.selected = Some(selected.to_owned());
             state.initialize();
             Traffic::Forward

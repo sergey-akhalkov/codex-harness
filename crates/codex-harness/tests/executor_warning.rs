@@ -192,9 +192,7 @@ impl Frontend {
     fn attach(port: u16, token: &str) -> Self {
         let address = format!("127.0.0.1:{port}");
         let stream = TcpStream::connect(&address).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
         stream.set_write_timeout(Some(WAIT)).unwrap();
         let mut request = format!("ws://{address}").into_client_request().unwrap();
         request.headers_mut().insert(
@@ -202,6 +200,10 @@ impl Frontend {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         let (socket, _) = client_with_config(request, stream, Some(config())).unwrap();
+        socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
         Self { socket }
     }
 
@@ -674,8 +676,16 @@ fn unsolicited_bursts_and_heartbeats_survive_frontend_reconnect() {
             socket
                 .send(Message::Text(format!("alive-{generation}").into()))
                 .unwrap();
-            // Close only this attachment; the relay remains available.
-            let _ = socket.close(None);
+            socket.flush().unwrap();
+            // Wait for this attachment's close before accepting the next
+            // generation, so an abrupt local reset cannot discard the final
+            // event on Windows.
+            loop {
+                match socket.read().unwrap() {
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
         }
     });
     let mut relay = Relay::start(port, TOKEN, THREAD).unwrap();
@@ -1241,6 +1251,119 @@ fn observed_resume_and_fork_register_the_returned_threads() {
 }
 
 #[test]
+fn ephemeral_threads_leave_the_main_registered_and_usable() {
+    for (method, forked_from, params) in [
+        (
+            "thread/fork",
+            Some(THREAD),
+            json!({"threadId": THREAD, "ephemeral": true}),
+        ),
+        ("thread/start", None, json!({"ephemeral": true})),
+    ] {
+        let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+        server.answer(
+            "thread/resume",
+            Answer::Result(json!({"thread": {"id": THREAD}})),
+        );
+        server.answer(
+            method,
+            Answer::Result(json!({
+                "thread": {"id": OTHER_THREAD, "ephemeral": true, "forkedFromId": forked_from}
+            })),
+        );
+        server.answer(
+            "turn/start",
+            Answer::Result(json!({"turn": {"id": "turn-1"}})),
+        );
+        let seen = observer_log();
+        let observed = Arc::clone(&seen);
+        let observer: SelectionObserver = Arc::new(move |thread| {
+            observed.lock().unwrap().push(thread.to_owned());
+            if thread == THREAD {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "reflection recovery is pending (ReplicaChanged)",
+                ))
+            }
+        });
+        let mut relay = Relay::start_observed(server.port, TOKEN, observer).unwrap();
+        let mut frontend = Frontend::attach(relay.port(), TOKEN);
+        frontend.request(1, "thread/resume", json!({"threadId": THREAD}));
+        assert!(
+            record_of(frontend.receive(WAIT).text())
+                .get("result")
+                .is_some()
+        );
+        frontend.request(2, method, params);
+        let forked = record_of(frontend.receive(WAIT).text());
+        assert_eq!(forked["result"]["thread"]["id"], OTHER_THREAD, "{forked}");
+        assert_eq!(observed_threads(&seen), vec![THREAD.to_owned()]);
+        for (id, thread) in [(3, OTHER_THREAD), (4, THREAD), (5, OTHER_THREAD)] {
+            frontend.request(id, "turn/start", json!({"threadId": thread}));
+            let reply = record_of(frontend.receive(WAIT).text());
+            assert!(reply.get("result").is_some(), "{reply}");
+        }
+        assert_eq!(server.requests_for("turn/start").len(), 3);
+        server.answer(
+            "thread/resume",
+            Answer::Result(json!({
+                "thread": {"id": OTHER_THREAD, "ephemeral": true, "forkedFromId": forked_from}
+            })),
+        );
+        frontend.request(6, "thread/resume", json!({"threadId": OTHER_THREAD}));
+        let resumed = record_of(frontend.receive(WAIT).text());
+        assert_eq!(resumed["result"]["thread"]["id"], OTHER_THREAD, "{resumed}");
+        assert_eq!(observed_threads(&seen), vec![THREAD.to_owned()]);
+
+        frontend.close();
+        relay.close();
+    }
+}
+
+#[test]
+fn failed_or_mismatched_ephemeral_threads_never_authorize_a_turn() {
+    for method in ["thread/fork", "thread/start"] {
+        for answer in [
+            Answer::Error(json!({"code": -32600, "message": "fork refused"})),
+            Answer::Result(
+                json!({"thread": {"id": OTHER_THREAD, "ephemeral": false, "forkedFromId": THREAD}}),
+            ),
+            Answer::Result(
+                json!({"thread": {"id": OTHER_THREAD, "ephemeral": true, "forkedFromId": OTHER_THREAD}}),
+            ),
+        ] {
+            let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+            server.answer(
+                "thread/resume",
+                Answer::Result(json!({"thread": {"id": THREAD}})),
+            );
+            server.answer(method, answer);
+            let seen = observer_log();
+            let mut relay =
+                Relay::start_observed(server.port, TOKEN, recording_observer(Arc::clone(&seen)))
+                    .unwrap();
+            let mut frontend = Frontend::attach(relay.port(), TOKEN);
+            frontend.request(1, "thread/resume", json!({"threadId": THREAD}));
+            frontend.receive(WAIT).text();
+            frontend.request(2, method, json!({"threadId": THREAD, "ephemeral": true}));
+            let forked = record_of(frontend.receive(WAIT).text());
+            assert!(forked.get("error").is_some(), "{forked}");
+            frontend.request(3, "turn/start", json!({"threadId": OTHER_THREAD}));
+            assert!(
+                record_of(frontend.receive(WAIT).text())
+                    .get("error")
+                    .is_some()
+            );
+            assert!(server.requests_for("turn/start").is_empty());
+            assert_eq!(observed_threads(&seen), vec![THREAD.to_owned()]);
+            frontend.close();
+            relay.close();
+        }
+    }
+}
+
+#[test]
 fn observed_switch_registers_each_selection_and_gates_the_previous_thread() {
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
     server.answer_sequence(
@@ -1254,6 +1377,13 @@ fn observed_switch_registers_each_selection_and_gates_the_previous_thread() {
         "turn/start",
         Answer::Result(json!({"turn": {"id": "turn-1", "status": "inProgress"}})),
     );
+    let side = "01a0c719-f4d4-7880-a9d2-1a96ee0f24aa";
+    server.answer(
+        "thread/fork",
+        Answer::Result(json!({
+            "thread": {"id": side, "ephemeral": true, "forkedFromId": THREAD}
+        })),
+    );
     let seen = observer_log();
     let mut relay =
         Relay::start_observed(server.port, TOKEN, recording_observer(Arc::clone(&seen))).unwrap();
@@ -1263,6 +1393,15 @@ fn observed_switch_registers_each_selection_and_gates_the_previous_thread() {
     assert_eq!(
         record_of(frontend.receive(WAIT).text())["result"]["thread"]["id"],
         THREAD
+    );
+    frontend.request(
+        10,
+        "thread/fork",
+        json!({"threadId": THREAD, "ephemeral": true}),
+    );
+    assert_eq!(
+        record_of(frontend.receive(WAIT).text())["result"]["thread"]["id"],
+        side
     );
     frontend.request(2, "thread/resume", json!({"threadId": OTHER_THREAD}));
     assert_eq!(
@@ -1278,6 +1417,13 @@ fn observed_switch_registers_each_selection_and_gates_the_previous_thread() {
     let refused = record_of(frontend.receive(WAIT).text());
     assert_eq!(refused["id"], 3, "{refused}");
     assert!(refused.get("result").is_none(), "{refused}");
+    assert!(server.requests_for("turn/start").is_empty());
+    frontend.request(11, "turn/start", json!({"threadId": side}));
+    assert!(
+        record_of(frontend.receive(WAIT).text())
+            .get("error")
+            .is_some()
+    );
     assert!(server.requests_for("turn/start").is_empty());
 
     frontend.request(4, "turn/start", json!({"threadId": OTHER_THREAD}));

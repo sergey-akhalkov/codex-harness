@@ -872,7 +872,7 @@ fn a_failed_frontend_attachment_retires_only_the_owned_state() {
 }
 
 // The installed ordinary-entry check uses the immutable candidate launcher and
-// the real native CLI. The owned provider answers the only model request; the
+// the real native CLI. The owned provider answers every model request; the
 // test sets no executor, bounded-lead or reflection marker and never runs the
 // explicit enable command. Root runs this after integrating the final host.
 const INSTALLED_FINAL: &str = "ORDINARY_INSTALLED_CANNED_RESULT";
@@ -924,9 +924,11 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
     let root = tempfile::Builder::new()
         .prefix("ordinary-installed-")
         .tempdir()
-        .unwrap();
-    let home = root.path().join("home");
-    let evidence = root.path().join("evidence");
+        .unwrap()
+        .keep();
+    eprintln!("ordinary installed evidence {}", root.display());
+    let home = root.join("home");
+    let evidence = root.join("evidence");
     fs::create_dir_all(home.join("harness/bin")).unwrap();
     fs::create_dir_all(&evidence).unwrap();
 
@@ -956,7 +958,7 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
     )
     .unwrap();
 
-    let project = installed_role_build::kit_source(root.path());
+    let project = installed_role_build::kit_source(&root);
     installed_write_roles(&project);
     let bd = installed_bd();
     installed_git(&project, &["init", "-q", "--initial-branch=main"]);
@@ -987,12 +989,24 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
         "bd init did not create the project board"
     );
 
-    let responses = installed_responses::Responses::routed(evidence.clone(), |_request| {
+    const SIDE_PROMPT: &str = "Explain the side question fixture.";
+    const SIDE_FINAL: &str = "SIDE_QUESTION_CANNED_RESULT";
+    const RETURN_PROMPT: &str = "Continue the main conversation fixture.";
+    const RETURN_FINAL: &str = "RETURNED_MAIN_CANNED_RESULT";
+    let responses = installed_responses::Responses::routed(evidence.clone(), |request| {
+        let request = request.to_string();
+        let result = if request.contains(RETURN_PROMPT) {
+            RETURN_FINAL
+        } else if request.contains(SIDE_PROMPT) {
+            SIDE_FINAL
+        } else {
+            INSTALLED_FINAL
+        };
         serde_json::json!({
             "type": "message",
             "id": "msg-installed-final",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": INSTALLED_FINAL}]
+            "content": [{"type": "output_text", "text": result}]
         })
     });
     installed_write_home(&home, &project, responses.port);
@@ -1093,6 +1107,63 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
         installed_logs(&home)
     );
     let backend = backend_identity(&home, &session.transcript());
+
+    // Seed the reported retained recovery under the controller's own lock.
+    // The embedded board fixture cannot perform the raw/sync writes that caused it.
+    let state: harness_core::delivery_reflection::ReflectionState =
+        serde_json::from_value(lifecycle.clone()).unwrap();
+    let state_file = home
+        .join("harness/delivery-reflection")
+        .join(format!("{}.json", state.source.stable_key()));
+    let lock = installed_wait_value(WAIT, || {
+        harness_core::process::ExclusiveFileLock::try_acquire(
+            &state_file.with_extension("json.lock"),
+        )
+        .unwrap()
+    })
+    .expect("the fixture must acquire the reflection state lock");
+    let mut state: harness_core::delivery_reflection::ReflectionState =
+        serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    state.recovery = Some(harness_core::delivery_reflection::RecoveryState {
+        kind: harness_core::delivery_reflection::RecoveryKind::ReplicaChanged,
+        detail: "synthetic board commit changed without a journal record".to_owned(),
+        observed_source: Some(state.source.clone()),
+        floor: None,
+        head: None,
+        records: Vec::new(),
+        recorded_at: state.binding.activated_at.clone(),
+    });
+    let recovering = serde_json::to_value(&state).unwrap();
+    let staged = state_file.with_extension("json.tmp");
+    fs::write(&staged, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    fs::rename(staged, &state_file).unwrap();
+    drop(lock);
+    for (prompt, result) in [
+        (format!("/btw {SIDE_PROMPT}"), SIDE_FINAL),
+        (RETURN_PROMPT.to_owned(), RETURN_FINAL),
+    ] {
+        session.send(&prompt).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        session.send("\r").unwrap();
+        assert!(
+            installed_wait(WAIT, || installed_marker_visible(&session, result)),
+            "the native side/return turn did not complete: {}\n{}",
+            session.transcript(),
+            installed_logs(&home)
+        );
+        assert_eq!(
+            installed_selected_thread(&home).as_deref(),
+            Some(thread.as_str())
+        );
+        let retained = installed_active_lifecycle(&home, &thread).unwrap();
+        assert_eq!(retained["binding"], recovering["binding"]);
+        assert_eq!(retained["recovery"], recovering["recovery"]);
+        assert_eq!(retained["records"], recovering["records"]);
+        if result == SIDE_FINAL {
+            session.send("\u{3}").unwrap();
+            thread::sleep(Duration::from_millis(300));
+        }
+    }
 
     let _ = session.send("/quit");
     thread::sleep(Duration::from_millis(300));

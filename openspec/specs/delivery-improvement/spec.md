@@ -46,6 +46,11 @@ When the flag is true, the installed ordinary interactive `codex` entrypoint SHA
 - **WHEN** ordinary interactive startup selects a model, profile, configuration or existing conversation through native arguments
 - **THEN** the same choices reach the managed transport and visible conversation, including native resume/fork selection, without silent replacement or dropped parameters
 
+#### Scenario: A side question opens while reflection requires recovery
+
+- **WHEN** the native frontend creates an ephemeral fork of its registered main conversation for `/btw` or `/side`, including while reflection has a journal recovery pending
+- **THEN** the side conversation and return to the main conversation remain usable without transferring reflection ownership, advancing its event boundary, clearing recovery or interrupting retained work; only successfully correlated ephemeral forks or native temporary conversations are admitted alongside the main conversation
+
 #### Scenario: Internal and noninteractive invocation
 - **WHEN** Codex runs help, a noninteractive subcommand, an explicit remote attachment or an owned executor/reflection/backend invocation
 - **THEN** it retains its appropriate native owner and does not recursively start an ordinary lead host
