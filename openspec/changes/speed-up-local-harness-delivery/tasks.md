@@ -1,20 +1,20 @@
 ## 1. Baseline and acceptance thresholds
 
-- [ ] 1.1 Freeze the current source, toolchain, target and heavy budget; capture fresh fat-LTO release phase times, the second-phase compile set, peak memory, queue wait and delivered artifact sizes in local evidence. Verify the inputs are matched and the retained log supports the stated scope.
+- [x] 1.1 Freeze the current source, toolchain, target and heavy budget; capture fresh fat-LTO release phase times, the second-phase compile set, peak memory, queue wait and delivered artifact sizes in local evidence. Verify the inputs are matched and the retained log supports the stated scope.
 - [ ] 1.2 Capture the fast-profile candidate on the same machine at two and four Cargo jobs for cold, warm-dependency, edited-source and no-op workloads; retain wall time, payload time, queue wait, peak memory, artifact size and startup. Verify no source bytes are changed by the measurement.
-- [ ] 1.3 Record the predeclared acceptance policy: unchanged protected source reuses without Cargo in at most five seconds; a leaf-package fast rebuild targets at most two minutes, with 20-60 seconds as the stretch goal for a single small binary or measured artifact-level reuse; a cold fast build targets at most six minutes; ordinary release publication retains its accepted profile and checks. Verify every later comparison uses the same thresholds and reports missing evidence rather than substituting a prediction.
+- [x] 1.3 Record the predeclared acceptance policy: unchanged protected source reuses without Cargo in at most five seconds; a leaf-package fast rebuild targets at most two minutes, with 20-60 seconds as the stretch goal for a single small binary or measured artifact-level reuse; a cold fast build targets at most six minutes; ordinary release publication retains its accepted profile and checks. Verify every later comparison uses the same thresholds and reports missing evidence rather than substituting a prediction.
 
 ## 2. Fast profile and explicit command contract
 
-- [ ] 2.1 Add the maintained `delivery-fast` Cargo profile with release optimizations, stripping, fat LTO disabled and the measured parallel codegen setting; verify `cargo build --profile delivery-fast` and the effective compiler flags, and verify the release profile is unchanged.
-- [ ] 2.2 Add the explicit `deploy --fast` selector, help text, option validation and receipt fields; verify fast and release selectors are mutually coherent, unsupported combinations fail before effects, and no ambient profile/compiler override can select fast mode.
-- [ ] 2.3 Extend the build-record schema and profile validation so a legacy record without a profile remains release, a fast record is identifiable, and ordinary release selection, preview and fresh-manager delivery cannot select a fast candidate. Verify with both profiles present and with a newer fast build.
+- [x] 2.1 Add the maintained `delivery-fast` Cargo profile with release optimizations, stripping, fat LTO disabled and the measured parallel codegen setting; verify `cargo build --profile delivery-fast` and the effective compiler flags, and verify the release profile is unchanged.
+- [x] 2.2 Add the explicit `deploy --fast` selector, help text, option validation and receipt fields; verify fast and release selectors are mutually coherent, unsupported combinations fail before effects, and no ambient profile/compiler override can select fast mode.
+- [x] 2.3 Extend the build-record schema and profile validation so a legacy record without a profile remains release, a fast record is identifiable, and ordinary release selection, preview and fresh-manager delivery cannot select a fast candidate. Verify with both profiles present and with a newer fast build.
 
 ## 3. Profile-aware native build and installation plumbing
 
-- [ ] 3.1 Thread the selected profile through candidate preparation, handoff, finalization, build identity and dep-info paths; verify a fast candidate uses its own profile output and no hardcoded release path or profile check remains on that route.
-- [ ] 3.2 Update candidate selection, preview, reuse and core installation to filter by the requested profile; verify fast preview does not select release, release preview does not select fast, and explicit build selection remains authoritative.
-- [ ] 3.3 Publish fast candidates as immutable builds with the same binary hashes, ownership, recovery and no-rewrite guarantees as release; verify an altered fast candidate is rejected and the prior working installation is preserved.
+- [x] 3.1 Thread the selected profile through candidate preparation, handoff, finalization, build identity and dep-info paths; verify a fast candidate uses its own profile output and no hardcoded release path or profile check remains on that route.
+- [x] 3.2 Update candidate selection, preview, reuse and core installation to filter by the requested profile; verify fast preview does not select release, release preview does not select fast, and explicit build selection remains authoritative.
+- [x] 3.3 Publish fast candidates as immutable builds with the same binary hashes, ownership, recovery and no-rewrite guarantees as release; verify an altered fast candidate is rejected and the prior working installation is preserved.
 
 ## 4. Owned fast target and freshness guard
 
