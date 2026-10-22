@@ -301,15 +301,16 @@ conditions, source, toolchain, target and machine changes invalidate transfer;
 the leaf-rebuild and single-binary reuse targets have not been measured as
 current command times.
 
-This revision has no persistent fast compiler target. Both profiles prepare a
-fresh leased scratch target under `%TEMP%\chx`, so a changed-source deployment
-recompiles dependencies again. Unchanged exact source can reuse an intact,
-verified immutable candidate without Cargo. The scratch ownership, recovery
-and cleanup details belong to the
+This revision implements no fast cache: there is no persistent fast compiler
+target or cache lifecycle. Both profiles prepare a fresh leased scratch target
+under `%TEMP%\chx`, so a changed-source deployment recompiles dependencies
+again. Unchanged exact source can reuse an intact, verified immutable candidate
+without Cargo. The scratch ownership, recovery and cleanup details belong to the
 [native build lifecycle](rust-native.md#manager-inventory-and-core-connection).
-A persistent installation-owned fast target, its freshness and foreign-state
-handling, compiled-input-only candidate reuse, and one-invocation delivery are
-planned and not available; do not hand-build or assume such a cache.
+A persistent installation-owned fast target with keyed freshness, ownership
+handling and retirement, compiled-input-only candidate reuse, and
+one-invocation delivery are planned and not available; do not hand-build or
+assume such a cache.
 
 For a test- or fixture-only change that does not exercise delivery, run the
 focused [Cargo feedback route](rust-native.md#development-feedback-without-a-publication-build)

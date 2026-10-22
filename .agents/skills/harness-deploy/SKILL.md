@@ -49,13 +49,14 @@ other, and an unavailable fast candidate or mismatched explicit build is an
 error before installation changes. The retained 2026-10-22 cold scope was a
 617.8 s release baseline and 2m34s for the fast profile at two Cargo jobs;
 the current native command uses one job, so these are not a matched
-same-job promise. This revision has no persistent fast target or
-one-invocation delivery. Preview and applying delivery keep their source,
-build, profile and ownership checks; preview does not certify changed source.
-For a test- or fixture-only change, run focused Cargo checks; deploy only when
-delivery or installed behavior is under test.
-Measured scope, cache lifecycle, limitations and the test-only no-deploy rule
-are owned by the [installation guide](../../../docs/installation.md#fast-local-delivery).
+same-job promise. This revision has no persistent fast target, fast-cache
+lifecycle or one-invocation delivery. Preview and applying delivery keep their
+source, build, profile and ownership checks; preview does not certify changed
+source. For a test- or fixture-only change, run focused Cargo checks; deploy
+only when delivery or installed behavior is under test. Measured scope, current
+fresh-target behavior, planned cache limitations and the test-only no-deploy
+rule are owned by the
+[installation guide](../../../docs/installation.md#fast-local-delivery).
 
 ## Repairing a blocked installation
 

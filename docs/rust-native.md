@@ -147,15 +147,16 @@ scratch lease, reclamation and recovery behavior is described in
 [Manager, inventory and core connection](#manager-inventory-and-core-connection);
 do not treat that scratch root as a reusable user cache.
 
-A persistent installation-owned fast target is planned but not available:
-its toolchain/target/profile/lockfile/manifest/configuration key, ownership
-record, lease, conservative freshness fallback and inactivity retirement do
-not exist in this revision. One-invocation delivery and compiled-input-only
-reuse for test-only changes are also planned. Current preparation still
-bootstraps the source manager, queries its delivery set and runs the
-completion phase, while full-checkout identity governs reuse. Keep test-only
-feedback on its [Cargo route](#development-feedback-without-a-publication-build)
-unless delivery or installed behavior is what needs verification.
+A persistent installation-owned fast target and its cache lifecycle are planned
+but not available: its toolchain/target/profile/lockfile/manifest/configuration
+key, ownership record, lease, conservative freshness fallback and inactivity
+retirement do not exist in this revision. One-invocation delivery and
+compiled-input-only reuse for test-only changes are also planned. Current
+preparation still bootstraps the source manager, queries its delivery set and
+runs the completion phase, while full-checkout identity governs reuse. Keep
+test-only feedback on its
+[Cargo route](#development-feedback-without-a-publication-build) unless
+delivery or installed behavior is what needs verification.
 
 ### Integration targets and compilation parallelism
 
