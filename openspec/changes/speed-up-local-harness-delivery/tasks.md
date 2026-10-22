@@ -18,15 +18,15 @@
 
 ## 4. Owned fast target and freshness guard
 
-- [ ] 4.1 Implement the persistent fast target under an owned short compiler-cache root with a key, ownership record and lease covering toolchain, target, profile, lockfile, manifests, Cargo host configuration and declared build inputs. Verify a foreign or ambiguous target is preserved and an owned target can be retired only after inactivity.
-- [ ] 4.2 Implement pre-build source comparison and the conservative freshness guard: when a changed compiled input has an mtime that is not newer than the last successful build epoch, use a fresh target; verify changed bytes with a restored timestamp never reuse the old artifact.
-- [ ] 4.3 Verify ordinary release publication always uses its fresh target and never inherits the fast target's eligibility, even after a successful fast build and an interrupted fast build.
+- [x] 4.1 Implement the persistent fast target under an owned short compiler-cache root with a key, ownership record and lease covering toolchain, target, profile, lockfile, manifests, Cargo host configuration and declared build inputs. Verify a foreign or ambiguous target is preserved and an owned target can be retired only after inactivity.
+- [x] 4.2 Implement pre-build source comparison and the conservative freshness guard: when a changed compiled input has an mtime that is not newer than the last successful build epoch, use a fresh target; verify changed bytes with a restored timestamp never reuse the old artifact.
+- [x] 4.3 Verify ordinary release publication always uses its fresh target and never inherits the fast target's eligibility, even after a successful fast build and an interrupted fast build.
 
 ## 5. Source-owned delivery declaration and one Cargo invocation
 
-- [ ] 5.1 Add one source-owned delivery-program declaration in the root Cargo metadata and a runtime-list validation that fails on drift; verify fixtures and other test helpers are not selected.
-- [ ] 5.2 Read the declaration before compilation and build the complete delivery set in one Cargo invocation; verify a source that adds a delivery program is handled without trusting an older producer, and a missing or invalid declaration uses the existing two-phase source-manager fallback.
-- [ ] 5.3 Compare the one-invocation fast build with the existing two-phase build on the same source and budget; verify the complete binary set, final dep-info coverage, immutable publication and recovery remain identical apart from the declared profile.
+- [x] 5.1 Add one source-owned delivery-program declaration in the root Cargo metadata and a runtime-list validation that fails on drift; verify fixtures and other test helpers are not selected.
+- [x] 5.2 Read the declaration before compilation and build the complete delivery set in one Cargo invocation; verify a source that adds a delivery program is handled without trusting an older producer, and a missing or invalid declaration uses the existing two-phase source-manager fallback.
+- [x] 5.3 Compare the one-invocation fast build with the existing two-phase build on the same source and budget; verify the complete binary set, final dep-info coverage, immutable publication and recovery remain identical apart from the declared profile.
 
 ## 6. Compiled-input identity and test-only reuse
 
@@ -38,7 +38,7 @@
 
 - [ ] 7.1 Run a matched fat-LTO comparison of the existing release default and two or four Cargo jobs inside the unchanged heavy budget; adopt a larger release job count only if payload improvement is material, peak memory stays safe and required checks pass.
 - [ ] 7.2 Measure test compilation and execution separately from delivery. Evaluate scoped serialization or an optional test runner only where shared-resource tests require it, preserving every selected case, ignored-condition and failure report; do not adopt a runner or consolidation without measured benefit.
-- [ ] 7.3 Record thin LTO as unadopted unless a new matched hypothesis reverses the retained slower-and-larger result; verify the release profile remains fat LTO.
+- [x] 7.3 Record thin LTO as unadopted unless a new matched hypothesis reverses the retained slower-and-larger result; verify the release profile remains fat LTO.
 
 ## 8. Documentation, verification and delivery
 
