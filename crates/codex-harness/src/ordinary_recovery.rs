@@ -91,6 +91,16 @@ impl RecoveryHost {
             self.cancel("a user action");
             return Ok(());
         }
+        // Our own status-only activation is the source of this update. The
+        // relay gate did not move, so this active goal is not a user takeover;
+        // treating it as one would cancel the attempt we just sent.
+        if method == "thread/goal/updated"
+            && raw["params"]["goal"]["status"] == "active"
+            && self.recovery.is_in_flight()
+            && self.gate.revision() == self.scheduled_revision
+        {
+            return Ok(());
+        }
         match method {
             "turn/completed" => {
                 let failed = raw["params"]["turn"]["status"] == "failed";
