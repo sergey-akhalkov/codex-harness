@@ -36,8 +36,8 @@
 
 ## 7. Release concurrency and test feedback
 
-- [ ] 7.1 Run a matched fat-LTO comparison of the existing release default and two or four Cargo jobs inside the unchanged heavy budget; adopt a larger release job count only if payload improvement is material, peak memory stays safe and required checks pass.
-- [ ] 7.2 Measure test compilation and execution separately from delivery. Evaluate scoped serialization or an optional test runner only where shared-resource tests require it, preserving every selected case, ignored-condition and failure report; do not adopt a runner or consolidation without measured benefit.
+- [x] 7.1 Run a matched fat-LTO comparison of the existing release default and two or four Cargo jobs inside the unchanged heavy budget; adopt a larger release job count only if payload improvement is material, peak memory stays safe and required checks pass.
+- [x] 7.2 Measure test compilation and execution separately from delivery. Evaluate scoped serialization or an optional test runner only where shared-resource tests require it, preserving every selected case, ignored-condition and failure report; do not adopt a runner or consolidation without measured benefit.
 - [x] 7.3 Record thin LTO as unadopted unless a new matched hypothesis reverses the retained slower-and-larger result; verify the release profile remains fat LTO.
 
 ## 8. Documentation, verification and delivery
