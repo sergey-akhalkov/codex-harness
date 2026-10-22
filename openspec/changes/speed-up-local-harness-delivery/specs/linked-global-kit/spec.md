@@ -26,7 +26,9 @@ selected interchangeably: a newer fast build MUST NOT cause ordinary release
 deployment or preview to install non-release binaries, and a fast request MUST
 NOT silently fall back to release when its profile or candidate is
 unavailable. `--fast --all --preview` SHALL report the fast core plan and each
-component plan without compiling or changing installation state.
+component plan without changing installation state. It SHALL reuse an eligible
+verified build without compiling; when none is available, the normal
+preparation or explicit error path applies.
 
 For `deploy --preview` without an explicit build, the kit SHALL reuse an
 eligible integrity-verified existing build selected by the existing
