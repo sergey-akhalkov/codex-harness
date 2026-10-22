@@ -7,6 +7,7 @@ use crate::process::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -28,6 +29,16 @@ const SCRATCH_LEASE_FILE: &str = "lease";
 /// Leading identity line of an ownership record. Ownership is this content,
 /// never a directory name, timestamp or process identifier.
 const SCRATCH_OWNER: &str = "codex-harness-native-scratch-v1\n";
+/// A persistent fast target has distinct ownership, so scratch hygiene never
+/// retires it just because a build released its lease.
+const FAST_OWNER: &str = "codex-harness-native-fast-target-v1\n";
+const FAST_RECORD_FILE: &str = "last.json";
+const FAST_USED_FILE: &str = "used";
+const FAST_SCHEMA: u32 = 1;
+/// Unused fast targets are retired only after a full quiet period. The lease,
+/// not this age, decides whether a target is currently active.
+const FAST_INACTIVITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const DELIVERY_SELECTION_FILE: &str = "delivery-selection.json";
 
 #[path = "native_handoff.rs"]
 mod handoff;
@@ -80,6 +91,72 @@ fn answer_delivery_probe(request: &Path) -> io::Result<bool> {
         }))?
     );
     Ok(true)
+}
+
+/// Read the source-owned delivery declaration before a manager exists. An
+/// absent, malformed or unsafe declaration is unavailable, not an empty or
+/// inferred set; the caller retains the two-phase manager query.
+fn declared_delivery(manifest: &Path) -> Option<Vec<String>> {
+    let text = fs::read_to_string(manifest).ok()?;
+    let document: toml::Value = toml::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let entries = document
+        .get("workspace")?
+        .get("metadata")?
+        .get("harness")?
+        .get("delivery")?
+        .as_array()?;
+    let mut delivery = Vec::with_capacity(entries.len());
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let name = entry.as_str()?;
+        let stem = name.strip_suffix(".exe")?;
+        if stem.is_empty()
+            || !stem
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !seen.insert(name)
+        {
+            return None;
+        }
+        delivery.push(name.to_owned());
+    }
+    (!delivery.is_empty()).then_some(delivery)
+}
+
+/// One Cargo invocation for the complete declared set. Package selection stays
+/// unchanged, so a declaration cannot widen the build to unrelated members.
+fn declared_delivery_cargo(
+    source: &Path,
+    target: &Path,
+    cargo: &OsStr,
+    profile: Profile,
+    delivery: &[String],
+) -> io::Result<CommandSpec> {
+    let mut command = publication_cargo(source, target, cargo, profile)?;
+    command
+        .args
+        .extend(publication_bin_selection(Some(delivery)));
+    Ok(command)
+}
+
+fn write_delivery_selection(staging: &Path, declaration: Option<&[String]>) -> io::Result<()> {
+    let evidence = match declaration {
+        Some(delivery) => serde_json::json!({
+            "schema": 1,
+            "selection": "source-declaration",
+            "one_cargo_invocation": true,
+            "delivery": delivery,
+        }),
+        None => serde_json::json!({
+            "schema": 1,
+            "selection": "two-phase-manager-query",
+            "one_cargo_invocation": false,
+        }),
+    };
+    fs::write(
+        staging.join(DELIVERY_SELECTION_FILE),
+        serde_json::to_vec_pretty(&evidence)?,
+    )
 }
 
 fn verify_compiled_inputs(
@@ -573,6 +650,329 @@ fn reclaim_owned_entry(path: &Path, lease: ExclusiveFileLock) {
     let _ = fs::remove_file(path.join(SCRATCH_LEASE_FILE));
     let _ = fs::remove_file(path.join(SCRATCH_OWNER_FILE));
     let _ = fs::remove_dir(path);
+}
+
+/// Evidence from the last successful build in a persistent fast target.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FastBuildRecord {
+    schema: u32,
+    key: String,
+    state: String,
+    built_epoch_ns: u128,
+    source: build_identity::SourceIdentity,
+}
+
+/// A leased persistent compiler target. Dropping it releases the lease but
+/// deliberately leaves the target for the next explicit fast build.
+struct FastTarget {
+    _lease: ExclusiveFileLock,
+    path: PathBuf,
+    key: String,
+    state: String,
+}
+
+impl FastTarget {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn record_success(&self, source: &build_identity::SourceIdentity) -> io::Result<()> {
+        let built_epoch_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let record = FastBuildRecord {
+            schema: FAST_SCHEMA,
+            key: self.key.clone(),
+            state: self.state.clone(),
+            built_epoch_ns,
+            source: source.clone(),
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(self.path.join(FAST_RECORD_FILE))?;
+        file.write_all(&serde_json::to_vec_pretty(&record)?)?;
+        file.sync_all()?;
+        fs::write(self.path.join(FAST_USED_FILE), built_epoch_ns.to_string())
+    }
+}
+
+/// Key build-affecting inputs while leaving ordinary source bytes to Cargo's
+/// incremental rebuild. The manifest itself carries the delivery declaration.
+fn fast_key_input(path: &str) -> bool {
+    path == "Cargo.toml"
+        || path == "Cargo.lock"
+        || path.ends_with("/Cargo.toml")
+        || path == "build.rs"
+        || path.ends_with("/build.rs")
+        || path == "rust-toolchain"
+        || path == "rust-toolchain.toml"
+        || path.starts_with(".cargo/")
+        || path.starts_with("cargo-host-config/")
+}
+
+fn fast_target_key(
+    identity: &build_identity::SourceIdentity,
+    rustc: &str,
+    cargo: &str,
+    profile: Profile,
+) -> io::Result<String> {
+    let files: BTreeMap<_, _> = identity
+        .files
+        .iter()
+        .filter(|(path, _)| fast_key_input(path))
+        .map(|(path, hash)| (path.clone(), hash.clone()))
+        .collect();
+    Ok(build_identity::hash_bytes(&serde_json::to_vec(
+        &serde_json::json!({
+            "schema": FAST_SCHEMA,
+            "rustc": rustc,
+            "cargo": cargo,
+            "target": TARGET,
+            "profile": profile.as_str(),
+            "files": files,
+        }),
+    )?))
+}
+
+fn fast_target_path(root: &Path, key: &str) -> PathBuf {
+    root.join(format!("f{}", &key[..16]))
+}
+
+fn fast_owner_record(key: &str, state: &str) -> String {
+    format!("{FAST_OWNER}key={key}\nstate={state}\n")
+}
+
+fn fast_owner_identity(path: &Path) -> Option<(String, String)> {
+    if build_identity::ordinary(path).is_err() {
+        return None;
+    }
+    if fs::metadata(path).ok()?.len() > 1024 {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != FAST_OWNER.trim_end() {
+        return None;
+    }
+    let key = lines.next()?.strip_prefix("key=")?.to_owned();
+    let state = lines.next()?.strip_prefix("state=")?.to_owned();
+    (lines.next().is_none()).then_some((key, state))
+}
+
+fn fast_state_id(state: &Path) -> io::Result<String> {
+    Ok(build_identity::hash_bytes(
+        state
+            .canonicalize()?
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .as_bytes(),
+    ))
+}
+
+fn fast_target_is_empty(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|mut entries| {
+        entries.all(|entry| {
+            entry.is_ok_and(|entry| {
+                matches!(
+                    entry.file_name().to_str(),
+                    Some(SCRATCH_OWNER_FILE | SCRATCH_LEASE_FILE | FAST_USED_FILE)
+                )
+            })
+        })
+    })
+}
+
+fn fast_file_or_absent(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.is_file() && build_identity::ordinary(path).is_ok(),
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+/// Reuse is allowed only when every changed identity input is newer than the
+/// last successful build. A restored timestamp therefore falls back to fresh
+/// scratch instead of trusting Cargo's mtime comparison.
+fn fast_record_allows(
+    record: &FastBuildRecord,
+    source: &Path,
+    current: &build_identity::SourceIdentity,
+) -> bool {
+    if record.source.sha256 == current.sha256 {
+        return true;
+    }
+    let mut paths = BTreeSet::new();
+    paths.extend(record.source.files.keys().cloned());
+    paths.extend(current.files.keys().cloned());
+    for path in paths {
+        if record.source.files.get(&path) == current.files.get(&path) {
+            continue;
+        }
+        let Ok(metadata) = fs::metadata(source.join(&path)) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        let Ok(modified) = modified.duration_since(UNIX_EPOCH) else {
+            return false;
+        };
+        if modified.as_nanos() <= record.built_epoch_ns {
+            return false;
+        }
+    }
+    true
+}
+
+/// Acquire one keyed fast target. Any foreign, active, mismatched or unproven
+/// state returns `None` without mutation so the caller uses fresh scratch.
+fn fast_target_in(
+    root: &Path,
+    source: &Path,
+    state: &Path,
+    identity: &build_identity::SourceIdentity,
+    rustc: &str,
+    cargo: &str,
+    profile: Profile,
+) -> io::Result<Option<FastTarget>> {
+    if profile != Profile::DeliveryFast {
+        return Ok(None);
+    }
+    let key = fast_target_key(identity, rustc, cargo, profile)?;
+    let state = fast_state_id(state)?;
+    let path = fast_target_path(root, &key);
+    let created = match fs::create_dir(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error),
+    };
+    if created {
+        fs::write(
+            path.join(SCRATCH_OWNER_FILE),
+            fast_owner_record(&key, &state),
+        )?;
+        let target = FastTarget {
+            _lease: ExclusiveFileLock::try_acquire(&path.join(SCRATCH_LEASE_FILE))?
+                .ok_or_else(|| io::Error::other("Fresh fast target lease is already held."))?,
+            path,
+            key,
+            state,
+        };
+        fs::write(target.path.join(FAST_USED_FILE), "created")?;
+        return Ok(Some(target));
+    }
+    let lease = path.join(SCRATCH_LEASE_FILE);
+    if !path.is_dir()
+        || build_identity::ordinary(&path).is_err()
+        || fast_owner_identity(&path.join(SCRATCH_OWNER_FILE)) != Some((key.clone(), state.clone()))
+        || !fast_file_or_absent(&lease)
+    {
+        return Ok(None);
+    }
+    let _lease = match ExclusiveFileLock::try_acquire_existing(&lease) {
+        Ok(Some(lease)) => lease,
+        _ => return Ok(None),
+    };
+    let record_path = path.join(FAST_RECORD_FILE);
+    let used = path.join(FAST_USED_FILE);
+    if !fast_file_or_absent(&record_path) || !fast_file_or_absent(&used) {
+        return Ok(None);
+    }
+    let record = match fs::read(&record_path) {
+        Ok(bytes) => serde_json::from_slice::<FastBuildRecord>(&bytes).ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let accepted = match record {
+        Some(record)
+            if record.schema == FAST_SCHEMA && record.key == key && record.state == state =>
+        {
+            fast_record_allows(&record, source, identity)
+        }
+        None => fast_target_is_empty(&path),
+        _ => false,
+    };
+    if !accepted {
+        return Ok(None);
+    }
+    fs::write(
+        used,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_secs()
+            .to_string(),
+    )?;
+    Ok(Some(FastTarget {
+        _lease,
+        path,
+        key,
+        state,
+    }))
+}
+
+fn fast_target(
+    source: &Path,
+    state: &Path,
+    identity: &build_identity::SourceIdentity,
+    rustc: &str,
+    cargo: &str,
+    profile: Profile,
+) -> io::Result<Option<FastTarget>> {
+    if profile != Profile::DeliveryFast {
+        return Ok(None);
+    }
+    let root = owned_scratch_root(&scratch_root(), true)?.ok_or_else(|| {
+        io::Error::other(
+            "Fast compiler-cache root is foreign or ambiguous; preserving it and refusing to inherit its target.",
+        )
+    })?;
+    retire_inactive_fast_targets(&root, &fast_state_id(state)?, SystemTime::now());
+    fast_target_in(&root, source, state, identity, rustc, cargo, profile)
+}
+
+/// Retire only released, owned fast targets that have been quiet for the full
+/// inactivity period for this installation. Active, malformed, linked and
+/// foreign entries survive.
+fn retire_inactive_fast_targets(root: &Path, state: &str, now: SystemTime) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+            || build_identity::ordinary(&path).is_err()
+        {
+            continue;
+        }
+        let Some((_, owner_state)) = fast_owner_identity(&path.join(SCRATCH_OWNER_FILE)) else {
+            continue;
+        };
+        if owner_state != state {
+            continue;
+        }
+        let used = path.join(FAST_USED_FILE);
+        if build_identity::ordinary(&used).is_err() {
+            continue;
+        }
+        let Ok(modified) = fs::metadata(&used).and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|quiet| quiet >= FAST_INACTIVITY)
+            && let Ok(Some(lease)) =
+                ExclusiveFileLock::try_acquire_existing(&path.join(SCRATCH_LEASE_FILE))
+        {
+            reclaim_owned_entry(&path, lease);
+        }
+    }
 }
 
 pub(crate) fn owner_root(state: &Path) -> io::Result<()> {
@@ -1253,11 +1653,21 @@ pub fn prepare_for(
         .open(&log_path)?;
     // Never let Cargo's mtime cache certify a different content identity, and
     // never write into pre-existing cache descendants (which may be links).
-    // Unchanged builds reuse their verified immutable artifacts above.
-    // Keep compiler paths short: nested state/build IDs can exceed MSVC's
-    // practical object-file path limit even when Rust accepts verbatim paths.
-    let scratch = owned_scratch()?;
-    let target = scratch.path().to_owned();
+    // Unchanged builds reuse their verified immutable artifacts above. Only
+    // explicit fast delivery may adopt a persistent target; publication always
+    // receives a fresh scratch tree.
+    let fast = fast_target(&source, &state, &before, &rustc, &cargo_version, profile)?;
+    let scratch = fast.is_none().then(owned_scratch).transpose()?;
+    let target = match &fast {
+        Some(fast) => fast.path().to_owned(),
+        None => scratch
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Native build target was not prepared."))?
+            .path()
+            .to_owned(),
+    };
+    let declaration = declared_delivery(&source.join("Cargo.toml"));
+    write_delivery_selection(&staging, declaration.as_deref())?;
     ordinary_ancestors(&target)?;
     // Release LTO of every manager binary exceeds a 4 GiB Job. The compiler Job
     // is the lifecycle job inside the admitted envelope. A held admission places
@@ -1266,39 +1676,48 @@ pub fn prepare_for(
     // path and does not acquire a second slot or aggregate limit. The compilation
     // tree inherits the same marker, so a nested native consumer reuses this
     // admission instead of queueing on it.
-    // The bootstrap phase compiles only the manager that owns the delivery
-    // definition; the completion phase then adds exactly the programs that
-    // manager's own source declares, in the same fresh target. A manager that
-    // predates the delivery query is completed with the pre-query whole-package
-    // selection instead, so older sources and producers keep publishing. The
-    // delivery programs are therefore compiled without unrelated test-only
-    // fixture binaries and without a second maintained list of names.
-    let mut command = publication_cargo(&source, &target, cargo, profile)?;
-    command.args.push("--bin".into());
-    command.args.push("codex-harness".into());
-    run_publication_phase(
-        &admission,
-        &budget,
-        &account,
-        deadline,
-        &log,
-        &log_path,
-        &mut command,
-    )?;
-    let delivery = probe_delivery(&target, &staging, &source, profile)?;
-    let mut command = publication_cargo(&source, &target, cargo, profile)?;
-    command
-        .args
-        .extend(publication_bin_selection(delivery.as_deref()));
-    run_publication_phase(
-        &admission,
-        &budget,
-        &account,
-        deadline,
-        &log,
-        &log_path,
-        &mut command,
-    )?;
+    // A source-owned declaration selects the complete delivery set before the
+    // manager exists. Legacy or unusable declarations retain the two-phase
+    // manager query and its whole-package compatibility fallback.
+    if let Some(delivery) = declaration.as_deref() {
+        let mut command = declared_delivery_cargo(&source, &target, cargo, profile, delivery)?;
+        run_publication_phase(
+            &admission,
+            &budget,
+            &account,
+            deadline,
+            &log,
+            &log_path,
+            &mut command,
+        )?;
+    } else {
+        let mut command = publication_cargo(&source, &target, cargo, profile)?;
+        command.args.push("--bin".into());
+        command.args.push("codex-harness".into());
+        run_publication_phase(
+            &admission,
+            &budget,
+            &account,
+            deadline,
+            &log,
+            &log_path,
+            &mut command,
+        )?;
+        let delivery = probe_delivery(&target, &staging, &source, profile)?;
+        let mut command = publication_cargo(&source, &target, cargo, profile)?;
+        command
+            .args
+            .extend(publication_bin_selection(delivery.as_deref()));
+        run_publication_phase(
+            &admission,
+            &budget,
+            &account,
+            deadline,
+            &log,
+            &log_path,
+            &mut command,
+        )?;
+    }
     // Both phases are done; closing the shared log before finalization keeps
     // the staging directory renamable on Windows.
     drop(log);
@@ -1338,6 +1757,13 @@ pub fn prepare_for(
             staging.display()
         ))
     })?;
+    if let Some(fast) = &fast
+        && let Err(error) = fast.record_success(&before)
+    {
+        eprintln!(
+            "native build: fast target evidence could not be recorded ({error}); the immutable candidate is valid but the target will not be reused without fresh evidence."
+        );
+    }
     drop(lock);
     Ok(PreparedBuild {
         build: published,
@@ -1843,6 +2269,32 @@ mod tests {
         root
     }
 
+    fn fast_fixture(outer: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let root = owned_root_fixture(outer);
+        let state = outer.join("state");
+        owner_root(&state).unwrap();
+        let source = source_fixture(outer, "source").canonicalize().unwrap();
+        (root, source, state)
+    }
+
+    fn open_fast_target(
+        root: &Path,
+        source: &Path,
+        state: &Path,
+        profile: Profile,
+    ) -> io::Result<Option<FastTarget>> {
+        let identity = build_identity::source_identity(source)?;
+        fast_target_in(
+            root,
+            source,
+            state,
+            &identity,
+            "rustc fixture",
+            "cargo fixture",
+            profile,
+        )
+    }
+
     #[test]
     fn scratch_root_is_adopted_only_with_its_ownership_record() {
         let outer = tempfile::tempdir().unwrap();
@@ -1978,6 +2430,322 @@ mod tests {
         assert!(active.path().is_dir());
         assert!(link.is_dir());
         assert_eq!(fs::read_to_string(sentinel.join("keep")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn fast_target_is_keyed_leased_and_reacquired() {
+        let outer = tempfile::tempdir().unwrap();
+        let (root, source, state) = fast_fixture(outer.path());
+        let identity = build_identity::source_identity(&source).unwrap();
+        let key = fast_target_key(
+            &identity,
+            "rustc fixture",
+            "cargo fixture",
+            Profile::DeliveryFast,
+        )
+        .unwrap();
+        let target = open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+            .unwrap()
+            .unwrap();
+        let path = target.path().to_owned();
+        assert_eq!(path.parent(), Some(root.as_path()));
+        assert_eq!(
+            path.file_name().unwrap(),
+            format!("f{}", &key[..16]).as_str()
+        );
+        assert_eq!(
+            fast_owner_identity(&path.join(SCRATCH_OWNER_FILE)).map(|(key, _)| key),
+            Some(key.clone())
+        );
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join(SCRATCH_LEASE_FILE))
+            .unwrap();
+        assert!(probe.try_lock().is_err(), "fast target lease is live");
+        drop(probe);
+        assert!(
+            open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+                .unwrap()
+                .is_none(),
+            "a live fast target is not acquired twice"
+        );
+        drop(target);
+        let acquired = open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+            .unwrap()
+            .unwrap();
+        assert_eq!(acquired.path(), path);
+        drop(acquired);
+
+        fs::write(source.join("crates/one/src/lib.rs"), "changed source").unwrap();
+        let changed = build_identity::source_identity(&source).unwrap();
+        assert_eq!(
+            fast_target_key(
+                &changed,
+                "rustc fixture",
+                "cargo fixture",
+                Profile::DeliveryFast
+            )
+            .unwrap(),
+            key,
+            "ordinary source bytes do not key the target"
+        );
+        fs::write(source.join("Cargo.lock"), "changed lock").unwrap();
+        let relocked = build_identity::source_identity(&source).unwrap();
+        assert_ne!(
+            fast_target_key(
+                &relocked,
+                "rustc fixture",
+                "cargo fixture",
+                Profile::DeliveryFast
+            )
+            .unwrap(),
+            key,
+            "a build-affecting input changes the target key"
+        );
+    }
+
+    #[test]
+    fn fast_target_preserves_foreign_and_ambiguous_entries() {
+        let outer = tempfile::tempdir().unwrap();
+        let (root, source, state) = fast_fixture(outer.path());
+        let identity = build_identity::source_identity(&source).unwrap();
+        let key = fast_target_key(
+            &identity,
+            "rustc fixture",
+            "cargo fixture",
+            Profile::DeliveryFast,
+        )
+        .unwrap();
+        let path = fast_target_path(&root, &key);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("foreign"), "keep").unwrap();
+        assert!(
+            open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read_to_string(path.join("foreign")).unwrap(), "keep");
+        fs::remove_dir_all(&path).unwrap();
+
+        let state_id = build_identity::hash_bytes(
+            state
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .as_bytes(),
+        );
+        fs::create_dir(&path).unwrap();
+        fs::write(
+            path.join(SCRATCH_OWNER_FILE),
+            fast_owner_record(&key, &state_id),
+        )
+        .unwrap();
+        fs::write(path.join(SCRATCH_LEASE_FILE), "").unwrap();
+        fs::write(path.join(FAST_USED_FILE), "interrupted").unwrap();
+        fs::write(path.join("partial-target"), "keep").unwrap();
+        assert!(
+            open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+                .unwrap()
+                .is_none(),
+            "a target without successful evidence is ambiguous"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("partial-target")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join(FAST_USED_FILE)).unwrap(),
+            "interrupted"
+        );
+        assert!(path.join(SCRATCH_OWNER_FILE).is_file());
+    }
+
+    #[test]
+    fn fast_target_rejects_changed_bytes_with_a_restored_timestamp() {
+        let outer = tempfile::tempdir().unwrap();
+        let (root, source, state) = fast_fixture(outer.path());
+        let identity = build_identity::source_identity(&source).unwrap();
+        let target = open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+            .unwrap()
+            .unwrap();
+        target.record_success(&identity).unwrap();
+        drop(target);
+
+        let changed = source.join("crates/one/src/lib.rs");
+        fs::write(&changed, "changed bytes").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&changed)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+                .unwrap()
+                .is_none(),
+            "an older changed input must use fresh scratch"
+        );
+
+        OpenOptions::new()
+            .write(true)
+            .open(&changed)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+                .unwrap()
+                .is_some(),
+            "a provably newer input may use Cargo's rebuild path"
+        );
+    }
+
+    #[test]
+    fn ordinary_release_never_acquires_a_fast_target() {
+        let outer = tempfile::tempdir().unwrap();
+        let (root, source, state) = fast_fixture(outer.path());
+        let identity = build_identity::source_identity(&source).unwrap();
+        let target = open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+            .unwrap()
+            .unwrap();
+        target.record_success(&identity).unwrap();
+        let used = target.path().join(FAST_USED_FILE);
+        let before = fs::read_to_string(&used).unwrap();
+        assert!(
+            open_fast_target(&root, &source, &state, Profile::Release)
+                .unwrap()
+                .is_none(),
+            "release never inherits a live fast target"
+        );
+        drop(target);
+        assert!(
+            open_fast_target(&root, &source, &state, Profile::Release)
+                .unwrap()
+                .is_none(),
+            "release never inherits successful fast evidence"
+        );
+        assert_eq!(fs::read_to_string(used).unwrap(), before);
+    }
+
+    #[test]
+    fn inactive_fast_target_retires_only_after_the_quiet_period() {
+        let outer = tempfile::tempdir().unwrap();
+        let (root, source, state) = fast_fixture(outer.path());
+        let first = open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+            .unwrap()
+            .unwrap();
+        let first_path = first.path().to_owned();
+        drop(first);
+        fs::write(source.join("Cargo.lock"), "second").unwrap();
+        let second = open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+            .unwrap()
+            .unwrap();
+        let second_path = second.path().to_owned();
+        drop(second);
+        fs::write(source.join("Cargo.lock"), "third").unwrap();
+        let active = open_fast_target(&root, &source, &state, Profile::DeliveryFast)
+            .unwrap()
+            .unwrap();
+        backdate(&first_path.join(FAST_USED_FILE));
+        backdate(&active.path().join(FAST_USED_FILE));
+        let other = root.join("fother-state");
+        fs::create_dir(&other).unwrap();
+        fs::write(
+            other.join(SCRATCH_OWNER_FILE),
+            fast_owner_record("other-key", "other-state"),
+        )
+        .unwrap();
+        fs::write(other.join(SCRATCH_LEASE_FILE), "").unwrap();
+        fs::write(other.join(FAST_USED_FILE), "quiet").unwrap();
+        backdate(&other.join(FAST_USED_FILE));
+
+        retire_inactive_fast_targets(&root, &fast_state_id(&state).unwrap(), SystemTime::now());
+
+        assert!(!first_path.exists(), "quiet owned target is retired");
+        assert!(second_path.exists(), "recent owned target is preserved");
+        assert!(active.path().is_dir(), "live leased target is preserved");
+        assert!(other.is_dir(), "another installation's target is preserved");
+    }
+
+    #[test]
+    fn delivery_declaration_matches_runtime_and_builds_in_one_command() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = root.join("Cargo.toml");
+        let delivery = declared_delivery(&manifest).expect("root delivery declaration");
+        assert_eq!(
+            delivery,
+            BINARIES
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>(),
+            "source declaration and runtime delivery list drifted"
+        );
+        assert!(
+            !delivery.iter().any(|name| name.contains("fixture")),
+            "test fixtures are not delivery programs"
+        );
+        let command = declared_delivery_cargo(
+            &root,
+            Path::new("D:/target"),
+            OsStr::new("cargo"),
+            Profile::DeliveryFast,
+            &delivery,
+        )
+        .unwrap();
+        let args: Vec<String> = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("build"));
+        assert_eq!(args.iter().filter(|arg| *arg == "--profile").count(), 1);
+        assert!(!args.iter().any(|arg| arg == "--bins"));
+        let selected: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--bin")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            BINARIES
+                .iter()
+                .map(|name| name.strip_suffix(".exe").unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unavailable_delivery_declaration_keeps_the_two_phase_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("Cargo.toml");
+        assert!(declared_delivery(&manifest).is_none());
+        for invalid in [
+            "[workspace]\nmembers = []\n",
+            "[workspace.metadata.harness]\ndelivery = []\n",
+            "[workspace.metadata.harness]\ndelivery = [\"bad/name.exe\"]\n",
+            "[workspace.metadata.harness]\ndelivery = [\"one.exe\", \"one.exe\"]\n",
+            "[workspace.metadata.harness]\ndelivery = [1]\n",
+        ] {
+            fs::write(&manifest, invalid).unwrap();
+            assert!(declared_delivery(&manifest).is_none(), "{invalid}");
+        }
+        fs::write(
+            &manifest,
+            "[workspace.metadata.harness]\ndelivery = [\"one.exe\", \"new-program.exe\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            declared_delivery(&manifest).unwrap(),
+            ["one.exe", "new-program.exe"]
+        );
+        write_delivery_selection(temp.path(), None).unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join(DELIVERY_SELECTION_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(evidence["selection"], "two-phase-manager-query");
+        assert_eq!(evidence["one_cargo_invocation"], false);
     }
 
     #[test]
