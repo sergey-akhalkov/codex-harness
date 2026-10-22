@@ -9,7 +9,7 @@
 use crate::executor_cli::{
     control::{Conversation, Reply},
     note_log,
-    warning::{FrontendGate, QueueOutcome, WarningQueue},
+    warning::{FrontendEvents, FrontendGate, QueueOutcome, WarningQueue},
 };
 use harness_core::{
     task_failure::{FailureCause, TurnFailure},
@@ -30,6 +30,7 @@ const JITTER_CEILING_MS: u64 = 400;
 pub(crate) struct RecoveryHost {
     thread: String,
     gate: FrontendGate,
+    events: FrontendEvents,
     warnings: WarningQueue,
     checkpoint: PathBuf,
     log: PathBuf,
@@ -38,12 +39,15 @@ pub(crate) struct RecoveryHost {
     scheduled_revision: u64,
     /// A request that may have reached Codex without an acknowledgement.
     uncertain: Option<Dispatch>,
+    /// The latest native goal observed on the frontend connection.
+    latest_goal: Option<Value>,
 }
 
 impl RecoveryHost {
     pub(crate) fn new(
         thread: String,
         gate: FrontendGate,
+        events: FrontendEvents,
         warnings: WarningQueue,
         checkpoint: PathBuf,
         log: PathBuf,
@@ -52,12 +56,14 @@ impl RecoveryHost {
         let host = Self {
             thread,
             gate,
+            events,
             warnings,
             checkpoint,
             log,
             recovery: Recovery::new(Default::default()),
             scheduled_revision: 0,
             uncertain: None,
+            latest_goal: None,
         };
         // A checkpoint from an earlier owner is evidence, not authority. It is
         // never replayed: a fresh host starts idle and reconciles from native
@@ -79,6 +85,11 @@ impl RecoveryHost {
         };
         if raw["params"]["threadId"].as_str() != Some(self.thread.as_str()) {
             return Ok(());
+        }
+        if method == "thread/goal/updated" {
+            self.latest_goal = Some(raw["params"]["goal"].clone());
+        } else if method == "thread/goal/cleared" {
+            self.latest_goal = None;
         }
         // The relay bumps this revision while it forwards a user mutation.
         // Checking it on every observation also covers an interruption during
@@ -115,7 +126,10 @@ impl RecoveryHost {
                     self.cancel("an unrelated turn error");
                     return Ok(());
                 }
-                let goal = conversation.thread_goal(&self.thread)?;
+                let goal = match self.latest_goal.clone() {
+                    Some(goal) => goal,
+                    None => conversation.thread_goal(&self.thread)?,
+                };
                 let decision = self.recovery.on_failed_turn(
                     &self.thread,
                     &failure.turn_id,
@@ -139,6 +153,16 @@ impl RecoveryHost {
         Ok(())
     }
 
+    /// Drain notifications observed on the frontend socket. An empty new
+    /// thread has no rollout, so the control connection cannot resume it; the
+    /// relay is the authoritative observation path for that conversation.
+    pub(crate) fn drain_events(&mut self, conversation: &mut Conversation) -> io::Result<()> {
+        for raw in self.events.drain() {
+            self.on_event(conversation, &raw)?;
+        }
+        Ok(())
+    }
+
     /// Dispatch one due attempt while holding the relay's ordering gate.
     pub(crate) fn tick(&mut self, conversation: &mut Conversation) {
         if let Some(dispatch) = self.uncertain.take() {
@@ -158,13 +182,16 @@ impl RecoveryHost {
             self.cancel("a user action");
             return;
         }
-        let goal = match conversation.thread_goal(&self.thread) {
-            Ok(goal) => goal,
-            Err(error) => {
-                drop(gate);
-                self.observation_failed(&error.to_string());
-                return;
-            }
+        let goal = match self.latest_goal.clone() {
+            Some(goal) => goal,
+            None => match conversation.thread_goal(&self.thread) {
+                Ok(goal) => goal,
+                Err(error) => {
+                    drop(gate);
+                    self.observation_failed(&error.to_string());
+                    return;
+                }
+            },
         };
         if !eligible(&goal, &dispatch) {
             drop(gate);

@@ -513,6 +513,8 @@ pub struct Relay {
     queue: WarningQueue,
     #[allow(dead_code)] // Read by the ordinary recovery host; the relay test target has no host.
     gate: FrontendGate,
+    #[allow(dead_code)] // Read by the ordinary recovery host; the relay test target has no host.
+    events: FrontendEvents,
     stop: Arc<AtomicBool>,
     sessions: Arc<Mutex<Vec<JoinHandle<()>>>>,
     worker: Option<JoinHandle<()>>,
@@ -565,6 +567,7 @@ impl Relay {
         listener.set_nonblocking(true)?;
         let queue = WarningQueue::attached();
         let gate = FrontendGate::default();
+        let events = FrontendEvents::default();
         let stop = Arc::new(AtomicBool::new(false));
         let sessions = Arc::new(Mutex::new(Vec::new()));
         let transport = Arc::new(Transport {
@@ -574,6 +577,7 @@ impl Relay {
             threads,
             queue: queue.clone(),
             gate: gate.clone(),
+            events: events.clone(),
             stop: Arc::clone(&stop),
             sessions: Arc::clone(&sessions),
         });
@@ -582,6 +586,7 @@ impl Relay {
             port,
             queue,
             gate,
+            events,
             stop,
             sessions,
             worker: Some(worker),
@@ -605,6 +610,14 @@ impl Relay {
     #[allow(dead_code)] // Read by the ordinary recovery host; the relay test target has no host.
     pub(crate) fn gate(&self) -> FrontendGate {
         self.gate.clone()
+    }
+
+    /// Server notifications observed on the frontend connection. The recovery
+    /// owner consumes them because a control connection cannot subscribe to an
+    /// empty new thread that has no rollout yet.
+    #[allow(dead_code)] // Read by the ordinary recovery host; the relay test target has no host.
+    pub(crate) fn events(&self) -> FrontendEvents {
+        self.events.clone()
     }
 
     /// Stops accepting, ends every relayed session and waits, bounded, for the
@@ -668,6 +681,7 @@ struct Transport {
     threads: ThreadPolicy,
     queue: WarningQueue,
     gate: FrontendGate,
+    events: FrontendEvents,
     stop: Arc<AtomicBool>,
     sessions: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -760,6 +774,7 @@ impl Transport {
             match read_ready(&mut upstream) {
                 Ok(message) => {
                     active = true;
+                    self.events.record(&message);
                     match self.upstream_action(&message, &mut frontend_state) {
                         Traffic::Forward => {
                             if frontend.send(message).is_err() {
@@ -871,6 +886,48 @@ impl FrontendGate {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+const MAX_FRONTEND_EVENTS: usize = 128;
+
+/// Bounded server notifications observed on the frontend connection. This is
+/// evidence from the conversation's own socket, not a second control owner.
+#[derive(Clone, Default)]
+pub(crate) struct FrontendEvents {
+    queue: Arc<Mutex<VecDeque<Value>>>,
+}
+
+impl FrontendEvents {
+    fn record(&self, message: &Message) {
+        let Message::Text(text) = message else {
+            return;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(text.as_str()) else {
+            return;
+        };
+        if !matches!(
+            record.get("method").and_then(Value::as_str),
+            Some("turn/completed" | "thread/goal/updated" | "thread/goal/cleared")
+        ) {
+            return;
+        }
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queue.len() >= MAX_FRONTEND_EVENTS {
+            queue.pop_front();
+        }
+        queue.push_back(record);
+    }
+
+    pub(crate) fn drain(&self) -> Vec<Value> {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.drain(..).collect()
     }
 }
 

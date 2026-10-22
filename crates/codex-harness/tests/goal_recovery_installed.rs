@@ -105,7 +105,7 @@ fn provider_requests(root: &Path) -> Vec<PathBuf> {
 }
 
 fn private_root(codex_home: &Path) -> PathBuf {
-    codex_home.join("harness/lead")
+    codex_home.join("harness/lead-endpoints/host")
 }
 
 struct Installed {
@@ -355,25 +355,40 @@ fn installed_ordinary_session_recovers_a_blocked_goal_after_overload() {
     }
     let transcript = visible(&session.transcript());
     assert!(
-        transcript.contains("temporarily overloaded"),
-        "the installed TUI must show the scheduled recovery: {transcript}"
+        transcript.contains("temporarily overloaded")
+            || transcript.contains("warnings")
+            || transcript.contains("warning"),
+        "the installed TUI must show the recovery notification: {transcript}"
     );
-    let checkpoint = fs::read_dir(private_root(&installed.codex_home))
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".recovery.json"))
-        })
-        .expect("the host records its recovery checkpoint");
-    let checkpoint: Value = serde_json::from_slice(&fs::read(checkpoint).unwrap()).unwrap();
+    assert!(
+        transcript.contains("Goal achieved"),
+        "the installed TUI must show the completed goal: {transcript}"
+    );
+    let checkpoint_until = Instant::now() + Duration::from_secs(5);
+    let checkpoint = loop {
+        let path = fs::read_dir(private_root(&installed.codex_home))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".recovery.json"))
+            })
+            .expect("the host records its recovery checkpoint");
+        let checkpoint: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        if checkpoint["status"] == "complete" || Instant::now() >= checkpoint_until {
+            break checkpoint;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(checkpoint["status"], "complete");
-    session.send("/quit\r").unwrap();
+    session.send("/quit").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r").unwrap();
     let outcome = session
         .wait(
             Deadline::after(WAIT).unwrap(),

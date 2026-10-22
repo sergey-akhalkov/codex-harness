@@ -6050,10 +6050,12 @@ impl OwnedFrontend {
 
     /// The relay's ordering gate and warning surface when this frontend is
     /// hosted through one. Recovery owns both for the session lifetime.
-    pub(crate) fn recovery_surface(&self) -> Option<(warning::FrontendGate, WarningQueue)> {
+    pub(crate) fn recovery_surface(
+        &self,
+    ) -> Option<(warning::FrontendGate, warning::FrontendEvents, WarningQueue)> {
         self.relay
             .as_ref()
-            .map(|relay| (relay.gate(), relay.warnings()))
+            .map(|relay| (relay.gate(), relay.events(), relay.warnings()))
     }
 
     /// The frontend's own exit code, when it already exited.

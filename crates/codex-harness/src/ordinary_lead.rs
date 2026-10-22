@@ -225,11 +225,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                     Ok(()) => {
                         adopted = Some(selected_now.thread.clone());
                         if recovery.is_none()
-                            && let Some((gate, warnings)) = frontend.recovery_surface()
+                            && let Some((gate, events, warnings)) = frontend.recovery_surface()
                         {
                             recovery = Some(RecoveryHost::new(
                                 selected_now.thread.clone(),
                                 gate,
+                                events,
                                 warnings,
                                 plan.paths.log.with_extension("recovery.json"),
                                 plan.paths.log.clone(),
@@ -273,6 +274,9 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 && adopted.is_some()
                 && let Some(host) = recovery.as_mut()
             {
+                if let Err(error) = host.drain_events(&mut conversation) {
+                    host.observation_failed(&error.to_string());
+                }
                 host.tick(&mut conversation);
             }
             if adopted.is_some() {
