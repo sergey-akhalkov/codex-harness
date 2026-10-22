@@ -1715,6 +1715,31 @@ Supply the intended native CLI executable explicitly, then run from this checkou
 cargo test --locked -p codex-harness --test task_control_contract native_two_clients_reconnect_tool_result_and_tui --jobs 1 -- --ignored --nocapture --test-threads=1
 ```
 
+### Goal overload and stale-resume evidence
+
+`goal_recovery_contract` retains the native primitives needed by goal recovery;
+it is not the recovery owner. Both ignored tests use an explicit installed CLI,
+owned homes/processes and a local Responses provider, with no live model call.
+`native_overload_blocks_goal_and_status_only_resume_recovers` returns a terminal
+503 whose JSON error code is `server_is_overloaded` and deliberately omits
+`Retry-After`. The native goal becomes `blocked`; a status-only automatic
+activation then continues the same thread and goal creation identity with the
+original objective and 10,000-token budget. The recovered goal completes with
+usage accounting advanced and exactly one owned file effect.
+
+`native_stale_automatic_resume_wins_after_user_pause` sends a real `/goal pause`
+through the owned native TUI and observes `paused` before sending a deliberately
+stale status-only automatic update. The installed 0.163.0 app-server accepts
+that update as `active` and starts one owned turn, which the fixture terminates
+with the same synthetic overload. This is a counterexample, not delivered
+recovery behavior: a status read followed by an unchecked update is not an
+ordering boundary. The future recovery owner must serialize user pause and
+automatic dispatch.
+
+```powershell
+cargo test --locked -p codex-harness --test goal_recovery_contract --jobs 1 -- --ignored --nocapture --test-threads=1
+```
+
 The ordinary native-entry acceptance is a separate opt-in test:
 
 ```powershell

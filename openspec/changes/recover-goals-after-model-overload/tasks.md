@@ -4,8 +4,8 @@ Discovery evidence is recorded in [design.md](design.md). The disposable probe e
 
 ## 1. Preserve the native regression boundary
 
-- [ ] 1.1 Promote the discovery's synthetic Responses overload/success sequence into the existing native test ownership beside `task_control_contract.rs`, using explicit installed CLI input, owned homes/processes and retained private evidence. Verify native `serverOverloaded`, blocked goal, status-only automatic resume, same thread/TUI/goal creation identity, preserved budget/accounting and exactly one completed file effect.
-- [ ] 1.2 Retain the native stale-resume counterexample and console input helper: a real `/goal pause` must be observed before deliberately sending the stale automatic update. Verify the baseline accepts that update, document the race in the native verification guide, and keep it distinct from the future harness regression assertion.
+- [x] 1.1 Promote the discovery's synthetic Responses overload/success sequence into the existing native test ownership beside `task_control_contract.rs`, using explicit installed CLI input, owned homes/processes and retained private evidence. Verify native `serverOverloaded`, blocked goal, status-only automatic resume, same thread/TUI/goal creation identity, preserved budget/accounting and exactly one completed file effect.
+- [x] 1.2 Retain the native stale-resume counterexample and console input helper: a real `/goal pause` must be observed before deliberately sending the stale automatic update. Verify the baseline accepts that update, document the race in the native verification guide, and keep it distinct from the future harness regression assertion.
 
 ## 2. Implement the ordered recovery owner
 

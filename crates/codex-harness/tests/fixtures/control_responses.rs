@@ -86,6 +86,184 @@ impl Responses {
         Self::configured(evidence, true, false, Quota::None, true)
     }
 
+    /// Serves a finite native goal-recovery sequence. Overload at 2 returns one
+    /// owned file effect, a terminal `serverOverloaded` response without retry
+    /// advice, the native goal completion call, and the final assistant result.
+    /// Overload at 1 terminates the first request, which the stale-resume probe
+    /// uses after its deliberate automatic activation. The same thread must
+    /// continue across the overload.
+    #[allow(dead_code)]
+    pub fn with_server_overload(evidence: PathBuf, overload_at: usize) -> Self {
+        assert!(
+            matches!(overload_at, 1 | 2),
+            "the finite owned script overloads on its first or post-tool request"
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = thread::spawn(move || {
+            let mut sequence = 0;
+            let mut owned_thread = None;
+            while !stopping.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let Some((headers, request_body)) = read_request(&mut stream) else {
+                    respond_models(&mut stream);
+                    continue;
+                };
+                let request: Value = serde_json::from_slice(&request_body).unwrap();
+                let identity = harness_core::task_request::RequestIdentity::from_request(&request)
+                    .expect("native provider request must carry consistent conversation identity");
+                if let Some(expected) = &owned_thread {
+                    assert_eq!(
+                        &identity.thread, expected,
+                        "the recovery continuation must stay on the owned thread"
+                    );
+                } else {
+                    owned_thread = Some(identity.thread);
+                }
+                sequence += 1;
+                fs::write(
+                    evidence.join(format!("provider-{sequence}.json")),
+                    &request_body,
+                )
+                .unwrap();
+                let tool_result = request["input"].as_array().unwrap().iter().any(|item| {
+                    matches!(
+                        item["type"].as_str(),
+                        Some("function_call_output" | "custom_tool_call_output")
+                    ) && item["call_id"] == "control-tool-1"
+                });
+                let goal_result = request["input"].as_array().unwrap().iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "goal-complete-1"
+                });
+                if sequence == overload_at {
+                    if overload_at == 2 {
+                        assert!(
+                            tool_result,
+                            "the overload must follow the owned tool result"
+                        );
+                    }
+                    let body = json!({
+                        "error": {
+                            "message": "Synthetic terminal server overload.",
+                            "type": "server_error",
+                            "param": null,
+                            "code": "server_is_overloaded"
+                        }
+                    })
+                    .to_string();
+                    fs::write(evidence.join("overload-response.json"), &body).unwrap();
+                    send_response(
+                        &mut stream,
+                        &evidence,
+                        &headers,
+                        &request_body,
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        sequence,
+                    );
+                    continue;
+                }
+                assert_ne!(
+                    overload_at, 1,
+                    "the overload-at-one script has no successful request"
+                );
+                let item = if sequence == 1 {
+                    assert!(!tool_result);
+                    assert!(
+                        request["input"]
+                            .to_string()
+                            .contains("Perform the owned proof command"),
+                        "the initial turn must carry the explicit owned prompt"
+                    );
+                    let arguments = serde_json::to_string(&json!({
+                        "cmd": "[IO.File]::AppendAllText('proof.txt', 'one'); Get-Content proof.txt",
+                        "shell": owned_pwsh(),
+                        "yield_time_ms": 10000
+                    }))
+                    .unwrap();
+                    let custom_exec = request["tools"].as_array().is_some_and(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| tool["type"] == "custom" && tool["name"] == "exec")
+                    });
+                    if custom_exec {
+                        json!({"type":"custom_tool_call","call_id":"control-tool-1","name":"exec",
+                            "input":format!("const result = await tools.exec_command({arguments}); text(result);")})
+                    } else {
+                        json!({"type":"function_call","call_id":"control-tool-1","name":"exec_command","arguments":arguments})
+                    }
+                } else if sequence == overload_at + 1 {
+                    assert!(
+                        tool_result,
+                        "the continuation must consume the existing tool result"
+                    );
+                    json!({"type":"function_call","call_id":"goal-complete-1","name":"update_goal",
+                        "arguments":serde_json::to_string(&json!({"status":"complete"})).unwrap()})
+                } else if sequence == overload_at + 2 {
+                    assert!(
+                        goal_result,
+                        "the final response must follow goal completion"
+                    );
+                    json!({"type":"message","id":"msg-recovered","role":"assistant",
+                        "content":[{"type":"output_text","text":FINAL}]})
+                } else {
+                    panic!(
+                        "unexpected provider request {sequence}; the finite recovery script ended"
+                    );
+                };
+                let events = [
+                    json!({"type":"response.created","response":{"id":format!("resp-{sequence}")}}),
+                    json!({"type":"response.output_item.done","item":item}),
+                    json!({"type":"response.completed","response":{"id":format!("resp-{sequence}"),"usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}}),
+                ];
+                let body = events
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().unwrap()
+                        )
+                    })
+                    .collect::<String>();
+                send_response(
+                    &mut stream,
+                    &evidence,
+                    &headers,
+                    &request_body,
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ),
+                    sequence,
+                );
+            }
+        });
+        Self {
+            port,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
     /// Serves one owned provider whose answer to every request comes from the
     /// caller's handler: the request identity is verified and the exact body is
     /// kept beside the evidence before the handler's item is streamed back,
