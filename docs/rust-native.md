@@ -1122,7 +1122,7 @@ and next action. Stop keeps files, the checkout, the slot and partial work (no
 reset, clean, release or completion claim); a repeated stop reports the current
 state, and a stop racing natural completion reports which outcome won.
 
-`lead message` is the executor's direction and its only channel: a
+`lead message` is the executor's only escalation channel: a
 literal payload from piped input, `--text` or `--file` goes to the originating
 lead recorded for its own live run, so the caller supplies no address, and
 `--notify` marks an exceptional notice that requests no reply. The default kind

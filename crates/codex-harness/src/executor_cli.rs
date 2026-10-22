@@ -9090,7 +9090,7 @@ mod tests {
             "a streamed or typed assignment renders one brief"
         );
         assert!(
-            text.contains("feedback: return the result and any decision you escalate to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
+            text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
             "{text}"
         );
         // Standing exchange guidance is owned by the executor role fragment

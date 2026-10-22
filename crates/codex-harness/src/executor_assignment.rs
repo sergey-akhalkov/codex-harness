@@ -61,7 +61,7 @@ pub const LEAD_CHANNEL_COMMAND: &str = "codex-harness lead message";
 /// they are not restated here.
 fn push_feedback_address(text: &mut String, consumer: &str) {
     text.push_str(&format!(
-        "feedback: return the result and any decision you escalate to {consumer} through {LEAD_CHANNEL_COMMAND} (short --text fallback).\n"
+        "feedback: return the compact result through the native final response; escalate a decision you cannot resolve to {consumer} through {LEAD_CHANNEL_COMMAND} (short --text fallback).\n"
     ));
 }
 
@@ -765,7 +765,7 @@ mod tests {
     /// a result or an escalated decision returns.
     fn expected_feedback_line(consumer: &str) -> String {
         format!(
-            "feedback: return the result and any decision you escalate to {consumer} through codex-harness lead message (short --text fallback).\n"
+            "feedback: return the compact result through the native final response; escalate a decision you cannot resolve to {consumer} through codex-harness lead message (short --text fallback).\n"
         )
     }
 
