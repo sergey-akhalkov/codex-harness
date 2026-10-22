@@ -23,6 +23,23 @@ pub mod tool_catalogue;
 pub const FINAL: &str = "CONTROL_TOOL_RESULT_CONSUMED";
 pub const PARENT_FINAL: &str = "CONTROL_PARENT_RESULTS_CONSUMED";
 
+/// A frontend may ask the provider for a one-line title beside the goal turn.
+/// It is ephemeral: answer it without consuming a scripted provider sequence.
+fn asks_for_task_title(request: &Value) -> bool {
+    request["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part["text"].as_str().is_some_and(|text| {
+                            text.starts_with("Generate a concise, single-line task title")
+                        })
+                    })
+                })
+        })
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Quota {
     None,
@@ -86,6 +103,15 @@ impl Responses {
         Self::configured(evidence, true, false, Quota::None, true)
     }
 
+    /// Serves the finite same-thread overload sequence with a long-lived
+    /// background terminal. The first provider response starts it; the next
+    /// receives the terminal overload; recovery must consume the running
+    /// session's existing result rather than restart the process.
+    #[allow(dead_code)]
+    pub fn with_server_overload_background(evidence: PathBuf) -> Self {
+        Self::overload_script(evidence, 2, true)
+    }
+
     /// Serves a finite native goal-recovery sequence. Overload at 2 returns one
     /// owned file effect, a terminal `serverOverloaded` response without retry
     /// advice, the native goal completion call, and the final assistant result.
@@ -94,9 +120,17 @@ impl Responses {
     /// continue across the overload.
     #[allow(dead_code)]
     pub fn with_server_overload(evidence: PathBuf, overload_at: usize) -> Self {
+        Self::overload_script(evidence, overload_at, false)
+    }
+
+    fn overload_script(evidence: PathBuf, overload_at: usize, background: bool) -> Self {
         assert!(
             matches!(overload_at, 1 | 2),
             "the finite owned script overloads on its first or post-tool request"
+        );
+        assert!(
+            !background || overload_at == 2,
+            "the background script overloads after its terminal result"
         );
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -127,6 +161,20 @@ impl Responses {
                     continue;
                 };
                 let request: Value = serde_json::from_slice(&request_body).unwrap();
+                if asks_for_task_title(&request) {
+                    fs::write(evidence.join("title-request.json"), &request_body).unwrap();
+                    stream
+                        .write_all(
+                            sse_response(
+                                0,
+                                json!({"type":"message","id":"msg-title","role":"assistant",
+                                    "content":[{"type":"output_text","text":"Owned background recovery"}]}),
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                    continue;
+                }
                 let identity = harness_core::task_request::RequestIdentity::from_request(&request)
                     .expect("native provider request must carry consistent conversation identity");
                 if let Some(expected) = &owned_thread {
@@ -194,10 +242,21 @@ impl Responses {
                             .contains("Perform the owned proof command"),
                         "the initial turn must carry the explicit owned prompt"
                     );
+                    let (cmd, yield_time_ms) = if background {
+                        (
+                            "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-terminal); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-terminal)) { throw 'owned terminal release deadline' }; Get-Content proof.txt",
+                            1000,
+                        )
+                    } else {
+                        (
+                            "[IO.File]::AppendAllText('proof.txt', 'one'); Get-Content proof.txt",
+                            10000,
+                        )
+                    };
                     let arguments = serde_json::to_string(&json!({
-                        "cmd": "[IO.File]::AppendAllText('proof.txt', 'one'); Get-Content proof.txt",
+                        "cmd": cmd,
                         "shell": owned_pwsh(),
-                        "yield_time_ms": 10000
+                        "yield_time_ms": yield_time_ms
                     }))
                     .unwrap();
                     let custom_exec = request["tools"].as_array().is_some_and(|tools| {
@@ -216,6 +275,24 @@ impl Responses {
                         tool_result,
                         "the continuation must consume the existing tool result"
                     );
+                    if background {
+                        let output = request["input"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|item| {
+                                matches!(
+                                    item["type"].as_str(),
+                                    Some("function_call_output" | "custom_tool_call_output")
+                                ) && item["call_id"] == "control-tool-1"
+                            })
+                            .and_then(|item| item["output"].as_str())
+                            .expect("the recovered request must carry the running terminal result");
+                        assert!(
+                            output.contains("Process running with session ID"),
+                            "the recovered request must consume the same running session: {output}"
+                        );
+                    }
                     json!({"type":"function_call","call_id":"goal-complete-1","name":"update_goal",
                         "arguments":serde_json::to_string(&json!({"status":"complete"})).unwrap()})
                 } else if sequence == overload_at + 2 {
@@ -230,29 +307,12 @@ impl Responses {
                         "unexpected provider request {sequence}; the finite recovery script ended"
                     );
                 };
-                let events = [
-                    json!({"type":"response.created","response":{"id":format!("resp-{sequence}")}}),
-                    json!({"type":"response.output_item.done","item":item}),
-                    json!({"type":"response.completed","response":{"id":format!("resp-{sequence}"),"usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}}),
-                ];
-                let body = events
-                    .iter()
-                    .map(|event| {
-                        format!(
-                            "event: {}\ndata: {event}\n\n",
-                            event["type"].as_str().unwrap()
-                        )
-                    })
-                    .collect::<String>();
                 send_response(
                     &mut stream,
                     &evidence,
                     &headers,
                     &request_body,
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    ),
+                    sse_response(sequence, item),
                     sequence,
                 );
             }
@@ -560,16 +620,7 @@ impl Responses {
                 } else if helper_case && worker {
                     assert_executor_visible(&evidence, &identity.thread);
                 }
-                let title = request["input"].as_array().unwrap().iter().any(|item| {
-                    item["role"] == "user"
-                        && item["content"].as_array().is_some_and(|parts| {
-                            parts.iter().any(|part| {
-                                part["text"].as_str().is_some_and(|text| {
-                                    text.starts_with("Generate a concise, single-line task title")
-                                })
-                            })
-                        })
-                });
+                let title = asks_for_task_title(&request);
                 let recovering = request["input"]
                     .to_string()
                     .contains("Continue only the previously authorized task");
@@ -1108,6 +1159,27 @@ fn send_response(
         b"{\"nativeRequestUnchanged\":true,\"authorizationPreserved\":true,\"viewAdmitted\":true}",
     )
     .unwrap();
+}
+
+fn sse_response(sequence: usize, item: Value) -> String {
+    let events = [
+        json!({"type":"response.created","response":{"id":format!("resp-{sequence}")}}),
+        json!({"type":"response.output_item.done","item":item}),
+        json!({"type":"response.completed","response":{"id":format!("resp-{sequence}"),"usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}}),
+    ];
+    let body = events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect::<String>();
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 /// Answers one frontend model-catalogue probe without a model and without a

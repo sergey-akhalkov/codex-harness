@@ -2471,6 +2471,14 @@ The model-free native contract tests are
 `goal_recovery_contract`; the state machine's deterministic tests run with
 `cargo test -p harness-core --lib task_recovery`.
 
+`native_overload_preserves_background_terminal_while_recovering` adds in-flight
+work to that contract: a yielded long-lived terminal stays in
+`thread/backgroundTerminals/list` across the blocked goal and the same-thread
+automatic continuation, whose request consumes the running-session result. The
+test releases the terminal explicitly, observes exactly one file effect, and
+requires an empty native inventory before cleanup. The overload fixture answers
+ephemeral task-title requests without consuming a scripted recovery step.
+
 ## Outcome, usage and helpers
 
 Installed tool-workflow qualification for the retired graph tools was removed

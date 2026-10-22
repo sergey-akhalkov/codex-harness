@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     fs::{self, OpenOptions},
-    io::Write,
-    net::TcpListener,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -166,6 +166,14 @@ fn capture(exe: &Path, home: &Path, workspace: &Path, root: &Path, args: &[&str]
 }
 
 fn native_fixture(overload_at: usize) -> NativeFixture {
+    native_fixture_for(overload_at, false)
+}
+
+fn native_fixture_background() -> NativeFixture {
+    native_fixture_for(2, true)
+}
+
+fn native_fixture_for(overload_at: usize, background: bool) -> NativeFixture {
     let exe = PathBuf::from(
         std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("explicit native Codex executable"),
     );
@@ -181,7 +189,11 @@ fn native_fixture(overload_at: usize) -> NativeFixture {
         .trim()
         .to_owned();
     assert_eq!(version, "codex-cli 0.163.0");
-    let responses = control_responses::Responses::with_server_overload(root.into(), overload_at);
+    let responses = if background {
+        control_responses::Responses::with_server_overload_background(root.into())
+    } else {
+        control_responses::Responses::with_server_overload(root.into(), overload_at)
+    };
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
     fs::write(
         home.join("config.toml"),
@@ -311,6 +323,102 @@ fn tui(fixture: &NativeFixture, thread: &str) -> ConsoleSession {
         Some(fixture.token.clone().into()),
     );
     ConsoleSession::spawn(ConsoleSpec::new(command)).unwrap()
+}
+
+fn background_terminals(client: &mut Client, thread: &str) -> Value {
+    client.request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId":thread,"limit":5}),
+    )
+}
+
+fn wait_terminals_empty(client: &mut Client, thread: &str) -> Value {
+    let until = Instant::now() + WAIT;
+    loop {
+        let snapshot = background_terminals(client, thread);
+        if snapshot["data"].as_array().unwrap().is_empty() && snapshot["nextCursor"].is_null() {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < until,
+            "owned terminal did not leave native inventory: {snapshot}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn retain_json(path: &Path, value: &Value) {
+    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
+
+fn title_request(port: u16, root: &Path) {
+    let body = json!({
+        "model":"gpt-6-astra",
+        "input":[{"role":"user","content":[{"type":"input_text",
+            "text":"Generate a concise, single-line task title for this owned conversation."}]}]
+    })
+    .to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    stream.set_write_timeout(Some(WAIT)).unwrap();
+    write!(
+        stream,
+        "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.contains("msg-title"), "{response}");
+    assert!(
+        root.join("title-request.json").is_file(),
+        "the ephemeral title request must be retained as separate evidence"
+    );
+    assert!(
+        !root.join("provider-1.json").exists(),
+        "a title request must not consume the first scripted provider response"
+    );
+}
+
+struct SessionEvidence {
+    session: ConsoleSession,
+    path: PathBuf,
+}
+
+impl SessionEvidence {
+    fn new(session: ConsoleSession, path: PathBuf) -> Self {
+        Self { session, path }
+    }
+}
+
+impl Drop for SessionEvidence {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, self.session.transcript());
+        eprintln!("native TUI transcript: {}", self.path.display());
+    }
+}
+
+/// Best-effort release while unwinding; the normal path removes the terminal
+/// through the same marker and verifies the native inventory first.
+struct ReleaseBackground<'a> {
+    workspace: &'a Path,
+    evidence: &'a Path,
+}
+
+impl Drop for ReleaseBackground<'_> {
+    fn drop(&mut self) {
+        let marker = self.workspace.join("finish-terminal");
+        if marker.exists() {
+            return;
+        }
+        if fs::write(&marker, "release owned background terminal").is_ok() {
+            eprintln!(
+                "released owned background terminal; evidence: {}",
+                self.evidence.display()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
 }
 
 fn visible(transcript: &str) -> String {
@@ -494,6 +602,18 @@ fn native_overload_blocks_goal_and_status_only_resume_recovers() {
     );
     let requests = provider_requests(root);
     assert_eq!(requests.len(), 4, "{requests:?}");
+    let recovered: Value = serde_json::from_slice(&fs::read(&requests[2]).unwrap()).unwrap();
+    let tool_output = recovered["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "control-tool-1")
+        .and_then(|item| item["output"].as_str())
+        .expect("the recovered request must carry the prior control-tool-1 output");
+    assert!(
+        tool_output.contains("Process exited with code 0") && tool_output.contains("one"),
+        "the recovered request must retain the completed tool result: {tool_output}"
+    );
     for request in &requests {
         let body: Value = serde_json::from_slice(&fs::read(request).unwrap()).unwrap();
         assert_eq!(body["client_metadata"]["thread_id"], thread);
@@ -515,6 +635,214 @@ fn native_overload_blocks_goal_and_status_only_resume_recovers() {
             "toolEffect":"one"
         }),
         terminal.to_string_lossy().into_owned(),
+    );
+}
+
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned native background-terminal goal recovery probe"]
+fn native_overload_preserves_background_terminal_while_recovering() {
+    let fixture = native_fixture_background();
+    let root = fixture.root.path().to_path_buf();
+    let workspace = fixture.workspace.clone();
+    let _release = ReleaseBackground {
+        workspace: &workspace,
+        evidence: &root,
+    };
+    title_request(fixture.responses.port, &root);
+    let mut first = Client::connect(fixture.port, &fixture.token, &root, "background-first");
+    let mut observer = Client::connect(fixture.port, &fixture.token, &root, "background-observer");
+    let thread = start_thread(
+        &mut first,
+        &fixture.workspace,
+        "Owned background goal recovery",
+    );
+    let set = first.request(
+        "thread/goal/set",
+        json!({"threadId":thread,"objective":OBJECTIVE,"status":"active",
+            "tokenBudget":10000,"origin":"user"}),
+    );
+    assert_eq!(set["goal"]["status"], "active");
+    first.request(
+        "turn/start",
+        json!({"threadId":thread,"input":[{"type":"text",
+            "text":"Perform the owned proof command as a long-lived background process and retain its native result."}]}),
+    );
+    let terminal = root.join("terminal-background-overload.txt");
+    let session = SessionEvidence::new(tui(&fixture, &thread), terminal.clone());
+    let failed = first.event(|event| {
+        event["method"] == "turn/completed"
+            && event["params"]["threadId"] == thread
+            && event["params"]["turn"]["status"] == "failed"
+    });
+    assert_eq!(
+        failed["params"]["turn"]["error"]["codexErrorInfo"], "serverOverloaded",
+        "{failed}"
+    );
+    let failed_turn = failed["params"]["turn"]["id"].as_str().unwrap().to_owned();
+    let before = wait_goal(&mut first, &thread, |goal| goal["status"] == "blocked");
+    assert_eq!(before["threadId"], thread);
+    assert_eq!(before["objective"], OBJECTIVE);
+    assert_eq!(before["tokenBudget"], 10000);
+    let blocked = background_terminals(&mut first, &thread);
+    retain_json(&root.join("terminals-blocked.json"), &blocked);
+    assert_eq!(
+        blocked["data"].as_array().unwrap().len(),
+        1,
+        "the blocked goal must retain its one running background terminal: {blocked}"
+    );
+    assert!(blocked["nextCursor"].is_null());
+    assert_eq!(blocked["data"][0]["itemId"], "control-tool-1");
+    assert!(
+        blocked["data"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("finish-terminal")
+    );
+    let session_id = blocked["data"][0]["processId"]
+        .as_str()
+        .expect("the running terminal must expose a native session id")
+        .to_owned();
+    wait_visible(
+        &session.session,
+        &terminal,
+        &["Goal stalled (/goal resume)"],
+    );
+    let tokens_before = before["tokensUsed"].as_i64().unwrap();
+
+    let resumed = observer.request(
+        "thread/goal/set",
+        json!({"threadId":thread,"status":"active","origin":"automatic"}),
+    )["goal"]
+        .clone();
+    assert_eq!(resumed["status"], "active");
+    assert_eq!(resumed["threadId"], thread);
+    assert_eq!(resumed["createdAt"], before["createdAt"]);
+    assert_eq!(resumed["objective"], OBJECTIVE);
+    assert_eq!(resumed["tokenBudget"], 10000);
+
+    let until = Instant::now() + WAIT;
+    while provider_requests(&root).len() < 3 {
+        assert!(
+            Instant::now() < until,
+            "the recovered turn did not reach the provider fixture"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let recovered_terminals = background_terminals(&mut first, &thread);
+    retain_json(&root.join("terminals-recovered.json"), &recovered_terminals);
+    assert_eq!(
+        recovered_terminals["data"].as_array().unwrap().len(),
+        1,
+        "the recovered turn must start while the terminal is running: {recovered_terminals}"
+    );
+    assert_eq!(recovered_terminals["data"][0]["processId"], session_id);
+    let recovered_requests = provider_requests(&root);
+    let recovered: Value =
+        serde_json::from_slice(&fs::read(&recovered_requests[2]).unwrap()).unwrap();
+    assert_eq!(recovered["client_metadata"]["thread_id"], thread);
+    let recovered_output = recovered["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "control-tool-1")
+        .and_then(|item| item["output"].as_str())
+        .expect("the recovered request must carry the running terminal result");
+    assert!(
+        recovered_output.contains("Process running with session ID")
+            && recovered_output.contains(&session_id),
+        "the recovered request must consume the same running session {session_id}: {recovered_output}"
+    );
+
+    let completed = first.event(|event| {
+        event["method"] == "turn/completed"
+            && event["params"]["threadId"] == thread
+            && event["params"]["turn"]["status"] == "completed"
+            && event["params"]["turn"]["id"] != failed_turn
+    });
+    assert_eq!(
+        completed["params"]["turn"]["status"], "completed",
+        "{completed}"
+    );
+    let after_completion = background_terminals(&mut first, &thread);
+    retain_json(
+        &root.join("terminals-after-completion.json"),
+        &after_completion,
+    );
+    assert_eq!(
+        after_completion["data"].as_array().unwrap().len(),
+        1,
+        "a completed recovered turn must not hide its background terminal: {after_completion}"
+    );
+    assert_eq!(after_completion["data"][0]["processId"], session_id);
+    let after = wait_goal(&mut first, &thread, |goal| {
+        goal["status"] == "complete" && goal["tokensUsed"].as_i64() > Some(tokens_before)
+    });
+    assert_eq!(after["threadId"], thread);
+    assert_eq!(after["createdAt"], before["createdAt"]);
+    assert_eq!(after["objective"], OBJECTIVE);
+    assert_eq!(after["tokenBudget"], 10000);
+    assert!(
+        after["tokensUsed"].as_i64().unwrap() > tokens_before,
+        "native accounting must advance: before={before} after={after}"
+    );
+    wait_visible(&session.session, &terminal, &[control_responses::FINAL]);
+    assert_eq!(
+        fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        "one",
+        "the owned tool effect must happen exactly once"
+    );
+
+    fs::write(
+        workspace.join("finish-terminal"),
+        "release owned background terminal",
+    )
+    .unwrap();
+    let finished = wait_terminals_empty(&mut first, &thread);
+    retain_json(&root.join("terminals-finished.json"), &finished);
+    assert!(finished["data"].as_array().unwrap().is_empty());
+    assert_eq!(
+        fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        "one",
+        "releasing the terminal must not repeat the file effect"
+    );
+
+    let requests = provider_requests(&root);
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    for request in &requests {
+        let body: Value = serde_json::from_slice(&fs::read(request).unwrap()).unwrap();
+        assert_eq!(body["client_metadata"]["thread_id"], thread);
+    }
+    let overload = fs::read_to_string(root.join("overload-response.json")).unwrap();
+    assert!(overload.contains("server_is_overloaded"));
+
+    drop(session);
+    drop(first);
+    drop(observer);
+    finish(
+        fixture,
+        "background-continuity-result.json",
+        json!({
+            "schema":1,
+            "threadId":thread,
+            "backgroundSessionId":session_id,
+            "goalBefore":before,
+            "goalAfter":after,
+            "terminalsBlocked":blocked,
+            "terminalsRecovered":recovered_terminals,
+            "terminalsAfterCompletion":after_completion,
+            "terminalsFinished":finished,
+            "ephemeralTitleRequest":"title-request.json",
+            "providerRequests":requests.len(),
+            "toolEffect":"one"
+        }),
+        terminal.to_string_lossy().into_owned(),
+    );
+    let retained: Value =
+        serde_json::from_slice(&fs::read(root.join("background-continuity-result.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        retained["cleanup"]["activeProcesses"], 0,
+        "owned process cleanup must be complete: {retained}"
     );
 }
 
