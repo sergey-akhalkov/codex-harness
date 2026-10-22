@@ -131,6 +131,26 @@ Codex and the executor profile work. Connecting the subscription component
 does not authorize a provider or create a user's Z.AI profile. Choose billing
 routes explicitly; see [subscription setup](subscription-models.md).
 
+The shared defaults set `code_mode_host = true` under `[features]` and
+`suppress_unstable_features_warning = true`, so a new deployment inherits the
+Code Mode host and does not print the experimental-feature notice. An explicit
+machine-local `[features]` value still wins. Code Mode remains an
+under-development capability.
+
+Codex does not know a custom provider model's limits unless the profile
+declares a catalog. For `ds`, point `model_catalog_json` at a local copy or link
+of the compact
+[DeepSeek catalog](../global/codex-profiles/deepseek.models.json), for example
+`CODEX_HOME/deepseek-models.json`, and keep `[features] code_mode = false`.
+Use this compact entry: copying a bundled OpenAI model entry into the catalog
+can make DeepSeek print tool calls as DSML text instead of invoking them.
+Provider credentials and routing remain local. This removes the
+fallback-metadata warning; verify the catalog with
+`codex debug models -c model_catalog_json='<path>'`, then start a fresh
+`codex exec --profile ds`. The long-thread notice has no disable setting; open a
+new thread when it appears. Startup notices already shown in a thread remain
+there; open a new Codex process after changing these settings.
+
 The shipped orchestration profile also sets `self_reflection_enabled = true`.
 Ordinary interactive `codex` automatically prepares its current session's
 reflection transport and project lifecycle; no separate lead-start or

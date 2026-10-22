@@ -304,6 +304,19 @@ pub(crate) enum PreparationTrigger {
     Acceptance,
 }
 
+/// Reads the retained reflection owner without changing ownership or state.
+/// A host uses this to avoid presenting a locally selected thread as the
+/// expected core owner when another live lead still retains reflection.
+pub(crate) fn retained_thread_owner(home: &Path, project: &Path) -> io::Result<Option<String>> {
+    let home = canonical_dir(home, "CODEX_HOME")?;
+    let project = canonical_dir(project, "consumer project")?;
+    let controller =
+        ReflectionController::new(crate::feedback_cli::discover_bd_in(&home)?, &project, &home);
+    Ok(controller
+        .stored_state()?
+        .map(|state| state.binding.lead_session))
+}
+
 /// Prepare the existing reflection lifecycle from the configuration permission
 /// and an already-authenticated managed lead. The caller supplies every
 /// identity explicitly: a host must pass its own thread rather than inheriting

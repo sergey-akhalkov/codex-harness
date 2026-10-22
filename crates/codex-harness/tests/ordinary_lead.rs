@@ -163,7 +163,10 @@ impl Fixture {
         source: Option<&str>,
         native: &[&str],
     ) -> CommandSpec {
-        let mut spec = CommandSpec::new(MANAGER);
+        let manager = std::env::var_os("HARNESS_ACCEPTANCE_BUILD")
+            .map(|build| PathBuf::from(build).join("codex-harness.exe"))
+            .unwrap_or_else(|| PathBuf::from(MANAGER));
+        let mut spec = CommandSpec::new(manager);
         spec.current_dir = Some(self.project.clone());
         spec.args = vec![
             OsString::from("_ordinary-lead"),
@@ -474,8 +477,7 @@ fn wait_for_content(path: &Path, expected: &str, what: &str, session: &ConsoleSe
     );
 }
 
-/// Reads the one retained lifecycle state the real board source produced.
-fn reflection_state(fixture: &Fixture) -> Option<Value> {
+fn reflection_state_path(fixture: &Fixture) -> Option<PathBuf> {
     let dir = fixture.home.join("harness/delivery-reflection");
     for entry in fs::read_dir(dir).ok()? {
         let path = entry.ok()?.path();
@@ -483,10 +485,15 @@ fn reflection_state(fixture: &Fixture) -> Option<Value> {
             .extension()
             .is_some_and(|extension| extension == "json")
         {
-            return serde_json::from_slice(&fs::read(path).ok()?).ok();
+            return Some(path);
         }
     }
     None
+}
+
+/// Reads the one retained lifecycle state the real board source produced.
+fn reflection_state(fixture: &Fixture) -> Option<Value> {
+    serde_json::from_slice(&fs::read(reflection_state_path(fixture)?).ok()?).ok()
 }
 
 fn wait_reflection_binding(fixture: &Fixture, expected: &str, session: &ConsoleSession) -> Value {
@@ -773,6 +780,176 @@ fn current_selection_transfer_completes_before_the_new_thread_turn() {
     let transcript = text(&finished);
     assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
     assert_cleanup(&fixture, backend, TRANSFER_NEW_THREAD);
+}
+
+#[test]
+fn live_reflection_owner_does_not_make_a_second_host_selection_fatal() {
+    let mut fixture = Fixture::new();
+    fixture.reflection();
+    let owner_exit = fixture.home.join("owner-exit");
+    let mut owner_spec = fixture.command("new", NEW_THREAD, None, &["--no-alt-screen"]);
+    owner_spec.env.insert(
+        "HARNESS_FRONTEND_EXIT_ON_FILE".into(),
+        Some(owner_exit.as_os_str().to_owned()),
+    );
+    let owner = spawn(owner_spec);
+    wait_for(
+        &fixture.selected(),
+        "the retained owner's selection",
+        &owner,
+    );
+    wait_reflection_binding(&fixture, NEW_THREAD, &owner);
+    let owner_process = owner.identity();
+    assert!(
+        process_alive(owner_process),
+        "the retained owner exited early"
+    );
+    let state_path = reflection_state_path(&fixture).expect("the owner published reflection state");
+    let owner_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let owner_registry = fs::read(fixture.registry(NEW_THREAD)).unwrap();
+
+    let newcomer_exit = fixture.home.join("newcomer-exit");
+    let mut spec = fixture.command(
+        "transfer",
+        RESUME_THREAD,
+        Some(RESUME_THREAD),
+        &["--profile", "ds", "--no-alt-screen"],
+    );
+    spec.env.insert(
+        "HARNESS_FRONTEND_FORK_THREAD".into(),
+        Some(TRANSFER_NEW_THREAD.into()),
+    );
+    spec.env.insert(
+        "HARNESS_IMPROVEMENT_FIXTURE_FORK_SESSION".into(),
+        Some(TRANSFER_NEW_THREAD.into()),
+    );
+    spec.env.insert(
+        "HARNESS_FRONTEND_EXIT_ON_FILE".into(),
+        Some(newcomer_exit.as_os_str().to_owned()),
+    );
+    let newcomer = spawn(spec);
+    wait_for(
+        &fixture.home.join("frontend-transfer-repeat.txt"),
+        "the non-owning host's first selection",
+        &newcomer,
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.selected()).unwrap(),
+        RESUME_THREAD
+    );
+    assert!(fixture.registry(RESUME_THREAD).is_file());
+    assert_eq!(
+        fs::read(fixture.registry(NEW_THREAD)).unwrap(),
+        owner_registry
+    );
+
+    fs::write(fixture.home.join("frontend-transfer-before-fork"), b"fork").unwrap();
+    wait_for_content(
+        &fixture.selected(),
+        TRANSFER_NEW_THREAD,
+        "the non-owning host's second native selection",
+        &newcomer,
+    );
+    assert!(fixture.registry(TRANSFER_NEW_THREAD).is_file());
+    assert!(fixture.registry(NEW_THREAD).is_file());
+    assert!(
+        !fixture.registry(RESUME_THREAD).exists(),
+        "the prior locally selected registration survived the native switch"
+    );
+    assert_eq!(
+        fs::read(fixture.registry(NEW_THREAD)).unwrap(),
+        owner_registry
+    );
+    let after_selection: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    for key in [
+        "binding",
+        "source",
+        "journal",
+        "checkpoint",
+        "current_session_floor",
+        "records",
+        "recovery",
+        "refusals",
+        "retired_leads",
+        "stopped_at",
+        "owner_process",
+    ] {
+        assert_eq!(
+            after_selection[key], owner_state[key],
+            "the non-owning host changed {key}"
+        );
+    }
+    assert!(process_alive(owner_process));
+
+    fs::write(fixture.home.join("frontend-transfer-turn-gate"), b"turn").unwrap();
+    wait_for(
+        &fixture.home.join("frontend-transfer-turn-started.txt"),
+        "the non-owning host's real turn",
+        &newcomer,
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.home.join("frontend-transfer-turn-started.txt")).unwrap(),
+        TRANSFER_NEW_THREAD
+    );
+
+    fs::write(newcomer_exit, b"exit").unwrap();
+    let finished = wait_session(newcomer);
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        !transcript.contains("reflection ownership changed"),
+        "{transcript}"
+    );
+    assert!(
+        !transcript.contains("thread selection was not registered"),
+        "{transcript}"
+    );
+    assert!(
+        host_logs(&fixture).contains("reflection remains owned by"),
+        "{}",
+        host_logs(&fixture)
+    );
+    assert!(
+        !host_logs(&fixture).contains("reflection ownership changed"),
+        "{}",
+        host_logs(&fixture)
+    );
+    assert!(!fixture.registry(RESUME_THREAD).exists());
+    assert!(!fixture.registry(TRANSFER_NEW_THREAD).exists());
+    assert_eq!(
+        fs::read(fixture.registry(NEW_THREAD)).unwrap(),
+        owner_registry
+    );
+    let after_exit: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    for key in [
+        "binding",
+        "source",
+        "journal",
+        "checkpoint",
+        "current_session_floor",
+        "records",
+        "recovery",
+        "refusals",
+        "retired_leads",
+        "stopped_at",
+        "owner_process",
+    ] {
+        assert_eq!(
+            after_exit[key], owner_state[key],
+            "the non-owning host changed {key} on exit"
+        );
+    }
+    assert!(process_alive(owner_process));
+
+    fs::write(owner_exit, b"exit").unwrap();
+    let owner_finished = wait_session(owner);
+    assert_eq!(
+        owner_finished.outcome.exit_code,
+        0,
+        "{}",
+        text(&owner_finished)
+    );
+    assert!(!fixture.registry(NEW_THREAD).exists());
 }
 
 #[test]
@@ -1063,14 +1240,14 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
     thread::sleep(Duration::from_millis(250));
     session.send("\r").unwrap();
     let mut requested = installed_wait(Duration::from_secs(20), || {
-        installed_provider_requested(&evidence, INSTALLED_PROMPT)
+        installed_provider_thread(&evidence, INSTALLED_PROMPT).is_some()
     });
     let mut retries = 0;
     while !requested && retries < 2 {
         let _ = session.send("\r");
         retries += 1;
         requested = installed_wait(Duration::from_secs(20), || {
-            installed_provider_requested(&evidence, INSTALLED_PROMPT)
+            installed_provider_thread(&evidence, INSTALLED_PROMPT).is_some()
         });
     }
     assert!(
@@ -1160,8 +1337,17 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
         assert_eq!(retained["recovery"], recovering["recovery"]);
         assert_eq!(retained["records"], recovering["records"]);
         if result == SIDE_FINAL {
-            session.send("\u{3}").unwrap();
+            // The Windows frontend enables Win32 input mode: Ctrl+/ key-down/up.
+            session
+                .send("\u{1b}[191;53;47;1;8;1_\u{1b}[191;53;47;0;8;1_")
+                .unwrap();
             thread::sleep(Duration::from_millis(300));
+        } else {
+            assert_eq!(
+                installed_provider_thread(&evidence, RETURN_PROMPT).as_deref(),
+                Some(thread.as_str()),
+                "the return prompt must reach the main conversation"
+            );
         }
     }
 
@@ -1488,10 +1674,8 @@ fn installed_host_status(home: &Path, thread: &str) -> Option<Value> {
     None
 }
 
-fn installed_provider_requested(evidence: &Path, prompt: &str) -> bool {
-    let Ok(entries) = fs::read_dir(evidence) else {
-        return false;
-    };
+fn installed_provider_thread(evidence: &Path, prompt: &str) -> Option<String> {
+    let entries = fs::read_dir(evidence).ok()?;
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with("provider-") || !name.ends_with(".json") {
@@ -1500,11 +1684,14 @@ fn installed_provider_requested(evidence: &Path, prompt: &str) -> bool {
         let Ok(bytes) = fs::read(entry.path()) else {
             continue;
         };
-        if String::from_utf8_lossy(&bytes).contains(prompt) {
-            return true;
+        if String::from_utf8_lossy(&bytes).contains(prompt)
+            && let Ok(request) = serde_json::from_slice::<Value>(&bytes)
+            && let Some(thread) = request["client_metadata"]["thread_id"].as_str()
+        {
+            return Some(thread.to_owned());
         }
     }
-    false
+    None
 }
 
 fn installed_marker_visible(session: &ConsoleSession, marker: &str) -> bool {

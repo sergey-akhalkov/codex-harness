@@ -448,9 +448,13 @@ codex-harness delivery-improvement status --project CHECKOUT
 
 ### Ordinary accepted closure ownership and recovery
 
-`executor accept` closes as the authenticated approving lead. Before writing
-acceptance metadata, an open task assigned to another actor is conditionally
-transferred to that lead with `bd update ... --if-assignee ... --if-status ...`.
+`executor accept` closes as the authenticated approving lead. It binds the
+latest native turn, which must be in progress with a nonblank exact identity.
+Earlier unfinished turns in resumed history do
+not block acceptance; a terminal or unusable latest turn cannot fall back to
+one of them. Before writing acceptance metadata, an open task assigned to
+another actor is conditionally transferred to that lead with
+`bd update ... --if-assignee ... --if-status ...`.
 The guarded update never uses `--force`; if the claim changed, acceptance fails
 before writing metadata. A task that is already unassigned or assigned to the
 lead needs no ownership write. A successful close is idempotent: replaying the

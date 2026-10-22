@@ -357,38 +357,35 @@ fn current_lead(home: &Path) -> io::Result<LeadTurn> {
     };
     let mut conversation = control::Conversation::attach(&endpoint, control::DEFAULT_BOUND)?;
     let record = conversation.read_thread_record(&thread)?;
-    let active = record
+    let turns = record
         .get("turns")
         .and_then(serde_json::Value::as_array)
-        .map(|turns| {
-            turns
-                .iter()
-                .filter(|turn| {
-                    turn.get("status").and_then(serde_json::Value::as_str) == Some("inProgress")
-                })
-                .collect::<Vec<_>>()
-        })
         .ok_or_else(|| {
             invalid(&format!(
                 "lead thread {thread} has no native turn list; acceptance cannot establish the exact current lead turn and refuses before changing the board"
             ))
         })?;
-    if active.len() != 1 {
-        return Err(invalid(&format!(
-            "lead thread {thread} has {} in-progress native turns; acceptance requires exactly one exact current lead turn and refuses before changing the board",
-            active.len()
-        )));
-    }
-    let turn = control::active_turn(&record).ok_or_else(|| {
+    // Resumed history can retain unfinished turns; only the newest turn can approve.
+    let latest = turns.last().ok_or_else(|| {
         invalid(&format!(
-            "lead thread {thread} has an in-progress native turn without a usable exact turn identity; acceptance refuses before changing the board"
+            "lead thread {thread} has no native turns; acceptance refuses before changing the board"
         ))
     })?;
-    if active[0].get("id").and_then(serde_json::Value::as_str) != Some(turn.as_str()) {
+    if latest.get("status").and_then(serde_json::Value::as_str) != Some("inProgress") {
         return Err(invalid(&format!(
-            "lead thread {thread} has an in-progress native turn without a usable exact turn identity; acceptance refuses before changing the board"
+            "lead thread {thread}'s latest native turn is not in progress; acceptance refuses before changing the board"
         )));
     }
+    let turn = latest
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            invalid(&format!(
+                "lead thread {thread} has an in-progress native turn without a usable exact turn identity; acceptance refuses before changing the board"
+            ))
+        })?
+        .to_owned();
     Ok(LeadTurn { thread, turn })
 }
 

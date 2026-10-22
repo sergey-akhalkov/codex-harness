@@ -448,17 +448,19 @@ impl AcceptanceFixture {
             json!({"id": fixture.lead_turn, "status": "inProgress"}),
         ]);
         fixture.register_endpoint(fixture.server.port, &fixture.lead_thread);
+        fixture.install_kit_source();
         fixture
     }
 
-    /// Installs the synthetic kit source needed when acceptance reads the
-    /// permission outside an explicit consumer kit checkout. The fixture owns
-    /// both the source and the installation record; no real home is touched.
+    /// Installs the owned kit configuration with reflection off until activate().
     fn install_kit_source(&self) {
         let kit = synthetic_role_build::kit_source(&self.spawn.base.root);
-        fs::copy(
-            self.checkout().join("global/orchestration.toml"),
+        fs::write(
             kit.join("global/orchestration.toml"),
+            format!(
+                "{}\nself_reflection_enabled = false\n",
+                fs::read_to_string(self.checkout().join("global/orchestration.toml")).unwrap()
+            ),
         )
         .unwrap();
         fs::create_dir_all(self.home().join("harness")).unwrap();
@@ -534,6 +536,39 @@ impl AcceptanceFixture {
     }
 
     fn activate(&self) -> ReflectionController {
+        let kit = self.spawn.base.root.join("kit");
+        let config = kit.join("global/orchestration.toml");
+        fs::write(
+            &config,
+            fs::read_to_string(&config).unwrap().replace(
+                "self_reflection_enabled = false",
+                "self_reflection_enabled = true",
+            ),
+        )
+        .unwrap();
+        let roles = kit.join("global/roles.toml");
+        for role in ["executor-self-reflection", "lead-self-reflection"] {
+            fs::write(kit.join(format!("global/{role}.md")), role).unwrap();
+        }
+        fs::write(
+            &roles,
+            format!(
+                "{}\n[roles.executor-self-reflection]\ninstructions = 'global/executor-self-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/lead-self-reflection.md'\nskills = []\n",
+                fs::read_to_string(&roles).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            self.home().join("config.toml"),
+            "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'xhigh'\n",
+        )
+        .unwrap();
+        fs::write(
+            self.home().join("ds.config.toml"),
+            "model = 'deepseek-flash'\nmodel_provider = 'fixture'\nmodel_reasoning_effort = 'max'\n",
+        )
+        .unwrap();
+        fs::write(self.home().join("harness/bin/codex.exe"), b"not executed").unwrap();
         let controller = self.controller();
         controller
             .activate(&ActivationRequest {
@@ -730,10 +765,19 @@ impl AcceptanceFixture {
         owner: &str,
     ) -> (String, String, SlotAssignmentBinding, String) {
         let assignment = self.spawn.assignment(name, task, purpose);
+        // Dispatch must stop before launch; acceptance only needs this sentinel to exist.
+        let launcher = self.home().join("harness/bin/codex.exe");
+        let saved = launcher.is_file().then(|| fs::read(&launcher).unwrap());
+        if saved.is_some() {
+            fs::remove_file(&launcher).unwrap();
+        }
         let dispatched = self.spawn.spawn(
             &["--assignment", assignment.to_str().unwrap()],
             &["--owner", owner],
         );
+        if let Some(bytes) = saved {
+            fs::write(&launcher, bytes).unwrap();
+        }
         let text = output_text(&dispatched);
         assert!(!dispatched.status.success(), "{text}");
         assert!(
@@ -2509,8 +2553,14 @@ fn accept_refuses_a_foreign_live_lead_without_board_effects() {
     let out = fixture.accept_raw(foreign_thread, &task, None);
     let text = output_text(&out);
     assert_eq!(out.status.code(), Some(2), "{text}");
-    assert!(text.contains("WrongLead"), "{text}");
-    assert!(text.contains("not expected 'lead-foreign'"), "{text}");
+    assert!(
+        text.contains("retained lead 'lead-acceptance' is still live"),
+        "{text}"
+    );
+    assert!(
+        text.contains("will not replace it with 'lead-foreign'"),
+        "{text}"
+    );
     assert_eq!(fixture.acceptance(&task), before);
     assert_ne!(fixture.show(&task)["status"], "closed");
     assert_eq!(controller.poll().unwrap().jobs.len(), 0);
@@ -2518,33 +2568,98 @@ fn accept_refuses_a_foreign_live_lead_without_board_effects() {
 }
 
 #[test]
-fn accept_requires_exactly_one_in_progress_lead_turn() {
-    let fixture = AcceptanceFixture::new("accept-turn-count");
-    let task = fixture.create_task("Exact turn count", Some(Purpose::Ordinary));
+fn accept_uses_latest_lead_turn_despite_unfinished_history() {
+    let fixture = AcceptanceFixture::new("accept-resumed-turn");
+    let controller = fixture.activate();
+    let task = fixture.create_task("Accept after resumed lead", Some(Purpose::Ordinary));
+    fixture.retain(&task, Purpose::Ordinary, "run-resumed", "completed", None);
+    fixture.set_lead_turns(vec![
+        json!({"id": "lead-turn-stale", "status": "inProgress"}),
+        json!({"id": "lead-turn-finished", "status": "completed"}),
+        json!({"id": ACCEPTANCE_LEAD_TURN, "status": "inProgress"}),
+    ]);
+
+    let receipt = fixture.accept(&task, None);
+    assert_eq!(receipt["leadTurn"], ACCEPTANCE_LEAD_TURN, "{receipt}");
+    assert_eq!(receipt["reflection"]["automaticTrigger"], true, "{receipt}");
+    assert_eq!(fixture.show(&task)["status"], "closed");
+    let recorded = fixture.acceptance(&task).expect("accepted metadata");
+    let binding: AcceptanceBinding = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(binding.lead_turn.as_deref(), Some(ACCEPTANCE_LEAD_TURN));
+    let poll = controller.poll().unwrap();
+    assert_eq!(poll.accepted, 1, "{poll:?}");
+    assert_eq!(poll.jobs.len(), 1, "{poll:?}");
+    assert_eq!(poll.jobs[0].stage.as_str(), "executor");
+    assert_eq!(
+        poll.jobs[0].lead_turn.as_deref(),
+        Some(ACCEPTANCE_LEAD_TURN)
+    );
+
+    let repeat = fixture.accept(&task, None);
+    assert_eq!(repeat["duplicate"], true, "{repeat}");
+    assert_eq!(repeat["acceptanceId"], receipt["acceptanceId"]);
+    assert_eq!(
+        fixture.acceptance(&task).as_deref(),
+        Some(recorded.as_str())
+    );
+    let repeated = controller.poll().unwrap();
+    assert_eq!(repeated.accepted, 0, "{repeated:?}");
+    assert_eq!(repeated.jobs.len(), 1, "{repeated:?}");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accept_refuses_without_a_usable_latest_in_progress_lead_turn() {
+    let fixture = AcceptanceFixture::new("accept-current-turn");
+    let task = fixture.create_task("Exact current turn", Some(Purpose::Ordinary));
     fixture.retain(
         &task,
         Purpose::Ordinary,
-        "run-turn-count",
+        "run-current-turn",
         "completed",
         None,
     );
     let before = fixture.acceptance(&task);
 
-    fixture.set_lead_turns(vec![json!({"id": "lead-turn-0", "status": "completed"})]);
-    let none = fixture.refuse(&task, None);
-    assert!(none.contains("has 0 in-progress native turns"), "{none}");
+    for latest in [
+        json!({"id": "lead-turn-last", "status": "completed"}),
+        json!({"id": "lead-turn-last", "status": "interrupted"}),
+        json!({"id": "lead-turn-last", "status": "failed"}),
+        json!({"id": "lead-turn-last"}),
+    ] {
+        fixture.set_lead_turns(vec![
+            json!({"id": "lead-turn-stale", "status": "inProgress"}),
+            latest,
+        ]);
+        let refused = fixture.refuse(&task, None);
+        assert!(
+            refused.contains("latest native turn is not in progress"),
+            "{refused}"
+        );
+        assert_eq!(fixture.acceptance(&task), before);
+        assert_ne!(fixture.show(&task)["status"], "closed");
+    }
+    fixture.set_lead_turns(vec![]);
+    let empty = fixture.refuse(&task, None);
+    assert!(empty.contains("no native turns"), "{empty}");
 
-    fixture.set_lead_turns(vec![
-        json!({"id": "lead-turn-a", "status": "inProgress"}),
-        json!({"id": "lead-turn-b", "status": "inProgress"}),
-    ]);
-    let multiple = fixture.refuse(&task, None);
-    assert!(
-        multiple.contains("has 2 in-progress native turns"),
-        "{multiple}"
-    );
-    assert_eq!(fixture.acceptance(&task), before);
-    assert_ne!(fixture.show(&task)["status"], "closed");
+    for latest in [
+        json!({"status": "inProgress"}),
+        json!({"id": "", "status": "inProgress"}),
+        json!({"id": " ", "status": "inProgress"}),
+    ] {
+        fixture.set_lead_turns(vec![
+            json!({"id": "lead-turn-stale", "status": "inProgress"}),
+            latest,
+        ]);
+        let refused = fixture.refuse(&task, None);
+        assert!(
+            refused.contains("without a usable exact turn identity"),
+            "{refused}"
+        );
+        assert_eq!(fixture.acceptance(&task), before);
+        assert_ne!(fixture.show(&task)["status"], "closed");
+    }
     fixture.drop_fixture();
 }
 
@@ -2987,6 +3102,7 @@ fn accept_refuses_unknown_purpose_and_another_close_reason() {
 #[test]
 fn accepted_without_exact_turn_metadata_repeats_but_is_reflection_ineligible() {
     let fixture = AcceptanceFixture::new("accept-missing-turns");
+    fixture.activate();
     let task = fixture.create_task("Legacy accepted record", Some(Purpose::Ordinary));
     fixture.retain(&task, Purpose::Ordinary, "run-legacy", "completed", None);
     let first = fixture.accept(&task, None);

@@ -18,6 +18,10 @@ The installed managed lead SHALL automatically enable the two-stage reflection c
 - **WHEN** another activation addresses the same work
 - **THEN** it identifies the existing owner, preserves checkpoints and retained records, and launches no duplicate consumer or reflection
 
+#### Scenario: Another live managed lead retains reflection
+- **WHEN** a new ordinary host selects a different native thread while another managed lead retains active reflection ownership
+- **THEN** the host registers and serves the selected thread and its turns without taking ownership, leaves the retained owner, its registration and reflection state unchanged, reports reflection as unavailable, and never presents a locally selected thread as the expected core owner on a later switch
+
 #### Scenario: Mode is disabled
 - **WHEN** ordinary development proceeds with the flag false
 - **THEN** no new automatic reflection runs and ordinary lead, executor and feedback behavior remains available
@@ -134,6 +138,11 @@ The system SHALL start executor reflection only after the lead accepts and close
 #### Scenario: The lead accepts the corrected result
 - **WHEN** the lead records acceptance of the bound executor work and closes its task
 - **THEN** one reflection becomes eligible with the original assignment, correction history and accepted result references
+
+#### Scenario: Resumed lead history contains unfinished earlier turns
+- **WHEN** the authenticated live lead accepts work while its latest native turn is in progress and earlier historical turns also retain `inProgress`
+- **THEN** acceptance binds the latest turn's exact identity, closes the task and makes one reflection eligible; repeating acceptance preserves that identity without duplicating reflection
+- **AND** a missing, terminal or unidentified latest turn refuses before board mutation instead of selecting an earlier unfinished turn
 
 #### Scenario: The executor submits an initial report
 - **WHEN** the executor finishes a turn or submits work awaiting lead review

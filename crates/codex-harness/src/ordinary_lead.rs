@@ -187,12 +187,23 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 false
             }
         };
-        let (selected_now, observer_error) = {
-            let state = observed
+        let (selected_now, observer_error, warnings) = {
+            let mut state = observed
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (state.selected.clone(), state.callback_error.clone())
+            let warnings = std::mem::take(&mut state.warnings);
+            (
+                state.selected.clone(),
+                state.callback_error.clone(),
+                warnings,
+            )
         };
+        for warning in warnings {
+            note_log(
+                &plan.paths.log,
+                &format!("reflection unavailable: {warning}"),
+            );
+        }
         if failure.is_none()
             && let Some(error) = observer_error
         {
@@ -342,6 +353,11 @@ struct Selected {
 #[derive(Default)]
 struct SelectionState {
     selected: Option<Selected>,
+    /// Every endpoint this host published, including a prior registration
+    /// retained because reflection still owns it.
+    owned: Vec<Selected>,
+    /// Non-fatal reflection preparation results for the host log.
+    warnings: Vec<String>,
     callback_error: Option<String>,
     /// The thread whose registration callback is still completing.
     registering: Option<String>,
@@ -410,6 +426,8 @@ fn observer(
                     }
                     return Ok(());
                 }
+                state.owned.retain(|owned| owned.path != selected.path);
+                state.owned.push(selected.clone());
                 state.selected = Some(selected);
                 Ok(())
             }
@@ -487,7 +505,6 @@ fn transfer_selection(
     if is_closing(state) {
         return Ok(());
     }
-    let source = kit_source(home, project)?;
     // Quiesce and drop the old owned lifecycle before asking the core to move
     // current control. The object is taken under the lock, then stopped
     // outside it, so it can never tick again and the observer is not blocked.
@@ -506,6 +523,67 @@ fn transfer_selection(
     if is_closing(state) {
         return Ok(());
     }
+    let retained = match lifecycle::retained_thread_owner(home, project) {
+        Ok(owner) => owner,
+        Err(error) => {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .warnings
+                .push(format!(
+                    "the retained reflection owner could not be read: {error}; native thread '{}' remains selected without reflection",
+                    staged.thread
+                ));
+            *owned_lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(LeadLifecycle::new(home, project, &staged.thread));
+            return Ok(());
+        }
+    };
+    let source = match kit_source(home, project) {
+        Ok(source) => source,
+        Err(error) => {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .warnings
+                .push(format!(
+                    "reflection preparation is unavailable: {error}; native thread '{}' remains selected",
+                    staged.thread
+                ));
+            *owned_lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(LeadLifecycle::new(home, project, &staged.thread));
+            return Ok(());
+        }
+    };
+    // The first local selection is not a core owner. Never pass it to the
+    // core as the expected owner merely because this host selected it.
+    if retained.as_deref() != Some(previous.thread.as_str()) {
+        if let Err(error) = retire_owned_registry(previous) {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cleanup_errors
+                .push(error.to_string());
+        }
+        *owned_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(LeadLifecycle::new(home, project, &staged.thread));
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .warnings
+            .push(format!(
+                "reflection remains owned by '{}'; native thread '{}' is selected without reflection",
+                retained.as_deref().unwrap_or("no retained lead"),
+                staged.thread
+            ));
+        return Ok(());
+    }
     let preparation = lifecycle::prepare_selected_thread(
         home,
         &source,
@@ -513,7 +591,27 @@ fn transfer_selection(
         &previous.thread,
         &staged.thread,
         true,
-    )?;
+    );
+    let preparation = match preparation {
+        Ok(preparation) => preparation,
+        Err(error) => {
+            // Keep the prior registration available for reflection recovery;
+            // the new native selection remains independently usable.
+            *owned_lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(LeadLifecycle::new(home, project, &staged.thread));
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .warnings
+                .push(format!(
+                    "reflection selection for '{}' could not be prepared: {error}; the prior registration '{}' was retained for recovery",
+                    staged.thread, previous.thread
+                ));
+            return Ok(());
+        }
+    };
     match preparation {
         // An administrative stop stays stopped until a genuinely fresh host
         // starts. A transferred selection never resumes it implicitly.
@@ -672,13 +770,13 @@ fn release(
     launcher: &Path,
 ) -> (Option<u32>, Vec<String>) {
     let mut notes = Vec::new();
-    let (selection, cleanup_errors) = {
+    let (registrations, cleanup_errors) = {
         let mut state = observed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.closing = true;
         (
-            state.selected.clone(),
+            std::mem::take(&mut state.owned),
             std::mem::take(&mut state.cleanup_errors),
         )
     };
@@ -709,10 +807,10 @@ fn release(
     {
         notes.push(format!("the native frontend could not be ended: {error}"));
     }
-    if let Some(selection) = selection
-        && let Err(error) = retire_owned_registry(&selection)
-    {
-        notes.push(error.to_string());
+    for selection in registrations {
+        if let Err(error) = retire_owned_registry(&selection) {
+            notes.push(error.to_string());
+        }
     }
     notes.extend(retire_transient(plan));
     if let Err(error) = end_owned_child(job, conversation, launcher) {
