@@ -46,16 +46,36 @@ codex-harness deploy --source <ABSOLUTE-KIT-CHECKOUT> --fast
 The receipt's top-level `profile` must be `delivery-fast`; ordinary deployment
 must report `release`. Fast and release candidates do not substitute for each
 other, and an unavailable fast candidate or mismatched explicit build is an
-error before installation changes. The retained 2026-10-22 cold scope was a
-617.8 s release baseline and 2m34s for the fast profile at two Cargo jobs;
-the current native command uses one job, so these are not a matched
-same-job promise. This revision has no persistent fast target, fast-cache
-lifecycle or one-invocation delivery. Preview and applying delivery keep their
-source, build, profile and ownership checks; preview does not certify changed
-source. For a test- or fixture-only change, run focused Cargo checks; deploy
-only when delivery or installed behavior is under test. Measured scope, current
-fresh-target behavior, planned cache limitations and the test-only no-deploy
-rule are owned by the
+error before installation changes. Fast candidates are local delivery output,
+not publication candidates, and release deployment keeps its fresh-target
+fat-LTO path. Both retain the normal immutable-build, ownership, integrity and
+installed-runtime checks.
+
+A valid source-owned delivery declaration compiles the exact declared set in
+one Cargo invocation for either profile; a missing or invalid declaration uses
+the two-phase manager query. Fast preparation may reuse one keyed,
+installation-owned compiler target with a lease, conservative changed-input
+timestamp fallback and seven-day inactivity retirement. Release never acquires
+it. Do not hand-build, edit or delete fast-target entries; the full ownership,
+foreign-state and retirement lifecycle belongs to the
+[installation guide](../../../docs/installation.md#fast-local-delivery).
+
+The retained 2026-10-22 single runs were 4.2 s for unchanged verified reuse
+without Cargo, 410.8 s for one-invocation cold fast and 675.4 s for the
+two-phase fallback. These are neither repeatability proof nor evidence for the
+360 s cold, 120 s leaf or 20-60 s single-binary targets. Compiled-input-only
+reuse for test/documentation changes and later job/test measurements remain
+planned. Applied delivery with both profiles present, interruption/recovery
+and delivery outside the checkout remain unvalidated.
+
+Preview and applying delivery keep their source, build, profile and ownership
+checks; `--fast --all --preview` reports the fast core and component plans
+without changing installation state. It reuses an eligible verified build
+without Cargo and otherwise follows normal preparation. Preview does not
+certify changed source or authorize the later apply.
+For a test- or fixture-only change, run focused Cargo checks; deploy only when
+delivery or installed behavior is under test. Read the full command, cache and
+limitation detail in the
 [installation guide](../../../docs/installation.md#fast-local-delivery).
 
 ## Repairing a blocked installation

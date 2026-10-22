@@ -283,34 +283,75 @@ fails before installation links change. The receipt's top-level `profile` must
 be `delivery-fast` for this choice and `release` for ordinary deployment. Fast
 and release candidates are not interchangeable, even when both exist for the
 same source. Keep fast candidates on the local developer installation; release
-candidates remain the publication output.
+candidates remain the publication output. Both profiles retain the same
+immutable-build, ownership, integrity, installed-runtime and recovery checks;
+the selector changes the compiler profile and fast target eligibility.
 
-Retained cold-build observations from 2026-10-22, with rustc/cargo 1.98.1 on
-`x86_64-pc-windows-msvc`, one host and adjacent source revisions under the
-shared heavy budget:
+`--fast --preview` filters existing candidates by the fast profile and does not
+compile when an eligible verified build is available. `--fast --all --preview`
+reports that core plan and each component plan without changing installation
+state.
+
+Fast mode has one persistent compiler target per key under the owned short
+`%TEMP%\chx` root. The key covers the rustc/cargo versions, target triple,
+profile and build-affecting manifest, lockfile, toolchain, build-script and
+Cargo host-configuration inputs; the target record binds it to the installation
+state, stores the full source identity and last successful build, and is leased
+while in use. An unchanged source identity may reuse the target. After source
+changes, reuse requires every changed identity path to be a regular file whose
+modification time is later than that last success; otherwise preparation uses
+fresh scratch. That conservative fallback protects a restored or otherwise
+untrustworthy timestamp instead of trusting Cargo's mtime comparison.
+
+A target whose ownership, record or lease evidence is unavailable or
+mismatched, or which is actively leased, is not reused or removed; preparation
+uses fresh scratch. A foreign or ambiguous `%TEMP%\chx` root is preserved and
+fast preparation reports the explicit ownership error instead of inheriting
+it. An owned target for this installation with a free lease and no use for
+seven days is retired during a later fast preparation.
+Active entries and foreign or ambiguous entries are preserved. Ordinary
+release deployment never acquires the fast target. The fast target is
+additional regenerable disk state; no current size measurement is retained for
+it. Lease and reclamation mechanics belong to the
+[native build lifecycle](rust-native.md#fast-local-delivery-profile).
+
+The root `[workspace.metadata.harness]` delivery list is the source-owned
+declaration. When valid, both profiles compile its exact declared set
+(currently seven executables) in one Cargo invocation. A missing or invalid
+declaration retains the existing two-phase source-manager query; it is not
+guessed, omitted or silently widened.
+
+Retained observations from 2026-10-22, on one Windows x64 host with
+rustc/cargo 1.98.1, `x86_64-pc-windows-msvc` and the shared heavy budget. Except
+where noted, the current native command uses one Cargo job. These are single
+runs and foundation evidence, not matched repeatability:
 
 | Route | Retained observation |
 | --- | --- |
 | Release baseline at source `4bd9ea12` | 617.757813 s wall (phase 1 518 s, phase 2 96 s); outer-Job peak 3,256,029,184 bytes; seven artifacts 35,290,624 bytes total; manager 27,249,664 bytes |
-| `delivery-fast` foundation at source `f96fe382` | 2m34s cold at two Cargo jobs; manager 29,714,944 bytes |
+| `delivery-fast` foundation at source `f96fe382`, two Cargo jobs | 2m34s cold; manager 29,714,944 bytes; opt-level 3, LTO off, 16 codegen units and stripped symbols |
+| One-invocation cold fast | 410.755 s |
+| Two-phase fallback cold fast | 675.446 s |
+| Unchanged source with a verified candidate | 4.2 s; `build_selection=verified-existing`; no Cargo |
+| Fast target after source changes | 124.943 s and 290.112 s (two samples) |
 
-These are scoped planning expectations, not a matched same-job speedup claim:
-the fast foundation used two Cargo jobs, while the native command currently
-uses one job for either profile and has no deploy job-count option. Queue
+The one-invocation and fallback runs built the same seven declared executables
+and produced identical normalized dep-info sets. The unchanged-source sample
+meets the predeclared five-second reuse target. The 410.755 s cold sample does
+not demonstrate the 360 s cold-fast target, and no current leaf-rebuild or
+single-binary/artifact-reuse measurement establishes the 120 s leaf target or
+the 20-60 s stretch target. These samples cover build and reuse, not a current
+startup or representative runtime comparison between fast and release. Queue
 conditions, source, toolchain, target and machine changes invalidate transfer;
-the leaf-rebuild and single-binary reuse targets have not been measured as
-current command times.
+these numbers are not a universal or matched same-job speedup claim.
 
-This revision implements no fast cache: there is no persistent fast compiler
-target or cache lifecycle. Both profiles prepare a fresh leased scratch target
-under `%TEMP%\chx`, so a changed-source deployment recompiles dependencies
-again. Unchanged exact source can reuse an intact, verified immutable candidate
-without Cargo. The scratch ownership, recovery and cleanup details belong to the
-[native build lifecycle](rust-native.md#manager-inventory-and-core-connection).
-A persistent installation-owned fast target with keyed freshness, ownership
-handling and retirement, compiled-input-only candidate reuse, and
-one-invocation delivery are planned and not available; do not hand-build or
-assume such a cache.
+Compiled-input-only candidate reuse for test- or documentation-only changes is
+still planned and unavailable. Immutable candidate reuse continues to require
+the full checkout identity, although finalization checks delivery dep-info
+coverage. A test-only edit therefore invalidates the existing candidate even
+when the guarded fast target can retain dependency compilation. Cargo
+job-count/test-feedback measurements also remain open; no larger release job
+count has been adopted.
 
 For a test- or fixture-only change that does not exercise delivery, run the
 focused [Cargo feedback route](rust-native.md#development-feedback-without-a-publication-build)
@@ -325,6 +366,11 @@ checks; applying additionally verifies the installed launcher. A preview may
 select an older verified build and report it as source-stale; it does not
 certify changed source as compiled, tested or accepted, and it grants no
 authority to the later applying step.
+
+Applying fast and release delivery with both profile candidates present,
+interrupted delivery/CLI recovery, and delivery outside this checkout remain
+unvalidated (OpenSpec tasks 8.3 and 8.4). The scoped build observations above
+do not establish those installed-lifecycle scenarios.
 
 For connected code tools, delivery requires real Serena semantic acceptance
 before link changes and through the installed manager afterward. The receipt's

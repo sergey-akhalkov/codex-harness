@@ -38,12 +38,22 @@ integrity and the existing machine resource budgets remain intact.
 Ordinary `deploy` remains the release/publication route with a fresh target and
 fat LTO. `deploy --fast` is an explicit local-iteration choice; it never falls
 back to release, and fast and release candidates cannot be selected
-interchangeably. Test-only feedback stays on Cargo unless delivery or installed
-behavior is under test. The persistent fast target/cache lifecycle,
-compiled-input-only reuse and one-invocation delivery remain planned and are not
-current behavior.
-Commands, retained measurement scope and current limitations live in the
-[installation guide](installation.md#fast-local-delivery) and
+interchangeably. Fast preparation may reuse one guarded, installation-owned
+compiler target with a key, lease, conservative changed-input timestamp
+fallback and seven-day inactivity retirement; release preparation never
+acquires it. A valid source-owned delivery declaration builds the exact set in
+one Cargo invocation for either profile, with the existing two-phase
+manager-query fallback when the declaration is missing or invalid.
+
+Test-only feedback stays on Cargo unless delivery or installed behavior is
+under test. Compiled-input-only candidate reuse for test or documentation
+changes and the release-concurrency/test-feedback measurements remain planned
+and unavailable. The retained single-run observations do not establish the
+cold, leaf-rebuild or single-binary targets, and applied/interrupted installed
+delivery remains unvalidated. Commands, measurement scope, cache lifecycle and
+current limitations live in the
+[installation guide](installation.md#fast-local-delivery); implementation
+mechanics live in the
 [native guide](rust-native.md#fast-local-delivery-profile).
 
 Use the existing `cargo-fast` skill to carry measured, portable practices to

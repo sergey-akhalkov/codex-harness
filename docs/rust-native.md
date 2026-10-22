@@ -139,24 +139,51 @@ than a release fallback. The user-facing choice, retained measurements and
 their scope are owned by [installation](installation.md#fast-local-delivery).
 
 Both profiles currently compile with the native one-Cargo-job limit. Fast
-preparation in this revision still uses a fresh leased scratch target under
-`%TEMP%\chx`; it keeps no compiler target between candidates, so a
-changed-source fast deployment pays dependency compilation again. Exact
-unchanged source can reuse an immutable verified candidate without Cargo. The
-scratch lease, reclamation and recovery behavior is described in
-[Manager, inventory and core connection](#manager-inventory-and-core-connection);
-do not treat that scratch root as a reusable user cache.
+preparation may reuse one persistent target per key under the owned short
+`%TEMP%\chx` root. The key hashes the rustc/cargo version strings, target
+triple, profile and build-affecting inputs: root and member manifests,
+`Cargo.lock`, build scripts, toolchain selectors and Cargo host configuration.
+The target record binds that key to the canonical installation state, stores
+the full source identity and last successful build epoch, and holds an
+exclusive lease for the build. Ordinary release preparation always uses fresh
+leased scratch and never acquires this target.
 
-A persistent installation-owned fast target and its cache lifecycle are planned
-but not available: its toolchain/target/profile/lockfile/manifest/configuration
-key, ownership record, lease, conservative freshness fallback and inactivity
-retirement do not exist in this revision. One-invocation delivery and
-compiled-input-only reuse for test-only changes are also planned. Current
-preparation still bootstraps the source manager, queries its delivery set and
-runs the completion phase, while full-checkout identity governs reuse. Keep
-test-only feedback on its
+An unchanged source identity may reuse the target. A changed identity is
+accepted only when every added or changed identity path exists as a regular
+file with a modification time later than the recorded build epoch; a missing,
+older or restored timestamp uses fresh scratch. This is deliberately
+conservative and is not compiled-input-only reuse: the immutable candidate
+still requires the full checkout identity. An existing target with unavailable
+or mismatched ownership, record or lease evidence, or an active lease, is
+preserved and not reused, with preparation proceeding on fresh scratch; a
+foreign or ambiguous `%TEMP%\chx` root itself is preserved and reported as an
+explicit fast-preparation error. The distinct fast-target owner prevents
+ordinary scratch hygiene from reclaiming it. A
+`used` marker records access; an owned entry for the same state, with a free
+lease and seven days of inactivity, is retired during a later fast preparation.
+Active, malformed, linked and foreign entries survive. No current measurement
+covers the fast target's disk size.
+
+Publication and fast preparation read the source-owned
+`[workspace.metadata.harness]` delivery list before compiling. A valid,
+nonempty, unambiguous `.exe` declaration selects exactly those binaries in one
+Cargo invocation. The staging evidence records
+`selection=source-declaration` and `one_cargo_invocation=true`. A missing or
+invalid declaration records the two-phase fallback, bootstraps the source
+manager, queries its delivery set through the existing handoff probe, and then
+completes that set in the second phase. The declaration lets a new source add
+a delivery program before its manager is compiled and does not select test
+helpers.
+
+Compiled-input-only candidate reuse remains planned and unavailable. Final
+dep-info coverage is verified, but the immutable candidate's reuse key is the
+full source identity, so test and fixture changes covered by that identity
+still invalidate it. Release concurrency and test-feedback measurements also
+remain open. Keep test-only feedback on its
 [Cargo route](#development-feedback-without-a-publication-build) unless
-delivery or installed behavior is what needs verification.
+delivery or installed behavior is what needs verification. User-facing
+selection, measured scope and unresolved installed-lifecycle checks belong to
+[Fast local delivery](installation.md#fast-local-delivery).
 
 ### Integration targets and compilation parallelism
 
@@ -251,8 +278,9 @@ without coverage. A narrower publication key was evaluated and **not**
 adopted: exclusion by path category is either unsafe (a fixture can be a
 real compiler input) or unnecessary, while a dep-info-derived key exists only
 after a build and would need retained compiled-input evidence; no measured
-safe benefit justified the change. The planned fast-only reuse would retain
-that evidence; it is not implemented and does not change release publication.
+safe benefit justified narrowing the publication identity. The fast target
+uses the full source identity plus its conservative changed-input timestamp
+guard; it does not implement compiled-input-only candidate reuse.
 The release profile (`lto = true`,
 `codegen-units = 1`) was compared once against thin LTO with 16 codegen
 units under identical source and toolchain conditions: the candidate built
@@ -260,22 +288,24 @@ slower (532 s vs 448 s), produced 5.4% larger binaries, and showed equal
 startup and runtime behavior within measurement noise, so the accepted
 profile is retained. The release route continues to reject a persistent
 compiler target because Cargo's freshness check trusts timestamps: a changed
-input with a preserved timestamp could silently reuse a stale artifact. A
-fast-only target remains planned rather than implemented and would need the
-separate conservative freshness guard; no fast target exists in this revision.
+input with a preserved timestamp could silently reuse a stale artifact. Only
+the explicit fast route acquires a target, and it applies the separate
+conservative freshness fallback described above. Compiled-input-only candidate
+reuse remains planned and unavailable.
 Unchanged identity is already
 served by verified artifact reuse (a full live-identity and integrity
 validation measured 114-138 ms) without running Cargo at all.
 
-Publication now bootstraps the requested source's manager, asks it for its
-declared delivery programs, and completes exactly those binaries in the same
-fresh compiler directory. The two Cargo phases reuse eligible compiler outputs;
-unrelated test helpers are not selected. This also preserves upgrades where the
-new source adds delivery programs: the installed producer's older list does not
-limit the new source. A manager rejecting the delivery query keeps the previous
+Publication reads a valid source-owned delivery declaration and completes
+exactly those binaries in one Cargo invocation. A missing or invalid
+declaration bootstraps the requested source's manager, asks it for its declared
+delivery programs, and completes that set in a second phase. Unrelated test
+helpers are not selected. This also preserves upgrades where the new source
+adds delivery programs: the installed producer's older list does not limit the
+new source. A manager rejecting the delivery query keeps the previous
 whole-package route with an explicit diagnostic and retained log. An incomplete
 query or unusable successful response fails instead of silently widening the
-build. Both compiler phases retain the existing admission and resource limits.
+build. Both Cargo phases retain the existing admission and resource limits.
 
 ### Compact verification output
 
@@ -2144,9 +2174,11 @@ of the previous build keep their broker until they finish. A generation with no
 consumers retires on its idle timeout; explicit retirement remains a separate
 maintenance command.
 
-Every compilation uses a fresh leased scratch target with a short path for
-MSVC; unchanged candidates reuse verified immutable binaries. Explicit release
-compilation uses the [shared heavy-command budget](#heavy-command-budget).
+Ordinary release compilation uses a fresh leased scratch target with a short
+path for MSVC; explicit fast compilation may reuse its keyed persistent target
+under the same short root. Unchanged candidates reuse verified immutable
+binaries. Explicit release compilation uses the
+[shared heavy-command budget](#heavy-command-budget).
 All explicit-management scratch (compilation targets, tool probes and
 consumer/activation evidence) lives beneath one dedicated short owned root,
 `%TEMP%\chx`. Each entry carries an ownership record and a live lease: an
@@ -2172,10 +2204,13 @@ conclusions are recorded (for example `cargo clean`), so verification state
 does not accumulate on the system drive.
 Reusing Cargo's
 mtime cache across changed source hashes is unsafe even if the manifest uses
-content hashes. Ordinary launch selection verifies the required executables'
-integrity and compatibility against the delivered build's record without
-traversing compiled sources for freshness; live source-owned data (the kit
-manifest and its profile) is still read. Changing native source/lock inputs
+content hashes. The fast target therefore applies the conservative
+changed-input timestamp fallback described in
+[Fast local delivery profile](#fast-local-delivery-profile); ordinary release
+never inherits that target. Ordinary launch selection verifies the required
+executables' integrity and compatibility against the delivered build's record
+without traversing compiled sources for freshness; live source-owned data (the
+kit manifest and its profile) is still read. Changing native source/lock inputs
 makes explicit Check report stale while launches keep following the
 integrity-verified delivered build; an explicit build/update (deploy)
 switches new processes to the newer source. `check --build` distinguishes
@@ -2194,6 +2229,10 @@ belong under crate `src`; source-owned skill/configuration data remains live
 filesystem input and must not be embedded in a deployed binary. Source
 subdirectories named `tests` or `examples` are included. Root documentation
 and noncompiled Markdown outside `src` do not require recompilation.
+
+The fast target has its own owner record and seven-day inactivity retirement,
+so ordinary scratch hygiene does not reclaim it merely because a build
+released its lease. Only `deploy --fast` may acquire it.
 
 The source fingerprint includes non-Markdown files throughout `crates/`,
 including integration tests and their support modules. Freeze those inputs as
