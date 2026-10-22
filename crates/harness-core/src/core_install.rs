@@ -1045,6 +1045,7 @@ mod tests {
         crate::process_path::with_test_environment(|| {
             let mut fixture = Fixture::new();
             fixture.request.path_scope = Some(PathScope::Process);
+            fixture.request.goal_recovery = Some(true);
             let compile_root = fixture.root.join("compile");
             fs::create_dir_all(&compile_root).unwrap();
             fixture.request.upstream = Some(compile_fixture(
@@ -1071,6 +1072,15 @@ mod tests {
 
             let metadata = fixture.request.codex_home.join("harness/installation.json");
             let metadata_before = fs::read(&metadata).unwrap();
+            let launch = fixture
+                .request
+                .codex_home
+                .join("harness/native-launch.json");
+            let launch_before = fs::read(&launch).unwrap();
+            let launch_value: serde_json::Value =
+                serde_json::from_slice(&launch_before).unwrap();
+            assert_eq!(launch_value["schema"], 3);
+            assert_eq!(launch_value["goal_recovery"], true);
             let instruction_link = fixture.request.codex_home.join("AGENTS.md");
             let link_before = fs::read_link(&instruction_link).unwrap();
             fs::write(fixture.request.build.join("codex.exe"), b"altered").unwrap();
@@ -1083,6 +1093,11 @@ mod tests {
                 .is_err()
             );
             assert_eq!(fs::read(metadata).unwrap(), metadata_before);
+            assert_eq!(
+                fs::read(launch).unwrap(),
+                launch_before,
+                "a rejected update must preserve the recovery policy registration"
+            );
             assert_eq!(fs::read_link(instruction_link).unwrap(), link_before);
         });
     }
@@ -2150,6 +2165,21 @@ mod tests {
             .unwrap();
             let token_before = fs::read(&token).unwrap();
             let subscriptions_before = fs::read(&subscriptions).unwrap();
+            let goal_state = home.join("goals/owned-thread.json");
+            let credentials = home.join("auth.json");
+            fs::create_dir_all(goal_state.parent().unwrap()).unwrap();
+            fs::write(
+                &goal_state,
+                b"{\"status\":\"blocked\",\"tokensUsed\":40,\"tokenBudget\":10000}",
+            )
+            .unwrap();
+            fs::write(&credentials, b"{\"unrelated\":\"credential-sentinel\"}").unwrap();
+            let goal_before = fs::read(&goal_state).unwrap();
+            let credentials_before = fs::read(&credentials).unwrap();
+            let mut live_session = std::process::Command::new("pwsh")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .spawn()
+                .unwrap();
             let preview = connect(&fixture.request, true).unwrap();
             assert_eq!(preview.status, "preview");
             assert_eq!(fs::read(&token).unwrap(), token_before);
@@ -2157,9 +2187,34 @@ mod tests {
             let first = connect(&fixture.request, false).unwrap();
             assert_eq!(first.status, "connected");
             assert!(first.runtime.unwrap().passed);
+            let launch_path = home.join("harness/native-launch.json");
+            let launch: serde_json::Value =
+                serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+            assert_eq!(launch["schema"], 3);
+            assert_eq!(launch["goal_recovery"], true);
+            fixture.request.goal_recovery = Some(false);
+            let before_policy_preview = fs::read(&launch_path).unwrap();
+            assert_eq!(connect(&fixture.request, true).unwrap().status, "preview");
+            assert_eq!(
+                fs::read(&launch_path).unwrap(),
+                before_policy_preview,
+                "a recovery-policy preview performs no writes"
+            );
+            let disabled = connect(&fixture.request, false).unwrap();
+            assert_eq!(disabled.status, "connected");
+            let launch: serde_json::Value =
+                serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+            assert_eq!(launch["goal_recovery"], false);
+            fixture.request.goal_recovery = None;
             let second = connect(&fixture.request, false).unwrap();
             assert_eq!(second.status, "connected");
             assert!(second.runtime.unwrap().passed);
+            let launch: serde_json::Value =
+                serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+            assert_eq!(
+                launch["goal_recovery"], false,
+                "an update without the option retains the explicit opt-out"
+            );
             let config: toml::Value =
                 toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
             assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
@@ -2176,6 +2231,9 @@ mod tests {
             .unwrap();
             assert_eq!(checked.status, "connected");
             assert!(checked.runtime.passed);
+            assert_eq!(checked.goal_recovery.configured, false);
+            assert_eq!(checked.goal_recovery.support, "declared");
+            assert!(!checked.goal_recovery.exercised);
             let preview_disconnect = crate::core_disconnect::disconnect(
                 &home,
                 &fixture.request.user_home,
@@ -2197,6 +2255,9 @@ mod tests {
             assert!(!home.join("AGENTS.md").exists());
             assert_eq!(fs::read(&token).unwrap(), token_before);
             assert_eq!(fs::read(&subscriptions).unwrap(), subscriptions_before);
+            assert_eq!(fs::read(&goal_state).unwrap(), goal_before);
+            assert_eq!(fs::read(&credentials).unwrap(), credentials_before);
+            assert!(live_session.try_wait().unwrap().is_none());
             let idle = crate::core_disconnect::disconnect(
                 &home,
                 &fixture.request.user_home,
@@ -2205,6 +2266,11 @@ mod tests {
             )
             .unwrap();
             assert_eq!(idle.status, "not-connected");
+            assert_eq!(fs::read(&goal_state).unwrap(), goal_before);
+            assert_eq!(fs::read(&credentials).unwrap(), credentials_before);
+            assert!(live_session.try_wait().unwrap().is_none());
+            live_session.kill().unwrap();
+            live_session.wait().unwrap();
         });
     }
 

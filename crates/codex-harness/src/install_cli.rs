@@ -65,6 +65,19 @@ fn optional(values: &BTreeMap<OsString, OsString>, name: &str) -> Option<PathBuf
     values.get(&OsString::from(name)).map(PathBuf::from)
 }
 
+fn goal_recovery(values: &BTreeMap<OsString, OsString>) -> io::Result<Option<bool>> {
+    values
+        .get(&OsString::from("--goal-recovery"))
+        .map(|value| match value.to_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("enabled") => Ok(true),
+            Some("disabled") => Ok(false),
+            _ => Err(io::Error::other(
+                "--goal-recovery must be enabled or disabled",
+            )),
+        })
+        .transpose()
+}
+
 #[allow(dead_code)]
 fn unfinished(component: Component, action: &str) -> io::Error {
     io::Error::other(format!(
@@ -367,18 +380,7 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
                             },
                         )
                         .transpose()?,
-                    goal_recovery: options
-                        .values
-                        .get(&OsString::from("--goal-recovery"))
-                        .map(|value| match value.to_str().map(str::to_ascii_lowercase).as_deref()
-                        {
-                            Some("enabled") => Ok(true),
-                            Some("disabled") => Ok(false),
-                            _ => Err(io::Error::other(
-                                "--goal-recovery must be enabled or disabled",
-                            )),
-                        })
-                        .transpose()?,
+                    goal_recovery: goal_recovery(&options.values)?,
                 },
                 options.preview,
             )?)?
@@ -844,6 +846,31 @@ mod tests {
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn goal_recovery_option_is_enabled_disabled_or_absent() {
+        let mut values = BTreeMap::new();
+        assert_eq!(goal_recovery(&values).unwrap(), None);
+        values.insert(OsString::from("--goal-recovery"), OsString::from("ENABLED"));
+        assert_eq!(goal_recovery(&values).unwrap(), Some(true));
+        values.insert(
+            OsString::from("--goal-recovery"),
+            OsString::from("disabled"),
+        );
+        assert_eq!(goal_recovery(&values).unwrap(), Some(false));
+        values.insert(
+            OsString::from("--goal-recovery"),
+            OsString::from("sometimes"),
+        );
+        assert!(goal_recovery(&values).is_err());
+        let parsed = options(
+            &os(&["--core-only", "--goal-recovery", "disabled"]),
+            &["--goal-recovery"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(goal_recovery(&parsed.values).unwrap(), Some(false));
     }
 
     fn candidate(root: &Path, profile: Profile) -> (PathBuf, PathBuf) {

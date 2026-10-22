@@ -16,15 +16,15 @@ Discovery evidence is recorded in [design.md](design.md). The disposable probe e
 
 ## 3. Integrate ordinary and already-hosted sessions
 
-- [ ] 3.1 Add the minimal recovery-owned app-server/TUI route to ordinary interactive launch, preserving the inherited terminal; extract only required shared transport/attach behavior from existing owners. Verify `codex` and `codex resume` through the installed launcher without user-supplied `--remote`, without window creation/arrangement, delegation or task-handoff activation.
-- [ ] 3.2 Reuse an existing hosted session's control owner and preserve unsupported/noninteractive forwarding. Verify one backend/recovery owner per supported session, no silent retargeting of a foreign remote endpoint, and parity for cwd, Unicode, arguments, profiles, explicit overrides, native configuration writes and exit status; document supported and degraded routes.
+- [x] 3.1 Add the minimal recovery-owned app-server/TUI route to ordinary interactive launch, preserving the inherited terminal; extract only required shared transport/attach behavior from existing owners. Verify `codex` and `codex resume` through the installed launcher without user-supplied `--remote`, without window creation/arrangement, delegation or task-handoff activation.
+- [x] 3.2 Reuse an existing hosted session's control owner and preserve unsupported/noninteractive forwarding. Verify one backend/recovery owner per supported session, no silent retargeting of a foreign remote endpoint, and parity for cwd, Unicode, arguments, profiles, explicit overrides, native configuration writes and exit status; document supported and degraded routes.
 - [ ] 3.3 Exercise native ongoing-work continuity: overload with pending tool-result delivery and with a long-lived background terminal. Verify same-session result consumption, no duplicated effects/processes, and no blanket requirement that every background terminal end before recovery.
 - [ ] 3.4 Exercise failure and cleanup through the ordinary entry point. Verify preparation failure falls back once before payload start, an observer fault after startup preserves existing work instead of launching a second session, and frontend/owner closure cancels retries and reclaims only owned resources.
 
 ## 4. Deliver policy through the global lifecycle
 
-- [ ] 4.1 Add the versioned enabled/disabled recovery policy to existing installation settings and generated launch registration, retaining explicit opt-out on update. Verify preview performs no writes, incompatible/old registration behavior is explicit, and Check distinguishes configuration/support from exercised recovery; document the lifecycle option in the installation guide.
-- [ ] 4.2 Deliver and exercise install/update/disable/disconnect/rollback in owned isolated state. Verify saved goals/accounting, credentials, unrelated hooks/settings and already-running sessions are preserved; activation/rollback must not build on ordinary launch or automatically reopen old blocked goals.
+- [x] 4.1 Add the versioned enabled/disabled recovery policy to existing installation settings and generated launch registration, retaining explicit opt-out on update. Verify preview performs no writes, incompatible/old registration behavior is explicit, and Check distinguishes configuration/support from exercised recovery; document the lifecycle option in the installation guide.
+- [x] 4.2 Deliver and exercise install/update/disable/disconnect/rollback in owned isolated state. Verify saved goals/accounting, credentials, unrelated hooks/settings and already-running sessions are preserved; activation/rollback must not build on ordinary launch or automatically reopen old blocked goals.
 
 ## 5. Complete integrated acceptance
 

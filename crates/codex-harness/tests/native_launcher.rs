@@ -174,6 +174,19 @@ impl Fixture {
     fn set_reflection(&self, enabled: Option<bool>) {
         self.write_reflection(&reflection_config(enabled));
     }
+    fn set_goal_recovery(&self, enabled: bool) {
+        let path = self.home.join("harness/native-launch.json");
+        let mut registration: Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        registration["schema"] = json!(3);
+        registration
+            .as_object_mut()
+            .unwrap()
+            .remove("state");
+        registration["build"] = json!(self.launcher.parent().unwrap());
+        registration["goal_recovery"] = json!(enabled);
+        fs::write(&path, serde_json::to_vec_pretty(&registration).unwrap()).unwrap();
+    }
     fn write_reflection(&self, body: &str) {
         fs::write(self.source.join("global/orchestration.toml"), body).unwrap();
     }
@@ -374,6 +387,54 @@ fn ordinary_reflection_false_keeps_the_native_launcher_path() {
     let f = Fixture::new();
     f.install_manager();
     f.set_reflection(Some(false));
+    let (code, report) = launch_report(&f, &[OsString::from("hello")]);
+    assert_eq!(code, 19);
+    assert_ne!(report["args"][0], "_ordinary-lead");
+}
+
+#[test]
+fn goal_recovery_alone_hosts_the_ordinary_session_when_reflection_is_off() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(false));
+    f.set_goal_recovery(true);
+    let (code, report) = launch_report(&f, &[OsString::from("hello")]);
+    assert_eq!(code, 19);
+    assert_eq!(
+        report["args"][0], "_ordinary-lead",
+        "the recovery policy must not depend on the reflection permission"
+    );
+    let (code, resume) = launch_report(
+        &f,
+        &[
+            OsString::from("resume"),
+            OsString::from("--last"),
+            OsString::from("continue"),
+        ],
+    );
+    assert_eq!(code, 19);
+    assert_eq!(
+        resume["args"][0], "_ordinary-lead",
+        "codex resume must use the same recovery-owned host"
+    );
+    assert!(
+        resume["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|arg| arg == "resume"),
+        "the resume selection must survive to the hosted frontend: {}",
+        resume["args"]
+    );
+}
+
+#[test]
+fn disabled_goal_recovery_and_reflection_keep_the_native_launcher_path() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(false));
+    f.set_goal_recovery(false);
     let (code, report) = launch_report(&f, &[OsString::from("hello")]);
     assert_eq!(code, 19);
     assert_ne!(report["args"][0], "_ordinary-lead");
