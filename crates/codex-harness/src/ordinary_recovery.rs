@@ -17,8 +17,7 @@ use harness_core::{
 };
 use serde_json::{Value, json};
 use std::{
-    fs,
-    io,
+    fs, io,
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -128,9 +127,7 @@ impl RecoveryHost {
                 self.apply(decision);
             }
             "thread/goal/updated" => {
-                let decision = self
-                    .recovery
-                    .on_goal(&self.thread, &raw["params"]["goal"]);
+                let decision = self.recovery.on_goal(&self.thread, &raw["params"]["goal"]);
                 self.apply(decision);
             }
             "thread/goal/cleared" => {
@@ -195,11 +192,9 @@ impl RecoveryHost {
                     ));
                     self.save("inFlight", Some(&dispatch));
                 } else if goal["status"] == "blocked" {
-                    let decision = self.recovery.blocked(
-                        &dispatch,
-                        Instant::now(),
-                        self.jitter(),
-                    );
+                    let decision = self
+                        .recovery
+                        .blocked(&dispatch, Instant::now(), self.jitter());
                     self.apply(decision);
                 } else {
                     let decision = self.recovery.on_goal(&self.thread, goal);
@@ -207,9 +202,9 @@ impl RecoveryHost {
                 }
             }
             Ok(Reply::Rejected(_)) => {
-                let decision =
-                    self.recovery
-                        .rejected(&dispatch, Instant::now(), self.jitter());
+                let decision = self
+                    .recovery
+                    .rejected(&dispatch, Instant::now(), self.jitter());
                 self.apply(decision);
             }
             // The request may have reached Codex. Never send it again to find
@@ -289,10 +284,7 @@ impl RecoveryHost {
     }
 
     fn cancel(&mut self, reason: &'static str) {
-        if self.uncertain.is_some()
-            || self.recovery.is_waiting()
-            || self.recovery.is_in_flight()
-        {
+        if self.uncertain.is_some() || self.recovery.is_waiting() || self.recovery.is_in_flight() {
             let decision = self.recovery.cancel(reason);
             self.apply(decision);
         }
@@ -317,12 +309,8 @@ impl RecoveryHost {
                 ));
                 self.save("exhausted", None);
             }
-            Decision::Cancelled {
-                reason: "goal complete",
-            } => {
-                self.notify(
-                    "Goal completed; automatic recovery is no longer needed.".to_owned(),
-                );
+            Decision::Cancelled { reason } if reason == "goal complete" => {
+                self.notify("Goal completed; automatic recovery is no longer needed.".to_owned());
                 self.save("complete", None);
             }
             Decision::Cancelled { reason } => {
@@ -344,11 +332,15 @@ impl RecoveryHost {
     }
 
     fn save(&self, state: &str, dispatch: Option<&Dispatch>) {
+        let attempt = self
+            .recovery
+            .attempts_used()
+            .max(dispatch.map_or(0, |dispatch| dispatch.attempt));
         let value = json!({
             "schema": 1,
             "threadId": self.thread,
             "status": state,
-            "attempt": self.recovery.attempts_used(),
+            "attempt": attempt,
             "dispatch": dispatch.map(|dispatch| json!({
                 "threadId": dispatch.goal.thread_id,
                 "createdAt": dispatch.goal.created_at,

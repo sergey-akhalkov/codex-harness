@@ -29,9 +29,18 @@
 //!   completion so the finite host must refuse it, `hold` keeps the turn open
 //!   without ever completing it so the real stop owner can interrupt and end
 //!   this run, and `fail` ends this child with a nonzero exit code before any
-//!   completion. With
+//!   completion. `recovery` fails the first submitted turn as an overloaded
+//!   server with a blocked goal, then answers the host's status-only automatic
+//!   resume and completes one continuation turn. With
 //!   `HARNESS_IMPROVEMENT_FIXTURE_CONTROL_MARKER` the child records the
 //!   assignment it observed before `hold` or `fail` takes effect;
+//! - `HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_RECORD`: append every recovery
+//!   request, notification and goal state as JSON lines for a check;
+//!   `HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_ACK=drop-first` leaves the first
+//!   automatic goal set unanswered without applying it, exercising the
+//!   unconfirmed-acknowledgement path;
+//!   `HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_OBSERVE=fail` makes the goal read
+//!   after the overload return a native error;
 //! - `HARNESS_IMPROVEMENT_FIXTURE_MODEL` / `..._EFFORT`: override the model and
 //!   reasoning effort recorded in the native rollout (the wrong-observation
 //!   counterexamples); the default echoes the arm's installed configuration;
@@ -249,6 +258,9 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
     let synthetic = synthetic_turn()?;
     let turn = synthetic.clone().unwrap_or_else(FixtureTurn::legacy);
     let route = installed_route(args)?;
+    if control_mode() == "recovery" {
+        return run_recovery_app_server(port, token_file, session, route);
+    }
     let rollout_model =
         env::var("HARNESS_IMPROVEMENT_FIXTURE_MODEL").unwrap_or_else(|_| route.model.clone());
     let rollout_effort =
@@ -480,6 +492,350 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
     agent.join().ok();
     loop {
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+const RECOVERY_TURN: &str = "fixture-turn-overloaded";
+const RECOVERY_CONTINUATION_TURN: &str = "fixture-turn-recovered";
+const RECOVERY_CREATED_AT: i64 = 1_760_000_000_000;
+const RECOVERY_BUDGET: i64 = 10_000;
+
+struct RecoveryState {
+    thread: String,
+    status: &'static str,
+    tokens_used: i64,
+    automatic_sets: u32,
+    user_sets: u32,
+    turn_starts: u32,
+    failed: bool,
+    recovered_turn: bool,
+    fail_observation: bool,
+    record: Option<PathBuf>,
+}
+
+impl RecoveryState {
+    fn goal(&self) -> Value {
+        json!({
+            "threadId": self.thread,
+            "objective": "ordinary recovery fixture objective",
+            "status": self.status,
+            "createdAt": RECOVERY_CREATED_AT,
+            "tokenBudget": RECOVERY_BUDGET,
+            "tokensUsed": self.tokens_used,
+        })
+    }
+
+    fn record(&self, value: Value) {
+        let Some(path) = self.record.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{value}");
+        }
+    }
+}
+
+/// One model-free ordinary conversation with an overloaded first turn and a
+/// native goal continuation. All state remains in this fake app-server; the
+/// host, relay and recovery state machine are the real production path.
+fn run_recovery_app_server(
+    port: u16,
+    token_file: PathBuf,
+    thread: String,
+    route: InstalledRoute,
+) -> io::Result<i32> {
+    let drop_ack = env::var("HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_ACK")
+        .is_ok_and(|value| value == "drop-first");
+    let fail_observation =
+        env::var("HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_OBSERVE").is_ok_and(|value| value == "fail");
+    let record = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_RECORD").map(PathBuf::from);
+    let state = Arc::new(Mutex::new(RecoveryState {
+        thread: thread.clone(),
+        status: "blocked",
+        tokens_used: 20,
+        automatic_sets: 0,
+        user_sets: 0,
+        turn_starts: 0,
+        failed: false,
+        recovered_turn: false,
+        fail_observation,
+        record,
+    }));
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(json!({"kind": "fixture-start", "pid": std::process::id()}));
+    let _server = Server::start_on_with(port, Bearer::File(token_file), |server| {
+        let state = Arc::clone(&state);
+        let notifier = server.notifier();
+        server.answer_fn(move |request| {
+            recovery_answer(&state, &notifier, &thread, &route, drop_ack, request)
+        });
+    });
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn recovery_answer(
+    state: &Arc<Mutex<RecoveryState>>,
+    notifier: &Notifier,
+    thread: &str,
+    route: &InstalledRoute,
+    drop_ack: bool,
+    request: &Value,
+) -> Answer {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let method = request["method"].as_str().unwrap_or_default();
+    let params = &request["params"];
+    state.record(json!({
+        "kind": "request",
+        "atMs": unix_ms(),
+        "method": method,
+        "params": params,
+    }));
+    match method {
+        "initialize" | "initialized" => Answer::Result(json!({})),
+        "thread/start" => {
+            notifier.push(json!({
+                "method": "thread/started",
+                "params": {"thread": {"id": thread}},
+            }));
+            Answer::Result(json!({
+                "thread": {"id": thread, "cwd": env::current_dir().ok(), "turns": []},
+                "model": route.model,
+                "modelProvider": route.provider,
+                "reasoningEffort": route.effort,
+            }))
+        }
+        "thread/resume" => Answer::Result(json!({
+            "thread": {"id": thread, "cwd": env::current_dir().ok(), "turns": []},
+            "model": route.model,
+            "modelProvider": route.provider,
+            "reasoningEffort": route.effort,
+        })),
+        "thread/read" => {
+            let mut turns = Vec::new();
+            if state.failed {
+                turns.push(json!({
+                    "id": RECOVERY_TURN,
+                    "status": "failed",
+                    "items": [],
+                    "error": {
+                        "message": "synthetic server overload",
+                        "codexErrorInfo": "serverOverloaded",
+                    },
+                }));
+            }
+            if state.recovered_turn {
+                turns.push(json!({
+                    "id": RECOVERY_CONTINUATION_TURN,
+                    "status": "completed",
+                    "items": [{
+                        "id": "fixture-recovered-message",
+                        "type": "agentMessage",
+                        "text": "recovered continuation completed",
+                    }],
+                }));
+            }
+            Answer::Result(json!({"thread": {
+                "id": thread,
+                "cwd": env::current_dir().ok(),
+                "turns": turns,
+            }}))
+        }
+        "thread/name/set" => Answer::Result(json!({})),
+        "turn/start" => {
+            state.turn_starts += 1;
+            if state.turn_starts != 1 {
+                return Answer::Error(json!({
+                    "message": "the recovery fixture refuses a resent prompt or turn",
+                }));
+            }
+            notifier.push(json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": thread,
+                    "turn": {"id": RECOVERY_TURN, "status": "inProgress"},
+                },
+            }));
+            let failed = json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread,
+                    "turn": {
+                        "id": RECOVERY_TURN,
+                        "status": "failed",
+                        "error": {
+                            "message": "synthetic server overload",
+                            "codexErrorInfo": "serverOverloaded",
+                        },
+                    },
+                },
+            });
+            state.failed = true;
+            notifier.push(failed.clone());
+            state.record(json!({
+                "kind": "notification",
+                "atMs": unix_ms(),
+                "notification": failed,
+            }));
+            Answer::Result(json!({
+                "turn": {"id": RECOVERY_TURN, "status": "inProgress"},
+            }))
+        }
+        "thread/goal/get" => {
+            if state.fail_observation {
+                state.record(json!({
+                    "kind": "observation-failure",
+                    "atMs": unix_ms(),
+                }));
+                return Answer::Error(json!({
+                    "message": "synthetic native goal observation failure",
+                }));
+            }
+            let goal = state.goal();
+            state.record(json!({
+                "kind": "goal",
+                "atMs": unix_ms(),
+                "origin": "read",
+                "goal": goal,
+            }));
+            Answer::Result(json!({"goal": goal}))
+        }
+        "thread/goal/set" => {
+            if params["threadId"].as_str() != Some(thread) {
+                return Answer::Error(json!({"message": "the goal names another thread"}));
+            }
+            match params["origin"].as_str() {
+                Some("automatic") => {
+                    if params["status"] != "active" {
+                        return Answer::Error(json!({
+                            "message": "automatic recovery must set only active status",
+                        }));
+                    }
+                    if ["objective", "tokenBudget", "model", "provider"]
+                        .iter()
+                        .any(|key| params.get(key).is_some())
+                    {
+                        return Answer::Error(json!({
+                            "message": "automatic recovery carried more than its status",
+                        }));
+                    }
+                    state.automatic_sets += 1;
+                    if drop_ack && state.automatic_sets == 1 {
+                        state.record(json!({
+                            "kind": "automatic-set",
+                            "atMs": unix_ms(),
+                            "acknowledged": false,
+                        }));
+                        return Answer::Silence;
+                    }
+                    state.status = "active";
+                    let active = state.goal();
+                    let updated = json!({
+                        "method": "thread/goal/updated",
+                        "params": {"threadId": thread, "goal": active},
+                    });
+                    notifier.push(updated.clone());
+                    state.record(json!({
+                        "kind": "automatic-set",
+                        "atMs": unix_ms(),
+                        "acknowledged": true,
+                    }));
+                    state.record(json!({
+                        "kind": "notification",
+                        "atMs": unix_ms(),
+                        "notification": updated,
+                    }));
+                    let started = json!({
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": thread,
+                            "turn": {"id": RECOVERY_CONTINUATION_TURN, "status": "inProgress"},
+                        },
+                    });
+                    notifier.push(started.clone());
+                    state.record(json!({
+                        "kind": "notification",
+                        "atMs": unix_ms(),
+                        "notification": started,
+                    }));
+                    state.recovered_turn = true;
+                    state.tokens_used = 40;
+                    state.status = "complete";
+                    let complete = state.goal();
+                    let updated = json!({
+                        "method": "thread/goal/updated",
+                        "params": {"threadId": thread, "goal": complete},
+                    });
+                    notifier.push(updated.clone());
+                    state.record(json!({
+                        "kind": "notification",
+                        "atMs": unix_ms(),
+                        "notification": updated,
+                    }));
+                    state.record(json!({
+                        "kind": "goal",
+                        "atMs": unix_ms(),
+                        "origin": "automatic",
+                        "goal": complete,
+                    }));
+                    let completed = json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread,
+                            "turn": {"id": RECOVERY_CONTINUATION_TURN, "status": "completed"},
+                        },
+                    });
+                    notifier.push(completed.clone());
+                    state.record(json!({
+                        "kind": "notification",
+                        "atMs": unix_ms(),
+                        "notification": completed,
+                    }));
+                    // The acknowledgement reports the status this request
+                    // applied; the continuation's later notifications follow.
+                    Answer::Result(json!({"goal": active}))
+                }
+                Some("user") => {
+                    if params["status"] != "paused" {
+                        return Answer::Error(json!({
+                            "message": "the fixture user mutation pauses the goal",
+                        }));
+                    }
+                    state.user_sets += 1;
+                    state.status = "paused";
+                    let goal = state.goal();
+                    let updated = json!({
+                        "method": "thread/goal/updated",
+                        "params": {"threadId": thread, "goal": goal},
+                    });
+                    notifier.push(updated.clone());
+                    state.record(json!({
+                        "kind": "notification",
+                        "atMs": unix_ms(),
+                        "notification": updated,
+                    }));
+                    state.record(json!({
+                        "kind": "goal",
+                        "atMs": unix_ms(),
+                        "origin": "user",
+                        "goal": goal,
+                    }));
+                    Answer::Result(json!({"goal": goal}))
+                }
+                _ => Answer::Error(json!({
+                    "message": "the recovery fixture supports automatic or user goal mutations",
+                })),
+            }
+        }
+        _ => Answer::Result(json!({})),
     }
 }
 

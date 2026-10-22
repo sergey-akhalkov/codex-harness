@@ -4857,7 +4857,8 @@ fn managed_tui_all_tools(
             schema: 2,
             state: None,
             build: Some(install.build.clone()),
-            task_control: false, goal_recovery: false,
+            task_control: false,
+            goal_recovery: false,
             upstream: Upstream {
                 executable: install.upstream.clone(),
                 sha256: build_identity::hash_file(&install.upstream).unwrap(),

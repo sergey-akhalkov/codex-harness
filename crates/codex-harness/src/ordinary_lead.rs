@@ -12,11 +12,11 @@ use crate::executor_cli::{
     },
     end_owned_child, note_log, retire_stale_endpoint,
 };
+use crate::ordinary_recovery::RecoveryHost;
 use crate::self_reflection_cli::{
     host::LeadLifecycle,
     lifecycle::{self, Preparation},
 };
-use crate::ordinary_recovery::RecoveryHost;
 use harness_core::{
     process::{Job, Limits},
     task_arguments::{self, ManagedArguments},
@@ -24,7 +24,7 @@ use harness_core::{
 use std::{
     env,
     ffi::OsString,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -255,9 +255,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                                 if failure.is_some() {
                                     break;
                                 }
-                                if let Err(error) =
-                                    host.on_event(&mut conversation, &event.raw)
-                                {
+                                if let Err(error) = host.on_event(&mut conversation, &event.raw) {
                                     host.observation_failed(&error.to_string());
                                 }
                             }
@@ -796,6 +794,15 @@ fn retire_transient(plan: &ControlPlan) -> Vec<String> {
         if let Err(error) = retire_stale_endpoint(path) {
             notes.push(error.to_string());
         }
+    }
+    let recovery = plan.paths.log.with_extension("recovery.json");
+    if let Err(error) = fs::remove_file(&recovery)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        notes.push(format!(
+            "the ordinary recovery checkpoint {} could not be removed: {error}",
+            recovery.display()
+        ));
     }
     notes
 }

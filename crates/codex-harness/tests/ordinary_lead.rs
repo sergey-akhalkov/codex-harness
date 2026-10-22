@@ -63,7 +63,8 @@ impl Fixture {
             schema: 2,
             state: None,
             build: None,
-            task_control: false, goal_recovery: false,
+            task_control: false,
+            goal_recovery: false,
             upstream: Upstream {
                 executable: frontend.clone(),
                 sha256: build_identity::hash_file(&frontend).unwrap(),
@@ -1122,7 +1123,8 @@ fn installed_ordinary_entry_registers_and_activates_reflection_without_enable() 
         schema: 2,
         state: None,
         build: Some(installed_build.clone()),
-        task_control: false, goal_recovery: false,
+        task_control: false,
+        goal_recovery: false,
         upstream: Upstream {
             executable: native.clone(),
             sha256: build_identity::hash_file(&native).unwrap(),
@@ -1751,4 +1753,623 @@ fn installed_logs(home: &Path) -> String {
         }
     }
     output
+}
+
+const RECOVERY_WAIT: Duration = Duration::from_secs(25);
+const UNCERTAIN_WAIT: Duration = Duration::from_secs(40);
+const RECOVERY_SETTLE: Duration = Duration::from_secs(5);
+
+fn recovery_native() -> [&'static str; 9] {
+    [
+        "--no-alt-screen",
+        "-m",
+        MODEL,
+        "-c",
+        "model_provider=\"fixture-provider\"",
+        "-c",
+        "model_reasoning_effort=\"max\"",
+        "--",
+        PROMPT,
+    ]
+}
+
+fn recovery_record(fixture: &Fixture) -> PathBuf {
+    fixture.home.join("fixture/recovery.jsonl")
+}
+
+fn recovery_session(
+    fixture: &Fixture,
+    drop_ack: bool,
+    pause_gate: bool,
+    observation_failure: bool,
+) -> ConsoleSession {
+    let native = recovery_native();
+    let mut spec = fixture.command("new", NEW_THREAD, None, &native);
+    spec.env.insert(
+        "HARNESS_IMPROVEMENT_FIXTURE_CONTROL".into(),
+        Some("recovery".into()),
+    );
+    spec.env.insert(
+        "HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_RECORD".into(),
+        Some(recovery_record(fixture).as_os_str().to_owned()),
+    );
+    if drop_ack {
+        spec.env.insert(
+            "HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_ACK".into(),
+            Some("drop-first".into()),
+        );
+    }
+    if observation_failure {
+        spec.env.insert(
+            "HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_OBSERVE".into(),
+            Some("fail".into()),
+        );
+    }
+    if pause_gate {
+        spec.env.insert(
+            "HARNESS_FRONTEND_GOAL_PAUSE_ON_FILE".into(),
+            Some(
+                fixture
+                    .home
+                    .join("frontend-goal-pause-gate")
+                    .as_os_str()
+                    .to_owned(),
+            ),
+        );
+    }
+    spawn(spec)
+}
+
+fn wait_transcript(session: &ConsoleSession, needle: &str, what: &str, timeout: Duration) {
+    let until = Instant::now() + timeout;
+    while Instant::now() < until {
+        if session.transcript().contains(needle) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{what} was not shown within {timeout:?}; expected {needle:?}:\n{}",
+        session.transcript()
+    );
+}
+
+fn recovery_entries(fixture: &Fixture) -> Vec<Value> {
+    fs::read_to_string(recovery_record(fixture))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn wait_recovery(
+    session: &ConsoleSession,
+    fixture: &Fixture,
+    what: &str,
+    timeout: Duration,
+    predicate: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    let until = Instant::now() + timeout;
+    while Instant::now() < until {
+        let entries = recovery_entries(fixture);
+        if predicate(&entries) {
+            return entries;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{what} was not observed within {timeout:?}; fixture record:\n{}\ntranscript:\n{}",
+        serde_json::to_string_pretty(&recovery_entries(fixture)).unwrap_or_default(),
+        session.transcript()
+    );
+}
+
+fn recovery_requests(entries: &[Value], method: &str) -> Vec<Value> {
+    entries
+        .iter()
+        .filter(|entry| entry["kind"] == "request" && entry["method"] == method)
+        .cloned()
+        .collect()
+}
+
+fn automatic_goal_sets(entries: &[Value]) -> Vec<Value> {
+    recovery_requests(entries, "thread/goal/set")
+        .into_iter()
+        .filter(|entry| entry["params"]["origin"] == "automatic")
+        .collect()
+}
+
+fn recovery_goal(entries: &[Value], status: &str) -> Option<Value> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if entry["kind"] == "goal" {
+                Some(entry["goal"].clone())
+            } else if entry["kind"] == "notification"
+                && entry["notification"]["method"] == "thread/goal/updated"
+            {
+                Some(entry["notification"]["params"]["goal"].clone())
+            } else {
+                None
+            }
+        })
+        .filter(|goal| goal["status"] == status)
+        .next_back()
+}
+
+fn recovery_checkpoint(fixture: &Fixture) -> Option<Value> {
+    let host = fixture.home.join("harness/lead-endpoints/host");
+    let path = fs::read_dir(host)
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let path = entry.path();
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".recovery.json"))
+                .then_some(path)
+        })?;
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn wait_checkpoint(
+    session: &ConsoleSession,
+    fixture: &Fixture,
+    what: &str,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let until = Instant::now() + RECOVERY_WAIT;
+    while Instant::now() < until {
+        if let Some(checkpoint) = recovery_checkpoint(fixture)
+            && predicate(&checkpoint)
+        {
+            return checkpoint;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{what} was not recorded; checkpoint {:?}; transcript:\n{}",
+        recovery_checkpoint(fixture),
+        session.transcript()
+    );
+}
+
+fn release_and_assert_cleanup(
+    fixture: &Fixture,
+    session: ConsoleSession,
+    backend: ProcessIdentity,
+) {
+    fixture.release();
+    let finished = wait_session(session);
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert_cleanup(fixture, backend, NEW_THREAD);
+}
+
+#[test]
+fn ordinary_host_recovers_blocked_goal_after_overload() {
+    let fixture = Fixture::new();
+    let session = recovery_session(&fixture, false, false, false);
+    wait_for(
+        &fixture.selected(),
+        "the frontend-selected thread",
+        &session,
+    );
+    wait_for(
+        &fixture.readiness(),
+        "the pre-turn registry check",
+        &session,
+    );
+    let entries = wait_recovery(
+        &session,
+        &fixture,
+        "the first failed turn and blocked goal",
+        RECOVERY_WAIT,
+        |entries| {
+            entries.iter().any(|entry| {
+                entry["kind"] == "notification"
+                    && entry["notification"]["method"] == "turn/completed"
+                    && entry["notification"]["params"]["turn"]["status"] == "failed"
+            }) && recovery_goal(entries, "blocked").is_some()
+        },
+    );
+    wait_transcript(
+        &session,
+        "Automatic recovery attempt 1/5 is scheduled",
+        "the scheduled-attempt warning",
+        RECOVERY_WAIT,
+    );
+    assert!(
+        automatic_goal_sets(&entries).is_empty(),
+        "the automatic set bypassed the scheduled delay"
+    );
+    let backend = backend_identity(&fixture.home, &session.transcript());
+    assert_eq!(
+        recovery_requests(&entries, "turn/start").len(),
+        1,
+        "the frontend's submitted turn was resent"
+    );
+
+    let entries = wait_recovery(
+        &session,
+        &fixture,
+        "the accepted recovery and completed goal",
+        RECOVERY_WAIT,
+        |entries| {
+            recovery_goal(entries, "complete").is_some()
+                && entries
+                    .iter()
+                    .any(|entry| entry["kind"] == "automatic-set" && entry["acknowledged"] == true)
+        },
+    );
+    wait_transcript(
+        &session,
+        "Automatic recovery attempt 1/5 was accepted",
+        "the accepted-attempt warning",
+        RECOVERY_WAIT,
+    );
+    wait_transcript(
+        &session,
+        "Goal completed; automatic recovery is no longer needed.",
+        "the successful-completion notice",
+        RECOVERY_WAIT,
+    );
+
+    let automatic = automatic_goal_sets(&entries);
+    assert_eq!(automatic.len(), 1, "exactly one activation is allowed");
+    let params = &automatic[0]["params"];
+    assert_eq!(params["threadId"], NEW_THREAD);
+    assert_eq!(params["status"], "active");
+    assert_eq!(params["origin"], "automatic");
+    for field in ["objective", "tokenBudget", "model", "provider"] {
+        assert!(
+            params.get(field).is_none(),
+            "automatic activation carried {field}: {params}"
+        );
+    }
+    assert_eq!(
+        recovery_requests(&entries, "turn/start").len(),
+        1,
+        "recovery resent the prompt or turn"
+    );
+
+    let blocked = recovery_goal(&entries, "blocked").expect("blocked goal");
+    let active = recovery_goal(&entries, "active").expect("active goal");
+    let complete = recovery_goal(&entries, "complete").expect("complete goal");
+    for goal in [&blocked, &active, &complete] {
+        assert_eq!(goal["threadId"], NEW_THREAD);
+        assert_eq!(goal["createdAt"], blocked["createdAt"]);
+        assert_eq!(goal["objective"], blocked["objective"]);
+        assert_eq!(goal["tokenBudget"], blocked["tokenBudget"]);
+    }
+    assert_eq!(blocked["tokensUsed"], 20);
+    assert_eq!(complete["tokensUsed"], 40);
+
+    let recovered = entries
+        .iter()
+        .filter(|entry| {
+            entry["kind"] == "notification"
+                && entry["notification"]["method"] == "turn/completed"
+                && entry["notification"]["params"]["turn"]["id"] == "fixture-turn-recovered"
+                && entry["notification"]["params"]["turn"]["status"] == "completed"
+        })
+        .count();
+    assert_eq!(
+        recovered, 1,
+        "the continuation did not complete exactly once"
+    );
+    let active_position = entries
+        .iter()
+        .position(|entry| {
+            entry["kind"] == "notification"
+                && entry["notification"]["method"] == "thread/goal/updated"
+                && entry["notification"]["params"]["goal"]["status"] == "active"
+        })
+        .expect("the native active update");
+    let completed_position = entries
+        .iter()
+        .position(|entry| {
+            entry["kind"] == "notification"
+                && entry["notification"]["method"] == "turn/completed"
+                && entry["notification"]["params"]["turn"]["id"] == "fixture-turn-recovered"
+                && entry["notification"]["params"]["turn"]["status"] == "completed"
+        })
+        .expect("the recovered turn completion");
+    assert!(
+        active_position < completed_position,
+        "the active update did not precede the recovered turn"
+    );
+
+    let checkpoint = wait_checkpoint(&session, &fixture, "the completed recovery", |value| {
+        value["status"] == "complete"
+    });
+    assert_eq!(checkpoint["threadId"], NEW_THREAD);
+
+    let transcript = session.transcript();
+    assert!(
+        !transcript.contains("Automatic recovery cancelled"),
+        "the successful goal showed a generic cancellation:\n{transcript}"
+    );
+    release_and_assert_cleanup(&fixture, session, backend);
+}
+
+#[test]
+fn ordinary_host_user_pause_wins_before_dispatch() {
+    let fixture = Fixture::new();
+    let session = recovery_session(&fixture, false, true, false);
+    wait_for(
+        &fixture.selected(),
+        "the frontend-selected thread",
+        &session,
+    );
+    wait_transcript(
+        &session,
+        "Automatic recovery attempt 1/5 is scheduled",
+        "the scheduled-attempt warning",
+        RECOVERY_WAIT,
+    );
+    let backend = backend_identity(&fixture.home, &session.transcript());
+
+    fs::write(fixture.home.join("frontend-goal-pause-gate"), b"pause").unwrap();
+    wait_transcript(
+        &session,
+        "Automatic recovery cancelled (a user action)",
+        "the cancellation notice",
+        RECOVERY_WAIT,
+    );
+    let entries = wait_recovery(
+        &session,
+        &fixture,
+        "the user's paused goal",
+        RECOVERY_WAIT,
+        |entries| {
+            entries.iter().any(|entry| {
+                entry["kind"] == "request"
+                    && entry["method"] == "thread/goal/set"
+                    && entry["params"]["origin"] == "user"
+                    && entry["params"]["status"] == "paused"
+            }) && recovery_goal(entries, "paused").is_some()
+        },
+    );
+    assert!(
+        automatic_goal_sets(&entries).is_empty(),
+        "the host dispatched after the user pause"
+    );
+
+    thread::sleep(RECOVERY_SETTLE);
+    let later = recovery_entries(&fixture);
+    assert!(
+        automatic_goal_sets(&later).is_empty(),
+        "a later read resumed the paused goal"
+    );
+    assert_eq!(
+        recovery_requests(&later, "turn/start").len(),
+        1,
+        "the pause caused a prompt or turn resend"
+    );
+    assert_eq!(
+        recovery_goal(&later, "paused").expect("paused goal")["status"],
+        "paused"
+    );
+    assert!(
+        recovery_goal(&later, "active").is_none(),
+        "the paused goal was activated after cancellation"
+    );
+    release_and_assert_cleanup(&fixture, session, backend);
+}
+
+#[test]
+fn ordinary_host_closes_without_reopening_a_blocked_goal() {
+    let fixture = Fixture::new();
+    let session = recovery_session(&fixture, false, false, false);
+    wait_for(
+        &fixture.selected(),
+        "the frontend-selected thread",
+        &session,
+    );
+    wait_transcript(
+        &session,
+        "Automatic recovery attempt 1/5 is scheduled",
+        "the scheduled-attempt warning",
+        RECOVERY_WAIT,
+    );
+    let backend = backend_identity(&fixture.home, &session.transcript());
+    fixture.release();
+    let finished = wait_session(session);
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        automatic_goal_sets(&recovery_entries(&fixture)).is_empty(),
+        "a delayed activation arrived before the host closed"
+    );
+
+    thread::sleep(RECOVERY_SETTLE);
+    let later = recovery_entries(&fixture);
+    assert!(
+        automatic_goal_sets(&later).is_empty(),
+        "the closed host left a delayed activation"
+    );
+    assert_eq!(
+        recovery_requests(&later, "turn/start").len(),
+        1,
+        "closing the frontend resent the prompt or turn"
+    );
+    assert_cleanup(&fixture, backend, NEW_THREAD);
+}
+
+#[test]
+fn ordinary_host_reconciles_an_unconfirmed_ack_without_a_duplicate() {
+    let fixture = Fixture::new();
+    let session = recovery_session(&fixture, true, false, false);
+    wait_for(
+        &fixture.selected(),
+        "the frontend-selected thread",
+        &session,
+    );
+    wait_transcript(
+        &session,
+        "Automatic recovery attempt 1/5 is scheduled",
+        "the scheduled-attempt warning",
+        RECOVERY_WAIT,
+    );
+    let entries = wait_recovery(
+        &session,
+        &fixture,
+        "the first unacknowledged activation",
+        RECOVERY_WAIT,
+        |entries| {
+            entries
+                .iter()
+                .any(|entry| entry["kind"] == "automatic-set" && entry["acknowledged"] == false)
+        },
+    );
+    let backend = backend_identity(&fixture.home, &session.transcript());
+    assert_eq!(automatic_goal_sets(&entries).len(), 1);
+
+    wait_transcript(
+        &session,
+        "Automatic recovery stopped after an unconfirmed acknowledgement; the goal is still blocked. Use /goal resume to continue.",
+        "the unconfirmed-acknowledgement notice",
+        UNCERTAIN_WAIT,
+    );
+    let entries = wait_recovery(
+        &session,
+        &fixture,
+        "the reconciled blocked goal",
+        RECOVERY_WAIT,
+        |entries| {
+            let set = entries
+                .iter()
+                .position(|entry| entry["kind"] == "automatic-set");
+            let read = entries.iter().rposition(|entry| {
+                entry["kind"] == "goal"
+                    && entry["origin"] == "read"
+                    && entry["goal"]["status"] == "blocked"
+            });
+            set.zip(read).is_some_and(|(set, read)| read > set)
+        },
+    );
+    assert_eq!(
+        automatic_goal_sets(&entries).len(),
+        1,
+        "an unconfirmed activation was sent twice"
+    );
+    assert_eq!(
+        recovery_goal(&entries, "blocked").expect("blocked goal")["status"],
+        "blocked"
+    );
+    assert!(
+        recovery_goal(&entries, "complete").is_none(),
+        "the unanswered activation was reported as recovered"
+    );
+    let checkpoint = wait_checkpoint(&session, &fixture, "the unconfirmed outcome", |value| {
+        value["status"] == "unconfirmed"
+    });
+    assert_eq!(checkpoint["attempt"], 1, "{checkpoint}");
+    assert_eq!(checkpoint["dispatch"]["attempt"], 1, "{checkpoint}");
+    release_and_assert_cleanup(&fixture, session, backend);
+}
+
+#[test]
+fn ordinary_host_reports_goal_observation_failure_without_relaunching() {
+    let fixture = Fixture::new();
+    let session = recovery_session(&fixture, false, false, true);
+    wait_for(
+        &fixture.selected(),
+        "the frontend-selected thread",
+        &session,
+    );
+    wait_transcript(
+        &session,
+        "Automatic recovery stopped because the native goal could not be observed",
+        "the observation-failure notice",
+        RECOVERY_WAIT,
+    );
+    wait_transcript(
+        &session,
+        "use /goal resume to continue manually",
+        "the manual recovery action",
+        RECOVERY_WAIT,
+    );
+    let entries = wait_recovery(
+        &session,
+        &fixture,
+        "the failed native goal observation",
+        RECOVERY_WAIT,
+        |entries| {
+            entries
+                .iter()
+                .any(|entry| entry["kind"] == "observation-failure")
+        },
+    );
+    let backend = backend_identity(&fixture.home, &session.transcript());
+    assert!(
+        process_alive(backend),
+        "the owned app-server was replaced after the observation fault"
+    );
+    assert!(
+        automatic_goal_sets(&entries).is_empty(),
+        "the observation fault still dispatched an automatic activation"
+    );
+    assert_eq!(
+        recovery_requests(&entries, "turn/start").len(),
+        1,
+        "the observation fault resent the prompt or turn"
+    );
+    let backend_launches = entries
+        .iter()
+        .filter(|entry| entry["kind"] == "fixture-start")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backend_launches.len(),
+        1,
+        "the host launched a second app-server"
+    );
+    assert_eq!(
+        backend_launches[0]["pid"], backend.pid,
+        "the surviving session is not the original app-server"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["kind"] == "frontend-start")
+            .count(),
+        1,
+        "the host launched a second frontend"
+    );
+    let checkpoint = wait_checkpoint(&session, &fixture, "the observation failure", |value| {
+        value["status"] == "observationFailed"
+    });
+    assert_eq!(checkpoint["threadId"], NEW_THREAD);
+    assert!(
+        recovery_goal(&entries, "complete").is_none(),
+        "the observation fault was reported as recovered"
+    );
+
+    fixture.release();
+    let finished = wait_session(session);
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    thread::sleep(RECOVERY_SETTLE);
+    let later = recovery_entries(&fixture);
+    assert!(
+        automatic_goal_sets(&later).is_empty(),
+        "a delayed activation survived the observation fault"
+    );
+    assert_eq!(
+        later
+            .iter()
+            .filter(|entry| entry["kind"] == "fixture-start")
+            .count(),
+        1,
+        "cleanup launched another app-server"
+    );
+    assert_eq!(
+        later
+            .iter()
+            .filter(|entry| entry["kind"] == "frontend-start")
+            .count(),
+        1,
+        "cleanup launched another frontend"
+    );
+    assert_cleanup(&fixture, backend, NEW_THREAD);
 }

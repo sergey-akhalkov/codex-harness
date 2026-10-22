@@ -554,10 +554,7 @@ impl Plan {
         });
         settings.source_root = request.source.clone();
         settings.codex_command = upstream.clone();
-        settings.goal_recovery = request
-            .goal_recovery
-            .or(retained_recovery)
-            .unwrap_or(true);
+        settings.goal_recovery = request.goal_recovery.or(retained_recovery).unwrap_or(true);
         settings.path_added |= added;
         settings
             .versions

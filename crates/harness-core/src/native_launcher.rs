@@ -3361,7 +3361,8 @@ mod tests {
                     schema: 2,
                     state: None,
                     build: Some(build.clone()),
-                    task_control: false, goal_recovery: false,
+                    task_control: false,
+                    goal_recovery: false,
                     upstream: Upstream {
                         executable: upstream.clone(),
                         sha256: build_identity::hash_file(&upstream).unwrap(),

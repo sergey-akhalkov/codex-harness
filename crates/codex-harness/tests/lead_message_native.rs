@@ -4503,7 +4503,8 @@ fn managed_lead_start_hosts_the_catalogue_without_native_worktree_tools() {
         schema: 2,
         state: None,
         build: Some(build.clone()),
-        task_control: false, goal_recovery: false,
+        task_control: false,
+        goal_recovery: false,
         upstream: harness_core::native_launcher::Upstream {
             executable: upstream.clone(),
             sha256: build_identity::hash_file(&upstream).unwrap(),

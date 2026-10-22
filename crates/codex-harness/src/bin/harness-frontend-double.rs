@@ -25,6 +25,7 @@ use harness_core::task_control::ControlConnection;
 use serde_json::{Value, json};
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -43,6 +44,8 @@ const TRANSFER_BEFORE_FORK_FILE: &str = "frontend-transfer-before-fork";
 const TRANSFER_TURN_GATE_FILE: &str = "frontend-transfer-turn-gate";
 const TRANSFER_TURN_FILE: &str = "frontend-transfer-turn-started.txt";
 const EXIT_MARKER_FILE: &str = "frontend-exit-triggered.txt";
+const GOAL_PAUSE_ON_FILE_ENV: &str = "HARNESS_FRONTEND_GOAL_PAUSE_ON_FILE";
+const GOAL_PAUSE_SENT_FILE: &str = "frontend-goal-pause-sent.txt";
 /// The one synthetic assignment this fixture submits after selecting its
 /// thread. It contains no user data and no task identity.
 const SYNTHETIC_INPUT: &str = "harness frontend double: synthetic protocol turn";
@@ -91,9 +94,10 @@ fn main() {
     let Some(home) = home else {
         std::process::exit(2);
     };
+    record_launch();
     install_exit_trigger(&home);
 
-    let _protocol = match protocol_mode() {
+    let mut protocol = match protocol_mode() {
         Ok(None) => None,
         Ok(Some(mode)) => match run_protocol(&home, mode) {
             Ok(connection) => Some(connection),
@@ -109,10 +113,79 @@ fn main() {
     };
 
     let release = home.join("frontend-release");
+    let pause_gate = env::var_os(GOAL_PAUSE_ON_FILE_ENV).map(PathBuf::from);
+    let mut paused = false;
     let until = Instant::now() + RELEASE_TIMEOUT;
     while Instant::now() < until && !release.is_file() {
-        thread::sleep(Duration::from_millis(40));
+        if let Some(connection) = protocol.as_mut() {
+            let closed = match connection.receive(Duration::from_millis(40)) {
+                Ok(Some(record)) => {
+                    present_warning(&record);
+                    false
+                }
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if closed {
+                protocol = None;
+                continue;
+            }
+            if !paused
+                && let Some(gate) = pause_gate.as_ref()
+                && gate.is_file()
+            {
+                match send_user_pause(&home, connection) {
+                    Ok(thread) => {
+                        let _ = fs::write(home.join(GOAL_PAUSE_SENT_FILE), &thread);
+                        println!("goal pause sent: {thread}");
+                    }
+                    Err(error) => eprintln!("frontend double goal pause: {error}"),
+                }
+                paused = true;
+            }
+        } else {
+            thread::sleep(Duration::from_millis(40));
+        }
     }
+}
+
+fn record_launch() {
+    let Some(path) = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_RECOVERY_RECORD").map(PathBuf::from)
+    else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(
+            file,
+            "{}",
+            json!({"kind": "frontend-start", "pid": std::process::id()})
+        );
+    }
+}
+
+fn present_warning(record: &Value) {
+    if record["method"] == "warning"
+        && let Some(message) = record["params"]["message"].as_str()
+    {
+        println!("warning: {message}");
+    }
+}
+
+fn send_user_pause(home: &Path, connection: &mut ControlConnection) -> Result<String, String> {
+    let thread = fs::read_to_string(home.join(SELECTED_FILE))
+        .map_err(|error| format!("the selected thread could not be read: {error}"))?;
+    let thread = thread.trim();
+    validate_thread_id(thread, "selected thread")?;
+    call(
+        connection,
+        1000,
+        "thread/goal/set",
+        json!({"threadId": thread, "status": "paused", "origin": "user"}),
+    )?;
+    Ok(thread.to_owned())
 }
 
 /// Absence or an empty value keeps the original double. A named but unknown
@@ -470,6 +543,7 @@ fn call(
                 REQUEST_TIMEOUT.as_secs()
             ));
         };
+        present_warning(&answer);
         if answer.get("id").and_then(Value::as_u64) != Some(id) {
             continue;
         }
