@@ -1753,6 +1753,16 @@ impl Conversation {
                 "the selected native thread identity is not an exact registry key",
             ));
         }
+        // Subscribe this control connection to the frontend's selected thread.
+        // Without the resume, native turn and goal notifications reach only the
+        // frontend connection and the host cannot observe a failed turn.
+        let resumed = self.call("thread/resume", json!({"threadId": thread_id}))?;
+        if resumed["thread"]["id"].as_str() != Some(thread_id) {
+            return Err(invalid(format!(
+                "thread/resume answered for {} instead of the selected {thread_id}",
+                resumed["thread"]["id"]
+            )));
+        }
         self.thread_id = key.clone();
         self.endpoint.thread_id = Some(key);
         Ok(())
