@@ -2457,6 +2457,12 @@ An unconfirmed acknowledgement is never resent: the owner reconciles the goal
 read, reports the uncertain outcome and requires a manual `/goal resume` when
 the goal is still blocked.
 
+If recovery preparation fails before the visible frontend starts (a degraded
+shared launch, an unavailable app-server or an attachment failure), the
+ordinary route starts the registered native CLI once with the original argv and
+a recovery-unavailable notice. After the frontend starts, a fault preserves the
+existing session instead of launching a second copy.
+
 The relay's `warning` surface shows the scheduled attempt and delay, recovery,
 cancellation, exhaustion and observation failure in the same terminal. A
 private recovery checkpoint is evidence only; a new host ignores stale state

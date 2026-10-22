@@ -100,9 +100,18 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             for note in notes {
                 eprintln!("ordinary lead note: {note}");
             }
-            return Err(invalid(format!(
-                "the ordinary app-server did not start: {error}; the native frontend was not started"
-            )));
+            return fallback_native(
+                &launcher,
+                &home,
+                native_args,
+                &original_cwd,
+                &format!("the recovery app-server did not start: {error}"),
+            )
+            .map_err(|fallback| {
+                invalid(format!(
+                    "the ordinary app-server did not start: {error}; the native frontend was not started; the native fallback failed: {fallback}"
+                ))
+            });
         }
     };
     if let Some(identity) = conversation.process_identity() {
@@ -129,9 +138,18 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         for note in notes {
             eprintln!("ordinary lead note: {note}");
         }
-        return Err(invalid(format!(
-            "the ordinary app-server endpoint could not be recorded before attachment: {error}"
-        )));
+        return fallback_native(
+            &launcher,
+            &home,
+            native_args,
+            &original_cwd,
+            &format!("the recovery endpoint could not be recorded before attachment: {error}"),
+        )
+        .map_err(|fallback| {
+            invalid(format!(
+                "the ordinary app-server endpoint could not be recorded before attachment: {error}; the native fallback failed: {fallback}"
+            ))
+        });
     }
 
     let observer = observer(
@@ -158,7 +176,19 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                     eprintln!("ordinary lead note: {note}");
                 }
                 eprintln!("ordinary lead: {error}");
-                return Ok(1);
+                return match fallback_native(
+                    &launcher,
+                    &home,
+                    native_args,
+                    &original_cwd,
+                    &format!("the native frontend could not be attached: {error}"),
+                ) {
+                    Ok(code) => Ok(code),
+                    Err(fallback) => {
+                        eprintln!("ordinary lead: the native fallback could not start: {fallback}");
+                        Ok(1)
+                    }
+                };
             }
         };
     note_log(
@@ -366,6 +396,25 @@ fn adopt_selected(
         ),
     );
     Ok(())
+}
+
+/// One native fallback after recovery preparation failed before the visible
+/// payload started. It uses the same registered upstream and prepared argv; the
+/// bypass prevents the fallback from re-entering this host.
+fn fallback_native(
+    launcher: &Path,
+    home: &Path,
+    native_args: &[OsString],
+    cwd: &Path,
+    reason: &str,
+) -> io::Result<i32> {
+    eprintln!(
+        "codex-harness: goal recovery unavailable before the session started ({reason}); starting the registered native Codex CLI once"
+    );
+    let mut command = harness_core::native_launcher::command(launcher, home, native_args)?;
+    command.current_dir(cwd);
+    command.env(harness_core::native_launcher::ORDINARY_HOSTING_BYPASS, "1");
+    Ok(command.status()?.code().unwrap_or(1))
 }
 
 fn parse(args: &[OsString]) -> io::Result<(PathBuf, &[OsString])> {

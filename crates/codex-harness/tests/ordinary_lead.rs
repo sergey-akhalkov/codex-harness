@@ -1049,6 +1049,94 @@ fn a_failed_frontend_attachment_retires_only_the_owned_state() {
     assert_cleanup(&fixture, backend, NEW_THREAD);
 }
 
+#[test]
+fn preparation_failure_falls_back_to_the_native_cli_once() {
+    let fixture = Fixture::new();
+    let bin = fixture.home.join("harness/bin");
+    let upstream = bin.join("fallback-upstream.exe");
+    fs::copy(env!("CARGO_BIN_EXE_harness-launch-fixture"), &upstream).unwrap();
+    for name in build_identity::BINARIES {
+        if *name != "codex.exe" {
+            fs::write(bin.join(name), name).unwrap();
+        }
+    }
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let record = build_identity::BuildRecord {
+        schema: build_identity::SCHEMA,
+        source_root: source.clone(),
+        source: build_identity::source_identity(&source).unwrap(),
+        rustc: "ordinary fallback fixture".into(),
+        cargo: "ordinary fallback fixture".into(),
+        target: "x86_64-pc-windows-msvc".into(),
+        profile: "release".into(),
+        binaries: build_identity::BINARIES
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    build_identity::hash_file(&bin.join(name)).unwrap(),
+                )
+            })
+            .collect(),
+    };
+    fs::write(bin.join("build.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::write(
+        fixture.home.join("harness/native-launch.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 2,
+            "build": bin,
+            "upstream": {
+                "executable": upstream,
+                "sha256": build_identity::hash_file(&upstream).unwrap(),
+                "package": null,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let marker = fixture.project.join("fallback-marker.json");
+    let mut command = fixture.command("new", NEW_THREAD, None, &["--no-alt-screen"]);
+    // The backend exits instead of serving app-server, so preparation fails
+    // before any visible payload; the manager must run the registered native
+    // upstream exactly once with the original argv.
+    command.env.insert(
+        "HARNESS_EXECUTOR_CHILD_FIXTURE_MODE".into(),
+        Some("complete".into()),
+    );
+    command.env.insert(
+        "HARNESS_LAUNCH_FIXTURE_MODE".into(),
+        Some("dependency-version".into()),
+    );
+    command.env.insert(
+        "HARNESS_DEPENDENCY_VERSION_FIXTURE".into(),
+        Some("private-error".into()),
+    );
+    command.env.insert(
+        "HARNESS_LAUNCH_FIXTURE_MARKER".into(),
+        Some(marker.as_os_str().to_owned()),
+    );
+    let finished = wait_session(spawn(command));
+    let transcript = text(&finished);
+    assert_eq!(finished.outcome.exit_code, 23, "{transcript}");
+    assert!(
+        transcript.contains("goal recovery unavailable before the session started"),
+        "{transcript}"
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(report["cwd"], serde_json::json!(fixture.project));
+    assert!(
+        report["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--no-alt-screen"),
+        "the fallback lost the prepared argv: {report}"
+    );
+}
+
 // The installed ordinary-entry check uses the immutable candidate launcher and
 // the real native CLI. The owned provider answers every model request; the
 // test sets no executor, bounded-lead or reflection marker and never runs the

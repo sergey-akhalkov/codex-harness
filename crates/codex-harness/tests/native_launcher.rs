@@ -183,6 +183,12 @@ impl Fixture {
         registration["goal_recovery"] = json!(enabled);
         fs::write(&path, serde_json::to_vec_pretty(&registration).unwrap()).unwrap();
     }
+    fn break_source_root(&self) {
+        let path = self.launcher.parent().unwrap().join("build.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["source_root"] = json!(self.root.path().join("missing-source"));
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    }
     fn write_reflection(&self, body: &str) {
         fs::write(self.source.join("global/orchestration.toml"), body).unwrap();
     }
@@ -434,6 +440,21 @@ fn disabled_goal_recovery_and_reflection_keep_the_native_launcher_path() {
     let (code, report) = launch_report(&f, &[OsString::from("hello")]);
     assert_eq!(code, 19);
     assert_ne!(report["args"][0], "_ordinary-lead");
+}
+
+#[test]
+fn goal_recovery_unavailable_falls_back_to_the_native_launcher_once() {
+    let f = Fixture::new();
+    f.install_manager();
+    f.set_reflection(Some(true));
+    f.set_goal_recovery(true);
+    f.break_source_root();
+    let (code, report) = launch_report(&f, &[OsString::from("hello")]);
+    assert_eq!(code, 19);
+    assert_ne!(
+        report["args"][0], "_ordinary-lead",
+        "a degraded recovery host must start the registered native CLI once"
+    );
 }
 
 #[test]

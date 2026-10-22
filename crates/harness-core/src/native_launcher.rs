@@ -90,9 +90,12 @@ fn fail(message: &'static str) -> io::Error {
 }
 
 const DEGRADED_NOTICE: &str = "codex-harness: shared harness unavailable; launching registered Codex without harness overrides";
+/// Set on the one native fallback launch after recovery preparation failed.
+pub const ORDINARY_HOSTING_BYPASS: &str = "HARNESS_ORDINARY_HOSTING_BYPASS";
 /// Internal launches that already belong to another owner must never enter
 /// the ordinary reflection host and recurse back into it.
 const ORDINARY_HOSTING_BYPASS_ENV: &[&str] = &[
+    ORDINARY_HOSTING_BYPASS,
     crate::orchestration_config::EXECUTOR_SESSION_ENV,
     "HARNESS_REFLECTION_SESSION",
     "HARNESS_BOUNDED_LEAD_SESSION",
@@ -1669,6 +1672,11 @@ fn ordinary_manager_command(
             .iter()
             .any(|name| env::var_os(name).is_some())
     {
+        if goal_recovery && !harness_ready {
+            eprintln!(
+                "codex-harness: goal recovery unavailable (shared harness coverage is degraded); starting the native Codex CLI once"
+            );
+        }
         return Ok(None);
     }
     let working_directory = env::current_dir()?;
@@ -1686,8 +1694,22 @@ fn ordinary_manager_command(
         .parent()
         .ok_or_else(|| fail("launcher has no build directory"))?
         .to_path_buf();
-    let record = build_identity::read_record(&build)?;
+    let record = match build_identity::read_record(&build) {
+        Ok(record) => record,
+        Err(error) if goal_recovery => {
+            eprintln!(
+                "codex-harness: goal recovery unavailable (the build identity could not be read: {error}); starting the native Codex CLI once"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     if !record.source_root.is_dir() {
+        if goal_recovery {
+            eprintln!(
+                "codex-harness: goal recovery unavailable (the recorded source root is missing); starting the native Codex CLI once"
+            );
+        }
         return Ok(None);
     }
     // An omitted permission defaults on. A declared non-boolean value is an
@@ -1702,6 +1724,12 @@ fn ordinary_manager_command(
         return Ok(None);
     }
     if let Some(error) = planning_error {
+        if goal_recovery {
+            eprintln!(
+                "codex-harness: goal recovery unavailable for these arguments ({error}); starting the native Codex CLI once"
+            );
+            return Ok(None);
+        }
         return Err(error);
     }
     let mut manager = Command::new(build.join("codex-harness.exe"));
