@@ -98,14 +98,12 @@ SHALL account for additional caches introduced by an optimization.
 
 ### Requirement: Explicit fast local delivery profile
 
-The kit SHALL provide an explicitly selected local fast delivery mode backed
-by a maintained profile that keeps release optimizations and stripping while
-disabling fat LTO and enabling parallel codegen. The profile identity SHALL be
-recorded in the build candidate and delivery receipt. The ordinary `deploy`
-command and public publication SHALL retain the release profile with fat LTO.
-Fast mode SHALL NOT be selected through an ambient compiler or profile
-override, and a missing or incompatible fast profile SHALL fail before
-installation changes with an actionable error.
+The kit SHALL provide an explicitly selected local fast delivery mode backed by
+a maintained profile with release optimizations and stripping, fat LTO disabled
+and parallel codegen. The profile SHALL be recorded in the candidate and
+receipt. Ordinary deploy and public publication SHALL retain release/fat LTO.
+Ambient compiler or profile overrides SHALL NOT select fast mode; an
+unavailable profile SHALL fail before installation changes.
 
 #### Scenario: Fast deployment is explicitly requested
 
@@ -124,32 +122,36 @@ installation changes with an actionable error.
 
 ### Requirement: Fast delivery reuses a guarded owned compiler target
 
-Fast local delivery MAY reuse a persistent compiler target owned by the
-installation state, keyed by the toolchain, target triple, profile, lockfile,
-manifests, Cargo host configuration and other build-affecting inputs. Before
-reuse, it SHALL compare the current source identity with the last successful
-fast build. If a changed compiled input has a timestamp that is not newer than
-the recorded build epoch, or ownership or key evidence is missing or
-ambiguous, the build SHALL force a scoped rebuild of affected workspace
-packages or use a fresh target. It MUST NOT trust Cargo's mtime cache for an
-untrusted changed input. Final binaries SHALL still be copied into an immutable
-integrity-verified candidate. The ordinary release path SHALL remain
-fresh-target.
+Fast local delivery MAY reuse one persistent compiler target owned by the
+installation state and keyed by toolchain, target triple, profile, lockfile,
+manifests, Cargo host configuration and other build-affecting inputs.
+Ownership, key or lease evidence that is missing, foreign or ambiguous SHALL
+preserve the target and use fresh scratch or return an explicit preparation
+error.
 
 #### Scenario: Warm dependency reuse
 
 - **WHEN** a fast build repeats with unchanged dependency inputs and a small workspace change
 - **THEN** eligible dependency artifacts are reused and the changed workspace package is rebuilt without weakening the final identity or integrity checks
 
-#### Scenario: Changed bytes have a preserved timestamp
-
-- **WHEN** a compiled input changes while its timestamp is not newer than the recorded fast build epoch
-- **THEN** the affected package is rebuilt or a fresh target is used, and the stale artifact is never accepted as the changed source
-
 #### Scenario: Fast target has foreign ownership
 
 - **WHEN** the persistent target directory or its ownership record does not belong to this installation state
 - **THEN** it is preserved untouched and the build uses an owned target or reports the explicit preparation error
+
+### Requirement: Conservative fast freshness and immutable publication
+
+Before reusing a fast target, the kit SHALL compare the current source identity
+with the last successful fast build. A changed input whose timestamp is not
+newer than the recorded build epoch SHALL force a scoped rebuild or fresh
+target; Cargo mtime trust SHALL NOT authorize stale bytes. Final binaries SHALL
+be copied into an immutable integrity-verified candidate, and release
+publication SHALL remain fresh-target.
+
+#### Scenario: Changed bytes have a preserved timestamp
+
+- **WHEN** a compiled input changes while its timestamp is not newer than the recorded fast build epoch
+- **THEN** the affected package is rebuilt or a fresh target is used, and the stale artifact is never accepted as the changed source
 
 #### Scenario: Release publication remains fresh-target
 
@@ -158,15 +160,13 @@ fresh-target.
 
 ### Requirement: Compiled-input identity permits safe reuse
 
-The build record SHALL retain the union of actual compiled inputs from the
-dep-info evidence for every delivered binary, together with build-affecting
-manifest, lockfile, toolchain and Cargo host-configuration identities. Fast
-delivery MAY reuse verified delivered binaries when every recorded compiled
-input and build-affecting input matches, even when only noncompiled test,
-documentation or fixture files changed. A test-like or documentation-like path
-that is a compiled input SHALL invalidate the matching artifact. Missing,
-changed or ambiguous compiled-input evidence SHALL force a rebuild rather than
-authorize reuse.
+The build record SHALL retain the union of actual compiled inputs from every
+delivered binary's dep-info, plus build-affecting manifest, lockfile, toolchain
+and Cargo host-configuration identities. Fast delivery MAY reuse verified
+binaries when every recorded compiled and build-affecting input matches, even
+if only noncompiled test, documentation or fixture files changed. A compiled
+test-like path SHALL invalidate. Missing, changed or ambiguous evidence SHALL
+force a rebuild.
 
 #### Scenario: Test-only change
 

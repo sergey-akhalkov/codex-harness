@@ -80,15 +80,13 @@ optimization candidates SHALL leave the accepted publication route intact.
 
 ### Requirement: Fast and release native candidates remain distinguishable
 
-Every native candidate SHALL record its compiler profile as part of its
-immutable identity, and every delivery receipt SHALL identify the selected
-profile. Fast candidates MUST NOT become eligible for ordinary release
-selection, preview or fresh-manager delivery unless the operator explicitly
-selects fast mode. The presence of a newer fast build SHALL NOT cause ordinary
-release deployment to install non-release binaries. Fast and release builds
-SHALL share the same ownership, integrity, immutable-file, installed-runtime,
-rollback and recovery guarantees; profile selection changes only the accepted
-compiler profile.
+Every native candidate SHALL record its compiler profile in its immutable
+identity; every delivery receipt SHALL identify the selected profile. Fast
+candidates MUST NOT be eligible for ordinary release selection, preview or
+fresh-manager delivery unless fast mode is explicitly selected. A newer fast
+build SHALL NOT cause release deployment to install non-release binaries. Both
+profiles SHALL share ownership, integrity, immutable-file, installed-runtime,
+rollback and recovery guarantees.
 
 #### Scenario: Fast build exists before ordinary release deployment
 
