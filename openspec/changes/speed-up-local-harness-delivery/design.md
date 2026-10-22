@@ -119,13 +119,14 @@ is complete and matching.
 
 ### Test and job measurement
 
-Keep the existing test coverage and dev profile. Measure fast builds at two and
-four Cargo jobs, plus queue wait and peak memory, before choosing the fast
-default. The measured payload improved at four jobs, but an unrelated shared
-heavy holder made total wall time worse; the fast default is chosen from
-matched no-contention runs. Test execution improvements remain a separate
-measured route; scoped serialization or a different runner cannot replace
-coverage and is not required for delivery speed.
+Keep the existing test coverage and dev profile. The 2026-10-22 matched
+no-contention matrix measured fast cold, warm-dependency, edited-source and
+no-op workloads at two and four Cargo jobs: four jobs reduced compile wall time
+by roughly 27-36%, with 2.68-2.71 GiB peak memory and zero queue wait. The fast
+default is therefore four Cargo jobs; release remains at one job pending task
+7.1. Test execution improvements remain a separate measured route; scoped
+serialization or a different runner cannot replace coverage and is not required
+for delivery speed.
 
 ## Risks / Trade-offs
 
