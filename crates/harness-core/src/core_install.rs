@@ -2227,7 +2227,7 @@ mod tests {
             .unwrap();
             assert_eq!(checked.status, "connected");
             assert!(checked.runtime.passed);
-            assert_eq!(checked.goal_recovery.configured, false);
+            assert!(!checked.goal_recovery.configured);
             assert_eq!(checked.goal_recovery.support, "declared");
             assert!(!checked.goal_recovery.exercised);
             let preview_disconnect = crate::core_disconnect::disconnect(

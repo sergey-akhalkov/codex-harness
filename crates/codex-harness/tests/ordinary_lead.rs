@@ -1893,8 +1893,7 @@ fn recovery_goal(entries: &[Value], status: &str) -> Option<Value> {
                 None
             }
         })
-        .filter(|goal| goal["status"] == status)
-        .next_back()
+        .rfind(|goal| goal["status"] == status)
 }
 
 fn recovery_checkpoint(fixture: &Fixture) -> Option<Value> {

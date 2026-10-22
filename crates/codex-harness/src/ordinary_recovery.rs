@@ -336,7 +336,9 @@ impl RecoveryHost {
                 ));
                 self.save("exhausted", None);
             }
-            Decision::Cancelled { reason } if reason == "goal complete" => {
+            Decision::Cancelled {
+                reason: "goal complete",
+            } => {
                 self.notify("Goal completed; automatic recovery is no longer needed.".to_owned());
                 self.save("complete", None);
             }
