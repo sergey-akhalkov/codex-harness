@@ -1,7 +1,7 @@
 ## 1. Baseline and acceptance thresholds
 
 - [x] 1.1 Freeze the current source, toolchain, target and heavy budget; capture fresh fat-LTO release phase times, the second-phase compile set, peak memory, queue wait and delivered artifact sizes in local evidence. Verify the inputs are matched and the retained log supports the stated scope.
-- [ ] 1.2 Capture the fast-profile candidate on the same machine at two and four Cargo jobs for cold, warm-dependency, edited-source and no-op workloads; retain wall time, payload time, queue wait, peak memory, artifact size and startup. Verify no source bytes are changed by the measurement.
+- [x] 1.2 Capture the fast-profile candidate on the same machine at two and four Cargo jobs for cold, warm-dependency, edited-source and no-op workloads; retain wall time, payload time, queue wait, peak memory, artifact size and startup. Verify no source bytes are changed by the measurement.
 - [x] 1.3 Record the predeclared acceptance policy: unchanged protected source reuses without Cargo in at most five seconds; a leaf-package fast rebuild targets at most two minutes, with 20-60 seconds as the stretch goal for a single small binary or measured artifact-level reuse; a cold fast build targets at most six minutes; ordinary release publication retains its accepted profile and checks. Verify every later comparison uses the same thresholds and reports missing evidence rather than substituting a prediction.
 
 ## 2. Fast profile and explicit command contract
