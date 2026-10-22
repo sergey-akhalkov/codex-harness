@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-22
+goal: Provide a measured fast local delivery path and eliminate avoidable Cargo
+  work while retaining fresh fat-LTO publication and build integrity.
