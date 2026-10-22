@@ -142,6 +142,7 @@ mod task_handoff;
 #[cfg(windows)]
 mod task_observer;
 pub mod task_orchestrate;
+pub mod task_recovery;
 pub mod task_request;
 #[cfg(windows)]
 pub mod task_runtime;
