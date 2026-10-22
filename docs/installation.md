@@ -322,44 +322,55 @@ declaration retains the existing two-phase source-manager query; it is not
 guessed, omitted or silently widened.
 
 Retained observations from 2026-10-22, on one Windows x64 host with
-rustc/cargo 1.98.1, `x86_64-pc-windows-msvc` and the shared heavy budget. Except
-where noted, the current native command uses one Cargo job. These are single
-runs and foundation evidence, not matched repeatability:
+rustc/cargo 1.98.1, `x86_64-pc-windows-msvc` and the shared heavy budget. The
+current native command uses four Cargo jobs for `delivery-fast` and one for
+release; release job counts remain under task 7.1. These are single runs and
+foundation evidence, not matched repeatability:
 
 | Route | Retained observation |
 | --- | --- |
 | Release baseline at source `4bd9ea12` | 617.757813 s wall (phase 1 518 s, phase 2 96 s); outer-Job peak 3,256,029,184 bytes; seven artifacts 35,290,624 bytes total; manager 27,249,664 bytes |
 | `delivery-fast` foundation at source `f96fe382`, two Cargo jobs | 2m34s cold; manager 29,714,944 bytes; opt-level 3, LTO off, 16 codegen units and stripped symbols |
-| One-invocation cold fast | 410.755 s |
-| Two-phase fallback cold fast | 675.446 s |
+| Fast matrix, cold, four Cargo jobs | 117.715 s wall; 117.500 s payload; 2.683 GiB peak; seven artifacts 40,254,464 bytes |
+| Real fast deployment, four Cargo jobs | 119.339 s; seven declared binaries; candidate healthy |
+| One-invocation cold fast, earlier one-job sample | 410.755 s |
+| Two-phase fallback cold fast, one job | 675.446 s |
 | Unchanged source with a verified candidate | 4.2 s; `build_selection=verified-existing`; no Cargo |
-| Fast target after source changes | 124.943 s and 290.112 s (two samples) |
+| Earlier fast-target reuse samples, pre-four-job | 124.943 s and 290.112 s |
 
 The one-invocation and fallback runs built the same seven declared executables
-and produced identical normalized dep-info sets. The unchanged-source sample
-meets the predeclared five-second reuse target. The 410.755 s cold sample does
-not demonstrate the 360 s cold-fast target, and no current leaf-rebuild or
-single-binary/artifact-reuse measurement establishes the 120 s leaf target or
-the 20-60 s stretch target. These samples cover build and reuse, not a current
-startup or representative runtime comparison between fast and release. Queue
-conditions, source, toolchain, target and machine changes invalidate transfer;
-these numbers are not a universal or matched same-job speedup claim.
+and produced identical normalized dep-info sets. The current four-job samples
+meet the 360 s cold-fast target; the earlier one-job sample did not. The
+unchanged-source sample meets the five-second reuse target. No current
+leaf-rebuild or single-binary/artifact-reuse measurement establishes the 120 s
+leaf target or the 20-60 s stretch target. These samples cover build and reuse,
+not a current startup or representative runtime comparison between fast and
+release. Queue conditions, source, toolchain, target and machine changes
+invalidate transfer; these numbers are not a universal or matched same-job
+speedup claim.
 
-Compiled-input-only candidate reuse for test- or documentation-only changes is
-still planned and unavailable. Immutable candidate reuse continues to require
-the full checkout identity, although finalization checks delivery dep-info
-coverage. A test-only edit therefore invalidates the existing candidate even
-when the guarded fast target can retain dependency compilation. Cargo
-job-count/test-feedback measurements also remain open; no larger release job
-count has been adopted.
+Fast compiled-input reuse is implemented. Each immutable fast candidate records
+the union of source-relative compiled inputs from all seven dep-info files plus
+build-affecting manifest, lockfile, toolchain and Cargo host-configuration
+identities. A fast candidate may be reused when every recorded compiled and
+build-affecting input matches, even if only noncompiled test or documentation
+files changed. A test-like path that is compiled invalidates; missing,
+malformed, empty, ambiguous or extra-unreferenced evidence forces a rebuild.
+Release candidates still require the full checkout identity. The reused
+candidate is not rewritten: a content-addressed selection record references the
+same verified binary hashes and the current checkout relationship.
+
+Release job-count and test-feedback measurements remain under tasks 7.1-7.2; no
+larger release job count has been adopted yet.
 
 For a test- or fixture-only change that does not exercise delivery, run the
 focused [Cargo feedback route](rust-native.md#development-feedback-without-a-publication-build)
 instead of deploying. Deployment is not a test runner and is needed only when
 the task itself exercises compilation, installation, the receipt, the launcher
-or installed runtime behavior. The current full-checkout source identity means
-a test-only edit invalidates the existing candidate; that is a reason to avoid
-an unnecessary deployment, not to call an older candidate current.
+or installed runtime behavior. When delivery is needed, a fast deployment may
+reuse the verified candidate if the changed file is outside dep-info; a release
+deployment still requires exact source identity. A compiled fixture or test
+path is a real input and invalidates the candidate.
 
 Preview and applying delivery retain their source, build, profile and ownership
 checks; applying additionally verifies the installed launcher. A preview may

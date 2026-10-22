@@ -43,15 +43,16 @@ compiler target with a key, lease, conservative changed-input timestamp
 fallback and seven-day inactivity retirement; release preparation never
 acquires it. A valid source-owned delivery declaration builds the exact set in
 one Cargo invocation for either profile, with the existing two-phase
-manager-query fallback when the declaration is missing or invalid.
+manager-query fallback when the declaration is missing or invalid. Fast uses
+four Cargo jobs; release remains at one pending task 7.1.
 
 Test-only feedback stays on Cargo unless delivery or installed behavior is
-under test. Compiled-input-only candidate reuse for test or documentation
-changes and the release-concurrency/test-feedback measurements remain planned
-and unavailable. The retained single-run observations do not establish the
-cold, leaf-rebuild or single-binary targets, and applied/interrupted installed
-delivery remains unvalidated. Commands, measurement scope, cache lifecycle and
-current limitations live in the
+under test. Fast compiled-input candidate reuse is implemented; release
+candidates still require the full source identity. Release-concurrency and
+test-feedback measurements remain under tasks 7.1-7.2. The retained single-run
+observations do not establish the leaf-rebuild or single-binary targets, and
+applied/interrupted installed delivery remains unvalidated. Commands,
+measurement scope, cache lifecycle and current limitations live in the
 [installation guide](installation.md#fast-local-delivery); implementation
 mechanics live in the
 [native guide](rust-native.md#fast-local-delivery-profile).

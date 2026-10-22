@@ -138,8 +138,9 @@ serve a release request, and an unavailable fast candidate is an error rather
 than a release fallback. The user-facing choice, retained measurements and
 their scope are owned by [installation](installation.md#fast-local-delivery).
 
-Both profiles currently compile with the native one-Cargo-job limit. Fast
-preparation may reuse one persistent target per key under the owned short
+Release currently compiles with one Cargo job; `delivery-fast` uses four Cargo
+jobs, selected from the matched no-contention matrix. Fast preparation may
+reuse one persistent target per key under the owned short
 `%TEMP%\chx` root. The key hashes the rustc/cargo version strings, target
 triple, profile and build-affecting inputs: root and member manifests,
 `Cargo.lock`, build scripts, toolchain selectors and Cargo host configuration.
@@ -151,9 +152,10 @@ leased scratch and never acquires this target.
 An unchanged source identity may reuse the target. A changed identity is
 accepted only when every added or changed identity path exists as a regular
 file with a modification time later than the recorded build epoch; a missing,
-older or restored timestamp uses fresh scratch. This is deliberately
-conservative and is not compiled-input-only reuse: the immutable candidate
-still requires the full checkout identity. An existing target with unavailable
+older or restored timestamp uses fresh scratch. This guard is separate from
+immutable-candidate reuse: fast candidate reuse also requires the
+compiled-input evidence below, while release still requires the full checkout
+identity. An existing target with unavailable
 or mismatched ownership, record or lease evidence, or an active lease, is
 preserved and not reused, with preparation proceeding on fresh scratch; a
 foreign or ambiguous `%TEMP%\chx` root itself is preserved and reported as an
@@ -175,11 +177,17 @@ completes that set in the second phase. The declaration lets a new source add
 a delivery program before its manager is compiled and does not select test
 helpers.
 
-Compiled-input-only candidate reuse remains planned and unavailable. Final
-dep-info coverage is verified, but the immutable candidate's reuse key is the
-full source identity, so test and fixture changes covered by that identity
-still invalidate it. Release concurrency and test-feedback measurements also
-remain open. Keep test-only feedback on its
+Fast compiled-input reuse is implemented. Finalization writes
+`compiled-inputs.json` with the union of source-relative dep-info inputs for
+every delivered binary, per-binary coverage and build-affecting identities. A
+fast candidate may be reused when all recorded compiled and build-affecting
+inputs match, even if only noncompiled test or documentation files changed; a
+test-like path that is compiled invalidates. Missing, malformed, empty,
+ambiguous or extra-unreferenced evidence forces a rebuild. Release candidates
+still require the full source identity. Reuse creates a content-addressed
+selection record with the same verified binary hashes and the current checkout
+relationship; it does not rewrite the build. Release concurrency and
+test-feedback measurements remain open. Keep test-only feedback on its
 [Cargo route](#development-feedback-without-a-publication-build) unless
 delivery or installed behavior is what needs verification. User-facing
 selection, measured scope and unresolved installed-lifecycle checks belong to
@@ -280,7 +288,9 @@ real compiler input) or unnecessary, while a dep-info-derived key exists only
 after a build and would need retained compiled-input evidence; no measured
 safe benefit justified narrowing the publication identity. The fast target
 uses the full source identity plus its conservative changed-input timestamp
-guard; it does not implement compiled-input-only candidate reuse.
+guard. Separately, fast immutable-candidate reuse uses the compiled-input
+evidence described above; release candidates still require the full source
+identity.
 The release profile (`lto = true`,
 `codegen-units = 1`) was compared once against thin LTO with 16 codegen
 units under identical source and toolchain conditions: the candidate built
@@ -290,8 +300,7 @@ profile is retained. The release route continues to reject a persistent
 compiler target because Cargo's freshness check trusts timestamps: a changed
 input with a preserved timestamp could silently reuse a stale artifact. Only
 the explicit fast route acquires a target, and it applies the separate
-conservative freshness fallback described above. Compiled-input-only candidate
-reuse remains planned and unavailable.
+conservative freshness fallback described above.
 Unchanged identity is already
 served by verified artifact reuse (a full live-identity and integrity
 validation measured 114-138 ms) without running Cargo at all.
