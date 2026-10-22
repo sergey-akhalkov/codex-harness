@@ -50,6 +50,7 @@ pub fn core_linked_binaries() -> impl Iterator<Item = &'static str> {
 #[derive(Serialize)]
 pub struct Report {
     pub status: &'static str,
+    pub profile: &'static str,
     pub model_calls: u32,
     pub links: usize,
     pub changed_links: usize,
@@ -321,7 +322,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn prepare(request: &Request) -> io::Result<Self> {
+    fn prepare(request: &Request, profile: build_identity::Profile) -> io::Result<Self> {
         for path in [
             &request.source,
             &request.build,
@@ -370,7 +371,7 @@ impl Plan {
             .map(|s| s.path_scope)
             .or(request.path_scope)
             .unwrap_or(PathScope::User);
-        validate_candidate_build(&request.source, &request.build)?;
+        validate_candidate_build_for(&request.source, &request.build, profile)?;
         let mut excluded = Vec::new();
         for binary in build_identity::BINARIES {
             excluded.push(request.build.join(binary));
@@ -567,11 +568,22 @@ impl Plan {
 /// Validate the immutable candidate independently of installed link ownership.
 /// Delivery calls this before reset can remove any current connection.
 pub fn validate_candidate_build(source: &Path, build: &Path) -> io::Result<()> {
-    let report = build_identity::check(build, Some(source));
+    let profile = build_identity::record_profile(&build_identity::read_record(build)?)?;
+    validate_candidate_build_for(source, build, profile)
+}
+
+/// Validate an immutable candidate for the profile the caller requested.
+pub fn validate_candidate_build_for(
+    source: &Path,
+    build: &Path,
+    profile: build_identity::Profile,
+) -> io::Result<()> {
+    let report = build_identity::check_profile(build, Some(source), profile);
     if !report.runtime_allowed {
-        return Err(io::Error::other(
-            "native candidate build is stale, missing or altered; explicit build required",
-        ));
+        return Err(io::Error::other(format!(
+            "native candidate build is stale, missing, altered, or for another profile; explicit matching build required: {}",
+            report.action
+        )));
     }
     let recorded_source = build_identity::read_record(build)?.source_root;
     if key(&plain(&recorded_source)?)? != key(&plain(&source.canonicalize()?)?)? {
@@ -585,12 +597,24 @@ pub fn validate_candidate_build(source: &Path, build: &Path) -> io::Result<()> {
 /// Explicit native core connection; dependency and subscription components are
 /// selected by the outer manager. Preview performs no publication or execution.
 pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
+    let profile = build_identity::record_profile(&build_identity::read_record(&request.build)?)?;
+    connect_for(request, preview, profile)
+}
+
+/// Connect an explicitly selected candidate profile. The caller must complete
+/// profile-aware selection before this installation boundary.
+pub fn connect_for(
+    request: &Request,
+    preview: bool,
+    profile: build_identity::Profile,
+) -> io::Result<Report> {
     let _owners = InstallationLocks::acquire(&request.user_home, &request.dependency_user_home)?;
-    let mut plan = Plan::prepare(request)?;
+    let mut plan = Plan::prepare(request, profile)?;
     if preview {
         let cpu_policy = cpu_policy::preview(&plan_routes(&plan));
         return Ok(Report {
             status: "preview",
+            profile: profile.as_str(),
             model_calls: 0,
             links: plan.desired.len() + usize::from(plan.reused_launch.is_none()),
             changed_links: plan.planned_changes,
@@ -757,6 +781,7 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
     let cpu_policy = cpu_policy::establish(&plan_routes(&plan));
     Ok(Report {
         status: "connected",
+        profile: profile.as_str(),
         model_calls: 0,
         links: plan.desired.len(),
         changed_links: applied
@@ -916,6 +941,13 @@ mod tests {
             )
             .unwrap();
         }
+        fn set_profile(&self, profile: build_identity::Profile) {
+            let path = self.request.build.join("build.json");
+            let mut record: build_identity::BuildRecord =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record.profile = profile.as_str().into();
+            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
         fn real(&mut self) {
             self.request.upstream = Some(
                 std::env::var_os("HARNESS_CORE_REAL_UPSTREAM")
@@ -955,6 +987,88 @@ mod tests {
                 b"foreign"
             );
             assert!(!fixture.request.codex_home.join("harness").exists());
+        });
+    }
+
+    #[test]
+    fn core_installation_enforces_the_requested_profile() {
+        crate::environment_path::with_test_registry(|| {
+            let fixture = Fixture::new();
+            assert!(
+                validate_candidate_build_for(
+                    &fixture.request.source,
+                    &fixture.request.build,
+                    build_identity::Profile::Release
+                )
+                .is_ok()
+            );
+            let error = validate_candidate_build_for(
+                &fixture.request.source,
+                &fixture.request.build,
+                build_identity::Profile::DeliveryFast,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("requested profile"), "{error}");
+            assert!(!fixture.request.codex_home.exists());
+
+            fixture.set_profile(build_identity::Profile::DeliveryFast);
+            let preview = connect_for(
+                &fixture.request,
+                true,
+                build_identity::Profile::DeliveryFast,
+            )
+            .unwrap();
+            assert_eq!(preview.profile, "delivery-fast");
+            assert!(connect_for(&fixture.request, true, build_identity::Profile::Release).is_err());
+            assert!(!fixture.request.codex_home.exists());
+        });
+    }
+
+    #[test]
+    fn altered_fast_candidate_preserves_the_connected_installation() {
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            let compile_root = fixture.root.join("compile");
+            fs::create_dir_all(&compile_root).unwrap();
+            fixture.request.upstream = Some(compile_fixture(
+                &compile_root,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_features.rs"),
+            ));
+            let launcher = compile_fixture(
+                &compile_root,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            fs::copy(&launcher, fixture.request.build.join("codex.exe")).unwrap();
+            fixture.record();
+            fixture.set_profile(build_identity::Profile::DeliveryFast);
+            let connected = connect_for(
+                &fixture.request,
+                false,
+                build_identity::Profile::DeliveryFast,
+            )
+            .unwrap();
+            assert_eq!(connected.profile, "delivery-fast");
+            assert!(connected.runtime.unwrap().passed);
+
+            let metadata = fixture.request.codex_home.join("harness/installation.json");
+            let metadata_before = fs::read(&metadata).unwrap();
+            let instruction_link = fixture.request.codex_home.join("AGENTS.md");
+            let link_before = fs::read_link(&instruction_link).unwrap();
+            fs::write(fixture.request.build.join("codex.exe"), b"altered").unwrap();
+            assert!(
+                connect_for(
+                    &fixture.request,
+                    false,
+                    build_identity::Profile::DeliveryFast
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(metadata).unwrap(), metadata_before);
+            assert_eq!(fs::read_link(instruction_link).unwrap(), link_before);
         });
     }
 

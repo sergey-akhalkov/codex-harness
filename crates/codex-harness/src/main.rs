@@ -311,7 +311,10 @@ fn run() -> io::Result<i32> {
             "codex-harness install|update --core-only|--code-tools-only --source CHECKOUT [--build DIRECTORY] --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--preview]"
         );
         println!(
-            "codex-harness deploy --source CHECKOUT [--codex-home DIRECTORY] [--user-home DIRECTORY] [--build DIRECTORY] [--state DIRECTORY] [--reset] [--all] [--preview]"
+            "codex-harness deploy --source CHECKOUT [--codex-home DIRECTORY] [--user-home DIRECTORY] [--build DIRECTORY] [--state DIRECTORY] [--reset] [--all] [--preview] [--fast]"
+        );
+        println!(
+            "deploy defaults to the release profile; --fast explicitly selects delivery-fast and never falls back to release"
         );
         println!(
             "codex-harness install --token-workflow-only|--board-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"

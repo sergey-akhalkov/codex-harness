@@ -38,3 +38,9 @@ debug = true
 strip = true
 lto = true
 codegen-units = 1
+
+[profile.delivery-fast]
+inherits = "release"
+strip = true
+lto = "off"
+codegen-units = 16

@@ -48,6 +48,42 @@ pub const BINARIES: &[&str] = &[
 pub const INSPECTION_SCHEMA: &str =
     ".agents/skills/structured-codex-run/assets/inspection.schema.json";
 
+/// Native compiler profiles that may be published into an owned build state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Profile {
+    #[default]
+    Release,
+    DeliveryFast,
+}
+
+impl Profile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::DeliveryFast => "delivery-fast",
+        }
+    }
+
+    /// Cargo's output directory within the target triple directory.
+    pub const fn output_dir(self) -> &'static str {
+        self.as_str()
+    }
+
+    pub fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "release" => Ok(Self::Release),
+            "delivery-fast" => Ok(Self::DeliveryFast),
+            _ => Err(io::Error::other(format!(
+                "unsupported native build profile {value:?}"
+            ))),
+        }
+    }
+}
+
+fn release_profile() -> String {
+    Profile::Release.as_str().into()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceIdentity {
@@ -64,6 +100,7 @@ pub struct BuildRecord {
     pub rustc: String,
     pub cargo: String,
     pub target: String,
+    #[serde(default = "release_profile")]
     pub profile: String,
     pub binaries: BTreeMap<String, String>,
 }
@@ -235,9 +272,13 @@ pub fn read_record(build: &Path) -> io::Result<BuildRecord> {
     serde_json::from_reader(file).map_err(io::Error::other)
 }
 
+pub fn record_profile(record: &BuildRecord) -> io::Result<Profile> {
+    Profile::parse(&record.profile)
+}
+
 pub(crate) fn verify_record_metadata(record: &BuildRecord) -> io::Result<()> {
     if record.schema != 1
-        || record.profile != "release"
+        || record_profile(record).is_err()
         || record.target != "x86_64-pc-windows-msvc"
         || !record.source_root.is_absolute()
         || !record.binaries.contains_key("codex-harness.exe")
@@ -361,7 +402,7 @@ pub fn artifacts(build: &Path) -> Artifacts {
     };
     let names_are_safe = record.binaries.keys().all(|name| binary_name_is_safe(name));
     let compatible = record.schema == SCHEMA
-        && record.profile == "release"
+        && record_profile(&record).is_ok()
         && record.target == "x86_64-pc-windows-msvc"
         && required_binaries_present(&record)
         && record.source.sha256
@@ -429,6 +470,24 @@ pub fn integrity(build: &Path) -> BuildCheck {
 /// the recorded checkout. Fresh, stale and unavailable source states are
 /// distinguished from executable damage.
 pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
+    check_with_profile(build, source_override, None)
+}
+
+/// Full diagnosis with an expected compiler profile. A candidate from another
+/// profile is incompatible even when its own artifacts are intact.
+pub fn check_profile(
+    build: &Path,
+    source_override: Option<&Path>,
+    expected: Profile,
+) -> BuildCheck {
+    check_with_profile(build, source_override, Some(expected))
+}
+
+fn check_with_profile(
+    build: &Path,
+    source_override: Option<&Path>,
+    expected: Option<Profile>,
+) -> BuildCheck {
     let artifacts = artifacts(build);
     if artifacts.check.status != Health::Healthy {
         return artifacts.check;
@@ -437,6 +496,19 @@ pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
         .record
         .as_ref()
         .expect("a healthy artifact pass carries its record");
+    if let Some(expected) = expected
+        && record_profile(record).is_ok_and(|actual| actual != expected)
+    {
+        return result(
+            Health::Incompatible,
+            false,
+            &format!(
+                "Native build profile {:?} does not match requested profile {:?}.",
+                record.profile,
+                expected.as_str()
+            ),
+        );
+    }
     let source = source_override.unwrap_or(&record.source_root);
     match source_identity(source) {
         Ok(current) if current == record.source => result(
@@ -622,6 +694,10 @@ mod tests {
 
     /// Owned build fixture: an intact record and every required binary.
     fn build_fixture(temp: &Path) -> (PathBuf, PathBuf) {
+        build_fixture_for(temp, Profile::Release)
+    }
+
+    fn build_fixture_for(temp: &Path, profile: Profile) -> (PathBuf, PathBuf) {
         let root = temp.join("source");
         source(&root);
         let build = temp.join("build");
@@ -638,7 +714,7 @@ mod tests {
             rustc: "test".into(),
             cargo: "test".into(),
             target: "x86_64-pc-windows-msvc".into(),
-            profile: "release".into(),
+            profile: profile.as_str().into(),
             binaries,
         };
         fs::write(
@@ -647,6 +723,55 @@ mod tests {
         )
         .unwrap();
         (root, build)
+    }
+
+    #[test]
+    fn legacy_records_default_to_release_and_profiles_do_not_cross() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_root, build) = build_fixture(temp.path());
+        let path = build.join("build.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("profile");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let record = read_record(&build).unwrap();
+        assert_eq!(record.profile, Profile::Release.as_str());
+        assert_eq!(
+            check_profile(&build, None, Profile::Release).status,
+            Health::Healthy
+        );
+        assert_eq!(
+            check_profile(&build, None, Profile::DeliveryFast).status,
+            Health::Incompatible
+        );
+
+        let fast_temp = tempfile::tempdir().unwrap();
+        let (_root, fast) = build_fixture_for(fast_temp.path(), Profile::DeliveryFast);
+        assert_eq!(
+            record_profile(&read_record(&fast).unwrap()).unwrap(),
+            Profile::DeliveryFast
+        );
+        assert_eq!(
+            check_profile(&fast, None, Profile::DeliveryFast).status,
+            Health::Healthy
+        );
+        assert_eq!(
+            check_profile(&fast, None, Profile::Release).status,
+            Health::Incompatible
+        );
+    }
+
+    #[test]
+    fn unknown_profiles_are_rejected_as_incompatible() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_root, build) = build_fixture(temp.path());
+        let path = build.join("build.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["profile"] = "release-ish".into();
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(integrity(&build).status, Health::Incompatible);
+        assert!(Profile::parse("release-ish").is_err());
     }
 
     fn hashes_of(events: &[String], path: &Path) -> usize {

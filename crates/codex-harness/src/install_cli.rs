@@ -1,7 +1,9 @@
 //! Native install/update/check/recover/disconnect with mutually exclusive
 //! component selectors. Combined activation remains unfinished.
 use harness_core::{
-    board_lifecycle, code_tools_lifecycle, core_install, installation_reset,
+    board_lifecycle, build_identity,
+    build_identity::Profile,
+    code_tools_lifecycle, core_install, installation_reset,
     lifecycle::{self, Component},
     native_build, subscription_lifecycle, token_workflow_lifecycle,
 };
@@ -568,12 +570,14 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
     let mut preview = false;
     let mut reset = false;
     let mut all = false;
+    let mut fast = false;
     let mut iter = args.iter();
     while let Some(key) = iter.next() {
         match key.to_str() {
             Some("--preview") if !preview => preview = true,
             Some("--reset") if !reset => reset = true,
             Some("--all") if !all => all = true,
+            Some("--fast") if !fast => fast = true,
             Some(name)
                 if [
                     "--source",
@@ -627,6 +631,11 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
         })
         .transpose()?
         .unwrap_or(45);
+    let profile = if fast {
+        Profile::DeliveryFast
+    } else {
+        Profile::Release
+    };
     let (build, build_selection) = match optional("--build") {
         Some(build) => (build, "explicit"),
         None => {
@@ -635,7 +644,9 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
                 None => current_state()?,
             };
             let existing = if preview {
-                native_build::preview_build(&state, &source).ok().flatten()
+                native_build::preview_build_for(&state, &source, profile)
+                    .ok()
+                    .flatten()
             } else {
                 None
             };
@@ -647,16 +658,16 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
                     .cloned()
                     .unwrap_or_else(|| "cargo".into());
                 (
-                    plain_path(native_build::prepare(&source, &state, &cargo)?.build),
+                    plain_path(native_build::prepare_for(&source, &state, &cargo, profile)?.build),
                     "prepared",
                 )
             }
         }
     };
     let build = plain_path(build);
-    core_install::validate_candidate_build(&source, &build)?;
-    let build_check = harness_core::build_identity::check(&build, Some(&source));
-    let build_identity = harness_core::build_identity::read_record(&build)
+    core_install::validate_candidate_build_for(&source, &build, profile)?;
+    let build_check = build_identity::check_profile(&build, Some(&source), profile);
+    let build_identity = build_identity::read_record(&build)
         .map(|record| record.source.sha256.chars().take(16).collect::<String>())
         .unwrap_or_default();
     let preflight = if preview {
@@ -667,7 +678,7 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "status":"verification-failed", "source":source, "build":build,
+                    "status":"verification-failed", "profile":profile.as_str(), "source":source, "build":build,
                     "build_identity":build_identity, "installation_changed":false,
                     "verification":{"serena":report},
                 }))?
@@ -684,7 +695,7 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
     } else {
         None
     };
-    let core = serde_json::to_value(core_install::connect(
+    let core = serde_json::to_value(core_install::connect_for(
         &core_install::Request {
             source: source.clone(),
             build: build.clone(),
@@ -705,6 +716,7 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
                 .transpose()?,
         },
         preview,
+        profile,
     )?)?;
     let mut components = Vec::new();
     let mut status = if preview { "preview" } else { "deployed" };
@@ -796,6 +808,7 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "status": status,
+            "profile": profile.as_str(),
             "source": source,
             "build": build,
             "build_identity": build_identity,
@@ -819,10 +832,77 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    fn candidate(root: &Path, profile: Profile) -> (PathBuf, PathBuf) {
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("crates/test/src")).unwrap();
+        for path in ["Cargo.toml", "Cargo.lock", "crates/test/src/lib.rs"] {
+            std::fs::write(source.join(path), path).unwrap();
+        }
+        let build = root.join("build");
+        std::fs::create_dir(&build).unwrap();
+        let binaries = build_identity::BINARIES
+            .iter()
+            .map(|name| {
+                std::fs::write(build.join(name), name).unwrap();
+                (
+                    (*name).to_owned(),
+                    build_identity::hash_file(&build.join(name)).unwrap(),
+                )
+            })
+            .collect();
+        let record = build_identity::BuildRecord {
+            schema: build_identity::SCHEMA,
+            source_root: source.clone(),
+            source: build_identity::source_identity(&source).unwrap(),
+            rustc: "fixture".into(),
+            cargo: "fixture".into(),
+            target: "x86_64-pc-windows-msvc".into(),
+            profile: profile.as_str().into(),
+            binaries,
+        };
+        std::fs::write(
+            build.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        (source, build)
+    }
+
     #[test]
     fn deploy_rejects_a_relative_source_before_any_work() {
         let error = deploy(&os(&["--source", "kit"])).unwrap_err();
         assert!(error.to_string().contains("absolute checkout path"));
+    }
+
+    #[test]
+    fn deploy_rejects_duplicate_fast_before_any_work() {
+        let error = deploy(&os(&["--source", "D:/kit", "--fast", "--fast"])).unwrap_err();
+        assert!(error.to_string().contains("unknown or duplicate"));
+    }
+
+    #[test]
+    fn explicit_build_must_match_the_requested_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let (source, build) = candidate(temp.path(), Profile::Release);
+        let codex_home = temp.path().join("codex");
+        let user_home = temp.path().join("user");
+        let error = deploy(&[
+            "--source".into(),
+            source.into_os_string(),
+            "--build".into(),
+            build.into_os_string(),
+            "--fast".into(),
+            "--preview".into(),
+            "--codex-home".into(),
+            codex_home.as_os_str().to_owned(),
+            "--user-home".into(),
+            user_home.as_os_str().to_owned(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requested profile"), "{error}");
+        assert!(!codex_home.exists());
+        assert!(!user_home.exists());
     }
 
     #[test]

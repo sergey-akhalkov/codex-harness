@@ -1,6 +1,6 @@
 //! Explicit candidate preparation. This module never changes active registrations.
 //! Compiler concurrency stays within the installation's fixed resource budget.
-use crate::build_identity::{self, BINARIES};
+use crate::build_identity::{self, BINARIES, Profile};
 use crate::heavy_command;
 use crate::process::{
     Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, StopReason,
@@ -86,12 +86,13 @@ fn verify_compiled_inputs(
     target: &Path,
     source: &Path,
     inputs: &build_identity::SourceIdentity,
+    profile: Profile,
 ) -> io::Result<()> {
     let canonical_target = target.canonicalize()?;
     for binary in BINARIES {
         let depfile = target
             .join(TARGET)
-            .join("release")
+            .join(profile.output_dir())
             .join(binary)
             .with_extension("d");
         ordinary_ancestors(&depfile)?;
@@ -627,7 +628,7 @@ fn published_sequence(build: &Path) -> Option<(u128, u32)> {
     Some((sequence, pid))
 }
 
-fn candidate_builds(state: &Path) -> io::Result<Vec<((u128, u32), PathBuf)>> {
+fn candidate_builds(state: &Path, profile: Profile) -> io::Result<Vec<((u128, u32), PathBuf)>> {
     owner_root(state)?;
     let builds = state.join("builds");
     let missing = || {
@@ -648,9 +649,10 @@ fn candidate_builds(state: &Path) -> io::Result<Vec<((u128, u32), PathBuf)>> {
         let Ok(record) = build_identity::verify_record_integrity(&path) else {
             continue;
         };
-        if !BINARIES
-            .iter()
-            .all(|name| record.binaries.contains_key(*name))
+        if build_identity::record_profile(&record).ok() != Some(profile)
+            || !BINARIES
+                .iter()
+                .all(|name| record.binaries.contains_key(*name))
         {
             continue;
         }
@@ -663,7 +665,11 @@ fn candidate_builds(state: &Path) -> io::Result<Vec<((u128, u32), PathBuf)>> {
 /// The freshest published build whose full record and every recorded binary
 /// still verify. An unverified, altered or foreign directory is never chosen.
 pub fn freshest_verified(state: &Path) -> io::Result<PathBuf> {
-    candidate_builds(state)?
+    freshest_verified_for(state, Profile::Release)
+}
+
+fn freshest_verified_for(state: &Path, profile: Profile) -> io::Result<PathBuf> {
+    candidate_builds(state, profile)?
         .into_iter()
         .next()
         .map(|(_, path)| path)
@@ -681,9 +687,10 @@ fn freshest_for_source(
     state: &Path,
     source: &Path,
     require_current_source: bool,
+    profile: Profile,
 ) -> io::Result<Option<PathBuf>> {
     let source = source.canonicalize()?;
-    Ok(candidate_builds(state)?
+    Ok(candidate_builds(state, profile)?
         .into_iter()
         .map(|(_, path)| path)
         .find(|path| {
@@ -692,7 +699,7 @@ fn freshest_for_source(
                 .and_then(|record| record.source_root.canonicalize().ok())
                 .is_some_and(|root| root == source)
                 && (!require_current_source
-                    || build_identity::check(path, Some(&source)).status
+                    || build_identity::check_profile(path, Some(&source), profile).status
                         == build_identity::Health::Healthy)
         }))
 }
@@ -701,8 +708,16 @@ fn freshest_for_source(
 /// or activating anything. The caller retains normal preparation when no
 /// eligible build is available.
 pub fn preview_build(state: &Path, source: &Path) -> io::Result<Option<PathBuf>> {
+    preview_build_for(state, source, Profile::Release)
+}
+
+pub fn preview_build_for(
+    state: &Path,
+    source: &Path,
+    profile: Profile,
+) -> io::Result<Option<PathBuf>> {
     verify_owned_state(state)?;
-    freshest_for_source(state, source, false)
+    freshest_for_source(state, source, false, profile)
 }
 
 /// The build delivered by an Install/Update that names none: the freshest
@@ -731,7 +746,8 @@ fn delivery_from(executable: &Path, source: &Path) -> io::Result<PathBuf> {
         return Err(outside());
     }
     let state = builds.parent().ok_or_else(outside)?;
-    freshest_for_source(state, source, true)?
+    let profile = build_identity::record_profile(&build_identity::read_record(build)?)?;
+    freshest_for_source(state, source, true, profile)?
         .ok_or_else(|| {
             io::Error::other(
                 "No integrity-verified native build matches the selected source; run an explicit build first.",
@@ -763,6 +779,7 @@ fn reusable_candidates(
     rustc: &str,
     cargo: &str,
     expected: &build_identity::SourceIdentity,
+    profile: Profile,
 ) -> io::Result<Vec<(PathBuf, build_identity::BuildRecord)>> {
     let builds = state.join("builds");
     if !builds.exists() {
@@ -779,6 +796,7 @@ fn reusable_candidates(
             || record.rustc != rustc
             || record.cargo != cargo
             || record.target != TARGET
+            || build_identity::record_profile(&record).ok() != Some(profile)
             || shared_content_differs(&record.source, expected)
         {
             continue;
@@ -794,8 +812,9 @@ fn find_reusable(
     rustc: &str,
     cargo: &str,
     expected: &build_identity::SourceIdentity,
+    profile: Profile,
 ) -> io::Result<Option<PreparedBuild>> {
-    for (path, record) in reusable_candidates(state, source, rustc, cargo, expected)? {
+    for (path, record) in reusable_candidates(state, source, rustc, cargo, expected, profile)? {
         if consumer_check(&path, Some(source))
             .is_ok_and(|check| check.status == build_identity::Health::Healthy)
         {
@@ -943,11 +962,17 @@ pub fn activate_candidate(
 
 /// Base publication Cargo command. Both phases share source, target and
 /// limits; only the binary selection differs.
-fn publication_cargo(source: &Path, target: &Path, cargo: &OsStr) -> io::Result<CommandSpec> {
+fn publication_cargo(
+    source: &Path,
+    target: &Path,
+    cargo: &OsStr,
+    profile: Profile,
+) -> io::Result<CommandSpec> {
     let mut command = CommandSpec::new(resolve_tool(cargo)?);
     command.args = [
         "build",
-        "--release",
+        "--profile",
+        profile.as_str(),
         "--locked",
         // Cargo otherwise scales rustc concurrency to host CPU count, which
         // does not reflect the fixed memory budget of the compiler job.
@@ -995,7 +1020,12 @@ fn publication_bin_selection(delivery: Option<&[String]>) -> Vec<OsString> {
 
 /// Ask the freshly compiled manager for the delivery programs its own source
 /// declares. `None` means the compiled manager predates the query.
-fn probe_delivery(target: &Path, staging: &Path, source: &Path) -> io::Result<Option<Vec<String>>> {
+fn probe_delivery(
+    target: &Path,
+    staging: &Path,
+    source: &Path,
+    profile: Profile,
+) -> io::Result<Option<Vec<String>>> {
     let request = staging.join("delivery-probe-request.json");
     ordinary_ancestors(&request)?;
     let mut file = OpenOptions::new()
@@ -1008,7 +1038,12 @@ fn probe_delivery(target: &Path, staging: &Path, source: &Path) -> io::Result<Op
     }))?)?;
     file.sync_all()?;
     drop(file);
-    let mut command = CommandSpec::new(target.join(TARGET).join("release/codex-harness.exe"));
+    let mut command = CommandSpec::new(
+        target
+            .join(TARGET)
+            .join(profile.output_dir())
+            .join("codex-harness.exe"),
+    );
     command.args = vec!["finalize-build-v1".into(), request.as_os_str().to_owned()];
     command.current_dir = Some(source.to_owned());
     let log = staging.join("delivery-probe.log");
@@ -1123,6 +1158,16 @@ fn run_publication_phase(
 /// Build into installation-owned state, then publish an immutable candidate.
 /// No Cargo command is reachable from `build_identity::check`.
 pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<PreparedBuild> {
+    prepare_for(source, state, cargo, Profile::Release)
+}
+
+/// Prepare an immutable candidate from the explicitly selected compiler profile.
+pub fn prepare_for(
+    source: &Path,
+    state: &Path,
+    cargo: &OsStr,
+    profile: Profile,
+) -> io::Result<PreparedBuild> {
     if !cfg!(all(windows, target_arch = "x86_64")) {
         return Err(io::Error::other(
             "Native bootstrap currently supports Windows x64 with MSVC.",
@@ -1188,7 +1233,8 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     if let Ok(Some(root)) = owned_scratch_root(&scratch_root(), false) {
         sweep_owned_scratch(&root);
     }
-    if let Some(reused) = find_reusable(&state, &source, &rustc, &cargo_version, &before)? {
+    if let Some(reused) = find_reusable(&state, &source, &rustc, &cargo_version, &before, profile)?
+    {
         return Ok(reused);
     }
     let sequence = SystemTime::now()
@@ -1227,7 +1273,7 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     // selection instead, so older sources and producers keep publishing. The
     // delivery programs are therefore compiled without unrelated test-only
     // fixture binaries and without a second maintained list of names.
-    let mut command = publication_cargo(&source, &target, cargo)?;
+    let mut command = publication_cargo(&source, &target, cargo, profile)?;
     command.args.push("--bin".into());
     command.args.push("codex-harness".into());
     run_publication_phase(
@@ -1239,8 +1285,8 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
         &log_path,
         &mut command,
     )?;
-    let delivery = probe_delivery(&target, &staging, &source)?;
-    let mut command = publication_cargo(&source, &target, cargo)?;
+    let delivery = probe_delivery(&target, &staging, &source, profile)?;
+    let mut command = publication_cargo(&source, &target, cargo, profile)?;
     command
         .args
         .extend(publication_bin_selection(delivery.as_deref()));
@@ -1261,7 +1307,10 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
             "Native sources changed during the build; candidate not accepted. Retry explicit build with stable inputs.",
         ));
     }
-    let compiled_manager = target.join(TARGET).join("release/codex-harness.exe");
+    let compiled_manager = target
+        .join(TARGET)
+        .join(profile.output_dir())
+        .join("codex-harness.exe");
     ordinary_ancestors(&compiled_manager)?;
     let record = handoff::run(handoff::Request {
         schema: 1,
@@ -1272,7 +1321,7 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
         rustc,
         cargo: cargo_version,
         build_target: TARGET.into(),
-        profile: "release".into(),
+        profile: profile.as_str().into(),
         manager_sha256: build_identity::hash_file(&compiled_manager)?,
     })?;
     if build_identity::source_identity(&source)? != before {
@@ -1342,6 +1391,16 @@ mod tests {
     }
 
     fn published_from(state: &Path, name: &str, source: &Path, binaries: &[&str]) -> PathBuf {
+        published_from_profile(state, name, source, binaries, Profile::Release)
+    }
+
+    fn published_from_profile(
+        state: &Path,
+        name: &str,
+        source: &Path,
+        binaries: &[&str],
+        profile: Profile,
+    ) -> PathBuf {
         let build = state.join("builds").join(name);
         fs::create_dir_all(&build).unwrap();
         let mut hashes = std::collections::BTreeMap::new();
@@ -1359,7 +1418,7 @@ mod tests {
             rustc: "fixture".into(),
             cargo: "fixture".into(),
             target: "x86_64-pc-windows-msvc".into(),
-            profile: "release".into(),
+            profile: profile.as_str().into(),
             binaries: hashes,
         };
         fs::write(
@@ -1397,6 +1456,75 @@ mod tests {
     }
 
     #[test]
+    fn preview_and_delivery_never_cross_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let source = source_fixture(temp.path(), "source");
+        let release = published_from(&state, "aaaa0000aaaa0000-1500-1", &source, BINARIES);
+        let fast = published_from_profile(
+            &state,
+            "bbbb0000bbbb0000-2500-2",
+            &source,
+            BINARIES,
+            Profile::DeliveryFast,
+        );
+        assert_eq!(
+            preview_build(&state, &source).unwrap(),
+            Some(release.clone())
+        );
+        assert_eq!(
+            preview_build_for(&state, &source, Profile::DeliveryFast).unwrap(),
+            Some(fast.clone())
+        );
+        assert_eq!(freshest_verified(&state).unwrap(), release);
+        assert_eq!(
+            freshest_verified_for(&state, Profile::DeliveryFast).unwrap(),
+            fast.clone()
+        );
+
+        let newer_release = published_from(&state, "cccc0000cccc0000-3500-3", &source, BINARIES);
+        assert_eq!(preview_build(&state, &source).unwrap(), Some(newer_release));
+        assert_eq!(
+            preview_build_for(&state, &source, Profile::DeliveryFast).unwrap(),
+            Some(fast.clone())
+        );
+        fs::remove_dir_all(fast).unwrap();
+        assert_eq!(
+            preview_build_for(&state, &source, Profile::DeliveryFast).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn publication_cargo_uses_the_selected_profile_only() {
+        let source = Path::new("D:/source");
+        let target = Path::new("D:/target");
+        let release =
+            publication_cargo(source, target, OsStr::new("cargo"), Profile::Release).unwrap();
+        let fast =
+            publication_cargo(source, target, OsStr::new("cargo"), Profile::DeliveryFast).unwrap();
+        let args = |command: &CommandSpec| -> Vec<String> {
+            command
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(
+            args(&release)
+                .windows(2)
+                .any(|pair| pair == ["--profile", "release"])
+        );
+        assert!(
+            args(&fast)
+                .windows(2)
+                .any(|pair| pair == ["--profile", "delivery-fast"])
+        );
+        assert!(!args(&fast).iter().any(|arg| arg == "--release"));
+    }
+
+    #[test]
     fn reuse_selection_rejects_nonmatching_candidates_before_consumer_validation() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
@@ -1423,20 +1551,52 @@ mod tests {
         let _changed_checkout =
             published_from(&state, "dddd0000dddd0000-4500-4", &source, BINARIES);
         fs::write(&changed, "fixture").unwrap();
+        let fast = published_from_profile(
+            &state,
+            "eeee0000eeee0000-5500-5",
+            &source,
+            BINARIES,
+            Profile::DeliveryFast,
+        );
 
-        let candidates =
-            reusable_candidates(&state, &source, "fixture", "fixture", &identity).unwrap();
+        let candidates = reusable_candidates(
+            &state,
+            &source,
+            "fixture",
+            "fixture",
+            &identity,
+            Profile::Release,
+        )
+        .unwrap();
         let names: Vec<_> = candidates
             .iter()
             .map(|(path, _)| path.file_name().unwrap().to_str().unwrap().to_owned())
             .collect();
         assert_eq!(names, vec!["aaaa0000aaaa0000-1500-1".to_owned()]);
         assert_eq!(candidates[0].0, matching);
+        let fast_candidates = reusable_candidates(
+            &state,
+            &source,
+            "fixture",
+            "fixture",
+            &identity,
+            Profile::DeliveryFast,
+        )
+        .unwrap();
+        assert_eq!(fast_candidates.len(), 1);
+        assert_eq!(fast_candidates[0].0, fast);
         // A candidate whose record is intact but whose recorded bytes changed
         // still reaches consumer validation: filtering is identity, not trust.
         fs::write(matching.join("harness-rtk.exe"), "changed").unwrap();
-        let candidates =
-            reusable_candidates(&state, &source, "fixture", "fixture", &identity).unwrap();
+        let candidates = reusable_candidates(
+            &state,
+            &source,
+            "fixture",
+            "fixture",
+            &identity,
+            Profile::Release,
+        )
+        .unwrap();
         assert_eq!(candidates.len(), 1);
         assert!(
             consumer_check(&candidates[0].0, Some(&source)).is_err(),
@@ -1453,8 +1613,10 @@ mod tests {
         let source = source_fixture(temp.path(), "source");
         let target = temp.path().join("target");
         let release = target.join(TARGET).join("release");
+        let delivery_fast = target.join(TARGET).join(Profile::DeliveryFast.output_dir());
         fs::create_dir_all(source.join("crates/one/tests/fixtures")).unwrap();
         fs::create_dir_all(&release).unwrap();
+        fs::create_dir_all(&delivery_fast).unwrap();
         let covered = source.join("crates/one/src/lib.rs");
         let fixture = source.join("crates/one/tests/fixtures/message.txt");
         fs::write(&fixture, "fixture").unwrap();
@@ -1464,6 +1626,8 @@ mod tests {
         fs::write(&outside, "readme").unwrap();
         let generated = release.join("generated.rs");
         fs::write(&generated, "generated").unwrap();
+        let generated_fast = delivery_fast.join("generated.rs");
+        fs::write(&generated_fast, "generated fast").unwrap();
         let foreign = temp.path().join("foreign.rs");
         fs::write(&foreign, "foreign").unwrap();
         let identity = build_identity::source_identity(&source).unwrap();
@@ -1478,39 +1642,41 @@ mod tests {
         // compares canonicalized input paths against them.
         let source = source.canonicalize().unwrap();
         let target = target.canonicalize().unwrap();
-        let write = |binary: &str, input: &Path| {
+        let write = |directory: &Path, binary: &str, input: &Path| {
             for &name in BINARIES {
-                fs::write(release.join(name), "binary").unwrap();
+                fs::write(directory.join(name), "binary").unwrap();
                 let chosen = if name == binary {
                     input
                 } else {
                     covered.as_path()
                 };
                 fs::write(
-                    release.join(name).with_extension("d"),
-                    format!("{}: {}\n", release.join(name).display(), chosen.display()),
+                    directory.join(name).with_extension("d"),
+                    format!("{}: {}\n", directory.join(name).display(), chosen.display()),
                 )
                 .unwrap();
             }
         };
-        write("", &covered);
-        verify_compiled_inputs(&target, &source, &identity).unwrap();
-        write("harness-rtk.exe", &fixture);
-        verify_compiled_inputs(&target, &source, &identity).unwrap();
-        write("codex.exe", &banner);
-        verify_compiled_inputs(&target, &source, &identity).unwrap();
-        write("token-audit.exe", &generated);
-        verify_compiled_inputs(&target, &source, &identity).unwrap();
-        write("harness-inspect.exe", &outside);
-        let refused = verify_compiled_inputs(&target, &source, &identity)
+        write(&release, "", &covered);
+        verify_compiled_inputs(&target, &source, &identity, Profile::Release).unwrap();
+        write(&release, "harness-rtk.exe", &fixture);
+        verify_compiled_inputs(&target, &source, &identity, Profile::Release).unwrap();
+        write(&release, "codex.exe", &banner);
+        verify_compiled_inputs(&target, &source, &identity, Profile::Release).unwrap();
+        write(&release, "token-audit.exe", &generated);
+        verify_compiled_inputs(&target, &source, &identity, Profile::Release).unwrap();
+        write(&delivery_fast, "token-audit.exe", &generated_fast);
+        verify_compiled_inputs(&target, &source, &identity, Profile::DeliveryFast).unwrap();
+        write(&release, "harness-inspect.exe", &outside);
+        let refused = verify_compiled_inputs(&target, &source, &identity, Profile::Release)
             .unwrap_err()
             .to_string();
         assert!(
             refused.contains("outside the native input inventory"),
             "{refused}"
         );
-        write("harness-observe.exe", &foreign);
-        let refused = verify_compiled_inputs(&target, &source, &identity)
+        write(&release, "harness-observe.exe", &foreign);
+        let refused = verify_compiled_inputs(&target, &source, &identity, Profile::Release)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1549,12 +1715,15 @@ mod tests {
         let from_second = published_from(&state, "bbbb0000bbbb0000-2500-2", &second, BINARIES);
         assert_eq!(freshest_verified(&state).unwrap(), from_second);
         assert_eq!(
-            freshest_for_source(&state, &first, true).unwrap(),
+            freshest_for_source(&state, &first, true, Profile::Release).unwrap(),
             Some(from_first.clone())
         );
         // A build whose live source no longer matches is not deliverable.
         fs::write(first.join("crates/one/src/lib.rs"), "changed").unwrap();
-        assert_eq!(freshest_for_source(&state, &first, true).unwrap(), None);
+        assert_eq!(
+            freshest_for_source(&state, &first, true, Profile::Release).unwrap(),
+            None
+        );
         assert_eq!(
             preview_build(&state, &first).unwrap(),
             Some(from_first.clone())
@@ -1597,6 +1766,31 @@ mod tests {
             error.to_string().contains("matches the selected source"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn delivery_from_uses_the_manager_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let source = source_fixture(temp.path(), "source");
+        let fast_old = published_from_profile(
+            &state,
+            "aaaa0000aaaa0000-1500-1",
+            &source,
+            BINARIES,
+            Profile::DeliveryFast,
+        );
+        let fast_new = published_from_profile(
+            &state,
+            "bbbb0000bbbb0000-2500-2",
+            &source,
+            BINARIES,
+            Profile::DeliveryFast,
+        );
+        let _release_new = published_from(&state, "cccc0000cccc0000-3500-3", &source, BINARIES);
+        let delivered = delivery_from(&fast_old.join("codex-harness.exe"), &source).unwrap();
+        assert_eq!(delivered, fast_new);
     }
 
     /// Create an NTFS junction without requiring the symlink privilege.

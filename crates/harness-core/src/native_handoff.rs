@@ -1,7 +1,7 @@
 //! Version 1 transfer from a bounded compiler owner to the freshly built manager.
 //! The caller owns the lock and publication; this process only fills staging.
 use super::{TARGET, ordinary_ancestors, verify_compiled_inputs};
-use crate::build_identity::{self, BINARIES, BuildRecord, SCHEMA, SourceIdentity};
+use crate::build_identity::{self, BINARIES, BuildRecord, Profile, SCHEMA, SourceIdentity};
 use crate::process::{Cancellation, CommandSpec, Deadline, Job, Limits, StopReason};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -127,7 +127,11 @@ fn validate_paths(request_path: &Path, request: &Request) -> io::Result<()> {
         ));
     }
     super::verify_owned_state(state)?;
-    let manager = target.join(TARGET).join("release/codex-harness.exe");
+    let profile = Profile::parse(&request.profile)?;
+    let manager = target
+        .join(TARGET)
+        .join(profile.output_dir())
+        .join("codex-harness.exe");
     if std::env::current_exe()?.canonicalize()? != manager.canonicalize()?
         || build_identity::hash_file(&manager)? != request.manager_sha256
     {
@@ -142,18 +146,23 @@ fn validate_paths(request_path: &Path, request: &Request) -> io::Result<()> {
 pub(super) fn finalize(request_path: &Path) -> io::Result<()> {
     let request_bytes = bounded_bytes(request_path)?;
     let request: Request = serde_json::from_slice(&request_bytes)?;
-    if request.schema != 1 || request.build_target != TARGET || request.profile != "release" {
+    if request.schema != 1 || request.build_target != TARGET {
         return Err(io::Error::other(
             "Unsupported native finalization protocol.",
         ));
     }
+    let profile = Profile::parse(&request.profile)?;
     validate_paths(request_path, &request)?;
     let current = build_identity::source_identity(&request.source)?;
     known_before(&current, &request.before)?;
-    verify_compiled_inputs(&request.target, &request.source, &current)?;
+    verify_compiled_inputs(&request.target, &request.source, &current, profile)?;
     let mut binaries = BTreeMap::new();
     for name in BINARIES {
-        let built = request.target.join(TARGET).join("release").join(name);
+        let built = request
+            .target
+            .join(TARGET)
+            .join(profile.output_dir())
+            .join(name);
         ordinary_ancestors(&built)?;
         let destination = request.staging.join(name);
         ordinary_ancestors(&destination)?;
@@ -185,7 +194,8 @@ pub(super) fn finalize(request_path: &Path) -> io::Result<()> {
     write_new(&request.staging.join("build.json"), &record_bytes)?;
     if build_identity::source_identity(&request.source)? != current
         || bounded_bytes(request_path)? != request_bytes
-        || !build_identity::check(&request.staging, Some(&request.source)).runtime_allowed
+        || !build_identity::check_profile(&request.staging, Some(&request.source), profile)
+            .runtime_allowed
     {
         return Err(io::Error::other(
             "Fresh consumer verification failed; staging retained.",
@@ -217,6 +227,7 @@ pub(super) fn run(request: Request) -> io::Result<BuildRecord> {
 
 fn run_with_timeout(request: Request, timeout: Duration) -> io::Result<BuildRecord> {
     let request_bytes = serde_json::to_vec_pretty(&request)?;
+    let profile = Profile::parse(&request.profile)?;
     let path = request.staging.join(REQUEST);
     write_new(&path, &request_bytes)?;
     let log_path = request.staging.join("finalize.log");
@@ -224,7 +235,8 @@ fn run_with_timeout(request: Request, timeout: Duration) -> io::Result<BuildReco
         request
             .target
             .join(TARGET)
-            .join("release/codex-harness.exe"),
+            .join(profile.output_dir())
+            .join("codex-harness.exe"),
     );
     command.args = vec!["finalize-build-v1".into(), path.as_os_str().to_owned()];
     command.current_dir = Some(request.source.clone());
@@ -326,6 +338,35 @@ pub(crate) fn invoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalization_rejects_an_unknown_profile_before_any_path_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = temp.path().join(REQUEST);
+        fs::write(
+            &request,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "source": temp.path().join("missing-source"),
+                "target": temp.path().join("missing-target"),
+                "staging": temp.path().join("missing-staging"),
+                "before": {"sha256": "", "files": {}},
+                "rustc": "fixture",
+                "cargo": "fixture",
+                "build_target": TARGET,
+                "profile": "release-ish",
+                "manager_sha256": "fixture"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = finalize(&request).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported native build profile"),
+            "{error}"
+        );
+        assert!(!temp.path().join("missing-staging").exists());
+    }
 
     #[cfg(windows)]
     #[test]
