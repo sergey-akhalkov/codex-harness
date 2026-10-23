@@ -13,6 +13,8 @@ mod executor_assignment;
 #[cfg(windows)]
 mod executor_cli;
 #[cfg(windows)]
+mod executor_mcp;
+#[cfg(windows)]
 mod executor_shell;
 mod feedback_cli;
 #[cfg(windows)]
@@ -276,6 +278,7 @@ fn run() -> io::Result<i32> {
         println!("codex-harness mcp apply-registration --help (owned MCP registration journal)");
         println!("codex-harness mcp serena --help (shared native Serena stdio client)");
         println!("codex-harness mcp nuphus --help (audited original Nuphus stdio adapter)");
+        println!("codex-harness mcp executors --help (same-runtime executor dispatch)");
         println!(
             "codex-harness diagnose [--project DIRECTORY] [--codex-home DIRECTORY] [--source CHECKOUT]"
         );

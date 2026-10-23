@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "executors": {
+      "command": "codex-harness",
+      "args": ["mcp", "executors"]
+    }
+  }
+}

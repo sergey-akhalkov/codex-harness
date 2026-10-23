@@ -32,6 +32,9 @@ pub struct Operation {
     pub id: Value,
     pub name: String,
     pub arguments: Value,
+    /// The request's `_meta` object, exactly as the client sent it. Identity
+    /// consumers read this trusted request channel, never tool arguments.
+    pub metadata: Value,
     pub deadline: Deadline,
     pub cancellation: Cancellation,
 }
@@ -216,6 +219,7 @@ impl Session {
                     id: id.clone(),
                     name: name.into(),
                     arguments,
+                    metadata: params.get("_meta").cloned().unwrap_or(Value::Null),
                     deadline: Deadline::after(Duration::from_secs(60))?,
                     cancellation: Cancellation::default(),
                 });

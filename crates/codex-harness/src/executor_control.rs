@@ -1730,6 +1730,15 @@ impl Conversation {
         Ok(conversation)
     }
 
+    /// Starts one new thread on an already registered app-server without
+    /// taking ownership of its process. The thread, not the lead's thread, is
+    /// the conversation this object then addresses. No turn starts here.
+    pub(crate) fn start_on_endpoint(endpoint: &Endpoint, plan: &ControlPlan) -> io::Result<Self> {
+        let mut conversation = Self::attach(endpoint, plan.bound)?;
+        conversation.start_thread(plan)?;
+        Ok(conversation)
+    }
+
     /// The endpoint of this conversation, with its thread identity.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
@@ -2069,6 +2078,27 @@ impl Conversation {
                 ));
             }
         };
+        let thread = &read["thread"];
+        if thread["id"].as_str() != Some(thread_id) {
+            return Err(invalid(format!(
+                "thread/read answered for thread {} instead of {thread_id}; refusing to read another conversation",
+                thread["id"]
+            )));
+        }
+        Ok(thread.clone())
+    }
+
+    /// Reads one exact thread's current record without turns. This is the
+    /// attachment proof: the same endpoint must report the requested thread as
+    /// loaded, not merely list its id from the shared thread store.
+    pub(crate) fn read_thread_state(&mut self, thread_id: &str) -> io::Result<Value> {
+        if thread_id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reading a thread state requires its exact identity",
+            ));
+        }
+        let read = self.call("thread/read", json!({"threadId": thread_id}))?;
         let thread = &read["thread"];
         if thread["id"].as_str() != Some(thread_id) {
             return Err(invalid(format!(
