@@ -1914,15 +1914,27 @@ fn release(operation: &Operation) -> io::Result<Value> {
     // canonical receipt while this run's own payload paths are removed.
     let message_cleanup = executor_input::cleanup_recorded_messages(&home, &current.receipt);
     let is_live = |owner: &str| executor_cli::owner_live(&home, &current.repository, owner);
-    let released = task_worktree::release_slot(
-        &home,
-        &pool,
-        current.slot,
-        disposition,
-        reason,
-        &base,
-        &is_live,
-    )?;
+    let released = match record.task.as_deref() {
+        Some(task) => task_worktree::release_task(
+            &home,
+            &current.repository,
+            task,
+            disposition,
+            reason,
+            &base,
+            record.handle.as_deref(),
+            &is_live,
+        )?,
+        None => task_worktree::release_slot(
+            &home,
+            &pool,
+            current.slot,
+            disposition,
+            reason,
+            &base,
+            &is_live,
+        )?,
+    };
     let (outcome, slot_state, base, limitation) = match released {
         LaneDisposition::Reused { base } => ("reused", "released", base, None),
         LaneDisposition::Preserved { limitation } => {
