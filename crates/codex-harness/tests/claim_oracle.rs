@@ -19,8 +19,11 @@
 
 use serde_json::Value;
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 fn fixture() -> PathBuf {
@@ -73,6 +76,19 @@ fn report(out: &Output) -> Value {
     serde_json::from_str(&output[start..]).unwrap_or_else(|error| {
         panic!("the checker report is not JSON ({error}): {output}");
     })
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "claim-oracle-test-{name}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&path).unwrap();
+    path
 }
 
 fn verdict(report: &Value, id: &str) -> (bool, String) {
@@ -175,12 +191,79 @@ fn supplied_unchanged_specimen_is_rejected() {
         let (passed, detail) = verdict(&report, id);
         assert!(!passed, "{id} unexpectedly passed: {detail}");
         assert!(
-            detail.contains("replaced the in-flight claim")
-                || detail.contains("post-claim fetches"),
+            detail.contains("replaced or altered the in-flight claim")
+                || detail.contains("replaced the in-flight claim"),
             "{id} does not name the stolen claim: {detail}"
         );
     }
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+}
+
+#[test]
+fn post_claim_reset_gate_records_its_claim_identity_and_is_bounded() {
+    let root = scratch("gate");
+    let gate = root.join("gate");
+    let started = root.join("started.json");
+    let slot = root.join("slot");
+    fs::create_dir_all(&gate).unwrap();
+    fs::create_dir_all(&slot).unwrap();
+    fs::write(gate.join("hold"), b"hold\n").unwrap();
+    let gate_git = root.join("git.exe");
+    fs::copy(fixture(), &gate_git).unwrap();
+    let mut child = Command::new(&gate_git)
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(&slot)
+        .env("HARNESS_CLAIM_ORACLE_GATE", &gate)
+        .env(
+            "HARNESS_CLAIM_ORACLE_GATE_REAL",
+            r"C:\Windows\System32\cmd.exe",
+        )
+        .env(
+            "HARNESS_CLAIM_ORACLE_GATE_PATH",
+            std::env::var_os("PATH").unwrap_or_default(),
+        )
+        .env("HARNESS_CLAIM_ORACLE_GATE_STARTED", &started)
+        .env("HARNESS_CLAIM_ORACLE_GATE_OWNER", "exec-gate")
+        .env("HARNESS_CLAIM_ORACLE_GATE_ASSIGNMENT", "claim-oracle:gate")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !started.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the post-claim reset gate did not record its claim identity"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the gate exited before release"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let record: Value = serde_json::from_slice(&fs::read(&started).unwrap()).unwrap();
+    assert_eq!(record["owner"], "exec-gate");
+    assert_eq!(record["assignment"], "claim-oracle:gate");
+    assert_eq!(
+        record["args"],
+        serde_json::json!(["reset", "--hard", "HEAD"])
+    );
+    assert_eq!(
+        fs::canonicalize(record["cwd"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(&slot).unwrap()
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    fs::remove_file(gate.join("hold")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("gated preparation did not finish after release");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

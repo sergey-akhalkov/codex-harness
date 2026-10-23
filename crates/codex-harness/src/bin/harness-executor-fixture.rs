@@ -19,6 +19,8 @@
 //! fixture mode; see `harness_executor_fixture/watch_oracle.rs`.
 //! `claim-oracle` is the candidate-independent acceptance for exclusive
 //! dispatch claims; see `harness_executor_fixture/claim_oracle.rs`.
+//! The checker's `git` gate helper holds one claimed dispatch at its
+//! post-claim checkout reset before host handoff.
 //! `claim-oracle-cleanup` exercises that checker's capture and termination
 //! helpers. It is not a claim-oracle case and does not broaden the checker.
 //! `parallel-lib-oracle` is the candidate-independent acceptance for the
@@ -49,24 +51,9 @@ const DEFAULT_SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
 const FINAL_MESSAGE: &str =
     "FIXTURE_OUTCOME_DONE\nremaining: none\nchecks: fixture event stream verified";
 
-fn claim_oracle_git_stand_in() -> bool {
-    if env::var_os("HARNESS_CLAIM_ORACLE_GIT_REAL").is_none() {
-        return false;
-    }
-    env::current_exe()
-        .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
-        .is_some_and(|name| {
-            name.eq_ignore_ascii_case("git.exe") || name.eq_ignore_ascii_case("git")
-        })
-}
-
 fn main() -> io::Result<()> {
-    // Set only on the checker's gated `git` stand-in. The same image is also
-    // the model-free launcher, and that child inherits the gate environment,
-    // so only an invocation whose file name is git forwards the real git.
-    if claim_oracle_git_stand_in() {
-        return exit(claim_oracle::forward_git()?);
+    if claim_oracle::gate_git_stand_in() {
+        return exit(claim_oracle::forward_gate_git()?);
     }
     // The acceptance checker owns its own arguments and never acts as a
     // launcher double, whichever fixture environment it inherited.

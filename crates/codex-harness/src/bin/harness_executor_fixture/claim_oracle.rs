@@ -9,10 +9,12 @@
 //! claim fix, open a model conversation, or treat a printed acceptance line
 //! as proof that a host received an assignment.
 //!
-//! The overlap proof gates `git fetch` after the claim and before host
-//! publication. A per-pool startup guard may hold the contender until that
-//! gate is released; that wait is not a failure. After release the checker
-//! requires a real model-free handoff. The independent app-server must have
+//! The overlap proof holds the first dispatch at its post-claim checkout reset
+//! and before host publication. The checker verifies that recorded
+//! owner/task/handle/startup identity before it starts a contender.
+//! A per-pool startup guard may hold the contender until that gate is
+//! released; that wait is not a failure. After release the checker requires
+//! a real model-free handoff. The independent app-server must have
 //! received the expected assignment in the actual `turn/start` request; a
 //! receipt or a constant host message is not delivery. Truncated, timed-out,
 //! and unreaped observations fail, including a host that exits 0 after
@@ -43,6 +45,8 @@ use std::{
 #[allow(clippy::duplicate_mod)]
 #[path = "../../../tests/fixtures/control_endpoint.rs"]
 mod held_endpoint;
+#[path = "../../../tests/fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
 
 pub(crate) const HOST_MODE: &str = "claim-oracle-host";
 
@@ -239,61 +243,96 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> io::Result<i32> {
     Ok(if passed { 0 } else { 1 })
 }
 
-/// Forward one `git` invocation from the gated stand-in. `fetch` waits while
-/// the gate directory contains `hold`, then the real git runs. A timeout is
-/// a non-zero exit and does not call git.
-pub(crate) fn forward_git() -> io::Result<i32> {
-    let real = env::var("HARNESS_CLAIM_ORACLE_GIT_REAL")
-        .map_err(|_| invalid("claim-oracle git stand-in has no real git"))?;
+const GATE_ENV: &str = "HARNESS_CLAIM_ORACLE_GATE";
+const GATE_REAL_ENV: &str = "HARNESS_CLAIM_ORACLE_GATE_REAL";
+const GATE_PATH_ENV: &str = "HARNESS_CLAIM_ORACLE_GATE_PATH";
+const GATE_STARTED_ENV: &str = "HARNESS_CLAIM_ORACLE_GATE_STARTED";
+const GATE_OWNER_ENV: &str = "HARNESS_CLAIM_ORACLE_GATE_OWNER";
+const GATE_ASSIGNMENT_ENV: &str = "HARNESS_CLAIM_ORACLE_GATE_ASSIGNMENT";
+const GATE_HOLD: &str = "hold";
+const GATE_WAIT: Duration = Duration::from_secs(90);
+
+/// True only for the checker's `git.exe` gate stand-in, never for the same
+/// fixture image when it is acting as the installed launcher.
+pub(crate) fn gate_git_stand_in() -> bool {
+    if env::var_os(GATE_REAL_ENV).is_none() {
+        return false;
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("git.exe") || name.eq_ignore_ascii_case("git")
+        })
+}
+
+/// Forward one gate `git` invocation. The post-claim checkout reset records
+/// the owned claim identity and waits for release; every other command goes
+/// straight to the real Git. This seam is after the claim in both current and
+/// historical task acquisition, unlike `post-checkout`.
+pub(crate) fn forward_gate_git() -> io::Result<i32> {
+    let real = env::var(GATE_REAL_ENV)
+        .map_err(|_| invalid("claim-oracle git gate has no real git executable"))?;
     let args: Vec<_> = env::args_os().skip(1).collect();
-    if args.first().and_then(|arg| arg.to_str()) == Some("fetch")
-        && let Ok(gate) = env::var("HARNESS_CLAIM_ORACLE_GIT_GATE")
-    {
-        record_fetch(Path::new(&gate))?;
-        wait_for_release(Path::new(&gate))?;
+    if is_post_claim_reset(&args) {
+        let gate = env::var_os(GATE_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| invalid("claim-oracle git gate has no gate directory"))?;
+        let started = env::var_os(GATE_STARTED_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| invalid("claim-oracle git gate has no start marker"))?;
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let record = json!({
+            "schema": 1,
+            "pid": std::process::id(),
+            "cwd": cwd.to_string_lossy(),
+            "owner": env::var(GATE_OWNER_ENV).ok(),
+            "assignment": env::var(GATE_ASSIGNMENT_ENV).ok(),
+            "args": args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+            "startedAtUnixMs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or(0),
+        });
+        fs::write(
+            started,
+            serde_json::to_vec_pretty(&record).map_err(io::Error::other)?,
+        )?;
+        let deadline = Instant::now() + GATE_WAIT;
+        while gate.join(GATE_HOLD).exists() {
+            if Instant::now() >= deadline {
+                return Err(invalid(
+                    "claim-oracle post-claim reset gate timed out before release; this is not success",
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
     let mut command = Command::new(&real);
     command.args(&args);
     if let Ok(cwd) = env::current_dir() {
         command.current_dir(cwd);
     }
-    if let Some(path) = env::var_os("HARNESS_CLAIM_ORACLE_GIT_PATH") {
+    if let Some(path) = env::var_os(GATE_PATH_ENV) {
         command.env("PATH", path);
     }
-    command.env_remove("HARNESS_CLAIM_ORACLE_GIT_REAL");
-    command.env_remove("HARNESS_CLAIM_ORACLE_GIT_GATE");
+    for name in [
+        GATE_ENV,
+        GATE_REAL_ENV,
+        GATE_PATH_ENV,
+        GATE_STARTED_ENV,
+        GATE_OWNER_ENV,
+        GATE_ASSIGNMENT_ENV,
+    ] {
+        command.env_remove(name);
+    }
     no_window(&mut command);
     let status = command.status()?;
     Ok(status.code().unwrap_or(1))
 }
 
-fn record_fetch(gate: &Path) -> io::Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let body = json!({
-        "pid": std::process::id(),
-        "cwd": cwd.to_string_lossy(),
-        "args": env::args().skip(1).collect::<Vec<_>>(),
-    });
-    fs::write(
-        gate.join(format!("entered-{}.json", std::process::id())),
-        serde_json::to_vec(&body).map_err(io::Error::other)?,
-    )
-}
-
-fn wait_for_release(gate: &Path) -> io::Result<()> {
-    let hold = gate.join("hold");
-    // Longer than the checker's contender bound, so a bounded wait is released
-    // before this stand-in can turn the first fetch into a timeout failure.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while hold.exists() {
-        if Instant::now() >= deadline {
-            return Err(invalid(
-                "claim-oracle git gate timed out before release; fetch was not forwarded and this is not success",
-            ));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Ok(())
+fn is_post_claim_reset(args: &[std::ffi::OsString]) -> bool {
+    args.first().is_some_and(|arg| arg == "reset") && args.iter().any(|arg| arg == "--hard")
 }
 
 fn binary_name() -> &'static str {
@@ -902,7 +941,7 @@ struct Overlap {
 }
 
 const HANDOFF_BOUND: Duration = Duration::from_secs(90);
-const EXCLUSIVITY_BOUND: Duration = Duration::from_secs(3);
+const EXCLUSIVITY_BOUND: Duration = Duration::from_secs(10);
 const TERMINAL_BOUND: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
@@ -1382,6 +1421,9 @@ fn install_model_free_launcher(lab: &Lab) -> io::Result<PathBuf> {
     if fs::hard_link(&source, &destination).is_err() {
         fs::copy(&source, &destination)?;
     }
+    let role_source = synthetic_role_build::kit_source(&lab.root);
+    let build = synthetic_role_build::recorded_build(&lab.root, &role_source);
+    synthetic_role_build::register(&lab.home, &lab.root, &build);
     Ok(destination)
 }
 
@@ -1414,12 +1456,12 @@ fn spawn_owned(
     ]);
     prepare_candidate(&mut command, lab);
     if let Some(gate) = gate {
-        command.env("HARNESS_CLAIM_ORACLE_GIT_REAL", &lab.git);
-        command.env("HARNESS_CLAIM_ORACLE_GIT_GATE", gate);
-        command.env(
-            "HARNESS_CLAIM_ORACLE_GIT_PATH",
-            env::var_os("PATH").unwrap_or_default(),
-        );
+        command.env(GATE_ENV, gate);
+        command.env(GATE_REAL_ENV, &lab.git);
+        command.env(GATE_PATH_ENV, env::var_os("PATH").unwrap_or_default());
+        command.env(GATE_STARTED_ENV, lab.root.join("gate-started.json"));
+        command.env(GATE_OWNER_ENV, owner);
+        command.env(GATE_ASSIGNMENT_ENV, assignment);
         let mut path = std::ffi::OsString::from(gate);
         path.push(if cfg!(windows) { ";" } else { ":" });
         path.push(env::var_os("PATH").unwrap_or_default());
@@ -1484,7 +1526,7 @@ fn wait_live_handoff(
                 return Err(format!(
                     "dispatch exited {:?} before a live host accepted the assignment: {}",
                     status.code(),
-                    excerpt(&captured(&lab.root, child.id()))
+                    captured(&lab.root, child.id())
                 ));
             }
             Ok(None) => {}
@@ -1756,15 +1798,17 @@ fn overlap_case(exe: &Path, git: &Path, spec: Overlap) -> Case {
     let Ok(lab) = Lab::create(&format!("overlap-{}", spec.id), spec.pool, git) else {
         return Case::fail(spec.id, "could not create the owned pool");
     };
-    let gate = lab.root.join("gate");
-    if let Err(error) = install_gate(&gate) {
-        return finish(
-            spec.id,
-            false,
-            format!("git gate was not installed: {error}"),
-            &lab,
-        );
-    }
+    let gate = match install_gate(&lab) {
+        Ok(gate) => gate,
+        Err(error) => {
+            return finish(
+                spec.id,
+                false,
+                format!("post-claim reset gate was not installed: {error}"),
+                &lab,
+            );
+        }
+    };
     let Ok(launcher) = install_model_free_launcher(&lab) else {
         return finish(
             spec.id,
@@ -1793,40 +1837,46 @@ fn overlap_case(exe: &Path, git: &Path, spec: Overlap) -> Case {
             );
         }
     };
-    if let Err(error) = wait_fetch(&gate, Duration::from_secs(25)) {
-        let stopped = stop_now(&lab, started);
-        return finish(
-            spec.id,
-            false,
-            note_cleanup(
-                &format!("first dispatch did not reach the post-claim fetch gate: {error}"),
-                &[stopped],
-            ),
-            &lab,
-        );
-    }
-    let hold_b = HostHold::new(&lab, "b", spec.owner_b);
-    let assignment_b = format!("claim-oracle:{}:{}", spec.id, spec.owner_b);
-    let mut contender = match spawn_owned(
-        exe,
+    let claim_a = match wait_claim_gate(
         &lab,
-        Some(&gate),
-        spec.owner_b,
-        &assignment_b,
-        Some(&hold_b),
+        &gate,
+        &mut started,
+        "exec-claim-a",
+        &assignment_a,
+        Duration::from_secs(30),
     ) {
-        Ok(child) => child,
+        Ok(claim) => claim,
         Err(error) => {
             let stopped = stop_now(&lab, started);
             return finish(
                 spec.id,
                 false,
-                note_cleanup(&format!("contender did not start: {error}"), &[stopped]),
+                note_cleanup(
+                    &format!(
+                        "first dispatch did not establish a recorded claim at the post-claim reset gate: {error}"
+                    ),
+                    &[stopped],
+                ),
                 &lab,
             );
         }
     };
-    let exclusive = exclusive_during_gate(&lab, &mut contender, &spec);
+    let hold_b = HostHold::new(&lab, "b", spec.owner_b);
+    let assignment_b = format!("claim-oracle:{}:{}", spec.id, spec.owner_b);
+    let mut contender =
+        match spawn_owned(exe, &lab, None, spec.owner_b, &assignment_b, Some(&hold_b)) {
+            Ok(child) => child,
+            Err(error) => {
+                let stopped = stop_now(&lab, started);
+                return finish(
+                    spec.id,
+                    false,
+                    note_cleanup(&format!("contender did not start: {error}"), &[stopped]),
+                    &lab,
+                );
+            }
+        };
+    let exclusive = exclusive_during_gate(&lab, &mut contender, &spec, &gate, &claim_a);
     if !exclusive.is_empty() {
         let stopped_b = stop_now(&lab, contender);
         let stopped_a = stop_now(&lab, started);
@@ -1837,14 +1887,14 @@ fn overlap_case(exe: &Path, git: &Path, spec: Overlap) -> Case {
             &lab,
         );
     }
-    if let Err(error) = fs::remove_file(gate.join("hold")) {
+    if let Err(error) = fs::remove_file(gate.join(GATE_HOLD)) {
         let stopped_b = stop_now(&lab, contender);
         let stopped_a = stop_now(&lab, started);
         return finish(
             spec.id,
             false,
             note_cleanup(
-                &format!("git gate was not released: {error}"),
+                &format!("post-claim reset gate was not released: {error}"),
                 &[stopped_a, stopped_b],
             ),
             &lab,
@@ -1886,50 +1936,69 @@ fn overlap_case(exe: &Path, git: &Path, spec: Overlap) -> Case {
             &assignment_b,
             spec.owner_b,
             &handoff_a,
+            &claim_a,
         )
     } else {
-        finish_one_slot(spec.id, &lab, started, contender, &hold_a, &handoff_a)
+        finish_one_slot(
+            spec.id, &lab, started, contender, &hold_a, &handoff_a, &claim_a,
+        )
     }
 }
 
-fn exclusive_during_gate(lab: &Lab, contender: &mut Child, spec: &Overlap) -> Vec<String> {
+fn exclusive_during_gate(
+    lab: &Lab,
+    contender: &mut Child,
+    spec: &Overlap,
+    gate: &Path,
+    baseline: &ClaimSnapshot,
+) -> Vec<String> {
     let started = Instant::now();
-    while started.elapsed() < EXCLUSIVITY_BOUND {
-        if contender.try_wait().ok().flatten().is_some() {
+    loop {
+        let exited = contender.try_wait().ok().flatten().is_some();
+        let records = read_slots(&lab.home);
+        let stable = slot_record(&records, 1).is_some_and(|record| baseline.unchanged(record));
+        let second_ready =
+            !spec.other_slot || slot_owner(&records, 2).as_deref() == Some(spec.owner_b);
+        if exited || (stable && second_ready) || started.elapsed() >= EXCLUSIVITY_BOUND {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     let during = read_slots(&lab.home);
-    let fetches = fetch_entries(&lab.root.join("gate"));
-    let slot_a = lab.slot(1);
-    let fetches_a = fetches
-        .iter()
-        .filter(|entry| same_path(&entry.cwd, &slot_a))
-        .count();
     let owner = slot_owner(&during, 1);
     let mut problems = Vec::new();
+    let current = slot_record(&during, 1).and_then(ClaimSnapshot::read);
+    if current.as_ref() != Some(baseline) {
+        problems.push(format!(
+            "contender replaced or altered the in-flight claim: owner is now {owner:?}; before [{}]; during [{}]",
+            baseline.line(),
+            current
+                .as_ref()
+                .map(ClaimSnapshot::line)
+                .unwrap_or_else(|| "missing claim".to_owned())
+        ));
+    }
     if owner.as_deref() != Some("exec-claim-a") {
         problems.push(format!(
             "contender replaced the in-flight claim: owner is now {owner:?}"
         ));
     }
-    if fetches_a != 1 {
-        problems.push(format!(
-            "slot 1 was entered by {fetches_a} post-claim fetches; one startup generation may fetch it"
-        ));
+    if !gate.join(GATE_HOLD).is_file() {
+        problems.push(
+            "post-claim reset gate was released before the contender was observed".to_owned(),
+        );
     }
     if !spec.other_slot && (slot_owner(&during, 2).is_some() || lab.slot(2).exists()) {
         problems.push("one-slot pool created another executor tree".to_owned());
     }
-    if spec.other_slot
-        && let Some(owner_b) = slot_owner(&during, 2)
-        && owner_b != spec.owner_b
-    {
-        problems.push(format!(
-            "slot 2 was bound to {owner_b}, not {}",
-            spec.owner_b
-        ));
+    if spec.other_slot {
+        let owner_b = slot_owner(&during, 2);
+        if owner_b.as_deref() != Some(spec.owner_b) {
+            problems.push(format!(
+                "slot 2 was bound to {owner_b:?}, not {}",
+                spec.owner_b
+            ));
+        }
     }
     let text = captured(&lab.root, contender.id());
     if text.contains("executor dispatch accepted") {
@@ -1945,6 +2014,7 @@ fn finish_one_slot(
     contender: Child,
     hold_a: &HostHold,
     handoff_a: &LiveHandoff,
+    claim_a: &ClaimSnapshot,
 ) -> Case {
     let mut contender = contender;
     let until = Instant::now() + Duration::from_secs(40);
@@ -1993,8 +2063,7 @@ fn finish_one_slot(
     if stopped_a.joined.code.is_some_and(|code| code != 0) {
         problems.push(format!(
             "first host terminal outcome was exit {:?}: {}",
-            stopped_a.joined.code,
-            excerpt(&stopped_a.joined.text)
+            stopped_a.joined.code, stopped_a.joined.text
         ));
     }
     problems.extend(unverified("first host", &stopped_a.joined));
@@ -2008,7 +2077,8 @@ fn finish_one_slot(
     let passed = problems.is_empty();
     let detail = if passed {
         format!(
-            "exclusive claim survived the gate; {} handed off and the contender refused without a second conversation",
+            "exclusive claim survived the gate ({}); {} handed off and the contender refused without a second conversation",
+            claim_a.line(),
             handoff_line(handoff_a)
         )
     } else {
@@ -2031,6 +2101,7 @@ fn finish_two_slot(
     assignment_b: &str,
     owner_b: &str,
     handoff_a: &LiveHandoff,
+    claim_a: &ClaimSnapshot,
 ) -> Case {
     let mut problems = Vec::new();
     let contender_exited = contender.try_wait().ok().flatten().is_some();
@@ -2112,15 +2183,13 @@ fn finish_two_slot(
     if stopped_a.joined.code.is_some_and(|code| code != 0) {
         problems.push(format!(
             "first host terminal outcome was exit {:?}: {}",
-            stopped_a.joined.code,
-            excerpt(&stopped_a.joined.text)
+            stopped_a.joined.code, stopped_a.joined.text
         ));
     }
     if stopped_b.joined.code.is_some_and(|code| code != 0) {
         problems.push(format!(
             "second host terminal outcome was exit {:?}: {}",
-            stopped_b.joined.code,
-            excerpt(&stopped_b.joined.text)
+            stopped_b.joined.code, stopped_b.joined.text
         ));
     }
     problems.extend(unverified("first host", &stopped_a.joined));
@@ -2134,7 +2203,8 @@ fn finish_two_slot(
     let passed = problems.is_empty();
     let detail = if passed {
         format!(
-            "startup wait was allowed; {} and {} stayed live together after handoff",
+            "startup wait was allowed; claim held at gate ({}); {} and {} stayed live together after handoff",
+            claim_a.line(),
             handoff_line(handoff_a),
             handoff_b
                 .as_ref()
@@ -2153,23 +2223,20 @@ fn creator_exit_case(exe: &Path, git: &Path) -> Case {
     let Ok(lab) = Lab::create("creator-exit", 1, git) else {
         return Case::fail(CASE_CREATOR_EXIT, "could not create the owned pool");
     };
-    let gate = lab.root.join("gate");
-    if let Err(error) = install_gate(&gate) {
-        return finish(
-            CASE_CREATOR_EXIT,
-            false,
-            format!("git gate was not installed: {error}"),
-            &lab,
-        );
-    }
-    let started = match spawn_dispatch(
-        exe,
-        &lab,
-        &gate,
-        true,
-        "exec-claim-a",
-        "claim-oracle:creator-exit:a",
-    ) {
+    let gate = match install_gate(&lab) {
+        Ok(gate) => gate,
+        Err(error) => {
+            return finish(
+                CASE_CREATOR_EXIT,
+                false,
+                format!("post-claim reset gate was not installed: {error}"),
+                &lab,
+            );
+        }
+    };
+    let assignment_a = "claim-oracle:creator-exit:a";
+    let mut started = match spawn_owned(exe, &lab, Some(&gate), "exec-claim-a", assignment_a, None)
+    {
         Ok(child) => child,
         Err(error) => {
             return finish(
@@ -2180,23 +2247,35 @@ fn creator_exit_case(exe: &Path, git: &Path) -> Case {
             );
         }
     };
-    if let Err(error) = wait_fetch(&gate, Duration::from_secs(25)) {
-        let stopped = stop_now(&lab, started);
-        return finish(
-            CASE_CREATOR_EXIT,
-            false,
-            note_cleanup(
-                &format!("creator did not reach the fetch gate: {error}"),
-                &[stopped],
-            ),
-            &lab,
-        );
-    }
+    let claim_a = match wait_claim_gate(
+        &lab,
+        &gate,
+        &mut started,
+        "exec-claim-a",
+        assignment_a,
+        Duration::from_secs(30),
+    ) {
+        Ok(claim) => claim,
+        Err(error) => {
+            let stopped = stop_now(&lab, started);
+            return finish(
+                CASE_CREATOR_EXIT,
+                false,
+                note_cleanup(
+                    &format!(
+                        "creator did not establish a recorded claim at the post-claim reset gate: {error}"
+                    ),
+                    &[stopped],
+                ),
+                &lab,
+            );
+        }
+    };
     let pid = started.id();
     let identity = observe_identity(pid);
     let kill = kill_tree(pid);
     let joined = join_child(&lab.root, started, CLEANUP_BOUND, PIPED_CAPTURE);
-    let _ = fs::remove_file(gate.join("hold"));
+    let _ = fs::remove_file(gate.join(GATE_HOLD));
     if kill.is_err() || joined.cleanup_error.is_some() || joined.timed_out || joined.code.is_none()
     {
         let mut cleanup = match &kill {
@@ -2207,7 +2286,7 @@ fn creator_exit_case(exe: &Path, git: &Path) -> Case {
             cleanup = format!("{cleanup}; {error}");
         }
         let cause = combine_failure(
-            "creator termination was requested after the fetch gate",
+            "creator termination was requested after the post-claim reset gate",
             &cleanup,
         );
         return finish(
@@ -2226,13 +2305,13 @@ fn creator_exit_case(exe: &Path, git: &Path) -> Case {
             &lab,
         );
     }
-    let next = match spawn_dispatch(
+    let next = match spawn_owned(
         exe,
         &lab,
-        &gate,
-        false,
+        None,
         "exec-claim-b",
         "claim-oracle:creator-exit:b",
+        None,
     ) {
         Ok(child) => child,
         Err(error) => {
@@ -2269,7 +2348,8 @@ fn creator_exit_case(exe: &Path, git: &Path) -> Case {
     let passed = problems.is_empty();
     let detail = if passed {
         format!(
-            "creator exit {code:?} stayed a failure; clean reservation rebound to exec-claim-b with the original launcher error"
+            "creator exit {code:?} stayed a failure; claim snapshot [{}] rebound to exec-claim-b with the original launcher error",
+            claim_a.line()
         )
     } else {
         problems.join("; ")
@@ -2623,15 +2703,13 @@ fn live_host_case(exe: &Path, git: &Path) -> Case {
     if stopped_a.joined.code.is_some_and(|code| code != 0) {
         problems.push(format!(
             "first host terminal outcome was exit {:?}: {}",
-            stopped_a.joined.code,
-            excerpt(&stopped_a.joined.text)
+            stopped_a.joined.code, stopped_a.joined.text
         ));
     }
     if stopped_b.joined.code.is_some_and(|code| code != 0) {
         problems.push(format!(
             "second host terminal outcome was exit {:?}: {}",
-            stopped_b.joined.code,
-            excerpt(&stopped_b.joined.text)
+            stopped_b.joined.code, stopped_b.joined.text
         ));
     }
     problems.extend(unverified("first host", &stopped_a.joined));
@@ -2708,7 +2786,7 @@ fn run_spawn(
     assignment: &str,
     bound: Duration,
 ) -> Result<Joined, String> {
-    let child = spawn_dispatch(exe, lab, &lab.root.join("gate"), false, owner, assignment)
+    let child = spawn_owned(exe, lab, None, owner, assignment, None)
         .map_err(|error| format!("{owner} did not start: {error}"))?;
     Ok(join_child(&lab.root, child, bound, PIPED_CAPTURE))
 }
@@ -2879,64 +2957,6 @@ fn observe_error(path: &Path) -> Option<String> {
     }
 }
 
-fn spawn_dispatch(
-    exe: &Path,
-    lab: &Lab,
-    gate: &Path,
-    hold: bool,
-    owner: &str,
-    assignment: &str,
-) -> io::Result<Child> {
-    let mut command = Command::new(exe);
-    command.args([
-        "executor",
-        "spawn",
-        "--source",
-        lab.source
-            .to_str()
-            .ok_or_else(|| invalid("source path is not unicode"))?,
-        "--codex-home",
-        lab.home
-            .to_str()
-            .ok_or_else(|| invalid("home path is not unicode"))?,
-        "--profile",
-        "ds",
-        "--owner",
-        owner,
-        "--exec",
-        assignment,
-    ]);
-    prepare_candidate(&mut command, lab);
-    if hold {
-        command.env("HARNESS_CLAIM_ORACLE_GIT_REAL", &lab.git);
-        command.env("HARNESS_CLAIM_ORACLE_GIT_GATE", gate);
-        command.env(
-            "HARNESS_CLAIM_ORACLE_GIT_PATH",
-            env::var_os("PATH").unwrap_or_default(),
-        );
-        let mut path = std::ffi::OsString::from(gate);
-        path.push(if cfg!(windows) { ";" } else { ":" });
-        path.push(env::var_os("PATH").unwrap_or_default());
-        command.env("PATH", path);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    no_window(&mut command);
-    let mut child = command.spawn()?;
-    let pid = child.id();
-    pump(
-        child.stdout.take(),
-        lab.root.join(format!("out-{pid}.stdout")),
-    );
-    pump(
-        child.stderr.take(),
-        lab.root.join(format!("out-{pid}.stderr")),
-    );
-    Ok(child)
-}
-
 fn pump<R>(source: Option<R>, destination: PathBuf)
 where
     R: std::io::Read + Send + 'static,
@@ -3023,8 +3043,12 @@ fn clear_session(command: &mut Command) {
         "HARNESS_LEAD_THREAD",
         "HARNESS_LEAD_RECIPIENT",
         "HARNESS_EXECUTOR_FIXTURE_MODE",
-        "HARNESS_CLAIM_ORACLE_GIT_REAL",
-        "HARNESS_CLAIM_ORACLE_GIT_GATE",
+        GATE_ENV,
+        GATE_REAL_ENV,
+        GATE_PATH_ENV,
+        GATE_STARTED_ENV,
+        GATE_OWNER_ENV,
+        GATE_ASSIGNMENT_ENV,
         "WT_SESSION",
         "CODEX_SESSION_ID",
         "CODEX_THREAD_ID",
@@ -3033,47 +3057,129 @@ fn clear_session(command: &mut Command) {
     }
 }
 
-fn install_gate(gate: &Path) -> io::Result<()> {
-    fs::create_dir_all(gate)?;
+fn install_gate(lab: &Lab) -> io::Result<PathBuf> {
+    let gate = lab.root.join("gate");
+    fs::create_dir_all(&gate)?;
+    fs::write(gate.join(GATE_HOLD), b"hold\n")?;
     let git_name = if cfg!(windows) { "git.exe" } else { "git" };
     let destination = gate.join(git_name);
     let source = env::current_exe()?;
     if fs::hard_link(&source, &destination).is_err() {
         fs::copy(&source, &destination)?;
     }
-    fs::write(gate.join("hold"), b"hold\n")?;
-    Ok(())
+    Ok(gate)
 }
 
-fn wait_fetch(gate: &Path, bound: Duration) -> io::Result<()> {
+fn wait_claim_gate(
+    lab: &Lab,
+    gate: &Path,
+    child: &mut Child,
+    owner: &str,
+    assignment: &str,
+    bound: Duration,
+) -> Result<ClaimSnapshot, String> {
+    let marker = lab.root.join("gate-started.json");
     let started = Instant::now();
-    while started.elapsed() < bound {
-        if !fetch_entries(gate).is_empty() {
-            return Ok(());
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "first dispatch exited {:?} before the post-claim reset gate: {}",
+                    status.code(),
+                    captured(&lab.root, child.id())
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "first dispatch identity could not be observed before the gate: {error}"
+                ));
+            }
+        }
+        if let Ok(bytes) = fs::read(&marker)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        {
+            let marker_owner = value["owner"].as_str();
+            let marker_assignment = value["assignment"].as_str();
+            let marker_cwd = value["cwd"].as_str().map(Path::new);
+            if marker_owner != Some(owner)
+                || marker_assignment != Some(assignment)
+                || marker_cwd.is_none_or(|cwd| !same_path(cwd, &lab.slot(1)))
+            {
+                return Err(format!(
+                    "post-claim reset gate identity did not match the first dispatch: {value}"
+                ));
+            }
+            if !gate.join(GATE_HOLD).is_file() {
+                return Err(
+                    "post-claim reset gate released before the claim could be observed".to_owned(),
+                );
+            }
+            let records = read_slots(&lab.home);
+            if let Some(record) = slot_record(&records, 1) {
+                let claim = ClaimSnapshot::read(record).ok_or_else(|| {
+                    "post-claim reset gate was reached without an owner/task/handle/startup claim"
+                        .to_owned()
+                })?;
+                if claim.owner != owner {
+                    return Err(format!(
+                        "post-claim reset gate reached with owner {}, not {owner}",
+                        claim.owner
+                    ));
+                }
+                return Ok(claim);
+            }
+        }
+        if started.elapsed() >= bound {
+            return Err(format!(
+                "timed out waiting for the post-claim reset gate; durable slots: {}",
+                serde_json::to_string(&read_slots(&lab.home)).unwrap_or_default()
+            ));
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Err(invalid("timed out waiting for the post-claim fetch gate"))
 }
 
-struct FetchEntry {
-    cwd: PathBuf,
+#[derive(Clone, Debug, PartialEq)]
+struct ClaimSnapshot {
+    owner: String,
+    task: Option<String>,
+    handle: Option<String>,
+    base: Option<String>,
+    state: Option<String>,
+    startup: Value,
+    assignment: Option<Value>,
 }
 
-fn fetch_entries(gate: &Path) -> Vec<FetchEntry> {
-    let Ok(entries) = fs::read_dir(gate) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("entered-"))
-        .filter_map(|entry| {
-            let value: Value = serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()?;
-            Some(FetchEntry {
-                cwd: PathBuf::from(value["cwd"].as_str()?),
-            })
+impl ClaimSnapshot {
+    fn read(record: &Value) -> Option<Self> {
+        Some(Self {
+            owner: record["owner"].as_str()?.to_owned(),
+            task: record["task"].as_str().map(str::to_owned),
+            handle: record["handle"].as_str().map(str::to_owned),
+            base: record["base"].as_str().map(str::to_owned),
+            state: record["state"].as_str().map(str::to_owned),
+            startup: record
+                .get("startup")
+                .filter(|value| value.is_object())?
+                .clone(),
+            assignment: record
+                .get("assignment")
+                .filter(|value| !value.is_null())
+                .cloned(),
         })
-        .collect()
+    }
+
+    fn unchanged(&self, record: &Value) -> bool {
+        Self::read(record).as_ref() == Some(self)
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "owner={} task={:?} handle={:?} base={:?} state={:?} startup=recorded",
+            self.owner, self.task, self.handle, self.base, self.state
+        )
+    }
 }
 
 fn spawn_sleeper() -> io::Result<Child> {
@@ -3191,6 +3297,10 @@ fn read_slots(home: &Path) -> Vec<Value> {
         })
         .filter_map(|entry| serde_json::from_slice(&fs::read(entry.path()).ok()?).ok())
         .collect()
+}
+
+fn slot_record(records: &[Value], index: u32) -> Option<&Value> {
+    records.iter().find(|record| record["index"] == index)
 }
 
 fn slot_owner(records: &[Value], index: u32) -> Option<String> {
