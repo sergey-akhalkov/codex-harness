@@ -147,6 +147,12 @@ fn elevated() -> io::Result<bool> {
     Ok(elevation.TokenIsElevated != 0)
 }
 
+/// Whether this process runs under an elevated Windows token. Used to decide
+/// whether locally recorded control state must carry a High mandatory label.
+pub fn is_elevated() -> io::Result<bool> {
+    elevated()
+}
+
 fn connect() -> io::Result<(Apartment, ITaskService, ITaskFolder)> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)

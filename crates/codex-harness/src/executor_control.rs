@@ -60,6 +60,7 @@
 
 use harness_core::{
     orchestration_config::{EXECUTOR_AGENT_TOOLS_OFF, EXECUTOR_SESSION_ENV, ProfileBinding},
+    private_state,
     process::{
         Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, OwnedProcess, ProcessIdentity,
     },
@@ -164,6 +165,17 @@ fn excerpt(text: &str, limit: usize) -> String {
 /// the endpoint record while the run is live, never observes a partial record,
 /// and a failed staging leaves the previous bytes in place.
 pub(crate) fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_staged_inner(path, bytes, false)
+}
+
+/// Write control state carrying a capability token. In an elevated session the
+/// staged file receives its High mandatory label before the rename, so the
+/// published name never exists in a lower-integrity-readable state.
+fn write_staged_protected(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_staged_inner(path, bytes, true)
+}
+
+fn write_staged_inner(path: &Path, bytes: &[u8], protect: bool) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| invalid("control state path has no directory"))?;
@@ -175,6 +187,10 @@ pub(crate) fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
     staged.push(format!(".new-{}", std::process::id()));
     let staged = directory.join(staged);
     fs::write(&staged, bytes)?;
+    if protect && let Err(error) = private_state::protect_if_elevated(&staged) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
     match fs::rename(&staged, path) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -814,7 +830,12 @@ impl Endpoint {
         if bytes.len() > MAX_RECORD {
             return Err(invalid("control endpoint record exceeds its bound"));
         }
-        write_staged(path, &bytes)
+        write_staged_protected(path, &bytes).map_err(|error| {
+            invalid(format!(
+                "the control endpoint record {} could not be protected: {error}",
+                path.display()
+            ))
+        })
     }
 
     /// Reads and validates a recorded endpoint. A malformed record fails
@@ -3517,7 +3538,12 @@ fn spawn_app_server(
     plan: &ControlPlan,
 ) -> io::Result<(OwnedProcess, ControlConnection, Endpoint)> {
     let token = capability_token()?;
-    write_staged(&plan.paths.token, token.as_bytes())?;
+    write_staged_protected(&plan.paths.token, token.as_bytes()).map_err(|error| {
+        invalid(format!(
+            "the elevated capability token {} could not be protected: {error}; no app-server was started",
+            plan.paths.token.display()
+        ))
+    })?;
     let port = match plan.port {
         Some(port) if port != 0 => port,
         _ => free_loopback_port()?,

@@ -99,6 +99,7 @@ pub mod outcome_report;
 pub mod pacing;
 pub mod path_plan;
 pub mod portable_config;
+pub mod private_state;
 pub mod process;
 mod process_path;
 #[cfg(windows)]
