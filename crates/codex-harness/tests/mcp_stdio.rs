@@ -1,7 +1,7 @@
 #![cfg(windows)]
 use harness_core::{
     cancellable_pipe::{CancellablePipe, anonymous_pipe},
-    mcp_protocol::{Decoder, Message, READ_CHUNK},
+    mcp_protocol::{Decoder, MAX_FRAME, Message, READ_CHUNK},
     mcp_session::{Operation, Session},
     mcp_stdio,
     process::{Cancellation, CommandSpec, Deadline, Job, Limits, OwnedProcess, StopReason},
@@ -61,18 +61,18 @@ impl Server {
             cancel,
         }
     }
-    fn raw(&mut self, bytes: &[u8]) {
+    fn try_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
         for chunk in bytes.chunks(READ_CHUNK) {
-            self.input
-                .as_mut()
-                .unwrap()
-                .write_all(
-                    chunk,
-                    Deadline::after(Duration::from_secs(3)).unwrap(),
-                    &self.cancel,
-                )
-                .unwrap();
+            self.input.as_mut().unwrap().write_all(
+                chunk,
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+                &self.cancel,
+            )?;
         }
+        Ok(())
+    }
+    fn raw(&mut self, bytes: &[u8]) {
+        self.try_raw(bytes).unwrap();
     }
     fn send(&mut self, value: Value) {
         let mut bytes = serde_json::to_vec(&value).unwrap();
@@ -171,6 +171,25 @@ fn actual_stdio_preserves_unicode_exact_ids_and_output_purity() {
 }
 
 #[test]
+fn actual_stdio_preserves_an_above_one_mebibyte_unicode_argument() {
+    let mut server = Server::start();
+    server.initialize();
+    let text = "日本語 кариллица \"quoted\"\n".repeat(48 * 1024);
+    assert!(text.len() > 1024 * 1024);
+    server.send(json!({
+        "jsonrpc": "2.0",
+        "id": "large",
+        "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"text": text}}
+    }));
+    let reply = server.reply_with_timeout(Duration::from_secs(30));
+    assert_eq!(reply["id"], "large");
+    assert_eq!(reply["result"]["structuredContent"]["text"], text);
+    server.eof();
+    assert!(server.finish(0, Duration::from_secs(5)).is_empty());
+}
+
+#[test]
 fn cancellation_reclaims_active_handler_before_queued_work_starts() {
     let mut server = Server::start();
     server.initialize();
@@ -202,13 +221,43 @@ fn eof_cancels_an_active_tool_and_finishes_cleanup() {
 fn incomplete_input_is_a_nonzero_protocol_failure() {
     let mut server = Server::start();
     server.initialize();
-    server.raw(b"{\"jsonrpc\":");
+    server.raw(
+        br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{"mark_start":true"#,
+    );
     server.eof();
+    let marker = server.root.path().join("queued-started");
     let error = server.finish(91, Duration::from_secs(5));
     assert!(
         error.contains("MCP stream ended before its final frame"),
         "{error}"
     );
+    assert!(!marker.exists(), "a partial frame reached tool dispatch");
+}
+
+#[test]
+fn an_oversized_frame_names_the_native_limit_without_dispatch() {
+    let mut server = Server::start();
+    server.initialize();
+    let mut frame = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "echo",
+            "arguments": {"mark_start": true, "text": "x".repeat(MAX_FRAME)}
+        }
+    }))
+    .unwrap();
+    frame.push(b'\n');
+    assert!(frame.len() > MAX_FRAME);
+    let _ = server.try_raw(&frame);
+    let marker = server.root.path().join("queued-started");
+    let error = server.finish(91, Duration::from_secs(10));
+    assert!(
+        error.contains(&format!("the limit is {MAX_FRAME} bytes")),
+        "{error}"
+    );
+    assert!(!marker.exists(), "an oversized frame reached tool dispatch");
 }
 
 #[test]

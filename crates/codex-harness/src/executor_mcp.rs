@@ -2137,7 +2137,7 @@ fn message(operation: &Operation) -> io::Result<Value> {
             ));
         }
         let run = single_run(&home, &caller, RunRole::Executor)?;
-        return send_to_lead(&home, &run, &args.text, KIND_NOTICE, args.client_message_id);
+        return send_to_lead(&run, &args.text, KIND_NOTICE, args.client_message_id);
     }
     if !is_lead {
         return Err(invalid(
@@ -2164,7 +2164,7 @@ fn message(operation: &Operation) -> io::Result<Value> {
             "the selected request does not belong to the calling lead; nothing was sent",
         ));
     }
-    let mut result = send_to_executor(&home, &run, &args.text, args.client_message_id, None)?;
+    let mut result = send_to_executor(&run, &args.text, args.client_message_id, None)?;
     attach_cache_guard(&home, &run, &mut result);
     Ok(result)
 }
@@ -2197,7 +2197,7 @@ fn reply(operation: &Operation) -> io::Result<Value> {
         result["replyMessageId"] = entry["resolvedBy"].clone();
         return Ok(result);
     }
-    let mut result = send_to_executor(&home, &run, &args.text, None, Some(&args.request_id))?;
+    let mut result = send_to_executor(&run, &args.text, None, Some(&args.request_id))?;
     result["requestId"] = Value::String(args.request_id.clone());
     result["replyMessageId"] = result["messageId"].clone();
     if result["delivery"]["status"].as_str() == Some("delivered")
@@ -2221,13 +2221,7 @@ fn ask_lead(operation: &Operation) -> io::Result<Value> {
     }
     let home = native_launcher::codex_home()?;
     let run = single_run(&home, &caller, RunRole::Executor)?;
-    send_to_lead(
-        &home,
-        &run,
-        &args.text,
-        KIND_REQUEST,
-        args.client_message_id,
-    )
+    send_to_lead(&run, &args.text, KIND_REQUEST, args.client_message_id)
 }
 
 fn delivery_from_entry(entry: &Value) -> Value {
@@ -2306,7 +2300,6 @@ fn message_id(run: &VerifiedRun, direction: &str, client_message_id: &str) -> St
 }
 
 fn lead_envelope(
-    home: &Path,
     run: &VerifiedRun,
     id: &str,
     kind: &str,
@@ -2333,13 +2326,13 @@ fn lead_envelope(
             "the executor message header could not be encoded: {error}"
         ))
     })?;
-    executor_input::compose(home, id, text, |body| {
-        format!("{header}{PAYLOAD_MARK}{body}")
+    Ok(ComposedDelivery {
+        text: format!("{header}{PAYLOAD_MARK}{text}"),
+        spill: None,
     })
 }
 
 fn reply_envelope(
-    home: &Path,
     run: &VerifiedRun,
     id: &str,
     request_id: &str,
@@ -2361,8 +2354,9 @@ fn reply_envelope(
             "the lead reply header could not be encoded: {error}"
         ))
     })?;
-    executor_input::compose(home, id, text, |body| {
-        format!("{header}{PAYLOAD_MARK}{body}")
+    Ok(ComposedDelivery {
+        text: format!("{header}{PAYLOAD_MARK}{text}"),
+        spill: None,
     })
 }
 
@@ -2469,7 +2463,6 @@ fn executor_message_now() -> u64 {
 }
 
 fn send_to_lead(
-    home: &Path,
     run: &VerifiedRun,
     text: &str,
     kind: &str,
@@ -2551,7 +2544,7 @@ fn send_to_lead(
                 ));
                 return Ok(result);
             };
-            let composed = lead_envelope(home, run, &id, kind, text)?;
+            let composed = lead_envelope(run, &id, kind, text)?;
             let observed = executor_message::observe_exact_thread(
                 endpoint,
                 &run.lead_thread,
@@ -2630,7 +2623,7 @@ fn send_to_lead(
             ));
         }
     }
-    let composed = lead_envelope(home, run, &id, kind, text)?;
+    let composed = lead_envelope(run, &id, kind, text)?;
     let attempts = previous
         .as_ref()
         .and_then(|entry| entry["attempts"].as_u64())
@@ -2743,7 +2736,6 @@ fn send_to_lead(
 }
 
 fn send_to_executor(
-    home: &Path,
     run: &VerifiedRun,
     text: &str,
     client_message_id: Option<String>,
@@ -2773,7 +2765,7 @@ fn send_to_executor(
         None => message_id(run, "lead-to-executor", &client),
     };
     let composed = match reply_to {
-        Some(request_id) => reply_envelope(home, run, &id, request_id, text)?,
+        Some(request_id) => reply_envelope(run, &id, request_id, text)?,
         None => ComposedDelivery {
             text: text.to_owned(),
             spill: None,
