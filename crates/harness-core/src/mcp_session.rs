@@ -15,7 +15,6 @@ use std::{
 };
 
 const QUEUE_LIMIT: usize = 64;
-const ARGUMENT_LIMIT: usize = 16 * 1024;
 const PROTOCOL: &str = "2024-11-05";
 
 #[derive(PartialEq, Eq)]
@@ -136,9 +135,6 @@ impl Session {
         if message.kind() != Kind::Request {
             return Err(invalid("unexpected MCP client response"));
         }
-        if serde_json::to_vec(message.value())?.len() > ARGUMENT_LIMIT {
-            return Err(invalid("MCP request exceeds the byte limit"));
-        }
         let id = message
             .id()
             .ok_or_else(|| invalid("MCP request missing identity"))?;
@@ -203,14 +199,8 @@ impl Session {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                if !arguments.is_object()
-                    || serde_json::to_vec(&arguments)?.len() > ARGUMENT_LIMIT
-                    || params.get("task").is_some()
-                {
-                    return error(
-                        -32602,
-                        "Tool arguments are invalid or exceed the request limit",
-                    );
+                if !arguments.is_object() || params.get("task").is_some() {
+                    return error(-32602, "Tool arguments are invalid");
                 }
                 if self.queue.len() >= QUEUE_LIMIT {
                     return error(-32000, "MCP request queue is full");

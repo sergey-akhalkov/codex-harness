@@ -215,6 +215,25 @@ fn tool_error(response: &Value) -> String {
         .to_owned()
 }
 
+fn above_one_mebibyte() -> String {
+    let text = "日本語 кариллица \"quoted\" $(literal) %PATH%\n".repeat(40 * 1024);
+    assert!(text.len() > 1024 * 1024, "{}", text.len());
+    text
+}
+
+fn assert_no_file_relay(home: &Path) {
+    let messages = home.join("harness/messages");
+    assert!(
+        !messages.exists() || fs::read_dir(&messages).unwrap().next().is_none(),
+        "MCP delivery wrote a file relay under {}",
+        messages.display()
+    );
+}
+
+fn turn_requests(server: &Server) -> usize {
+    server.requests_for("turn/start").len() + server.requests_for("turn/steer").len()
+}
+
 fn git_repo(root: &Path) -> String {
     fs::create_dir_all(root).unwrap();
     fs::write(root.join("README.md"), "synthetic consumer\n").unwrap();
@@ -1801,6 +1820,241 @@ fn duplicate_payloads_are_not_repeated_but_identical_intentional_messages_are_di
 
     drop(run);
     mcp.finish();
+}
+
+#[test]
+fn above_one_mebibyte_literal_message_survives_reconnect_without_replay() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let large = above_one_mebibyte();
+    let sent = mcp.call_tool(
+        10,
+        "executor_message",
+        json!({"text": large, "clientMessageId": "message-above-one-mebibyte"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&sent)["delivery"]["status"], "delivered");
+    let native = server
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| {
+            matches!(
+                request["method"].as_str(),
+                Some("turn/start" | "turn/steer")
+            )
+        })
+        .unwrap();
+    let delivered = native["params"]["input"][0]["text"].as_str().unwrap();
+    assert_eq!(delivered.len(), large.len());
+    assert!(
+        delivered == large,
+        "the literal message changed in transport"
+    );
+    let before_reconnect = turn_requests(&server);
+    assert_no_file_relay(home.path());
+
+    mcp.finish();
+    let mut reconnected = Mcp::start(home.path());
+    let repeated = reconnected.call_tool(
+        11,
+        "executor_message",
+        json!({"text": large, "clientMessageId": "message-above-one-mebibyte"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&repeated)["delivery"]["status"], "delivered");
+    assert_eq!(
+        turn_requests(&server),
+        before_reconnect,
+        "reconnect replayed the accepted message"
+    );
+    let status = reconnected.call_tool(
+        12,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        result(&status)["runs"][0]["pendingRequests"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a phantom request was recorded"
+    );
+    assert_no_file_relay(home.path());
+
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    let messages = receipt["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "reconnect duplicated the attempt record");
+    let entry = messages.last().unwrap();
+    assert_eq!(entry["status"], "delivered");
+    assert_eq!(entry["bytes"].as_u64(), Some(large.len() as u64));
+    assert!(entry["payloadPath"].is_null());
+
+    drop(run);
+    reconnected.finish();
+}
+
+#[test]
+fn above_one_mebibyte_question_and_reply_use_no_file_relay() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        true,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let question_text = above_one_mebibyte();
+    let asked = mcp.call_tool(
+        20,
+        "executor_ask_lead",
+        json!({"text": question_text, "clientMessageId": "large-question"}),
+        Some(json!({"threadId": EXECUTOR})),
+    );
+    let asked = result(&asked);
+    assert_eq!(asked["delivery"]["status"], "delivered");
+    assert_eq!(asked["awaitingReply"], true);
+    let request_id = asked["requestId"].as_str().unwrap().to_owned();
+    let native_question = server
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| request["method"] == "turn/steer")
+        .unwrap();
+    let delivered_question = native_question["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(delivered_question.ends_with(&question_text));
+    assert_no_file_relay(home.path());
+
+    let reply_text = above_one_mebibyte();
+    let replied = mcp.call_tool(
+        21,
+        "executor_reply",
+        json!({"requestId": request_id, "text": reply_text}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let replied = result(&replied);
+    assert_eq!(replied["delivery"]["status"], "delivered");
+    assert_eq!(replied["resolved"], true);
+    let native_reply = server
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| request["method"] == "turn/start")
+        .unwrap();
+    let delivered_reply = native_reply["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(delivered_reply.ends_with(&reply_text));
+    assert_no_file_relay(home.path());
+
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["leadMessages"].as_array().unwrap().len(), 1);
+    assert!(receipt["leadMessages"][0]["payloadPath"].is_null());
+    assert_eq!(receipt["messages"].as_array().unwrap().len(), 1);
+    let reply = receipt["messages"].as_array().unwrap().last().unwrap();
+    assert!(reply["payloadPath"].is_null());
+    assert!(reply["bytes"].as_u64().unwrap() > 1024 * 1024, "{reply}");
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn above_one_mebibyte_native_record_is_reread_after_interruption_and_reconnect() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    let record = above_one_mebibyte();
+    complete_turn(&sim, EXECUTOR, "initial-turn", &record);
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let before_reconnect = turn_requests(&server);
+
+    sim.lock().unwrap().read_error = Some("interrupted partial native record".into());
+    let interrupted = mcp.call_tool(
+        30,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let interrupted = structured(&interrupted);
+    assert_eq!(interrupted["state"], "observation-error");
+    assert!(
+        interrupted["error"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted partial native record")
+    );
+
+    sim.lock().unwrap().read_error = None;
+    mcp.finish();
+    let mut reconnected = Mcp::start(home.path());
+    let reread = reconnected.call_tool(
+        31,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let reread = result(&reread);
+    assert_eq!(reread["state"], "completed");
+    assert_eq!(
+        reread["result"]["finalMessageBytes"].as_u64(),
+        Some(record.len() as u64)
+    );
+    assert_eq!(reread["result"]["finalMessageTruncated"], true);
+    assert!(reread["result"]["finalMessage"].as_str().unwrap().len() <= 32 * 1024);
+    assert_eq!(
+        turn_requests(&server),
+        before_reconnect,
+        "re-reading a native record started or replayed model work"
+    );
+    assert!(
+        reread["pendingRequests"].as_array().unwrap().is_empty(),
+        "a reconnect created a phantom request"
+    );
+    assert_no_file_relay(home.path());
+
+    let status = reconnected.call_tool(
+        32,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&status)["runs"][0]["executorThreadId"], EXECUTOR);
+    assert!(
+        result(&status)["runs"][0]["pendingRequests"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(run);
+    reconnected.finish();
 }
 
 #[test]

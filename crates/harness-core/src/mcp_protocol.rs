@@ -12,6 +12,13 @@ fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid MCP JSON-RPC message")
 }
 
+fn frame_limit(actual: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("MCP frame is {actual} bytes; the limit is {MAX_FRAME} bytes"),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Request,
@@ -34,7 +41,10 @@ fn request_id(value: &Value) -> bool {
 
 impl Message {
     pub fn parse(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.is_empty() || bytes.len() > MAX_FRAME || bytes.contains(&b'\n') {
+        if bytes.len() > MAX_FRAME {
+            return Err(frame_limit(bytes.len()));
+        }
+        if bytes.is_empty() || bytes.contains(&b'\n') {
             return Err(invalid());
         }
         let value = strict_json(bytes).map_err(|_| invalid())?;
@@ -125,7 +135,7 @@ impl Message {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         let mut bytes = serde_json::to_vec(&self.value)?;
         if bytes.len() > MAX_FRAME {
-            return Err(invalid());
+            return Err(frame_limit(bytes.len()));
         }
         bytes.push(b'\n');
         Ok(bytes)
@@ -145,17 +155,18 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if self.failed
-            || bytes.len() > READ_CHUNK
-            || self
-                .buffer
-                .len()
-                .saturating_sub(self.consumed)
-                .saturating_add(bytes.len())
-                > MAX_FRAME + READ_CHUNK + 1
-        {
+        if self.failed || bytes.len() > READ_CHUNK {
             self.failed = true;
             return Err(invalid());
+        }
+        let pending = self
+            .buffer
+            .len()
+            .saturating_sub(self.consumed)
+            .saturating_add(bytes.len());
+        if pending > MAX_FRAME + READ_CHUNK + 1 {
+            self.failed = true;
+            return Err(frame_limit(pending));
         }
         if self.consumed > 0 {
             self.buffer.drain(..self.consumed);
@@ -175,9 +186,10 @@ impl Decoder {
             .position(|byte| *byte == b'\n')
         else {
             self.scanned = self.buffer.len();
-            if self.buffer.len() - self.consumed > MAX_FRAME + 1 {
+            let pending = self.buffer.len() - self.consumed;
+            if pending > MAX_FRAME + 1 {
                 self.failed = true;
-                return Err(invalid());
+                return Err(frame_limit(pending));
             }
             return Ok(None);
         };
@@ -266,6 +278,72 @@ mod tests {
         }
         flood.push(b"xx").unwrap();
         assert!(flood.next_message().is_err());
+    }
+
+    #[test]
+    fn above_one_mebibyte_frames_survive_fragmentation_and_reconnect() {
+        let payload = "日本語 кариллица \"quoted\"\n".repeat(48 * 1024);
+        let frame = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": payload}}
+        }))
+        .unwrap();
+        assert!(frame.len() > 1024 * 1024, "{}", frame.len());
+
+        let mut interrupted = Decoder::default();
+        interrupted.push(&frame[..READ_CHUNK]).unwrap();
+        assert!(interrupted.next_message().unwrap().is_none());
+        drop(interrupted);
+
+        let mut decoder = Decoder::default();
+        for chunk in frame.chunks(READ_CHUNK) {
+            decoder.push(chunk).unwrap();
+        }
+        decoder.push(b"\n").unwrap();
+        let message = decoder.next_message().unwrap().unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(message.id(), Some(&json!(7)));
+        assert_eq!(message.params().unwrap()["arguments"]["text"], payload);
+    }
+
+    #[test]
+    fn the_native_frame_limit_is_explicit_and_never_resynchronizes() {
+        let oversized = vec![b'x'; MAX_FRAME + 1];
+        let error = Message::parse(&oversized).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("the limit is {MAX_FRAME} bytes")),
+            "{error}"
+        );
+
+        let mut input = oversized;
+        input.push(b'\n');
+        let mut decoder = Decoder::default();
+        let mut error = None;
+        for chunk in input.chunks(READ_CHUNK) {
+            if let Err(rejected) = decoder.push(chunk) {
+                error = Some(rejected);
+                break;
+            }
+            match decoder.next_message() {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("oversized input produced a message"),
+                Err(rejected) => {
+                    error = Some(rejected);
+                    break;
+                }
+            }
+        }
+        let error = error.expect("the oversized frame was accepted");
+        assert!(
+            error.to_string().contains(&MAX_FRAME.to_string()),
+            "{error}"
+        );
+        assert!(decoder.next_message().is_err());
+        assert!(decoder.finish().is_err());
     }
 
     #[test]
