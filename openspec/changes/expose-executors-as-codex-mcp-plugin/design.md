@@ -76,7 +76,7 @@ Start with these consumer operations; final exported names follow the installed 
 | Operation | Necessary inputs and result |
 | --- | --- |
 | `executor_status` | Current caller scope; bounded owned runs, held slots, configured profile choices and availability, with native thread/detail references |
-| `executor_spawn` | Assignment, consuming repository when not already bound, committed base when needed, optional allowed profile; returns verified run/thread/slot/base and actual binding |
+| `executor_dispatch` | Assignment, consuming repository when not already bound, committed base when needed, optional allowed profile; returns verified run/thread/slot/base and actual binding |
 | `executor_message` | Literal content plus run or request reference when needed; request, notification or reply intent; returns correlated native delivery evidence |
 | `executor_wait` | Owned run references and bounded wait; returns actionable question, terminal result, timeout or observation failure |
 | `executor_stop` | Verified run reference; returns actual isolated stop outcome and preserved continuation identity |
