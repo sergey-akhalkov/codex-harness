@@ -941,6 +941,8 @@ struct Overlap {
 }
 
 const HANDOFF_BOUND: Duration = Duration::from_secs(90);
+// Three seconds was shorter than a real second dispatch's startup. This fixed
+// bound now observes actual second-slot progress instead of assuming it.
 const EXCLUSIVITY_BOUND: Duration = Duration::from_secs(10);
 const TERMINAL_BOUND: Duration = Duration::from_secs(45);
 
@@ -1957,12 +1959,18 @@ fn exclusive_during_gate(
         let exited = contender.try_wait().ok().flatten().is_some();
         let records = read_slots(&lab.home);
         let stable = slot_record(&records, 1).is_some_and(|record| baseline.unchanged(record));
-        let second_ready =
-            !spec.other_slot || slot_owner(&records, 2).as_deref() == Some(spec.owner_b);
-        if exited || (stable && second_ready) || started.elapsed() >= EXCLUSIVITY_BOUND {
-            break;
+        let second_bound = slot_owner(&records, 2).as_deref() == Some(spec.owner_b);
+        match gate_wait_state(
+            exited,
+            stable,
+            spec.other_slot,
+            second_bound,
+            started.elapsed(),
+            EXCLUSIVITY_BOUND,
+        ) {
+            GateWait::Contending => thread::sleep(Duration::from_millis(50)),
+            GateWait::ContenderExited | GateWait::SecondSlotBound | GateWait::BoundElapsed => break,
         }
-        thread::sleep(Duration::from_millis(50));
     }
     let during = read_slots(&lab.home);
     let owner = slot_owner(&during, 1);
@@ -2005,6 +2013,33 @@ fn exclusive_during_gate(
         problems.push("contender published acceptance before a host existed".to_owned());
     }
     problems
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GateWait {
+    Contending,
+    ContenderExited,
+    SecondSlotBound,
+    BoundElapsed,
+}
+
+fn gate_wait_state(
+    contender_exited: bool,
+    stable: bool,
+    other_slot: bool,
+    second_bound: bool,
+    elapsed: Duration,
+    bound: Duration,
+) -> GateWait {
+    if contender_exited {
+        GateWait::ContenderExited
+    } else if stable && other_slot && second_bound {
+        GateWait::SecondSlotBound
+    } else if elapsed >= bound {
+        GateWait::BoundElapsed
+    } else {
+        GateWait::Contending
+    }
 }
 
 fn finish_one_slot(
@@ -3118,8 +3153,7 @@ fn wait_claim_gate(
             let records = read_slots(&lab.home);
             if let Some(record) = slot_record(&records, 1) {
                 let claim = ClaimSnapshot::read(record).ok_or_else(|| {
-                    "post-claim reset gate was reached without an owner/task/handle/startup claim"
-                        .to_owned()
+                    "post-claim reset gate was reached without a durable owner".to_owned()
                 })?;
                 if claim.owner != owner {
                     return Err(format!(
@@ -3147,7 +3181,7 @@ struct ClaimSnapshot {
     handle: Option<String>,
     base: Option<String>,
     state: Option<String>,
-    startup: Value,
+    startup: Option<Value>,
     assignment: Option<Value>,
 }
 
@@ -3161,8 +3195,8 @@ impl ClaimSnapshot {
             state: record["state"].as_str().map(str::to_owned),
             startup: record
                 .get("startup")
-                .filter(|value| value.is_object())?
-                .clone(),
+                .filter(|value| value.is_object())
+                .cloned(),
             assignment: record
                 .get("assignment")
                 .filter(|value| !value.is_null())
@@ -3176,8 +3210,17 @@ impl ClaimSnapshot {
 
     fn line(&self) -> String {
         format!(
-            "owner={} task={:?} handle={:?} base={:?} state={:?} startup=recorded",
-            self.owner, self.task, self.handle, self.base, self.state
+            "owner={} task={:?} handle={:?} base={:?} state={:?} startup={}",
+            self.owner,
+            self.task,
+            self.handle,
+            self.base,
+            self.state,
+            if self.startup.is_some() {
+                "recorded"
+            } else {
+                "absent"
+            }
         )
     }
 }
@@ -3947,4 +3990,62 @@ fn tail(text: &str) -> String {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn one_slot_gate_waits_for_the_contender_or_the_whole_bound() {
+        assert_eq!(
+            gate_wait_state(false, true, false, false, Duration::ZERO, BOUND),
+            GateWait::Contending
+        );
+        assert_eq!(
+            gate_wait_state(false, true, false, false, BOUND, BOUND),
+            GateWait::BoundElapsed
+        );
+        assert_eq!(
+            gate_wait_state(true, true, false, false, Duration::ZERO, BOUND),
+            GateWait::ContenderExited
+        );
+    }
+
+    #[test]
+    fn two_slot_gate_waits_for_actual_second_slot_progress() {
+        assert_eq!(
+            gate_wait_state(false, true, true, false, Duration::ZERO, BOUND),
+            GateWait::Contending
+        );
+        assert_eq!(
+            gate_wait_state(false, true, true, true, Duration::ZERO, BOUND),
+            GateWait::SecondSlotBound
+        );
+    }
+
+    #[test]
+    fn claim_snapshot_preserves_an_absent_startup_reservation() {
+        let record = serde_json::json!({
+            "owner": "exec-pre-reservation",
+            "task": "exec-pre-reservation",
+            "handle": "generation",
+            "base": null,
+            "state": "synchronizing"
+        });
+        let claim = ClaimSnapshot::read(&record).expect("durable owner is sufficient");
+        assert!(claim.startup.is_none());
+        assert!(claim.unchanged(&record));
+        let with_startup = serde_json::json!({
+            "owner": "exec-pre-reservation",
+            "task": "exec-pre-reservation",
+            "handle": "generation",
+            "base": null,
+            "state": "synchronizing",
+            "startup": {"pid": 1}
+        });
+        assert!(!claim.unchanged(&with_startup));
+    }
 }
