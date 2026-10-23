@@ -30,6 +30,7 @@ use harness_core::task_view;
 use harness_core::task_worktree;
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
@@ -51,6 +52,12 @@ const SURFACE_GRACE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(100);
 /// Bound on recorded descendant processes one stop tracks by identity.
 const MEMBER_LIMIT: usize = 512;
+/// Bound on one exact-thread background-terminal cleanup after interruption.
+const TERMINAL_GRACE: Duration = Duration::from_secs(5);
+/// A cancelled foreground command can enter the background terminal inventory
+/// just after its turn becomes idle; this bounded settle read avoids calling an
+/// empty one-shot inventory verified containment too early.
+const INVENTORY_SETTLE: Duration = Duration::from_secs(1);
 
 struct Request {
     source: PathBuf,
@@ -118,6 +125,536 @@ impl Request {
             timeout: parse_seconds(timeout.as_deref(), DEFAULT_TIMEOUT.as_secs(), "--timeout")?,
         })
     }
+}
+
+/// Stops one MCP run through the shared runtime. This path never addresses the
+/// shared app-server process tree: it adopts the exact executor thread, requests
+/// native interruption, terminates only that thread's own background terminals,
+/// and verifies their inventory disappeared. A missing native capability is
+/// recorded as partial containment, never replaced by a server or terminal kill.
+pub(crate) fn mcp_stop(
+    receipt: &Path,
+    endpoint: &control::Endpoint,
+    expected_thread: &str,
+    bound: Duration,
+) -> io::Result<Value> {
+    let requested_ms = observation::now_ms();
+    let started = Instant::now();
+    let mut conversation = control::Conversation::attach(endpoint, bound)?;
+    conversation.adopt_thread(expected_thread)?;
+    let initial = conversation.thread_state()?;
+    let initial_terminals = conversation.background_terminals();
+    let mut expected_terminals = BTreeMap::new();
+    let mut containment_error = None;
+    match initial_terminals {
+        Ok(terminals) => remember_terminals(&mut expected_terminals, &terminals),
+        Err(error) => {
+            containment_error = Some(format!(
+                "the native terminal inventory could not be read before interruption: {error}"
+            ))
+        }
+    }
+
+    let active = control::active_turn(&initial);
+    let interrupted_turn = active.clone();
+    let mut interrupted = false;
+    let interrupt = match active.as_deref() {
+        Some(turn) => match conversation.call(
+            "turn/interrupt",
+            json!({"threadId": expected_thread, "turnId": turn}),
+        ) {
+            Ok(_) => {
+                interrupted = true;
+                format!("native turn/interrupt accepted for exact turn {turn}")
+            }
+            Err(error) => format!(
+                "native turn/interrupt was refused for exact turn {turn}: {error}; no shared process was terminated"
+            ),
+        },
+        None => "no native turn was in progress; this stop started no model work".into(),
+    };
+    let mut after = match conversation.thread_state() {
+        Ok(thread) => thread,
+        Err(error) => {
+            return mcp_stop_unknown(
+                receipt,
+                expected_thread,
+                requested_ms,
+                started,
+                &interrupt,
+                &expected_terminals,
+                error,
+            );
+        }
+    };
+    if interrupted {
+        let until = Instant::now() + remaining(&started, bound).min(INTERRUPT_GRACE);
+        loop {
+            if control::active_turn(&after).is_none() || Instant::now() >= until {
+                break;
+            }
+            thread::sleep(POLL);
+            after = match conversation.thread_state() {
+                Ok(thread) => thread,
+                Err(error) => {
+                    return mcp_stop_unknown(
+                        receipt,
+                        expected_thread,
+                        requested_ms,
+                        started,
+                        &interrupt,
+                        &expected_terminals,
+                        error,
+                    );
+                }
+            };
+        }
+    }
+    let settle_until = if interrupted && expected_terminals.is_empty() {
+        Some(Instant::now() + remaining(&started, bound).min(INVENTORY_SETTLE))
+    } else {
+        None
+    };
+    loop {
+        match conversation.background_terminals() {
+            Ok(terminals) => {
+                remember_terminals(&mut expected_terminals, &terminals);
+                containment_error = None;
+                if !expected_terminals.is_empty() {
+                    break;
+                }
+            }
+            Err(error) => {
+                if containment_error.is_none() {
+                    containment_error = Some(format!(
+                        "the native terminal inventory could not be read after interruption: {error}"
+                    ));
+                }
+                break;
+            }
+        }
+        let Some(until) = settle_until else {
+            break;
+        };
+        if Instant::now() >= until {
+            break;
+        }
+        thread::sleep(POLL);
+    }
+
+    let mut terminate_errors = BTreeMap::new();
+    for process_id in expected_terminals.keys() {
+        if let Err(error) = conversation.terminate_background_terminal(process_id) {
+            terminate_errors.insert(process_id.clone(), error.to_string());
+        }
+    }
+    let mut remaining_terminals = BTreeMap::new();
+    if !expected_terminals.is_empty() {
+        let until = Instant::now() + remaining(&started, bound).min(TERMINAL_GRACE);
+        loop {
+            match conversation.background_terminals() {
+                Ok(terminals) => {
+                    let current: BTreeSet<String> = terminals
+                        .iter()
+                        .filter_map(|terminal| terminal["processId"].as_str().map(str::to_owned))
+                        .collect();
+                    remaining_terminals = expected_terminals
+                        .iter()
+                        .filter(|(process_id, _)| current.contains(*process_id))
+                        .map(|(process_id, terminal)| (process_id.clone(), terminal.clone()))
+                        .collect();
+                    containment_error = None;
+                    if remaining_terminals.is_empty() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    containment_error = Some(format!(
+                        "the native terminal inventory could not be verified after termination: {error}"
+                    ));
+                    remaining_terminals = expected_terminals.clone();
+                }
+            }
+            if Instant::now() >= until {
+                break;
+            }
+            thread::sleep(POLL);
+        }
+    } else if containment_error.is_none() {
+        // Both inventory reads succeeded and found no child command.
+        remaining_terminals.clear();
+    }
+
+    let thread_state = after["status"]["type"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned();
+    let active_after = control::active_turn(&after);
+    let last_turn = last_turn(&after);
+    let last_turn_id = last_turn
+        .and_then(|turn| turn["id"].as_str())
+        .map(str::to_owned);
+    let last_status = last_turn
+        .and_then(|turn| turn["status"].as_str())
+        .unwrap_or("unknown");
+    let previous = observation::read_receipt_value(receipt)
+        .ok()
+        .and_then(|value| previous_stop_record(&value));
+    let previous_turn = observation::read_receipt_value(receipt)
+        .ok()
+        .and_then(|value| value["stopTurnId"].as_str().map(str::to_owned));
+    let started_work = !expected_terminals.is_empty() || interrupted;
+    let containment_verified = containment_error.is_none() && remaining_terminals.is_empty();
+    let repeated = matches!(
+        previous.as_ref().map(|stop| stop.outcome.as_str()),
+        Some(STOP_STOPPED) | Some(STOP_ALREADY_STOPPED)
+    ) && previous_turn == last_turn_id
+        && last_status != "completed"
+        && active_after.is_none()
+        && containment_verified;
+    let outcome = if last_status == "completed" {
+        STOP_ALREADY_COMPLETED
+    } else if active_after.is_some() || !containment_verified {
+        STOP_PARTIAL
+    } else if repeated {
+        STOP_ALREADY_STOPPED
+    } else if active.is_some() || started_work {
+        STOP_STOPPED
+    } else if matches!(last_status, "interrupted" | "failed" | "defect") {
+        STOP_ALREADY_STOPPED
+    } else {
+        STOP_ERROR
+    };
+    let ended = expected_terminals
+        .len()
+        .saturating_sub(remaining_terminals.len());
+    let mut survivors = Vec::new();
+    for (process_id, terminal) in &remaining_terminals {
+        let cause = terminate_errors
+            .get(process_id)
+            .map(|error| format!("native termination was refused: {error}"))
+            .or_else(|| containment_error.clone())
+            .unwrap_or_else(|| "the exact thread still lists this command".into());
+        survivors.push(StopSurvivor {
+            kind: "background-terminal".into(),
+            pid: terminal["osPid"].as_u64().and_then(|pid| u32::try_from(pid).ok()),
+            created: None,
+            image: None,
+            surface: Some(process_id.clone()),
+            cause,
+            next_action: format!(
+                "inspect native background terminal {process_id} for the exact executor thread and terminate only that command; do not restart the shared app-server"
+            ),
+        });
+    }
+    if active_after.is_some() {
+        survivors.push(StopSurvivor {
+            kind: "turn".into(),
+            pid: None,
+            created: None,
+            image: None,
+            surface: active_after.clone(),
+            cause: "the exact executor thread still reports an in-progress turn after interruption"
+                .into(),
+            next_action: "inspect the native thread and repeat stop only after its active turn ends; do not kill the shared app-server".into(),
+        });
+    }
+    if let Some(error) = &containment_error
+        && !survivors
+            .iter()
+            .any(|survivor| survivor.kind == "background-terminal")
+    {
+        survivors.push(StopSurvivor {
+            kind: "background-terminal-inventory".into(),
+            pid: None,
+            created: None,
+            image: None,
+            surface: Some(expected_thread.to_owned()),
+            cause: error.clone(),
+            next_action: "inspect the exact thread's native background-terminal inventory before claiming child containment; do not restart the shared app-server".into(),
+        });
+    }
+    let completed_ms = observation::now_ms();
+    let detail = format!(
+        "{}; exact executor thread {} is {}{}; {} background terminal(s) were listed for that thread and {} verified gone; the shared app-server and sibling conversations were not addressed",
+        match outcome {
+            STOP_STOPPED => "the exact executor turn stopped",
+            STOP_ALREADY_STOPPED =>
+                "no stop was needed; the exact executor thread was already idle",
+            STOP_ALREADY_COMPLETED =>
+                "the run completed while stop was observing it; its result stands",
+            STOP_PARTIAL => "stop could not verify complete containment of the exact executor run",
+            _ => "stop could not establish the exact executor thread's state",
+        },
+        expected_thread,
+        thread_state,
+        active_after
+            .as_deref()
+            .map(|turn| format!(" with active turn {turn}"))
+            .unwrap_or_default(),
+        expected_terminals.len(),
+        ended
+    );
+    let mut stop = if repeated {
+        let mut previous = previous.expect("checked above");
+        previous.repeats = previous.repeats.saturating_add(1);
+        previous.repeated_ms = Some(completed_ms);
+        previous
+    } else {
+        StopRecord {
+            schema: STOP_SCHEMA,
+            outcome: outcome.into(),
+            requested_ms,
+            completed_ms,
+            duration_ms: started.elapsed().as_millis() as u64,
+            detail: detail.clone(),
+            host: None,
+            interrupt: Some(interrupt),
+            ended: ended as u64,
+            survivors: survivors.clone(),
+            surface: Some(format!(
+                "exact thread {expected_thread} observed {thread_state}; shared app-server retained"
+            )),
+            undelivered: Vec::new(),
+            repeats: 0,
+            repeated_ms: None,
+            exit_code: None,
+        }
+    };
+    if repeated {
+        stop.survivors = survivors;
+        stop.detail = detail;
+        stop.outcome = outcome.into();
+        stop.ended = ended as u64;
+        stop.surface = Some(format!(
+            "exact thread {expected_thread} observed {thread_state}; shared app-server retained"
+        ));
+    }
+    let transition = match stop.outcome.as_str() {
+        STOP_STOPPED => StopTransition::Stopped,
+        STOP_PARTIAL => StopTransition::Partial,
+        _ => StopTransition::Keep,
+    };
+    let commit = observation::commit_stop(receipt, &mut stop, transition)?;
+    let (cancelled, cancellation_error) = if matches!(
+        stop.outcome.as_str(),
+        STOP_STOPPED | STOP_PARTIAL
+    ) {
+        match cancel_mcp_deliveries(
+            receipt,
+            last_turn_id.as_deref(),
+            &thread_state,
+            stop.completed_ms,
+        ) {
+            Ok(cancelled) => (cancelled, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "stop was recorded, but pending deliveries could not be marked cancelled; delivery is still refused by the recorded stop state and the receipt needs inspection: {error}"
+                )),
+            ),
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    let mut result = json!({
+        "outcome": stop.outcome,
+        "threadId": expected_thread,
+        "threadState": thread_state,
+        "activeTurnId": active_after,
+        "interruptedTurnId": interrupted_turn,
+        "interrupt": stop.interrupt,
+        "containment": {
+            "status": if containment_verified { "verified" } else { "partial" },
+            "authority": "native exact-thread background-terminal inventory",
+            "listed": expected_terminals.len(),
+            "ended": ended,
+            "remaining": remaining_terminals.keys().collect::<Vec<_>>()
+        },
+        "cancelledMessages": cancelled,
+        "stop": stop,
+        "state": commit.state,
+        "receipt": receipt
+    });
+    if let Some(error) = cancellation_error {
+        result["cancellationError"] = Value::String(error);
+    }
+    Ok(result)
+}
+
+/// Records an explicit partial stop when the native thread state became
+/// unreadable after interruption. This is not success: it preserves the
+/// interrupt evidence and refuses automatic restart without targeting the
+/// shared app-server.
+fn mcp_stop_unknown(
+    receipt: &Path,
+    thread_id: &str,
+    requested_ms: u64,
+    started: Instant,
+    interrupt: &str,
+    expected_terminals: &BTreeMap<String, Value>,
+    error: io::Error,
+) -> io::Result<Value> {
+    let completed_ms = observation::now_ms();
+    let detail = format!(
+        "the exact executor thread {thread_id} could not be read after interruption: {error}; containment is unverified and the shared app-server was not targeted"
+    );
+    let mut survivors: Vec<StopSurvivor> = expected_terminals
+        .iter()
+        .map(|(process_id, terminal)| StopSurvivor {
+            kind: "background-terminal".into(),
+            pid: terminal["osPid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok()),
+            created: None,
+            image: None,
+            surface: Some(process_id.clone()),
+            cause: "thread state became unreadable before this command could be verified or terminated"
+                .into(),
+            next_action: format!(
+                "inspect native background terminal {process_id} for the exact executor thread; do not restart the shared app-server"
+            ),
+        })
+        .collect();
+    survivors.push(StopSurvivor {
+        kind: "control-read".into(),
+        pid: None,
+        created: None,
+        image: None,
+        surface: Some(thread_id.to_owned()),
+        cause: detail.clone(),
+        next_action:
+            "inspect the exact executor thread's native state before continuing; do not restart the shared app-server"
+                .into(),
+    });
+    let mut stop = StopRecord {
+        schema: STOP_SCHEMA,
+        outcome: STOP_PARTIAL.into(),
+        requested_ms,
+        completed_ms,
+        duration_ms: started.elapsed().as_millis() as u64,
+        detail: detail.clone(),
+        host: None,
+        interrupt: Some(interrupt.to_owned()),
+        ended: 0,
+        survivors,
+        surface: Some(format!(
+            "exact thread {thread_id} was not readable after interruption; shared app-server retained"
+        )),
+        undelivered: Vec::new(),
+        repeats: 0,
+        repeated_ms: None,
+        exit_code: None,
+    };
+    let commit = observation::commit_stop(receipt, &mut stop, StopTransition::Partial)?;
+    let (cancelled, cancellation_error) = match cancel_mcp_deliveries(
+        receipt,
+        None,
+        "unknown",
+        completed_ms,
+    ) {
+        Ok(cancelled) => (cancelled, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "pending deliveries could not be marked cancelled after the unreadable stop: {error}"
+            )),
+        ),
+    };
+    let mut result = json!({
+        "outcome": stop.outcome,
+        "threadId": thread_id,
+        "threadState": "unknown",
+        "activeTurnId": Value::Null,
+        "interruptedTurnId": Value::Null,
+        "interrupt": stop.interrupt,
+        "containment": {
+            "status": "partial",
+            "authority": "native exact-thread state unavailable",
+            "listed": expected_terminals.len(),
+            "ended": 0,
+            "remaining": []
+        },
+        "cancelledMessages": cancelled,
+        "stop": stop,
+        "state": commit.state,
+        "receipt": receipt
+    });
+    if let Some(error) = cancellation_error {
+        result["cancellationError"] = Value::String(error);
+    }
+    Ok(result)
+}
+
+fn remember_terminals(expected: &mut BTreeMap<String, Value>, terminals: &[Value]) {
+    for terminal in terminals {
+        if let Some(process_id) = terminal["processId"].as_str() {
+            expected
+                .entry(process_id.to_owned())
+                .or_insert_with(|| terminal.clone());
+        }
+    }
+}
+
+fn last_turn(thread: &Value) -> Option<&Value> {
+    thread["turns"].as_array()?.last()
+}
+
+/// Cancels pending MCP deliveries that would otherwise restart a stopped run
+/// and records the exact turn whose shutdown this stop observed. The write is
+/// serialized with request/answer recording, so a concurrent resolution is
+/// preserved rather than replaced.
+fn cancel_mcp_deliveries(
+    receipt: &Path,
+    turn_id: Option<&str>,
+    thread_state: &str,
+    at_ms: u64,
+) -> io::Result<Vec<String>> {
+    super::executor_message::update_receipt_document(receipt, |document| {
+        if let Some(turn_id) = turn_id {
+            document["turnId"] = Value::String(turn_id.to_owned());
+        }
+        document["stopTurnId"] = json!(turn_id);
+        document["stopThreadState"] = Value::String(thread_state.to_owned());
+        let mut cancelled = Vec::new();
+        let mut pending_ids = Vec::new();
+        if let Some(messages) = document["leadMessages"].as_array_mut() {
+            for message in messages {
+                let was_pending = matches!(
+                    message["status"].as_str(),
+                    Some("pending") | Some("queued") | Some("indeterminate")
+                );
+                let delivered_request = message["status"].as_str() == Some("delivered")
+                    && message["kind"].as_str() == Some(super::executor_message::KIND_REQUEST);
+                if !was_pending && !delivered_request {
+                    continue;
+                }
+                let id = message["id"].as_str().unwrap_or("unnamed").to_owned();
+                message["status"] = Value::String("cancelled".into());
+                message["cancelledMs"] = Value::from(at_ms);
+                if was_pending {
+                    pending_ids.push(id.clone());
+                }
+                cancelled.push(id);
+            }
+        }
+        if let Some(stop) = document["stop"].as_object_mut() {
+            let undelivered = stop
+                .entry("undelivered")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(entries) = undelivered.as_array_mut() {
+                for id in &pending_ids {
+                    if !entries
+                        .iter()
+                        .any(|entry| entry.as_str() == Some(id.as_str()))
+                    {
+                        entries.push(Value::String(id.clone()));
+                    }
+                }
+            }
+        }
+        Ok(cancelled)
+    })
 }
 
 pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {

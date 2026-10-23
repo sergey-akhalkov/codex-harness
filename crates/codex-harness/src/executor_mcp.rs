@@ -1,7 +1,7 @@
-//! The executor MCP surface: dispatch, bounded status and native message,
-//! reply and ask-lead operations. Authority is Codex request `_meta.threadId`;
-//! runs are resolved from the existing MCP receipt and its slot/app-server
-//! lease. Dispatch preparation and delivery classification stay in the
+//! The executor MCP surface: dispatch, bounded status, native message/reply,
+//! isolated stop and explicit continuation. Authority is Codex request
+//! `_meta.threadId`; runs are resolved from the existing MCP receipt and its
+//! slot/app-server lease. Dispatch, delivery and stop containment stay in the
 //! existing executor owners; this module selects and validates the binding.
 
 use crate::{
@@ -39,10 +39,13 @@ const STATUS_TOOL: &str = "executor_status";
 const MESSAGE_TOOL: &str = "executor_message";
 const REPLY_TOOL: &str = "executor_reply";
 const ASK_TOOL: &str = "executor_ask_lead";
+const STOP_TOOL: &str = "executor_stop";
+const RESUME_TOOL: &str = "executor_resume";
 const APPROVAL_POLICY: &str = "never";
 const MAX_RECEIPTS: usize = 256;
 const MAX_STATUS_RUNS: usize = 8;
 const MAX_STATUS_REQUESTS: usize = 16;
+const MAX_PROGRESS_BYTES: usize = 4 * 1024;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -60,7 +63,7 @@ fn excerpt(text: &str, limit: usize) -> String {
 pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp executors\nServe the installed executor MCP plugin over stdio. The caller identity comes only from Codex-injected request `_meta.threadId`. Tools dispatch one executor on the originating app-server, exchange addressed messages or questions through recorded receipts, and read bounded native status. No run, thread, endpoint or recipient is accepted from tool arguments."
+            "codex-harness mcp executors\nServe the installed executor MCP plugin over stdio. The caller identity comes only from Codex-injected request `_meta.threadId`. Tools dispatch one executor on the originating app-server, exchange addressed messages or questions, read bounded status, stop one exact run through native turn interruption, and explicitly continue that run. No run, thread, endpoint or recipient is accepted from tool arguments as authority."
         );
         return Ok(0);
     }
@@ -80,6 +83,8 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             message_tool_definition(),
             reply_tool_definition(),
             ask_lead_tool_definition(),
+            stop_tool_definition(),
+            resume_tool_definition(),
         ],
     )?;
     mcp_stdio::serve_fallible_with_lifetime(
@@ -211,6 +216,51 @@ fn ask_lead_tool_definition() -> Value {
     })
 }
 
+fn stop_tool_definition() -> Value {
+    json!({
+        "name": STOP_TOOL,
+        "description": "Stop one executor run owned by the verified calling lead. Interrupts only the exact executor turn through the shared app-server, terminates only that thread's native background commands, verifies their inventory disappears, and preserves the checkout, slot, receipt and lease. The run's owned child command is not reported gone unless the exact-thread inventory proves it. No shared app-server or sibling conversation is targeted.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "run": {
+                    "type": "string",
+                    "description": "Optional exact run id returned by executor_status. Omitted selects the calling lead's sole recorded run; it never establishes authority by itself."
+                }
+            }
+        }
+    })
+}
+
+fn resume_tool_definition() -> Value {
+    json!({
+        "name": RESUME_TOOL,
+        "description": "Explicitly continue one stopped executor run owned by the verified calling lead. exact resumes the same thread with the preserved assignment and bounded progress, without resubmitting the assignment or resetting the pool. fresh starts a new thread on the same shared app-server with the preserved assignment, retains the predecessor, and asks the model to inspect interrupted effects. An explicit stop is never restarted automatically.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["mode"],
+            "properties": {
+                "run": {
+                    "type": "string",
+                    "description": "Optional exact run id returned by executor_status. Omitted selects the calling lead's sole recorded run."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["exact", "fresh"],
+                    "description": "exact continues the same native thread; fresh creates one new bound thread and retains the predecessor."
+                },
+                "progress": {
+                    "type": "string",
+                    "maxLength": 4096,
+                    "description": "Optional bounded progress or new facts for the continuation. Omitted is reported as no progress supplied, never inferred from logs."
+                }
+            }
+        }
+    })
+}
+
 fn perform(operation: &Operation) -> io::Result<Value> {
     match operation.name.as_str() {
         DISPATCH_TOOL => dispatch(operation),
@@ -218,6 +268,8 @@ fn perform(operation: &Operation) -> io::Result<Value> {
         MESSAGE_TOOL => message(operation),
         REPLY_TOOL => reply(operation),
         ASK_TOOL => ask_lead(operation),
+        STOP_TOOL => stop(operation),
+        RESUME_TOOL => resume(operation),
         other => Err(invalid(format!("unknown executor MCP tool '{other}'"))),
     }
 }
@@ -227,6 +279,12 @@ fn tool_response(result: io::Result<Value>, operation: &Operation) -> Value {
         Ok(value) => {
             let is_error = value.get("error").is_some()
                 || value.get("resolutionError").is_some()
+                || value.get("cancellationError").is_some()
+                || matches!(
+                    value["outcome"].as_str(),
+                    Some("partial") | Some("unsupported") | Some("error")
+                )
+                || value["containment"]["status"].as_str() == Some("partial")
                 || matches!(
                     value["delivery"]["status"].as_str(),
                     Some("error") | Some("indeterminate")
@@ -304,6 +362,23 @@ struct AskLeadArgs {
     client_message_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopArgs {
+    #[serde(default)]
+    run: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeArgs {
+    mode: String,
+    #[serde(default)]
+    run: Option<String>,
+    #[serde(default)]
+    progress: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunRole {
     Lead,
@@ -359,6 +434,7 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     let args: DispatchArgs = serde_json::from_value(operation.arguments.clone())
         .map_err(|error| invalid(format!("executor_dispatch arguments are invalid: {error}")))?;
     let owner = args.owner.unwrap_or_else(|| generated_owner(&caller));
+    let assignment_value = args.assignment.clone();
     let assignment = Assignment::from_value(args.assignment)?;
     let codex_home = native_launcher::codex_home()?;
     if mcp_receipts(&codex_home)?
@@ -468,6 +544,8 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         "leadThreadId": caller,
         "executorThreadId": executor_thread,
         "turnId": turn.turn_id,
+        "assignment": assignment_value,
+        "prompt": prepared.prompt,
         "title": prepared.title,
         "slot": prepared.slot,
         "source": prepared.source,
@@ -478,6 +556,13 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         "profile": identity,
         "observedStatus": observed,
         "allowProviderModelFallback": false,
+        "control": {
+            "approvalPolicy": plan.approval_policy,
+            "sandbox": plan.sandbox,
+            "config": plan.overrides,
+            "roleArgs": prepared.role_args,
+            "profileOverrides": prepared.profile_overrides
+        },
         "startupReservationReleased": startup_release.is_none(),
         "lease": {
             "slot": prepared.slot,
@@ -856,7 +941,10 @@ fn pending_requests(run: &VerifiedRun) -> (Vec<Value>, bool) {
         .iter()
         .filter(|entry| {
             entry["kind"].as_str() == Some(KIND_REQUEST)
-                && entry["status"].as_str() != Some("resolved")
+                && !matches!(
+                    entry["status"].as_str(),
+                    Some("resolved") | Some("cancelled")
+                )
         })
         .map(|entry| {
             json!({
@@ -893,6 +981,9 @@ fn run_summary(run: &VerifiedRun) -> Value {
         "checkout": run.checkout,
         "base": run.base,
         "profile": run.value["profile"],
+        "stop": run.value["stop"],
+        "continuation": run.value["continuation"],
+        "predecessorThreadId": run.value["predecessorThreadId"],
         "receipt": run.receipt
     })
 }
@@ -950,6 +1041,328 @@ fn status(operation: &Operation) -> io::Result<Value> {
         "truncated": truncated,
         "state": "ok"
     }))
+}
+
+fn stop(operation: &Operation) -> io::Result<Value> {
+    let caller = caller_thread(&operation.metadata)?;
+    let args: StopArgs = serde_json::from_value(operation.arguments.clone())
+        .map_err(|error| invalid(format!("executor_stop arguments are invalid: {error}")))?;
+    let home = native_launcher::codex_home()?;
+    let run = match args.run.as_deref() {
+        Some(run) => lead_run_by_id(&home, &caller, run)?,
+        None => single_run(&home, &caller, RunRole::Lead)?,
+    };
+    let endpoint = run.endpoint.clone().ok_or_else(|| {
+        invalid(format!(
+            "the exact run's registered app-server endpoint is unavailable ({}); no process was targeted",
+            run.endpoint_unavailable
+                .as_deref()
+                .unwrap_or("not recorded")
+        ))
+    })?;
+    let mut result =
+        executor_cli::mcp_stop(&run.receipt, &endpoint, &run.executor_thread, DEFAULT_BOUND)?;
+    result["run"] = Value::String(run.run.clone());
+    result["leadThreadId"] = Value::String(run.lead_thread.clone());
+    result["executorThreadId"] = Value::String(run.executor_thread.clone());
+    result["slot"] = Value::from(run.slot);
+    result["lease"] = run.value["lease"].clone();
+    result["preserved"] = json!({
+        "checkout": run.checkout,
+        "base": run.base,
+        "slot": run.slot,
+        "owner": run.run,
+        "receipt": run.receipt,
+        "appServerRetained": true,
+        "reset": false,
+        "released": false,
+        "reassigned": false
+    });
+    Ok(result)
+}
+
+fn resume(operation: &Operation) -> io::Result<Value> {
+    let caller = caller_thread(&operation.metadata)?;
+    let args: ResumeArgs = serde_json::from_value(operation.arguments.clone())
+        .map_err(|error| invalid(format!("executor_resume arguments are invalid: {error}")))?;
+    let mode = match args.mode.as_str() {
+        "exact" | "fresh" => args.mode.as_str(),
+        other => {
+            return Err(invalid(format!(
+                "executor_resume mode must be 'exact' or 'fresh', not {other:?}; no run was resumed"
+            )));
+        }
+    };
+    let progress = args.progress.as_deref().unwrap_or_default();
+    if progress.len() > MAX_PROGRESS_BYTES {
+        return Err(invalid(format!(
+            "executor_resume progress is {} bytes; the limit is {MAX_PROGRESS_BYTES}. Nothing was resumed",
+            progress.len()
+        )));
+    }
+    let home = native_launcher::codex_home()?;
+    let run = match args.run.as_deref() {
+        Some(run) => lead_run_by_id(&home, &caller, run)?,
+        None => single_run(&home, &caller, RunRole::Lead)?,
+    };
+    let endpoint = run.endpoint.clone().ok_or_else(|| {
+        invalid(format!(
+            "the exact run's registered app-server endpoint is unavailable ({}); no model work was started",
+            run.endpoint_unavailable
+                .as_deref()
+                .unwrap_or("not recorded")
+        ))
+    })?;
+    if run.value["stop"]["outcome"].as_str() == Some("partial") {
+        return Err(invalid(
+            "the last stop reported partial containment; no continuation was started. Repeat executor_stop until the exact thread and its background terminals are verified gone, or preserve the run for explicit inspection",
+        ));
+    }
+    let prompt = required_text(&run.value, "prompt")?.to_owned();
+    let evidence = workspace_evidence(&run.checkout, &run.base);
+    let from_turn = run.value["turnId"].as_str().map(str::to_owned);
+    match mode {
+        "exact" => {
+            let mut conversation = Conversation::attach(&endpoint, DEFAULT_BOUND)?;
+            conversation.adopt_thread(&run.executor_thread)?;
+            let thread = conversation.thread_state()?;
+            let turns = thread["turns"]
+                .as_array()
+                .filter(|turns| !turns.is_empty())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "exact executor thread {} reports no pre-turn history, so the preserved assignment cannot be proved; the run was not resumed. Use executor_resume mode=fresh to retain this predecessor and start from the recorded assignment",
+                        run.executor_thread
+                    ))
+                })?;
+            if let Some(turn) = active_turn(&thread) {
+                return Err(invalid(format!(
+                    "exact executor thread {} still has active turn {turn}; stop it before explicit continuation. No model work was started",
+                    run.executor_thread
+                )));
+            }
+            let objective = run.value["assignment"]["objective"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| excerpt(&prompt, 1024));
+            let text = exact_continuation_text(&objective, progress, &evidence, turns.len());
+            let turn = conversation.assign(&text)?;
+            record_continuation(
+                &run,
+                "exact",
+                &run.executor_thread,
+                from_turn.as_deref(),
+                &run.executor_thread,
+                &turn.turn_id,
+                progress.len(),
+            )?;
+            Ok(json!({
+                "mode": "exact",
+                "run": run.run,
+                "threadId": run.executor_thread,
+                "turnId": turn.turn_id,
+                "status": turn.status,
+                "predecessorRetained": false,
+                "preTurnTurns": turns.len(),
+                "checkout": run.checkout,
+                "base": run.base,
+                "slot": run.slot,
+                "receipt": run.receipt,
+                "workspace": evidence,
+                "detail": "resumed the exact native thread with the preserved assignment; the assignment was not resubmitted and the slot was not reset or reassigned"
+            }))
+        }
+        "fresh" => {
+            let mut current = Conversation::attach(&endpoint, DEFAULT_BOUND)?;
+            current.adopt_thread(&run.executor_thread)?;
+            let current_state = current.thread_state()?;
+            if let Some(turn) = active_turn(&current_state) {
+                return Err(invalid(format!(
+                    "exact executor thread {} still has active turn {turn}; stop it before fresh recovery. No new thread was started",
+                    run.executor_thread
+                )));
+            }
+            drop(current);
+            let identity = run.identity.clone().ok_or_else(|| {
+                invalid(
+                    "the run receipt records no exact profile binding; fresh recovery cannot preserve routing and no thread was started",
+                )
+            })?;
+            let overrides: BTreeMap<String, Value> = match run.value["control"]["config"]
+                .as_object()
+            {
+                Some(config) => config
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                None => {
+                    return Err(invalid(
+                        "the run receipt records no exact control configuration; fresh recovery cannot preserve routing and no thread was started",
+                    ));
+                }
+            };
+            let paths = ControlPaths::for_slot(&home, &run.repository, run.slot)?;
+            let mut plan = ControlPlan::new(
+                home.join("harness/bin/codex.exe"),
+                &home,
+                &run.checkout,
+                run.title.clone(),
+                identity,
+                paths,
+            );
+            plan.approval_policy = run.value["control"]["approvalPolicy"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| Some(APPROVAL_POLICY.into()));
+            plan.sandbox = run.value["control"]["sandbox"].as_str().map(str::to_owned);
+            plan.overrides = overrides;
+            let mut conversation = Conversation::start_on_endpoint(&endpoint, &plan)?;
+            let new_thread = conversation.thread_id().to_owned();
+            let thread = conversation.thread_state()?;
+            let observed = confirm_started(
+                &thread,
+                &new_thread,
+                &run.checkout,
+                run.identity.as_ref().expect("checked above"),
+                &run.title,
+            )?;
+            let text = fresh_recovery_text(&prompt, progress, &evidence, &run.executor_thread);
+            let turn = conversation.assign(&text)?;
+            record_continuation(
+                &run,
+                "fresh",
+                &run.executor_thread,
+                from_turn.as_deref(),
+                &new_thread,
+                &turn.turn_id,
+                progress.len(),
+            )?;
+            Ok(json!({
+                "mode": "fresh",
+                "run": run.run,
+                "threadId": new_thread,
+                "turnId": turn.turn_id,
+                "status": turn.status,
+                "observedStatus": observed,
+                "predecessorThreadId": run.executor_thread,
+                "predecessorRetained": true,
+                "checkout": run.checkout,
+                "base": run.base,
+                "slot": run.slot,
+                "receipt": run.receipt,
+                "workspace": evidence,
+                "detail": "created one new bound thread on the same shared app-server; the predecessor thread remains retained, the slot stayed bound, and the preserved assignment was submitted once in the new thread"
+            }))
+        }
+        _ => unreachable!("validated above"),
+    }
+}
+
+fn exact_continuation_text(
+    objective: &str,
+    progress: &str,
+    evidence: &str,
+    pre_turn_turns: usize,
+) -> String {
+    format!(
+        "Continue the preserved assignment in this same thread. Do not replay or resubmit the assignment, reset or clean the checkout, or repeat completed commands. Inspect the current diff, commits, untracked files and interrupted effects before reusing any prior result; preserve completed work.\n\nPreserved assignment objective: {objective}\nRecorded pre-turn history: {pre_turn_turns} turn(s), retained in this thread.\nCheckout at continuation: {evidence}\nBounded progress supplied by the lead:\n{}\n\nReturn the compact result to the originating lead.",
+        if progress.trim().is_empty() {
+            "(none supplied; do not infer progress from logs)"
+        } else {
+            progress
+        }
+    )
+}
+
+fn fresh_recovery_text(
+    assignment: &str,
+    progress: &str,
+    evidence: &str,
+    predecessor: &str,
+) -> String {
+    format!(
+        "Recover the preserved assignment in this new thread. The predecessor thread {predecessor} remains retained and is not this conversation. First inspect the current diff, commits, untracked files and interrupted effects; do not reset or clean the checkout and do not assume a prior command completed.\n\nCheckout at recovery: {evidence}\nBounded progress supplied by the lead:\n{}\n\nOriginal assignment:\n{assignment}\n\nReturn the compact result to the originating lead.",
+        if progress.trim().is_empty() {
+            "(none supplied; do not infer progress from logs)"
+        } else {
+            progress
+        }
+    )
+}
+
+fn workspace_evidence(checkout: &Path, base: &str) -> String {
+    let status = Command::new("git")
+        .args(["-C"])
+        .arg(checkout)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output();
+    let commits = Command::new("git")
+        .args(["-C"])
+        .arg(checkout)
+        .args(["rev-list", "--count", &format!("{base}..HEAD")])
+        .output();
+    let changed = status
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).lines().count());
+    let commits = commits
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        });
+    match (commits, changed) {
+        (Some(commits), Some(changed)) => format!(
+            "{commits} commit(s) since the recorded base; {changed} changed or untracked path(s) currently present"
+        ),
+        _ => "workspace inspection unavailable; inspect the checkout directly before reusing prior effects"
+            .into(),
+    }
+}
+
+fn record_continuation(
+    run: &VerifiedRun,
+    mode: &str,
+    from_thread: &str,
+    from_turn: Option<&str>,
+    thread_id: &str,
+    turn_id: &str,
+    progress_bytes: usize,
+) -> io::Result<()> {
+    executor_message::update_receipt_document(&run.receipt, |document| {
+        let now = executor_message_now();
+        let stop = document.get("stop").cloned().unwrap_or(Value::Null);
+        document["executorThreadId"] = Value::String(thread_id.to_owned());
+        document["turnId"] = Value::String(turn_id.to_owned());
+        document["observedStatus"] = Value::String("active".into());
+        document["continuation"] = json!({
+            "schema": 1,
+            "mode": mode,
+            "fromThreadId": from_thread,
+            "fromTurnId": from_turn,
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "progressBytes": progress_bytes,
+            "recordedMs": now
+        });
+        if let Some(stop) = document["stop"].as_object_mut() {
+            stop.insert("continuedMs".into(), Value::from(now));
+            stop.insert("continuedBy".into(), Value::String(mode.to_owned()));
+        }
+        if mode == "fresh" {
+            document["predecessorThreadId"] = Value::String(from_thread.to_owned());
+            document["predecessor"] = json!({
+                "threadId": from_thread,
+                "turnId": from_turn,
+                "retained": true,
+                "stop": stop
+            });
+        }
+        Ok(())
+    })
 }
 
 fn digest_id(prefix: &str, parts: &[&str]) -> String {
@@ -1283,6 +1696,22 @@ fn delivery_result(
     result
 }
 
+/// A stopped run is never restarted by a message or reply. Exact continuation
+/// is the only operation that starts model work again, so delivery is refused
+/// until that same stop record carries an explicit continuation marker.
+fn reject_stopped_delivery(run: &VerifiedRun) -> io::Result<()> {
+    let stopped = matches!(
+        run.value["stop"]["outcome"].as_str(),
+        Some("stopped") | Some("partial") | Some("already-stopped")
+    );
+    if stopped && run.value["stop"]["continuedMs"].is_null() {
+        return Err(invalid(
+            "the exact run is stopped; this delivery was not sent and no turn was started. Call executor_resume with mode exact or fresh for an explicit continuation",
+        ));
+    }
+    Ok(())
+}
+
 fn content_digest(kind: &str, text: &str) -> String {
     digest_id("content-", &[kind, text])
 }
@@ -1476,6 +1905,7 @@ fn send_to_lead(
             "only a recorded executor thread may send an executor message to its lead",
         ));
     }
+    reject_stopped_delivery(run)?;
     let client = checked_client_id(client_message_id, kind == KIND_REQUEST, text)?;
     let id = question_id(run, kind, &client);
     let content = content_digest(kind, text);
@@ -1508,6 +1938,23 @@ fn send_to_lead(
                 Some(&client),
                 awaiting,
             ));
+        }
+        if status == "cancelled" {
+            let delivery = delivery_from_entry(previous);
+            let mut result = delivery_result(
+                run,
+                "executor-to-lead",
+                &id,
+                Some(kind),
+                &delivery,
+                Some(&client),
+                false,
+            );
+            result["error"] = Value::String(
+                "the exact run was stopped, so this pending delivery was cancelled; explicit executor_resume is required before new work"
+                    .into(),
+            );
+            return Ok(result);
         }
         if matches!(status, "pending" | "queued" | "indeterminate") {
             let Some(endpoint) = run.endpoint.as_ref() else {
@@ -1732,6 +2179,7 @@ fn send_to_executor(
             "only the recorded originating lead may message this executor",
         ));
     }
+    reject_stopped_delivery(run)?;
     let client = match client_message_id {
         Some(client) => {
             if !valid_client_message_id(&client) {
@@ -1781,6 +2229,23 @@ fn send_to_executor(
                 result["resolved"] =
                     Value::Bool(receipt_question_status(run, request_id)? == "resolved");
             }
+            return Ok(result);
+        }
+        if status == "cancelled" {
+            let delivery = delivery_from_entry(previous);
+            let mut result = delivery_result(
+                run,
+                "lead-to-executor",
+                &id,
+                None,
+                &delivery,
+                Some(&client),
+                false,
+            );
+            result["error"] = Value::String(
+                "the exact run was stopped, so this pending delivery was cancelled; call executor_resume before sending new work"
+                    .into(),
+            );
             return Ok(result);
         }
         if matches!(status, "pending" | "queued" | "indeterminate") {

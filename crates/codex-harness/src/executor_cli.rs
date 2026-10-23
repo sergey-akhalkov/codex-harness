@@ -47,6 +47,7 @@ pub(crate) mod executor_input;
 pub(crate) mod executor_message;
 #[path = "executor_stop.rs"]
 mod executor_stop;
+pub(crate) use executor_stop::mcp_stop;
 #[path = "executor_observation.rs"]
 mod observation;
 pub(crate) mod reflection_admission;
