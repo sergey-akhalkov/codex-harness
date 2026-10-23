@@ -718,6 +718,138 @@ fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Sy
     }
 }
 
+struct ReleaseRun {
+    _root: tempfile::TempDir,
+    repository: PathBuf,
+    checkout: PathBuf,
+    slot_state: PathBuf,
+    receipt: PathBuf,
+    base: String,
+    run: String,
+}
+
+fn release_run(home: &Path, lead: &str, executor: &str, server: &Server) -> ReleaseRun {
+    endpoint(home, lead, lead, server.port, 0);
+    let endpoint_value: Value = serde_json::from_slice(
+        &fs::read(
+            home.join("harness/lead-endpoints")
+                .join(format!("{lead}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let repository = root.path().join("repo");
+    git_repo(&repository);
+    fs::write(repository.join(".gitignore"), "target/\n").unwrap();
+    let base = commit_checkout(&repository, "ignore build cache");
+    let run = format!("mcp-test-{executor}");
+    let acquired =
+        task_worktree::acquire_slot(home, &repository, 1, &run, Some(&base), &|_| false).unwrap();
+    let state = task_worktree::pool_state_dir(home, &repository).unwrap();
+    let receipt = state.join("mcp-1.json");
+    let value = json!({
+        "schema": 1,
+        "run": run,
+        "leadThreadId": lead,
+        "executorThreadId": executor,
+        "turnId": "initial-turn",
+        "assignment": {
+            "schema": 1,
+            "objective": "Prove one bounded executor dispatch",
+            "inputs": [],
+            "outputs": [],
+            "invariants": [],
+            "acceptance": ["Return a bounded result"]
+        },
+        "prompt": "Prove one bounded executor dispatch and return a bounded result.",
+        "title": format!("executor {executor}"),
+        "slot": 1,
+        "source": repository,
+        "repository": repository,
+        "poolSize": 1,
+        "checkout": acquired.path,
+        "base": base,
+        "profile": {
+            "profile": "test",
+            "model": "test-model",
+            "modelProvider": "test-provider",
+            "reasoningEffort": "high"
+        },
+        "observedStatus": "idle",
+        "allowProviderModelFallback": false,
+        "startupReservationReleased": true,
+        "control": {
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "config": {"agents.enabled": false},
+            "roleArgs": [],
+            "profileOverrides": []
+        },
+        "lease": {
+            "slot": 1,
+            "owner": run,
+            "checkout": acquired.path,
+            "appServer": endpoint_value["process"]
+        }
+    });
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    ReleaseRun {
+        _root: root,
+        repository,
+        checkout: acquired.path,
+        slot_state: state.join("slot-1.json"),
+        receipt,
+        base,
+        run,
+    }
+}
+
+fn record_release_payload(home: &Path, run: &ReleaseRun, id: &str) -> (PathBuf, PathBuf) {
+    let directory = fs::canonicalize(home).unwrap().join("harness/messages");
+    fs::create_dir_all(&directory).unwrap();
+    let payload = directory.join(format!("{id}.txt"));
+    let sibling = directory.join("another-run.txt");
+    fs::write(&payload, "recorded run payload\n").unwrap();
+    fs::write(&sibling, "another run payload\n").unwrap();
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    receipt["leadMessages"] = json!([{
+        "schema": 1,
+        "id": id,
+        "kind": "reply-request",
+        "status": "resolved",
+        "contentId": "resolved-request",
+        "payloadPath": payload,
+        "payloadBytes": 21
+    }]);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    (payload, sibling)
+}
+
+fn release_tool(
+    mcp: &mut Mcp,
+    id: u64,
+    caller: &str,
+    run: Option<&str>,
+    disposition: &str,
+    reason: &str,
+) -> Value {
+    let mut arguments = json!({"disposition": disposition, "reason": reason});
+    if let Some(run) = run {
+        arguments["run"] = json!(run);
+    }
+    mcp.call_tool(
+        id,
+        "executor_release",
+        arguments,
+        Some(json!({"threadId": caller})),
+    )
+}
+
+fn slot_record(run: &ReleaseRun) -> Value {
+    serde_json::from_slice(&fs::read(&run.slot_state).unwrap()).unwrap()
+}
+
 fn result(response: &Value) -> &Value {
     assert_eq!(response["result"]["isError"], false, "{response}");
     &response["result"]["structuredContent"]
@@ -962,6 +1094,7 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
         "executor_ask_lead",
         "executor_stop",
         "executor_resume",
+        "executor_release",
     ] {
         assert!(names.contains(&required), "{listed}");
     }
@@ -981,6 +1114,7 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
                 | Some("executor_wait")
                 | Some("executor_stop")
                 | Some("executor_resume")
+                | Some("executor_release")
         ) {
             assert!(
                 !properties.contains_key("run"),
@@ -1058,7 +1192,7 @@ fn status_is_bounded_to_the_verified_calling_thread_and_rejects_forged_arguments
     );
 
     let second_status = mcp.call_tool(
-        4,
+        5,
         "executor_status",
         json!({}),
         Some(json!({"threadId": SECOND_LEAD})),
@@ -3569,6 +3703,429 @@ fn continuation_refuses_an_active_thread_before_starting_new_work() {
     assert!(server.requests_for("turn/start").is_empty());
     assert!(server.requests_for("thread/start").is_empty());
     assert_eq!(sim.lock().unwrap().threads[EXECUTOR].state(), "active");
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn release_requires_explicit_review_and_refuses_foreign_or_ambiguous_targets() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.checkout,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let marker = run.checkout.join("unreviewed.txt");
+    fs::write(&marker, "do not delete\n").unwrap();
+    let mut mcp = Mcp::start(home.path());
+
+    let missing = mcp.call_tool(
+        2,
+        "executor_release",
+        json!({"run": run.run}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&missing).contains("arguments are invalid"),
+        "{missing}"
+    );
+    let empty = release_tool(&mut mcp, 3, LEAD, Some(&run.run), "merged", "  ");
+    assert!(tool_error(&empty).contains("nonempty reason"), "{empty}");
+    let foreign = release_tool(
+        &mut mcp,
+        4,
+        OTHER_LEAD,
+        Some(&run.run),
+        "discarded",
+        "not this lead's run",
+    );
+    assert!(
+        tool_error(&foreign).contains("no recorded MCP executor run"),
+        "{foreign}"
+    );
+    let executor_caller = release_tool(
+        &mut mcp,
+        5,
+        EXECUTOR,
+        Some(&run.run),
+        "discarded",
+        "an executor cannot release its own run",
+    );
+    assert!(
+        tool_error(&executor_caller).contains("no recorded MCP executor run"),
+        "{executor_caller}"
+    );
+    assert_eq!(slot_record(&run)["state"], "occupied");
+    assert!(marker.is_file(), "a refused release reset the checkout");
+
+    let state = run.receipt.parent().unwrap();
+    fs::write(
+        state.join("mcp-2.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "run": "another-run",
+            "leadThreadId": LEAD,
+            "executorThreadId": SECOND_EXECUTOR,
+            "slot": 2
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ambiguous = release_tool(&mut mcp, 6, LEAD, None, "discarded", "ambiguous target");
+    assert!(tool_error(&ambiguous).contains("ambiguous"), "{ambiguous}");
+    assert!(
+        marker.is_file(),
+        "an ambiguous release reset the only concrete slot"
+    );
+    assert_eq!(slot_record(&run)["state"], "occupied");
+    assert!(server.requests_for("turn/start").is_empty());
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn release_refuses_an_active_turn_or_unanswered_request_before_effects() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.checkout,
+        false,
+        true,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let marker = run.checkout.join("active-work.txt");
+    fs::write(&marker, "active work\n").unwrap();
+    let mut mcp = Mcp::start(home.path());
+
+    let active = release_tool(
+        &mut mcp,
+        2,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "reviewed while still running",
+    );
+    assert!(
+        tool_error(&active).contains("still has active turn"),
+        "{active}"
+    );
+    assert!(marker.is_file());
+    assert_eq!(slot_record(&run)["state"], "occupied");
+
+    sim.lock().unwrap().set_active(EXECUTOR, false);
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    receipt["leadMessages"] = json!([{
+        "schema": 1,
+        "id": "unanswered-release-question",
+        "kind": "reply-request",
+        "status": "pending",
+        "contentId": "unanswered"
+    }]);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let pending = release_tool(
+        &mut mcp,
+        3,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "reviewed with a question still open",
+    );
+    assert!(
+        tool_error(&pending).contains("unresolved request"),
+        "{pending}"
+    );
+    assert!(marker.is_file());
+    assert_eq!(slot_record(&run)["state"], "occupied");
+    assert!(server.requests_for("turn/start").is_empty());
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn release_refuses_a_live_executor_session_lease_before_reset() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.checkout,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let program = std::env::current_exe().unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+        .unwrap()
+        .identity();
+    let lease = run.receipt.parent().unwrap().join("lease-1.json");
+    fs::write(
+        &lease,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "owner": run.run,
+            "index": 1,
+            "path": run.checkout,
+            "pid": identity.pid,
+            "created": identity.creation_time,
+            "program": program
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let marker = run.checkout.join("leased-work.txt");
+    fs::write(&marker, "live session work\n").unwrap();
+    let mut mcp = Mcp::start(home.path());
+
+    let refused = release_tool(
+        &mut mcp,
+        2,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "live session still holds the slot",
+    );
+    assert!(
+        tool_error(&refused).contains("live executor-session lease"),
+        "{refused}"
+    );
+    assert!(marker.is_file(), "a live lease was force-reset");
+    assert_eq!(slot_record(&run)["state"], "occupied");
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn merged_release_frees_the_slot_records_status_keeps_cache_and_repeats_without_reset() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.checkout,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    fs::create_dir_all(run.checkout.join("target")).unwrap();
+    fs::write(run.checkout.join("target/artifact"), "warm cache\n").unwrap();
+    let (payload, sibling) = record_release_payload(home.path(), &run, "this-run");
+    let mut mcp = Mcp::start(home.path());
+
+    let response = release_tool(
+        &mut mcp,
+        2,
+        LEAD,
+        Some(&run.run),
+        "merged",
+        "accepted merged result",
+    );
+    let released = result(&response);
+    assert_eq!(released["state"], "released", "{released}");
+    assert_eq!(released["outcome"], "reused", "{released}");
+    assert_eq!(released["released"], true, "{released}");
+    assert_eq!(released["disposition"], "merged", "{released}");
+    assert_eq!(released["base"], run.base, "{released}");
+    assert_eq!(released["messagePayloadsRemoved"], 1, "{released}");
+    assert!(run.checkout.join("target/artifact").is_file());
+    assert!(!payload.exists(), "the run's own payload survived release");
+    assert!(sibling.is_file(), "another run's payload was removed");
+    let record = slot_record(&run);
+    assert_eq!(record["state"], "released", "{record}");
+    assert_eq!(record["disposition"], "merged", "{record}");
+    assert_eq!(record["reason"], "accepted merged result", "{record}");
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["release"]["outcome"], "reused", "{receipt}");
+    assert_eq!(receipt["release"]["slotFreed"], true, "{receipt}");
+
+    let status = mcp.call_tool(
+        3,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let status = result(&status);
+    assert_eq!(
+        status["runs"][0]["release"]["outcome"], "reused",
+        "{status}"
+    );
+    assert_eq!(
+        status["runs"][0]["release"]["disposition"], "merged",
+        "{status}"
+    );
+
+    let sentinel = run.checkout.join("post-release.txt");
+    fs::write(&sentinel, "must survive a repeated release\n").unwrap();
+    let repeated = release_tool(&mut mcp, 4, LEAD, None, "merged", "same accepted result");
+    let repeated = result(&repeated);
+    assert_eq!(repeated["idempotent"], true, "{repeated}");
+    assert_eq!(repeated["run"], run.run, "{repeated}");
+    assert_eq!(repeated["released"], true, "{repeated}");
+    assert!(
+        sentinel.is_file(),
+        "a repeated release reset the slot again"
+    );
+    assert_eq!(slot_record(&run)["state"], "released");
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn merged_release_preserves_dirty_work_and_explicit_discard_resets_it() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.checkout,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let scratch = run.checkout.join("scratch.txt");
+    fs::write(&scratch, "unreviewed work\n").unwrap();
+    fs::create_dir_all(run.checkout.join("target")).unwrap();
+    fs::write(run.checkout.join("target/artifact"), "warm cache\n").unwrap();
+    let (payload, sibling) = record_release_payload(home.path(), &run, "dirty-run");
+    let mut mcp = Mcp::start(home.path());
+
+    let preserved = release_tool(
+        &mut mcp,
+        2,
+        LEAD,
+        Some(&run.run),
+        "merged",
+        "merged claim with local work",
+    );
+    let preserved = result(&preserved);
+    assert_eq!(preserved["state"], "preserved", "{preserved}");
+    assert_eq!(preserved["slotFreed"], false, "{preserved}");
+    assert!(scratch.is_file(), "merged force-reset dirty work");
+    assert!(payload.is_file(), "a preserved slot removed its messages");
+    assert_eq!(slot_record(&run)["state"], "occupied");
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["release"]["outcome"], "preserved", "{receipt}");
+
+    let discarded = release_tool(
+        &mut mcp,
+        3,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "explicitly discarded after review",
+    );
+    let discarded = result(&discarded);
+    assert_eq!(discarded["state"], "released", "{discarded}");
+    assert_eq!(discarded["outcome"], "reused", "{discarded}");
+    assert!(!scratch.exists(), "explicit discard did not reset the slot");
+    assert!(run.checkout.join("target/artifact").is_file());
+    assert!(!payload.exists(), "the run's payload was not removed");
+    assert!(sibling.is_file(), "another run's payload was removed");
+    let record = slot_record(&run);
+    assert_eq!(record["state"], "released", "{record}");
+    assert_eq!(record["disposition"], "discarded", "{record}");
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn archived_or_missing_native_thread_alone_leaves_the_slot_occupied() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.checkout,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let marker = run.checkout.join("archived-work.txt");
+    fs::write(&marker, "preserved after archive\n").unwrap();
+    sim.lock().unwrap().threads.remove(EXECUTOR);
+    let mut mcp = Mcp::start(home.path());
+
+    let refused = release_tool(
+        &mut mcp,
+        2,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "archive is not release",
+    );
+    let error = tool_error(&refused);
+    assert!(error.contains("native archive alone"), "{error}");
+    assert!(
+        marker.is_file(),
+        "archive alone reset or cleaned the checkout"
+    );
+    let record = slot_record(&run);
+    assert_eq!(record["state"], "occupied", "{record}");
+    assert_eq!(record["owner"], run.run, "{record}");
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn an_old_release_reference_cannot_reset_a_later_occupant() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.checkout,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let released = release_tool(
+        &mut mcp,
+        2,
+        LEAD,
+        Some(&run.run),
+        "merged",
+        "accepted first run",
+    );
+    assert_eq!(result(&released)["state"], "released");
+
+    task_worktree::acquire_slot(
+        home.path(),
+        &run.repository,
+        1,
+        "successor-owner",
+        Some(&run.base),
+        &|_| false,
+    )
+    .unwrap();
+    let successor = run.checkout.join("successor-work.txt");
+    fs::write(&successor, "later occupant work\n").unwrap();
+    let stale = release_tool(
+        &mut mcp,
+        3,
+        LEAD,
+        Some(&run.run),
+        "merged",
+        "stale release of a reused position",
+    );
+    assert!(tool_error(&stale).contains("recorded ownership"), "{stale}");
+    assert!(successor.is_file(), "the later occupant's work was reset");
+    let record = slot_record(&run);
+    assert_eq!(record["owner"], "successor-owner", "{record}");
+    assert_eq!(record["state"], "occupied", "{record}");
     mcp.finish();
     drop(run);
 }
