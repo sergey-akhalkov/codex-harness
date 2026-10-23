@@ -4156,7 +4156,11 @@ fn slot_content(pool: &Pool, index: u32, base: Option<&str>) -> io::Result<SlotC
             "slot {index} is not a usable Git worktree; the lead resolves or retires it"
         )));
     };
-    if !status.trim().is_empty() {
+    let unreviewed = status.lines().any(|line| {
+        let path = line.get(3..).unwrap_or_default().trim();
+        !path.is_empty() && path != ".serena/" && !path.starts_with(".serena/")
+    });
+    if unreviewed {
         return Ok(SlotContent::Unreviewed(format!(
             "slot {index} holds local or untracked changes; merge or explicitly discard them before reuse"
         )));
