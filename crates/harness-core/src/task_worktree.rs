@@ -119,7 +119,10 @@ pub fn reset_for_reuse(
             limitation: "lane reset failed; preserving the lane for retirement".into(),
         });
     }
-    if git(&mapping.path, &["clean", "-fd"]).is_err() {
+    // Serena's generated project state is tool cache, not unreviewed work. It
+    // may be recreated by a live MCP worker, so keep it out of the reset and
+    // out of the cleanliness decision below.
+    if git(&mapping.path, &["clean", "-fd", "-e", ".serena"]).is_err() {
         return Ok(LaneDisposition::Preserved {
             limitation: "lane cleanup failed; preserving the lane for retirement".into(),
         });
@@ -135,7 +138,11 @@ pub fn reset_for_reuse(
         &mapping.path,
         &["status", "--porcelain=v1", "--untracked-files=all"],
     )?;
-    if !porcelain.trim().is_empty() {
+    let unreviewed = porcelain.lines().any(|line| {
+        let path = line.get(3..).unwrap_or_default().trim();
+        !path.is_empty() && path != ".serena/" && !path.starts_with(".serena/")
+    });
+    if unreviewed {
         return Ok(LaneDisposition::Preserved {
             limitation: "lane is not clean after reset; preserving the lane for retirement".into(),
         });
@@ -6217,6 +6224,8 @@ mod tests {
         );
         fs::create_dir_all(lane.join("target")).unwrap();
         fs::write(lane.join("target/cache.bin"), "warm\n").unwrap();
+        fs::create_dir_all(lane.join(".serena")).unwrap();
+        fs::write(lane.join(".serena/project.local.yml"), "tool state\n").unwrap();
         fs::write(lane.join("scratch.txt"), "leftover\n").unwrap();
         fs::write(lane.join("README.md"), "executor edit\n").unwrap();
         // The lead's accepted merge moves the shared checkout to the new base.
@@ -6242,6 +6251,11 @@ mod tests {
             b"warm\n",
             "ignored build caches stay for the next lane task"
         );
+        assert_eq!(
+            fs::read(lane.join(".serena/project.local.yml")).unwrap(),
+            b"tool state\n",
+            "generated Serena tool state stays for the next lane task"
+        );
         assert!(!lane.join("scratch.txt").exists());
         let readme = fs::read_to_string(lane.join("README.md")).unwrap();
         assert!(readme.contains("shared"), "{readme}");
@@ -6251,7 +6265,14 @@ mod tests {
             &["status", "--porcelain=v1", "--untracked-files=all"],
         )
         .unwrap();
-        assert!(status.trim().is_empty(), "{status}");
+        assert!(
+            status.lines().all(|line| line
+                .get(3..)
+                .unwrap_or_default()
+                .trim()
+                .starts_with(".serena/")),
+            "{status}"
+        );
         assert_eq!(
             audit(&repo).unwrap().total,
             2,
