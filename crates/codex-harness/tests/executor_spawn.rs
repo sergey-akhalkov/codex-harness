@@ -295,6 +295,18 @@ fn output_text(out: &std::process::Output) -> String {
     )
 }
 
+fn assert_lead_id_only_in_recovery(text: &str, thread: &str) {
+    let recovery = format!("codex-harness lead start --session {thread}");
+    assert!(
+        text.contains(&recovery),
+        "missing exact-session recovery: {text}"
+    );
+    assert!(
+        !text.replace(&recovery, "").contains(thread),
+        "lead thread id appeared outside its recovery command: {text}"
+    );
+}
+
 fn file_url(path: &Path) -> String {
     format!("file:///{}", path.to_str().unwrap().replace('\\', "/"))
 }
@@ -2840,10 +2852,7 @@ fn two_leads_sharing_a_checkout_keep_explicit_profiles_on_the_shell_path() {
             "{profile}: shared checkout was not recorded: {recorded_source}"
         );
         recorded_sources.push(recorded_source.to_owned());
-        assert!(
-            !text.contains(thread),
-            "{profile}: dispatch leaked the lead thread id: {text}"
-        );
+        assert_lead_id_only_in_recovery(&text, thread);
         assert!(
             !text.contains("endpoint-"),
             "{profile}: spawn invented an endpoint before a launcher: {text}"
@@ -2957,10 +2966,7 @@ fn a_live_thread_id_is_recorded_and_the_child_does_not_keep_it() {
         text.contains("installed Codex launcher is missing"),
         "a live thread id must still dispatch: {text}"
     );
-    assert!(
-        !text.contains("lead-thread-synthetic"),
-        "dispatch leaked the lead thread id: {text}"
-    );
+    assert_lead_id_only_in_recovery(&text, "lead-thread-synthetic");
     let receipt: Value =
         serde_json::from_slice(&fs::read(pooled_receipt_path(&fixture.home, 1)).unwrap()).unwrap();
     assert_eq!(
@@ -3115,10 +3121,7 @@ fn a_stale_lead_endpoint_is_refused_and_retired() {
         text.contains("codex-harness lead start"),
         "the refusal must name the supported remedy: {text}"
     );
-    assert!(
-        !text.contains("lead-thread-synthetic"),
-        "dispatch leaked the lead thread id: {text}"
-    );
+    assert_lead_id_only_in_recovery(&text, "lead-thread-synthetic");
     assert!(
         !leftover.exists(),
         "a stale lead endpoint of this slot must not survive the dispatch"
@@ -3150,9 +3153,10 @@ fn a_mismatched_or_malformed_lead_endpoint_is_refused() {
         text.contains("belongs to another conversation"),
         "the refusal must name the mismatch: {text}"
     );
+    assert_lead_id_only_in_recovery(&text, "lead-thread-synthetic");
     assert!(
-        !text.contains("lead-thread-elsewhere") && !text.contains("lead-thread-synthetic"),
-        "dispatch leaked a lead thread id: {text}"
+        !text.contains("lead-thread-elsewhere"),
+        "dispatch leaked another lead thread id: {text}"
     );
     let state =
         harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
@@ -3458,10 +3462,7 @@ fn a_descendant_cwd_change_keeps_the_recorded_lead() {
             "{owner} must still dispatch from {}: {text}",
             cwd.display()
         );
-        assert!(
-            !text.contains(thread),
-            "{owner} leaked the lead thread id: {text}"
-        );
+        assert_lead_id_only_in_recovery(&text, thread);
         let receipt = recorded_originating_lead(&fixture.home);
         assert_eq!(
             receipt["threadId"], thread,
