@@ -2137,6 +2137,7 @@ pub(crate) fn prepare_mcp_dispatch(
     source: &Path,
     repository: &Path,
     owner: &str,
+    profile: Option<&str>,
     base: Option<&str>,
     assignment: executor_assignment::Assignment,
 ) -> io::Result<McpDispatch> {
@@ -2152,7 +2153,7 @@ pub(crate) fn prepare_mcp_dispatch(
         ));
     }
     let config = load(source)?;
-    let profile = executor_profile(&config, None)?;
+    let profile = executor_profile(&config, profile)?;
     let pool_size = worktree_pool_size(&config);
     let inventory = task_worktree::task_inventory(codex_home, repository, pool_size)?;
     if inventory.iter().any(|slot| {

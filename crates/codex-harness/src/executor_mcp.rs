@@ -74,7 +74,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
 fn tool_definition() -> Value {
     json!({
         "name": TOOL,
-        "description": "Dispatch one executor into a pooled worktree and a new thread on this lead's exact Codex app-server. The configured default executor profile is used; no model, provider, effort, thread or endpoint argument is accepted.",
+        "description": "Dispatch one executor into a pooled worktree and a new thread on this lead's exact Codex app-server. The configured default executor profile, or an allowed requested profile, is used; no model, provider, effort, thread or endpoint argument is accepted.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -87,6 +87,10 @@ fn tool_definition() -> Value {
                 "base": {
                     "type": "string",
                     "description": "Optional committed base. Omitted uses the consumer checkout's configured upstream."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Optional allowed executor profile. Omitted uses the configured default."
                 },
                 "assignment": {
                     "type": "object",
@@ -150,6 +154,8 @@ struct DispatchArgs {
     assignment: Value,
     #[serde(default)]
     base: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 fn dispatch(operation: &Operation) -> io::Result<Value> {
@@ -184,6 +190,7 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         &source,
         &repository,
         &owner,
+        args.profile.as_deref(),
         args.base.as_deref(),
         assignment,
     )?;
