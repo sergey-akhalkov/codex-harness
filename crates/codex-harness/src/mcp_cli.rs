@@ -41,6 +41,9 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     if args.first().is_some_and(|arg| arg == "nuphus") {
         return nuphus(&args[1..]);
     }
+    if args.first().is_some_and(|arg| arg == "executors") {
+        return crate::executor_mcp::run(&args[1..]);
+    }
     if args.first().is_some_and(|arg| arg == "broker-retire") {
         if args.len() != 3 || args[1] != "--root" {
             return Err(invalid());
@@ -72,6 +75,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "codex-harness mcp broker-prepare\ncodex-harness mcp broker-retire --root DIRECTORY\ncodex-harness mcp serena --help"
         );
         println!("codex-harness mcp nuphus --help");
+        println!("codex-harness mcp executors --help");
         println!("codex-harness mcp serena-check --source DIRECTORY --registry FILE");
         return Ok(0);
     }

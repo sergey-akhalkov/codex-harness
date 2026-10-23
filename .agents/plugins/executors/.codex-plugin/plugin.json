@@ -1,0 +1,21 @@
+{
+  "name": "executors",
+  "version": "0.1.0",
+  "description": "Dispatch one executor thread on the calling lead's Codex app-server.",
+  "author": {
+    "name": "coding-agents-harness"
+  },
+  "license": "MIT",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Executors",
+    "shortDescription": "Run a configured executor on the lead's runtime",
+    "longDescription": "Adds the executor_dispatch MCP tool. It binds the caller from Codex request metadata, allocates the existing worktree pool, and starts one executor thread with the configured ds profile on the same app-server as the lead.",
+    "developerName": "coding-agents-harness",
+    "category": "Engineering",
+    "capabilities": ["Write", "Interactive"],
+    "defaultPrompt": [
+      "Dispatch this assignment to a configured executor"
+    ]
+  }
+}

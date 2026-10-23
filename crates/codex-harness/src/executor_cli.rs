@@ -42,7 +42,7 @@ mod acceptance;
 #[path = "executor_control.rs"]
 pub(crate) mod control;
 #[path = "executor_input.rs"]
-mod executor_input;
+pub(crate) mod executor_input;
 #[path = "executor_message.rs"]
 pub(crate) mod executor_message;
 #[path = "executor_stop.rs"]
@@ -2092,6 +2092,171 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
     })
 }
 
+/// One pool dispatch prepared for the same-runtime MCP path. It carries the
+/// same slot/profile/assignment validation as the visible CLI route, plus the
+/// owned role and profile overrides the attached app-server needs on
+/// `thread/start`. No terminal surface or app-server child is created here.
+pub(crate) struct McpDispatch {
+    pub owner: String,
+    pub title: String,
+    pub slot: u32,
+    pub source: PathBuf,
+    pub repository: PathBuf,
+    pub pool_size: u32,
+    pub checkout: PathBuf,
+    pub base: String,
+    pub prompt: String,
+    pub bound: ProfileBinding,
+    pub role_args: Vec<String>,
+    pub profile_overrides: Vec<String>,
+    pub receipt: PathBuf,
+    codex_home: PathBuf,
+    binding: SlotBinding,
+}
+
+impl McpDispatch {
+    /// Returns a claim whose thread was refused before any turn started.
+    pub(crate) fn release(self, error: io::Error) -> io::Error {
+        release_mcp_claim(
+            &self.codex_home,
+            &self.repository,
+            self.pool_size,
+            &self.binding,
+            error,
+        )
+    }
+}
+
+/// Resolves the configured default executor profile from the installed kit
+/// source and acquires one fresh binding in the consumer repository's pool.
+/// An existing owner binding is refused rather than continued: an MCP tool
+/// argument cannot select another lead's run. The caller starts the thread on
+/// its verified app-server after this returns.
+pub(crate) fn prepare_mcp_dispatch(
+    codex_home: &Path,
+    source: &Path,
+    repository: &Path,
+    owner: &str,
+    base: Option<&str>,
+    assignment: executor_assignment::Assignment,
+) -> io::Result<McpDispatch> {
+    let owner = owner.trim();
+    if owner.is_empty()
+        || owner.len() > 128
+        || !owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(invalid(
+            "owner must be a bounded label of ASCII letters, digits, '-', '_' or '.'",
+        ));
+    }
+    let config = load(source)?;
+    let profile = executor_profile(&config, None)?;
+    let pool_size = worktree_pool_size(&config);
+    let inventory = task_worktree::task_inventory(codex_home, repository, pool_size)?;
+    if inventory.iter().any(|slot| {
+        slot.owner.as_deref() == Some(owner) && slot.state != task_worktree::TaskState::Free
+    }) {
+        return Err(invalid(&format!(
+            "owner '{owner}' already has a recorded run; MCP dispatch creates a fresh run and never continues another lead's binding"
+        )));
+    }
+    let request = Dispatch {
+        codex_home,
+        source,
+        repository,
+        pool_size,
+        max_concurrency: config.max_concurrent_executors,
+        named_slot: None,
+        owner,
+        base,
+        task: None,
+        handle: None,
+        profile: &profile,
+        prompt: PromptSource::Structured(assignment),
+        role: Role::Executor,
+        mode: SpawnMode::Exec,
+        resumed_session: None,
+        terminal_profile: None,
+        terminal_window: None,
+    };
+    let prepared = prepare_dispatch(&request)?;
+    let run = (|| -> io::Result<(Vec<String>, Vec<String>)> {
+        let profile_config = orchestration_config::profile_config(codex_home, &profile)?;
+        let role = native_launcher::role_launch(
+            codex_home,
+            &prepared.binding.path,
+            Some(&profile_config),
+            &toml::Table::new(),
+            Role::Executor,
+        )?;
+        Ok((
+            role.args,
+            orchestration_config::profile_config_overrides(codex_home, &profile)?,
+        ))
+    })();
+    let (role_args, profile_overrides) = match run {
+        Ok(run) => run,
+        Err(error) => {
+            return Err(release_mcp_claim(
+                codex_home,
+                repository,
+                pool_size,
+                &prepared.binding,
+                error,
+            ));
+        }
+    };
+    Ok(McpDispatch {
+        owner: owner.to_owned(),
+        title: executor_title(&profile, owner),
+        slot: prepared.binding.index,
+        source: source.to_path_buf(),
+        repository: repository.to_path_buf(),
+        pool_size,
+        checkout: prepared.binding.path.clone(),
+        base: prepared.binding.base.clone(),
+        prompt: prepared.route.control().assignment.clone(),
+        bound: prepared.bound,
+        role_args,
+        profile_overrides,
+        receipt: prepared
+            .paths
+            .receipt
+            .with_file_name(format!("mcp-{}.json", prepared.binding.index)),
+        codex_home: codex_home.to_path_buf(),
+        binding: prepared.binding,
+    })
+}
+
+/// Clears the MCP dispatch's startup reservation before returning its unused
+/// claim. The MCP helper outlives the request, so the normal host-lease
+/// handoff never occurs on this route.
+fn release_mcp_claim(
+    codex_home: &Path,
+    repository: &Path,
+    pool_size: u32,
+    binding: &SlotBinding,
+    error: io::Error,
+) -> io::Error {
+    let reservation = task_worktree::release_startup_reservation(
+        codex_home,
+        repository,
+        binding.index,
+        &binding.owner,
+    )
+    .err();
+    let error = release_claim(codex_home, pool_size, binding, false, error);
+    match reservation {
+        Some(reservation) => io::Error::new(
+            error.kind(),
+            format!("{error}; startup reservation cleanup also failed: {reservation}"),
+        ),
+        None => error,
+    }
+}
+
 fn dispatch(request: &Dispatch) -> io::Result<i32> {
     let prepared = prepare_dispatch(request)?;
     launch_bound(
@@ -3231,13 +3396,30 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
 /// never destroyed. Resume deliberately does not release its claim, because
 /// that slot holds the interrupted session's partial work.
 fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Error) -> io::Error {
-    let live = |owner: &str| owner_live(request.codex_home, binding.repository(), owner);
+    release_claim(
+        request.codex_home,
+        request.pool_size,
+        binding,
+        request.task.is_some() && binding.task.is_some(),
+        error,
+    )
+}
+
+/// Returns one prepared but unused claim to the pool. A handed-off ordinary
+/// task keeps its binding; every other rejected claim follows the normal
+/// reset-for-reuse and preserved-work rules.
+fn release_claim(
+    codex_home: &Path,
+    pool_size: u32,
+    binding: &SlotBinding,
+    handed_off_task: bool,
+    error: io::Error,
+) -> io::Error {
+    let live = |owner: &str| owner_live(codex_home, binding.repository(), owner);
     // A handed-off ordinary task never loses its binding to a rejected
     // assignment: its checkout, task identity and partial work stay exactly
     // as the lead handed them over, for the lead to continue or release.
-    if request.task.is_some()
-        && let Some(task) = binding.task.as_deref()
-    {
+    if handed_off_task && let Some(task) = binding.task.as_deref() {
         return io::Error::new(
             error.kind(),
             format!(
@@ -3248,7 +3430,7 @@ fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Er
     }
     let released = match binding.task.as_deref() {
         Some(task) => task_worktree::release_task(
-            request.codex_home,
+            codex_home,
             binding.repository(),
             task,
             SlotDisposition::Discarded,
@@ -3257,9 +3439,9 @@ fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Er
             binding.handle.as_deref(),
             &live,
         ),
-        None => task_worktree::pool(binding.repository(), request.pool_size).and_then(|pool| {
+        None => task_worktree::pool(binding.repository(), pool_size).and_then(|pool| {
             task_worktree::release_slot(
-                request.codex_home,
+                codex_home,
                 &pool,
                 binding.index,
                 SlotDisposition::Discarded,

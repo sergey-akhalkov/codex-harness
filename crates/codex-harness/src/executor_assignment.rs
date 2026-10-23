@@ -114,6 +114,19 @@ pub struct AssignmentContext<'a> {
 }
 
 impl Assignment {
+    /// Validates one assignment already decoded from an MCP argument. The
+    /// caller supplies literal structured data; no file path or runtime
+    /// address is accepted here.
+    pub(crate) fn from_value(value: serde_json::Value) -> io::Result<Self> {
+        let assignment: Self = serde_json::from_value(value).map_err(|error| {
+            invalid(&format!(
+                "assignment is not a schema {ASSIGNMENT_SCHEMA} document: {error}"
+            ))
+        })?;
+        assignment.validate()?;
+        Ok(assignment)
+    }
+
     /// Reads one assignment file and checks schema, limits and path syntax.
     /// Nothing here touches a checkout or a model.
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -147,7 +160,7 @@ impl Assignment {
         Ok(assignment)
     }
 
-    fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
         if self.schema != ASSIGNMENT_SCHEMA {
             return Err(invalid(&format!(
                 "assignment schema {} is unsupported; this build accepts schema {ASSIGNMENT_SCHEMA}",
