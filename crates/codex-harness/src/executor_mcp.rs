@@ -623,6 +623,12 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     if let Some(error) = startup_release {
         result["startupReleaseError"] = json!(error);
     }
+    if result["receiptError"].is_null()
+        && let Err(error) = verified_receipt(&codex_home, &prepared.receipt, &caller)
+            .and_then(|run| ensure_cache_guard(&codex_home, &run))
+    {
+        result["cacheGuardError"] = json!(error.to_string());
+    }
     Ok(result)
 }
 
@@ -1039,6 +1045,12 @@ fn wait(operation: &Operation) -> io::Result<Value> {
             "executor_wait is available only to the verified lead of the exact run",
         ));
     }
+    if let Err(error) = ensure_cache_guard(&home, &run) {
+        eprintln!(
+            "codex-harness: cache guard for exact run {} could not start ({error}); no stop was attempted",
+            run.run
+        );
+    }
     let started = Instant::now();
     let deadline = started.checked_add(total).unwrap_or(started);
     // A read never starts unless its bound fits before the caller's deadline.
@@ -1361,6 +1373,7 @@ fn turn_result(
             "turnId": turn_id,
             "status": status
         },
+        "cacheGuard": run.value["cacheGuard"],
         "detailLocator": {
             "threadId": run.executor_thread,
             "turnId": turn_id,
@@ -1435,11 +1448,105 @@ fn run_summary(run: &VerifiedRun) -> Value {
         "checkout": run.checkout,
         "base": run.base,
         "profile": run.value["profile"],
+        "cacheGuard": run.value["cacheGuard"],
         "stop": run.value["stop"],
         "continuation": run.value["continuation"],
         "predecessorThreadId": run.value["predecessorThreadId"],
         "receipt": run.receipt
     })
+}
+
+fn verified_receipt(home: &Path, receipt: &Path, caller: &str) -> io::Result<VerifiedRun> {
+    let bytes = fs::read(receipt).map_err(|error| {
+        invalid(format!(
+            "the MCP run receipt {} could not be re-read: {error}",
+            receipt.display()
+        ))
+    })?;
+    let value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(format!(
+            "the MCP run receipt {} is not valid JSON: {error}",
+            receipt.display()
+        ))
+    })?;
+    verify_run(
+        home,
+        RunReceipt {
+            path: receipt.to_owned(),
+            value,
+        },
+        caller,
+    )
+}
+
+/// Starts one background monitor for the exact current turn. The monitor uses
+/// the existing detector and warning queue; this adapter supplies only the
+/// exact receipt, thread, turn, lease and existing exact-thread stop.
+fn ensure_cache_guard(home: &Path, run: &VerifiedRun) -> io::Result<()> {
+    let stopped = run.value["stop"].is_object()
+        && run.value["stop"]
+            .get("continuedMs")
+            .is_none_or(Value::is_null);
+    if stopped {
+        return Ok(());
+    }
+    let turn = required_text(&run.value, "turnId")?.to_owned();
+    let cache_home = home.to_owned();
+    let receipt = run.receipt.clone();
+    let lead = run.lead_thread.clone();
+    let thread = run.executor_thread.clone();
+    let run_id = run.run.clone();
+    let lease = run.value["lease"].clone();
+    let guard_receipt = receipt.clone();
+    let guard_lead = lead.clone();
+    let guard_thread = thread.clone();
+    let guard_turn = turn.clone();
+    let guard_lease = lease.clone();
+    executor_cli::cache::ensure_mcp_guard(
+        home,
+        &receipt,
+        &run_id,
+        &thread,
+        &turn,
+        lease,
+        move |loss| {
+            let current = verified_receipt(&cache_home, &guard_receipt, &guard_lead)?;
+            if current.executor_thread != guard_thread
+                || current.value["turnId"].as_str() != Some(guard_turn.as_str())
+                || current.value["lease"] != guard_lease
+            {
+                return Err(invalid(
+                    "the cache guard no longer names the exact current run, thread, turn and lease; no process was targeted",
+                ));
+            }
+            let endpoint = current.endpoint.clone().ok_or_else(|| {
+                invalid(format!(
+                    "the exact run's registered app-server endpoint is unavailable ({}); no process was targeted",
+                    current
+                        .endpoint_unavailable
+                        .as_deref()
+                        .unwrap_or("not recorded")
+                ))
+            })?;
+            let result = executor_cli::mcp_stop(
+                &current.receipt,
+                &endpoint,
+                &current.executor_thread,
+                DEFAULT_BOUND,
+            )?;
+            executor_cli::cache::record_stop_result(&current.receipt, loss, &result)
+        },
+    )
+}
+
+fn attach_cache_guard(home: &Path, previous: &VerifiedRun, response: &mut Value) {
+    match refresh_run(home, previous).and_then(|current| {
+        ensure_cache_guard(home, &current)?;
+        Ok(current)
+    }) {
+        Ok(current) => response["cacheGuard"] = current.value["cacheGuard"].clone(),
+        Err(error) => response["cacheGuardError"] = Value::String(error.to_string()),
+    }
 }
 
 fn status(operation: &Operation) -> io::Result<Value> {
@@ -1470,6 +1577,9 @@ fn status(operation: &Operation) -> io::Result<Value> {
             ));
         }
         role = Some(run.role);
+        let cache_guard_error = ensure_cache_guard(&home, &run)
+            .err()
+            .map(|error| error.to_string());
         let caller_thread = match run.role {
             RunRole::Lead => &run.lead_thread,
             RunRole::Executor => &run.executor_thread,
@@ -1486,6 +1596,9 @@ fn status(operation: &Operation) -> io::Result<Value> {
         summary["executorNative"] = executor_native.unwrap_or(Value::Null);
         summary["pendingRequests"] = Value::Array(pending);
         summary["pendingRequestsTruncated"] = Value::Bool(pending_truncated);
+        if let Some(error) = cache_guard_error {
+            summary["cacheGuardError"] = Value::String(error);
+        }
         runs.push(summary);
     }
     Ok(json!({
@@ -1521,6 +1634,7 @@ fn stop(operation: &Operation) -> io::Result<Value> {
     result["executorThreadId"] = Value::String(run.executor_thread.clone());
     result["slot"] = Value::from(run.slot);
     result["lease"] = run.value["lease"].clone();
+    result["cacheGuard"] = run.value["cacheGuard"].clone();
     result["preserved"] = json!({
         "checkout": run.checkout,
         "base": run.base,
@@ -1610,7 +1724,7 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 &turn.turn_id,
                 progress.len(),
             )?;
-            Ok(json!({
+            let mut response = json!({
                 "mode": "exact",
                 "run": run.run,
                 "threadId": run.executor_thread,
@@ -1624,7 +1738,9 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "receipt": run.receipt,
                 "workspace": evidence,
                 "detail": "resumed the exact native thread with the preserved assignment; the assignment was not resubmitted and the slot was not reset or reassigned"
-            }))
+            });
+            attach_cache_guard(&home, &run, &mut response);
+            Ok(response)
         }
         "fresh" => {
             let mut current = Conversation::attach(&endpoint, DEFAULT_BOUND)?;
@@ -1691,7 +1807,7 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 &turn.turn_id,
                 progress.len(),
             )?;
-            Ok(json!({
+            let mut response = json!({
                 "mode": "fresh",
                 "run": run.run,
                 "threadId": new_thread,
@@ -1706,7 +1822,9 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "receipt": run.receipt,
                 "workspace": evidence,
                 "detail": "created one new bound thread on the same shared app-server; the predecessor thread remains retained, the slot stayed bound, and the preserved assignment was submitted once in the new thread"
-            }))
+            });
+            attach_cache_guard(&home, &run, &mut response);
+            Ok(response)
         }
         _ => unreachable!("validated above"),
     }
@@ -2046,7 +2164,9 @@ fn message(operation: &Operation) -> io::Result<Value> {
             "the selected request does not belong to the calling lead; nothing was sent",
         ));
     }
-    send_to_executor(&home, &run, &args.text, args.client_message_id, None)
+    let mut result = send_to_executor(&home, &run, &args.text, args.client_message_id, None)?;
+    attach_cache_guard(&home, &run, &mut result);
+    Ok(result)
 }
 
 fn reply(operation: &Operation) -> io::Result<Value> {
@@ -2088,6 +2208,7 @@ fn reply(operation: &Operation) -> io::Result<Value> {
                 .to_owned(),
         );
     }
+    attach_cache_guard(&home, &run, &mut result);
     Ok(result)
 }
 

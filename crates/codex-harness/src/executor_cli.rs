@@ -50,6 +50,8 @@ mod executor_stop;
 pub(crate) use executor_stop::mcp_stop;
 #[path = "executor_observation.rs"]
 mod observation;
+// The MCP host reuses the exact-session cache monitor without a second policy.
+pub(crate) use observation::cache;
 pub(crate) mod reflection_admission;
 // The native warning relay: the frontend-facing socket the host may append a
 // degraded diagnostic to. It is not a second backend address, and `executor
