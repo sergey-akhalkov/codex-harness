@@ -291,13 +291,13 @@ receipt establishes native listing and MCP configuration, not a model call.
 Verified scope on Codex 0.164.0: plugin install/update/check/recovery,
 same-runtime dispatch/status/wait/message/reply/stop/resume/release, same-slot
 reuse, stop with exact-continuation preservation, and visual `/agents`
-confirmation for two installed executor threads. Open installed gaps: elevated
-privilege isolation (elevated executor commands run at High integrity, but the
-same-user medium endpoint/token is readable, so protected attachment is not
-established; no shared daemon is used) and native MCP warning presentation
-(the cache guard reports `diagnosticDelivery: no-native-consumer`).
-`executor_status` and `executor_wait` remain the verified machine-readable
-state and result paths.
+confirmation for two installed executor threads, plus elevated command and
+attachment protection: elevated token/endpoint state carries a High mandatory
+label, same-user Medium access is denied, and no shared daemon is used. Native
+MCP warning presentation is unavailable in Codex 0.164; the cache guard exposes
+its warning text and threshold evidence in receipt/status/wait, which the user
+accepted as the current limitation. `executor_status` and `executor_wait`
+remain the verified machine-readable state and result paths.
 
 ### Ponytail setup
 
