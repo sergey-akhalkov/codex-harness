@@ -17,14 +17,22 @@ use crate::{
     registration::{LinkChange, Registration, metadata::MetadataDestination},
     registration_native::{self as native, FileGuard, StagedFile},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs, io,
     io::Read,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
+
+const EXECUTORS_PLUGIN_ID: &str = "executors@coding-agents-harness";
+const EXECUTORS_MARKETPLACE: &str = "coding-agents-harness";
+const EXECUTORS_PLUGIN_RELATIVE: &str = ".agents/plugins/executors";
+const EXECUTORS_RECEIPT: &str = "harness/executors-plugin.json";
+const PLUGIN_RECORD_LIMIT: u64 = 64 * 1024;
 
 pub struct Request {
     pub source: PathBuf,
@@ -60,6 +68,9 @@ pub struct Report {
     pub path_change: bool,
     pub runtime: Option<core_runtime::RuntimeReceipt>,
     pub cpu_policy: CpuPolicyReport,
+    /// The owned executors plugin. `unsupported` preserves an older Codex CLI
+    /// without claiming that plugin delivery occurred.
+    pub plugin: PluginReport,
 }
 
 #[derive(Serialize)]
@@ -67,6 +78,7 @@ pub struct RecoveryReport {
     pub status: &'static str,
     pub committed: bool,
     pub model_calls: u32,
+    pub plugin: PluginReport,
 }
 
 #[derive(Serialize)]
@@ -75,6 +87,706 @@ pub struct RecoveryPreview {
     pub action: &'static str,
     pub journal: Option<&'static str>,
     pub model_calls: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginReport {
+    pub status: &'static str,
+    pub plugin: &'static str,
+    pub installed: bool,
+    pub enabled: bool,
+    pub available: bool,
+    pub changed: bool,
+    pub recorded: Option<&'static str>,
+    pub model_calls: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PluginDesired {
+    Connect,
+    Disconnect,
+}
+
+impl PluginDesired {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Disconnect => "disconnect",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PluginReceiptState {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PluginReceipt {
+    schema: u32,
+    plugin: String,
+    marketplace: String,
+    source: PathBuf,
+    codex: PathBuf,
+    desired: PluginDesired,
+    state: PluginReceiptState,
+}
+
+impl PluginReceipt {
+    fn validate(&self) -> io::Result<()> {
+        if self.schema != 1
+            || self.plugin != EXECUTORS_PLUGIN_ID
+            || self.marketplace != EXECUTORS_MARKETPLACE
+        {
+            return Err(plugin_conflict());
+        }
+        crate::installation_state::recorded_path(&self.source)?;
+        crate::installation_state::recorded_path(&self.codex)?;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ObservedPlugin {
+    installed: bool,
+    enabled: bool,
+    available: bool,
+}
+
+fn plugin_conflict() -> io::Error {
+    io::Error::other(
+        "executors plugin state conflicts with current ownership; preserving it without changes",
+    )
+}
+
+fn plugin_report(
+    status: &'static str,
+    observed: ObservedPlugin,
+    changed: bool,
+    recorded: Option<PluginDesired>,
+) -> PluginReport {
+    PluginReport {
+        status,
+        plugin: EXECUTORS_PLUGIN_ID,
+        installed: observed.installed,
+        enabled: observed.enabled,
+        available: observed.available,
+        changed,
+        recorded: recorded.map(PluginDesired::as_str),
+        model_calls: 0,
+    }
+}
+
+fn plugin_receipt_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(EXECUTORS_RECEIPT)
+}
+
+fn read_plugin_receipt(codex_home: &Path) -> io::Result<Option<PluginReceipt>> {
+    let path = plugin_receipt_path(codex_home);
+    inventory::ordinary_parents(&path)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let snapshot = ConfigSnapshot::read(&path).map_err(|_| plugin_conflict())?;
+    if snapshot.contents().len() as u64 > PLUGIN_RECORD_LIMIT {
+        return Err(plugin_conflict());
+    }
+    let receipt: PluginReceipt =
+        serde_json::from_slice(snapshot.contents()).map_err(|_| plugin_conflict())?;
+    receipt.validate()?;
+    Ok(Some(receipt))
+}
+
+fn write_plugin_receipt(codex_home: &Path, receipt: &PluginReceipt) -> io::Result<()> {
+    receipt.validate()?;
+    let path = plugin_receipt_path(codex_home);
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    inventory::ordinary_parents(&path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            read_plugin_receipt(codex_home)?.ok_or_else(plugin_conflict)?;
+            ConfigSnapshot::read(&path)?
+                .plan_replace(&bytes)?
+                .publish()?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            StagedFile::create(&path, &bytes)?.commit()?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn plugin_package(source: &Path) -> io::Result<Option<PathBuf>> {
+    let marketplace = source.join(".agents/plugins/marketplace.json");
+    match fs::symlink_metadata(&marketplace) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let package = source.join(EXECUTORS_PLUGIN_RELATIVE);
+    let marketplace: serde_json::Value = read_plugin_json(&marketplace)?;
+    if marketplace.get("name").and_then(|v| v.as_str()) != Some(EXECUTORS_MARKETPLACE) {
+        return Err(plugin_conflict());
+    }
+    let declared = marketplace
+        .get("plugins")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin.get("name").and_then(|v| v.as_str()) == Some("executors"))
+        })
+        .ok_or_else(plugin_conflict)?;
+    if declared
+        .get("source")
+        .and_then(|v| v.get("source"))
+        .and_then(|v| v.as_str())
+        != Some("local")
+        || declared
+            .get("source")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            != Some("./.agents/plugins/executors")
+    {
+        return Err(plugin_conflict());
+    }
+    let manifest: serde_json::Value = read_plugin_json(&package.join(".codex-plugin/plugin.json"))?;
+    if manifest.get("name").and_then(|v| v.as_str()) != Some("executors")
+        || manifest.get("mcpServers").and_then(|v| v.as_str()) != Some("./.mcp.json")
+    {
+        return Err(plugin_conflict());
+    }
+    let mcp: serde_json::Value = read_plugin_json(&package.join(".mcp.json"))?;
+    let server = mcp
+        .get("mcpServers")
+        .and_then(|v| v.get("executors"))
+        .ok_or_else(plugin_conflict)?;
+    let args = server
+        .get("args")
+        .and_then(|v| v.as_array())
+        .ok_or_else(plugin_conflict)?;
+    if server.get("command").and_then(|v| v.as_str()) != Some("codex-harness")
+        || args.len() != 2
+        || args[0].as_str() != Some("mcp")
+        || args[1].as_str() != Some("executors")
+    {
+        return Err(plugin_conflict());
+    }
+    Ok(Some(package))
+}
+
+fn read_plugin_json(path: &Path) -> io::Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(PLUGIN_RECORD_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > PLUGIN_RECORD_LIMIT {
+        return Err(plugin_conflict());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| plugin_conflict())
+}
+
+fn plugin_supported(codex: &Path, codex_home: &Path) -> bool {
+    Command::new(codex)
+        .args(["plugin", "--help"])
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn codex_json<I, S>(
+    codex: &Path,
+    codex_home: &Path,
+    label: &str,
+    args: I,
+) -> io::Result<serde_json::Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = Command::new(codex)
+        .args(args)
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.lines().next().unwrap_or("no diagnostic").trim();
+        let detail: String = detail.chars().take(512).collect();
+        return Err(io::Error::other(format!(
+            "native Codex {label} failed: {detail}"
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| io::Error::other(format!("native Codex {label} returned invalid JSON")))
+}
+
+fn same_local(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = crate::installation_state::recorded_path(left)?;
+    let right = crate::installation_state::recorded_path(right)?;
+    Ok(crate::installation_state::key(&left)? == crate::installation_state::key(&right)?)
+}
+
+fn marketplace_root(codex: &Path, codex_home: &Path) -> io::Result<Option<PathBuf>> {
+    let value = codex_json(
+        codex,
+        codex_home,
+        "plugin marketplace listing",
+        ["plugin", "marketplace", "list", "--json"],
+    )?;
+    let marketplaces = value
+        .get("marketplaces")
+        .and_then(|v| v.as_array())
+        .ok_or_else(plugin_conflict)?;
+    let mut found = None;
+    for marketplace in marketplaces {
+        if marketplace.get("name").and_then(|v| v.as_str()) == Some(EXECUTORS_MARKETPLACE) {
+            if found.is_some() {
+                return Err(plugin_conflict());
+            }
+            found = marketplace
+                .get("root")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            if found.is_none() {
+                return Err(plugin_conflict());
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn ensure_marketplace(codex: &Path, codex_home: &Path, source: &Path) -> io::Result<bool> {
+    if let Some(root) = marketplace_root(codex, codex_home)? {
+        if !same_local(&root, source)? {
+            return Err(io::Error::other(format!(
+                "marketplace '{EXECUTORS_MARKETPLACE}' belongs to another checkout; preserving it because Ponytail and unrelated plugins may share it"
+            )));
+        }
+        return Ok(false);
+    }
+    let mut add = vec![
+        OsString::from("plugin"),
+        OsString::from("marketplace"),
+        OsString::from("add"),
+        source.as_os_str().to_owned(),
+        OsString::from("--json"),
+    ];
+    codex_json(codex, codex_home, "plugin marketplace add", add.drain(..))?;
+    let root = marketplace_root(codex, codex_home)?
+        .ok_or_else(|| io::Error::other("native Codex did not record the executors marketplace"))?;
+    if !same_local(&root, source)? {
+        return Err(plugin_conflict());
+    }
+    Ok(true)
+}
+
+fn observe_plugin(codex: &Path, codex_home: &Path, source: &Path) -> io::Result<ObservedPlugin> {
+    let listed = codex_json(
+        codex,
+        codex_home,
+        "plugin listing",
+        [
+            "plugin",
+            "list",
+            "--marketplace",
+            EXECUTORS_MARKETPLACE,
+            "--json",
+        ],
+    )?;
+    let plugin = listed
+        .get("installed")
+        .and_then(|v| v.as_array())
+        .and_then(|plugins| {
+            plugins.iter().find(|plugin| {
+                plugin.get("pluginId").and_then(|v| v.as_str()) == Some(EXECUTORS_PLUGIN_ID)
+            })
+        });
+    let installed = plugin
+        .is_some_and(|plugin| plugin.get("installed").and_then(|v| v.as_bool()) == Some(true));
+    let enabled =
+        plugin.is_some_and(|plugin| plugin.get("enabled").and_then(|v| v.as_bool()) == Some(true));
+    let owned = match plugin
+        .and_then(|plugin| plugin.get("source"))
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+    {
+        Some(path) => same_local(Path::new(path), &source.join(EXECUTORS_PLUGIN_RELATIVE))?,
+        None => false,
+    };
+    let servers = codex_json(codex, codex_home, "MCP listing", ["mcp", "list", "--json"])?;
+    let mcp = servers.as_array().is_some_and(|servers| {
+        servers.iter().any(|server| {
+            let transport = server.get("transport");
+            server.get("name").and_then(|v| v.as_str()) == Some("executors")
+                && server.get("enabled").and_then(|v| v.as_bool()) == Some(true)
+                && transport
+                    .and_then(|v| v.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("stdio")
+                && transport
+                    .and_then(|v| v.get("command"))
+                    .and_then(|v| v.as_str())
+                    == Some("codex-harness")
+                && transport
+                    .and_then(|v| v.get("args"))
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|args| {
+                        args.len() == 2
+                            && args[0].as_str() == Some("mcp")
+                            && args[1].as_str() == Some("executors")
+                    })
+        })
+    });
+    Ok(ObservedPlugin {
+        installed,
+        enabled,
+        available: installed && enabled && owned && mcp,
+    })
+}
+
+fn install_plugin_native(
+    codex: &Path,
+    codex_home: &Path,
+    source: &Path,
+) -> io::Result<(ObservedPlugin, bool)> {
+    plugin_package(source)?.ok_or_else(plugin_conflict)?;
+    let before = observe_plugin(codex, codex_home, source)?;
+    let marketplace_added = ensure_marketplace(codex, codex_home, source)?;
+    codex_json(
+        codex,
+        codex_home,
+        "plugin add",
+        ["plugin", "add", EXECUTORS_PLUGIN_ID, "--json"],
+    )?;
+    let after = observe_plugin(codex, codex_home, source)?;
+    if !after.available {
+        return Err(io::Error::other(
+            "native Codex installed the executors plugin but did not expose its enabled stdio MCP entry",
+        ));
+    }
+    Ok((after, marketplace_added || !before.available))
+}
+
+fn remove_plugin_native(codex: &Path, codex_home: &Path, source: &Path) -> io::Result<bool> {
+    let before = observe_plugin(codex, codex_home, source)?;
+    if before.installed {
+        codex_json(
+            codex,
+            codex_home,
+            "plugin remove",
+            ["plugin", "remove", EXECUTORS_PLUGIN_ID, "--json"],
+        )?;
+    }
+    let after = observe_plugin(codex, codex_home, source)?;
+    if after.installed {
+        return Err(io::Error::other(
+            "native Codex did not remove the owned executors plugin",
+        ));
+    }
+    Ok(before.installed)
+}
+
+fn pending_plugin_error(codex_home: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{error}; executors plugin recovery is pending at {}; run the kit recover lifecycle with a connected manager or checkout",
+            plugin_receipt_path(codex_home).display()
+        ),
+    )
+}
+
+fn plugin_preview(source: &Path) -> PluginReport {
+    let packaged = source.join(".agents/plugins/marketplace.json").is_file();
+    plugin_report(
+        if packaged { "preview" } else { "not-packaged" },
+        ObservedPlugin::default(),
+        false,
+        None,
+    )
+}
+
+pub fn plugin_connect(
+    codex_home: &Path,
+    source: &Path,
+    codex: &Path,
+    preview: bool,
+) -> io::Result<PluginReport> {
+    if plugin_package(source)?.is_none() {
+        return Ok(plugin_report(
+            "not-packaged",
+            ObservedPlugin::default(),
+            false,
+            None,
+        ));
+    }
+    if preview {
+        return Ok(plugin_preview(source));
+    }
+    let existing = read_plugin_receipt(codex_home)?;
+    if let Some(receipt) = &existing
+        && receipt.desired == PluginDesired::Connect
+        && !same_local(&receipt.source, source)?
+    {
+        return Err(plugin_conflict());
+    }
+    if !plugin_supported(codex, codex_home) {
+        return Ok(plugin_report(
+            "unsupported",
+            ObservedPlugin::default(),
+            false,
+            existing.as_ref().map(|receipt| receipt.desired),
+        ));
+    }
+    let mut receipt = PluginReceipt {
+        schema: 1,
+        plugin: EXECUTORS_PLUGIN_ID.into(),
+        marketplace: EXECUTORS_MARKETPLACE.into(),
+        source: source.to_owned(),
+        codex: codex.to_owned(),
+        desired: PluginDesired::Connect,
+        state: PluginReceiptState::Pending,
+    };
+    write_plugin_receipt(codex_home, &receipt)
+        .map_err(|error| pending_plugin_error(codex_home, error))?;
+    let result = install_plugin_native(codex, codex_home, source);
+    let (observed, changed) = result.map_err(|error| pending_plugin_error(codex_home, error))?;
+    receipt.state = PluginReceiptState::Completed;
+    write_plugin_receipt(codex_home, &receipt)
+        .map_err(|error| pending_plugin_error(codex_home, error))?;
+    Ok(plugin_report(
+        "connected",
+        observed,
+        changed,
+        Some(PluginDesired::Connect),
+    ))
+}
+
+fn plugin_owner(
+    codex_home: &Path,
+    user_home: &Path,
+    dependency_user_home: &Path,
+) -> io::Result<Option<(PathBuf, PathBuf, Option<PluginDesired>)>> {
+    if let Some(receipt) = read_plugin_receipt(codex_home)? {
+        return Ok(Some((receipt.source, receipt.codex, Some(receipt.desired))));
+    }
+    let prior = Prior::read_homes(codex_home, user_home, dependency_user_home)?;
+    Ok(prior
+        .settings()
+        .map(|settings| (settings.source_root, settings.codex_command, None)))
+}
+
+pub fn plugin_check(
+    codex_home: &Path,
+    user_home: &Path,
+    dependency_user_home: &Path,
+) -> io::Result<PluginReport> {
+    let owner = plugin_owner(codex_home, user_home, dependency_user_home)?;
+    let Some((source, codex, recorded)) = owner else {
+        return Ok(plugin_report(
+            "not-recorded",
+            ObservedPlugin::default(),
+            false,
+            None,
+        ));
+    };
+    if plugin_package(&source)?.is_none() {
+        return Ok(plugin_report(
+            "not-packaged",
+            ObservedPlugin::default(),
+            false,
+            recorded,
+        ));
+    }
+    if !plugin_supported(&codex, codex_home) {
+        return Ok(plugin_report(
+            "unsupported",
+            ObservedPlugin::default(),
+            false,
+            recorded,
+        ));
+    }
+    let observed = observe_plugin(&codex, codex_home, &source)?;
+    let status = if observed.available {
+        "ready"
+    } else {
+        "unavailable"
+    };
+    Ok(plugin_report(status, observed, false, recorded))
+}
+
+pub fn plugin_begin_disconnect(
+    codex_home: &Path,
+    user_home: &Path,
+    dependency_user_home: &Path,
+    preview: bool,
+) -> io::Result<PluginReport> {
+    let Some((source, codex, recorded)) =
+        plugin_owner(codex_home, user_home, dependency_user_home)?
+    else {
+        return Ok(plugin_report(
+            "not-connected",
+            ObservedPlugin::default(),
+            false,
+            None,
+        ));
+    };
+    let supported = plugin_supported(&codex, codex_home);
+    if !supported && recorded.is_some() {
+        return Err(io::Error::other(
+            "installed Codex CLI no longer exposes native plugin removal; refusing to disconnect the core while the recorded executors plugin cannot be removed",
+        ));
+    }
+    if !supported {
+        return Ok(plugin_report(
+            "unsupported",
+            ObservedPlugin::default(),
+            false,
+            recorded,
+        ));
+    }
+    let observed = observe_plugin(&codex, codex_home, &source)?;
+    if !observed.installed {
+        return Ok(plugin_report(
+            if preview { "preview" } else { "not-installed" },
+            observed,
+            false,
+            recorded,
+        ));
+    }
+    if preview {
+        return Ok(plugin_report("preview", observed, false, recorded));
+    }
+    let receipt = PluginReceipt {
+        schema: 1,
+        plugin: EXECUTORS_PLUGIN_ID.into(),
+        marketplace: EXECUTORS_MARKETPLACE.into(),
+        source,
+        codex,
+        desired: PluginDesired::Disconnect,
+        state: PluginReceiptState::Pending,
+    };
+    write_plugin_receipt(codex_home, &receipt)
+        .map_err(|error| pending_plugin_error(codex_home, error))?;
+    Ok(plugin_report(
+        "pending",
+        observed,
+        false,
+        Some(PluginDesired::Disconnect),
+    ))
+}
+
+pub fn plugin_finish_disconnect(codex_home: &Path) -> io::Result<PluginReport> {
+    let Some(mut receipt) = read_plugin_receipt(codex_home)? else {
+        return Ok(plugin_report(
+            "not-recorded",
+            ObservedPlugin::default(),
+            false,
+            None,
+        ));
+    };
+    if receipt.desired != PluginDesired::Disconnect {
+        return Err(plugin_conflict());
+    }
+    if !plugin_supported(&receipt.codex, codex_home) {
+        return Err(pending_plugin_error(
+            codex_home,
+            io::Error::other("installed Codex CLI does not expose native plugin removal"),
+        ));
+    }
+    let changed = remove_plugin_native(&receipt.codex, codex_home, &receipt.source)
+        .map_err(|error| pending_plugin_error(codex_home, error))?;
+    let observed = observe_plugin(&receipt.codex, codex_home, &receipt.source)
+        .map_err(|error| pending_plugin_error(codex_home, error))?;
+    receipt.state = PluginReceiptState::Completed;
+    write_plugin_receipt(codex_home, &receipt)
+        .map_err(|error| pending_plugin_error(codex_home, error))?;
+    Ok(plugin_report(
+        "disconnected",
+        observed,
+        changed,
+        Some(PluginDesired::Disconnect),
+    ))
+}
+
+pub fn plugin_recover(codex_home: &Path) -> io::Result<PluginReport> {
+    let Some(mut receipt) = read_plugin_receipt(codex_home)? else {
+        return Ok(plugin_report(
+            "not-recorded",
+            ObservedPlugin::default(),
+            false,
+            None,
+        ));
+    };
+    if receipt.state == PluginReceiptState::Completed {
+        let observed = if plugin_supported(&receipt.codex, codex_home) {
+            observe_plugin(&receipt.codex, codex_home, &receipt.source)?
+        } else {
+            ObservedPlugin::default()
+        };
+        return Ok(plugin_report(
+            "no-pending-operation",
+            observed,
+            false,
+            Some(receipt.desired),
+        ));
+    }
+    let observed = match receipt.desired {
+        PluginDesired::Connect => {
+            if !codex_home.join("harness/installation.json").is_file() {
+                return Err(io::Error::other(format!(
+                    "executors plugin recovery is pending at {}; the core installation is not connected, so rerun install/update before recovery",
+                    plugin_receipt_path(codex_home).display()
+                )));
+            }
+            plugin_package(&receipt.source)?.ok_or_else(plugin_conflict)?;
+            if !plugin_supported(&receipt.codex, codex_home) {
+                return Err(io::Error::other(
+                    "installed Codex CLI no longer exposes native plugin installation; the pending receipt is preserved",
+                ));
+            }
+            install_plugin_native(&receipt.codex, codex_home, &receipt.source)
+                .map_err(|error| pending_plugin_error(codex_home, error))?
+                .0
+        }
+        PluginDesired::Disconnect => {
+            if codex_home.join("harness/installation.json").is_file() {
+                return Err(io::Error::other(format!(
+                    "executors plugin recovery is pending at {}; the core installation is still connected, so rerun the core disconnect before retrying plugin removal",
+                    plugin_receipt_path(codex_home).display()
+                )));
+            }
+            if !plugin_supported(&receipt.codex, codex_home) {
+                return Err(io::Error::other(
+                    "installed Codex CLI no longer exposes native plugin removal; the pending receipt is preserved",
+                ));
+            }
+            remove_plugin_native(&receipt.codex, codex_home, &receipt.source)
+                .map_err(|error| pending_plugin_error(codex_home, error))?;
+            observe_plugin(&receipt.codex, codex_home, &receipt.source)
+                .map_err(|error| pending_plugin_error(codex_home, error))?
+        }
+    };
+    receipt.state = PluginReceiptState::Completed;
+    write_plugin_receipt(codex_home, &receipt)
+        .map_err(|error| pending_plugin_error(codex_home, error))?;
+    Ok(plugin_report(
+        "recovered",
+        observed,
+        true,
+        Some(receipt.desired),
+    ))
 }
 
 /// Read-only plan, including ownership and available inverse checks. A later
@@ -116,31 +828,31 @@ pub fn recover(
     let owners = InstallationOwners::new(codex_home, user_home, dependency_user_home)?;
     let _locks = InstallationLocks::acquire(user_home, dependency_user_home)?;
     if crate::legacy_pending::recover(codex_home, user_home, dependency_user_home)? {
+        let plugin = plugin_recover(codex_home)?;
         return Ok(RecoveryReport {
             status: "recovered-legacy",
             committed: false,
             model_calls: 0,
+            plugin,
         });
     }
     let state = codex_home.join("harness/native-registration");
     inventory::ordinary_parents(&state.join("owner"))?;
-    match fs::symlink_metadata(&state) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RecoveryReport {
-                status: "no-pending-operation",
-                committed: false,
-                model_calls: 0,
-            });
-        }
+    let report = match fs::symlink_metadata(&state) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
-        Ok(_) => {}
-    }
-    let reg = Registration::open(&state)?;
-    let report = reg.recover_owned_installation(&owners)?;
+        Ok(_) => Some(Registration::open(&state)?.recover_owned_installation(&owners)?),
+    };
+    let plugin = plugin_recover(codex_home)?;
     Ok(RecoveryReport {
-        status: "recovered",
-        committed: report.committed,
+        status: if report.is_some() || plugin.status == "recovered" {
+            "recovered"
+        } else {
+            "no-pending-operation"
+        },
+        committed: report.is_some_and(|report| report.committed),
         model_calls: 0,
+        plugin,
     })
 }
 
@@ -623,6 +1335,7 @@ pub fn connect_for(
     let mut plan = Plan::prepare(request, profile)?;
     if preview {
         let cpu_policy = cpu_policy::preview(&plan_routes(&plan));
+        let plugin = plugin_preview(&request.source);
         return Ok(Report {
             status: "preview",
             profile: profile.as_str(),
@@ -632,6 +1345,7 @@ pub fn connect_for(
             path_change: !plan.path.is_noop(),
             runtime: None,
             cpu_policy,
+            plugin,
         });
     }
     let manifest: crate::inventory::Manifest =
@@ -789,6 +1503,7 @@ pub fn connect_for(
         &request.user_home,
         &request.dependency_user_home,
     )?)?;
+    let plugin = plugin_connect(&request.codex_home, &request.source, &plan.upstream, false)?;
     let cpu_policy = cpu_policy::establish(&plan_routes(&plan));
     Ok(Report {
         status: "connected",
@@ -804,6 +1519,7 @@ pub fn connect_for(
         path_change: !plan.path.is_noop(),
         runtime,
         cpu_policy,
+        plugin,
     })
 }
 
