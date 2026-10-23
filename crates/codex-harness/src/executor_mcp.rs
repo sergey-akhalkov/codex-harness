@@ -1,8 +1,9 @@
 //! The executor MCP surface: dispatch, bounded status, native message/reply,
-//! isolated stop and explicit continuation. Authority is Codex request
+//! isolated stop, explicit continuation and explicit release. Authority is Codex request
 //! `_meta.threadId`; runs are resolved from the existing MCP receipt and its
-//! slot/app-server lease. Dispatch, delivery and stop containment stay in the
-//! existing executor owners; this module selects and validates the binding.
+//! slot/app-server lease. Dispatch, delivery, stop containment and pool reset
+//! stay in the existing executor owners; this module selects and validates the
+//! binding.
 
 use crate::{
     executor_assignment::Assignment,
@@ -20,7 +21,7 @@ use harness_core::{
     mcp_session::{Operation, Session},
     mcp_stdio, native_launcher,
     process::Cancellation,
-    task_worktree::{self, SlotState},
+    task_worktree::{self, LaneDisposition, SlotDisposition, SlotState},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -42,6 +43,7 @@ const REPLY_TOOL: &str = "executor_reply";
 const ASK_TOOL: &str = "executor_ask_lead";
 const STOP_TOOL: &str = "executor_stop";
 const RESUME_TOOL: &str = "executor_resume";
+const RELEASE_TOOL: &str = "executor_release";
 const APPROVAL_POLICY: &str = "never";
 const MAX_RECEIPTS: usize = 256;
 const MAX_STATUS_RUNS: usize = 8;
@@ -69,7 +71,7 @@ fn excerpt(text: &str, limit: usize) -> String {
 pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp executors\nServe the installed executor MCP plugin over stdio. The caller identity comes only from Codex-injected request `_meta.threadId`. Tools dispatch one executor on the originating app-server, exchange addressed messages or questions, read bounded status, wait for one exact run's question or terminal result, stop one exact run through native turn interruption, and explicitly continue that run. No run, thread, endpoint or recipient is accepted from tool arguments as authority."
+            "codex-harness mcp executors\nServe the installed executor MCP plugin over stdio. The caller identity comes only from Codex-injected request `_meta.threadId`. Tools dispatch one executor on the originating app-server, exchange addressed messages or questions, read bounded status, wait for one exact run's question or terminal result, stop one exact run through native turn interruption, explicitly continue that run, and explicitly release an accepted or discarded run through the existing pool owner. No run, thread, endpoint or recipient is accepted from tool arguments as authority."
         );
         return Ok(0);
     }
@@ -92,6 +94,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             ask_lead_tool_definition(),
             stop_tool_definition(),
             resume_tool_definition(),
+            release_tool_definition(),
         ],
     )?;
     mcp_stdio::serve_fallible_with_lifetime(
@@ -291,6 +294,37 @@ fn resume_tool_definition() -> Value {
     })
 }
 
+fn release_tool_definition() -> Value {
+    json!({
+        "name": RELEASE_TOOL,
+        "description": "Explicitly release one executor run owned by the verified calling lead after its active work has ended. Requires a merged or discarded disposition and a nonempty reason. Refuses an active turn, unresolved request, stale or foreign lease, or ambiguous target before effects. Reuses the existing pool release owner: a clean or explicitly discarded slot is reset to the selected base with eligible ignored caches retained; dirty work under a merged disposition is preserved. Native thread archive alone never frees a slot.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["disposition", "reason"],
+            "properties": {
+                "run": {
+                    "type": "string",
+                    "description": "Optional exact run id returned by executor_status. Omitted selects the calling lead's sole recorded run; it never establishes authority by itself."
+                },
+                "disposition": {
+                    "type": "string",
+                    "enum": ["merged", "discarded"],
+                    "description": "Explicit review disposition. merged resets a clean run to the selected base; discarded also authorizes deleting the run's unreviewed changes."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Nonempty reason recorded with the disposition in the run receipt and slot state."
+                },
+                "base": {
+                    "type": "string",
+                    "description": "Optional committed base selected in the repository. Omitted uses the repository's current committed HEAD."
+                }
+            }
+        }
+    })
+}
+
 fn perform(operation: &Operation) -> io::Result<Value> {
     match operation.name.as_str() {
         DISPATCH_TOOL => dispatch(operation),
@@ -301,6 +335,7 @@ fn perform(operation: &Operation) -> io::Result<Value> {
         ASK_TOOL => ask_lead(operation),
         STOP_TOOL => stop(operation),
         RESUME_TOOL => resume(operation),
+        RELEASE_TOOL => release(operation),
         other => Err(invalid(format!("unknown executor MCP tool '{other}'"))),
     }
 }
@@ -417,6 +452,17 @@ struct ResumeArgs {
     run: Option<String>,
     #[serde(default)]
     progress: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseArgs {
+    #[serde(default)]
+    run: Option<String>,
+    disposition: String,
+    reason: String,
+    #[serde(default)]
+    base: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,7 +847,23 @@ fn matching_receipts(home: &Path, caller: &str) -> io::Result<Vec<RunReceipt>> {
         .collect())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunView {
+    Live,
+    Release,
+    Status,
+}
+
 fn verify_run(home: &Path, receipt: RunReceipt, caller: &str) -> io::Result<VerifiedRun> {
+    verify_run_for(home, receipt, caller, RunView::Live)
+}
+
+fn verify_run_for(
+    home: &Path,
+    receipt: RunReceipt,
+    caller: &str,
+    view: RunView,
+) -> io::Result<VerifiedRun> {
     let value = &receipt.value;
     if value["schema"].as_u64() != Some(1) {
         return Err(invalid(format!(
@@ -869,13 +931,44 @@ fn verify_run(home: &Path, receipt: RunReceipt, caller: &str) -> io::Result<Veri
             "slot {slot} has no recorded ownership; the MCP run has no exact lease"
         ))
     })?;
-    if record.owner.as_deref() != Some(run.as_str())
-        || record.index != slot
-        || !same_path(&record.path, &checkout)
-        || !matches!(record.state, SlotState::Occupied)
-    {
+    let exact_owner = record.owner.as_deref() == Some(run.as_str());
+    let exact_checkout = record.index == slot && same_path(&record.path, &checkout);
+    let release_recorded = !value["release"].is_null();
+    let released_with_record = release_recorded
+        && exact_checkout
+        && match record.state {
+            SlotState::Released => {
+                record.owner.is_none() && value["release"]["slotFreed"].as_bool() == Some(true)
+            }
+            SlotState::AwaitingReview => exact_owner,
+            _ => false,
+        };
+    let allowed = match view {
+        RunView::Live => exact_owner && matches!(record.state, SlotState::Occupied),
+        RunView::Release => {
+            (exact_owner
+                && matches!(
+                    record.state,
+                    SlotState::Occupied | SlotState::AwaitingReview
+                ))
+                || released_with_record
+        }
+        RunView::Status => {
+            (exact_owner
+                && matches!(
+                    record.state,
+                    SlotState::Occupied | SlotState::AwaitingReview
+                ))
+                || released_with_record
+        }
+    };
+    if !exact_checkout || !allowed {
         return Err(invalid(format!(
-            "slot {slot} is not the recorded run's live lease: owner {:?}, state {:?}, checkout {}; no operation was performed",
+            "slot {slot} is not the recorded run's {}: owner {:?}, state {:?}, checkout {}; no operation was performed",
+            match view {
+                RunView::Live => "live lease",
+                RunView::Release | RunView::Status => "recorded ownership",
+            },
             record.owner,
             record.state,
             record.path.display()
@@ -977,6 +1070,23 @@ fn native_thread(run: &VerifiedRun, thread_id: &str, executor_side: bool) -> io:
         "cwd": thread["cwd"],
         "activeTurnId": active_turn(&thread)
     }))
+}
+
+fn native_status_or_release(
+    run: &VerifiedRun,
+    thread_id: &str,
+    executor_side: bool,
+) -> io::Result<Value> {
+    match native_thread(run, thread_id, executor_side) {
+        Ok(native) => Ok(native),
+        Err(error) if !run.value["release"].is_null() => Ok(json!({
+            "threadId": thread_id,
+            "status": "unavailable",
+            "error": error.to_string(),
+            "detail": "the run's explicit release record remains authoritative; native archive or a missing thread does not reopen or refill the slot"
+        })),
+        Err(error) => Err(error),
+    }
 }
 
 fn pending_requests(run: &VerifiedRun) -> (Vec<Value>, bool) {
@@ -1451,12 +1561,22 @@ fn run_summary(run: &VerifiedRun) -> Value {
         "cacheGuard": run.value["cacheGuard"],
         "stop": run.value["stop"],
         "continuation": run.value["continuation"],
+        "release": run.value["release"],
         "predecessorThreadId": run.value["predecessorThreadId"],
         "receipt": run.receipt
     })
 }
 
 fn verified_receipt(home: &Path, receipt: &Path, caller: &str) -> io::Result<VerifiedRun> {
+    verified_receipt_for(home, receipt, caller, RunView::Live)
+}
+
+fn verified_receipt_for(
+    home: &Path,
+    receipt: &Path,
+    caller: &str,
+    view: RunView,
+) -> io::Result<VerifiedRun> {
     let bytes = fs::read(receipt).map_err(|error| {
         invalid(format!(
             "the MCP run receipt {} could not be re-read: {error}",
@@ -1469,13 +1589,14 @@ fn verified_receipt(home: &Path, receipt: &Path, caller: &str) -> io::Result<Ver
             receipt.display()
         ))
     })?;
-    verify_run(
+    verify_run_for(
         home,
         RunReceipt {
             path: receipt.to_owned(),
             value,
         },
         caller,
+        view,
     )
 }
 
@@ -1568,7 +1689,7 @@ fn status(operation: &Operation) -> io::Result<Value> {
     let mut role = None;
     let mut runs = Vec::new();
     for receipt in receipts.into_iter().take(MAX_STATUS_RUNS) {
-        let run = verify_run(&home, receipt, &caller)?;
+        let run = verify_run_for(&home, receipt, &caller, RunView::Status)?;
         if let Some(previous) = role
             && previous != run.role
         {
@@ -1577,16 +1698,18 @@ fn status(operation: &Operation) -> io::Result<Value> {
             ));
         }
         role = Some(run.role);
-        let cache_guard_error = ensure_cache_guard(&home, &run)
-            .err()
+        let released = !run.value["release"].is_null();
+        let cache_guard_error = (!released)
+            .then(|| ensure_cache_guard(&home, &run))
+            .and_then(Result::err)
             .map(|error| error.to_string());
         let caller_thread = match run.role {
             RunRole::Lead => &run.lead_thread,
             RunRole::Executor => &run.executor_thread,
         };
-        let native = native_thread(&run, caller_thread, run.role == RunRole::Executor)?;
+        let native = native_status_or_release(&run, caller_thread, run.role == RunRole::Executor)?;
         let executor_native = if run.role == RunRole::Lead {
-            Some(native_thread(&run, &run.executor_thread, true)?)
+            Some(native_status_or_release(&run, &run.executor_thread, true)?)
         } else {
             None
         };
@@ -1647,6 +1770,408 @@ fn stop(operation: &Operation) -> io::Result<Value> {
         "reassigned": false
     });
     Ok(result)
+}
+
+fn release(operation: &Operation) -> io::Result<Value> {
+    let caller = caller_thread(&operation.metadata)?;
+    let ReleaseArgs {
+        run: selected,
+        disposition,
+        reason,
+        base,
+    } = serde_json::from_value(operation.arguments.clone())
+        .map_err(|error| invalid(format!("executor_release arguments are invalid: {error}")))?;
+    let disposition = match disposition.as_str() {
+        "merged" => SlotDisposition::Merged,
+        "discarded" => SlotDisposition::Discarded,
+        other => {
+            return Err(invalid(format!(
+                "executor_release disposition must be 'merged' or 'discarded', not {other:?}; nothing was released"
+            )));
+        }
+    };
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(invalid(
+            "executor_release requires a nonempty reason; nothing was released",
+        ));
+    }
+    let home = native_launcher::codex_home()?;
+    let receipt = release_receipt(&home, &caller, selected.as_deref())?;
+    let run = verify_run_for(&home, receipt, &caller, RunView::Release)?;
+    let previous = run.value["release"]
+        .as_object()
+        .map(|_| run.value["release"].clone());
+    if let Some(previous) = previous.as_ref() {
+        if previous["run"].as_str() != Some(run.run.as_str())
+            || previous["slot"].as_u64() != Some(u64::from(run.slot))
+        {
+            return Err(invalid(
+                "the run receipt carries a release record for another run or slot; refusing an ambiguous release",
+            ));
+        }
+        let recorded = previous["disposition"].as_str().ok_or_else(|| {
+            invalid("the run receipt's release record names no disposition; nothing was released")
+        })?;
+        let slot_released = previous["slotFreed"].as_bool() == Some(true)
+            || task_worktree::load_slot_record(&home, &run.repository, run.slot)?
+                .is_some_and(|record| record.state == SlotState::Released);
+        if slot_released {
+            if recorded != executor_cli::disposition_name(disposition) {
+                return Err(invalid(format!(
+                    "run {} was already released as {recorded}; a repeated release cannot change the disposition and nothing was reset",
+                    run.run
+                )));
+            }
+            return Ok(release_response(&run, previous, true));
+        }
+    }
+    require_release_ready(&run)?;
+    let requested_base = match base {
+        Some(base) if base.trim().is_empty() => {
+            return Err(invalid(
+                "executor_release base must not be empty when supplied; nothing was released",
+            ));
+        }
+        Some(base) => Some(base.trim().to_owned()),
+        None => None,
+    };
+    let base = match requested_base.as_deref() {
+        Some(base) => base.to_owned(),
+        None => executor_cli::committed_head(&run.repository)?,
+    };
+
+    // Re-read the exact receipt and run state after the native check. A slot
+    // or thread replaced during release preparation must not be reset by this
+    // caller, and a newer pending request must still refuse the release.
+    let current = verified_receipt_for(&home, &run.receipt, &caller, RunView::Release)?;
+    if current.run != run.run
+        || current.executor_thread != run.executor_thread
+        || current.slot != run.slot
+    {
+        return Err(invalid(
+            "the exact run identity changed during release preparation; nothing was reset",
+        ));
+    }
+    require_release_ready(&current)?;
+    let pool_size = release_pool_size(&current)?;
+    let pool = task_worktree::pool(&current.repository, pool_size)?;
+    let slot = pool.slot(current.slot)?;
+    if !same_path(&slot.path, &current.checkout) {
+        return Err(invalid(format!(
+            "slot {} resolves to {} instead of the recorded checkout {}; nothing was reset",
+            current.slot,
+            slot.path.display(),
+            current.checkout.display()
+        )));
+    }
+    let record = task_worktree::load_slot_record(&home, &current.repository, current.slot)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "slot {} has no recorded ownership; nothing was released",
+                current.slot
+            ))
+        })?;
+    if record.startup.is_some() {
+        return Err(invalid(format!(
+            "slot {} still carries an in-flight startup reservation; the slot was not reset",
+            current.slot
+        )));
+    }
+    if executor_cli::owner_live(&home, &current.repository, &current.run) {
+        return Err(invalid(format!(
+            "slot {} is still held by a live executor-session lease for run {}; stop it before release",
+            current.slot, current.run
+        )));
+    }
+
+    // A merged claim cannot justify deleting uncommitted or untracked work.
+    // Preserve it with an explicit outcome; discarded is the caller's explicit
+    // authorization for the existing pool owner to reset that work.
+    if disposition == SlotDisposition::Merged && checkout_dirty(&current.checkout)? {
+        let repeats = release_repeats(previous.as_ref());
+        let release = release_record(
+            &current,
+            ReleaseFacts {
+                disposition,
+                reason,
+                requested_base: requested_base.as_deref(),
+                base: &base,
+                outcome: "preserved",
+                slot_state: "occupied",
+                limitation: Some(
+                    "the checkout holds local or untracked changes; merged does not authorize deleting them. Commit or merge the intended work, or repeat with disposition=discarded to authorize deletion",
+                ),
+                message_cleanup: None,
+                repeats,
+            },
+        );
+        record_release_result(&current, &caller, release.clone())?;
+        return Ok(release_response(&current, &release, false));
+    }
+
+    // The slot is still held here, so no later occupant can publish a new
+    // canonical receipt while this run's own payload paths are removed.
+    let message_cleanup = executor_input::cleanup_recorded_messages(&home, &current.receipt);
+    let is_live = |owner: &str| executor_cli::owner_live(&home, &current.repository, owner);
+    let released = task_worktree::release_slot(
+        &home,
+        &pool,
+        current.slot,
+        disposition,
+        reason,
+        &base,
+        &is_live,
+    )?;
+    let (outcome, slot_state, base, limitation) = match released {
+        LaneDisposition::Reused { base } => ("reused", "released", base, None),
+        LaneDisposition::Preserved { limitation } => {
+            ("preserved", "awaitingReview", base, Some(limitation))
+        }
+    };
+    let release = release_record(
+        &current,
+        ReleaseFacts {
+            disposition,
+            reason,
+            requested_base: requested_base.as_deref(),
+            base: &base,
+            outcome,
+            slot_state,
+            limitation: limitation.as_deref(),
+            message_cleanup: Some(&message_cleanup),
+            repeats: release_repeats(previous.as_ref()),
+        },
+    );
+    record_release_result(&current, &caller, release.clone())?;
+    Ok(release_response(&current, &release, false))
+}
+
+fn release_receipt(home: &Path, caller: &str, selected: Option<&str>) -> io::Result<RunReceipt> {
+    if let Some(run) = selected
+        && !valid_run_id(run)
+    {
+        return Err(invalid(format!(
+            "run {run:?} is malformed; refusing before any run lookup or release"
+        )));
+    }
+    let matches: Vec<RunReceipt> = read_receipts(home)?
+        .into_iter()
+        .filter(|receipt| {
+            receipt.value["leadThreadId"].as_str() == Some(caller)
+                && selected.is_none_or(|run| receipt.value["run"].as_str() == Some(run))
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Err(invalid(match selected {
+            Some(run) => format!(
+                "no recorded MCP executor run {run:?} is owned by the calling lead; nothing was released"
+            ),
+            None => {
+                "no recorded MCP executor run is owned by the calling lead; nothing was released"
+                    .into()
+            }
+        })),
+        [receipt] => Ok(RunReceipt {
+            path: receipt.path.clone(),
+            value: receipt.value.clone(),
+        }),
+        _ => {
+            let runs: Vec<Value> = matches
+                .iter()
+                .map(|receipt| {
+                    json!({
+                        "run": receipt.value["run"],
+                        "executorThreadId": receipt.value["executorThreadId"],
+                        "slot": receipt.value["slot"]
+                    })
+                })
+                .take(MAX_STATUS_RUNS)
+                .collect();
+            Err(invalid(format!(
+                "the calling lead owns {} recorded MCP executor runs; the release target is ambiguous and nothing was reset. Choose one with executor_release run=<run>. runs: {}",
+                matches.len(),
+                Value::Array(runs)
+            )))
+        }
+    }
+}
+
+fn require_release_ready(run: &VerifiedRun) -> io::Result<()> {
+    let (pending, _) = pending_requests(run);
+    if !pending.is_empty() {
+        let ids: Vec<&Value> = pending
+            .iter()
+            .filter_map(|request| request.get("requestId"))
+            .take(MAX_STATUS_REQUESTS)
+            .collect();
+        return Err(invalid(format!(
+            "run {} has unresolved request(s) {}; answer them before release and nothing was reset",
+            run.run,
+            Value::Array(ids.into_iter().cloned().collect())
+        )));
+    }
+    if run.value["stop"]["outcome"].as_str() == Some("partial") {
+        return Err(invalid(format!(
+            "run {} last reported partial stop containment; its owned work is not proved ended, so the slot was not released",
+            run.run
+        )));
+    }
+    if run.endpoint.is_none() {
+        return Err(invalid(format!(
+            "run {} has no verified live lead endpoint ({}); its native thread state cannot be proved idle and the slot was not released",
+            run.run,
+            run.endpoint_unavailable
+                .as_deref()
+                .unwrap_or("not recorded")
+        )));
+    }
+    let native = native_thread(run, &run.executor_thread, true).map_err(|error| {
+        invalid(format!(
+            "the exact executor thread {} state cannot be read ({error}); native archive alone is not completion and slot {} remains occupied",
+            run.executor_thread, run.slot
+        ))
+    })?;
+    if let Some(turn) = native["activeTurnId"].as_str() {
+        return Err(invalid(format!(
+            "run {} still has active turn {turn} in executor thread {}; stop it before release and nothing was reset",
+            run.run, run.executor_thread
+        )));
+    }
+    let status = native["status"].as_str().unwrap_or("unknown");
+    if status != "idle" {
+        return Err(invalid(format!(
+            "executor thread {} reports {status}, not an idle run whose active work has ended; release is refused and nothing was reset. Native archive or presentation alone does not free a slot",
+            run.executor_thread
+        )));
+    }
+    Ok(())
+}
+
+fn release_pool_size(run: &VerifiedRun) -> io::Result<u32> {
+    run.value["poolSize"]
+        .as_u64()
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            invalid(
+                "the MCP run receipt records no usable pool size; the exact slot layout cannot be resolved and nothing was reset",
+            )
+        })
+}
+
+fn checkout_dirty(checkout: &Path) -> io::Result<bool> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(checkout)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .map_err(|error| {
+            invalid(format!(
+                "the checkout {} could not be inspected before release: {error}",
+                checkout.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "the checkout {} could not be inspected before release: {}",
+            checkout.display(),
+            excerpt(&String::from_utf8_lossy(&output.stderr), 300)
+        )));
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn release_repeats(previous: Option<&Value>) -> u64 {
+    previous
+        .and_then(|release| release["repeats"].as_u64())
+        .map(|repeats| repeats.saturating_add(1))
+        .unwrap_or(0)
+}
+
+struct ReleaseFacts<'a> {
+    disposition: SlotDisposition,
+    reason: &'a str,
+    requested_base: Option<&'a str>,
+    base: &'a str,
+    outcome: &'a str,
+    slot_state: &'a str,
+    limitation: Option<&'a str>,
+    message_cleanup: Option<&'a io::Result<usize>>,
+    repeats: u64,
+}
+
+fn release_record(run: &VerifiedRun, facts: ReleaseFacts<'_>) -> Value {
+    let (removed, cleanup_error) = match facts.message_cleanup {
+        Some(Ok(count)) => (json!(count), Value::Null),
+        Some(Err(error)) => (Value::Null, json!(error.to_string())),
+        None => (Value::Null, Value::Null),
+    };
+    let slot_freed = facts.outcome == "reused";
+    json!({
+        "schema": 1,
+        "run": run.run,
+        "leadThreadId": run.lead_thread,
+        "executorThreadId": run.executor_thread,
+        "slot": run.slot,
+        "checkout": run.checkout,
+        "disposition": executor_cli::disposition_name(facts.disposition),
+        "reason": facts.reason,
+        "requestedBase": facts.requested_base,
+        "base": facts.base,
+        "outcome": facts.outcome,
+        "slotFreed": slot_freed,
+        "slotState": facts.slot_state,
+        "preserved": !slot_freed,
+        "limitation": facts.limitation,
+        "messagePayloadsRemoved": removed,
+        "messageCleanupError": cleanup_error,
+        "repeats": facts.repeats,
+        "recordedMs": executor_message_now()
+    })
+}
+
+fn record_release_result(run: &VerifiedRun, caller: &str, release: Value) -> io::Result<()> {
+    executor_message::update_receipt_document(&run.receipt, |document| {
+        if document["run"].as_str() != Some(run.run.as_str())
+            || document["leadThreadId"].as_str() != Some(caller)
+            || document["executorThreadId"].as_str() != Some(run.executor_thread.as_str())
+            || document["slot"].as_u64() != Some(u64::from(run.slot))
+        {
+            return Err(invalid(
+                "the MCP run receipt changed before its release could be recorded; the release record was not written",
+            ));
+        }
+        document["release"] = release;
+        Ok(())
+    })
+}
+
+fn release_response(run: &VerifiedRun, release: &Value, idempotent: bool) -> Value {
+    let slot_freed = release["slotFreed"].as_bool().unwrap_or(false);
+    json!({
+        "run": run.run,
+        "leadThreadId": run.lead_thread,
+        "executorThreadId": run.executor_thread,
+        "slot": run.slot,
+        "checkout": run.checkout,
+        "receipt": run.receipt,
+        "state": if slot_freed { "released" } else { "preserved" },
+        "outcome": release["outcome"],
+        "released": slot_freed,
+        "slotFreed": slot_freed,
+        "idempotent": idempotent,
+        "disposition": release["disposition"],
+        "reason": release["reason"],
+        "base": release["base"],
+        "requestedBase": release["requestedBase"],
+        "preserved": release["preserved"],
+        "slotState": release["slotState"],
+        "limitation": release["limitation"],
+        "messagePayloadsRemoved": release["messagePayloadsRemoved"],
+        "messageCleanupError": release["messageCleanupError"],
+        "release": release
+    })
 }
 
 fn resume(operation: &Operation) -> io::Result<Value> {

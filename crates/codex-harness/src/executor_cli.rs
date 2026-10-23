@@ -4586,7 +4586,7 @@ fn report_cleaned_messages(messages: Result<&usize, &io::Error>) {
     }
 }
 
-fn disposition_name(disposition: SlotDisposition) -> &'static str {
+pub(crate) fn disposition_name(disposition: SlotDisposition) -> &'static str {
     match disposition {
         SlotDisposition::Merged => "merged",
         SlotDisposition::Discarded => "discarded",
@@ -5432,7 +5432,7 @@ fn print_watch_report(report: &WatchReport, json_output: bool) -> io::Result<()>
 
 /// The merged committed base of the source checkout, used when the lead does
 /// not name the base explicitly.
-fn committed_head(source: &Path) -> io::Result<String> {
+pub(crate) fn committed_head(source: &Path) -> io::Result<String> {
     let out = Command::new("git")
         .args(["rev-parse", "--verify", "HEAD^{commit}"])
         .current_dir(source)
