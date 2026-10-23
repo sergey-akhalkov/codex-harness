@@ -55,6 +55,29 @@ The consumer proof used a synthetic Git checkout without `global/orchestration.t
 
 The first executor turn ran the real brief in the pooled checkout through the configured default profile (currently DeepSeek) and executed `git rev-parse HEAD`, returning the assigned base. The executor thread record reported the pooled `cwd`, title, `deepseek-flash`, `deepseek` and `max`. The `allowProviderModelFallback: false` request field was sent but was not echoed by the thread record, so it is request verification, not an observed runtime assertion. The executor inherited the app-server's sandbox; this slice does not independently prove per-profile sandbox differentiation. The synthetic consumer executor created an untracked `.serena/` tooling directory; the isolated proof lane was preserved as not clean, with no tracked change. The terminal-side watch/pool session display still reads the legacy spawn receipt, so `mcp-<slot>.json` is authoritative for this MCP run until the compatibility paths are reconciled.
 
+### Task 4.1 plugin lifecycle contract
+
+Observed on 2026-10-23 with installed `codex-cli 0.164.0` in isolated Codex
+homes:
+
+| Lifecycle | Verified behavior |
+| --- | --- |
+| Install and update | Core Install/Update runs the native `codex plugin marketplace add <source> --json` and `codex plugin add executors@coding-agents-harness --json` commands with the selected `CODEX_HOME`. The second install/update is idempotent. No interactive install prompt appeared. The plugin is enabled and `codex mcp list --json` reports `codex-harness mcp executors` over stdio. |
+| Check | Core Check adds `plugin` to its receipt. `status = "ready"` requires native plugin listing to report the owned source installed and enabled, plus the enabled stdio MCP entry. `installed`, `enabled`, `available`, `changed`, `recorded` and `model_calls` remain distinct. |
+| Receipt and recovery | The lifecycle writes `CODEX_HOME/harness/executors-plugin.json` before native effects. A pending receipt records only plugin/marketplace identity, source, resolved upstream command and intended connect/disconnect state. `recover --core-only` replays a pending connect, or a pending disconnect after core removal is committed, and verifies the resulting native state. A pending disconnect while core is still connected asks for the core disconnect to be rerun. No credential or task payload enters the receipt. |
+| Disconnect | Disconnect journals its intent before core removal, then removes only `executors@coding-agents-harness`. The shared `coding-agents-harness` marketplace is retained because Ponytail and unrelated plugins may use it. |
+| Preservation | The isolated acceptance retained Ponytail and another plugin selection, an unrelated MCP server, model/settings and authentication bytes, a marketplace entry, and synthetic executor-pool dispatch, endpoint and assignment files across install, update, check, recovery and disconnect. Command output did not expose sentinels from those records. |
+| Server identity | A spawned installed `codex-harness mcp executors` completed MCP initialize as server `executors` and listed `executor_dispatch`. This verifies the installed stdio command and tool surface, not a model turn or `/agents` interaction. |
+| Version and PATH | `.mcp.json` names `codex-harness` rather than a tracked absolute path, so a fresh Codex process must resolve it through the selected PATH scope. Sources without the marketplace declaration report `not-packaged`; a Codex CLI without the native plugin command reports `unsupported` and is not claimed as plugin-capable. The accepted plugin lifecycle host is 0.164.0; the older core baseline does not establish this support. |
+| Relocation limit | Codex refuses to add the same marketplace name from a different checkout. The lifecycle fails closed before plugin changes and preserves the existing marketplace, rather than removing state that Ponytail or unrelated plugins may share. A moved connected installation therefore needs an explicit native marketplace decision. |
+
+The acceptance is
+`cargo test --locked -p codex-harness --test plugin_lifecycle -- --ignored --exact install_update_check_recover_and_disconnect_preserve_unrelated_state --test-threads=1`
+with `HARNESS_PLUGIN_CODEX_EXE` naming the native Codex executable. It builds an
+isolated kit source and homes, runs the real lifecycle, starts the installed MCP
+server, and checks native listings and preserved state. It does not use the live
+user home.
+
 This slice does **not** establish automatic delivery while the lead is active or idle, bidirectional question/reply handling, isolated stop/continuation, elevated attachment, two-profile concurrency or native `/agents` UI interaction. Those remain tasks 1.2-1.5 and must pass before broad migration. These are explicit feasibility conditions, not accepted shortcuts or deferred user choices.
 
 Primary contracts: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [developer commands](https://learn.chatgpt.com/docs/developer-commands), [subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents), [hooks](https://learn.chatgpt.com/docs/hooks), [plugin build contract](https://developers.openai.com/plugins/build/plugins), and [configuration schema](https://developers.openai.com/codex/config-schema.json). Recheck the supported installed version's help and generated schema when implementing; website reachability alone does not establish an API contract.

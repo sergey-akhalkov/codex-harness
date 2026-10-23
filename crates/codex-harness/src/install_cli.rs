@@ -185,12 +185,16 @@ pub fn check(args: &[OsString]) -> io::Result<i32> {
                 })
                 .transpose()?
                 .unwrap_or(45);
-            serde_json::to_value(harness_core::core_check::check(
-                &required(&options.values, "--codex-home")?,
+            let codex_home = required(&options.values, "--codex-home")?;
+            let mut report = serde_json::to_value(harness_core::core_check::check(
+                &codex_home,
                 &user,
                 &dependency,
                 Duration::from_secs(timeout),
-            )?)?
+            )?)?;
+            report["plugin"] =
+                serde_json::to_value(core_install::plugin_check(&codex_home, &user, &dependency)?)?;
+            report
         }
         Component::CodeTools => {
             serde_json::to_value(code_tools_lifecycle::run(&code_tools_lifecycle::Request {
@@ -271,12 +275,37 @@ pub fn disconnect(args: &[OsString]) -> io::Result<i32> {
     let dependency =
         optional(&options.values, "--dependency-user-home").unwrap_or_else(|| user.clone());
     let report = match options.component {
-        Component::Core => serde_json::to_value(harness_core::core_disconnect::disconnect(
-            &required(&options.values, "--codex-home")?,
-            &user,
-            &dependency,
-            options.preview,
-        )?)?,
+        Component::Core => {
+            let codex_home = required(&options.values, "--codex-home")?;
+            let report = if options.preview {
+                let plugin =
+                    core_install::plugin_begin_disconnect(&codex_home, &user, &dependency, true)?;
+                let mut report = serde_json::to_value(harness_core::core_disconnect::disconnect(
+                    &codex_home,
+                    &user,
+                    &dependency,
+                    true,
+                )?)?;
+                report["plugin"] = serde_json::to_value(plugin)?;
+                report
+            } else {
+                // The read-only pass discovers pending core journals before the
+                // plugin receipt writes anything. Core metadata still owns the
+                // native Codex command and source used below.
+                harness_core::core_disconnect::disconnect(&codex_home, &user, &dependency, true)?;
+                core_install::plugin_begin_disconnect(&codex_home, &user, &dependency, false)?;
+                let mut report = serde_json::to_value(harness_core::core_disconnect::disconnect(
+                    &codex_home,
+                    &user,
+                    &dependency,
+                    false,
+                )?)?;
+                report["plugin"] =
+                    serde_json::to_value(core_install::plugin_finish_disconnect(&codex_home)?)?;
+                report
+            };
+            report
+        }
         Component::CodeTools => {
             serde_json::to_value(code_tools_lifecycle::run(&code_tools_lifecycle::Request {
                 source: required(&options.values, "--source")?,

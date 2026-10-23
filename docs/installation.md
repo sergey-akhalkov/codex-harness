@@ -49,9 +49,13 @@ relocated checkout. The component selectors are mutually exclusive:
 - Windows x64 with PowerShell 7, a Rust MSVC toolchain (Rust 1.98 or later),
   Cargo, the MSVC C++ linker and the
   Windows SDK. Workspace dependencies are locked in `Cargo.lock`.
-- Installed Codex CLI. The compatibility baseline is **0.153.4**; the global
-  installation lifecycle also passed with **0.162.0**. Installation resolves the real executable and
-  performs a model-free startup handoff before committing.
+- Installed Codex CLI. The core compatibility baseline is **0.153.4**; the
+  global installation lifecycle also passed with **0.162.0**. Executor plugin
+  delivery additionally requires the native `codex plugin` and `codex mcp`
+  commands and was verified with **0.164.0**. An older CLI reports
+  `plugin.status = "unsupported"`; it is not claimed as plugin-capable.
+  Installation resolves the real executable and performs a model-free startup
+  handoff before committing.
 - OpenSpec CLI **1.12.0 or later** for the included OpenSpec skills.
 - Permission to create symbolic links: enable Windows Developer Mode or use a
   context that already has the required link privilege. The manager does not
@@ -208,6 +212,75 @@ survive. Report the selected versions, command results and any remaining native
 trust step. Use [targeted recovery](#completion-and-targeted-recovery) if delivery
 is incomplete; keep target-machine evidence with its owner. A written handoff
 does not claim that the other PC has already passed these checks.
+
+### Executors plugin lifecycle
+
+Core Install/Update owns the `executors@coding-agents-harness` plugin when the
+source contains `.agents/plugins/marketplace.json`. It uses the installed
+Codex CLI through the supported native commands, with `--json` output and no
+interactive install prompt:
+
+```powershell
+codex plugin marketplace add "<absolute-kit-checkout>" --json
+codex plugin add executors@coding-agents-harness --json
+```
+
+The lifecycle runs these commands with the selected `CODEX_HOME`; it does not
+copy credentials or write another registration format. Repeating them is
+idempotent. The marketplace declaration supplies the plugin source, and
+`.agents/plugins/executors/.mcp.json` supplies the `executors` stdio server
+with `command = "codex-harness"` and `args = ["mcp", "executors"]`. The tracked
+files contain no absolute path or machine credential. A fresh Codex process
+must therefore resolve `codex-harness` from PATH; core delivery links it under
+`CODEX_HOME/harness/bin`, and that directory must be in the selected PATH scope.
+Starting the server directly does not use a generated wrapper or per-task
+endpoint.
+
+Check reports the owned plugin in the core receipt:
+
+```powershell
+codex-harness check --core-only --codex-home "<codex-home>" --user-home "<user-home>"
+```
+
+`plugin.status = "ready"` means native listing reports the plugin installed and
+enabled at this checkout, and MCP listing reports the enabled stdio entry.
+`installed`, `enabled` and `available` expose the corresponding facts. Native
+`codex plugin list --marketplace coding-agents-harness --json` and
+`codex mcp list --json` remain the direct listing evidence; a successful
+model-free MCP initialize/tools request verifies that the server starts.
+
+Install, update and disconnect write
+`CODEX_HOME/harness/executors-plugin.json` before native plugin effects. A
+pending receipt records only the plugin id, marketplace, source, resolved
+native Codex command and intended state. A failed native plugin command reports
+that the receipt is pending; an interrupted process leaves the same receipt
+for the next recovery. Finish it without resetting work or copying credentials:
+
+```powershell
+codex-harness recover --core-only --codex-home "<codex-home>" --user-home "<user-home>"
+```
+
+Add `--preview` to recovery or disconnect for a read-only plan. A disconnect
+journals its intent before core removal, then removes only
+`executors@coding-agents-harness`. It leaves the
+`coding-agents-harness` marketplace, Ponytail, other plugins, MCP servers,
+settings, authentication and retained executor-pool/endpoint/assignment files
+in place; the marketplace is deliberately retained because Ponytail and
+unrelated plugins may share it.
+
+If a disconnect was interrupted while core was still connected, rerun the core
+disconnect; recovery does not remove the plugin while the core installation
+still exists. Once core removal is committed, `recover` can finish a pending
+plugin removal.
+
+Known limits: Codex 0.164.0 refuses to re-add the same marketplace name from a
+different checkout. The lifecycle fails closed when that happens and preserves
+the existing marketplace rather than removing it for Ponytail or other
+plugins. Moving a connected installation therefore needs an explicit native
+marketplace decision; do not delete or overwrite the shared entry to force it.
+Native plugin installation is non-interactive, but ordinary tool approval and
+project trust remain Codex session decisions and are not bypassed. The plugin
+receipt establishes native listing and MCP configuration, not a model call.
 
 ### Ponytail setup
 
