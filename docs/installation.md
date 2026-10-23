@@ -290,10 +290,10 @@ receipt establishes native listing and MCP configuration, not a model call.
 
 Verified scope on Codex 0.164.0: plugin install/update/check/recovery,
 same-runtime dispatch/status/wait/message/reply/stop/resume/release, same-slot
-reuse, and stop with exact-continuation preservation. Open installed gaps:
-visual `/agents` picker interaction, elevated privilege isolation, and native
-MCP warning presentation (the cache guard reports
-`diagnosticDelivery: no-native-consumer`). `executor_status` and
+reuse, stop with exact-continuation preservation, and visual `/agents`
+confirmation for two installed executor threads. Open installed gaps: elevated
+privilege isolation and native MCP warning presentation (the cache guard
+reports `diagnosticDelivery: no-native-consumer`). `executor_status` and
 `executor_wait` remain the verified machine-readable state and result paths.
 
 ### Ponytail setup

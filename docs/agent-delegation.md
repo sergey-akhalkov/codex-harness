@@ -37,9 +37,9 @@ Executor threads are native threads on the lead's app-server, and the intended
 inspection surface is Codex's native `/agents` view with a distinct title, its
 conversation, model/effort and state; the lead keeps one CLI view and does not
 open per-executor terminal tabs, panes, consoles or a file relay. Visual
-`/agents` presentation has not yet been part of the installed acceptance, so
-`executor_status` and `executor_wait` are the verified bounded state and result
-paths when that view is unavailable. Include model-backed helpers, make
+`/agents` presentation was confirmed for the installed two-executor proof, and
+`executor_status`/`executor_wait` remain the bounded machine-readable state and
+result paths when that view is unavailable. Include model-backed helpers, make
 leadership changes explicit, and inspect a run's conversation in the same
 native view when available. `/agents` navigation is observation only: opening,
 focusing or closing its view does not start, complete, stop or resume a run.
