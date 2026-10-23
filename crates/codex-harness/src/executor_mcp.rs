@@ -31,11 +31,12 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DISPATCH_TOOL: &str = "executor_dispatch";
 const STATUS_TOOL: &str = "executor_status";
+const WAIT_TOOL: &str = "executor_wait";
 const MESSAGE_TOOL: &str = "executor_message";
 const REPLY_TOOL: &str = "executor_reply";
 const ASK_TOOL: &str = "executor_ask_lead";
@@ -46,6 +47,11 @@ const MAX_RECEIPTS: usize = 256;
 const MAX_STATUS_RUNS: usize = 8;
 const MAX_STATUS_REQUESTS: usize = 16;
 const MAX_PROGRESS_BYTES: usize = 4 * 1024;
+const DEFAULT_WAIT_MS: u64 = 30_000;
+const MAX_WAIT_MS: u64 = 55_000;
+const WAIT_POLL: Duration = Duration::from_millis(100);
+const MAX_WAIT_MESSAGE_BYTES: usize = 32 * 1024;
+const MAX_WAIT_TURN_PAGES: usize = 64;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -63,7 +69,7 @@ fn excerpt(text: &str, limit: usize) -> String {
 pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp executors\nServe the installed executor MCP plugin over stdio. The caller identity comes only from Codex-injected request `_meta.threadId`. Tools dispatch one executor on the originating app-server, exchange addressed messages or questions, read bounded status, stop one exact run through native turn interruption, and explicitly continue that run. No run, thread, endpoint or recipient is accepted from tool arguments as authority."
+            "codex-harness mcp executors\nServe the installed executor MCP plugin over stdio. The caller identity comes only from Codex-injected request `_meta.threadId`. Tools dispatch one executor on the originating app-server, exchange addressed messages or questions, read bounded status, wait for one exact run's question or terminal result, stop one exact run through native turn interruption, and explicitly continue that run. No run, thread, endpoint or recipient is accepted from tool arguments as authority."
         );
         return Ok(0);
     }
@@ -80,6 +86,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         vec![
             dispatch_tool_definition(),
             status_tool_definition(),
+            wait_tool_definition(),
             message_tool_definition(),
             reply_tool_definition(),
             ask_lead_tool_definition(),
@@ -150,6 +157,29 @@ fn status_tool_definition() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {}
+        }
+    })
+}
+
+fn wait_tool_definition() -> Value {
+    json!({
+        "name": WAIT_TOOL,
+        "description": "Wait up to timeoutMs for one verified lead-owned executor run. A pending question returns immediately with its exact request id. Otherwise this reads the exact native thread at a bounded interval and returns its current terminal result, a stable timeout, or an observation failure. It starts no model turn and requires no picker navigation.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "run": {
+                    "type": "string",
+                    "description": "Optional exact run id returned by executor_status. It is resolved only among the calling lead's verified runs."
+                },
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_WAIT_MS,
+                    "description": "Maximum wait in milliseconds. Omitted uses 30000."
+                }
+            }
         }
     })
 }
@@ -265,6 +295,7 @@ fn perform(operation: &Operation) -> io::Result<Value> {
     match operation.name.as_str() {
         DISPATCH_TOOL => dispatch(operation),
         STATUS_TOOL => status(operation),
+        WAIT_TOOL => wait(operation),
         MESSAGE_TOOL => message(operation),
         REPLY_TOOL => reply(operation),
         ASK_TOOL => ask_lead(operation),
@@ -334,6 +365,15 @@ struct DispatchArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WaitArgs {
+    #[serde(default)]
+    run: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -951,6 +991,7 @@ fn pending_requests(run: &VerifiedRun) -> (Vec<Value>, bool) {
                 "requestId": entry["id"],
                 "kind": entry["kind"],
                 "status": entry["status"],
+                "contentId": entry["contentId"],
                 "method": entry["method"],
                 "turnId": entry["turnId"],
                 "attempts": entry["attempts"],
@@ -958,6 +999,8 @@ fn pending_requests(run: &VerifiedRun) -> (Vec<Value>, bool) {
                 "recordedMs": entry["recordedMs"],
                 "deliveredMs": entry["deliveredMs"],
                 "payloadBytes": entry["payloadBytes"].as_u64().or_else(|| entry["bytes"].as_u64()),
+                "payloadPath": entry["payloadPath"],
+                "detail": entry["detail"].as_str().map(|detail| excerpt(detail, 400)),
                 "resolvedMs": entry["resolvedMs"],
                 "resolvedBy": entry["resolvedBy"]
             })
@@ -966,6 +1009,417 @@ fn pending_requests(run: &VerifiedRun) -> (Vec<Value>, bool) {
     let truncated = pending.len() > MAX_STATUS_REQUESTS;
     pending.truncate(MAX_STATUS_REQUESTS);
     (pending, truncated)
+}
+
+fn wait(operation: &Operation) -> io::Result<Value> {
+    let caller = caller_thread(&operation.metadata)?;
+    let args: WaitArgs = serde_json::from_value(operation.arguments.clone())
+        .map_err(|error| invalid(format!("executor_wait arguments are invalid: {error}")))?;
+    let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_MS);
+    if timeout_ms > MAX_WAIT_MS {
+        return Err(invalid(format!(
+            "executor_wait timeoutMs is {timeout_ms}; the limit is {MAX_WAIT_MS}. No wait was started"
+        )));
+    }
+    let total = Duration::from_millis(timeout_ms);
+    let operation_budget = operation.deadline.remaining();
+    if operation_budget < total.saturating_add(Duration::from_secs(1)) {
+        return Err(invalid(format!(
+            "executor_wait requested {timeout_ms} ms but only {} ms remain in this MCP request's budget; retry with a smaller timeoutMs. No wait was started",
+            operation_budget.as_millis()
+        )));
+    }
+    let home = native_launcher::codex_home()?;
+    let mut run = match args.run.as_deref() {
+        Some(run) => lead_run_by_id(&home, &caller, run)?,
+        None => single_run(&home, &caller, RunRole::Lead)?,
+    };
+    if run.role != RunRole::Lead {
+        return Err(invalid(
+            "executor_wait is available only to the verified lead of the exact run",
+        ));
+    }
+    let started = Instant::now();
+    let deadline = started.checked_add(total).unwrap_or(started);
+    // A read never starts unless its bound fits before the caller's deadline.
+    // The last bounded interval is returned as a timeout instead of extending
+    // the wait or being mistaken for a failed observation.
+    let read_bound = WAIT_POLL.min(total / 2).max(Duration::from_millis(1));
+    let mut conversation: Option<Conversation> = None;
+    loop {
+        if operation.cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "executor_wait was cancelled; no model work was started",
+            ));
+        }
+        run = match refresh_run(&home, &run) {
+            Ok(run) => run,
+            Err(error) => {
+                return Ok(wait_failure(
+                    &caller,
+                    &run,
+                    timeout_ms,
+                    elapsed_ms(started),
+                    error.to_string(),
+                ));
+            }
+        };
+        let (pending, pending_truncated) = pending_requests(&run);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let can_read = !remaining.is_zero() && remaining >= read_bound;
+        let mut observation = None;
+        let mut observation_error = None;
+        if can_read {
+            if conversation.is_none() {
+                match run.endpoint.as_ref() {
+                    Some(endpoint) => match Conversation::attach(endpoint, read_bound) {
+                        Ok(attached) => conversation = Some(attached),
+                        Err(error) => {
+                            observation_error = Some(format!(
+                                "the verified run endpoint could not be read: {error}"
+                            ));
+                        }
+                    },
+                    None => {
+                        observation_error = Some(format!(
+                            "the originating lead has no verified live endpoint ({})",
+                            run.endpoint_unavailable
+                                .as_deref()
+                                .unwrap_or("not recorded")
+                        ));
+                    }
+                }
+            }
+            if observation_error.is_none()
+                && let Some(conversation) = conversation.as_mut()
+            {
+                match observe_executor(conversation, &run) {
+                    Ok(result) => observation = result,
+                    Err(error) => observation_error = Some(error.to_string()),
+                }
+            }
+        }
+        let elapsed = elapsed_ms(started);
+        if !pending.is_empty() {
+            let mut response = wait_base(&caller, &run, timeout_ms, elapsed);
+            response["state"] = Value::String("question".into());
+            response["pendingRequests"] = Value::Array(pending);
+            response["pendingRequestsTruncated"] = Value::Bool(pending_truncated);
+            if let Some(result) = observation {
+                response["result"] = result;
+            }
+            if let Some(error) = observation_error {
+                response["observationError"] = Value::String(error);
+            }
+            return Ok(response);
+        }
+        if let Some(error) = observation_error {
+            return Ok(wait_failure(&caller, &run, timeout_ms, elapsed, error));
+        }
+        if let Some(result) = observation {
+            let mut response = wait_base(&caller, &run, timeout_ms, elapsed);
+            response["state"] = result["state"].clone();
+            response["outcome"] = result["outcome"].clone();
+            if let Some(error) = result.get("error") {
+                response["error"] = error.clone();
+            }
+            response["result"] = result;
+            return Ok(response);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(wait_timeout(&caller, &run, timeout_ms, elapsed_ms(started)));
+        }
+        if remaining < read_bound {
+            std::thread::sleep(remaining);
+            return Ok(wait_timeout(&caller, &run, timeout_ms, elapsed_ms(started)));
+        }
+        std::thread::sleep(WAIT_POLL.min(remaining));
+    }
+}
+
+fn refresh_run(home: &Path, previous: &VerifiedRun) -> io::Result<VerifiedRun> {
+    let bytes = fs::read(&previous.receipt).map_err(|error| {
+        invalid(format!(
+            "the MCP run receipt {} could not be refreshed: {error}",
+            previous.receipt.display()
+        ))
+    })?;
+    let value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(format!(
+            "the MCP run receipt {} is not valid JSON: {error}",
+            previous.receipt.display()
+        ))
+    })?;
+    verify_run(
+        home,
+        RunReceipt {
+            path: previous.receipt.clone(),
+            value,
+        },
+        &previous.lead_thread,
+    )
+}
+
+/// Reads only the current executor turn. The receipt's accepted turn must
+/// still be in native history, while a later turn started by an addressed
+/// message becomes the one that can finish this observation. A stale read that
+/// lacks the accepted turn is an observation failure, never an older result.
+fn observe_executor(
+    conversation: &mut Conversation,
+    run: &VerifiedRun,
+) -> io::Result<Option<Value>> {
+    let mut thread = conversation.read_thread_record(&run.executor_thread)?;
+    if thread["id"].as_str() != Some(run.executor_thread.as_str()) {
+        return Err(invalid(format!(
+            "thread/read answered for {} instead of the recorded executor thread {}",
+            thread["id"], run.executor_thread
+        )));
+    }
+    if thread["turns"]
+        .as_array()
+        .is_none_or(|turns| turns.is_empty())
+    {
+        thread["turns"] = Value::Array(list_thread_turns(conversation, &run.executor_thread)?);
+    }
+    let thread_status = thread["status"]["type"]
+        .as_str()
+        .or_else(|| thread["status"].as_str())
+        .unwrap_or("unknown");
+    if thread_status == "systemError" {
+        let cause = thread["error"]["message"]
+            .as_str()
+            .or_else(|| thread["status"]["message"].as_str())
+            .unwrap_or("the native executor thread reported a system error");
+        let turn_id = thread["turns"]
+            .as_array()
+            .and_then(|turns| turns.last())
+            .and_then(|turn| turn["id"].as_str())
+            .or_else(|| run.value["turnId"].as_str())
+            .unwrap_or_default();
+        let mut result = turn_result(run, turn_id, "systemError", "failed", "failed");
+        result["error"] = Value::String(cause.to_owned());
+        result["detail"] = Value::String(
+            "the native thread reported a system error; no final result is claimed".into(),
+        );
+        return Ok(Some(result));
+    }
+    let turns = thread["turns"]
+        .as_array()
+        .filter(|turns| !turns.is_empty())
+        .ok_or_else(|| {
+            invalid(format!(
+                "executor thread {} reports no turn history; its current turn cannot be observed",
+                run.executor_thread
+            ))
+        })?;
+    let accepted_turn = required_text(&run.value, "turnId")?;
+    if !turns
+        .iter()
+        .any(|turn| turn["id"].as_str() == Some(accepted_turn))
+    {
+        return Err(invalid(format!(
+            "executor thread {} no longer reports accepted turn {accepted_turn}; refusing to settle an older or unrelated turn",
+            run.executor_thread
+        )));
+    }
+    let turn = turns.last().expect("non-empty turn history");
+    let turn_id = required_text(turn, "id")?;
+    let status = required_text(turn, "status")?;
+    match status {
+        "completed" => {
+            let final_message = turn["items"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .rev()
+                    .find(|item| item["type"] == "agentMessage")
+            });
+            let Some(final_message) = final_message else {
+                let mut result =
+                    turn_result(run, turn_id, status, "output-defect", "missing-output");
+                result["output"] = Value::String("missing".into());
+                result["error"] = Value::String(
+                    "the current turn completed without an assistant message; this is a missing-output defect, not a provider failure or timeout"
+                        .into(),
+                );
+                result["detail"] = Value::String(
+                    "the native turn is terminal, but no final assistant message is available"
+                        .into(),
+                );
+                return Ok(Some(result));
+            };
+            match final_message["text"].as_str() {
+                Some(text) if !text.trim().is_empty() => {
+                    let (text, truncated, bytes) = bounded_wait_text(text);
+                    let mut result = turn_result(run, turn_id, status, "completed", "completed");
+                    result["output"] = Value::String("present".into());
+                    result["finalMessage"] = Value::String(text);
+                    result["finalMessageBytes"] = Value::from(bytes);
+                    result["finalMessageTruncated"] = Value::Bool(truncated);
+                    result["detail"] = Value::String(
+                        "the current turn completed with a final assistant message; this is observation, not lead acceptance or slot release"
+                            .into(),
+                    );
+                    Ok(Some(result))
+                }
+                _ => {
+                    let mut result =
+                        turn_result(run, turn_id, status, "output-defect", "empty-output");
+                    result["output"] = Value::String("empty".into());
+                    result["error"] = Value::String(
+                        "the current turn completed with an empty final assistant message; this is an output defect, not a provider failure or timeout"
+                            .into(),
+                    );
+                    result["detail"] = Value::String(
+                        "the native turn is terminal, but its final assistant message carries no text"
+                            .into(),
+                    );
+                    Ok(Some(result))
+                }
+            }
+        }
+        "failed" => {
+            let cause = turn["error"]["message"]
+                .as_str()
+                .unwrap_or("the native turn failed without a message");
+            let mut result = turn_result(run, turn_id, status, "failed", "failed");
+            result["error"] = Value::String(cause.to_owned());
+            result["detail"] = Value::String(
+                "the current native turn failed; partial work remains in the recorded checkout"
+                    .into(),
+            );
+            Ok(Some(result))
+        }
+        "interrupted" => {
+            let mut result = turn_result(run, turn_id, status, "stopped", "interrupted");
+            result["detail"] = Value::String(
+                "the current native turn was interrupted; the run was not completed or accepted"
+                    .into(),
+            );
+            Ok(Some(result))
+        }
+        "inProgress" | "pending" | "queued" => Ok(None),
+        other => Err(invalid(format!(
+            "executor thread {} reported unknown turn status {other:?} for turn {turn_id}; refusing to guess a result",
+            run.executor_thread
+        ))),
+    }
+}
+
+/// Reads native turn history through the paginated owner when `thread/read`
+/// omits turns (the installed idle-thread fallback). Pagination is bounded; a
+/// missing or malformed page is an observation failure.
+fn list_thread_turns(conversation: &mut Conversation, thread_id: &str) -> io::Result<Vec<Value>> {
+    let mut turns = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_WAIT_TURN_PAGES {
+        let mut params = json!({
+            "threadId": thread_id,
+            "itemsView": "full",
+            "sortDirection": "asc",
+            "limit": 100
+        });
+        if let Some(cursor) = cursor.as_deref() {
+            params["cursor"] = Value::String(cursor.to_owned());
+        }
+        let page = conversation.call("thread/turns/list", params)?;
+        let data = page["data"].as_array().ok_or_else(|| {
+            invalid(format!(
+                "thread/turns/list for {thread_id} carried no data array; its history cannot be observed"
+            ))
+        })?;
+        turns.extend(data.iter().cloned());
+        match page["nextCursor"].as_str() {
+            Some(next) if !next.is_empty() => cursor = Some(next.to_owned()),
+            _ => return Ok(turns),
+        }
+    }
+    Err(invalid(format!(
+        "thread/turns/list for {thread_id} did not terminate within {MAX_WAIT_TURN_PAGES} pages; refusing an unbounded read"
+    )))
+}
+
+fn turn_result(
+    run: &VerifiedRun,
+    turn_id: &str,
+    status: &str,
+    state: &str,
+    outcome: &str,
+) -> Value {
+    json!({
+        "state": state,
+        "outcome": outcome,
+        "status": status,
+        "turnId": turn_id,
+        "output": Value::Null,
+        "finalMessage": Value::Null,
+        "finalMessageBytes": Value::Null,
+        "finalMessageTruncated": false,
+        "native": {
+            "threadId": run.executor_thread,
+            "turnId": turn_id,
+            "status": status
+        },
+        "detailLocator": {
+            "threadId": run.executor_thread,
+            "turnId": turn_id,
+            "statusTool": STATUS_TOOL
+        }
+    })
+}
+
+fn bounded_wait_text(text: &str) -> (String, bool, usize) {
+    let bytes = text.len();
+    if bytes <= MAX_WAIT_MESSAGE_BYTES {
+        return (text.to_owned(), false, bytes);
+    }
+    let mut end = MAX_WAIT_MESSAGE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true, bytes)
+}
+
+fn wait_base(caller: &str, run: &VerifiedRun, timeout_ms: u64, elapsed_ms: u64) -> Value {
+    json!({
+        "callerThreadId": caller,
+        "role": "lead",
+        "run": run_summary(run),
+        "state": Value::Null,
+        "result": Value::Null,
+        "pendingRequests": [],
+        "pendingRequestsTruncated": false,
+        "timeoutMs": timeout_ms,
+        "elapsedMs": elapsed_ms
+    })
+}
+
+fn wait_timeout(caller: &str, run: &VerifiedRun, timeout_ms: u64, elapsed_ms: u64) -> Value {
+    let mut response = wait_base(caller, run, timeout_ms, elapsed_ms);
+    response["state"] = Value::String("timeout".into());
+    response["detail"] = Value::String(
+        "no pending question or terminal result was observed before the caller's deadline; the executor was not stopped or replayed"
+            .into(),
+    );
+    response
+}
+
+fn wait_failure(
+    caller: &str,
+    run: &VerifiedRun,
+    timeout_ms: u64,
+    elapsed_ms: u64,
+    error: String,
+) -> Value {
+    let mut response = wait_base(caller, run, timeout_ms, elapsed_ms);
+    response["state"] = Value::String("observation-error".into());
+    response["error"] = Value::String(format!("executor observation failed: {error}"));
+    response
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn run_summary(run: &VerifiedRun) -> Value {

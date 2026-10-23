@@ -343,6 +343,7 @@ struct SimTerminal {
 struct NativeSim {
     threads: BTreeMap<String, SimThread>,
     terminals: BTreeMap<String, Vec<SimTerminal>>,
+    read_error: Option<String>,
     lose_next_ack: Option<String>,
     suppress_next_evidence: bool,
     refuse_turns: bool,
@@ -380,6 +381,7 @@ impl NativeSim {
         Self {
             threads,
             terminals: BTreeMap::new(),
+            read_error: None,
             lose_next_ack: None,
             suppress_next_evidence: false,
             refuse_turns: false,
@@ -432,6 +434,45 @@ impl NativeSim {
     }
 }
 
+fn seed_active_turn(sim: &Arc<Mutex<NativeSim>>, thread: &str, turn: &str) {
+    let mut sim = sim.lock().unwrap();
+    let cwd = sim.threads.get(thread).expect("thread").cwd.clone();
+    sim.threads
+        .insert(thread.to_owned(), SimThread::active(thread, &cwd, turn));
+}
+
+fn complete_turn(sim: &Arc<Mutex<NativeSim>>, thread: &str, turn_id: &str, text: &str) {
+    let mut sim = sim.lock().unwrap();
+    let turn = sim
+        .threads
+        .get_mut(thread)
+        .expect("thread")
+        .turns
+        .iter_mut()
+        .find(|turn| turn["id"].as_str() == Some(turn_id))
+        .expect("turn");
+    turn["status"] = json!("completed");
+    turn["items"] = json!([{
+        "id": format!("agent-{turn_id}"),
+        "type": "agentMessage",
+        "text": text
+    }]);
+}
+
+fn fail_turn(sim: &Arc<Mutex<NativeSim>>, thread: &str, turn_id: &str, message: &str) {
+    let mut sim = sim.lock().unwrap();
+    let turn = sim
+        .threads
+        .get_mut(thread)
+        .expect("thread")
+        .turns
+        .iter_mut()
+        .find(|turn| turn["id"].as_str() == Some(turn_id))
+        .expect("turn");
+    turn["status"] = json!("failed");
+    turn["error"] = json!({"message": message});
+}
+
 fn native_responder(
     sim: Arc<Mutex<NativeSim>>,
 ) -> impl Fn(&Value) -> Answer + Send + Sync + 'static {
@@ -442,6 +483,9 @@ fn native_responder(
             "thread/read" => {
                 let id = request["params"]["threadId"].as_str().unwrap_or_default();
                 let sim = sim.lock().unwrap();
+                if let Some(error) = sim.read_error.as_ref() {
+                    return Answer::Error(json!({"message": error}));
+                }
                 match sim.threads.get(id) {
                     Some(thread) => Answer::Result(json!({"thread": thread.record()})),
                     None => Answer::Error(json!({"message": format!("unknown thread {id}")})),
@@ -657,6 +701,10 @@ fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Sy
 
 fn result(response: &Value) -> &Value {
     assert_eq!(response["result"]["isError"], false, "{response}");
+    &response["result"]["structuredContent"]
+}
+
+fn structured(response: &Value) -> &Value {
     &response["result"]["structuredContent"]
 }
 
@@ -889,6 +937,7 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
     for required in [
         "executor_dispatch",
         "executor_status",
+        "executor_wait",
         "executor_message",
         "executor_reply",
         "executor_ask_lead",
@@ -909,7 +958,10 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
         }
         if !matches!(
             tool["name"].as_str(),
-            Some("executor_message") | Some("executor_stop") | Some("executor_resume")
+            Some("executor_message")
+                | Some("executor_wait")
+                | Some("executor_stop")
+                | Some("executor_resume")
         ) {
             assert!(
                 !properties.contains_key("run"),
@@ -1065,6 +1117,500 @@ fn status_is_bounded_to_the_verified_calling_thread_and_rejects_forged_arguments
     drop(run);
     drop(second_run);
     drop(ambiguous);
+    mcp.finish();
+}
+
+#[test]
+fn wait_returns_a_pending_question_and_a_terminal_result_separately() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let question = mcp.call_tool(
+        2,
+        "executor_ask_lead",
+        json!({"text": "which result should I return?", "clientMessageId": "wait-question"}),
+        Some(json!({"threadId": EXECUTOR})),
+    );
+    let request_id = result(&question)["requestId"].as_str().unwrap().to_owned();
+    complete_turn(
+        &sim,
+        EXECUTOR,
+        "initial-turn",
+        "result while question is open",
+    );
+
+    let waited = mcp.call_tool(
+        3,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let waited = result(&waited);
+    assert_eq!(waited["state"], "question", "{waited}");
+    assert_eq!(
+        waited["pendingRequests"][0]["requestId"], request_id,
+        "{waited}"
+    );
+    assert_eq!(
+        waited["pendingRequests"][0]["kind"], "reply-request",
+        "{waited}"
+    );
+    assert_eq!(waited["result"]["state"], "completed", "{waited}");
+    assert_eq!(
+        waited["result"]["finalMessage"],
+        "result while question is open"
+    );
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn an_actionable_question_interrupts_a_wait_without_starting_work() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let started = Instant::now();
+
+    let (waited, request_id) = std::thread::scope(|scope| {
+        let question = scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut executor = Mcp::start(home.path());
+            let asked = executor.call_tool(
+                2,
+                "executor_ask_lead",
+                json!({"text": "interrupting question", "clientMessageId": "interrupt-question"}),
+                Some(json!({"threadId": EXECUTOR})),
+            );
+            let id = result(&asked)["requestId"].as_str().unwrap().to_owned();
+            executor.finish();
+            id
+        });
+        let waited = mcp.call_tool(
+            2,
+            "executor_wait",
+            json!({"timeoutMs": 3000}),
+            Some(json!({"threadId": LEAD})),
+        );
+        (waited, question.join().unwrap())
+    });
+
+    let waited = result(&waited);
+    assert_eq!(waited["state"], "question", "{waited}");
+    assert_eq!(
+        waited["pendingRequests"][0]["requestId"], request_id,
+        "{waited}"
+    );
+    assert!(waited["result"].is_null(), "{waited}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the question did not interrupt the wait: {:?}",
+        started.elapsed()
+    );
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn wait_times_out_without_model_work_and_refuses_an_executor_caller() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let before = server.requests_for("turn/start").len() + server.requests_for("turn/steer").len();
+    let started = Instant::now();
+
+    let waited = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 200}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let waited = result(&waited);
+    assert_eq!(waited["state"], "timeout", "{waited}");
+    assert!(waited["result"].is_null(), "{waited}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "the wait returned before its bounded interval: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the wait exceeded its bound: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        server.requests_for("turn/start").len() + server.requests_for("turn/steer").len(),
+        before
+    );
+
+    let mut executor = Mcp::start(home.path());
+    let denied = executor.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 100}),
+        Some(json!({"threadId": EXECUTOR})),
+    );
+    assert!(
+        tool_error(&denied).contains("calling lead thread"),
+        "{denied}"
+    );
+
+    drop(run);
+    executor.finish();
+    mcp.finish();
+}
+
+#[test]
+fn wait_returns_the_exact_current_final_message_and_keeps_a_native_locator() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let completion = std::thread::spawn({
+        let sim = Arc::clone(&sim);
+        move || {
+            std::thread::sleep(Duration::from_millis(150));
+            complete_turn(&sim, EXECUTOR, "initial-turn", "done\n\u{2603}");
+        }
+    });
+
+    let waited = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    completion.join().unwrap();
+    let waited = result(&waited);
+    assert_eq!(waited["state"], "completed", "{waited}");
+    assert_eq!(waited["outcome"], "completed", "{waited}");
+    assert_eq!(
+        waited["result"]["finalMessage"], "done\n\u{2603}",
+        "{waited}"
+    );
+    assert_eq!(waited["result"]["output"], "present", "{waited}");
+    assert_eq!(waited["result"]["finalMessageTruncated"], false);
+    assert_eq!(waited["result"]["native"]["threadId"], EXECUTOR);
+    assert_eq!(waited["result"]["native"]["turnId"], "initial-turn");
+    assert_eq!(
+        waited["result"]["detailLocator"]["statusTool"],
+        "executor_status"
+    );
+
+    let status = mcp.call_tool(
+        3,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let status = result(&status);
+    assert_eq!(status["runs"][0]["executorThreadId"], EXECUTOR);
+    assert_eq!(status["runs"][0]["executorNative"]["status"], "idle");
+
+    let repeated = mcp.call_tool(
+        4,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(
+        result(&repeated)["result"]["finalMessage"],
+        "done\n\u{2603}"
+    );
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn wait_distinguishes_empty_output_from_provider_and_read_failures() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    complete_turn(&sim, EXECUTOR, "initial-turn", "");
+    let empty_response = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(
+        empty_response["result"]["isError"], true,
+        "{empty_response}"
+    );
+    let empty_error = tool_error(&empty_response);
+    let empty = structured(&empty_response);
+    assert_eq!(empty["state"], "output-defect", "{empty}");
+    assert_eq!(empty["outcome"], "empty-output", "{empty}");
+    assert!(empty["result"]["finalMessage"].is_null(), "{empty}");
+    assert!(
+        empty_error.contains("empty final assistant message"),
+        "{empty}"
+    );
+
+    fail_turn(&sim, EXECUTOR, "initial-turn", "provider route failed");
+    let failed_response = mcp.call_tool(
+        3,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(
+        failed_response["result"]["isError"], true,
+        "{failed_response}"
+    );
+    let failed = structured(&failed_response);
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["outcome"], "failed", "{failed}");
+    assert_eq!(failed["error"], "provider route failed", "{failed}");
+
+    sim.lock().unwrap().read_error = Some("native thread read rejected".into());
+    let started = Instant::now();
+    let unreadable_response = mcp.call_tool(
+        4,
+        "executor_wait",
+        json!({"timeoutMs": 3000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(
+        unreadable_response["result"]["isError"], true,
+        "{unreadable_response}"
+    );
+    let unreadable_error = tool_error(&unreadable_response);
+    let unreadable = structured(&unreadable_response);
+    assert_eq!(unreadable["state"], "observation-error", "{unreadable}");
+    assert!(
+        unreadable_error.contains("native thread read rejected"),
+        "{unreadable}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a read failure was reported as a wait timeout: {:?}",
+        started.elapsed()
+    );
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn an_older_completion_cannot_settle_newer_work_or_change_a_timeout_boundary() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    {
+        let mut sim_state = sim.lock().unwrap();
+        let mut thread = SimThread::active(EXECUTOR, run._checkout.path(), "initial-turn");
+        thread.turns.insert(
+            0,
+            json!({
+                "id": "older-turn",
+                "status": "completed",
+                "items": [{
+                    "id": "older-message",
+                    "type": "agentMessage",
+                    "text": "an older result"
+                }]
+            }),
+        );
+        sim_state.threads.insert(EXECUTOR.to_owned(), thread);
+    }
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let first = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 200}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let first = result(&first);
+    assert_eq!(first["state"], "timeout", "{first}");
+    assert_eq!(first["result"], Value::Null, "{first}");
+
+    complete_turn(&sim, EXECUTOR, "initial-turn", "the newer result");
+    let later = mcp.call_tool(
+        3,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let later = result(&later);
+    assert_eq!(later["state"], "completed", "{later}");
+    assert_eq!(later["result"]["finalMessage"], "the newer result");
+    assert_ne!(later["result"]["finalMessage"], "an older result");
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn executor_notices_reach_the_lead_once_and_an_indeterminate_retry_is_not_resent() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let first = mcp.call_tool(
+        2,
+        "executor_message",
+        json!({
+            "text": "bounded terminal result",
+            "clientMessageId": "result-notice"
+        }),
+        Some(json!({"threadId": EXECUTOR})),
+    );
+    let first = result(&first);
+    let message_id = first["messageId"].as_str().unwrap().to_owned();
+    assert_eq!(first["delivery"]["status"], "delivered", "{first}");
+    assert_eq!(first["awaitingReply"], false, "{first}");
+    assert!(
+        first["delivery"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("whether the recipient applied it"),
+        "{first}"
+    );
+    let sent = server.requests_for("turn/start").len() + server.requests_for("turn/steer").len();
+
+    let repeated = mcp.call_tool(
+        3,
+        "executor_message",
+        json!({
+            "text": "bounded terminal result",
+            "clientMessageId": "result-notice"
+        }),
+        Some(json!({"threadId": EXECUTOR})),
+    );
+    let repeated = result(&repeated);
+    assert_eq!(repeated["messageId"], message_id, "{repeated}");
+    assert_eq!(repeated["delivery"]["status"], "delivered", "{repeated}");
+    assert_eq!(
+        server.requests_for("turn/start").len() + server.requests_for("turn/steer").len(),
+        sent,
+        "a delivered result was sent again"
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert_eq!(
+        receipt["leadMessages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["id"].as_str() == Some(message_id.as_str()))
+            .count(),
+        1
+    );
+    let lead_items = sim.lock().unwrap().threads[LEAD]
+        .turns
+        .iter()
+        .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+        .filter(|item| item["clientId"].as_str() == Some(message_id.as_str()))
+        .count();
+    assert_eq!(
+        lead_items, 1,
+        "the lead did not receive exactly one native item"
+    );
+
+    sim.lock().unwrap().lose_next_ack = Some("turn/steer".to_owned());
+    let lost = mcp.call_tool(
+        4,
+        "executor_message",
+        json!({
+            "text": "result with unknown acceptance",
+            "clientMessageId": "result-lost"
+        }),
+        Some(json!({"threadId": EXECUTOR})),
+    );
+    assert_eq!(lost["result"]["isError"], true, "{lost}");
+    let lost = structured(&lost);
+    assert_eq!(lost["delivery"]["status"], "indeterminate", "{lost}");
+    let after_lost =
+        server.requests_for("turn/start").len() + server.requests_for("turn/steer").len();
+    let retry = mcp.call_tool(
+        5,
+        "executor_message",
+        json!({
+            "text": "result with unknown acceptance",
+            "clientMessageId": "result-lost"
+        }),
+        Some(json!({"threadId": EXECUTOR})),
+    );
+    let retry = structured(&retry);
+    assert_eq!(retry["delivery"]["status"], "indeterminate", "{retry}");
+    assert_eq!(
+        server.requests_for("turn/start").len() + server.requests_for("turn/steer").len(),
+        after_lost,
+        "an indeterminate result was resent"
+    );
+
+    drop(run);
     mcp.finish();
 }
 
