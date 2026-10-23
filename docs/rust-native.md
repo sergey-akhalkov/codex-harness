@@ -956,8 +956,8 @@ holds concurrency, a held or suspended task keeps only its pool position, and a
 refusal names the active runs without allocating anything. `executor_status`
 reports the MCP run and slot state; the ordinary `worktree list` reports the
 durable task bindings. Normal release remains the lead's explicit
-accepted/discarded disposition through the owning pool lifecycle; MCP completion
-does not release a slot.
+accepted/discarded disposition through `executor_release` or the compatibility
+pool lifecycle; MCP completion does not release a slot.
 
 ### Bounded lead conversations
 

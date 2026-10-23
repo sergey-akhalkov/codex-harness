@@ -779,7 +779,9 @@ Report issues to security@steveyegge.com.
 **2026-09-19, confirmed:** executor worktrees are lane-owned and reused, not
 task-owned and rebuilt. After an accepted merge the lead resets the lane
 worktree to the new committed base (`git reset --hard` plus `git clean -fd`,
-keeping ignored build caches) and dispatches the next lane task into it;
+keeping ignored build caches and generated `.serena/` tool state) and
+dispatches the next lane task into it; `.serena/` is not treated as unreviewed
+user work, while any other local or untracked change still preserves the lane;
 deletion happens only on lane retirement or unresolvable state, and merged
 branches are kept. Rationale: `git worktree add` is a ~2 s local hardlink
 checkout with no upstream, while the per-worktree build cache (gigabytes of

@@ -33,14 +33,16 @@ For example, use an ordinary agent with `model="gpt-6-astra"` and
 `reasoning_effort="high"` instead of `agent_type="middle_backup"`. Those
 OpenCodex role files are retired. The former `grok_reviewer` remains retired.
 
-Every active conversation appears in Codex's native `/agents` view with a
-distinct title, its conversation, model/effort and state. The `executors`
-plugin creates each executor as a native thread on the lead's app-server; the
-lead keeps one CLI view and does not open per-executor terminal tabs, panes,
-consoles or a file relay. Include model-backed helpers, make leadership changes
-explicit, and inspect a run's conversation in the same native view. `/agents`
-navigation is observation only: opening, focusing or closing its view does not
-start, complete, stop or resume a run.
+Executor threads are native threads on the lead's app-server, and the intended
+inspection surface is Codex's native `/agents` view with a distinct title, its
+conversation, model/effort and state; the lead keeps one CLI view and does not
+open per-executor terminal tabs, panes, consoles or a file relay. Visual
+`/agents` presentation has not yet been part of the installed acceptance, so
+`executor_status` and `executor_wait` are the verified bounded state and result
+paths when that view is unavailable. Include model-backed helpers, make
+leadership changes explicit, and inspect a run's conversation in the same
+native view when available. `/agents` navigation is observation only: opening,
+focusing or closing its view does not start, complete, stop or resume a run.
 
 Do not resize, move or arrange desktop windows - including the lead's own
 terminal - so sessions fit the screen. Do not capture Codex or sibling agent
@@ -79,7 +81,10 @@ worktree_pool_size = 6
 
 The installed `executors` plugin supplies the ordinary workflow:
 `executor_dispatch`, `executor_status`, `executor_wait`, `executor_message`,
-`executor_reply`, `executor_ask_lead`, `executor_stop` and `executor_resume`.
+`executor_reply`, `executor_ask_lead`, `executor_stop`, `executor_resume` and
+`executor_release`. `executor_release` records the lead's explicit
+`merged`/`discarded` disposition; completion, stop, archive or a new dispatch
+never frees a slot.
 Start a fresh lead session after installing or updating the plugin so its MCP
 tools and role guidance are loaded. `executor_dispatch` uses the calling
 thread's repository, the installed kit configuration and a pooled checkout, and
@@ -281,7 +286,7 @@ Managed ordinary, lead and executor sessions suppress the competing native `code
 
 A fresh dispatch claims the first free position and binds it to the owner as a durable task with its exact committed base before the first model request: the refreshed upstream default branch by default, or the explicit `base` commit resolved locally without a fetch. The claim stays exclusively owned and a competing dispatch cannot reclaim the position or replace its pending assignment. Two free positions still start independently. Dispatch is also admitted against `max_concurrent_executors`, independently of the pool: free positions alone do not grant another active executor run, and a held or suspended task keeps its position without consuming concurrency. A confirmed-dead clean unused reservation can be recovered, but a durable task binding is never freed by process exit alone and a former owner cannot continue a reassigned task. Ad-hoc worktrees are refused, and a position holding unreviewed work is preserved rather than reset.
 
-A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. MCP completion does not release a slot. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through the owning pool lifecycle. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets only a clean, reviewed position and retains ignored caches. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason rather than reported free.
+A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. MCP completion does not release a slot. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through the owning pool lifecycle. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets only a clean, reviewed position and retains ignored caches. Generated `.serena/` project state is tool state: release preserves it and excludes it from the cleanliness decision, while any other local or untracked work still preserves the position. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason rather than reported free.
 
 A missing host lease does not mean a position is free while its creator is
 starting. If a competing dispatch refuses, inspect its reported cause and
