@@ -236,6 +236,12 @@ must therefore resolve `codex-harness` from PATH; core delivery links it under
 Starting the server directly does not use a generated wrapper or per-task
 endpoint.
 
+The plugin transport resolves the Codex home through `CODEX_HOME` or, when the
+native child does not inherit it, the default `USERPROFILE\.codex`. An isolated
+test home must therefore present that default path, for example through a
+private `USERPROFILE` directory; the globally installed default-home path is
+the supported delivery path.
+
 Check reports the owned plugin in the core receipt:
 
 ```powershell
