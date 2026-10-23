@@ -2407,6 +2407,400 @@ fn stop_run(mcp: &mut Mcp, id: u64, caller: &str, run: &str) -> Value {
     )
 }
 
+fn cache_stamp() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    chrono::DateTime::from_timestamp_millis(millis)
+        .unwrap()
+        .to_rfc3339()
+}
+
+fn append_cache_usage(home: &Path, session: &str, records: &[(u64, u64, u64)]) {
+    let path = home
+        .join("sessions/2026/10/01")
+        .join(format!("rollout-{session}.jsonl"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    if file.metadata().unwrap().len() == 0 {
+        writeln!(
+            file,
+            "{}",
+            json!({"type": "session_meta", "payload": {"id": session}})
+        )
+        .unwrap();
+    }
+    for (input, cached, total) in records {
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "token_usage_record",
+                "timestamp": cache_stamp(),
+                "payload": {
+                    "thread_id": session,
+                    "response_id": format!("response-{total}"),
+                    "usage": {
+                        "input_tokens": input,
+                        "cached_input_tokens": cached
+                    },
+                    "thread_token_usage": {"input_tokens": total}
+                }
+            })
+        )
+        .unwrap();
+    }
+}
+
+fn cache_guard(receipt: &Path) -> Value {
+    serde_json::from_slice::<Value>(&fs::read(receipt).unwrap()).unwrap()["cacheGuard"].clone()
+}
+
+fn wait_cache(
+    receipt: &Path,
+    timeout: Duration,
+    ready: impl Fn(&Value) -> bool,
+    reason: &str,
+) -> Value {
+    let until = Instant::now() + timeout;
+    loop {
+        let guard = cache_guard(receipt);
+        if ready(&guard) {
+            return guard;
+        }
+        if Instant::now() >= until {
+            panic!("cache guard never reached {reason}: {guard}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn cache_loss_stops_only_the_exact_run_and_preserves_exact_continuation() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let first = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let second = synthetic_run(home.path(), SECOND_LEAD, SECOND_EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        first._checkout.path(),
+        false,
+        true,
+    )));
+    {
+        let mut sim = sim.lock().unwrap();
+        sim.threads.insert(
+            SECOND_LEAD.to_owned(),
+            SimThread::idle(SECOND_LEAD, second._checkout.path()),
+        );
+        sim.threads.insert(
+            SECOND_EXECUTOR.to_owned(),
+            SimThread::active(SECOND_EXECUTOR, second._checkout.path(), "sibling-turn"),
+        );
+        sim.terminals.insert(
+            SECOND_EXECUTOR.to_owned(),
+            vec![terminal("6101", "sibling command")],
+        );
+        sim.terminals.insert(
+            EXECUTOR.to_owned(),
+            vec![terminal("6100", "owned cache command")],
+        );
+    }
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    fs::write(first._checkout.path().join("preserved.txt"), "committed\n").unwrap();
+    let preserved = commit_checkout(first._checkout.path(), "preserved cache work");
+    fs::write(first._checkout.path().join("untracked.txt"), "partial\n").unwrap();
+    let mut mcp = Mcp::start(home.path());
+
+    let started = mcp.call_tool(
+        2,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&started)["runs"][0]["executorThreadId"], EXECUTOR);
+    let waiting = wait_cache(
+        &first.receipt,
+        Duration::from_secs(10),
+        |guard| guard["status"] == "waiting-for-usage",
+        "waiting-for-usage",
+    );
+    assert_eq!(waiting["diagnosticDelivery"], "no-native-consumer");
+
+    append_cache_usage(
+        home.path(),
+        EXECUTOR,
+        &[
+            (200_000, 199_000, 200_000),
+            (200_000, 0, 400_000),
+            (200_000, 0, 600_000),
+            (200_000, 0, 800_000),
+        ],
+    );
+    let guard = wait_cache(
+        &first.receipt,
+        Duration::from_secs(15),
+        |guard| guard["stopOutcome"] == "stopped",
+        "an exact-thread cache-loss stop",
+    );
+    assert_eq!(guard["status"], "stopped");
+    assert_eq!(guard["run"], format!("mcp-test-{EXECUTOR}"));
+    assert_eq!(guard["threadId"], EXECUTOR);
+    assert_eq!(guard["turnId"], "initial-turn");
+    assert_eq!(guard["consecutiveMisses"], 3);
+    assert_eq!(guard["lastInputTokens"], 200_000);
+    assert_eq!(guard["lastCachedTokens"], 0);
+    assert_eq!(guard["lastMissTokens"], 200_000);
+    assert_eq!(guard["runtimeSupport"], "proven");
+    assert_eq!(guard["diagnosticDelivery"], "no-native-consumer");
+    assert_eq!(guard["threshold"]["warmupInputTokens"], 100_000);
+    assert_eq!(guard["threshold"]["warmupCachedPercent"], 90);
+    assert_eq!(guard["threshold"]["consecutiveMisses"], 3);
+    assert_eq!(guard["threshold"]["missInputTokens"], 100_000);
+    assert_eq!(guard["threshold"]["missInputPercent"], 50);
+    let warning = guard["warning"].as_str().unwrap();
+    assert!(
+        warning.contains("cache loss on provider test-provider"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("thread 01a00000-0000-7000-8000-000000000003"),
+        "{warning}"
+    );
+    assert!(warning.contains("threshold"), "{warning}");
+    let receipt: Value = serde_json::from_slice(&fs::read(&first.receipt).unwrap()).unwrap();
+    assert_eq!(guard["lease"], receipt["lease"]);
+    assert_eq!(receipt["stop"]["outcome"], "stopped");
+    assert_eq!(receipt["executorThreadId"], EXECUTOR);
+    assert_eq!(
+        receipt["assignment"]["objective"],
+        "Prove one bounded executor dispatch"
+    );
+    assert_eq!(receipt["checkout"], json!(first._checkout.path()));
+    assert_eq!(receipt["slot"], 1);
+    assert_eq!(
+        server
+            .requests_for("turn/interrupt")
+            .iter()
+            .filter_map(|request| request["params"]["threadId"].as_str())
+            .collect::<Vec<_>>(),
+        vec![EXECUTOR]
+    );
+
+    let sim_state = sim.lock().unwrap();
+    assert_eq!(
+        sim_state.threads[EXECUTOR].turns.last().unwrap()["status"],
+        "interrupted"
+    );
+    assert_eq!(sim_state.threads[SECOND_EXECUTOR].state(), "active");
+    assert_eq!(sim_state.terminals[SECOND_EXECUTOR].len(), 1);
+    assert!(
+        sim_state.terminals[EXECUTOR].is_empty(),
+        "the stopped run's owned terminal must be gone"
+    );
+    drop(sim_state);
+
+    let alive = mcp.call_tool(
+        3,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": SECOND_LEAD})),
+    );
+    assert_eq!(
+        result(&alive)["runs"][0]["executorThreadId"],
+        SECOND_EXECUTOR
+    );
+    let resumed = mcp.call_tool(
+        4,
+        "executor_resume",
+        json!({
+            "run": format!("mcp-test-{EXECUTOR}"),
+            "mode": "exact",
+            "progress": "A cache stop interrupted this turn; verify partial work before reuse."
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    let resumed = result(&resumed);
+    assert_eq!(resumed["threadId"], EXECUTOR, "{resumed}");
+    assert_eq!(resumed["predecessorRetained"], false);
+    let starts = server.requests_for("turn/start");
+    let text = starts.last().unwrap()["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        text.starts_with("Continue the preserved assignment"),
+        "{text}"
+    );
+    assert!(!text.contains("Original assignment:"), "{text}");
+    assert_eq!(server.requests_for("thread/start").len(), 0);
+    let receipt: Value = serde_json::from_slice(&fs::read(&first.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["executorThreadId"], EXECUTOR);
+    assert_eq!(receipt["stop"]["continuedBy"], "exact");
+    assert_eq!(
+        Command::new("git")
+            .args(["-C", first._checkout.path().to_str().unwrap()])
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+        format!("{preserved}\n").into_bytes()
+    );
+    assert_eq!(
+        fs::read_to_string(first._checkout.path().join("untracked.txt")).unwrap(),
+        "partial\n"
+    );
+    drop(first);
+    drop(second);
+    mcp.finish();
+}
+
+#[test]
+fn cache_guard_ignores_cold_start_and_a_broken_miss_sequence() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        true,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let status = mcp.call_tool(
+        2,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&status)["runs"][0]["executorThreadId"], EXECUTOR);
+    wait_cache(
+        &run.receipt,
+        Duration::from_secs(10),
+        |guard| guard["status"] == "waiting-for-usage",
+        "waiting-for-usage",
+    );
+    append_cache_usage(
+        home.path(),
+        EXECUTOR,
+        &[
+            (200_000, 0, 200_000),
+            (200_000, 0, 400_000),
+            (200_000, 0, 600_000),
+        ],
+    );
+    let cold = wait_cache(
+        &run.receipt,
+        Duration::from_secs(10),
+        |guard| guard["responses"] == 3,
+        "three cold responses",
+    );
+    assert!(cold["stopOutcome"].is_null(), "{cold}");
+    assert_eq!(cold["consecutiveMisses"], 0);
+
+    append_cache_usage(
+        home.path(),
+        EXECUTOR,
+        &[
+            (200_000, 199_000, 800_000),
+            (200_000, 0, 1_000_000),
+            (200_000, 199_000, 1_200_000),
+            (200_000, 0, 1_400_000),
+            (200_000, 0, 1_600_000),
+        ],
+    );
+    let guard = wait_cache(
+        &run.receipt,
+        Duration::from_secs(10),
+        |guard| guard["responses"] == 8,
+        "eight classified responses",
+    );
+    assert!(guard["stopOutcome"].is_null(), "{guard}");
+    assert_eq!(guard["consecutiveMisses"], 2);
+    assert_eq!(guard["runtimeSupport"], "proven");
+    assert_eq!(sim.lock().unwrap().threads[EXECUTOR].state(), "active");
+    assert!(server.requests_for("turn/interrupt").is_empty());
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn cache_guard_does_not_replay_historical_loss_but_stops_new_misses() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    append_cache_usage(
+        home.path(),
+        EXECUTOR,
+        &[
+            (200_000, 199_000, 200_000),
+            (200_000, 0, 400_000),
+            (200_000, 0, 600_000),
+            (200_000, 0, 800_000),
+        ],
+    );
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        true,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let status = mcp.call_tool(
+        2,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&status)["runs"][0]["executorThreadId"], EXECUTOR);
+    let historical = wait_cache(
+        &run.receipt,
+        Duration::from_secs(10),
+        |guard| guard["responses"] == 4,
+        "historical usage warmup",
+    );
+    assert!(historical["stopOutcome"].is_null(), "{historical}");
+    assert_eq!(historical["consecutiveMisses"], 0);
+    assert!(server.requests_for("turn/interrupt").is_empty());
+
+    append_cache_usage(
+        home.path(),
+        EXECUTOR,
+        &[
+            (200_000, 0, 1_000_000),
+            (200_000, 0, 1_200_000),
+            (200_000, 0, 1_400_000),
+        ],
+    );
+    let stopped = wait_cache(
+        &run.receipt,
+        Duration::from_secs(15),
+        |guard| guard["stopOutcome"] == "stopped",
+        "new post-history misses",
+    );
+    assert_eq!(stopped["consecutiveMisses"], 3);
+    assert_eq!(stopped["diagnosticDelivery"], "no-native-consumer");
+    assert_eq!(
+        server
+            .requests_for("turn/interrupt")
+            .iter()
+            .filter_map(|request| request["params"]["threadId"].as_str())
+            .collect::<Vec<_>>(),
+        vec![EXECUTOR]
+    );
+    drop(run);
+    mcp.finish();
+}
+
 #[test]
 fn stop_interrupts_only_the_exact_thread_and_contains_its_terminal() {
     let home = home();

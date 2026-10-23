@@ -6,10 +6,12 @@ use super::{Line, SpoolTail, now_ms, update_receipt_field};
 use serde_json::{Value, json};
 use std::os::windows::ffi::OsStrExt;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs, io,
     io::Write,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -122,10 +124,12 @@ impl Identity {
             let text = field.as_str()?.trim();
             (!text.is_empty() && text.chars().count() <= IDENTITY_LIMIT).then(|| text.to_owned())
         }
-        Self {
-            provider: bounded(&value["modelProvider"]),
-            model: bounded(&value["model"]),
-        }
+        // CLI receipts record the resolved identity at the top level; MCP
+        // receipts record the same binding under `profile`.
+        let provider = bounded(&value["modelProvider"])
+            .or_else(|| bounded(&value["profile"]["modelProvider"]));
+        let model = bounded(&value["model"]).or_else(|| bounded(&value["profile"]["model"]));
+        Self { provider, model }
     }
 
     /// Provider-neutral evidence label, e.g. `provider zai model glm-5.3`.
@@ -201,6 +205,15 @@ impl std::fmt::Display for CacheLoss {
 }
 
 impl std::error::Error for CacheLoss {}
+
+/// Poll interval of one MCP run's background cache guard. The monitor's
+/// filesystem notification and one-second open-file reconciliation do the
+/// actual wake-up; this is only the bounded liveness check between them.
+const MCP_GUARD_POLL: Duration = Duration::from_millis(100);
+
+type GuardKey = (PathBuf, String, String);
+
+static MCP_GUARDS: OnceLock<Mutex<BTreeMap<GuardKey, JoinHandle<()>>>> = OnceLock::new();
 
 #[derive(Default)]
 struct Detector {
@@ -590,6 +603,262 @@ impl Monitor {
         }
         Ok(None)
     }
+}
+
+/// Ensures one exact MCP turn has a background cache guard. The guard reads the
+/// same detector, thresholds, evidence and warning queue as the CLI host, but
+/// stops through the exact-thread owner supplied by its caller. The registry
+/// deduplicates monitors inside one MCP server process; another process may
+/// start its own guard after reconnecting.
+pub(crate) fn ensure_mcp_guard(
+    home: &Path,
+    receipt: &Path,
+    run: &str,
+    thread: &str,
+    turn: &str,
+    lease: Value,
+    stop: impl FnMut(&CacheLoss) -> io::Result<()> + Send + 'static,
+) -> io::Result<()> {
+    if !active_guard_target(receipt, thread, turn)? {
+        return Ok(());
+    }
+    let key = (receipt.to_owned(), thread.to_owned(), turn.to_owned());
+    let guards = MCP_GUARDS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guards = guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guards.retain(|_, handle| !handle.is_finished());
+    if guards.contains_key(&key) {
+        return Ok(());
+    }
+    let home = home.to_owned();
+    let receipt = receipt.to_owned();
+    let run = run.to_owned();
+    let thread = thread.to_owned();
+    let turn = turn.to_owned();
+    let log = receipt.with_extension("cache-guard.log");
+    let handle = thread::Builder::new()
+        .name("executor-cache-guard".into())
+        .spawn(move || {
+            run_mcp_guard(home, receipt, run, thread, turn, lease, log, stop);
+        })
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("the exact-run cache guard did not start: {error}"),
+            )
+        })?;
+    guards.insert(key, handle);
+    Ok(())
+}
+
+fn run_mcp_guard(
+    home: PathBuf,
+    receipt: PathBuf,
+    run: String,
+    thread: String,
+    turn: String,
+    lease: Value,
+    log: PathBuf,
+    mut stop: impl FnMut(&CacheLoss) -> io::Result<()>,
+) {
+    let mut monitor = match Monitor::new(&receipt, &home, Some(&log)) {
+        Ok(Some(monitor)) => monitor,
+        Ok(None) => return,
+        Err(error) => {
+            record_guard_error(
+                &receipt,
+                &thread,
+                &turn,
+                &format!("cache monitor did not start: {error}"),
+            );
+            return;
+        }
+    };
+    loop {
+        match active_guard_target(&receipt, &thread, &turn) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return,
+        }
+        match monitor.poll(Some(&thread), false) {
+            Ok(Some(mut loss)) => {
+                loss.1["run"] = json!(run.as_str());
+                loss.1["threadId"] = json!(thread.as_str());
+                loss.1["turnId"] = json!(turn.as_str());
+                loss.1["lease"] = lease;
+                loss.1["warning"] = json!(warning_text(&loss, &run, &thread, &turn));
+                loss.1["threshold"] = threshold();
+                if let Err(error) = stop(&loss) {
+                    record_stop_failure(&receipt, &loss, &error);
+                }
+                return;
+            }
+            Ok(None) => thread::sleep(MCP_GUARD_POLL),
+            Err(error) => {
+                record_guard_error(
+                    &receipt,
+                    &thread,
+                    &turn,
+                    &format!("cache monitor read failed: {error}"),
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn active_guard_target(receipt: &Path, thread: &str, turn: &str) -> io::Result<bool> {
+    let value = super::read_receipt_value(receipt)?;
+    let target = value["executorThreadId"].as_str() == Some(thread)
+        && value["turnId"].as_str() == Some(turn);
+    let stopped = value
+        .get("stop")
+        .is_some_and(|stop| !stop.is_null() && stop.get("continuedMs").is_none_or(Value::is_null));
+    Ok(target && !stopped)
+}
+
+fn threshold() -> Value {
+    json!({
+        "warmupInputTokens": LARGE_INPUT,
+        "warmupCachedPercent": 90,
+        "consecutiveMisses": REQUIRED_MISSES,
+        "missInputTokens": LARGE_INPUT,
+        "missInputPercent": 50
+    })
+}
+
+fn warning_text(loss: &CacheLoss, run: &str, thread: &str, turn: &str) -> String {
+    format!(
+        "{}; exact run {run} thread {thread} turn {turn}; cache-loss threshold: warmup >= {LARGE_INPUT} input tokens with >= 90% cached, then {REQUIRED_MISSES} consecutive distinct responses each missing >= {LARGE_INPUT} input tokens and >= 50% of input",
+        loss.0
+    )
+}
+
+fn bound_evidence(loss: &CacheLoss) -> Value {
+    let mut guard = loss.1.clone();
+    guard["threshold"] = threshold();
+    if let (Some(run), Some(thread), Some(turn)) = (
+        guard["run"].as_str(),
+        guard["threadId"].as_str(),
+        guard["turnId"].as_str(),
+    ) {
+        guard["warning"] = json!(warning_text(loss, run, thread, turn));
+    }
+    guard
+}
+
+fn recovery(guard: &Value) -> String {
+    let run = guard["run"].as_str().unwrap_or("the exact run");
+    let thread = guard["threadId"].as_str().unwrap_or("the exact thread");
+    format!(
+        "Lead action required: review preserved partial work, then use executor_resume mode=exact with run {run} to continue exact thread {thread}, or mode=fresh to retain that predecessor and start a new thread. Do not release or reset the slot; inspect interrupted commands before reusing their results."
+    )
+}
+
+fn merge_guard(receipt: &Path, update: impl FnOnce(&mut Value)) -> io::Result<()> {
+    super::with_receipt_lock(receipt, || {
+        let mut value = super::read_receipt_value(receipt)?;
+        if !value["cacheGuard"].is_object() {
+            value["cacheGuard"] = json!({});
+        }
+        update(&mut value["cacheGuard"]);
+        super::write_receipt(receipt, &value)
+    })
+}
+
+/// Binds a cache-loss stop's evidence to the exact run/thread/turn/lease and
+/// records its non-success outcome without changing another receipt field.
+pub(crate) fn record_stop_result(
+    receipt: &Path,
+    loss: &CacheLoss,
+    result: &Value,
+) -> io::Result<()> {
+    if let Ok(value) = super::read_receipt_value(receipt)
+        && (value["executorThreadId"] != loss.1["threadId"]
+            || value["turnId"] != loss.1["turnId"]
+            || value["stop"]["completedMs"] != result["stop"]["completedMs"]
+            || !value["stop"]["continuedMs"].is_null())
+    {
+        return Ok(());
+    }
+    let outcome = result["outcome"].as_str().unwrap_or("error");
+    let detail = result["stop"]["detail"]
+        .as_str()
+        .unwrap_or("the exact-thread stop returned no detail");
+    let mut guard = bound_evidence(loss);
+    guard["stopOutcome"] = json!(outcome);
+    guard["status"] = json!(match outcome {
+        "stopped" => "stopped",
+        "partial" => "partial-stop",
+        other => other,
+    });
+    guard["reason"] = json!(format!("{}; {detail}", loss.0));
+    let recovery_text = if outcome == "already-completed" {
+        "No stop was recorded because the run completed first; its recorded result stands."
+            .to_owned()
+    } else {
+        recovery(&guard)
+    };
+    guard["recovery"] = json!(recovery_text);
+    merge_guard(receipt, |current| *current = guard)
+}
+
+/// Preserves a failed cache-loss stop while the exact turn is still current.
+/// The run's prior monitoring status is not rewritten, and a newer stop or
+/// continuation leaves its receipt state intact.
+pub(crate) fn record_stop_failure(receipt: &Path, loss: &CacheLoss, error: &io::Error) {
+    if let (Some(thread), Some(turn)) = (loss.1["threadId"].as_str(), loss.1["turnId"].as_str())
+        && !active_guard_target(receipt, thread, turn).unwrap_or(false)
+    {
+        return;
+    }
+    let recorded = super::read_receipt_value(receipt).ok().and_then(|value| {
+        if !value["stop"]["continuedMs"].is_null() {
+            return None;
+        }
+        value["stop"]["outcome"].as_str().map(str::to_owned)
+    });
+    let message = match &recorded {
+        Some(outcome) => format!(
+            "{}; the exact-thread stop recorded {outcome}, but its cache-stop evidence update failed: {error}",
+            loss.0
+        ),
+        None => format!(
+            "{}; the exact-thread cache-loss stop failed: {error}; the run was not reported stopped",
+            loss.0
+        ),
+    };
+    let mut guard = bound_evidence(loss);
+    guard["stopOutcome"] = json!("error");
+    guard["stopError"] = json!(error.to_string());
+    guard["reason"] = json!(message);
+    guard["recovery"] = json!(recovery(&guard));
+    if let Some(outcome) = recorded {
+        guard["stopOutcome"] = json!(outcome);
+    }
+    if let Err(write) = merge_guard(receipt, |current| {
+        let mut status = current["status"].clone();
+        if status.is_null() {
+            status = json!(STATUS_UNAVAILABLE);
+        }
+        *current = guard;
+        current["status"] = status;
+    }) {
+        eprintln!(
+            "codex-harness: cache-loss stop failure could not be recorded in {}: {write}",
+            receipt.display()
+        );
+    }
+}
+
+fn record_guard_error(receipt: &Path, thread: &str, turn: &str, error: &str) {
+    if !active_guard_target(receipt, thread, turn).unwrap_or(false) {
+        return;
+    }
+    let _ = merge_guard(receipt, |guard| {
+        guard["guardError"] = json!(error);
+        guard["guardErrorMs"] = json!(now_ms());
+    });
 }
 
 /// Bounded visible evidence only. Opaque reasoning is neither read nor
