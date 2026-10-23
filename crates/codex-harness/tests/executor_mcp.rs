@@ -2552,7 +2552,7 @@ fn cache_loss_stops_only_the_exact_run_and_preserves_exact_continuation() {
     assert_eq!(guard["status"], "stopped");
     assert_eq!(guard["run"], format!("mcp-test-{EXECUTOR}"));
     assert_eq!(guard["threadId"], EXECUTOR);
-    assert_eq!(guard["turnId"], "initial-turn");
+    assert_eq!(guard["turnId"], "executor-active");
     assert_eq!(guard["consecutiveMisses"], 3);
     assert_eq!(guard["lastInputTokens"], 200_000);
     assert_eq!(guard["lastCachedTokens"], 0);
@@ -2573,9 +2573,11 @@ fn cache_loss_stops_only_the_exact_run_and_preserves_exact_continuation() {
         warning.contains("thread 01a00000-0000-7000-8000-000000000003"),
         "{warning}"
     );
+    assert!(warning.contains("turn executor-active"), "{warning}");
     assert!(warning.contains("threshold"), "{warning}");
     let receipt: Value = serde_json::from_slice(&fs::read(&first.receipt).unwrap()).unwrap();
     assert_eq!(guard["lease"], receipt["lease"]);
+    assert_eq!(guard["turnId"], receipt["stopTurnId"]);
     assert_eq!(receipt["stop"]["outcome"], "stopped");
     assert_eq!(receipt["executorThreadId"], EXECUTOR);
     assert_eq!(

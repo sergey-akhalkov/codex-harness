@@ -773,9 +773,9 @@ pub(crate) fn record_stop_result(
     loss: &CacheLoss,
     result: &Value,
 ) -> io::Result<()> {
-    if let Ok(value) = super::read_receipt_value(receipt)
+    let current = super::read_receipt_value(receipt).ok();
+    if let Some(value) = &current
         && (value["executorThreadId"] != loss.1["threadId"]
-            || value["turnId"] != loss.1["turnId"]
             || value["stop"]["completedMs"] != result["stop"]["completedMs"]
             || !value["stop"]["continuedMs"].is_null())
     {
@@ -786,6 +786,19 @@ pub(crate) fn record_stop_result(
         .as_str()
         .unwrap_or("the exact-thread stop returned no detail");
     let mut guard = bound_evidence(loss);
+    if let Some(turn) = current
+        .as_ref()
+        .and_then(|value| value["stopTurnId"].as_str())
+        .or_else(|| loss.1["turnId"].as_str())
+    {
+        let run = guard["run"].as_str().map(str::to_owned);
+        let thread = guard["threadId"].as_str().map(str::to_owned);
+        if let (Some(run), Some(thread)) = (run, thread) {
+            let warning = warning_text(loss, &run, &thread, turn);
+            guard["turnId"] = json!(turn);
+            guard["warning"] = json!(warning);
+        }
+    }
     guard["stopOutcome"] = json!(outcome);
     guard["status"] = json!(match outcome {
         "stopped" => "stopped",
