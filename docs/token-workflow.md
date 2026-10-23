@@ -136,14 +136,14 @@ Orchestrated work applies the same accounting instead of a second budget:
   and archiving make no model calls; only the lead's similarity and consequence
   judgments are model work, and one triage batch is bounded by
   `feedback_batch_limit` from `global/orchestration.toml`.
-- Executor assignments run in exec-mode tabs that exit and close on completion,
-  and a successor is a bounded `codex exec resume` continuation turn. Neither
-  leaves a growing conversation to re-read, and neither replays uncertain
-  external effects.
-- Waiting uses one native watcher event instead of model-side polling, and lane
-  worktrees are reset and reused after an accepted merge so the next task starts
-  from a warm build cache. Both save wall-clock and spend rather than tokens
-  inside a turn.
+- Executor work uses native threads dispatched through `executor_dispatch` and
+  inspected in `/agents`; `executor_resume` is an explicit exact or fresh
+  continuation. Neither leaves a separate terminal conversation to re-read or
+  replays uncertain external effects.
+- Waiting uses one pending `executor_wait` instead of model-side polling, and
+  lane worktrees are reset and reused after an accepted merge so the next task
+  starts from a warm build cache. Both save wall-clock and spend rather than
+  tokens inside a turn.
 - Pacing lowers new-work concurrency, the triage batch size and the reasoning
   effort ceiling when fresh scoped observations show pressure, and leaves a
   healthy executor untouched. Unknown telemetry is neither zero nor unlimited,

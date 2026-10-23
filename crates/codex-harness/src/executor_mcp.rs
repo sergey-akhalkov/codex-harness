@@ -489,7 +489,7 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         RegisteredLead::Live(endpoint) => endpoint,
         RegisteredLead::Unavailable(reason) => {
             return Err(invalid(format!(
-                "{reason}; no app-server was contacted. Remedy: start or recover the lead with `codex-harness lead start`, then retry from that live lead session"
+                "{reason}; no app-server was contacted. Remedy: restart this lead through the installed codex-harness launcher so its native thread endpoint is registered, then retry executor_dispatch from that live lead session"
             )));
         }
     };

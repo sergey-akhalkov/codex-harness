@@ -807,11 +807,12 @@ mod tests {
         assert!(normalized.contains("must not activate this role"));
         assert!(normalized.contains("must not spawn executors"));
         assert!(normalized.contains("board-workflow"));
-        assert!(normalized.contains("executor spawn"));
-        assert!(normalized.contains("codex-harness executor --help"));
-        assert!(normalized.contains("stale harness build"));
-        assert!(normalized.contains("launcher stale"));
-        assert!(normalized.contains("installation.json"));
+        assert!(normalized.contains("executor_dispatch"));
+        assert!(normalized.contains("executor_wait"));
+        assert!(normalized.contains("executor_ask_lead"));
+        assert!(normalized.contains("executor_resume"));
+        assert!(!normalized.contains("executor spawn"));
+        assert!(!normalized.contains("codex-harness executor --help"));
         assert!(normalized.contains("Do not use for a small direct task"));
     }
 

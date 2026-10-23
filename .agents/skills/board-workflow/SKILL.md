@@ -239,7 +239,10 @@ adoption.
 ## Pipeline
 
 All agent work goes through this board. Do not use process polling or chat as
-the assignment record.
+the assignment record. Executor transport uses the installed MCP tools
+(`executor_dispatch`, `executor_status`, `executor_wait`, `executor_message`,
+`executor_reply`, `executor_ask_lead`, `executor_stop`, `executor_resume`) and
+the native `/agents` view; these carry no second tracker or mailbox.
 
 Custom status `lead_review` (wip): configure with
 `bd config set status.custom "lead_review:wip"`.
@@ -248,7 +251,7 @@ Custom status `lead_review` (wip): configure with
 | --- | --- |
 | Lead | Creates epics/features/tasks, assigns executor work, records its own follow-ups as tasks assigned to `lead` so a later lead session does not repeat them |
 | Executor | Claims assigned work, implements the outcome, sets `lead_review` when done. Does not `bd close` its own assignment |
-| Lead | Reviews `lead_review` and `assignee=lead` as results arrive (the native wait event) and at stage boundaries, then merges, closes or returns to `in_progress` with feedback |
+| Lead | Reviews `lead_review` and `assignee=lead` as native wait results arrive and at stage boundaries, then merges, closes or returns to `in_progress` with feedback |
 
 On a new lead session: read the board first (`lead_review`, assignee `lead`,
 ready work). Create new tasks for new situation; do not re-open completed
@@ -256,35 +259,24 @@ verification.
 
 ### Structured acceptance
 
-After reviewing a structured executor result, accept it from the real managed
-lead conversation:
+After reviewing a structured executor result in its native thread, record the
+acceptance decision on that board task and close it through the board owner.
+The MCP result is transport evidence; the board remains the durable assignment
+and acceptance record. Do not infer acceptance, merge or slot release from
+delivery, completion, `/agents` navigation or archival.
 
-```powershell
-codex-harness executor accept <task> --project <project>
-```
-
-Add the common `--source <checkout>` or `--codex-home <directory>` only when
-they differ from the project/default home. The command authenticates the current
-native lead endpoint, derives the assignment, result, executor session/turn and
-current lead turn from the retained completion, then records acceptance and
-closes through the board owner. Do not hand-author identity or request JSON, and
-do not substitute a plain close when that structured completion should be
-accepted.
-
-Use `--run <generation>` only to resolve an explicitly reported ambiguous
-selection. It never bypasses a newer retained completion or an unresolved
-same-task correction that is active, starting or awaiting review; resolve or
-accept the newest result instead. A repeat for the same accepted result is a
-no-op. Foreign leads, stale board scope or purpose, a stale explicit run,
-changed results, cancelled/unrelated closures, and missing or ambiguous exact
-turns are refused before board effects.
+For a completion that carries exact executor and lead turn provenance, use the
+owning native acceptance path rather than hand-authoring identity or request
+JSON. It must resolve the assignment, result and turns from the retained
+completion, then record acceptance and close the task. A repeat for the same
+accepted result is a no-op. Foreign leads, stale board scope or purpose, changed
+results, cancelled or unrelated closures, and missing or ambiguous exact turns
+are refused before board effects.
 
 Automatic reflection requires an active reflection binding, ordinary purpose,
 and exact executor and lead turns. Improvement work and a mode-off binding
-close normally and run no reflection. A legacy accepted record without exact
-turn provenance still repeats but reports reflection ineligibility. Tasks
-without a structured retained completion keep the existing ordinary `bd close`
-workflow.
+close normally and run no reflection. Tasks without a structured retained
+completion keep the ordinary `bd close` workflow.
 
 For a requested continuous improvement loop, use `self-improvement-loop` and
 the [sequential comparison record guide](references/self-improvement.md).

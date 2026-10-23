@@ -33,21 +33,22 @@ For example, use an ordinary agent with `model="gpt-6-astra"` and
 `reasoning_effort="high"` instead of `agent_type="middle_backup"`. Those
 OpenCodex role files are retired. The former `grok_reviewer` remains retired.
 
-Every active conversation needs its own visible terminal surface with a
-distinct title - a dedicated tab in the same terminal, a pane or a window -
-showing assignment, model/effort, messages/tool activity and status. Include
-any model-backed helpers and explicitly show changes of leader. The controller
-opens that surface per conversation before dispatch; a titled terminal tab is
-sufficient, and tiling every conversation on screen at once is not required. A
-hidden process, raw log or one chat identity masking several conversations is
-insufficient. If a required view closes, suspend new model requests, preserve
-in-flight work and restore visibility through the owning dispatch command. Do
-not resize, move or arrange desktop windows - including the lead's own
-terminal - so sessions fit the screen; that ceremony is not part of dispatch.
-Do not capture Codex or sibling agent windows with Nuphus screenshots, and do
-not poll window pixels for status. Identify non-Codex windows with list,
-title, bounds and state; keep screenshots for genuine visual questions about
-owned UI.
+Every active conversation appears in Codex's native `/agents` view with a
+distinct title, its conversation, model/effort and state. The `executors`
+plugin creates each executor as a native thread on the lead's app-server; the
+lead keeps one CLI view and does not open per-executor terminal tabs, panes,
+consoles or a file relay. Include model-backed helpers, make leadership changes
+explicit, and inspect a run's conversation in the same native view. `/agents`
+navigation is observation only: opening, focusing or closing its view does not
+start, complete, stop or resume a run.
+
+Do not resize, move or arrange desktop windows - including the lead's own
+terminal - so sessions fit the screen. Do not capture Codex or sibling agent
+windows with Nuphus screenshots, and do not poll window pixels for status.
+Identify non-Codex windows with list, title, bounds and state; keep screenshots
+for genuine visual questions about owned UI. If a required native view is
+unavailable, report that capability gap; `executor_status` and `executor_wait`
+remain the bounded state and result path.
 
 ## Orchestration configuration
 
@@ -76,69 +77,36 @@ max_concurrent_executors = 6
 worktree_pool_size = 6
 ```
 
-Dispatch an executor with the installed launcher:
+The installed `executors` plugin supplies the ordinary workflow:
+`executor_dispatch`, `executor_status`, `executor_wait`, `executor_message`,
+`executor_reply`, `executor_ask_lead`, `executor_stop` and `executor_resume`.
+Start a fresh lead session after installing or updating the plugin so its MCP
+tools and role guidance are loaded. `executor_dispatch` uses the calling
+thread's repository, the installed kit configuration and a pooled checkout, and
+creates the executor thread on that same app-server. It accepts `base`, an
+allowed `profile` and a fresh `owner`; it does not accept a thread, endpoint,
+model, provider or effort as authority.
 
-```powershell
-codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --base REV --exec "assignment"
-```
+The configured executor profile from the example is the complete model/effort
+selection; an unlisted requested profile is an error, and the tool accepts no
+per-assignment model or effort override. An explicit user `codex --profile <id>`
+keeps native precedence over role configuration. A missing plugin/tool,
+unavailable endpoint, missing profile or role input, no free slot, or fetch or
+startup failure blocks dispatch with its exact cause and remedy. There is no
+silent fallback to another provider, raw `codex exec`, terminal automation,
+in-session subagents or a second tracker. Only an MCP- or installation-reported
+failure blocks dispatch; a routing-rule interpretation, the single executor
+profile or unknown quota does not. Quota succession looks up the successor
+profile's model in the native catalog; the verified handoff seed stays a
+configured binding, not a hardcoded provider role.
 
-Omitting `--mode` selects the native Codex TUI. `--exec` is the assignment
-input, not a presentation selector.
-
-Skills and `orchestration.toml` are live links into the kit checkout, while the
-launcher is an immutable native build changed only by an explicit build and
-install, so a checkout updated after the last install can reference an
-`executor` command the installed launcher lacks. Probe with
-`codex-harness executor --help` before the first dispatch; `unsupported command`
-names a stale build, not unavailable executors: rebuild and update through the
-[installation lifecycle](installation.md#install-and-verify) from the source
-root recorded in `CODEX_HOME/harness/installation.json`. Until then
-orchestration stays blocked - no profile substitution, no raw `codex exec`, TUI
-automation or in-session helpers. `codex-harness --version` prints the installed
-build's source identity when its build record is present, so a stale launcher
-is identifiable without guessing.
-
-Dispatch uses the configured executor profile from the example above; an
-unlisted `--profile` is an error, and an explicit user `codex --profile <id>`
-keeps native precedence over role configuration. The profile is the complete
-model/effort selection and `executor spawn` accepts no per-assignment override
-by design. If any instruction appears to demand one for executor dispatch, that
-demand belongs to ordinary in-session agents: dispatch the configured profile
-and report the discrepancy. Only a launcher- or installation-check-reported
-failure - missing profile, missing role inputs, stale build, no free slot,
-fetch failure - blocks dispatch, with its exact cause and remedy; never a
-routing-rule interpretation, the single executor profile or unknown quota.
-Quota succession looks up the successor profile's model in the native
-catalog; the verified handoff seed stays a configured binding, not a
-hardcoded provider role.
-
-Spawn opens the assignment in a new tab of the lead's own Windows Terminal
-window when the lead already runs there (`WT_SESSION`). Windows Terminal has no
-supported address for the calling process's window - `wt -w 0` resolves to the
-most recently used window of the current desktop, which is the user's focused
-window, not the lead's - so dispatch finds the lead's window through the
-console parenting of its pseudo console window, briefly holds it foreground,
-resolves the tab there, and restores the user's previous foreground window and
-selected tab once the titled tab is observably open; the lead window never
-stays stolen. When that window cannot be addressed (another virtual desktop or
-a blocked activation), the tab opens in the stable per-checkout window
-`codex-harness-<repository>`, which the terminal creates on first use, and
-`--terminal-window` targets an explicitly named window for setups that prefer
-one. Spawn does not pass `--focus` / maximized / fullscreen and never sends
-synthetic input into a conversation.
-Without `WT_SESSION`, spawn opens a visible console instead of a tab. Steering
-stays `executor message`, not TUI keystrokes. Spawn returns after the surface
-is open. Presentation, closure, watch and exact-session recovery are the
-[observed lifecycle](#observed-executor-lifecycle).
-While an executor runs, one native watcher process checks the board review
-queue, the assignment's result artifact and executor liveness and emits a
-single event; the lead blocks on that event between other work and keeps
-blocking when no useful independent work remains, instead of polling executor
-process ids from model turns, duplicating the assignment's investigation or
-reading window pixels.
-Assignments live on the beads board; executors set `lead_review` when done
-instead of closing. The lead reviews that inbox and its own `assignee=lead`
-tasks.
+`executor_dispatch` returns the run id, executor thread, checkout, slot and
+committed base after the first turn is accepted. Inspect that thread in
+`/agents`; `executor_status` is the compact machine-readable view and
+`executor_wait` is the blocking result or question path. Assignments live on the
+beads board; executors set `lead_review` when done instead of closing. The lead
+reviews that inbox and its own `assignee=lead` tasks. No separate mailbox,
+per-executor console or result file is part of the workflow.
 
 A structured assignment's brief carries the result consumer, the standing
 escalation boundaries, the executor's own investigate, implement, check and
@@ -147,25 +115,22 @@ work, the checkout and base worked from, files, actual checks, limitations,
 required decision and detail locator. A declared `consumer` or `escalate`
 trigger extends that contract instead of replacing it, and an executor resolves
 ordinary implementation errors - syntax, API names, failing checks - itself,
-reaching its lead through the installed message channel only when a trigger is
-actually hit.
+using `executor_ask_lead` only when a trigger is actually hit. The lead replies
+to the exact request through `executor_reply`.
 The schema, optional fields, defaults and limits live in
 [native commands](rust-native.md#structured-executor-assignments).
 
-Every executor session runs as a single-agent worker. Dispatch, resume and
-instruction-refresh succession pass Codex CLI's built-in
-`agents.enabled=false` configuration, so the session's tool set contains no
-agent-spawning or agent-messaging tools and its instructions contain no
-multi-agent usage guidance - even though the `ds` model catalog advertises
-multi-agent v2. The installed launcher applies the same setting to every Codex
-process started inside an executor, so a raw nested `codex` invocation is
-still single-agent, and `executor spawn`, `resume`, `run` and `succeed` refuse
-to run under the executor environment marker with an error naming the lead as
-the owner of further delegation. Ephemeral `spawn_agent` helpers are
-therefore lead-only: an executor that needs another agent or executor reports
-the need instead of creating one. Clearing the marker and calling the
-registered upstream Codex executable directly is outside the supported entry
-points; the guards are not a sandbox.
+Every executor session runs as a single-agent worker. MCP dispatch and
+continuation pass Codex CLI's built-in `agents.enabled=false` configuration, so
+the executor thread has no built-in agent-spawning or agent-messaging tools even
+though the `ds` model catalog advertises multi-agent v2. The installed launcher
+applies the same setting to every Codex process started inside an executor, so a
+raw nested `codex` invocation is still single-agent. Executor sessions must not
+call `executor_dispatch`; ephemeral `spawn_agent` helpers are lead-only. An
+executor that needs another agent or executor reports the need instead of
+creating one. Clearing the marker and calling the registered upstream Codex
+executable directly is outside the supported entry points; the guards are not a
+sandbox.
 
 The `team-lead` skill owns lead activation, briefs, steering, acceptance and
 stop. Activation comes from a user request or from the main session's own
@@ -179,29 +144,24 @@ A managed session resolves its responsibility role from the source root its
 installed build recorded - [roles.toml](../global/roles.toml) and the
 fragments it names in the kit checkout - through the runtime's shared role
 resolver, then composes the result with the applicable native user, project,
-profile and session context before any model request. `executor spawn`,
-`resume`, `run` and `succeed` resolve the executor role; a lead session opened
-through the harness resolves the lead role. The consuming checkout never needs
-to own kit role assets, and native precedence is preserved: an explicit user
-`--profile` still wins, retained explicit skill disables and unrelated or
-project skills stay untouched, and no shared user configuration is mutated.
-Missing or inconsistent role inputs refuse with their exact cause before any
-launcher or model request; a dispatch keeps its slot bound and recoverable
-instead of hosting a conversation without its responsibility role.
+profile and session context before any model request. `executor_dispatch`
+resolves the executor role for its new thread; a managed lead session resolves
+the lead role. The consuming checkout never needs to own kit role assets, and
+native precedence is preserved: an explicit user `--profile` still wins,
+retained explicit skill disables and unrelated or project skills stay untouched,
+and no shared user configuration is mutated. Missing or inconsistent role
+inputs refuse with their exact cause before the thread's model request; a
+dispatch keeps its slot bound and recoverable instead of hosting a conversation
+without its responsibility role.
 
-Each control receipt records the role, the revision this dispatch resolved,
-the developer text a native thread is known to save (`saved`) and what a
-continued predecessor recorded. Resume and restart re-resolve the role at the
-new dispatch, record it and report the effective state honestly
-(`role context: role=... revision=... saved=... previous=...`): a fresh start
-or restart consumes the role text the current dispatch resolved, while a
-resumed native thread keeps the developer text saved at its start, carried
-forward unchanged across repeated resumes (skills the live catalogue gained
-still refresh); no report names the freshly resolved revision as text a
-resumed thread loaded. A replaced receipt whose original saved text is not
-reliably recorded reports `saved=unrecorded`, and a receipt written before
-role recording reports `role context: unrecorded`: both stay usable, and the
-next fresh dispatch, resume or restart records the current role.
+The MCP dispatch record identifies the resolved role and the native threads.
+`executor_resume mode=exact` continues the same thread and therefore keeps the
+developer text saved at its start, carried forward unchanged across repeated
+exact continuations (skills the live catalogue gained still refresh).
+`executor_resume mode=fresh` creates one new bound thread, retains the
+predecessor and starts from the recorded assignment; inspect its effective
+context rather than claiming it loaded a newly resolved revision. Role
+configuration that cannot be resolved blocks dispatch before model work.
 
 Inspect a composition without a model call:
 `codex-harness skills catalogue --role lead|executor [--profile ID]`
@@ -222,7 +182,7 @@ only the sessions whose role inputs are missing and fails nothing else.
 While the lead role is active, substantial eligible investigation, writing or
 code is dispatched to available executor capacity before the lead starts it,
 and released capacity is backfilled before unrelated lead work starts. An idle
-capacity's cause stays identifiable from board and `executor pool` state: no
+capacity's cause stays identifiable from the board and `executor_status`: no
 checkpoint ritual, reason note or occupancy narration is required, and a
 summary that would otherwise mislead about capacity that sat unused names the
 cause in a clause. Requirements live in the
@@ -235,27 +195,14 @@ here.
 ## Instruction-refresh succession
 
 When an accepted instruction or skill change must reach an active executor
-session, replace its CLI process through the verified non-interactive resume
-path instead of steering the stale session:
-
-```powershell
-codex-harness executor succeed --request FILE
-```
-
-The request names the exact session id (never `--last` or a picker), the
-configured profile, the workspace, the private session state root or its
-recorded pointer, the compact revision identity published by skill-evolution
-(`name`, canonical `path`, `revision`, `operation`), the durable task context
-and a private evidence directory. The command makes no model calls: it waits
-for a safe boundary after in-flight tool effects, writes the handover record
-into the owning task records, confirms the predecessor process stopped, spawns
-`codex exec resume <SESSION_ID>` with the recorded sandbox and approval
-policy, and verifies from the successor's own session rollout that the current
-instructions and skill revision were reloaded. A stale published revision or
-a missing reload is reported as `succession not established` with a non-zero
-exit; the gap is fixed before the refresh is relied on. The successor is a
-bounded continuation turn, not an interactive view; same-session compact
-recovery, catalogue delivery and in-process activation remain owned by
+assignment, do not steer the stale thread as if it had reloaded the change.
+Finish or stop it at a safe boundary, commit the required inputs, and dispatch a
+new run with `executor_dispatch` from that base. For an interrupted assignment
+whose partial work must survive, `executor_resume mode=fresh` preserves the
+predecessor and starts from the recorded assignment without resetting the slot.
+Inspect the new thread's loaded context and actual workspace before relying on
+the refresh; an unavailable reload is reported rather than inferred. Same-session
+compact recovery, catalogue delivery and in-process activation remain owned by
 `autonomous-skill-evolution`.
 
 ## Board workflow
@@ -321,17 +268,24 @@ the skill-evaluation contract for library mutations.
 
 ## Executor worktrees
 
-`executor spawn` and the ordinary `codex-harness worktree` commands allocate isolation through one durable task owner: one pool per repository, shared by executor sessions and ordinary tasks so neither can bypass or overwrite the other's held position. Slots are sibling directories `<repository-name>-wt1..wtN` bounded by `worktree_pool_size` (the legacy executor-derived capacity when the configuration omits it). `--source` names the kit/configuration checkout that selects profiles and capacity, defaulting to the installed kit source recorded under `--codex-home`; `--repository` names the independent target repository whose pool, slot records and receipts the dispatch uses and defaults to `--source`, so an existing caller keeps its previous target and a consuming repository needs only to be a Git checkout, not a kit configuration of its own.
+`executor_dispatch` and the ordinary `codex-harness worktree` operations allocate
+isolation through one durable task owner: one pool per repository, shared by
+executor threads and ordinary tasks so neither can bypass or overwrite the
+other's held position. Slots are sibling directories
+`<repository-name>-wt1..wtN` bounded by `worktree_pool_size` (the legacy
+executor-derived capacity when the configuration omits it). MCP dispatch resolves
+the installed kit/configuration source and the calling thread's target repository;
+the target needs only to be a Git checkout, not a kit configuration of its own.
 
-Managed ordinary, lead and executor sessions suppress the competing native `codex_worktrees` tool surface through the shared configuration and the forwarded `features.worktrees=false` leaf; [native commands](rust-native.md#native-worktree-tool-suppression) owns the precedence rules, the conflict report and the model-free catalogue checks. A conversation that was already running when the suppression arrived keeps the tools it registered, and no in-place update exists: end it and start again through the normal route, for example a new ordinary session or `codex-harness lead start --session THREAD_ID` to resume a managed lead thread with a refreshed catalogue. A higher-precedence explicit `features.worktrees=true` keeps the tools; the managed start reports that configuration conflict with its removal remedy rather than successful managed-pool delivery.
+Managed ordinary, lead and executor sessions suppress the competing native `codex_worktrees` tool surface through the shared configuration and the forwarded `features.worktrees=false` leaf; [native commands](rust-native.md#native-worktree-tool-suppression) owns the precedence rules, the conflict report and the model-free catalogue checks. A conversation that was already running when the suppression arrived keeps the tools it registered, and no in-place update exists: end it and start a fresh session through the normal route. A higher-precedence explicit `features.worktrees=true` keeps the tools; the managed start reports that configuration conflict with its removal remedy rather than successful managed-pool delivery.
 
-A fresh dispatch claims the first free position and binds it to the owner as a durable task with its generation handle and exact committed base before the first model request: the refreshed upstream default branch by default, or an explicit `--base` commit resolved locally without a fetch. The claim records the creating process and stays exclusively owned until that dispatch's host publishes its lease, including while no host lease exists yet. A competing dispatch, whether it uses another owner or the same owner, cannot reclaim the position or replace the pending assignment or receipt; it refuses with that position's cause instead of allocating past the pool or holding exclusion for the model conversation. Two free positions still start independently. A fresh dispatch is also admitted against `max_concurrent_executors`, independently of the pool: free positions alone do not grant another active executor run, a run holds concurrency only while its host lease is live or its startup claim still excludes other dispatches, and a held or suspended task keeps its position without consuming concurrency. The claim-record lock is only the short mutation bound: if it stays busy, dispatch refuses rather than overwriting. A confirmed-dead creator's clean unused reservation can be reclaimed by the next dispatch, which keeps the original failure, but a durable task binding is never freed by process exit alone, and a former owner cannot continue a reassigned task. Repeating an owner continues its held binding without a second checkout or reset; `--task ID --handle HANDLE` hands a held ordinary task to the executor session with the same checkout, base, generation handle and partial work preserved. `--workspace` may name only the target checkout or one existing pool position inside the configured capacity. Ad-hoc worktrees are refused, and a position holding unreviewed work is preserved rather than reset.
+A fresh dispatch claims the first free position and binds it to the owner as a durable task with its exact committed base before the first model request: the refreshed upstream default branch by default, or the explicit `base` commit resolved locally without a fetch. The claim stays exclusively owned and a competing dispatch cannot reclaim the position or replace its pending assignment. Two free positions still start independently. Dispatch is also admitted against `max_concurrent_executors`, independently of the pool: free positions alone do not grant another active executor run, and a held or suspended task keeps its position without consuming concurrency. A confirmed-dead clean unused reservation can be recovered, but a durable task binding is never freed by process exit alone and a former owner cannot continue a reassigned task. Ad-hoc worktrees are refused, and a position holding unreviewed work is preserved rather than reset.
 
-A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through `executor release` or `codex-harness worktree release`. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets a clean/reviewed position to the chosen base and removes only that run's recorded message payloads; unrelated messages survive. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason (exit 2) rather than reported free.
+A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. MCP completion does not release a slot. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through the owning pool lifecycle. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets only a clean, reviewed position and retains ignored caches. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason rather than reported free.
 
 A missing host lease does not mean a position is free while its creator is
 starting. If a competing dispatch refuses, inspect its reported cause and
-`executor pool`; do not release or reset the position to bypass startup
+`executor_status`; do not release or reset the position to bypass startup
 contention. An uncertain process identity preserves the reservation until its
 owner is resolved. A failed launch keeps its original error, and only a
 confirmed-dead, clean unused reservation can be recovered automatically.
@@ -347,7 +301,13 @@ codex-harness worktree release --task ID --disposition merged|discarded --reason
 
 Acquire resolves the exact local base without fetching and prints the pool line with the slot receipt (slot, path, presence, state, base, task, handle, owner, disposition, reason); repeating it for a held task returns the same binding, and a different requested base refuses as a conflict. Continue returns the held binding; a stale generation handle, a released binding or a live foreign session refuses with its exact cause. List reports every configured position plus registered-missing and foreign directories for lead review.
 
-`executor pool` is the cheap authoritative mapping of index, path, presence, tree/lease/run state, repository, owner, base, task, handle, disposition and reason. It shows the same durable bindings as `worktree list`, including ordinary tasks, and also reports foreign, legacy and beyond-pool worktrees for lead review. `git worktree list` remains the tree inventory; `worktree_limit` is compatibility only. Legacy task-named worktrees are neither adopted nor deleted automatically: preserve their work, merge or record a discard, then remove them only by an authorized explicit Git operation.
+`executor_status` is the authoritative run and slot view for MCP executor threads,
+including each run's base, state and pending request. `codex-harness worktree list`
+remains the inventory for ordinary task bindings and reports registered-missing
+or foreign directories for lead review. `git worktree list` remains the tree
+inventory; `worktree_limit` is compatibility only. Legacy task-named worktrees
+are neither adopted nor deleted automatically: preserve their work, merge or
+record a discard, then remove them only by an authorized explicit Git operation.
 
 An older harness reports upgraded pool records as unreadable with a missing
 `schema` field. This is a compatibility refusal that protects held work during
@@ -376,162 +336,91 @@ still requires its own recovery; pruning is not task release.
 
 ## Observed executor lifecycle
 
-Spawn, resume and restart present the managed conversation in the native Codex TUI; explicit `--mode exec` uses the same observed lifecycle with the native inline TUI, not an unobserved launcher. The host records `dispatch-accepted`, `native-start`, `running`, `completed`, `failed`, `defect` and `interrupted` in `$CODEX_HOME/harness/executor-pool/spawn-<N>.json`, with the exact native session, final-message locator and bounded detail file. A created tab is not a native start, frontend exit is not a finished turn, and historical receipts keep their recorded coverage.
+`executor_dispatch` starts one executor thread on the calling lead's app-server
+and records its run, profile, checkout, base, slot and thread identity. The
+thread is visible in `/agents` with its title, conversation and state. There is
+no per-executor terminal tab, console host or relay in the ordinary workflow;
+opening or closing the native view is not a lifecycle event.
 
-The host owns one app-server child in a Windows Job. Startup, identity, observation and receipt writes fail closed; abnormal host death reaps the owned child tree, while ordinary completion preserves unrelated background work. Losing the only frontend suspends dispatch, but an unfocused tab does not. Receipt writes are locked and atomic. After the result is persisted the owned frontend/backend end and the terminal closes; cleanup failures name survivors without changing the outcome. Closure is not acceptance, merge or release, and an unresolved reply keeps the surface open.
+`executor_status` reports the bounded state and pending questions for runs owned
+by the verified calling thread. `executor_wait` blocks for one exact run,
+returning immediately for an actionable question, otherwise returning the
+current terminal result, a stable timeout, or an explicit observation failure.
+It starts no model turn and needs no picker navigation. Use one pending wait and
+resume that call after a short tool yield instead of polling process ids,
+rollout files or window pixels.
 
-The frontend relay drains ready traffic in both directions and waits only while
-both are idle. A quiet user does not throttle streamed progress or heartbeat
-traffic. A frontend reconnect attaches to the running conversation without
-replaying the assignment. A stalled or reconnecting TUI alone does not prove
-the executor stopped: use its receipt/watch result before choosing recovery.
-Installing a relay fix applies to new hosts; already running hosts keep their
-loaded binary and should not be interrupted merely to update presentation.
+A completed native turn with a nonempty final assistant message is the executor
+report. A completed turn with empty or missing output is an output defect, not
+quota exhaustion. A wait timeout, quiet stream or view navigation proves neither
+success nor failure. The result is not verified acceptance and does not merge,
+release or close the board task.
 
-Control observations wait for socket readiness and read without blocking. Idle
-and partial-frame waits preserve the connection and do not replay requests;
-actual disconnects remain failures. This replaces repeated Windows blocking
-receive timeouts, which [Microsoft documents](https://learn.microsoft.com/en-us/windows/win32/winsock/sol-socket-socket-options)
-as leaving the connection indeterminate. Retained executor failures reported
-I/O error 997, but its exact OS trigger was not reproduced in the short local
-test. The confirmed regression was an 80 ms observation taking 549 ms while
-a frame trickled in; the corrected transport passes that deadline case and
-128 idle/partial-frame cycles, heartbeat, disconnect and backpressure checks
-(`cargo test -p harness-core --lib task_control::tests --locked`). A transport
-failure is not evidence against the executor's model or implementation approach.
-The affected `executor_control`, `executor_message`, `executor_observation`,
-`executor_stop` and `executor_warning` integration targets passed, as did the
-opt-in model-free app-server binding check with Codex 0.159.3 and workspace
-clippy with warnings denied. These checks do not establish a recurrence rate
-for 997 in long model-backed sessions.
+Compatibility CLI lifecycle commands remain available for existing callers and
+their regression checks, but they are not the ordinary agent path. Active
+guidance uses the MCP tools; a missing plugin reports a capability failure
+rather than a terminal or file-relay fallback.
 
-Wait through the record, never model polling or rollout searches:
-
-```powershell
-codex-harness executor watch --source CHECKOUT --codex-home DIRECTORY --slot N
-codex-harness executor watch --receipt FILE [--json]
-```
-
-`--receipt` is absolute; `--owner`, `--timeout` and `--poll` match executor help. Address fields are optional when recorded state identifies one live run. Watch returns bounded state/identity/checkout/base/changed-file/result locators and the executor report, explicitly separating committed and working changes. Exit 0 completes, 1 names failure/defect/interruption, 2 means missing/unavailable coverage or timeout while the run continues, and 3 means an unanswered reply request: answer its printed reference and watch again. A native turn completion is pending finalization, not success and not an output defect, while the host has not yet retained the exit status and final result: the same watch keeps observing that run. Exit 0, in text or JSON, requires the recorded successful exit and a readable bounded result. Once that exit is recorded, a missing or unusable result is an output defect (exit 1). Timeout while finalization is still pending returns 2 with an explicit finalization cause, leaves the run working, and does not stop or replay the executor. Prior-session or prior-turn events, quiet output and frontend exit do not establish success. Timeout does not stop or resume the run.
-
-Keep one watcher per run. Short tool yields continue that watcher; at the supervision boundary use one compact `executor pool` snapshot and, only if progress is unclear, inspect the latest bounded evidence once. Process existence, log growth, elapsed time, silence and a missing patch prove neither progress nor a stall.
-
-For that diagnostic inspection, `detailTruncated=true` means the detail stream
-retains an initial prefix. Its tail can contain old commands while the receipt's
-`updatedMs` continues advancing. Check the event identity and freshness before
-acting. When current detail is missing, inspect bounded visible tool events
-from the exact native session; preserve the gap and leave the completion watcher
-running. Never interpret opaque reasoning or compaction state as activity.
-
-`executor run --file` is the visible host. It propagates the launcher outcome, treats an empty completion as an output defect, and never presents a completion record as proof that claimed checks passed. Exact-session recovery is the worktree resume command; cache loss uses the fresh restart below.
-
-An attachment timeout includes at most 4096 UTF-8 bytes of visible console text,
-read only while the exact frontend belongs to that console. This diagnostic
-neither captures pixels nor sends input and never substitutes for attachment.
-Keep the failure in the owning local receipt: a resumed console can contain
-private conversation text. Unavailable text is reported without hiding the
-original timeout or changing its cleanup.
 ## Steering and stopping executors
 
-Steer a continuing run by piping content into `codex-harness executor message`; a short `--text` or explicit UTF-8 `--file` remains a fallback. With one live run the command resolves and verifies checkout, home, slot, owner and exact session itself; several runs produce a bounded listing that names `--slot`. Oversized piped input spills automatically and is reported as spill evidence, never confused with model delivery. Message only to add a fact, resolve a request or correct an established mistake—not for status, hurry or repetition without new facts.
+`executor_message` sends one literal lead-to-executor message over the native
+conversation. Address the `run` from `executor_status`, supply `text`, and reuse
+`clientMessageId` only for an idempotent retry of the same content. For an
+executor question, answer the exact reference with `executor_reply requestId=...
+text=...`; a reply resolves that request and continues the same thread without
+resuming or reconstructing an address. Message only to add a fact, resolve a
+request or correct an established mistake - not for status, hurry or repetition
+without new facts. A local success or queued delivery is not evidence that the
+recipient applied it.
 
-An executor asks through `codex-harness lead message` from piped/text/file input; `--notify` sends a no-reply notice. The request reference lets the lead answer with `codex-harness executor message --reply-to MESSAGE_ID`, continuing the same conversation without reconstructing an address or resuming. A completed assignment's compact result still returns through the native final response and the existing watcher; it is not sent through `lead message`. `lead start` registers the lead endpoint that spawn inherits; that managed endpoint steers an active turn and starts an idle one on the exact thread. When a dispatch recorded no per-spawn endpoint, the command resolves only the managed registry record for that exact originating thread under the lead home recorded at dispatch, which `lead start --session THREAD` publishes after resuming the same thread. It never starts a second conversation or listener, never uses a registry record from another home or for another thread, and never replaces a malformed, mismatched or stale per-spawn endpoint.
+An executor's only escalation channel is `executor_ask_lead`, which addresses
+its originating lead and returns a stable request id without waiting for the
+answer. The lead sees it through `executor_wait` or `executor_status`. An
+unanswered request keeps the thread, slot, worktree and partial work live; it is
+not completion or a reason to resume. The executor continues independent work
+and does not poll.
 
-The default `codex-harness lead start` host remains persistent: it keeps its visible native frontend and owned app-server alive after a turn so asynchronous reflection delivery can reach the idle thread. For one finite assignment, pass `--once` with exactly one of `--exec PROMPT` or `--exec-file FILE`. The prompt is submitted after the frontend attaches, and only the newly assigned turn's terminal result can end the host; a resumed thread's earlier completion, frontend exit, silence or elapsed time is not completion. On a completed turn with a nonempty final assistant message, the command prints the result, closes its owned frontend and app-server, retires its endpoint and exits zero only when cleanup is confirmed. Failure, interruption, a protocol defect, empty or missing output, or unconfirmed cleanup exits nonzero; any partial output remains visible and is labeled as not a success. `--once` without a prompt refuses before starting anything.
+`executor_stop` interrupts only the exact executor thread and its recorded
+background commands. It preserves files, checkout, slot and partial work and
+reports whether containment is complete; no shared app-server or sibling
+conversation is targeted. Stop only for explicit cancellation or a concrete
+necessity: demonstrated wrong direction, inability to progress, or a resource
+conflict the executor cannot resolve. Waiting, silence, slowness and timeout are
+not causes.
 
-New control endpoints name the child's resolved executable image, not the
-mutable `harness/bin/codex.exe` link. A record written by an older build can
-still name that link after an installation update retargets it. Endpoint
-validation may recover such an existing record only when the exact pid,
-creation time and caller account still match the running child, and its
-running image and the link's current target are distinct sibling published
-builds with the link's executable name. The live thread is still checked
-afterward, so the message reaches the recorded conversation without rewriting
-the endpoint or interrupting the worker. A reused pid, foreign image or build
-family, renamed executable, different account or wrong thread still refuses;
-strict service and termination identity checks do not use this recovery.
-
-The installed native queue is idle-only: its queue operation dispatches only
-when the target turn is idle, so it cannot deliver an operational message
-during the lead's current turn and `lead message` does not use it. With no
-verified live managed endpoint the command refuses before composing the
-envelope, writing a spill, recording an attempt or creating a reply hold, and
-names the same-thread managed resume remedy. That is an honest capability
-limitation of an ordinary embedded conversation, not evidence that the
-session was repaired. Legacy queued or indeterminate attempts stay recorded
-for reconciliation: a repeat reads the lead's own stored items without
-transmitting, upgrades to delivered only on that evidence, keeps an accepted
-attempt queued and never sends the same text again. Native queue entries are
-not deleted, so the recorded identity remains the one input to reconcile.
-
-Stop only for explicit cancellation or a concrete necessity: demonstrated wrong direction, inability to progress, or a resource conflict the executor cannot resolve. Waiting, silence, slowness and timeout are not causes. The kit stop preserves files, slot and partial work, verifies recorded identity, closes only that run's surface and records the outcome; manual killing has none of those guarantees. Continue an ordinary interruption by exact-session resume, cache loss by restart, and release only by explicit lead decision.
+`executor_resume mode=exact` continues that same thread with the preserved
+assignment and bounded progress; it does not resubmit the assignment, reset the
+slot or repeat completed work blindly. `mode=fresh` starts one new bound thread,
+retains the predecessor and requires inspecting interrupted effects first. A
+stopped run is never restarted automatically. Release remains an explicit lead
+acceptance/discard decision, not a consequence of stop or completion.
 
 ## Provider-neutral cache-loss protection and recovery
 
-Every observed managed executor host monitors its exact session's native
-per-response input/cache counters, whatever provider and model its receipt
-resolved - control-backed spawn and observed exact-session resume alike.
-Support is proven at runtime: a recorded response with at least 100,000 input
-tokens and 90% cached input warms that run, and only a warmed run is subject to
-the stop policy. Provider branding, a static allowlist entry or
-numeric-but-never-warmed counters prove nothing. After warmup, three
-consecutive distinct responses each missing at least 100,000 tokens and 50% of
-input trigger termination of the owned process tree. Cold starts, duplicate
-observations, below-threshold responses that reset the consecutive count and
-historical losses on resume do not count; earlier history on an explicit resume
-can establish warmup but never a new miss. The host terminates before waiting
-on control acknowledgments or writing its stop receipt; it does not wait for a
-model, test or build to finish.
+An MCP executor run monitors its exact native conversation's per-response
+input/cache counters. Support is proven at runtime: a recorded response with at
+least 100,000 input tokens and 90% cached input warms that run. Provider
+branding or numeric-but-never-warmed counters prove nothing. After warmup,
+three consecutive distinct responses each missing at least 100,000 tokens and
+50% of input trigger the repeated-loss guard. Cold starts, duplicate
+observations, below-threshold responses that reset the count and historical
+losses on continuation do not count. Usage arrives after billing, so an
+in-flight request can still cost money; this is a repeated-loss guard, not a
+currency cap or an upstream-cache repair.
 
-Windows file-change notifications and native events trigger bounded reads of
-appended records. A one-second open-file size check covers delayed Windows
-notifications; unchanged content is not periodically reread. Only the exact
-session's counters are read, and no monitoring request is sent to the model.
-Usage arrives after billing, so the three responses and an already in-flight
-request can still cost money. This is a repeated-loss guard, not a currency cap
-or a fix for the upstream cache. Missing, invalid or never-proven counters are
-reported as unavailable coverage with the run's resolved provider and model.
-Already running older hosts do not gain protection from installing a new
-binary.
+The run status reports missing, invalid or never-proven counters as unavailable
+coverage, with the resolved provider and model. Cache loss is a terminal
+non-success outcome, not a dismissible warning or evidence against the model
+approach. The lead reviews preserved commits, uncommitted/untracked files and
+saved test/build evidence before acting.
 
-Routine guard status - `waiting-for-usage`, `warming`, `armed` and other
-below-threshold transitions - stays in the receipt and host log; it adds no
-terminal diagnostic line and no user warning. The run's own truncated cache-guard
-journal `endpoint-<index>.cache-guard.log` beside the receipt carries those
-status lines; the app-server child owns `endpoint-<index>.log` itself. Degraded coverage - invalid or
-unavailable counters, rollout truncation, a session-identity change - is
-delivered through Codex's native warning presentation when a native executor
-frontend is attached, so it appears in that frontend's warning count and viewer
-instead of the terminal input area.
-A compatibility surface without a native consumer keeps the diagnostic on its
-receipt/log surface and records `no-native-consumer` instead of claiming native
-warning presentation. The receipt records each degraded diagnostic as
-`native-sent`, `undelivered` or `no-native-consumer`: a native-format send is
-not evidence that the user opened the viewer, an undelivered diagnostic is
-never reported as a shown warning, and a delivery failure does not terminate
-otherwise healthy model work. Cache loss stays a terminal non-success outcome,
-not a dismissible warning.
-
-The receipt's `cacheGuard` records the counters, the resolved `provider` and
-`model`, `runtimeSupport` (`proven`, `unproven`, `invalid` or `unavailable`)
-and `diagnosticDelivery` (`native-sent`, `undelivered` or
-`no-native-consumer`). The failed watch result retains the stop cause and an
-exact recovery command. The lead reviews preserved work and runs that command:
-
-```powershell
-codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID --session PREVIOUS_SESSION_ID
-```
-
-Restart starts a fresh conversation on the native TUI in the same worktree, keeping its commits,
-uncommitted/untracked files and saved test/build evidence. It does not fetch,
-reset, clean or release the slot. The old rollout remains available. The new
-session receives the recorded original assignment plus a bounded checkpoint
-of recent visible activity and must inspect the actual work before continuing;
-an interrupted command is not proof of success. It does not replay the whole
-old context or restore unsaved internal model state. If no assignment was
-retained, supply the original `--assignment FILE` or `--exec PROMPT`. A stale
-predecessor identity or live owner is refused. Use the configured binding;
-investigate recurring loss instead of creating an automatic restart loop.
+For recovery, use `executor_resume mode=fresh` with bounded progress. It starts
+one new bound thread, retains the predecessor and its checkout and runs from
+the recorded assignment; it does not fetch, reset or clean the slot, and it does
+not replay the assignment as if the interrupted effects were fresh. The new
+thread must inspect the actual diff, commits and interrupted tests/builds before
+reusing any prior result. A partial stop must be resolved or preserved first.
+Investigate recurring loss instead of creating an automatic restart loop.
 
 ## How selection works
 
@@ -554,11 +443,11 @@ inside a delegated slice's boundaries remains executor work.
 
 Combine related routine into one substantial assignment and state material
 input bounds up front. Routine supervision runs at most once per 15 minutes of
-wall-clock time, batched across active executors, as described with
-`executor watch` above. Check earlier only for a delivered result, explicit
+wall-clock time, batched across active executors, using `executor_status` and
+one pending `executor_wait`. Check earlier only for a delivered result, explicit
 error, help request, new or corrected user instruction or concrete risk to
 correctness or shared resources. Do independent work between events; when none
-remains, keep blocking on the watcher instead of polling, rereading worker
+remains, keep blocking on the wait instead of polling, rereading worker
 source, diffs or logs, duplicating the investigation or manufacturing status
 work. The interval is not a task deadline, and silence is not a stall.
 
@@ -611,8 +500,8 @@ is no mandatory escalation ladder.
 ## Global connection and limits
 
 The [harness profile](../global/harness.config.toml) contains a short standing
-policy and a limit of two concurrent native in-session child threads. Harness
-`executor spawn` launches separate sessions governed by
+policy and a limit of two concurrent native in-session child threads.
+`executor_dispatch` creates native executor threads governed by
 `max_concurrent_executors` in [orchestration.toml](../global/orchestration.toml);
 the lead is not included in that executor count. Apply each limit only to its
 dispatch mechanism, as specified by the

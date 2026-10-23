@@ -6,13 +6,13 @@
 //! result and the escalation boundaries that return decisions to that
 //! consumer. Validation is deterministic and model-free: the document, its
 //! limits and every declared path are checked against the allocated checkout
-//! before a launcher process opens a model conversation, and the rendered
+//! before a model turn opens, and the rendered
 //! brief carries the actual checkout, the committed base and the exact
 //! relative paths.
 //!
-//! Both dispatch paths render the same small task contract: the caller's
-//! literal text or the declared assignment, the named consumer, the concrete
-//! installed feedback command and the task-specific boundaries. Standing
+//! MCP dispatch and the compatibility CLI render the same small task contract:
+//! the caller's literal text or the declared assignment, the named consumer,
+//! the MCP escalation tool and the task-specific boundaries. Standing
 //! responsibility guidance - the work cycle, base verification, the
 //! heavy-command lane, when escalation is justified, the waiting behavior and
 //! the compact result shape - is owned once by the executor role fragment and
@@ -35,42 +35,42 @@ use std::{
 
 /// Version of the assignment document this build accepts.
 pub const ASSIGNMENT_SCHEMA: u32 = 1;
-/// The assignment file is bounded: its brief becomes a launcher argument.
+/// The assignment file is bounded: its brief becomes the model input.
 pub const MAX_ASSIGNMENT_BYTES: u64 = 256 * 1024;
 pub const MAX_OBJECTIVE_BYTES: usize = 1024;
 pub const MAX_LIST_ITEMS: usize = 64;
 pub const MAX_ITEM_BYTES: usize = 512;
 pub const MAX_RELATIVE_PATH_BYTES: usize = 240;
-/// Bound on the rendered brief handed to the launcher process.
+/// Bound on the rendered brief handed to the executor.
 pub const MAX_BRIEF_BYTES: usize = 16 * 1024;
 
 /// Who consumes the returned result when the assignment does not declare a
 /// consumer: the lead that dispatched it is always the direct consumer.
 pub const DEFAULT_CONSUMER: &str = "the lead that dispatched this assignment";
 
-/// The one escalation channel every assignment names. The installed command
+/// The one escalation channel every assignment names. The installed MCP tool
 /// addresses the originating lead itself, so no recipient, slot, session,
 /// checkout or endpoint is discovered, supplied or taught here.
-pub const LEAD_CHANNEL_COMMAND: &str = "codex-harness lead message";
+pub const LEAD_CHANNEL_TOOL: &str = "executor_ask_lead";
 
 /// The task-specific feedback addressing every assignment carries: who
-/// consumes the returned result and the concrete installed command that
+/// consumes the returned result and the concrete MCP tool that
 /// reaches them. The standing exchange rules around it - when escalation is
 /// justified, the waiting behavior and the compact result shape - are owned
 /// by the executor role fragment, which a managed session receives once, so
 /// they are not restated here.
 fn push_feedback_address(text: &mut String, consumer: &str) {
     text.push_str(&format!(
-        "feedback: return the compact result through the native final response; escalate a decision you cannot resolve to {consumer} through {LEAD_CHANNEL_COMMAND} (short --text fallback).\n"
+        "feedback: return the compact result through the native final response; escalate a decision you cannot resolve to {consumer} through the {LEAD_CHANNEL_TOOL} MCP tool.\n"
     ));
 }
 
 /// The free-text assignment one session receives: the caller's own text stays
 /// first and literal, followed by the same small task contract every managed
-/// assignment renders - the implicit consumer and the concrete installed
-/// feedback command. Resume and restart render through this same function, and
-/// a restart keeps the text it recorded, so no path needs a second copy of the
-/// standing guidance.
+/// assignment renders - the implicit consumer and the MCP escalation tool.
+/// Continuation renders through this same function, and a fresh recovery keeps
+/// the assignment it recorded, so no path needs a second copy of the standing
+/// guidance.
 pub fn free_text_brief(text: &str) -> String {
     let mut rendered = text.trim_end().to_owned();
     rendered.push_str("\n\n");
@@ -778,7 +778,7 @@ mod tests {
     /// a result or an escalated decision returns.
     fn expected_feedback_line(consumer: &str) -> String {
         format!(
-            "feedback: return the compact result through the native final response; escalate a decision you cannot resolve to {consumer} through codex-harness lead message (short --text fallback).\n"
+            "feedback: return the compact result through the native final response; escalate a decision you cannot resolve to {consumer} through the executor_ask_lead MCP tool.\n"
         )
     }
 
@@ -786,15 +786,15 @@ mod tests {
     /// role file carries these obligations; the assignment renderer must not
     /// restate them in any brief.
     const ROLE_OWNED_STANDING_PHRASES: [&str; 9] = [
-        "by piping codex-harness lead message",
-        "It asks for a reply unless --notify",
+        "It addresses the originating lead without a recipient",
+        "returns a stable request id",
         "Ask only after investigating the available facts",
-        "ordinary implementation errors and routine progress, is yours",
+        "Ordinary local errors and routine progress remain yours",
         "durable blockers, decisions and results stay on the bd issue",
         "no polling, keep-alive loop or resume",
-        "An executor watch result of 3 means answer that request",
+        "An action-required question is not completion",
         "report a compact result: done and remaining work",
-        "spills long content automatically",
+        "Do not invent a transport file",
     ];
 
     /// The small task contract every brief renders with no standing exchange
@@ -1080,7 +1080,7 @@ mod tests {
             &document("Ship the outcome", &["input.txt"], &[]),
         );
         // Every list and item stays inside its own limit; the rendered brief
-        // still cannot fit the launcher argument budget.
+        // still cannot fit the assignment budget.
         let item = format!("keep the change inside the checkout: {}", "x".repeat(400));
         assignment.invariants = vec![item.clone(); MAX_LIST_ITEMS];
         assignment.acceptance = vec![item; MAX_LIST_ITEMS];

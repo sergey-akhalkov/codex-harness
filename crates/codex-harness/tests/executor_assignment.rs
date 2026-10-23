@@ -1059,7 +1059,7 @@ fn dry_run_renders_the_bound_checkout_base_and_exact_paths() {
     assert!(text.contains("- crates/new/module.rs"), "{text}");
     assert!(text.contains("- the synthetic check passes"), "{text}");
     assert!(
-        text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
+        text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead that dispatched this assignment through the executor_ask_lead MCP tool."),
         "{text}"
     );
     // Standing responsibility guidance (work cycle, base verification, the
@@ -1146,7 +1146,7 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "{text}"
     );
     assert!(
-        text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
+        text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead that dispatched this assignment through the executor_ask_lead MCP tool."),
         "{text}"
     );
     // Standing boundaries, waiting behavior and the compact result shape stay
@@ -1193,7 +1193,7 @@ fn consumer_and_escalation_reach_the_rendered_brief() {
         "{text}"
     );
     assert!(
-        text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead of epic sample-3mu through codex-harness lead message (short --text fallback)."),
+        text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead of epic sample-3mu through the executor_ask_lead MCP tool."),
         "{text}"
     );
     assert!(
