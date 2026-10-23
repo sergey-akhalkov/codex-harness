@@ -69,6 +69,7 @@ pub(crate) use warning::SelectionObserver;
 use warning::{Relay, WarningQueue};
 
 const USAGE: &str = concat!(
+    "Compatibility CLI lifecycle. Ordinary agent work uses the installed executors MCP tools and the native /agents view; these commands remain for existing callers and regression checks.\n",
     "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--repository REPO] [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--task ID --handle HANDLE] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
     "codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --slot N --owner ID [--session SESSION_ID] [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
     "codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY [--repository REPO] --slot N --owner ID [--session PREVIOUS_SESSION_ID] [--profile ID] [--exec PROMPT|- | --assignment FILE]\n  Start a NEW conversation in the same occupied worktree, preserving partial work and reusing the recorded assignment by default. The successor records the predecessor session and publishes a new control endpoint; a stale endpoint is not an address of that conversation. Never releases or resets the slot.\n",
@@ -9284,7 +9285,7 @@ mod tests {
             "a streamed or typed assignment renders one brief"
         );
         assert!(
-            text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead that dispatched this assignment through codex-harness lead message (short --text fallback)."),
+            text.contains("feedback: return the compact result through the native final response; escalate a decision you cannot resolve to the lead that dispatched this assignment through the executor_ask_lead MCP tool."),
             "{text}"
         );
         // Standing exchange guidance is owned by the executor role fragment

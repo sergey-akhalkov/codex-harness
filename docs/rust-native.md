@@ -448,8 +448,8 @@ codex-harness delivery-improvement status --project CHECKOUT
 
 ### Ordinary accepted closure ownership and recovery
 
-`executor accept` closes as the authenticated approving lead. It binds the
-latest native turn, which must be in progress with a nonblank exact identity.
+The structured-acceptance owner closes as the authenticated approving lead. It
+binds the latest native turn, which must be in progress with a nonblank exact identity.
 Earlier unfinished turns in resumed history do
 not block acceptance; a terminal or unusable latest turn cannot fall back to
 one of them. Before writing acceptance metadata, an open task assigned to
@@ -473,13 +473,16 @@ command without changing the environment:
 ```powershell
 bd update TASK --assignee LEAD --if-assignee OLD_ASSIGNEE --if-status OBSERVED_STATUS --actor LEAD --json
 bd close TASK --reason accepted --actor LEAD --json
-codex-harness executor accept TASK --run RECORDED_RUN --project CHECKOUT
 ```
 
-The replay must report `status: accepted`, `duplicate: true`, and the unchanged
+Then replay the owning acceptance validation through its supported lead surface;
+it must report `status: accepted`, `duplicate: true`, and the unchanged
 acceptance identity. Do not remove or replace metadata, delete history, or use
 `--force`. If history shows a reopen or cancellation, use a fresh task (or an
 explicitly reviewed board correction) rather than treating old work as accepted.
+The compatibility acceptance command remains for existing callers and its
+regression tests; this guide does not present its invocation as required agent
+workflow.
 
 Automatic preparation resolves the kit, configured profiles, roles and registered
 lead address before activating the board's native event journal at its current
@@ -946,16 +949,15 @@ registered-missing and foreign directories for lead review. Release records
 base for reuse while retaining ignored caches, and preserves a position that
 cannot reset safely with exit 2.
 
-Executor dispatch consumes the same pool: `executor spawn` accepts
-`--repository REPO` (default `--source`) and `--task ID --handle HANDLE` to
-hand a held ordinary task to the session without a reset or a second tree.
-Dispatch is admitted against `max_concurrent_executors`, separately from the
-pool: an active run holds concurrency while its host lease is live or its
-startup claim still excludes other dispatches, a held or suspended task keeps
-only its pool position, and a refusal names the active runs without allocating
-anything. `executor resume`, `restart`, `watch`, `message`, `stop`,
-`assignment`, `pool` and `release` accept the same `--repository` selector. `executor pool` lines
-add `repository=`, `task=` and `handle=` beside the session fields.
+MCP `executor_dispatch` consumes the same pool and reports the allocated slot,
+checkout, committed base and native executor thread. Dispatch is admitted
+against `max_concurrent_executors`, separately from the pool: an active run
+holds concurrency, a held or suspended task keeps only its pool position, and a
+refusal names the active runs without allocating anything. `executor_status`
+reports the MCP run and slot state; the ordinary `worktree list` reports the
+durable task bindings. Normal release remains the lead's explicit
+accepted/discarded disposition through the owning pool lifecycle; MCP completion
+does not release a slot.
 
 ### Bounded lead conversations
 
@@ -965,12 +967,13 @@ add `repository=`, `task=` and `handle=` beside the session fields.
 Native agent tools and further harness model dispatch are disabled inside this
 conversation; the originating lead owns executor assignments and integration.
 `lead resume` accepts the same source, home and owner plus `--slot N` and optional
-`--session THREAD_ID`, retaining the exact conversation and partial work. Observe,
-message and stop it through the corresponding `executor` commands and recorded slot.
-Dispatch exit zero means the request was accepted; the receipt records completion,
-failure or interruption. Model-free fixtures cover dispatch, resume, role mismatch,
-stopping and child failure; measured workflow composition and real-agent equivalence
-require their own acceptance before this route can supply comparison evidence.
+`--session THREAD_ID`, retaining the exact conversation and partial work.
+Dispatch exit zero means the request was accepted; the retained lifecycle
+records completion, failure or interruption. This bounded lead route is not the
+executor workflow. Model-free fixtures cover dispatch, resume, role mismatch,
+stopping and child failure; measured workflow composition and real-agent
+equivalence require their own acceptance before this route can supply comparison
+evidence.
 
 ### Managed lead host lifetime
 
@@ -1093,11 +1096,14 @@ than an in-place update.
 
 ## Structured executor assignments
 
-`codex-harness executor spawn`, `resume` and `restart` accept `--assignment FILE` or
-`--exec PROMPT`, and `--exec -` reads the free-text assignment from piped
-standard input instead of the command line. Keep the file local or in the
-owning project; do not put private consumer details into this pack. Example
-schema:
+The ordinary dispatch path is the installed `executors` MCP plugin. Start a
+fresh lead session after install/update, then call `executor_dispatch` with a
+schema-1 `assignment` object and optional `base`, allowed `profile` or fresh
+`owner`. The tool allocates one pooled checkout, creates one native executor
+thread on the lead's app-server and returns the run, thread, checkout, slot and
+committed base. The thread is inspectable in `/agents`. Keep assignment content
+local or in the owning project; do not put private consumer details into this
+pack. Example:
 
 ```json
 {
@@ -1108,19 +1114,22 @@ schema:
   "invariants": ["Preserve the public result type"],
   "acceptance": ["Run the parser tests and report actual results"],
   "consumer": "the lead session for sample-17",
+  "board_task": "sample-17",
   "escalate": ["any change to the public result type"]
 }
 ```
 
-`consumer` and `escalate` are optional, and both are additive. Omission of
-`consumer` names the dispatching lead as the result consumer. The rendered
-brief always carries the standing escalation boundaries - a change to the
-agreed outcome or scope, a material architecture or design change, missing
-authority or access, and a concrete dependency the executor cannot obtain -
-so a declared `escalate` item adds a task-specific trigger instead of
-replacing them, and an omitted field adds nothing. Nothing else escalates:
-ordinary implementation errors (syntax, incorrect API names, failing checks)
-belong to the executor, which investigates, corrects and re-runs them.
+`schema`, `objective`, `inputs`, `outputs`, `invariants` and `acceptance` are
+required. `consumer`, `purpose`, `board_task` and `escalate` are optional and
+additive. Omission of `consumer` names the dispatching lead as the result
+consumer. The rendered brief always carries the standing escalation boundaries
+- a change to the agreed outcome or scope, a material architecture or design
+change, missing authority or access, and a concrete dependency the executor
+cannot obtain - so a declared `escalate` item adds a task-specific trigger
+instead of replacing them. Ordinary implementation errors (syntax, incorrect
+API names, failing checks) belong to the executor, which investigates, corrects
+and re-runs them. An executor escalates through `executor_ask_lead`; the lead
+answers with `executor_reply`.
 
 The brief also carries the executor's own work cycle - read the declared
 inputs, investigate the current source and callers before editing, implement
@@ -1136,102 +1145,53 @@ outputs may be new. Absolute paths, traversal and links escaping the checkout
 are rejected before a model starts. The generated brief names the real checkout
 and full committed base, preserving the caller's objective and acceptance.
 Schema/path checks cannot establish semantic completeness or execution success.
-Resume retains partial work. Free text remains supported.
+Exact continuation retains partial work. MCP dispatch requires the structured
+object; free-text assignment rendering remains a compatibility CLI path and is
+not the ordinary agent workflow.
 
-For an existing pool slot, `codex-harness executor assignment --source CHECKOUT
---slot N --base REV --assignment FILE` validates/renders without allocating,
-resetting, writing or launching a conversation. Normal dispatch still uses the
-installed profile. Omitting `--mode` selects the native TUI; explicit
-`--mode exec` is the inline presentation on the same lifecycle.
+### Observation and control
 
-The observed lifecycle of dispatched sessions is a native command, not a log
-search: `codex-harness executor watch` (same optional address fields, or
-`--receipt FILE` with an absolute path) blocks on the receipt's recorded
-lifecycle and prints bounded review data. Exit 3 means action required: the
-live run holds an unanswered reply request whose one-command reply reference
-the result carries - a state to answer, never a completion, an output defect
-or a resume trigger.
-`codex-harness executor run --file RECEIPT` is the tab or console host: it
-attaches the native TUI, inline when spawn selected exec, and records that
-lifecycle rather than launching an unobserved `codex exec`. States, exit codes,
-automatic closure and exact-session resume are in
+`executor_status` returns the bounded run, native thread, slot, state and
+pending-question view for the verified calling thread. `executor_wait` blocks for
+one exact run, returns immediately for an actionable question, and otherwise
+returns the native terminal result, a stable timeout or an explicit observation
+failure. It starts no model turn and needs no picker or window navigation.
+`/agents` displays the same threads; view navigation is not a lifecycle event.
+
+`executor_message` sends literal lead-to-executor content to the exact run.
+`executor_reply requestId=...` answers one executor question through
+`executor_ask_lead`, and `executor_stop` interrupts only that native thread and
+its recorded background commands. `executor_resume mode=exact|fresh` is the only
+explicit continuation; see
 [agent delegation](agent-delegation.md#observed-executor-lifecycle).
 
-A live run is addressed and controlled through its recorded identity; address
-fields are optional and resolve only from harness records:
+Messages are literal UTF-8: line breaks are preserved and no shell evaluation
+occurs. Reuse `clientMessageId` only for an idempotent retry of the same content.
+The result distinguishes delivered, queued, error and indeterminate states; a
+local write or accepted turn is not evidence that the recipient applied it. An
+executor question returns its exact `requestId`; the lead replies through
+`executor_reply`, and an unanswered question keeps the thread, slot and partial
+work live without a resume.
 
-```powershell
-Get-Content correction.txt | codex-harness executor message
-codex-harness executor message --text 'short correction'
-codex-harness executor message --reply-to MESSAGE_ID
-codex-harness executor stop
-codex-harness lead message [--notify]
-```
+`executor_stop` interrupts the exact native thread and terminates only that
+thread's recorded background commands, verifying their inventory. It preserves
+the checkout, slot and partial work and reports complete or partial containment.
+It never targets the shared app-server or a sibling conversation, and it does
+not release or merge anything. A partial stop names the surviving effect and
+next action. A later delivery to a stopped run is refused until an explicit
+`executor_resume`.
 
-Message content is piped standard input (`--text -` selects it), a short
-`--text`, or explicit UTF-8 `--file`; no size has to be known and no file
-created, and the payload arrives verbatim - line breaks kept, no shell
-evaluation - in the run's own conversation at the nearest supported point,
-even mid tool call, without interrupting it. Above the 256 KiB inline
-bound either direction - including a `--reply-to` reply - spills
-automatically: the command persists the payload under
-`CODEX_HOME/harness/messages/` and sends a pointer envelope naming the exact
-size and absolute path for the recipient's own tools. Receipts and watch report
-`delivery: spill` with `payloadPath` and `payloadBytes`, never inline delivery,
-and above the 8 MiB ceiling the refusal names the limit and sends nothing.
-Inline results stay `queued`, `delivered` and `error`: a local write is never
-model delivery, and an indeterminate retry cannot deliver the same text twice.
+`executor_resume mode=exact` continues the same thread from the preserved
+assignment and bounded progress without replaying the assignment or resetting
+the pool. `mode=fresh` creates one new bound thread, retains the predecessor and
+requires inspecting interrupted effects before reuse. A completed turn with a
+nonempty final message is a result; empty or missing output is an output defect,
+not quota exhaustion. Stop, completion, delivery and view navigation are not
+acceptance.
 
-Explicit address fields (`--source`, `--codex-home`, `--slot`, `--owner`,
-optional `--session`) stay accepted for disambiguation and scripting and are
-verified exactly like resolved values.
-`--codex-home` defaults to `CODEX_HOME` or the recorded installation default,
-`--source` to the installation record's checkout, and slot, owner and session
-resolve from the recorded live pool lease and receipts when exactly one run
-matches; several live runs refuse with a bounded listing naming `--slot`, a
-stale binding refuses the identity mismatch, and resolution reads only harness
-records - never the working directory, process names, window titles or most
-recent session. Lifecycle commands keep requiring explicit paths. A completed,
-stopped or unavailable run gets its state and exact-session resume remedy; no
-recorded control endpoint means `message` is unsupported with the same remedy,
-while `stop` still works through the recorded host identity.
-
-`stop` urgently ends one exact run - native interruption where the backend
-provides it, else bounded termination of the recorded host's process tree,
-verified by recorded identity and never by process id, program name or window
-title - closing exactly that run's tab while the lead's terminal and
-neighboring tabs stay usable, and records `stopped`, `already-completed`,
-`partial` or `error` with an unknown exit code kept unknown and pending
-messages marked undelivered; a partial stop names the surviving process, cause
-and next action. Stop keeps files, the checkout, the slot and partial work (no
-reset, clean, release or completion claim); a repeated stop reports the current
-state, and a stop racing natural completion reports which outcome won.
-
-`lead message` is the executor's only escalation channel: a
-literal payload from piped input, `--text` or `--file` goes to the originating
-lead recorded for its own live run, so the caller supplies no address, and
-`--notify` marks an exceptional notice that requests no reply. The default kind
-requests one; the lead answers with
-`executor message --reply-to MESSAGE_ID`, which resolves that request instead
-of an address and continues the same conversation in place, and an unanswered
-request keeps the run, its session, slot and worktree live (`executor watch`
-exit 3) without a resume. Selection rules live in
-[agent delegation](agent-delegation.md#steering-and-stopping-executors).
-
-Transmission requires a verified live managed endpoint: `turn/steer` on the
-lead's active turn, or `turn/start` on its idle recorded thread. When the
-dispatch recorded no per-spawn endpoint, the command reads only the managed
-registry record for that exact thread under the originating lead home recorded
-at dispatch, as published by `lead start --session THREAD` after resuming the
-same thread. The installed native queue is not used: its queue operation
-dispatches only when the target turn is idle, so it cannot deliver an
-operational message during the lead's current turn. With no live verified
-endpoint the command refuses before composing an envelope, writing a spill,
-recording an attempt or creating a reply hold, and names the same-thread
-managed resume remedy. A malformed, mismatched or stale recorded endpoint
-fails closed. Legacy queued or indeterminate attempts are reconciled read-only
-from the lead's own stored items on a repeat; they are never transmitted again,
-and native queue entries are left in place.
+The compatibility CLI keeps its existing assignment, observation, message, stop,
+pool and recovery commands and regression tests for existing callers. They are
+not required agent workflow and must not be reintroduced as the ordinary path.
 
 ```powershell
 cargo test --locked -p codex-harness --test executor_observation --jobs 1 -- --test-threads=1

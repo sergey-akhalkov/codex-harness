@@ -225,7 +225,7 @@ Complete that change through direct native behavior acceptance, current-source
 integration and installed delivery verification. Preserve integrity, freshness
 and ownership checks and retained historical evidence. Avoiding compilation for
 an eligible preview does not establish overall time or token savings. This scoped
-decision does not close the executor-watch workload or parent improvement loop.
+decision does not close the executor-observation workload or parent improvement loop.
 
 One clear, attributable bottleneck should produce a bounded correction promptly. Do not
 wait for repeated episodes, votes or statistical proof when the available facts
@@ -822,16 +822,24 @@ host-local and out of Git. The consuming item keeps every vote, merge and route
 comment as history, so promotion never deletes evidence. This resolves the
 design.md open question for OFAP task 3.2.
 
-**2026-09-20, confirmed (presentation superseded 2026-09-25):** executor assignments run in `codex exec` mode
-inside a visible terminal tab by default: the output streams while the
-executor works, the process exits on completion and the tab closes itself, so
-finished tabs never linger and the lead has no manual close step. Corrections
-and continuation reopen the exact session through `codex resume` /
-`codex exec resume` with the acceptance conditions stated in that session.
-Prompt-level `/goal` prefixes are not used for spawned executors: the CLI has
-no argv goal hook, so such a prefix is inert text; crash recovery is owned by
-the lead's watcher plus exact-session resume. Interactive `--mode tui` remains
-available for human-attended executors.
+**2026-10-23, confirmed (supersedes executor presentation and message
+decisions):** ordinary executor work uses the installed `executors` MCP plugin
+and the native `/agents` view. `executor_dispatch` allocates one pooled checkout
+and creates a native executor thread on the lead's app-server;
+`executor_status` and `executor_wait` provide bounded observation and result or
+question delivery; `executor_message` and `executor_reply` address native
+conversations; `executor_ask_lead` is the executor's escalation channel; and
+`executor_stop` plus `executor_resume mode=exact|fresh` provide isolated
+interruption and explicit continuation. The lead keeps one CLI view: executors
+are native threads, not per-executor terminal tabs, consoles or a file relay.
+View navigation is not a lifecycle event. The consuming project's board stays
+the durable assignment and feedback record; MCP tools are only transport.
+Completion, delivery and archival are not acceptance, merge or slot release.
+Committed base and slot preservation, partial-work preservation, explicit
+lead disposition, and the prohibition on recursive executor dispatch remain.
+The CLI lifecycle and package identifiers remain compatibility-tested but are
+not the ordinary agent workflow. Operating detail:
+[executor lifecycle](agent-delegation.md#observed-executor-lifecycle).
 
 **2026-09-27, confirmed (user decision):** the managed executor transports -
 the host's control connection to its owned app-server child and the
@@ -846,18 +854,6 @@ stays. The delivered-message fallback for an oversized final-message read and
 its output-defect scenario are removed with the limit; a read now completes or
 fails for its own reason and fails the host. Change:
 [fix executor transport size limit](../openspec/changes/archive/2026-09-27-fix-executor-transport-size-limit/proposal.md).
-
-**2026-09-25, confirmed (supersedes the 2026-09-20 text-default choice):** pooled `executor spawn`, `resume` and `restart` present the native Codex TUI by default. Explicit `spawn --mode exec` is the native inline TUI on that same observed lifecycle, not an unobserved launcher. Watch, automatic closure and exact-session `executor resume` stay the current path, and the 2026-09-24 tab-close policy still applies. Operating detail: [observed executor lifecycle](agent-delegation.md#observed-executor-lifecycle). Change: [add observed executor TUI](../openspec/changes/archive/2026-09-25-add-observed-executor-tui/proposal.md).
-
-**2026-09-24, confirmed:** a failed executor tab closes too. Windows Terminal's
-graceful close-on-exit was leaving the tab open after a non-zero host exit,
-including the frequent case where a completed turn's full-thread final-message
-read exceeds the 1 MiB transport limit and the host exited 2. The tab host
-exits 0 after the outcome is recorded so that tab closes; the receipt, detail
-file and control log remain the inspection surface, and the receipt's exit
-code is unchanged. This supersedes the earlier choice that a failure stays
-visible in the tab. A process killed before the host can exit is unchanged:
-stop still ends that host and reports a tab that did not close.
 
 **2026-09-30, confirmed:** implement the evidence-driven continuous loop with
 the supplied local model first, retaining the requirement to qualify repeated
