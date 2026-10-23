@@ -96,11 +96,13 @@ Only supported benefit and applicable integration/publication authority may
 advance an experimental baseline or live installation. Rejection retains useful
 artifacts without synchronizing the unadopted requirement delta into main specs.
 
-Reconciled 2026-10-14: the mechanism this design selected - the existing pool
-admission guard plus a process startup reservation held until the host lease -
-is already integrated through `unify-reusable-worktree-pool` task 2.2, with the
-failing pre-correction control and the corrected deterministic gate checks
-retained there. This design remains the specification of the independent
-experiment: its frozen checker, unchanged/corrected/interrupted controls and
-parent accounting have not run, so the delta is not adopted and this change
-stays open.
+Reconciled 2026-10-23: the existing pool admission guard and process startup
+reservation held until the host lease already implement this design through
+`unify-reusable-worktree-pool` task 2.2. Independent acceptance now reproduces
+claim replacement on pre-reservation `c39b2aa` and passes on product `bcfc3c2`,
+using one frozen checker with a post-claim reset gate. The gate observes the
+contender before release and accepts historical records without a startup field;
+absence alone is not a violation. See tasks.md for the checks and their limits.
+The parent experiment's comparative benefit and adoption gates remain pending.
+This workload's completed acceptance does not adopt the requirement delta or
+authorize publication of an experimental baseline.

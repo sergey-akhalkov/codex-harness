@@ -329,6 +329,13 @@ A fresh dispatch claims the first free position and binds it to the owner as a d
 
 A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through `executor release` or `codex-harness worktree release`. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets a clean/reviewed position to the chosen base and removes only that run's recorded message payloads; unrelated messages survive. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason (exit 2) rather than reported free.
 
+A missing host lease does not mean a position is free while its creator is
+starting. If a competing dispatch refuses, inspect its reported cause and
+`executor pool`; do not release or reset the position to bypass startup
+contention. An uncertain process identity preserves the reservation until its
+owner is resolved. A failed launch keeps its original error, and only a
+confirmed-dead, clean unused reservation can be recovered automatically.
+
 Ordinary tasks use the same pool without a conversation:
 
 ```powershell
