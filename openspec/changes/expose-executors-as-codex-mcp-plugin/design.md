@@ -183,6 +183,14 @@ The MCP call must not block waiting for its own recipient to answer. Native even
 
 An unanswered request keeps the run nonterminal without model keepalives. Notifications do not create a reply hold. A reply resolves its exact request and resumes the same conversation; stopping or replacing a run invalidates delivery to that old identity, not to its successor. A temporarily absent lead remains the recorded recipient until supported explicit recovery changes ownership.
 
+#### Bounded wait and result return
+
+`executor_wait` is a caller-initiated observation, not a background scheduler or a model operation. It first refreshes the existing run receipt and returns an unresolved reply-required request without continuing to the timeout. Otherwise it reads the exact executor thread through `thread/read`, with the bounded paginated `thread/turns/list` fallback when an idle read omits history, at a 100 ms interval. Every native read bound fits inside the caller's remaining deadline, and the last interval returns a timeout rather than starting a read that cannot finish. The tool sends no `turn/start`, `turn/steer`, message or model request.
+
+The receipt's accepted turn must still exist in that thread. The newest turn in the exact thread is the only one that can settle the observation, so an older completion cannot finish a continuation or a later message turn. A rejected, malformed or mismatched read remains an observation error. Failed, interrupted, present, empty and missing output are distinct outcomes, and a completion first observed after the caller's deadline is left for a later call.
+
+The inline final message is bounded to 32 KiB and names truncation; exact thread and turn identities point back to native history and `executor_status` after UI navigation. The longest wait is 55 seconds because one MCP tool request has a 60-second transport deadline. The wait occupies only the calling MCP operation; executor questions and notices use their own tool connection in the exercised two-process path. Installed-runtime sharing of that connection remains part of the installed acceptance task. Result notices reuse the existing `executor_message` notification path and its recorded client identity; a retry reuses the receipt entry, and delivery means the item is present in the lead's native history, not that the lead read or applied it.
+
 ### 5. Shared runtime lifetime is separate from executor outcome
 
 A native turn/result determines an executor outcome; app-server exit does not. Keep the existing distinction between completion, output defect, failure, stopped state and lead acceptance. Preserve the bounded result and native detail locator after UI navigation. Multiple user/tool turns in the same thread must not let an earlier completion finish newer work.
