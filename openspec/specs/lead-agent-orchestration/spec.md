@@ -462,6 +462,8 @@ The existing dispatch and receipt owners SHALL distinguish request acceptance, t
 
 For managed TUI runs, `executor watch` SHALL retain its existing receipt/slot addressing, options, blocking behavior, timeout behavior, bounded text/JSON review result and exit meanings: 0 for completion, 1 for an unsuccessful terminal outcome, and 2 for timeout or unavailable coverage. Native TUI presentation SHALL NOT by itself make coverage unavailable. Watch SHALL learn completion from the current run's correlated native outcome with the final result or output defect preserved, independently of the frontend's willingness to exit. Prior-session or prior-turn events, quiet output and frontend process termination alone SHALL NOT establish successful completion. A timeout SHALL NOT stop the run. No model-side status polling, periodic model messages, terminal scraping or manual rollout search SHALL be required to wait. A lost host or connection SHALL remain diagnosable and SHALL NOT be reported as success or leave waiting unbounded beyond the requested timeout. Historical receipts SHALL remain honestly readable without inventing missing coverage.
 
+A native turn-completion observation SHALL NOT authorize a successful watch return while the current host outcome or retained final result is still pending. Watch SHALL continue observing that same run until its finalized success or output defect is available, an original failure is established, or the requested timeout expires. Waiting reports SHALL identify pending finalization without treating quiet output, a missing exit status or an absent result file as proof of success. Finalized success SHALL include the recorded successful exit status and readable bounded result; it SHALL NOT depend on the frontend closing.
+
 Additional reply-workflow observation SHALL extend this base contract without replacing it. A native turn ending while a required reply remains unresolved SHALL report the workflow's nonterminal waiting result rather than completion or empty-output defect. Its action-required result SHALL NOT change the meanings of completion, failure and timeout/unavailable results above or authorize slot release.
 
 #### Scenario: Terminal opens but native start fails
@@ -503,6 +505,21 @@ Additional reply-workflow observation SHALL extend this base contract without re
 
 - **WHEN** a resumed session or a newly accepted turn receives history or terminal events from earlier work
 - **THEN** watch remains bound to the current run and accepted work until its own terminal outcome or an observed failure is established
+
+#### Scenario: Turn completion precedes host finalization
+
+- **WHEN** the current run reports native turn completion while its final exit status and result are not yet retained
+- **THEN** the same watch call continues observing that run and does not return successful completion or an output defect merely because finalization is pending
+
+#### Scenario: Finalization completes during watch
+
+- **WHEN** that run subsequently retains its successful host outcome and nonempty final result before the requested timeout
+- **THEN** watch returns success with the same run identity, actual exit status and retained bounded result in either text or JSON mode
+
+#### Scenario: Finalization remains incomplete at the timeout
+
+- **WHEN** the requested timeout expires while completion finalization remains unverified
+- **THEN** watch returns the existing timeout or unavailable result with an explicit finalization cause, preserves the run and its original diagnostics, and neither reports success nor dispatches another model request
 
 ### Requirement: Concise titles and four executor slots
 
