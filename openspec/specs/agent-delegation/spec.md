@@ -98,7 +98,7 @@ The lead and task runtime SHALL distinguish unavailable access from insufficient
 
 ### Requirement: Bounded collaboration and verification
 
-Each workstream SHALL receive a concise objective, sufficient inputs, dependencies, ownership of files and mutable runtime resources, constraints, acceptance checks, an integration consumer, a completion or return condition, and the synchronized base revision of its checkout. Independent edits SHALL use disjoint scopes and, when checkout isolation is needed, the common harness pool defined by `isolated-worktree-workflow`. Executor dispatch SHALL acquire through that pool before launching the session; a task-created ordinary or Codex-managed worktree SHALL NOT substitute for the recorded pool binding. An executor SHALL verify that its checkout HEAD equals the base named in its brief before substantive edits and SHALL stop and report a mismatch instead of repairing synchronization, copying files from another checkout or creating a substitute worktree; changed tracked inputs reach an assignment through a new committed base and a redispatch. Shared desktop sessions, services, installed directories and devices SHALL have one interaction owner, isolated allocation or serialized use; a separate checkout SHALL NOT imply runtime isolation. Executors SHALL report changed files or other concrete results, relevant decisions, checks, validity conditions, restoration state and unresolved issues concisely, with details available on demand under the owning retention policy. The active lead SHALL verify important risks and the combined result without routinely repeating completed investigation or every worker check. A supporting result SHALL count as delivered only after its intended consumer uses it and applicable integrated acceptance passes. The task-wide concurrency limit SHALL come from the orchestration configuration; leadership changes SHALL NOT multiply that limit. Workers SHALL NOT create unsolicited recursive agent trees. Executor sessions SHALL run as single-agent workers: dispatch, resume and instruction-refresh succession SHALL launch them with Codex CLI's built-in agent-capability switch disabled (`agents.enabled = false`), so the session tool set contains no agent-spawning or agent-messaging tools and the session receives no multi-agent usage instructions, whatever the selected model catalog advertises. The installed launcher SHALL apply the same switch to any Codex process started in an executor-marked environment, including a raw nested `codex` invocation. The kit's executor dispatch commands SHALL refuse to run inside an executor session with a concrete error that names the lead as the owner of further delegation. An executor that needs another agent or executor SHALL report that need to the lead instead of creating one. Configured controls SHALL be distinguished from advisory time/token budgets; unsupported hard reasoning-token caps SHALL NOT be claimed.
+Each workstream SHALL receive a concise objective, sufficient inputs, dependencies, ownership of files and mutable runtime resources, constraints, acceptance checks, an integration consumer, a completion or return condition, and the synchronized base revision of its checkout. Independent edits SHALL use disjoint scopes and, when checkout isolation is needed, the common harness pool defined by `isolated-worktree-workflow`. Executor dispatch SHALL acquire through that pool before launching the session; a task-created ordinary or Codex-managed worktree SHALL NOT substitute for the recorded pool binding. An executor SHALL verify that its checkout HEAD equals the base named in its brief before substantive edits and SHALL stop and report a mismatch instead of repairing synchronization, copying files from another checkout or creating a substitute worktree; changed tracked inputs reach an assignment through a new committed base and a redispatch. Shared desktop sessions, services, installed directories and devices SHALL have one interaction owner, isolated allocation or serialized use; a separate checkout SHALL NOT imply runtime isolation. Executors SHALL report changed files or other concrete results, relevant decisions, checks, validity conditions, restoration state and unresolved issues concisely, with details available on demand under the owning retention policy. The active lead SHALL verify important risks and the combined result without routinely repeating completed investigation or every worker check. A supporting result SHALL count as delivered only after its intended consumer uses it and applicable integrated acceptance passes. The task-wide concurrency limit SHALL come from the orchestration configuration; leadership changes SHALL NOT multiply that limit. Workers SHALL NOT create unsolicited recursive agent trees. Executor sessions SHALL run as single-agent workers: dispatch, continuation and instruction-refresh succession SHALL disable Codex's built-in descendant-agent capabilities, so native agent-spawning tools and unrelated multi-agent instructions are absent whatever the selected model catalog advertises. Authenticated MCP communication with the originating lead SHALL remain available under `executor-mcp-plugin`; disabling native agent capabilities SHALL NOT disable that required channel. The installed launcher SHALL apply the same switch to any Codex process started in an executor-marked environment, including a raw nested `codex` invocation. The kit's executor dispatch interfaces SHALL refuse to run inside an executor session with a concrete error that names the lead as the owner of further delegation. An executor that needs another agent or executor SHALL report that need to the lead instead of creating one. Configured controls SHALL be distinguished from advisory time/token budgets; unsupported hard reasoning-token caps SHALL NOT be claimed.
 
 #### Scenario: Parallel work is integrated
 - **WHEN** two executors handle independent workstreams
@@ -122,7 +122,7 @@ Each workstream SHALL receive a concise objective, sufficient inputs, dependenci
 
 #### Scenario: An executor has no agent tools
 - **WHEN** an executor session starts under a profile whose model catalog advertises multi-agent support
-- **THEN** its provider request advertises no agent-spawning or agent-messaging tools, its instructions contain no multi-agent usage guidance, and a dispatch command invoked from its shell is refused with the lead named as the owner of further delegation
+- **THEN** its provider request advertises no native agent-spawning or native cross-agent messaging tools, authenticated MCP communication with its own lead remains usable, unrelated multi-agent usage guidance is absent, and attempted descendant dispatch is refused with the lead named as its owner
 
 #### Scenario: One isolation contract across task types
 - **WHEN** a workstream changes from a main-session experiment to an executor assignment
@@ -158,7 +158,7 @@ Sources and setup SHALL activate through the existing linked global lifecycle fo
 
 #### Scenario: A new external session starts
 - **WHEN** the kit is installed and ordinary Codex starts outside this repository
-- **THEN** the delegation policy, the `team-lead` skill, orchestration role configuration, board availability, explicit model/effort selection, per-conversation titled terminal views and task recovery are usable without copying sources or repeatedly performing manual setup
+- **THEN** the delegation policy, the `team-lead` skill, orchestration role configuration, board availability, explicit model/effort selection, distinct native conversations inspectable through /agents in the same CLI and task recovery are usable without copying sources or repeatedly performing manual setup
 
 #### Scenario: Subscription integration is disconnected
 - **WHEN** its lifecycle is exercised in an isolated installation
@@ -186,11 +186,11 @@ The primary agent SHALL verify that a delegated or directly isolated supporting 
 
 ### Requirement: Visibility policy does not capture conversation pixels
 
-The requirement that every active model conversation appear on its own visible terminal surface - a dedicated titled tab, a pane or a window - SHALL remain a native UI or controller obligation, established by the owning dispatch command before the first model request. A titled terminal tab per conversation SHALL satisfy the requirement; simultaneous on-screen tiling SHALL NOT be required. Until that capability is available, agents SHALL keep execution in the already visible main conversation and MUST NOT start hidden model processes. They MUST NOT satisfy the visibility rule by taking screenshots of Codex or other agent windows, sending those images to a model, or polling window pixels for status, and they MUST NOT resize, move or arrange desktop windows - including the terminal they run in - to make conversations fit the screen. Missing views SHALL be reported as an unavailable controller capability and restored through the owning dispatch command, not as a Nuphus visual or window-management task.
+Visibility of each active model conversation SHALL remain a native UI or controller obligation established before its first model request. For MCP executors, distinct titled conversations accessible through the same CLI's native /agents interface SHALL satisfy this obligation without separate terminal surfaces or simultaneous display. Until required native access is available, agents SHALL keep acceptance-independent work in the already visible main conversation and MUST NOT start hidden model processes. They MUST NOT satisfy visibility by screenshots of Codex or other agent windows, sending those images to a model, polling window pixels, or resizing, moving or arranging desktop windows. Ordinary conversation navigation SHALL NOT count as lost visibility. Lost controlling CLI access SHALL be reported and restored by its owning runtime path, not treated as a desktop visual task.
 
 #### Scenario: A child conversation needs a separate view
-- **WHEN** a lead would dispatch a child and no titled terminal surface for it is established by the dispatch command
-- **THEN** it reports the missing view, keeps the work in the visible main conversation or waits for the controller, and neither screenshots existing Codex windows nor rearranges desktop windows
+- **WHEN** a lead would dispatch an executor and its distinct conversation cannot be made accessible through the controlling CLI's native interface
+- **THEN** it reports the missing capability before model work and preserves the existing work without hidden dispatch, screenshots or desktop rearrangement
 
 #### Scenario: Window identity is needed for an owned desktop target
 - **WHEN** an authorized desktop task needs to select a non-Codex window
@@ -228,17 +228,16 @@ and reasoning effort SHALL be that assignment's complete explicit selection.
 The absence of per-assignment model or effort arguments on executor dispatch
 SHALL NOT be treated as a conflict with any selection rule, capability ceiling
 or session instruction; explicit per-task model and effort selection applies
-to ordinary in-session agents, not to kit executor dispatch. The configured
-executor set - currently the single `ds` profile binding DeepSeek V4.1-Flash
-at `max` - SHALL be dispatched exactly as configured with no substitute
-model, effort or profile, and a single configured executor profile SHALL be
+to ordinary in-session agents, not to kit executor dispatch. The selected allowed profile, or the configured executor default when omitted,
+SHALL be dispatched exactly as configured with no substitute model, provider,
+effort, billing route or profile, and a single configured executor profile SHALL be
 treated as normal full delegation capacity, not as reduced capability that
 justifies keeping executor-suitable work with the lead. Instruction or
 preference wording that appears to restrict delegation (model preferences,
 effort rules, routing guidance, unknown quota) SHALL bound only which
 configured session runs the work and SHALL NOT justify withholding a
 dispatch; the discrepancy SHALL be reported while dispatch proceeds. Only a
-concrete dispatch failure reported by the launcher or installation check
+concrete dispatch failure reported by the dispatch interface or installation check
 SHALL block dispatch, and it SHALL be reported with its exact cause and
 remedy instead of silent solo continuation.
 
@@ -247,7 +246,7 @@ remedy instead of silent solo continuation.
 - **THEN** the profile's configured model and effort are the assignment's explicit selection, the dispatch proceeds without per-assignment model or effort arguments, and no rule conflict is reported
 
 #### Scenario: A single executor profile is full capacity
-- **WHEN** `orchestration.toml` configures exactly one executor profile (`ds`, DeepSeek V4.1-Flash, `max`) and executor-suitable work exists
+- **WHEN** `orchestration.toml` configures exactly one executor profile and executor-suitable work exists
 - **THEN** the lead dispatches that work to the configured profile and does not treat the single profile, its model or its effort as a reason to keep the work solo or to wait for another route
 
 #### Scenario: Conflicting routing wording is reported, not obeyed
@@ -256,36 +255,7 @@ remedy instead of silent solo continuation.
 
 #### Scenario: Only a verified dispatch failure blocks
 - **WHEN** executor dispatch is withheld
-- **THEN** the blocking cause is a concrete launcher- or installation-check-reported failure (for example a missing profile, a stale build, an occupied pool or a fetch failure) with its exact cause and remedy reported, and unverified quota, routing or rule-conflict interpretations are not blockers
-
-### Requirement: Interrupted pooled executors resume through the pooled command
-
-The kit SHALL provide an executor dispatch that continues one exact
-interrupted pooled session on its recorded pool slot without resynchronizing
-that slot: no fetch, reset, clean or base change SHALL occur between the
-interruption and the resumed session. The command SHALL require the exact
-session id, the explicit slot index and the owner id; it SHALL refuse a live
-owner and any slot claimed by a different owner, and it SHALL adopt a slot
-whose owner was cleared by reconciliation only for the explicitly named slot
-and owner. The resumed session SHALL run through the same receipt, lease,
-terminal and console hosts as a fresh dispatch, and its child invocation
-SHALL use the verified non-interactive resume argument order.
-
-#### Scenario: Partial work survives the resume
-- **WHEN** an interrupted executor slot holds uncommitted partial work and the lead resumes its exact session on that slot
-- **THEN** the slot is rebound without reset or clean, the partial work is still present when the resumed session starts, and the recorded base is unchanged
-
-#### Scenario: A reconciled slot is adopted explicitly
-- **WHEN** the interrupted session's host is gone and reconciliation cleared the slot record's owner
-- **THEN** resume with that slot index and owner id rebinds the slot and records the lease, instead of failing an ownership comparison
-
-#### Scenario: Another owner's claim is refused
-- **WHEN** the named slot is bound to a different owner or the requested owner is already live
-- **THEN** resume refuses with both identities named and no tree state changes
-
-#### Scenario: Hand-edited receipts fail with a remedy
-- **WHEN** `executor run --file` receives a receipt whose owner differs from an unowned slot record
-- **THEN** the failure names the pooled spawn or resume command for that slot instead of only the owner mismatch
+- **THEN** the blocking cause is a concrete dispatch- or installation-check-reported failure (for example a missing profile, a stale build, an occupied pool or a fetch failure) with its exact cause and remedy reported, and unverified quota, routing or rule-conflict interpretations are not blockers
 
 ### Requirement: Executable autonomous outcome assignments
 
@@ -319,35 +289,11 @@ Acceptance SHALL compare a minimal comparable set of baseline and candidate task
 - **WHEN** accepted behavior is verified but comparable lead or executor accounting is unavailable
 - **THEN** the result reports verified properties and missing metrics without inventing savings or weakening acceptance
 
-### Requirement: Addressed executor message and stop commands
-
-The delegation kit SHALL expose an executor message command and an executor stop command that address one pooled executor run through the accepted checkout, slot, owner and exact recorded session identity, each of which MAY be supplied explicitly or resolved from recorded state when omission leaves exactly one live run. Executor message SHALL additionally accept a verified `--reply-to MESSAGE_ID` that resolves the original sender without those manual address fields. Both commands SHALL verify the addressed run's actual identity and lifecycle before acting, SHALL behave deterministically for completed, stopped, interrupted or unavailable runs by reporting the observed state with a supported next action, and SHALL NOT start a new conversation, reset or clean the slot, or release it automatically. A waiting-for-reply run SHALL remain live and directly addressable, and a correlated reply SHALL continue that same conversation without a separate resume command. Message content SHALL be accepted as a short literal text, a UTF-8 file containing multiline text, or the full UTF-8 content of piped standard input, and a payload above the inline delivery bound SHALL be delivered automatically through the harness-owned spill pointer rather than refused. Message delivery SHALL preserve the run's conversation, model, provider, reasoning effort and partial work, and stop SHALL preserve the run's files and slot for explicit continuation. The commands SHALL use the existing executor receipt, task-state, terminal-surface and process-tree owners rather than a parallel executor-management or reporting system, and their results SHALL be available to the calling lead after the run's terminal tab closes.
-
-#### Scenario: Message uses the existing owners
-- **WHEN** the lead messages a running pooled executor
-- **THEN** addressing, delivery recording and visibility reuse the dispatch receipt, kit-local task state and the run's existing terminal surface rather than a second tracking system
-
-#### Scenario: Message addresses a unique live run with no flags
-- **WHEN** the lead runs the executor message command with only piped content while exactly one pooled run is live
-- **THEN** the command resolves that run from the recorded pool identity and delivers into its exact live conversation
-
-#### Scenario: Reply does not require manual resume
-- **WHEN** a lead answers its executor's unresolved request through the supplied reply reference
-- **THEN** the existing live waiting conversation receives the answer and continues in place without requiring the lead to reconstruct an address or run executor resume
-
-#### Scenario: Stop keeps the slot occupied
-- **WHEN** an executor is stopped mid-task with uncommitted changes in its slot
-- **THEN** the slot remains bound for the lead's explicit continuation or release decision and the changes are still present
-
-#### Scenario: Instructions name the commands and selection rules
-- **WHEN** a new lead session reads the installed kit instructions
-- **THEN** the executor usage, delegation guide and team-lead workflow name both commands and the message-versus-stop selection rules, including using the kit's standard commands before manual process killing and preserving partial work after a stop
-
 ### Requirement: Stop observed executors on runtime-proven sustained cache loss
 
 Observed managed executor runs SHALL stop automatically when a previously warmed cache suffers three consecutive large misses, regardless of the configured provider or model. Warmup SHALL require a recorded response with at least 100,000 input tokens and at least 90 percent cached input, and SHALL be the runtime proof that this policy applies to that run. The mere presence of a cached-input field, provider branding, or a static model allowlist SHALL NOT establish support. Each qualifying miss SHALL have at least 100,000 uncached input tokens and at least 50 percent uncached input. A valid intervening response below either miss threshold SHALL reset the consecutive count. Cold starts, never-warmed runs, and duplicate usage records SHALL NOT trigger a stop.
 
-The policy SHALL cover the current control-backed spawn and observed exact-session resume routes for every configured executor profile. It SHALL use recorded per-response input and cached-input counters for the exact native session, without decoding reasoning or sending model requests for monitoring. Historical usage on explicit resume MAY establish warmup but SHALL NOT count as new misses. Missing or invalid counters SHALL NOT be invented; unavailable, invalid, or never-proven coverage SHALL be reported with the run's actual resolved provider and model. Monitoring SHALL consume appended data in bounded reads triggered by filesystem/native events and SHALL cover delayed filesystem notifications with a one-second open-file size reconciliation, without periodically rereading unchanged rollout contents. At detection the host SHALL terminate its owned process tree before potentially blocking control acknowledgments or receipt writes, without waiting for model work, tests or builds to finish. Usage only becomes available after a response; this policy SHALL NOT claim a hard spending cap or zero further in-flight requests.
+The policy SHALL cover the MCP dispatch and observed exact-session continuation routes for every configured executor profile. It SHALL use recorded per-response input and cached-input counters for the exact native session, without decoding reasoning or sending model requests for monitoring. Historical usage on explicit resume MAY establish warmup but SHALL NOT count as new misses. Missing or invalid counters SHALL NOT be invented; unavailable, invalid, or never-proven coverage SHALL be reported with the run's actual resolved provider and model. Monitoring SHALL consume appended data in bounded reads triggered by filesystem/native events and SHALL cover delayed filesystem notifications with a one-second open-file size reconciliation, without periodically rereading unchanged rollout contents. At detection the controller SHALL urgently interrupt the verified native thread and contain that run's owned child work before potentially blocking acknowledgments or receipt writes, without waiting for model work, tests or builds to finish. It SHALL preserve the shared runtime, lead and other executors; terminating a shared app-server SHALL NOT be an acceptable stop mechanism. Usage only becomes available after a response; this policy SHALL NOT claim a hard spending cap or zero further in-flight requests.
 
 #### Scenario: Filesystem notifications are delayed
 - **WHEN** the native writer has appended readable usage but Windows has not delivered a file-change notification
@@ -356,12 +302,12 @@ The policy SHALL cover the current control-backed spawn and observed exact-sessi
 
 #### Scenario: A non-DeepSeek provider proves cache warmup
 - **WHEN** an executor on any configured provider records a response meeting the warmup thresholds and then three consecutive distinct responses cross both miss thresholds
-- **THEN** the executor stops its owned child tree and reports the provider/model, input, cached-input, and miss evidence with the same partial-work guarantees as any other supported run
+- **THEN** the executor stops its exact thread and owned child work and reports the provider/model, input, cached-input, and miss evidence with the same partial-work guarantees as any other supported run
 
 #### Scenario: Warmed cache repeatedly fails
 - **WHEN** three consecutive distinct responses after warmup cross both miss thresholds
-- **THEN** the executor stops its owned child tree, reports the input/cache-miss evidence and retains its session, checkout, slot binding and partial work
-- **AND** the receipt and watch result report a non-success outcome and an explicit continuation remedy, without a fallback model or automatic retry
+- **THEN** the executor stops its exact thread and owned child work, reports the input/cache-miss evidence and retains its session, checkout, slot binding and partial work
+- **AND** the receipt and MCP observation result report a non-success outcome and an explicit continuation remedy, without a fallback model or automatic retry
 
 #### Scenario: Cold start or temporary miss
 - **WHEN** the cache has not warmed, a below-threshold response interrupts a sequence of fewer than three qualifying misses, or numeric counters never establish a warmed response
@@ -372,7 +318,7 @@ The policy SHALL cover the current control-backed spawn and observed exact-sessi
 - **THEN** historical losses and foreign-session counters do not cause a stop, while new qualifying losses after historical warmup do
 
 #### Scenario: Cleanup is incomplete
-- **WHEN** the policy triggers but termination cannot verify that the owned tree is empty
+- **WHEN** the policy triggers but interruption and containment cannot verify that the target's owned work has ended
 - **THEN** the run reports a partial stop with its cleanup cause instead of claiming that spending has stopped
 
 #### Scenario: No usable usage evidence
@@ -383,7 +329,7 @@ The policy SHALL cover the current control-backed spawn and observed exact-sessi
 
 The managed executor host SHALL distinguish routine cache-guard status, degraded cache-guard coverage, and a terminal cache-loss stop. Routine status transitions SHALL be recorded in the run receipt and host log without becoming user-facing warnings. Degraded coverage diagnostics SHALL be delivered through Codex's native warning presentation when a native frontend is attached, so they participate in the frontend's warning count and viewer rather than being written directly into the terminal input area. The host SHALL record whether each degraded diagnostic was delivered natively, could not be delivered, or had no native warning consumer. A delivery failure SHALL NOT be reported as a shown warning, and a compatibility surface without a native warning consumer SHALL use only its existing receipt/log surface.
 
-A terminal cache-loss stop SHALL retain its non-success outcome, stop cause, bounded evidence, and explicit recovery command; it SHALL NOT be represented as a dismissible warning that replaces the existing result.
+A terminal cache-loss stop SHALL retain its non-success outcome, stop cause, bounded evidence, and explicit MCP recovery action; it SHALL NOT be represented as a dismissible warning that replaces the existing result.
 
 #### Scenario: Degraded coverage is visible in the native warning viewer
 - **WHEN** exact-session usage becomes invalid or unavailable while a native executor frontend is attached
@@ -405,12 +351,12 @@ A terminal cache-loss stop SHALL retain its non-success outcome, stop cause, bou
 
 #### Scenario: Cache loss terminates the run
 - **WHEN** runtime-proven sustained cache loss triggers the stop policy
-- **THEN** the native surface, receipt, and watch result report the stop cause and recovery path as a non-success terminal outcome
+- **THEN** the native surface, receipt, and MCP observation result report the stop cause and recovery path as a non-success terminal outcome
 - **AND** that outcome is not reduced to a warning-list entry without result state
 
 ### Requirement: Recover cache-stopped work in a fresh conversation without losing progress
 
-The cache-stop receipt and watcher SHALL give the lead an actionable fresh-session recovery command for the same verified slot, owner and predecessor session. `executor restart` SHALL preserve the original worktree, commits, uncommitted and untracked files and saved verification evidence without resetting, cleaning or releasing the slot. It SHALL refuse a stale predecessor identity or a live owner. It SHALL start a new conversation with the configured model binding, original assignment and bounded visible progress, retain the predecessor rollout for targeted lookup, and require verification of interrupted commands before reusing results. Missing original assignment SHALL require explicit assignment input rather than inventing a new task. Recovery SHALL NOT resume the old full context or automatically loop after repeated cache failures.
+The cache-stop receipt and MCP observation SHALL give the lead an actionable fresh-conversation recovery operation for the same verified slot, owner and predecessor session. MCP fresh recovery SHALL preserve the original worktree, commits, uncommitted and untracked files and saved verification evidence without resetting, cleaning or releasing the slot. It SHALL refuse a stale predecessor identity or a live owner. It SHALL start a new conversation with the configured model binding, original assignment and bounded visible progress, retain the predecessor rollout for targeted lookup, and require verification of interrupted commands before reusing results. Missing original assignment SHALL require explicit assignment input rather than inventing a new task. Recovery SHALL NOT resume the old full context or automatically loop after repeated cache failures.
 
 #### Scenario: Stop during a build and continue the original task
 - **WHEN** a cache-stopped executor leaves completed edits and an interrupted build, and the lead requests restart for the recorded predecessor
@@ -423,17 +369,17 @@ The cache-stop receipt and watcher SHALL give the lead an actionable fresh-sessi
 
 ### Requirement: Concise executor clarification instructions
 
-Every newly spawned executor SHALL receive concise installed guidance for `codex-harness lead message` in both free-text and structured assignment paths. Supported continuation paths SHALL retain current guidance without duplicating whole manuals. The guidance SHALL explain that the command automatically addresses the originating lead, questions request replies by default, waiting keeps the session and worktree available without a manual keep-alive loop, independent authorized work can continue, and `--notify` is available when no reply is needed. Executors SHALL use this channel exceptionally for a material ambiguity, authority/access boundary or concrete dependency they cannot resolve after inspecting available facts. They SHALL NOT use it for routine progress, repeated status messages or ordinary implementation errors they can correct. Durable task state and decisions SHALL remain on the existing bd board. The mechanism SHALL NOT enable native agent-spawning tools, recursive delegation or arbitrary agent messaging.
+Every newly spawned executor SHALL receive concise installed guidance for the installed MCP communication tool in both free-text and structured assignment paths. Supported continuation paths SHALL retain current guidance without duplicating whole manuals. The guidance SHALL explain that the tool automatically addresses the originating lead, questions request replies by default, waiting keeps the session and worktree available without a manual keep-alive loop, independent authorized work can continue, and a notification mode is available when no reply is needed. Executors SHALL use this channel exceptionally for a material ambiguity, authority/access boundary or concrete dependency they cannot resolve after inspecting available facts. They SHALL NOT use it for routine progress, repeated status messages or ordinary implementation errors they can correct. Durable task state and decisions SHALL remain on the existing bd board. The mechanism SHALL NOT enable native agent-spawning tools, recursive delegation or arbitrary agent messaging.
 
-The combined required owned guidance for the exchange SHALL NOT grow when superseded escalation/addressing instructions are removed. Accounting SHALL include generated briefs, skill bodies and required references/help for the same assignment inputs. Instructions SHALL explain the watch action-required result without teaching lifecycle bookkeeping or requiring another polling loop.
+The combined required owned guidance for the exchange SHALL NOT grow when superseded escalation/addressing instructions are removed. Accounting SHALL include generated briefs, skill bodies and required references/help for the same assignment inputs. Instructions SHALL explain the action-required observation result without teaching lifecycle bookkeeping or requiring another polling loop.
 
 #### Scenario: Free-text assignment asks a legitimate question
-- **WHEN** an executor started with `--exec` encounters an unresolved material acceptance ambiguity
-- **THEN** its injected guidance identifies the minimal lead message command and explains how to await an answer while preserving the bd assignment and independent authorized work
+- **WHEN** an executor started with a free-text assignment encounters an unresolved material acceptance ambiguity
+- **THEN** its injected guidance identifies the MCP question operation and explains how to await an answer while preserving the bd assignment and independent authorized work
 
 #### Scenario: Structured assignment needs missing authority
-- **WHEN** an executor started with `--assignment` reaches an authority boundary it cannot resolve
-- **THEN** it knows to contact its own lead through lead message, records the blocker on bd, and keeps the decision-dependent action pending
+- **WHEN** an executor started with a structured assignment reaches an authority boundary it cannot resolve
+- **THEN** it knows to contact its own lead through MCP, records the blocker on bd, and keeps the decision-dependent action pending
 
 #### Scenario: An ordinary implementation error occurs
 - **WHEN** the executor encounters a syntax error or API mismatch that its available tools can investigate
@@ -441,61 +387,21 @@ The combined required owned guidance for the exchange SHALL NOT grow when supers
 
 #### Scenario: Lead receives a clarification request
 - **WHEN** the lead receives a message envelope from one of its spawned executors
-- **THEN** its installed guidance explains the injected sender/worktree metadata and one-command reply, preserves the capable executor's ownership and directs durable decisions back to bd
+- **THEN** its installed guidance explains the injected sender/worktree metadata and direct MCP reply, preserves the capable executor's ownership and directs durable decisions back to bd
 
 #### Scenario: Waiting needs no instruction ritual
 - **WHEN** a request remains unanswered after the executor has no independent work
 - **THEN** the executor can end the current turn and rely on the native-backed lifecycle rather than running repeated sleeps, status questions, receipt edits or additional model turns to stay available
 
-### Requirement: Globally usable native-backed lead exchanges
-
-The kit SHALL deliver lead messaging, reply addressing, waiting behavior, help and instructions through its existing installation/update/recovery lifecycle. Fresh supported lead and executor sessions outside the kit checkout SHALL be able to complete a question, waiting and reply round trip using the installed entry points, preserving the same native sessions, worktrees and actual configured models/providers/efforts. Normal operation SHALL require no private endpoint setup, manually copied IDs or kit checkout access. Installed acceptance SHALL include actual model-visible receipt of the question and reply and continued executor work; a mock-only test, help output or successful local record write SHALL NOT establish that result. Existing explicitly addressed executor message and stop commands SHALL remain usable, and unrelated tools/settings and existing recovery guarantees SHALL be preserved.
-
-#### Scenario: Fresh installed consumer completes the exchange
-- **WHEN** an ordinary installed lead spawns an executor in an external consuming project and that executor requests a decision
-- **THEN** the lead sees the question with accurate metadata, answers with the supplied reply reference, and the same waiting executor receives the answer and continues its assigned work without resume or another conversation
-
-#### Scenario: Existing session lacks the new binding
-- **WHEN** a legacy executor without a verified originating relationship attempts lead messaging
-- **THEN** the command reports the missing binding and supported recovery instead of fabricating a lead from local state, and unrelated installed functionality remains usable
-
-### Requirement: Minimal delegation command forms in guidance
-
-The kit's generated executor guidance, team-lead workflow, CLI help and
-delegation reference SHALL teach the minimal command forms as the first
-choice: message content piped on standard input, automatic delivery of
-oversized messages through the harness-owned spill, and lead-side addressing
-with no copied checkout, home, slot, owner or session values when recorded
-state identifies the run. Guidance SHALL state that no message size or
-transport limit needs to be known before sending, SHALL name the explicit
-forms as fallbacks for disambiguation and scripting, and SHALL keep the
-existing message-versus-stop selection rules unchanged. Replacing path-heavy
-instructions with the minimal forms SHALL NOT grow the combined required
-guidance load across generated briefs, the team-lead skill and required
-references, and no instruction surface SHALL require a caller to construct a
-temporary file to send a long message.
-
-#### Scenario: A lead steers without copying addresses
-- **WHEN** a lead session reads the installed workflow guidance and must correct its single live executor
-- **THEN** the documented first-choice command pipes the correction with no address fields and no content file, and the guidance identifies the explicit address flags only as the disambiguation and scripting form
-
-#### Scenario: An executor asks without size knowledge
-- **WHEN** an executor consults its injected brief before escalating a material ambiguity to the lead
-- **THEN** the brief shows the piped or short-text message form without any file-creation step, size rule or transport detail, and preserves the existing exceptional-use boundaries
-
-#### Scenario: Guidance does not grow
-- **WHEN** the minimal forms replace the prior path-heavy command examples across the generated brief, skill and references
-- **THEN** the combined required guidance load for the same assignment inputs is not larger than before the change
-
 ### Requirement: Concise guidance relies on executable mechanics
 
-Owned delegation guidance SHALL state when to delegate, the assignment and acceptance contract, the supported commands and recovery decisions. Deterministic path, routing, lifecycle, ownership, delivery and cleanup checks already guaranteed by those commands SHALL NOT require the agent to repeat their implementation as a manual checklist. Shortening SHALL preserve model selection, visibility, board ownership, escalation, partial-work protection and complete acceptance.
+Owned delegation guidance SHALL state when to delegate, the assignment and acceptance contract, the supported MCP tools and recovery decisions. Deterministic path, routing, lifecycle, ownership, delivery and cleanup checks already guaranteed by those tools SHALL NOT require the agent to repeat their implementation as a manual checklist. Shortening SHALL preserve model selection, visibility, board ownership, escalation, partial-work protection and complete acceptance.
 
-The combined affected owned instructions SHALL decrease in both UTF-8 bytes and whitespace-delimited words from an identified baseline. For the same representative ordinary-task, lead-dispatch, executor-reply and recovery scenarios, the required instruction load SHALL NOT grow. Accounting SHALL include global/developer instructions, skill metadata and bodies, required references, generated briefs and mandatory command guidance; moving text among those surfaces SHALL NOT hide growth. User assignment payloads SHALL be held constant. Protected external instructions SHALL remain unchanged and separately identified. Less text SHALL be accompanied by successful use of the actual commands, not a wording-only test.
+The combined affected owned instructions SHALL decrease in both UTF-8 bytes and whitespace-delimited words from an identified baseline. For the same representative ordinary-task, lead-dispatch, executor-reply and recovery scenarios, the required instruction load SHALL NOT grow. Accounting SHALL include global/developer instructions, skill metadata and bodies, required references, generated briefs and mandatory tool guidance; moving text among those surfaces SHALL NOT hide growth. User assignment payloads SHALL be held constant. Protected external instructions SHALL remain unchanged and separately identified. Less text SHALL be accompanied by successful use of the actual installed tools, not a wording-only test.
 
 #### Scenario: An executor needs clarification
 - **WHEN** a spawned executor uses the shortened instructions to ask its lead and consume a reply
-- **THEN** it uses the supported minimal commands and automatic lifecycle, without reconstructing addresses, polling the model or losing its work, and the lead still applies the acceptance rules
+- **THEN** it uses the supported MCP operations and automatic lifecycle, without reconstructing addresses, polling the model or losing its work, and the lead still applies the acceptance rules
 
 #### Scenario: A checklist is moved to a mandatory reference
 - **WHEN** an instruction revision shortens a skill by adding a required reference or expanding its generated brief

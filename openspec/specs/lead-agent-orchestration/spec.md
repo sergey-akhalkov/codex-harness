@@ -50,14 +50,14 @@ integration, acceptance and work that genuinely exceeds executor capability,
 delegates the remaining parallelizable implementation work, and creates no
 manufactured slices or delegation-count targets. The skill SHALL own the lead
 workflow instructions: role configuration discovery, board setup and
-inspection, specification creation, executor briefs through harness commands,
+inspection, specification creation, executor briefs through the installed MCP interface,
 steering, acceptance, merge and explicit stop. Global instructions SHALL
 point to the skill without duplicating its workflow. Leaving the role or
 stopping orchestration SHALL remain explicit and preserve partial work.
 
 #### Scenario: A lead session is activated
 - **WHEN** the user invokes the `team-lead` skill with a stage goal in a consuming project
-- **THEN** the session reads the validated role configuration, prepares the board records and dispatches executors through harness commands, while sessions without activation behave as before
+- **THEN** the session reads the validated role configuration, prepares the board records and dispatches executors through the installed MCP interface, while sessions without activation behave as before
 
 #### Scenario: A user executor request activates the role
 - **WHEN** the user asks to use executors for the current work, or asks why executors are unused, without naming the `team-lead` skill
@@ -85,26 +85,26 @@ stopping orchestration SHALL remain explicit and preserve partial work.
 
 ### Requirement: Isolated and visible executor sessions
 
-Every executor assignment SHALL run a native `codex --profile <id>` session on its own visible terminal surface - a dedicated titled tab, a pane or a window - established by the dispatch command before its first model request, and in a harness-owned pool worktree that the dispatch command selects, synchronizes and binds to that session before its first model request. A titled terminal tab in the lead's own terminal SHALL satisfy the visibility requirement; simultaneous on-screen tiling of all conversations SHALL NOT be required. Executor isolation SHALL use the selected repository's shared harness pool defined by `isolated-worktree-workflow`. The dispatch command SHALL acquire and bind through that common owner before launching a session; executor sessions and lead-side recipes MUST NOT create substitute or additional worktrees. The controller SHALL record the slot mapping with the assignment, including slot path and index, owner session identity, archived or unavailable status and synchronized base revision, and preserve it through interruption. Slot release SHALL reuse the tree: after the lead merges or explicitly discards the assignment result, the slot is reset to the merged committed base with ignored build caches kept, and the same slot serves later assignments. A slot whose state cannot be safely reset SHALL be preserved with its reason for lead review; the controller MUST NOT silently reset a dirty slot, force-remove an unmerged tree, delete a branch whose work is not preserved, or treat agents-overview hide, archive or task deletion as slot release. Deleting a pool tree is a slot-retirement action that first establishes the work is preserved and the removal is authorized. A control view SHALL attach with its cwd at the already bound pool slot instead of allocating another checkout. Ephemeral spawn_agent helpers SHALL be spawned only by the lead; executor sessions SHALL run without agent-spawning tools, so helper and nested-executor conversations cannot originate inside an executor assignment. Executors SHALL NOT write to the shared checkout. Each surface SHALL show assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. The controller and lead SHALL NOT resize, move or arrange desktop windows - including the terminal the lead runs in - to make conversations fit the screen; missing or lost views SHALL be restored through the owning dispatch command. Automatic model-backed helpers SHALL be visible and attributable or disabled. If a required view fails or closes and no other attached view displays that conversation, the controller SHALL suspend new model dispatch for it, reconcile in-flight effects without replay, report the failure and restore visibility before continuing.
+Every executor assignment SHALL run in a distinct native Codex conversation with its configured effective profile and a harness-owned pool worktree selected, synchronized and bound before its first model request. The same CLI's native /agents interface SHALL provide conversation visibility under `executor-mcp-plugin`; separate terminal surfaces SHALL NOT be required. Executor isolation SHALL use the selected repository's shared harness pool defined by `isolated-worktree-workflow`. The MCP dispatch SHALL acquire and bind through that common owner before launching a session; executor sessions and lead-side recipes MUST NOT create substitute or additional worktrees. The controller SHALL record the slot mapping with the assignment, including slot path and index, owner session identity, archived or unavailable status and synchronized base revision, and preserve it through interruption. Slot release SHALL reuse the tree: after the lead merges or explicitly discards the assignment result, the slot is reset to the merged committed base with ignored build caches kept, and the same slot serves later assignments. A slot whose state cannot be safely reset SHALL be preserved with its reason for lead review; the controller MUST NOT silently reset a dirty slot, force-remove an unmerged tree, delete a branch whose work is not preserved, or treat agents-overview hide, archive or task deletion as slot release. Deleting a pool tree is a slot-retirement action that first establishes the work is preserved and the removal is authorized. A native conversation view SHALL expose the already bound pool checkout instead of allocating another checkout. Ephemeral spawn_agent helpers SHALL be spawned only by the lead; executor sessions SHALL run without agent-spawning tools, so helper and nested-executor conversations cannot originate inside an executor assignment. Executors SHALL NOT write to the shared checkout. Each native conversation SHALL expose assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. The controller and lead SHALL NOT resize, move or arrange desktop windows - including the terminal the lead runs in - to make conversations fit the screen; missing or lost native access SHALL be restored through the owning runtime connection. Automatic model-backed helpers SHALL be visible and attributable or disabled. Ordinary conversation navigation or closing an individual view SHALL NOT establish visibility loss. If the controlling CLI surface or required native access is lost, the controller SHALL suspend new dependent model dispatch, reconcile in-flight effects without replay, report the failure and restore access before continuing.
 
 #### Scenario: Two executors work in parallel
 - **WHEN** the lead dispatches two independent assignments to different configured profiles
-- **THEN** both executor sessions run concurrently on separate titled terminal surfaces (for example tabs of the lead's terminal), each bound before its first model request to a distinct slot of the shared worktree pool, with no shared-checkout writes and no worktree created beyond the pool
+- **THEN** both executor conversations run concurrently and are accessible through /agents in the same CLI, each bound before its first model request to a distinct slot of the shared worktree pool, with no shared-checkout writes and no worktree created beyond the pool
 
 #### Scenario: Same-terminal tabs satisfy visibility
-- **WHEN** executor spawn runs inside the lead's Windows terminal and opens each assignment as a titled tab of that terminal
-- **THEN** the visibility requirement is satisfied without opening separate windows and without resizing, moving or arranging any desktop window
+- **WHEN** MCP dispatch creates distinct titled native conversations reachable from the lead's CLI
+- **THEN** the visibility requirement is satisfied without new terminal tabs, panes or windows and without resizing, moving or arranging any desktop window
 
 #### Scenario: Desktop window rearrangement is not used for visibility
 - **WHEN** a lead considers making conversation windows fit one screen before or after dispatch
-- **THEN** it does not resize, move or tile desktop windows - including its own terminal - and relies on the dispatch command's titled surfaces instead
+- **THEN** it does not resize, move or tile desktop windows - including its own terminal - and uses the same CLI's native conversation picker
 
 #### Scenario: A remote control view attaches to a managed worktree
-- **WHEN** an executor is dispatched through the verified remote control path
-- **THEN** its session cwd is the already bound pool slot before the first model request, the visible surface attaches without allocating a second checkout, and the shared checkout is unmodified
+- **WHEN** an executor is dispatched through the verified MCP/native runtime path
+- **THEN** its session cwd is the already bound pool slot before the first model request, the native view opens without allocating a second checkout, and the shared checkout is unmodified
 
 #### Scenario: An executor window is lost
-- **WHEN** a required executor view fails or closes while its session is active
+- **WHEN** the controlling CLI surface or its required native runtime connection is lost while an executor is active
 - **THEN** new model dispatch for that conversation is suspended, in-flight effects are reconciled without replay, and visibility is restored before continuation
 
 #### Scenario: An interrupted worktree is recovered
@@ -121,7 +121,7 @@ Every executor assignment SHALL run a native `codex --profile <id>` session on i
 
 #### Scenario: Ordinary Git worktrees are not executor isolation
 - **WHEN** an executor assignment needs an isolated checkout
-- **THEN** the session is bound to a shared pool slot acquired by the dispatch command, and neither the executor nor the lead creates a task-named or otherwise ad-hoc substitute worktree for that session
+- **THEN** the session is bound to a shared pool slot acquired by the MCP dispatch, and neither the executor nor the lead creates a task-named or otherwise ad-hoc substitute worktree for that session
 
 #### Scenario: Overview archive does not retire a worktree
 - **WHEN** an executor task is hidden, archived or deleted in the agents overview while its slot worktree still exists
@@ -129,11 +129,11 @@ Every executor assignment SHALL run a native `codex --profile <id>` session on i
 
 ### Requirement: Board-based asynchronous assignment and feedback
 
-Lead and executors SHALL coordinate routine assignments and feedback through the consuming project's task board using its non-interactive CLI: development stages as epics, specifications as features, executor feedback as feedback tasks, and lead-initiated improvements as tasks, or as OpenSpec changes when they alter accepted requirements. The board SHALL remain consuming-project state; the Rust controller SHALL NOT parse or duplicate it, because lead and executors read and update the board themselves. The kit SHALL deliver board-tool availability and workflow guidance through its installation lifecycle, verified from a fresh external session. Public kit sources SHALL contain only synthetic examples. When the board is unavailable, the orchestrator SHALL report the limitation explicitly and continue only work whose acceptance does not depend on the board. Exceptional questions and escalations SHALL be able to reach the originating lead through lead message while durable blockers, decisions, progress and results remain on the board; messaging SHALL NOT replace the board or introduce a parallel task record.
+Lead and executors SHALL coordinate routine assignments and feedback through the consuming project's task board using its non-interactive CLI: development stages as epics, specifications as features, executor feedback as feedback tasks, and lead-initiated improvements as tasks, or as OpenSpec changes when they alter accepted requirements. The board SHALL remain consuming-project state; the Rust controller SHALL NOT parse or duplicate it, because lead and executors read and update the board themselves. The kit SHALL deliver board-tool availability and workflow guidance through its installation lifecycle, verified from a fresh external session. Public kit sources SHALL contain only synthetic examples. When the board is unavailable, the orchestrator SHALL report the limitation explicitly and continue only work whose acceptance does not depend on the board. Exceptional questions and escalations SHALL be able to reach the originating lead through the authenticated MCP communication tool while durable blockers, decisions, progress and results remain on the board; messaging SHALL NOT replace the board or introduce a parallel task record.
 
 #### Scenario: An executor escalates a blocker
 - **WHEN** an executor cannot proceed because of a missing dependency or an ambiguous requirement
-- **THEN** it records the concrete blocker in the existing assignment or appropriate feedback task, can ask its own lead through lead message, and records the resulting durable decision on the board without duplicating task state in the controller
+- **THEN** it records the concrete blocker in the existing assignment or appropriate feedback task, can ask its own lead through the authenticated MCP communication tool, and records the resulting durable decision on the board without duplicating task state in the controller
 
 #### Scenario: A fresh session discovers the workflow
 - **WHEN** an ordinary Codex session starts in a consuming project after kit installation
@@ -142,95 +142,6 @@ Lead and executors SHALL coordinate routine assignments and feedback through the
 #### Scenario: The board is unavailable
 - **WHEN** the board tool or its project state is missing or broken
 - **THEN** orchestration reports the limitation and affected assignments explicitly instead of silently losing acceptance records or inventing a replacement protocol
-
-### Requirement: Lead steering and executor escalation without waste
-
-The lead SHALL deliver steering to an executor through the kit's addressed executor message command into that executor's live conversation, and the delivered input SHALL appear in that executor's visible conversation. The message command SHALL address one existing run through the accepted checkout, slot, owner and exact recorded session identity - supplied explicitly or resolved from recorded state when exactly one live run matches - SHALL verify that identity against the actual run before delivery so a message cannot reach a later occupant of a reused slot, and SHALL accept a short literal text, a UTF-8 file containing multiline text, or the full UTF-8 content of standard input, preserving real line breaks and literal content without shell evaluation regardless of size up to the spill ceiling. Delivery SHALL go to the same conversation with its context, model, provider, reasoning effort and completed work preserved, and SHALL NOT be implemented through hidden stop/resume, a new conversation, model replacement or re-sending the whole task. While an executor is working, delivery SHALL use the backend's real capability to accept additional input, including at the nearest supported point during a running tool call, and SHALL NOT interrupt that tool call. The command SHALL distinguish queued input, confirmed delivery, spilled delivery and error, SHALL NOT present a local file write as delivery to the model, and a retry after an indeterminate result SHALL NOT silently deliver the same context twice. For a completed, stopped or unavailable run it SHALL return an explicit result with a supported next action and SHALL NOT start a new conversation. Waiting and routine event handling SHALL require no model calls, and no repeated status requests SHALL be sent to active executors. Steering SHALL add relevant facts, resolve a request, or correct an established mistake; status-only nudges, hurry demands and repeated messages without new facts SHALL NOT be sent. Executor reports and escalations SHALL reach the lead as board feedback tasks with bounded context rather than unbounded transcript copies.
-
-#### Scenario: A mid-assignment correction arrives
-- **WHEN** the lead sends a concrete correction while an executor is working
-- **THEN** the input appears in that executor's conversation, the executor continues in the same session and worktree, and no duplicate session is started
-
-#### Scenario: A path correction is delivered verbatim
-- **WHEN** the lead sends a multiline UTF-8 correction from a file while the executor is inside a long tool call
-- **THEN** the message is delivered at the nearest supported point without interrupting that tool call, its literal text appears in the executor's conversation, and the reported result distinguishes delivery from later application by the executor
-
-#### Scenario: A correction is typed without any address
-- **WHEN** the lead pipes a correction into the executor message command with no address fields while exactly one executor run is live
-- **THEN** the command resolves and verifies that run from recorded state and delivers the correction to its conversation without the lead copying any checkout, home, slot, owner or session value
-
-#### Scenario: A stale identity is refused
-- **WHEN** the addressed slot no longer runs the recorded session, or the slot was reused by another run
-- **THEN** message refuses with the observed identity mismatch and names a supported next action instead of delivering to the current occupant
-
-#### Scenario: A finished run cannot be messaged
-- **WHEN** message addresses a run whose recorded lifecycle is completed, stopped or unavailable
-- **THEN** the command returns that actual state with the continuation remedy and starts no new conversation
-
-#### Scenario: A healthy executor is waiting
-- **WHEN** an executor remains active beyond several observation waits without a demonstrated failure
-- **THEN** waiting generates no model status requests and the executor's ownership is preserved
-
-#### Scenario: A nudge without new facts is not sent
-- **WHEN** the lead is tempted to ask for status or hurry an executor that has no new decision-relevant fact
-- **THEN** no message is sent, and steering is reserved for concrete corrections, facts or requirement changes
-
-### Requirement: Urgent executor stop through the kit command
-
-The kit SHALL provide an executor stop command that urgently stops one exact executor run identified through the accepted checkout, slot, owner and exact recorded session identity. Stop SHALL NOT wait for task completion, a model answer or a long running command: it SHALL use the backend's native interruption signal where that provides urgent interruption, and SHALL boundedly terminate the remaining owned process tree when the signal is unavailable, insufficient or exceeded, without leaving a hung stop lacking a diagnosable result. It SHALL verify actual run and process ownership before acting - an old process id, program-name or window-title match SHALL NOT be sufficient. It SHALL close exactly the stopped run's terminal tab or pane through the existing terminal-surface owner and SHALL NOT close the lead's terminal, neighboring tabs or a window hosting other conversations. It SHALL stop further delivery of pending messages to that run and record their undelivered state honestly. It SHALL preserve changed and untracked files, the checkout, already received results and the information needed to continue: no reset, clean, worktree deletion or loss of partial work SHALL occur, the run SHALL NOT be marked complete, accepted or merged, the slot SHALL NOT be released or freed for another task, and continuation and release SHALL remain separate explicit actions. The lifecycle receipt SHALL record the observed outcome - stopped, already completed, partial stop or error - with an unknown exit code kept unknown, and stop SHALL NOT claim rollback of external actions or recovery of external systems. A repeated stop SHALL be safe and report the actual current state, a stop racing natural completion SHALL report which outcome won, and the result SHALL remain available to the lead after the tab closes. On partial failure the command SHALL name the surviving process or resource, the cause and the next action instead of reporting false success.
-
-#### Scenario: Stop during generation
-- **WHEN** the lead stops an executor while the model is generating
-- **THEN** the run ends promptly, its owned processes are gone, only its terminal tab closes, the receipt records the stopped state, and its files remain for continuation
-
-#### Scenario: Stop during a child command
-- **WHEN** the lead stops an executor while a long child command is running
-- **THEN** the child and its owned tree are terminated within the bounded stop path, the executor's tab closes, and the stop result reports actual termination rather than assuming the child ended with the host
-
-#### Scenario: Stop races natural completion
-- **WHEN** the run completes while stop is verifying identity or interrupting
-- **THEN** the command reports the completed state and its recorded result instead of recording a stop that did not happen
-
-#### Scenario: Stop is repeated
-- **WHEN** stop is issued again for an already stopped run
-- **THEN** it reports the stopped state without error, without touching another run and without releasing the slot
-
-#### Scenario: Only the executor's tab closes
-- **WHEN** the stopped executor shares a terminal window with the lead and other executors
-- **THEN** exactly the stopped run's tab closes and every other conversation surface remains usable
-
-#### Scenario: A partial stop is not success
-- **WHEN** the host ends but an owned child survives the bounded termination
-- **THEN** stop reports the surviving process, cause and next action, and the receipt records a partial stop instead of success
-
-### Requirement: Control-backed executor conversations
-
-Pooled executor dispatch SHALL run its managed conversations, including the default native TUI presentation and its pooled continuation, on a backend that actually accepts addressed input and urgent interruption for the live session. A command wrapper over an operation the backend does not support SHALL NOT be accepted as message or stop delivery, and absent capability SHALL NOT be masked by a successful response. The owning dispatch route SHALL provide the capability with the smallest necessary change while preserving the existing receipt, lease, slot, terminal, presentation, result-recording and process-ownership guarantees, and the change SHALL NOT alter the configured profile's model, provider or reasoning effort. Surfaces that remain unsupported for addressed input SHALL report that fact explicitly with the supported continuation path instead of pretending delivery. Attaching the native frontend SHALL NOT create a second conversation, duplicate an assignment or invalidate the existing message, stop, cache-loss protection or recovery contracts. Input accepted through the native TUI SHALL address the same managed conversation and participate in its observed lifecycle.
-
-#### Scenario: A dispatched executor is addressable
-
-- **WHEN** a pooled executor run is working in managed TUI or explicit exec presentation
-- **THEN** its live conversation accepts an addressed message and an urgent stop through the kit commands without a new conversation or task re-send
-
-#### Scenario: An unsupported surface is honest
-
-- **WHEN** message addresses a legacy or unmanaged interactive executor run whose surface has no verified inbound channel
-- **THEN** the command reports that surface as unsupported with its continuation remedy instead of reporting delivery
-
-#### Scenario: Profile binding is preserved
-
-- **WHEN** a pooled executor conversation runs on the control-backed route
-- **THEN** its recorded and displayed model, provider and reasoning effort remain those of the configured executor profile
-
-#### Scenario: TUI input belongs to the observed run
-
-- **WHEN** a user submits input through the managed native frontend while its run accepts input
-- **THEN** it reaches the same conversation once and its accepted work is reflected in the run lifecycle, without an older turn's completion prematurely finishing that work
-
-#### Scenario: Stop retains exact ownership with a frontend attached
-
-- **WHEN** the lead stops one of two active managed TUI runs
-- **THEN** the existing urgent-stop contract interrupts and contains only that run, closes its owned surface, preserves its files and continuation identity, and leaves the other executor and lead running
 
 ### Requirement: Delegation-first utilization without reporting ritual
 
@@ -322,7 +233,7 @@ After an unexpected controller or client interruption, the runtime SHALL reconci
 
 ### Requirement: Globally verified orchestration
 
-Delivery SHALL include installation, update, check, recovery and disconnection through the supported global kit lifecycle. Fresh ordinary Codex sessions outside this checkout SHALL exercise configured lead/executor dispatch, board workflow, titled terminal surfaces for every active conversation, worktree isolation, steering, recovery and merge through the real entry point, with actual subscribed tool work on a locally selected real external development task whose applicable acceptance passes and whose results are consumed. Failure acceptance SHALL use owned targets and deterministic quota/transport faults rather than exhausting accounts. Public records SHALL contain no consumer-specific data; a toy fixture alone SHALL NOT establish complete delivery.
+Delivery SHALL include installation, update, check, recovery and disconnection through the supported global kit lifecycle. Fresh ordinary Codex sessions outside this checkout SHALL exercise configured lead/executor dispatch, board workflow, distinct native conversations accessible through /agents in one CLI, worktree isolation, steering, recovery and merge through the real entry point, with actual subscribed tool work on a locally selected real external development task whose applicable acceptance passes and whose results are consumed. Failure acceptance SHALL use owned targets and deterministic quota/transport faults rather than exhausting accounts. Public records SHALL contain no consumer-specific data; a toy fixture alone SHALL NOT establish complete delivery.
 
 #### Scenario: A real consuming task completes
 - **WHEN** the globally installed workflow completes a locally selected external development task
@@ -334,19 +245,19 @@ Delivery SHALL include installation, update, check, recovery and disconnection t
 
 ### Requirement: Launcher capability preflight and stale-build handling
 
-Before the first executor dispatch in an activated lead session, the `team-lead` skill SHALL verify that the installed launcher implements executor dispatch by running the kit's executor usage probe (`codex-harness executor --help`) and requiring its success. When the probe reports an unsupported or unknown command, the session SHALL classify the failure as an installed launcher older than the kit instructions, report that blocker together with the kit's rebuild-and-update remedy and the registered kit source location, and continue only work whose acceptance does not depend on executors. The session SHALL NOT treat the failure as proof that executors are unavailable, substitute another profile, or bypass harness dispatch with raw native exec, TUI automation or in-session helper agents, because those paths drop the visible-conversation, steering, board and recovery contract. The manager's unknown-command diagnostic SHALL name the attempted command and state that kit instructions referencing it indicate an installed build older than the kit source, with the kit lifecycle as the remedy. An installed immutable launcher SHALL identify its recorded source identity through its own version output when that record is present.
+Before first executor dispatch, the installed MCP interface SHALL verify its own required tool/native-runtime capabilities and recorded installation identity. Missing, incompatible or stale components SHALL produce an actionable diagnosis with the existing lifecycle's update or recovery route and registered source location. Tool discovery or a version string alone SHALL NOT prove conversation attachment, profile execution or delivery. The lead SHALL continue only acceptance-independent work after failed preflight, without profile substitution, raw native-exec bypass, UI automation or replacement helper agents. Native and installed artifact versions SHALL be inspectable without exposing secrets; unrelated sessions SHALL remain intact.
 
 #### Scenario: A consumer lead meets a stale launcher
-- **WHEN** an activated lead session probes `codex-harness executor --help` and the installed launcher answers with an unsupported-command error
-- **THEN** the session reports a stale launcher with the rebuild-and-update remedy and the kit source location, performs no executor dispatch, no profile substitution and no raw native-exec bypass, and continues only acceptance-independent work
+- **WHEN** MCP discovery or dispatch identifies an installed artifact older than its required contract
+- **THEN** the result names the incompatible component and lifecycle remedy before model work, and the lead does not substitute a profile or bypass the managed workflow
 
 #### Scenario: A capable launcher passes the preflight
-- **WHEN** the probe prints the executor usage
-- **THEN** executor dispatch proceeds through the harness command with the configured profile and the ordinary visibility, board and recovery contract
+- **WHEN** the installed MCP and native-runtime contract passes preflight
+- **THEN** dispatch uses the configured profile with the ordinary native visibility, board and recovery guarantees, without a separate remembered CLI usage probe
 
 #### Scenario: The manager explains an unknown command
-- **WHEN** the manager receives a command it does not implement
-- **THEN** its diagnostic names that command, points at `--help`, and explains that kit instructions referencing the command mean the installed build is older than the kit source and must be rebuilt and updated through the kit lifecycle
+- **WHEN** compatibility callers address an unsupported operation
+- **THEN** the diagnostic identifies the unsupported operation and installed build, while active executor recovery guidance points only to the supported plugin lifecycle and does not teach migrated CLI operations
 
 ### Requirement: Executor worktree pool with deterministic slots and upstream freshness
 
@@ -404,39 +315,6 @@ Executor dispatch SHALL consume the selected repository's shared harness pool un
 - **WHEN** a caller uses an existing executor command without a repository selector
 - **THEN** its previous target selection, configured profile, visible terminal behavior and default upstream-base behavior remain available while its allocation uses the common pool
 
-### Requirement: Deterministic executor terminal targeting
-
-When the lead runs inside Windows Terminal, executor dispatch SHALL open the
-executor tab in the lead's own terminal window, and MUST NOT address the
-terminal's most-recently-used or focused window. Dispatch SHALL identify the
-lead's window through the console parenting exposed to the calling process,
-hold it foreground only as long as the terminal needs to resolve the tab there,
-and restore the user's previous foreground window and selected tab once the
-titled tab is observably open; the user's deliberate window switches SHALL be
-left untouched. When the lead's window cannot be addressed (another virtual
-desktop or a blocked activation), dispatch SHALL target the stable
-per-checkout window name derived from the source checkout, which the terminal
-creates on first use, and MUST NOT create the tab in an unrelated focused
-window; an explicit window name requested by configuration or arguments SHALL
-be targeted exactly. Activation escalation MUST NOT send synthetic input into
-any conversation surface.
-
-#### Scenario: Another project holds the user's focus
-- **WHEN** the lead running in one terminal window dispatches an executor while the user works in another window
-- **THEN** the executor tab opens in the lead's window, no new terminal window is created, the user's window keeps its foreground position and its selected tab
-
-#### Scenario: The lead window cannot be addressed
-- **WHEN** the lead's window is on another virtual desktop or its activation is blocked
-- **THEN** the tab opens in the per-checkout harness window instead of the user's focused window, and the user's foreground window is still restored
-
-#### Scenario: An explicit window name is requested
-- **WHEN** dispatch receives an explicit terminal window name
-- **THEN** the tab opens in exactly that window, and the terminal creates it first when it does not exist
-
-#### Scenario: The terminal activates late
-- **WHEN** the terminal summons the receiving window after the launcher exits or activates it again for the created tab
-- **THEN** dispatch keeps undoing those activations until they go quiet and leaves the user in their previous foreground window
-
 ### Requirement: Validated structured executor assignment
 Executor dispatch SHALL accept a structured assignment as an alternative to existing free text. It SHALL validate declared existing inputs and intended output paths against the allocated checkout, reject missing inputs and path escapes before a model request, and generate the brief with the actual checkout and full committed base. Newly created output files MUST NOT be required to exist. The assignment SHALL retain the agent-selected objective, scope, invariants and acceptance conditions. Resume SHALL preserve partial work and regenerate checkout context without resetting the slot. Existing free-text callers MUST remain compatible.
 
@@ -456,78 +334,13 @@ Executor dispatch SHALL accept a structured assignment as an alternative to exis
 - **WHEN** a caller supplies a base to the validation/render command
 - **THEN** it resolves a full commit and refuses an invalid or mismatching base without changing the checkout
 
-### Requirement: Observable executor lifecycle and bounded result
-
-The existing dispatch and receipt owners SHALL distinguish request acceptance, terminal creation, observed native start, running, completion, failure and lead acceptance. Native session identity, checkout/base, changed files, actual reported checks and outcomes, remaining work, limitations, required decision and a detail locator SHALL be available without manual rollout searches. Completion and errors SHALL reach the lead through the native observation path. Empty completion SHALL be an output defect, not evidence of model, authentication or quota unavailability. Every model conversation SHALL retain its distinct visible terminal surface.
-
-For managed TUI runs, `executor watch` SHALL retain its existing receipt/slot addressing, options, blocking behavior, timeout behavior, bounded text/JSON review result and exit meanings: 0 for completion, 1 for an unsuccessful terminal outcome, and 2 for timeout or unavailable coverage. Native TUI presentation SHALL NOT by itself make coverage unavailable. Watch SHALL learn completion from the current run's correlated native outcome with the final result or output defect preserved, independently of the frontend's willingness to exit. Prior-session or prior-turn events, quiet output and frontend process termination alone SHALL NOT establish successful completion. A timeout SHALL NOT stop the run. No model-side status polling, periodic model messages, terminal scraping or manual rollout search SHALL be required to wait. A lost host or connection SHALL remain diagnosable and SHALL NOT be reported as success or leave waiting unbounded beyond the requested timeout. Historical receipts SHALL remain honestly readable without inventing missing coverage.
-
-A native turn-completion observation SHALL NOT authorize a successful watch return while the current host outcome or retained final result is still pending. Watch SHALL continue observing that same run until its finalized success or output defect is available, an original failure is established, or the requested timeout expires. Waiting reports SHALL identify pending finalization without treating quiet output, a missing exit status or an absent result file as proof of success. Finalized success SHALL include the recorded successful exit status and readable bounded result; it SHALL NOT depend on the frontend closing.
-
-Additional reply-workflow observation SHALL extend this base contract without replacing it. A native turn ending while a required reply remains unresolved SHALL report the workflow's nonterminal waiting result rather than completion or empty-output defect. Its action-required result SHALL NOT change the meanings of completion, failure and timeout/unavailable results above or authorize slot release.
-
-#### Scenario: Terminal opens but native start fails
-
-- **WHEN** a dispatch creates its terminal and its child cannot start or exits unsuccessfully
-- **THEN** the receipt and observer report the actual stage and failure, preserve diagnostics and do not report successful model execution
-
-#### Scenario: Work completes
-
-- **WHEN** an executor finishes its accepted work with no unresolved reply hold
-- **THEN** a native observer emits a bounded completion or output-defect event with the exact session, slot, result and detail locator without model-side status polling
-
-#### Scenario: Interrupted assignment resumes
-
-- **WHEN** an original assignment stops with partial work
-- **THEN** continuation uses its recorded exact session and checkout without reset, retains visible identity and preserves changes for correction and acceptance
-
-#### Scenario: Accepted slot is released
-
-- **WHEN** the lead accepts and integrates an outcome and records its disposition
-- **THEN** the existing release operation records that decision before resetting the slot for reuse; unreviewed work remains preserved
-
-#### Scenario: Watch completes while the frontend would otherwise await input
-
-- **WHEN** the current assignment has a persisted terminal result with no unresolved reply hold but its native TUI would ordinarily remain at an input prompt
-- **THEN** the same blocking watch call returns the bounded result and correct exit status without requiring the user or lead to close the frontend first
-
-#### Scenario: Watch timeout leaves the executor working
-
-- **WHEN** the requested watch timeout expires while the managed run is active
-- **THEN** watch returns 2 with the ongoing state and detail locator, the TUI and assignment remain active, and a subsequent watch can observe the same run
-
-#### Scenario: Completion carries no usable final answer
-
-- **WHEN** the current turn reports completion, no unresolved reply hold remains and no nonempty final answer can be retained
-- **THEN** watch reports an output defect with its diagnostics and no false success or claim that the model, authentication or quota was unavailable
-
-#### Scenario: Old terminal events do not finish a continuation
-
-- **WHEN** a resumed session or a newly accepted turn receives history or terminal events from earlier work
-- **THEN** watch remains bound to the current run and accepted work until its own terminal outcome or an observed failure is established
-
-#### Scenario: Turn completion precedes host finalization
-
-- **WHEN** the current run reports native turn completion while its final exit status and result are not yet retained
-- **THEN** the same watch call continues observing that run and does not return successful completion or an output defect merely because finalization is pending
-
-#### Scenario: Finalization completes during watch
-
-- **WHEN** that run subsequently retains its successful host outcome and nonempty final result before the requested timeout
-- **THEN** watch returns success with the same run identity, actual exit status and retained bounded result in either text or JSON mode
-
-#### Scenario: Finalization remains incomplete at the timeout
-
-- **WHEN** the requested timeout expires while completion finalization remains unverified
-- **THEN** watch returns the existing timeout or unavailable result with an explicit finalization cause, preserves the run and its original diagnostics, and neither reports success nor dispatches another model request
-
 ### Requirement: Concise titles and four executor slots
 
-New executor terminal titles SHALL begin with `CEx` and retain their profile and assignment owner. The shipped orchestration configuration SHALL permit four concurrent executor runs and independently default the shared worktree pool capacity to four without changing the aggregate heavy-command allowance or explicit executor profile.
+New executor native conversation titles SHALL begin with `CEx` and retain their profile and assignment owner. The shipped orchestration configuration SHALL permit four concurrent executor runs and independently default the shared worktree pool capacity to four without changing the aggregate heavy-command allowance or explicit executor profile.
 
 #### Scenario: Executor terminal identity
-- **WHEN** dispatch or continuation opens an executor terminal
-- **THEN** its title uses `CEx ({profile}) - {owner}` and remains distinct from another owner's terminal
+- **WHEN** dispatch or continuation exposes an executor conversation
+- **THEN** its title uses `CEx ({profile}) - {owner}` and remains distinct from another owner's conversation
 
 #### Scenario: Configured four-slot pool is full
 - **WHEN** all four configured shared slots contain live, suspended, reserved or unreviewed tasks of any supported type and a fifth independent owner requests dispatch
@@ -556,332 +369,3 @@ Delivery SHALL exercise a small real Rust repair through installed components fi
 #### Scenario: Activation conflicts with another consumer
 - **WHEN** the normal installation lifecycle refuses activation because an unrelated active consumer owns affected state
 - **THEN** the candidate and its evidence remain available and the conflict is reported without stopping that consumer or replacing links out of band
-
-### Requirement: Executor tabs close when the host ends
-
-When dispatch opens an executor conversation as a Windows Terminal tab, that tab SHALL close after the host process ends, including when the recorded run failed, was interrupted, or ended as an output defect. Closing SHALL NOT send a terminal command, SHALL NOT close the lead's window, a sibling tab, or another conversation, and SHALL NOT change the receipt's recorded state or exit code. The receipt, detail file and control log remain the inspection surface. An owned console that is not a terminal tab SHALL keep returning the run's own exit code. A process killed before the host can exit is outside this close path; stop continues to close its tab by ending that run's host.
-
-#### Scenario: A failed executor tab closes
-- **WHEN** an executor tab's host records a failed run and the host process ends
-- **THEN** that tab closes, the receipt still records the failure and its cause, and no other conversation's tab closes
-
-#### Scenario: A successful executor tab still closes
-- **WHEN** an executor tab's host records a completed run and the host process ends
-- **THEN** that tab closes and the receipt records the completed outcome
-
-#### Scenario: An owned console keeps the run exit code
-- **WHEN** the same failed run is hosted in an owned console instead of a terminal tab
-- **THEN** the console process returns the run's own non-zero exit code and the receipt records the failure
-
-### Requirement: Native TUI for managed executor runs
-
-Ordinary pooled `executor spawn`, `executor resume` and `executor restart` SHALL present each managed conversation in the native Codex TUI on its dedicated titled terminal surface without requiring an additional caller option. The explicit TUI mode SHALL provide the same managed observation and control. The frontend SHALL display the exact bound conversation, assignment, actual model and supported effective effort, live messages, tool activity and state. It SHALL retain the recorded slot cwd, configured provider/model/effort and single-agent restrictions. Controller output SHALL NOT interleave with or corrupt the native TUI. Before the first model request, dispatch SHALL establish the frontend's attachment to that conversation and its live terminal surface; a process or tab existing alone SHALL NOT establish readiness. A failed or unsupported attachment SHALL report its cause and recovery action instead of silently substituting a text stream or an invisible conversation. Existing command spellings, including the assignment input named `--exec`, SHALL remain accepted; explicitly selected exec presentation SHALL retain its supported observation behavior.
-
-The supported explicit exec presentation SHALL reuse a qualified native presentation wherever equivalent; retaining its spelling SHALL NOT require a second conversation or control lifecycle. Any residual compatibility adaptation SHALL name the observed missing native property and preserve the same observation and control contract.
-
-#### Scenario: Default dispatch shows the native conversation
-
-- **WHEN** the lead dispatches an assignment with the existing spawn command and no presentation option
-- **THEN** a native TUI is attached to the bound slot and exact managed conversation before its first model request, showing its configured identity and subsequent messages and tools without mixed controller output or a duplicate assignment
-
-#### Scenario: Concurrent executor views remain distinct
-
-- **WHEN** two pooled runs are active in different slots
-- **THEN** each TUI displays its own recorded conversation and each observer reports only its bound run, without switching either model or sharing a conversation identity
-
-#### Scenario: Attachment fails before work starts
-
-- **WHEN** the native frontend cannot attach or the target CLI lacks the required capability
-- **THEN** no assignment model request is submitted, the failure and remedy are available through the dispatch observation, and no hidden or text-only substitute starts
-
-#### Scenario: Continuation preserves the managed presentation
-
-- **WHEN** the lead resumes the recorded exact session or restarts a fresh session in a preserved slot
-- **THEN** the continued run has a native TUI and full observation/control, resume retains the original session, restart records its new session and predecessor, and neither operation resets partial work or replays the old assignment as a new request
-
-### Requirement: Managed TUI lifetime follows the recorded run
-
-Once a managed run reaches its terminal outcome, the host SHALL preserve its result or failure and then end that run's owned frontend/backend and finish its terminal surface automatically, without a manual quit step. This SHALL retain the terminal-host closure policy, real run outcome and exit code, durable detail locators, process-ownership guarantees and partial work. Closing SHALL affect no neighboring conversation or terminal window and SHALL NOT imply acceptance, merge or slot release. A cleanup failure SHALL name surviving owned resources and the recovery action, separately from the run outcome, rather than claiming that closure succeeded. If the only attached frontend is lost during active work, the controller SHALL suspend new model dispatch, interrupt or contain the owned run, preserve its work and record interruption or a more specific observed failure. It SHALL NOT allow unseen continuation or report success from frontend exit alone. Loss of focus or selecting another terminal tab SHALL NOT count as frontend loss.
-
-A native turn ending with an unresolved required reply SHALL NOT establish a terminal run or trigger this cleanup. The existing reply workflow SHALL retain its live surface and resources until reply continuation or an actual failure/stop. Backend cleanup SHALL release only run-owned resources; a shared native server and neighboring sessions SHALL remain available.
-
-#### Scenario: Successful work closes its TUI automatically
-
-- **WHEN** the current run completes with a nonempty final answer and no unresolved reply hold
-- **THEN** the answer and successful outcome remain available to watch after the owned frontend closes, run-owned backend resources are released and the executor tab closes, without a user quit command or effects on neighboring tabs or shared services
-
-#### Scenario: An unsuccessful run retains its evidence after closure
-
-- **WHEN** the current run records a failure, interruption or output defect and its host finishes
-- **THEN** its TUI surface follows the terminal-host closure policy while watch retains the real unsuccessful outcome, cause and diagnostics instead of inferring success from the host exit used to close a tab
-
-#### Scenario: The user closes an active TUI
-
-- **WHEN** the only frontend disappears while an assignment or its tool is active
-- **THEN** further model dispatch is suspended, the owned run is interrupted or contained with surviving processes reported honestly, its partial work and identity remain, and watch reports an unsuccessful outcome with the supported continuation route
-
-#### Scenario: Completion races frontend exit
-
-- **WHEN** a terminal backend event and frontend exit occur near the same time
-- **THEN** the retained native evidence determines the outcome, a previously recorded result is not lost, and frontend exit alone never manufactures a successful completion
-
-### Requirement: Spawn-bound executor-to-lead messaging
-
-The kit SHALL expose `codex-harness lead message --text TEXT` and an alternative `--file FILE` for literal UTF-8 multiline input. An executor SHALL need to supply only the payload, with no lead, source checkout, home, slot, owner, endpoint or session address. `executor spawn` SHALL establish the relationship between the exact executor run and the native lead session that originated it before the executor's first model request. The message command SHALL verify the caller's membership in that live spawned run and SHALL deliver only to its recorded originating lead. A marker, supplied identifier, current directory, matching label or most recently used session SHALL NOT alone establish authority. Caller-provided recipient overrides SHALL NOT be accepted. Missing, forged, stale or mismatched identity SHALL cause refusal before delivery, with a concrete reason and supported next action. Calling from another directory within the legitimate executor's process tree SHALL NOT change or lose the recipient. Existing executor restrictions on recursive delegation and native agent tools SHALL remain in effect.
-
-#### Scenario: Minimal question from a spawned executor
-- **WHEN** a live executor spawned by lead A invokes `codex-harness lead message --text 'Which contract applies?'`
-- **THEN** harness validates its run and sends the question to lead A without requiring the executor to discover or supply addressing metadata
-
-#### Scenario: Concurrent leads share a repository
-- **WHEN** leads A and B each spawn executors from the same source checkout and both executors send messages
-- **THEN** each message reaches only its own originating lead, independently of cwd, visible tab selection, labels or dispatch order
-
-#### Scenario: An unrelated process copies the executor marker
-- **WHEN** an ordinary shell, unrelated agent or sibling executor invokes lead message using another executor's marker or run reference
-- **THEN** sender validation refuses the request before any lead receives it
-
-#### Scenario: Sender changes working directory
-- **WHEN** a legitimate executor runs the command from a subdirectory or another task-authorized directory
-- **THEN** the originating lead and sender metadata remain those of its recorded spawned run
-
-#### Scenario: A stale process outlives its run
-- **WHEN** a stopped or replaced executor process attempts to send after its slot or run generation has changed
-- **THEN** the command refuses the stale sender and does not use the new occupant's identity or lead relationship
-
-#### Scenario: A spawn cannot establish the lead channel
-- **WHEN** spawn cannot verify the originating native lead session or its supported delivery route
-- **THEN** it reports the exact unavailable capability and recovery action before the executor's first model request, without guessing a parent, silently dispatching an isolated worker or restarting the active lead
-
-### Requirement: Trusted sender metadata and direct replies
-
-Every executor-to-lead message SHALL include harness-generated message identity, request or notification kind, originating lead identity, executor owner label, immutable run identity, exact native session, source checkout, worktree and slot, plus explicitly registered assignment or bd references when available. Absent assignment metadata SHALL remain explicitly unavailable rather than inferred from text. Payload content SHALL remain distinct from this metadata and SHALL NOT override it. Private authentication material SHALL NOT be included. The delivered envelope SHALL identify the sender without further lookup and supply a reply reference usable as `codex-harness executor message --reply-to MESSAGE_ID --text TEXT`, with the same `--file` alternative. Reply resolution SHALL verify the calling lead and exact original sender run before delivery; another lead, a retired reference or a reused slot SHALL NOT receive or authorize a redirected reply. Reply addressing SHALL be independent of the lead's current directory. Conflicting explicit addressing and a reply reference SHALL be rejected before delivery.
-
-#### Scenario: Lead answers without reconstructing an address
-- **WHEN** a lead receives an executor question with its injected metadata
-- **THEN** it can identify the executor and worktree and answer using only the supplied reply reference and response text, without finding a receipt, slot, endpoint or session ID
-
-#### Scenario: Another lead uses the reply reference
-- **WHEN** lead B attempts to reply to a request sent to lead A
-- **THEN** the command refuses the caller mismatch without delivering or transferring ownership
-
-#### Scenario: Reply arrives after slot reuse
-- **WHEN** the original executor ended and its slot now belongs to another run
-- **THEN** a reply to the old message reports that original run's state and does not reach the new occupant or automatically resume an old session
-
-#### Scenario: Payload imitates routing metadata
-- **WHEN** the payload contains a fabricated sender header, shell syntax or a different session identifier
-- **THEN** the literal text is preserved as payload, the trusted envelope still identifies the actual sender, and no payload text is evaluated or used to choose a recipient
-
-#### Scenario: A continuation preserves its originating lead
-- **WHEN** an authorized continuation of a spawned executor is created through the existing recovery path
-- **THEN** it retains the original lead relationship with its new verified run identity, while stale sender contexts and old reply references cannot silently address that replacement run
-
-### Requirement: Executor questions retain a reply-capable session
-
-Lead message SHALL request a reply by default and SHALL return a bounded delivery receipt without requiring a separate wait command. An optional `--notify` SHALL send an exceptional notification without requesting a reply. An unresolved request SHALL keep the executor's exact conversation, native input capability, visible terminal surface, slot lease, partial work and run ownership available. The executor SHALL be able to continue independent authorized work while a request remains unresolved. When its native turn ends with an unresolved request, the run SHALL be reported as waiting-for-reply rather than completed or an empty-output defect. Waiting SHALL cause no model polling, repeated status requests, automatic task replay, hidden stop/resume or arbitrary expiry. The observation path SHALL expose the waiting state and outstanding request promptly, so a lead waiting for its executor can respond. A definite delivery refusal SHALL NOT create a phantom successful request or reply hold; an uncertain result SHALL retain its unresolved identity and honest delivery status.
-
-An observed correlated reply SHALL resolve only its addressed request and continue the same executor conversation and worktree without a separate resume command or model/provider/effort change. Active executors SHALL receive native steering without interruption; idle waiting executors SHALL receive the next turn in their same native thread. Ordinary uncorrelated steering SHALL NOT silently resolve a request. Native turn completion, message acceptance, reply delivery and stop SHALL be reconciled so their races cannot prematurely close the conversation, duplicate a reply or target another run. Explicit stop, failure and visibility-loss handling SHALL retain their existing preservation and recovery guarantees; a dead process SHALL NOT be reported as waiting. Lead unavailability SHALL NOT silently complete the assignment, release the slot, invent an answer or transfer the executor to another lead.
-
-#### Scenario: Blocked executor finishes its current turn
-- **WHEN** an executor sends a clarification request, has no independent work and ends its native turn before the lead answers
-- **THEN** its live session and visible surface remain available in waiting-for-reply, the slot remains occupied, and the lead can answer using one executor message command without resume
-
-#### Scenario: Executor continues independent work
-- **WHEN** a question is pending but the executor has authorized work independent of the answer
-- **THEN** the send receipt allows that work to continue, and a correlated answer is delivered to the same active conversation without interruption or task replay
-
-#### Scenario: Lead is waiting for executor completion
-- **WHEN** the lead is observing an executor that transitions to waiting-for-reply
-- **THEN** the native observation path exposes the request and waiting state without waiting for assignment completion or sending model status probes
-
-#### Scenario: Reply races the executor's turn ending
-- **WHEN** the reply arrives as the executor's active turn completes
-- **THEN** the reply is delivered once into the same conversation using the appropriate active or idle native operation and no completion path destroys the reply channel first
-
-#### Scenario: Multiple unresolved requests
-- **WHEN** an executor has more than one accepted unresolved request and the lead answers one
-- **THEN** only that request is resolved and the remaining request identities and reply hold are preserved
-
-#### Scenario: Informational notice needs no answer
-- **WHEN** the executor sends a notice with `--notify` and later finishes with no unresolved requests
-- **THEN** the notice does not create a waiting state or prevent the existing completion path
-
-#### Scenario: Lead disconnects while a request is pending
-- **WHEN** the originating lead becomes unavailable before answering
-- **THEN** the executor's request identity, worktree and partial work remain preserved, availability is reported honestly, and no other lead or new conversation is selected automatically
-
-#### Scenario: Stop while waiting
-- **WHEN** an explicit executor stop targets a waiting run
-- **THEN** the existing urgent stop path ends that exact run, pending reply delivery is invalidated, and files and slot remain preserved for explicit recovery
-
-### Requirement: Native session delivery with observable outcomes
-
-The solution SHALL reuse official Codex session, queue, turn and event capabilities wherever they satisfy the required behavior. Harness-specific code SHALL provide the missing originating relationship, sender validation, metadata, reply resolution and lifecycle coordination rather than a parallel conversation runtime, model client, board store or delivery service. Stable mechanical behavior SHALL be enforced algorithmically instead of requiring agents to reconstruct addresses, keep sessions alive, inspect internal files or poll one another through prompts. Native-operation selection SHALL be verified against the installed CLI's actual behavior; help text alone SHALL NOT establish delivery. An ordinary globally installed lead session SHALL be able to receive and answer messages without a special per-task launcher, endpoint setup or terminal manipulation. Native argument semantics, profiles, local settings, sandbox/approval policy, model/provider/effort, visibility and process ownership SHALL remain preserved.
-
-Delivery SHALL target the exact owning native conversation while busy or idle, including a lead waiting in a tool, and appear on its visible surface. The result SHALL distinguish accepted or queued input, observed delivery, definite refusal, unavailability and indeterminate outcome. Acceptance SHALL NOT be reported as recipient action, and writing a local file SHALL NOT count as model delivery. An uncertain attempt SHALL be reconciled before retrying; duplicate delivery SHALL NOT result from retry. Identical text in a later resolved exchange SHALL remain sendable as a new message. Missing native capability SHALL produce an explicit cause and supported next action, without hidden runtime replacement, a new lead conversation, routing to another lead or a custom offline mailbox. Existing ordinary native CLI fallback and installation recovery guarantees SHALL remain intact.
-
-#### Scenario: Native queue satisfies the required delivery
-- **WHEN** a supported native queue operation demonstrably reaches the exact active or idle lead with the required observation and visibility
-- **THEN** the implementation reuses that capability instead of creating a second queue or conversation service
-
-#### Scenario: Queue defers a blocking question
-- **WHEN** the available native queue defers a question until a busy lead's current turn ends and therefore cannot satisfy timely delivery
-- **THEN** the solution uses a supported native input operation that reaches the active conversation without interrupting its running tool or substituting another session
-
-#### Scenario: Delivery acknowledgement is uncertain
-- **WHEN** a send loses its response after the native endpoint may have accepted it
-- **THEN** the command records and reports the indeterminate attempt and reconciles its identity before retrying, without claiming delivery or silently sending a second copy
-
-#### Scenario: Same words in a later exchange
-- **WHEN** an earlier exchange has been resolved and the executor legitimately sends the same text for another question
-- **THEN** the new exchange receives its own message identity rather than being suppressed by permanent content-only deduplication
-
-#### Scenario: Native delivery capability is missing
-- **WHEN** a lead's existing session cannot accept the required native input
-- **THEN** the command reports the specific unavailable capability and remedy without attaching a second server to a saved copy, launching another lead or claiming a local record was delivered
-
-### Requirement: Actionable observation of pending executor requests
-
-The existing watch, receipt and terminal observation owners SHALL expose waiting-for-reply with the exact run and bounded unresolved request/reply references. An active or newly invoked `executor watch` SHALL return promptly with exit 3 and an action-required waiting result in its supported text or JSON format when the verified run is waiting for a reply. This result SHALL preserve the live conversation, native frontend, lease, worktree and partial work; it SHALL NOT establish completion, failure, empty-output defect, unavailable coverage or permission to release the slot. Existing watch exit meanings 0 for completion, 1 for unsuccessful terminal outcome and 2 for timeout/unavailable coverage SHALL remain unchanged. A verified waiting state available at the timeout boundary SHALL yield the waiting result rather than a timeout. After the lead replies, the same watch interface SHALL observe continued work and eventual completion without a separate resume or new observation protocol.
-
-This requirement SHALL extend the base `Observable executor lifecycle and bounded result` contract rather than replace its native-TUI, identity, result, failure and recovery guarantees. A dead or stopped run SHALL retain its actual failure/stop outcome instead of appearing reply-capable; accepted reply/completion/stop races SHALL be reconciled by the existing lifecycle owner.
-
-#### Scenario: Turn finishes awaiting a decision
-- **WHEN** an executor ends its native turn with an unresolved question to the lead
-- **THEN** the observer reports waiting-for-reply with the exact run and message reference while the live reply channel, native surface and slot remain available
-
-#### Scenario: Lead is already blocked in watch
-- **WHEN** the observed executor reaches waiting-for-reply before the existing watch timeout
-- **THEN** that watch returns 3 promptly with the bounded request and reply reference, without terminating the executor or requiring a model status probe
-
-#### Scenario: Waiting is observed at the timeout boundary
-- **WHEN** the watch deadline and an established waiting state are available in the same observation
-- **THEN** watch returns the actionable waiting result rather than hiding the question behind timeout, and the run stays live
-
-#### Scenario: Reply resumes ordinary observation
-- **WHEN** the lead sends the correlated reply and invokes watch for the same run
-- **THEN** watch observes that run's continued work through its existing lifecycle and later returns its true terminal result without reconstructing an address or resuming the executor
-
-### Requirement: Size-free message delivery in both directions
-
-The kit's executor message and lead message commands SHALL accept message
-content from three interchangeable literal sources: a short `--text TEXT`
-argument, a UTF-8 `--file FILE`, and the full UTF-8 content of standard input
-when it is piped. Reading standard input SHALL NOT require the caller to
-know or name any size limit, and an interactive terminal with no content
-argument SHALL be refused harmlessly rather than blocking. A message whose
-composed payload exceeds the inline delivery bound SHALL be delivered
-automatically: the command persists the complete literal payload, without
-truncation or shell evaluation, into a harness-owned message file, and
-delivers a compact pointer envelope into the same live conversation stating
-the message identity, the exact byte size and the absolute path of that file
-so the recipient can read the full message with its ordinary tools. Spilled
-delivery SHALL be recorded as its own honest result class with the spill
-file's absolute path in the existing message receipts and watch output, SHALL
-NOT be presented as inline delivery, and a payload above the fixed spill
-ceiling SHALL be refused with the actual ceiling and nothing partially sent.
-Spill files SHALL live in the recorded harness message state rather than a
-worktree or repository, SHALL be cleaned together with their owning run
-records, and their directory SHALL stay bounded. This mechanism SHALL apply
-identically to lead-to-executor steering, executor-to-lead messages and
-reply-reference replies, and SHALL NOT alter the existing queued, delivered
-and error result classes for inline-sized messages.
-
-#### Scenario: A long correction is delivered without sender effort
-- **WHEN** the lead pipes a multiline correction larger than the inline bound into the executor message command while its executor runs
-- **THEN** the command itself persists the complete payload, delivers a pointer envelope into the executor's live conversation naming the exact size and absolute file path, and reports the spilled delivery with that path instead of refusing or truncating
-
-#### Scenario: Executor question travels by standard input
-- **WHEN** an executor pipes its clarification question into the lead message command without any content flag
-- **THEN** the piped UTF-8 content is delivered as the literal message with the same metadata, reply reference and waiting behavior as a `--text` message, and no manual file creation is involved
-
-#### Scenario: The recipient reads the full message
-- **WHEN** a spilled pointer envelope arrives in a live conversation
-- **THEN** the recipient can read the complete original message from the named absolute path with its ordinary file tools, and the watch and receipt surfaces show the spill path and size
-
-#### Scenario: An oversized payload is refused honestly
-- **WHEN** a piped payload exceeds the spill ceiling
-- **THEN** the command refuses with the actual ceiling, sends nothing partially, and leaves no phantom delivery record or reply hold
-
-#### Scenario: No piped input is not a silent empty message
-- **WHEN** either message command runs without a content flag and standard input is an interactive terminal
-- **THEN** the command refuses harmlessly with the supported content sources instead of blocking or sending an empty message
-
-### Requirement: Recorded-identity address defaults
-
-The lead-side executor commands SHALL accept the recorded checkout, home,
-slot, owner and session address fields as optional. When an address field is
-omitted, the command SHALL resolve it only from the harness's own recorded
-state - the effective `CODEX_HOME` or its recorded installation default, the
-installation record's source checkout, and the recorded live pool lease,
-receipt and session identity - and SHALL then apply the same identity
-verification it applies to explicitly supplied values. When exactly one live
-run matches, that run SHALL be addressed automatically; when several live
-runs match, the command SHALL refuse with a bounded listing of the live runs
-and the disambiguating slot argument; when none matches, it SHALL report the
-same honest state error as today. Resolution SHALL NOT infer an address from
-the current working directory, process names, window titles or the most
-recent session, and an explicitly supplied value SHALL always take precedence
-over a resolved default. The existing explicit address surface SHALL remain
-accepted and unchanged in meaning, and installation-lifecycle commands SHALL
-keep requiring their explicit paths.
-
-#### Scenario: One live executor needs no address
-- **WHEN** the lead messages, watches or stops its only live executor run using no address fields
-- **THEN** the command resolves that run from the recorded pool identity, verifies it as if the fields were typed, and delivers or acts on exactly that run
-
-#### Scenario: Several live runs demand a slot
-- **WHEN** two or more live runs match the omitted address fields
-- **THEN** the command refuses to choose, lists the live runs with their slots, and names the slot argument that disambiguates
-
-#### Scenario: Defaults never weaken verification
-- **WHEN** a resolved default points at a slot whose recorded session no longer matches the live run
-- **THEN** the command refuses with the identity mismatch exactly as it would for explicit values, and nothing is delivered to the current occupant
-
-#### Scenario: Explicit paths remain authoritative
-- **WHEN** the lead supplies `--source`, `--codex-home`, `--slot` or `--owner` explicitly
-- **THEN** those values are used and verified unchanged, and no recorded default overrides them
-
-### Requirement: Standard-input assignment text for executor spawn
-
-Executor spawn SHALL accept `--exec -` to read the complete free-text
-assignment from standard input as literal UTF-8, so a long assignment does
-not depend on process command-line length limits. The streamed assignment
-SHALL be rendered and dispatched with the same brief, boundaries, base
-revision and pool isolation as an equal `--exec TEXT` value, and spawn SHALL
-refuse harmlessly when `--exec -` meets an interactive terminal or an empty
-stream. `--exec TEXT` and `--assignment FILE` SHALL keep their current
-meaning.
-
-#### Scenario: A long assignment is spawned by pipe
-- **WHEN** the lead pipes a long free-text assignment into spawn with `--exec -`
-- **THEN** the executor receives the complete literal assignment with the standard rendered brief and isolation, and no command-line length limit is involved
-
-#### Scenario: Empty stdin assignment is refused
-- **WHEN** spawn runs with `--exec -` and standard input is an interactive terminal or an empty stream
-- **THEN** spawn refuses with the supported assignment sources and allocates no slot
-
-### Requirement: Managed executor transports impose no harness-side record size cap
-
-The host's control connection to its owned app-server child and the
-frontend-facing relay SHALL NOT impose a harness-side WebSocket message, frame
-or write-buffer size limit on managed conversation records. Time bounds -
-connect, read poll, socket write and relay shutdown - SHALL remain bounded. An
-exact-session resume or a full-thread final-message read whose records exceed
-any fixed small bound SHALL complete through the same transport. A final
-message SHALL come from the thread's own items; a full-thread read that fails
-for its own reason SHALL fail the run, with no delivered-message fallback for
-an oversized read.
-
-#### Scenario: An exact-session resume exceeds one mebibyte
-- **WHEN** a managed executor resumes an exact session whose resume state record is larger than one mebibyte
-- **THEN** the resume completes on the managed backend, the assignment is submitted on that exact thread, and no new conversation is started
-
-#### Scenario: A full-thread read exceeds one mebibyte
-- **WHEN** a completed turn's full-thread read is larger than one mebibyte and its thread items carry a final assistant message
-- **THEN** the run completes and records that message
-
-#### Scenario: Another final-message read failure still fails the host
-- **WHEN** a completed turn's final-message read fails for a reason other than record size
-- **THEN** the host records the failure, terminates the owned child tree, and does not report a successful run
