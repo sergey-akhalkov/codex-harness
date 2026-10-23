@@ -71,6 +71,16 @@ pub fn load(path: &Path) -> io::Result<Mapping> {
     })
 }
 
+/// True when a porcelain status contains no user work, only generated Serena
+/// project state. Serena may recreate it while a worker is live; it is a tool
+/// cache, not an unreviewed change.
+fn only_serena_tool_state(status: &str) -> bool {
+    status.lines().all(|line| {
+        let path = line.get(3..).unwrap_or_default().trim();
+        path.is_empty() || path == ".serena/" || path.starts_with(".serena/")
+    })
+}
+
 /// Reset a lane worktree to the committed base the lead merged, so the next
 /// lane task starts from the new base with the lane's ignored build caches
 /// intact (`git reset --hard <base>` plus `git clean -fd`). Unresettable state
@@ -138,11 +148,7 @@ pub fn reset_for_reuse(
         &mapping.path,
         &["status", "--porcelain=v1", "--untracked-files=all"],
     )?;
-    let unreviewed = porcelain.lines().any(|line| {
-        let path = line.get(3..).unwrap_or_default().trim();
-        !path.is_empty() && path != ".serena/" && !path.starts_with(".serena/")
-    });
-    if unreviewed {
+    if !only_serena_tool_state(&porcelain) {
         return Ok(LaneDisposition::Preserved {
             limitation: "lane is not clean after reset; preserving the lane for retirement".into(),
         });
@@ -2451,7 +2457,7 @@ fn reset_slot_to(
             .unwrap_or_default();
         let recorded = record.as_ref().and_then(|record| record.base.clone());
         let status = slot_status(&checkout)?;
-        if !status.trim().is_empty() {
+        if !only_serena_tool_state(&status) {
             return Err(pool_error(&format!(
                 "slot {index} holds unreviewed changes; merge or explicitly discard them before reuse: {}",
                 status.trim()
@@ -2471,7 +2477,7 @@ fn reset_slot_to(
             "slot {index} could not reset to {commit}: {error}"
         ))
     })?;
-    git(&checkout, &["clean", "-fd"]).map_err(|error| {
+    git(&checkout, &["clean", "-fd", "-e", ".serena"]).map_err(|error| {
         pool_error(&format!(
             "slot {index} could not remove untracked files: {error}"
         ))
@@ -2480,7 +2486,7 @@ fn reset_slot_to(
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
     let status = slot_status(&checkout)?;
-    if head != commit || !status.trim().is_empty() {
+    if head != commit || !only_serena_tool_state(&status) {
         return Err(pool_error(&format!(
             "slot {index} did not reach a clean synchronized state at {commit} (HEAD {head})"
         )));
@@ -4156,11 +4162,7 @@ fn slot_content(pool: &Pool, index: u32, base: Option<&str>) -> io::Result<SlotC
             "slot {index} is not a usable Git worktree; the lead resolves or retires it"
         )));
     };
-    let unreviewed = status.lines().any(|line| {
-        let path = line.get(3..).unwrap_or_default().trim();
-        !path.is_empty() && path != ".serena/" && !path.starts_with(".serena/")
-    });
-    if unreviewed {
+    if !only_serena_tool_state(&status) {
         return Ok(SlotContent::Unreviewed(format!(
             "slot {index} holds local or untracked changes; merge or explicitly discard them before reuse"
         )));
