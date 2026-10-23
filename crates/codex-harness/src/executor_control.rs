@@ -104,6 +104,10 @@ const RETRY: Duration = Duration::from_millis(50);
 /// A reflection catalogue is read in bounded pages; an endless or malformed
 /// cursor fails closed instead of guessing an empty tool surface.
 const MAX_CATALOGUE_PAGES: usize = 64;
+/// Bound on background terminals read for one exact thread.
+const MAX_BACKGROUND_TERMINALS: usize = 256;
+/// Page size of the native background-terminal inventory.
+const BACKGROUND_TERMINAL_PAGE: u32 = 64;
 const REFLECTION_FEATURE_SWITCHES: [&str; 26] = [
     "features.apps",
     "features.enable_mcp_apps",
@@ -2253,6 +2257,81 @@ impl Conversation {
         Ok(true)
     }
 
+    /// The live background commands owned by this exact thread. This reads the
+    /// runtime's own inventory, not the shared app-server's process tree, so a
+    /// sibling conversation's commands never enter the result.
+    pub(crate) fn background_terminals(&mut self) -> io::Result<Vec<Value>> {
+        let mut terminals = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = BTreeSet::new();
+        loop {
+            let mut params = json!({
+                "threadId": self.thread_id,
+                "limit": BACKGROUND_TERMINAL_PAGE
+            });
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let value = self.call("thread/backgroundTerminals/list", params)?;
+            let data = value["data"]
+                .as_array()
+                .ok_or_else(|| invalid("the native terminal inventory carried no data array"))?;
+            for terminal in data {
+                let process_id = terminal["processId"]
+                    .as_str()
+                    .filter(|id| valid_process_id(id))
+                    .ok_or_else(|| {
+                        invalid("the native terminal inventory carried no exact numeric process id")
+                    })?;
+                if terminals.len() >= MAX_BACKGROUND_TERMINALS {
+                    return Err(invalid(format!(
+                        "thread {} owns more than {MAX_BACKGROUND_TERMINALS} live background terminals; refusing an unbounded inventory",
+                        self.thread_id
+                    )));
+                }
+                terminals.push(json!({
+                    "processId": process_id,
+                    "itemId": terminal["itemId"],
+                    "command": terminal["command"],
+                    "cwd": terminal["cwd"],
+                    "osPid": terminal["osPid"]
+                }));
+            }
+            let next = value["nextCursor"]
+                .as_str()
+                .filter(|next| !next.is_empty())
+                .map(str::to_owned);
+            let Some(next) = next else {
+                break;
+            };
+            if !seen.insert(next.clone()) {
+                return Err(invalid(
+                    "the native terminal inventory repeated a pagination cursor; refusing an unbounded read",
+                ));
+            }
+            cursor = Some(next);
+        }
+        Ok(terminals)
+    }
+
+    /// Terminates one exact background command owned by this thread. The
+    /// runtime performs the containment; the caller verifies the inventory
+    /// afterwards instead of assuming this answer is process-tree proof.
+    pub(crate) fn terminate_background_terminal(&mut self, process_id: &str) -> io::Result<bool> {
+        if !valid_process_id(process_id) {
+            return Err(invalid(
+                "a background terminal must be addressed by its exact numeric process id",
+            ));
+        }
+        let value = self.call(
+            "thread/backgroundTerminals/terminate",
+            json!({"threadId": self.thread_id, "processId": process_id}),
+        )?;
+        value["terminated"].as_bool().ok_or_else(|| {
+            invalid("the native terminal termination answer carried no terminated result")
+        })
+    }
+
     /// Whether the bound thread already contains a turn. The assignment must
     /// not be submitted again when it does.
     #[allow(dead_code)]
@@ -2627,6 +2706,12 @@ impl Conversation {
         }
         Some(reason.to_owned())
     }
+}
+
+fn valid_process_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<i32>().is_ok_and(|id| id > 0)
 }
 
 fn thread_params(plan: &ControlPlan) -> Value {

@@ -253,6 +253,7 @@ fn git_repo(root: &Path) -> String {
 struct SimThread {
     id: String,
     cwd: PathBuf,
+    name: Option<String>,
     turns: Vec<Value>,
     next_turn: u64,
 }
@@ -262,6 +263,7 @@ impl SimThread {
         Self {
             id: id.to_owned(),
             cwd: cwd.to_path_buf(),
+            name: None,
             turns: Vec::new(),
             next_turn: 1,
         }
@@ -271,6 +273,7 @@ impl SimThread {
         Self {
             id: id.to_owned(),
             cwd: cwd.to_path_buf(),
+            name: None,
             turns: vec![json!({"id": turn, "status": "inProgress", "items": []})],
             next_turn: 2,
         }
@@ -289,6 +292,7 @@ impl SimThread {
             "id": self.id,
             "status": {"type": self.state()},
             "cwd": self.cwd,
+            "name": self.name,
             "model": "test-model",
             "modelProvider": "test-provider",
             "reasoningEffort": "high",
@@ -329,11 +333,23 @@ impl SimThread {
     }
 }
 
+#[derive(Clone)]
+struct SimTerminal {
+    process_id: String,
+    item_id: String,
+    command: String,
+}
+
 struct NativeSim {
     threads: BTreeMap<String, SimThread>,
+    terminals: BTreeMap<String, Vec<SimTerminal>>,
     lose_next_ack: Option<String>,
     suppress_next_evidence: bool,
     refuse_turns: bool,
+    interrupt_completes: bool,
+    terminate_terminals: bool,
+    post_interrupt_terminal: Option<SimTerminal>,
+    next_thread: u64,
 }
 
 impl NativeSim {
@@ -363,9 +379,14 @@ impl NativeSim {
         );
         Self {
             threads,
+            terminals: BTreeMap::new(),
             lose_next_ack: None,
             suppress_next_evidence: false,
             refuse_turns: false,
+            interrupt_completes: false,
+            terminate_terminals: true,
+            post_interrupt_terminal: None,
+            next_thread: 1,
         }
     }
 
@@ -379,6 +400,35 @@ impl NativeSim {
                 SimThread::idle(thread, &current.cwd)
             },
         );
+    }
+
+    fn interrupt(&mut self, thread: &str, turn: &str) -> Result<(), String> {
+        let completes = self.interrupt_completes;
+        let Some(thread) = self.threads.get_mut(thread) else {
+            return Err(format!("unknown thread {thread}"));
+        };
+        let Some(active) = thread
+            .turns
+            .iter_mut()
+            .find(|active| active["id"].as_str() == Some(turn))
+        else {
+            return Err(format!("unknown active turn {turn}"));
+        };
+        active["status"] = Value::String(
+            if completes {
+                "completed"
+            } else {
+                "interrupted"
+            }
+            .into(),
+        );
+        if let Some(terminal) = self.post_interrupt_terminal.take() {
+            self.terminals
+                .entry(thread.id.clone())
+                .or_default()
+                .push(terminal);
+        }
+        Ok(())
     }
 }
 
@@ -396,6 +446,71 @@ fn native_responder(
                     Some(thread) => Answer::Result(json!({"thread": thread.record()})),
                     None => Answer::Error(json!({"message": format!("unknown thread {id}")})),
                 }
+            }
+            "thread/start" => {
+                let mut sim = sim.lock().unwrap();
+                let id = format!("recovery-thread-{}", sim.next_thread);
+                sim.next_thread += 1;
+                let cwd = request["params"]["cwd"].as_str().unwrap_or_default();
+                sim.threads
+                    .insert(id.clone(), SimThread::idle(&id, Path::new(cwd)));
+                Answer::Result(json!({
+                    "thread": {"id": id},
+                    "cwd": cwd,
+                    "model": request["params"]["model"],
+                    "modelProvider": request["params"]["modelProvider"],
+                    "reasoningEffort": request["params"]["config"]["model_reasoning_effort"]
+                }))
+            }
+            "thread/name/set" => {
+                let mut sim = sim.lock().unwrap();
+                let id = request["params"]["threadId"].as_str().unwrap_or_default();
+                let Some(thread) = sim.threads.get_mut(id) else {
+                    return Answer::Error(json!({"message": format!("unknown thread {id}")}));
+                };
+                thread.name = request["params"]["name"].as_str().map(str::to_owned);
+                Answer::Result(json!({}))
+            }
+            "turn/interrupt" => {
+                let mut sim = sim.lock().unwrap();
+                let thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                let turn = request["params"]["turnId"].as_str().unwrap_or_default();
+                match sim.interrupt(thread, turn) {
+                    Ok(()) => Answer::Result(json!({})),
+                    Err(message) => Answer::Error(json!({"message": message})),
+                }
+            }
+            "thread/backgroundTerminals/list" => {
+                let sim = sim.lock().unwrap();
+                let thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                let data: Vec<Value> = sim
+                    .terminals
+                    .get(thread)
+                    .into_iter()
+                    .flatten()
+                    .map(|terminal| {
+                        json!({
+                            "processId": terminal.process_id.clone(),
+                            "itemId": terminal.item_id.clone(),
+                            "command": terminal.command.clone(),
+                            "cwd": sim.threads.get(thread).map(|thread| &thread.cwd),
+                            "osPid": null
+                        })
+                    })
+                    .collect();
+                Answer::Result(json!({"data": data, "nextCursor": null}))
+            }
+            "thread/backgroundTerminals/terminate" => {
+                let mut sim = sim.lock().unwrap();
+                let thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                let process_id = request["params"]["processId"].as_str().unwrap_or_default();
+                let terminated = sim.terminate_terminals
+                    && sim.terminals.get_mut(thread).is_some_and(|terminals| {
+                        let before = terminals.len();
+                        terminals.retain(|terminal| terminal.process_id != process_id);
+                        terminals.len() != before
+                    });
+                Answer::Result(json!({"terminated": terminated}))
             }
             "turn/steer" | "turn/start" => {
                 let mut sim = sim.lock().unwrap();
@@ -460,7 +575,8 @@ fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Sy
     .unwrap();
     let repository = tempfile::tempdir().unwrap();
     let checkout = tempfile::tempdir().unwrap();
-    let base = git_repo(repository.path());
+    git_repo(repository.path());
+    let base = git_repo(checkout.path());
     let slot = 1u32;
     let run = format!("mcp-test-{executor}");
     let state = task_worktree::pool_state_dir(home, repository.path()).unwrap();
@@ -492,6 +608,15 @@ fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Sy
         "leadThreadId": lead,
         "executorThreadId": executor,
         "turnId": "initial-turn",
+        "assignment": {
+            "schema": 1,
+            "objective": "Prove one bounded executor dispatch",
+            "inputs": [],
+            "outputs": [],
+            "invariants": [],
+            "acceptance": ["Return a bounded result"]
+        },
+        "prompt": "Prove one bounded executor dispatch and return a bounded result.",
         "title": format!("executor {executor}"),
         "slot": slot,
         "source": repository.path(),
@@ -508,6 +633,13 @@ fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Sy
         "observedStatus": "active",
         "allowProviderModelFallback": false,
         "startupReservationReleased": true,
+        "control": {
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "config": {"agents.enabled": false},
+            "roleArgs": [],
+            "profileOverrides": []
+        },
         "lease": {
             "slot": slot,
             "owner": run,
@@ -760,6 +892,8 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
         "executor_message",
         "executor_reply",
         "executor_ask_lead",
+        "executor_stop",
+        "executor_resume",
     ] {
         assert!(names.contains(&required), "{listed}");
     }
@@ -773,7 +907,10 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
                 tool["name"]
             );
         }
-        if tool["name"] != "executor_message" {
+        if !matches!(
+            tool["name"].as_str(),
+            Some("executor_message") | Some("executor_stop") | Some("executor_resume")
+        ) {
             assert!(
                 !properties.contains_key("run"),
                 "{} must not expose run: {tool}",
@@ -782,7 +919,8 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
         } else {
             assert!(
                 properties.contains_key("run"),
-                "executor_message must expose run: {tool}"
+                "{} must expose run: {tool}",
+                tool["name"]
             );
         }
     }
@@ -1680,4 +1818,561 @@ fn repeated_question_text_is_distinct_with_a_new_client_id_and_stable_when_omitt
 
     drop(run);
     mcp.finish();
+}
+
+fn commit_checkout(root: &Path, message: &str) -> String {
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(["-C", root.to_str().unwrap()])
+            .args(["-c", "user.name=Executor MCP Test"])
+            .args(["-c", "user.email=executor-mcp@example.invalid"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", message]);
+    String::from_utf8(git(&["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+fn terminal(process_id: &str, command: &str) -> SimTerminal {
+    SimTerminal {
+        process_id: process_id.into(),
+        item_id: format!("item-{process_id}"),
+        command: command.into(),
+    }
+}
+
+fn stop_run(mcp: &mut Mcp, id: u64, caller: &str, run: &str) -> Value {
+    mcp.call_tool(
+        id,
+        "executor_stop",
+        json!({"run": run}),
+        Some(json!({"threadId": caller})),
+    )
+}
+
+#[test]
+fn stop_interrupts_only_the_exact_thread_and_contains_its_terminal() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let first_run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let second_run = synthetic_run(home.path(), SECOND_LEAD, SECOND_EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        first_run._checkout.path(),
+        false,
+        true,
+    )));
+    {
+        let mut sim = sim.lock().unwrap();
+        sim.threads.insert(
+            SECOND_LEAD.to_owned(),
+            SimThread::idle(SECOND_LEAD, second_run._checkout.path()),
+        );
+        sim.threads.insert(
+            SECOND_EXECUTOR.to_owned(),
+            SimThread::active(SECOND_EXECUTOR, second_run._checkout.path(), "sibling-turn"),
+        );
+        sim.post_interrupt_terminal = Some(terminal("4101", "owned stop command"));
+        sim.terminals.insert(
+            SECOND_EXECUTOR.to_owned(),
+            vec![terminal("4102", "sibling command")],
+        );
+    }
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+
+    fs::write(first_run._checkout.path().join("committed.txt"), "kept\n").unwrap();
+    let head = commit_checkout(first_run._checkout.path(), "partial work");
+    fs::write(
+        first_run._checkout.path().join("untracked.txt"),
+        "untracked kept\n",
+    )
+    .unwrap();
+    let receipt_before: Value =
+        serde_json::from_slice(&fs::read(&first_run.receipt).unwrap()).unwrap();
+    let slot_before = receipt_before["lease"].clone();
+    let slot_state = task_worktree::pool_state_dir(home.path(), first_run._repository.path())
+        .unwrap()
+        .join("slot-1.json");
+    let record_before: Value = serde_json::from_slice(&fs::read(&slot_state).unwrap()).unwrap();
+    let mut receipt = receipt_before.clone();
+    receipt["leadMessages"] = json!([
+        {
+            "schema": 1,
+            "id": "pending-stop-message",
+            "kind": "message",
+            "status": "pending",
+            "contentId": "pending"
+        },
+        {
+            "schema": 1,
+            "id": "delivered-stop-request",
+            "kind": "reply-request",
+            "status": "delivered",
+            "contentId": "delivered"
+        }
+    ]);
+    fs::write(
+        &first_run.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    let run_id = format!("mcp-test-{EXECUTOR}");
+    let mut mcp = Mcp::start(home.path());
+    let response = stop_run(&mut mcp, 2, LEAD, &run_id);
+    let stopped = result(&response);
+    assert_eq!(stopped["outcome"], "stopped", "{response}");
+    assert_eq!(stopped["executorThreadId"], EXECUTOR);
+    assert_eq!(stopped["interruptedTurnId"], "executor-active");
+    assert_eq!(stopped["threadState"], "idle");
+    assert_eq!(stopped["containment"]["status"], "verified");
+    assert_eq!(stopped["containment"]["listed"], 1);
+    assert_eq!(stopped["containment"]["ended"], 1);
+    assert_eq!(
+        stopped["cancelledMessages"],
+        json!(["pending-stop-message", "delivered-stop-request"])
+    );
+
+    let interrupts = server.requests_for("turn/interrupt");
+    assert_eq!(interrupts.len(), 1, "{interrupts:?}");
+    assert_eq!(interrupts[0]["params"]["threadId"], EXECUTOR);
+    assert_eq!(interrupts[0]["params"]["turnId"], "executor-active");
+    let terminated = server.requests_for("thread/backgroundTerminals/terminate");
+    assert_eq!(terminated.len(), 1, "{terminated:?}");
+    assert_eq!(terminated[0]["params"]["threadId"], EXECUTOR);
+    assert_eq!(terminated[0]["params"]["processId"], "4101");
+    assert!(
+        server.requests_for("turn/start").is_empty(),
+        "stop must not start model work"
+    );
+    assert!(
+        server.requests_for("thread/start").is_empty(),
+        "stop must not create a thread"
+    );
+    for inventory in server.requests_for("thread/backgroundTerminals/list") {
+        assert_eq!(
+            inventory["params"]["threadId"], EXECUTOR,
+            "stop read a sibling inventory: {inventory}"
+        );
+    }
+    {
+        let sim = sim.lock().unwrap();
+        assert_eq!(sim.threads[EXECUTOR].state(), "idle");
+        assert_eq!(sim.threads[SECOND_EXECUTOR].state(), "active");
+        assert_eq!(sim.terminals.get(EXECUTOR).unwrap().len(), 0);
+        assert_eq!(sim.terminals.get(SECOND_EXECUTOR).unwrap().len(), 1);
+    }
+    assert_eq!(
+        String::from_utf8(
+            Command::new("git")
+                .args([
+                    "-C",
+                    first_run._checkout.path().to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD"
+                ])
+                .output()
+                .unwrap()
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        head
+    );
+    assert_eq!(
+        fs::read_to_string(first_run._checkout.path().join("untracked.txt")).unwrap(),
+        "untracked kept\n"
+    );
+    let receipt_after: Value =
+        serde_json::from_slice(&fs::read(&first_run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt_after["lease"], slot_before);
+    assert_eq!(receipt_after["turnId"], "executor-active");
+    assert_eq!(receipt_after["stopTurnId"], "executor-active");
+    assert_eq!(
+        receipt_after["leadMessages"][0]["status"], "cancelled",
+        "{receipt_after}"
+    );
+    let record_after: Value = serde_json::from_slice(&fs::read(&slot_state).unwrap()).unwrap();
+    assert_eq!(record_after, record_before);
+    let still_running = mcp.call_tool(
+        3,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&still_running)["runs"][0]["run"], run_id);
+    assert!(
+        result(&still_running)["runs"][0]["pendingRequests"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "cancelled requests are not pending"
+    );
+
+    let before_retry = server.requests_for("turn/start").len();
+    let refused_message = mcp.call_tool(
+        4,
+        "executor_message",
+        json!({"text": "restart? no", "clientMessageId": "after-stop"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&refused_message).contains("exact run is stopped"),
+        "{refused_message}"
+    );
+    assert_eq!(server.requests_for("turn/start").len(), before_retry);
+
+    let repeated = stop_run(&mut mcp, 5, LEAD, &run_id);
+    let repeated = result(&repeated);
+    assert_eq!(repeated["outcome"], "already-stopped", "{repeated}");
+    assert_eq!(repeated["stop"]["repeats"], 1);
+    assert_eq!(server.requests_for("turn/interrupt").len(), 1);
+
+    let forbidden = stop_run(&mut mcp, 6, EXECUTOR, &run_id);
+    assert!(
+        tool_error(&forbidden).contains("owned by the calling lead"),
+        "{forbidden}"
+    );
+    assert_eq!(server.requests_for("turn/interrupt").len(), 1);
+    assert_eq!(
+        sim.lock().unwrap().terminals[SECOND_EXECUTOR].len(),
+        1,
+        "the sibling command survives"
+    );
+
+    drop(first_run);
+    drop(second_run);
+    mcp.finish();
+}
+
+#[test]
+fn stop_reports_completion_race_and_partial_containment_honestly() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let raced = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let raced_sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        raced._checkout.path(),
+        false,
+        true,
+    )));
+    raced_sim.lock().unwrap().interrupt_completes = true;
+    server.answer_fn(native_responder(Arc::clone(&raced_sim)));
+    let mut mcp = Mcp::start(home.path());
+    let response = stop_run(&mut mcp, 2, LEAD, &format!("mcp-test-{EXECUTOR}"));
+    let completed = result(&response);
+    assert_eq!(completed["outcome"], "already-completed", "{response}");
+    assert_eq!(
+        raced_sim.lock().unwrap().threads[EXECUTOR]
+            .turns
+            .last()
+            .unwrap()["status"],
+        "completed"
+    );
+    assert!(
+        server
+            .requests_for("thread/backgroundTerminals/terminate")
+            .is_empty()
+    );
+    mcp.finish();
+    drop(raced);
+
+    let partial = synthetic_run(home.path(), SECOND_LEAD, SECOND_EXECUTOR, &server);
+    let partial_sim = Arc::new(Mutex::new(NativeSim::new(
+        SECOND_LEAD,
+        SECOND_EXECUTOR,
+        partial._checkout.path(),
+        false,
+        true,
+    )));
+    {
+        let mut sim = partial_sim.lock().unwrap();
+        sim.terminate_terminals = false;
+        sim.terminals.insert(
+            SECOND_EXECUTOR.to_owned(),
+            vec![terminal("5101", "cannot stop this command")],
+        );
+    }
+    server.answer_fn(native_responder(Arc::clone(&partial_sim)));
+    let mut mcp = Mcp::start(home.path());
+    let response = stop_run(
+        &mut mcp,
+        3,
+        SECOND_LEAD,
+        &format!("mcp-test-{SECOND_EXECUTOR}"),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let partial_value = &response["result"]["structuredContent"];
+    assert_eq!(partial_value["outcome"], "partial", "{response}");
+    assert_eq!(partial_value["containment"]["status"], "partial");
+    assert_eq!(partial_value["stop"]["survivors"][0]["surface"], "5101");
+    assert!(
+        server
+            .requests_for("turn/interrupt")
+            .iter()
+            .any(|request| request["params"]["threadId"] == SECOND_EXECUTOR),
+        "the partial stop interrupted its exact thread"
+    );
+    assert!(
+        server.requests_for("turn/start").is_empty(),
+        "partial containment must not start new work"
+    );
+    partial_sim.lock().unwrap().terminate_terminals = true;
+    let cleaned = stop_run(
+        &mut mcp,
+        4,
+        SECOND_LEAD,
+        &format!("mcp-test-{SECOND_EXECUTOR}"),
+    );
+    let cleaned = result(&cleaned);
+    assert_eq!(cleaned["outcome"], "stopped", "{cleaned}");
+    assert_eq!(cleaned["containment"]["status"], "verified");
+    assert!(cleaned["stop"]["survivors"].as_array().unwrap().is_empty());
+    let usable = mcp.call_tool(
+        5,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": SECOND_LEAD})),
+    );
+    assert_eq!(
+        result(&usable)["runs"][0]["executorThreadId"],
+        SECOND_EXECUTOR,
+        "the shared app-server remains usable"
+    );
+    mcp.finish();
+    drop(partial);
+}
+
+#[test]
+fn exact_continuation_reuses_the_thread_and_never_replays_the_assignment() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        true,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let run_id = format!("mcp-test-{EXECUTOR}");
+    let stopped = stop_run(&mut mcp, 2, LEAD, &run_id);
+    let stopped = result(&stopped);
+    assert_eq!(stopped["outcome"], "stopped");
+    let starts_before = server.requests_for("thread/start").len();
+    let turns_before = server.requests_for("turn/start").len();
+
+    let resumed = mcp.call_tool(
+        3,
+        "executor_resume",
+        json!({
+            "run": run_id,
+            "mode": "exact",
+            "progress": "The child command was interrupted; keep the committed and untracked files."
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    let resumed = result(&resumed);
+    assert_eq!(resumed["mode"], "exact", "{resumed}");
+    assert_eq!(resumed["threadId"], EXECUTOR);
+    assert_eq!(resumed["preTurnTurns"], 1);
+    assert_eq!(
+        resumed["predecessorRetained"], false,
+        "exact continuation is the same thread"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+    assert_eq!(server.requests_for("turn/start").len(), turns_before + 1);
+    let starts = server.requests_for("turn/start");
+    let text = starts[0]["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("Continue the preserved assignment in this same thread"),
+        "{text}"
+    );
+    assert!(text.contains("The child command was interrupted"), "{text}");
+    assert!(!text.contains("Original assignment:"), "{text}");
+    assert_eq!(
+        sim.lock().unwrap().threads[EXECUTOR].state(),
+        "active",
+        "explicit continuation starts the same thread"
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["executorThreadId"], EXECUTOR);
+    assert_eq!(receipt["turnId"], resumed["turnId"]);
+    assert_eq!(receipt["continuation"]["mode"], "exact");
+    assert_eq!(receipt["continuation"]["fromThreadId"], EXECUTOR);
+    assert!(receipt.get("predecessorThreadId").is_none());
+    assert_eq!(receipt["slot"], 1);
+    let allowed = mcp.call_tool(
+        4,
+        "executor_message",
+        json!({"text": "post-resume guidance", "clientMessageId": "post-resume"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(
+        allowed["result"]["isError"], false,
+        "explicit continuation clears the stopped-delivery gate: {allowed}"
+    );
+    assert_eq!(
+        server.requests_for("turn/start").len(),
+        turns_before + 1,
+        "post-resume delivery must not start a duplicate turn"
+    );
+    let stopped_again = stop_run(&mut mcp, 5, LEAD, &format!("mcp-test-{EXECUTOR}"));
+    let stopped_again = result(&stopped_again);
+    assert_eq!(stopped_again["outcome"], "stopped", "{stopped_again}");
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert!(receipt["stop"].get("continuedMs").is_none(), "{receipt}");
+    let refused_again = mcp.call_tool(
+        6,
+        "executor_message",
+        json!({"text": "after the new stop", "clientMessageId": "after-second-stop"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&refused_again).contains("exact run is stopped"),
+        "{refused_again}"
+    );
+    assert_eq!(server.requests_for("turn/start").len(), turns_before + 1);
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn fresh_recovery_creates_one_new_thread_and_retains_the_predecessor() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        true,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let run_id = format!("mcp-test-{EXECUTOR}");
+    let stopped = stop_run(&mut mcp, 2, LEAD, &run_id);
+    let stopped = result(&stopped);
+    assert_eq!(stopped["outcome"], "stopped");
+    let lease_before = stopped["lease"].clone();
+    let starts_before = server.requests_for("thread/start").len();
+    let resumed = mcp.call_tool(
+        3,
+        "executor_resume",
+        json!({
+            "run": run_id,
+            "mode": "fresh",
+            "progress": "Inspect the interrupted command before reusing its output."
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    let resumed = result(&resumed);
+    let new_thread = resumed["threadId"].as_str().unwrap();
+    assert_eq!(resumed["mode"], "fresh", "{resumed}");
+    assert_ne!(new_thread, EXECUTOR);
+    assert_eq!(resumed["predecessorThreadId"], EXECUTOR);
+    assert_eq!(resumed["predecessorRetained"], true);
+    assert_eq!(server.requests_for("thread/start").len(), starts_before + 1);
+    assert_eq!(server.requests_for("turn/start").len(), 1);
+    let starts = server.requests_for("turn/start");
+    let text = starts[0]["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Original assignment:"), "{text}");
+    assert!(
+        text.contains("Prove one bounded executor dispatch"),
+        "{text}"
+    );
+    assert!(text.contains("Inspect the interrupted command"), "{text}");
+    let sim = sim.lock().unwrap();
+    assert!(sim.threads.contains_key(EXECUTOR), "predecessor retained");
+    assert_eq!(sim.threads[new_thread].state(), "active");
+    drop(sim);
+    let receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["executorThreadId"], new_thread);
+    assert_eq!(receipt["predecessorThreadId"], EXECUTOR);
+    assert_eq!(receipt["predecessor"]["threadId"], EXECUTOR);
+    assert_eq!(receipt["predecessor"]["retained"], true);
+    assert_eq!(receipt["continuation"]["mode"], "fresh");
+    assert_eq!(receipt["slot"], 1);
+    assert_eq!(receipt["lease"], lease_before);
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn exact_continuation_reports_missing_pre_turn_history_without_starting_a_turn() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let response = mcp.call_tool(
+        2,
+        "executor_resume",
+        json!({"mode": "exact"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&response).contains("no pre-turn history"),
+        "{response}"
+    );
+    assert!(server.requests_for("turn/start").is_empty());
+    assert!(server.requests_for("thread/start").is_empty());
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn continuation_refuses_an_active_thread_before_starting_new_work() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        true,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    for (id, mode) in [(2, "exact"), (3, "fresh")] {
+        let response = mcp.call_tool(
+            id,
+            "executor_resume",
+            json!({"mode": mode}),
+            Some(json!({"threadId": LEAD})),
+        );
+        assert!(
+            tool_error(&response).contains("still has active turn"),
+            "{mode}: {response}"
+        );
+    }
+    assert!(server.requests_for("turn/start").is_empty());
+    assert!(server.requests_for("thread/start").is_empty());
+    assert_eq!(sim.lock().unwrap().threads[EXECUTOR].state(), "active");
+    mcp.finish();
+    drop(run);
 }
