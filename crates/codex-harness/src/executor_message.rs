@@ -917,7 +917,7 @@ pub(crate) fn content_id(thread_id: &str, text: &str) -> String {
 /// its addressed request to the identity: answering the same request with the
 /// same words is a repeat, while the same words answering another request - or
 /// a later, already resolved exchange - is a new input with its own identity.
-fn attempt_identity(thread_id: &str, text: &str, reply_to: Option<&str>) -> String {
+pub(crate) fn attempt_identity(thread_id: &str, text: &str, reply_to: Option<&str>) -> String {
     match reply_to {
         Some(id) => content_id(thread_id, &format!("reply-to {id}\n{text}")),
         None => content_id(thread_id, text),
@@ -1633,8 +1633,8 @@ codex-harness lead message [--text TEXT | --file FILE] [--notify]
 ";
 
 pub(crate) const PAYLOAD_MARK: &str = "\n---payload---\n";
-const KIND_REQUEST: &str = "reply-request";
-const KIND_NOTICE: &str = "notification";
+pub(crate) const KIND_REQUEST: &str = "reply-request";
+pub(crate) const KIND_NOTICE: &str = "notification";
 const UNAVAILABLE: &str = "unavailable";
 
 struct LeadInput {
@@ -2320,7 +2320,7 @@ fn unresolved_lead_message(
 /// so a concurrently recorded request, answer or resolution is preserved
 /// instead of being replaced by a stale snapshot: a pending request is never
 /// silently evicted and a resolved one is never silently reopened.
-fn update_receipt_document<T>(
+pub(crate) fn update_receipt_document<T>(
     receipt: &Path,
     edit: impl FnOnce(&mut Value) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -2895,6 +2895,286 @@ pub(crate) fn deliver_to_lead_thread(
             ),
         }),
     }
+}
+
+/// One classified delivery to an exact native thread. The same vocabulary is
+/// used for both directions of the MCP exchange: transport acceptance alone is
+/// queued, only an item in the recipient's own conversation is delivered.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExactDelivery {
+    pub status: &'static str,
+    pub method: String,
+    pub turn_id: Option<String>,
+    pub evidence: Option<String>,
+    pub detail: String,
+}
+
+fn verify_exact_thread(
+    thread_id: &str,
+    thread: &Value,
+    expected_cwd: Option<&Path>,
+    identity: Option<&BoundIdentity>,
+) -> io::Result<()> {
+    if thread["id"].as_str() != Some(thread_id) {
+        return Err(invalid(&format!(
+            "thread/read answered for thread {} instead of {thread_id}; nothing was delivered",
+            thread["id"]
+        )));
+    }
+    if let Some(expected) = expected_cwd {
+        let actual = thread["cwd"].as_str().ok_or_else(|| {
+            invalid("the live conversation reports no working directory; nothing was delivered")
+        })?;
+        if !same_directory(Path::new(actual), expected) {
+            return Err(invalid(&format!(
+                "the live conversation runs at {actual} instead of the recorded checkout {}; nothing was delivered",
+                expected.display()
+            )));
+        }
+    }
+    if let Some(identity) = identity
+        && let Err(mismatch) = identity.verify(thread)
+    {
+        return Err(invalid(&format!(
+            "the live conversation does not carry the recorded profile binding: {mismatch}; nothing was delivered"
+        )));
+    }
+    Ok(())
+}
+
+/// Attaches to the one live thread and verifies its exact identity, checkout
+/// and profile binding without sending anything. A caller that must preserve an
+/// attempt across a crash records it only after this succeeds.
+pub(crate) fn prepare_exact_thread(
+    endpoint: &Endpoint,
+    thread_id: &str,
+    expected_cwd: Option<&Path>,
+    identity: Option<&BoundIdentity>,
+) -> io::Result<Conversation> {
+    let endpoint = endpoint.for_thread(thread_id)?;
+    let mut conversation = Conversation::attach(&endpoint, CONTROL_BOUND).map_err(|error| {
+        invalid(&format!(
+            "the recorded control endpoint did not accept a connection: {error}; nothing was sent"
+        ))
+    })?;
+    let thread = conversation.thread_state().map_err(|error| {
+        invalid(&format!(
+            "the exact recipient thread could not be read: {error}; nothing was sent"
+        ))
+    })?;
+    verify_exact_thread(thread_id, &thread, expected_cwd, identity)?;
+    Ok(conversation)
+}
+
+/// Sends one already-composed input on an attached, verified conversation and
+/// classifies the result from that thread's own items. It never starts a second
+/// turn after a queue acceptance and never reports transport acceptance as
+/// delivery.
+pub(crate) fn send_exact_thread(
+    conversation: &mut Conversation,
+    thread_id: &str,
+    client_message_id: &str,
+    text: &str,
+) -> io::Result<ExactDelivery> {
+    let mut sent = 0u64;
+    while sent < DELIVERY_ROUNDS as u64 {
+        let thread = conversation.thread_state().map_err(|error| {
+            invalid(&format!(
+                "the exact recipient thread could not be read: {error}; nothing was sent"
+            ))
+        })?;
+        if thread["id"].as_str() != Some(thread_id) {
+            return Err(invalid(&format!(
+                "thread/read answered for thread {} instead of {thread_id}; nothing was sent",
+                thread["id"]
+            )));
+        }
+        let active = active_turn(&thread);
+        let (method, params) = request_params(thread_id, client_message_id, text, &active);
+        sent += 1;
+        match conversation.request(method, params) {
+            Ok(Reply::Result(result)) => {
+                let turn = answer_turn(&result);
+                let evidence = observe_input(
+                    conversation,
+                    client_message_id,
+                    text,
+                    Instant::now() + EVIDENCE_WINDOW,
+                );
+                if let Some(evidence) = evidence {
+                    return Ok(ExactDelivery {
+                        status: STATUS_DELIVERED,
+                        method: method.to_owned(),
+                        turn_id: Some(evidence.turn.clone()),
+                        evidence: Some(evidence.detail()),
+                        detail: format!(
+                            "the input is in the recipient conversation's own items ({}); whether the recipient applied it is the recipient's own report",
+                            evidence.detail()
+                        ),
+                    });
+                }
+                if turn.is_empty() {
+                    return Ok(ExactDelivery {
+                        status: STATUS_INDETERMINATE,
+                        method: method.to_owned(),
+                        turn_id: None,
+                        evidence: None,
+                        detail: format!(
+                            "{method} answered without a turn identity, so which turn holds the input is unknown"
+                        ),
+                    });
+                }
+                return Ok(ExactDelivery {
+                    status: STATUS_QUEUED,
+                    method: method.to_owned(),
+                    turn_id: Some(turn.clone()),
+                    evidence: None,
+                    detail: format!(
+                        "accepted by {method} for turn {turn}; the recipient's own items do not show the input yet"
+                    ),
+                });
+            }
+            // A refusal applied nothing, but the turn may have changed under
+            // the request. Re-read and submit once more to the current turn.
+            Ok(Reply::Rejected(error)) => {
+                let refused = observation::excerpt(&error.to_string(), 400);
+                if sent < DELIVERY_ROUNDS as u64 {
+                    continue;
+                }
+                return Ok(ExactDelivery {
+                    status: STATUS_ERROR,
+                    method: method.to_owned(),
+                    turn_id: None,
+                    evidence: None,
+                    detail: format!(
+                        "{method} was refused after {sent} rounds: {refused}; nothing was delivered"
+                    ),
+                });
+            }
+            Ok(Reply::Unanswered) | Err(_) => {
+                return Ok(ExactDelivery {
+                    status: STATUS_INDETERMINATE,
+                    method: method.to_owned(),
+                    turn_id: None,
+                    evidence: None,
+                    detail: format!(
+                        "{method} was not answered within {}s, so whether the input reached the recipient is unknown",
+                        CONTROL_BOUND.as_secs()
+                    ),
+                });
+            }
+        }
+    }
+    Err(io::Error::other(
+        "the delivery rounds ended without establishing an outcome; nothing is reported as delivered",
+    ))
+}
+
+/// Reads the exact recipient thread without sending anything. It is used to
+/// reconcile an earlier pending, queued or indeterminate attempt before any
+/// retry, so an unknown submission is never duplicated.
+pub(crate) fn observe_exact_thread(
+    endpoint: &Endpoint,
+    thread_id: &str,
+    expected_cwd: Option<&Path>,
+    identity: Option<&BoundIdentity>,
+    client_message_id: &str,
+    text: &str,
+) -> io::Result<Option<ExactDelivery>> {
+    let endpoint = endpoint.for_thread(thread_id)?;
+    let mut conversation = Conversation::attach(&endpoint, CONTROL_BOUND).map_err(|error| {
+        invalid(&format!(
+            "the recorded control endpoint did not accept a connection: {error}; the earlier attempt was not reconciled"
+        ))
+    })?;
+    let thread = conversation.thread_state().map_err(|error| {
+        invalid(&format!(
+            "the exact recipient thread could not be read: {error}; the earlier attempt was not reconciled"
+        ))
+    })?;
+    verify_exact_thread(thread_id, &thread, expected_cwd, identity)?;
+    Ok(
+        observe_input(
+            &mut conversation,
+            client_message_id,
+            text,
+            Instant::now() + EVIDENCE_WINDOW,
+        )
+        .map(|evidence| ExactDelivery {
+            status: STATUS_DELIVERED,
+            method: String::new(),
+            turn_id: Some(evidence.turn.clone()),
+            evidence: Some(evidence.detail()),
+            detail: format!(
+                "the earlier attempt is in the recipient conversation's own items ({}); whether the recipient applied it is the recipient's own report",
+                evidence.detail()
+            ),
+        }),
+    )
+}
+
+/// Reads one recorded input attempt from the receipt's existing `messages`
+/// field. An unreadable receipt is an error, not an empty history.
+pub(crate) fn read_exact_attempt(receipt: &Path, id: &str) -> io::Result<Option<Value>> {
+    let value = read_receipt_value(receipt)?;
+    Ok(read_attempts(&value)
+        .into_iter()
+        .find(|attempt| attempt["id"].as_str() == Some(id)))
+}
+
+/// Records the attempt before its request is sent, so an interrupted call
+/// leaves an identity that prevents the same payload from being sent again.
+pub(crate) fn begin_exact_attempt(
+    receipt: &Path,
+    id: &str,
+    text: &str,
+    attempts: u64,
+    reply_to: Option<&str>,
+) -> io::Result<()> {
+    let mut entry = pending_entry(id, "", None, text, attempts);
+    entry["contentId"] = Value::String(content_id(id, text));
+    entry["replyTo"] = json!(reply_to);
+    record_attempt(receipt, entry)
+}
+
+/// Merges the classified outcome into the attempt recorded before its request.
+/// A delivered correlated reply resolves its request under the same receipt
+/// lock; queued, error and indeterminate outcomes do not.
+pub(crate) fn finish_exact_attempt(
+    receipt: &Path,
+    id: &str,
+    text: &str,
+    delivery: &ExactDelivery,
+    expected_turn: Option<&str>,
+    attempts: u64,
+    reply_to: Option<&str>,
+) -> io::Result<()> {
+    let now = now_ms();
+    let entry = json!({
+        "schema": SCHEMA,
+        "id": id,
+        "contentId": content_id(id, text),
+        "clientMessageId": id,
+        "replyTo": reply_to,
+        "status": delivery.status,
+        "method": delivery.method,
+        "expectedTurnId": expected_turn,
+        "turnId": delivery.turn_id,
+        "evidence": delivery.evidence,
+        "attempts": attempts,
+        "bytes": text.len(),
+        "lines": text.lines().count().max(1),
+        "requestedMs": now,
+        "recordedMs": now,
+        "deliveredMs": if delivery.status == STATUS_DELIVERED {
+            Value::from(now)
+        } else {
+            Value::Null
+        },
+        "detail": delivery.detail,
+    });
+    record_attempt(receipt, entry)
 }
 
 /// Reconciles an earlier attempt from the exact lead conversation's own items.
