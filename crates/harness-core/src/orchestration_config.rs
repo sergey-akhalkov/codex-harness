@@ -299,6 +299,27 @@ pub fn profile_config_overrides(codex_home: &Path, profile: &str) -> io::Result<
     Ok(overrides)
 }
 
+/// Dotted `-c` overrides for only one installed profile's `[features]` table.
+///
+/// A managed frontend is a separate native process: it loads the base user
+/// configuration, not the profile that the harness app-server applies. Mirror
+/// the profile's feature choices there so startup notices about Code Mode (or
+/// another feature-dependent tool surface) describe the hosted conversation
+/// instead of the base model. Routing, credentials and permissions stay on the
+/// app-server child.
+pub fn profile_feature_overrides(codex_home: &Path, profile: &str) -> io::Result<Vec<String>> {
+    if profile == "default" {
+        return Ok(Vec::new());
+    }
+    let table = profile_config(codex_home, profile)?;
+    let Some(features) = table.get("features").and_then(toml::Value::as_table) else {
+        return Ok(Vec::new());
+    };
+    let mut overrides = Vec::new();
+    flatten_table("features", features, &mut overrides);
+    Ok(overrides)
+}
+
 /// Read a named native profile layer. The orchestration selector `default`
 /// adds no profile, but explicit native `--profile default` names a real file.
 pub fn profile_config(codex_home: &Path, profile: &str) -> io::Result<toml::Table> {
@@ -763,6 +784,8 @@ max_events_per_poll = 10
                 "model_reasoning_effort = \"max\"\n",
                 "[features]\n",
                 "hooks = true\n",
+                "code_mode = false\n",
+                "code_mode_host = false\n",
                 "[model_providers.deepseek]\n",
                 "base_url = \"https://api.example.test/v1\"\n",
                 "wire_api = \"responses\"\n",
@@ -775,6 +798,25 @@ max_events_per_poll = 10
         assert!(overrides.contains(&"model=\"deepseek-flash\"".to_owned()));
         assert!(overrides.contains(&"model_reasoning_effort=\"max\"".to_owned()));
         assert!(overrides.contains(&"features.hooks=true".to_owned()));
+        let features = profile_feature_overrides(&root, "ds").unwrap();
+        assert!(features.contains(&"features.hooks=true".to_owned()));
+        assert!(features.contains(&"features.code_mode=false".to_owned()));
+        assert!(features.contains(&"features.code_mode_host=false".to_owned()));
+        assert_eq!(features.len(), 3, "{features:?}");
+        assert!(
+            features.iter().all(|entry| !entry.contains("model")),
+            "frontend feature overrides must not carry routing: {features:?}"
+        );
+        assert!(
+            profile_feature_overrides(&root, "default")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            profile_feature_overrides(&root, "missing")
+                .unwrap()
+                .is_empty()
+        );
         assert!(overrides.contains(
             &"model_providers.deepseek.base_url=\"https://api.example.test/v1\"".to_owned()
         ));
@@ -815,6 +857,38 @@ max_events_per_poll = 10
             profile_config_overrides(&root, "missing")
                 .unwrap()
                 .is_empty()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_feature_overrides_preserve_an_enabled_code_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestration-features-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("chatgpt.config.toml"),
+            "[features]\ncode_mode = true\ncode_mode_host = true\n",
+        )
+        .unwrap();
+        let features = profile_feature_overrides(&root, "chatgpt").unwrap();
+        assert!(features.contains(&"features.code_mode=true".to_owned()));
+        assert!(features.contains(&"features.code_mode_host=true".to_owned()));
+        assert!(
+            features.iter().all(|entry| !entry.contains("=false")),
+            "an enabled Code Mode profile must stay enabled: {features:?}"
+        );
+        assert!(
+            profile_feature_overrides(&root, "default")
+                .unwrap()
+                .is_empty(),
+            "the base configuration already carries the default profile"
         );
         let _ = fs::remove_dir_all(&root);
     }

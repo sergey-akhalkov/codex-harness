@@ -1030,8 +1030,14 @@ off (`features.worktrees = false`), a session start forwards that leaf as
 the same pair before their `resume` subcommand. Those controller frontends
 (`lead start` / `executor host`) run as remote TUIs attached to the harness's
 app-server child, which serves the conversation; the pair pins the frontend
-process's own configuration to the managed default, while the selected
-profile and the user configuration reach the app-server child unchanged. A
+process's own configuration to the managed default. The selected profile's
+routing, credentials and permissions reach the app-server child unchanged;
+its `[features]` table is mirrored to the frontend so its local startup
+notices and tool-mode checks describe the hosted model. The kit's worktree pin
+follows those values and stays authoritative. Without that mirror, a DeepSeek
+executor frontend would read the base `code_mode = true` and warn that
+`deepseek-flash` does not advertise Code Mode even though the hosted thread
+runs with the profile's `code_mode = false`. A
 model-free probe of the installed app-server route (the same binary and
 `features.worktrees` override forms the hosted route uses) registered no
 worktree-named tool in its runtime catalogue under the feature default,

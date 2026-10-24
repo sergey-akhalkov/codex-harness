@@ -6796,13 +6796,26 @@ pub(crate) fn attach_owned_frontend(
     let frontend_port = relay
         .as_ref()
         .map_or_else(|| conversation.endpoint().port(), Relay::port);
+    let profile_features =
+        orchestration_config::profile_feature_overrides(&plan.home, &plan.identity.profile)
+            .map_err(|error| {
+                invalid(&format!(
+                    "the selected profile's feature settings could not be read for the native frontend: {error}; no frontend was started"
+                ))
+            })?;
     let mut spec = CommandSpec::new(&upstream);
     spec.inherit_console = true;
     spec.current_dir = Some(plan.slot.clone());
-    spec.args = frontend_args(frontend_port, conversation.thread_id(), presentation, role)
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    spec.args = frontend_args(
+        frontend_port,
+        conversation.thread_id(),
+        presentation,
+        role,
+        &profile_features,
+    )
+    .into_iter()
+    .map(Into::into)
+    .collect();
     spec.env.insert(
         "CODEX_HOME".into(),
         Some(plan.home.as_os_str().to_os_string()),
@@ -6948,10 +6961,12 @@ pub(crate) fn attach_observed_frontend(
 /// Global options before `resume`. The thread id is the only positional, so
 /// the frontend cannot submit the assignment. Every managed frontend runs as
 /// a remote TUI whose conversation, including its tool catalogue, is served
-/// by the harness's app-server child; the `-c features.worktrees=false` pair
-/// pins this frontend process's own configuration to the managed default and
-/// never shadows the selected profile, which travels only to the app-server
-/// child as configuration overrides. A hosted conversation whose effective
+/// by the harness's app-server child. The selected profile's routing,
+/// credentials and permissions stay on that child; its `[features]` are
+/// mirrored here because this process loads the base configuration and would
+/// otherwise evaluate feature-dependent startup notices against the base
+/// model. The `-c features.worktrees=false` pin follows them, so the managed
+/// worktree suppression still wins. A hosted conversation whose effective
 /// catalogue still re-exposed the competing tools would be a configuration
 /// conflict to report rather than a silently accepted suppression.
 fn frontend_args(
@@ -6959,15 +6974,20 @@ fn frontend_args(
     thread_id: &str,
     presentation: NativePresentation,
     role: FrontendRole,
+    profile_features: &[String],
 ) -> Vec<String> {
     let mut args = vec![
         "--remote".into(),
         format!("ws://127.0.0.1:{port}"),
         "--remote-auth-token-env".into(),
         FRONTEND_TOKEN_ENV.into(),
-        "-c".into(),
-        "features.worktrees=false".into(),
     ];
+    for feature in profile_features {
+        args.push("-c".into());
+        args.push(feature.clone());
+    }
+    args.push("-c".into());
+    args.push("features.worktrees=false".into());
     if matches!(
         role,
         FrontendRole::Executor | FrontendRole::BoundedLead | FrontendRole::Reflection
@@ -9543,7 +9563,7 @@ mod tests {
             FrontendRole::BoundedLead,
             FrontendRole::Lead,
         ] {
-            let args = frontend_args(1, "thread-1", NativePresentation::NativeInline, role);
+            let args = frontend_args(1, "thread-1", NativePresentation::NativeInline, role, &[]);
             assert!(
                 args.iter().any(|arg| arg == "--remote"),
                 "{role:?} frontend args must stay a remote TUI: {args:?}"
@@ -9751,6 +9771,7 @@ mod tests {
             "thread-1",
             NativePresentation::NativeInline,
             FrontendRole::Executor,
+            &[],
         );
         assert!(inline.contains(&"--remote".to_string()), "{inline:?}");
         assert!(
@@ -9773,6 +9794,7 @@ mod tests {
             "thread-1",
             NativePresentation::NativeTui,
             FrontendRole::Executor,
+            &[],
         );
         assert!(!full.contains(&"--no-alt-screen".to_string()), "{full:?}");
         assert!(
@@ -9791,6 +9813,65 @@ mod tests {
         );
         let resume = inline.iter().position(|arg| arg == "resume").unwrap();
         assert!(inline[..resume].iter().any(|arg| arg == "--no-alt-screen"));
+    }
+
+    #[test]
+    fn frontend_mirrors_profile_features_without_shadowing_routing() {
+        let features = [
+            "features.code_mode=false".to_owned(),
+            "features.code_mode_host=false".to_owned(),
+        ];
+        let args = frontend_args(
+            9,
+            "thread-1",
+            NativePresentation::NativeTui,
+            FrontendRole::Executor,
+            &features,
+        );
+        for feature in &features {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == *feature),
+                "the frontend must receive {feature}: {args:?}"
+            );
+        }
+        let code_mode = args
+            .iter()
+            .position(|arg| arg == "features.code_mode=false")
+            .unwrap();
+        let worktrees = args
+            .iter()
+            .position(|arg| arg == "features.worktrees=false")
+            .unwrap();
+        assert!(
+            code_mode < worktrees,
+            "the kit's worktree pin must stay authoritative: {args:?}"
+        );
+        assert!(
+            args.iter().all(|arg| !arg.starts_with("model=")
+                && !arg.starts_with("model_provider=")
+                && !arg.starts_with("model_providers.")),
+            "routing and credentials stay on the app-server child: {args:?}"
+        );
+        assert!(args.iter().all(|arg| arg != "--profile"));
+
+        let enabled = ["features.code_mode=true".to_owned()];
+        let args = frontend_args(
+            9,
+            "thread-1",
+            NativePresentation::NativeTui,
+            FrontendRole::Executor,
+            &enabled,
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == "features.code_mode=true"),
+            "a profile that supports Code Mode must keep it enabled: {args:?}"
+        );
+        assert!(
+            args.iter().all(|arg| arg != "features.code_mode=false"),
+            "the frontend mirror must not disable Code Mode globally: {args:?}"
+        );
     }
 
     #[test]
@@ -10172,6 +10253,7 @@ mod tests {
             "thread-1",
             NativePresentation::NativeTui,
             FrontendRole::Lead,
+            &[],
         );
         assert!(
             !lead_frontend
@@ -10186,6 +10268,7 @@ mod tests {
             "thread-1",
             NativePresentation::NativeTui,
             FrontendRole::BoundedLead,
+            &[],
         );
         assert!(
             bounded_frontend
@@ -10201,6 +10284,7 @@ mod tests {
                 "thread-1",
                 NativePresentation::NativeTui,
                 FrontendRole::Executor,
+                &[],
             )
             .iter()
             .any(|arg| arg == "agents.enabled=false")
@@ -11536,6 +11620,7 @@ mod tests {
     fn slot_summary_reports_the_mapping_and_the_selected_slot() {
         let binding = SlotBinding {
             index: 1,
+            label: None,
             path: PathBuf::from(r"D:\lanes\proj-wt1"),
             source: PathBuf::from(r"D:\lanes\proj"),
             repository: None,
@@ -11574,6 +11659,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         let binding = SlotBinding {
             index: 1,
+            label: None,
             path: source.parent().unwrap().join("proj-wt1"),
             source: source.clone(),
             repository: None,
@@ -11645,6 +11731,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         let binding = SlotBinding {
             index: 1,
+            label: None,
             path: source.parent().unwrap().join("proj-wt1"),
             source: source.clone(),
             repository: None,
@@ -11828,6 +11915,7 @@ mod tests {
         .unwrap();
         let binding = SlotBinding {
             index: 1,
+            label: None,
             path: checkout,
             source: source.clone(),
             repository: Some(source.clone()),
@@ -12295,6 +12383,7 @@ mod tests {
         fs::create_dir_all(&slot_path).unwrap();
         let binding = SlotBinding {
             index: 1,
+            label: None,
             path: slot_path.clone(),
             source: source.clone(),
             repository: None,
@@ -12313,6 +12402,7 @@ mod tests {
             &task_worktree::PoolSlot {
                 index: 1,
                 path: slot_path.clone(),
+                hierarchy_path: None,
                 presence: task_worktree::SlotPresence::Registered,
             },
         );
@@ -12334,6 +12424,7 @@ mod tests {
             &task_worktree::PoolSlot {
                 index: 2,
                 path: root.join("proj-wt2"),
+                hierarchy_path: None,
                 presence: task_worktree::SlotPresence::Absent,
             },
         );
@@ -12452,6 +12543,7 @@ mod tests {
         assert!(legacy.contains("legacy record"), "{legacy}");
         let binding = SlotBinding {
             index: 1,
+            label: None,
             path: source.parent().unwrap().join("proj-wt1"),
             source: source.clone(),
             repository: None,
