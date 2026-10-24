@@ -19,8 +19,8 @@ use crate::{
 };
 use harness_core::{
     mcp_session::{Operation, Session},
-    mcp_stdio, native_launcher,
-    process::Cancellation,
+    mcp_stdio, native_launcher, orchestration_config,
+    process::{Cancellation, ExclusiveFileLock},
     task_worktree::{self, LaneDisposition, SlotDisposition, SlotState},
 };
 use serde::Deserialize;
@@ -138,6 +138,10 @@ fn dispatch_tool_definition() -> Value {
                     "type": "string",
                     "description": "Optional fresh run label (ASCII letters, digits, '-', '_' or '.', at most 128 characters). Omitted generates one from the caller suffix and a nanosecond timestamp."
                 },
+                "requestId": {
+                    "type": "string",
+                    "description": "Optional stable dispatch identity scoped to the verified parent. Repetition returns the original run; reusing it with different intent fails before effects."
+                },
                 "base": {
                     "type": "string",
                     "description": "Optional committed base. Omitted uses the consumer checkout's configured upstream."
@@ -181,6 +185,10 @@ fn lead_dispatch_tool_definition() -> Value {
                 "owner": {
                     "type": "string",
                     "description": "Optional fresh run label (ASCII letters, digits, '-', '_' or '.', at most 128 characters). Omitted generates one from the caller suffix and a nanosecond timestamp."
+                },
+                "requestId": {
+                    "type": "string",
+                    "description": "Optional stable dispatch identity scoped to the verified parent. Repetition returns the original run; reusing it with different intent fails before effects."
                 },
                 "assignment": {
                     "type": "object",
@@ -446,6 +454,398 @@ fn generated_owner(caller: &str) -> String {
     format!("mcp-{suffix}-{nanos}")
 }
 
+const REQUEST_SCHEMA: u32 = 1;
+
+#[derive(Debug)]
+enum RequestState {
+    New { path: PathBuf, request: Value },
+    Started { receipt: PathBuf, request: Value },
+    Uncertain { request: Value },
+    Busy { request: Option<Value> },
+}
+
+#[derive(Debug)]
+struct ActiveRequest {
+    parent: String,
+    role: String,
+}
+
+fn requests_root(home: &Path) -> PathBuf {
+    home.join("harness/executor-pool/requests")
+}
+
+fn valid_dispatch_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn request_path(home: &Path, parent: &str, request_id: &str) -> io::Result<PathBuf> {
+    if !valid_thread_id(parent) || !valid_dispatch_request_id(request_id) {
+        return Err(invalid(
+            "a dispatch request identity must be a bounded parent thread id and request id; nothing was allocated",
+        ));
+    }
+    Ok(requests_root(home)
+        .join(parent)
+        .join(format!("{request_id}.json")))
+}
+
+fn read_request(path: &Path) -> io::Result<Option<Value>> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            invalid(format!(
+                "dispatch request {} is invalid: {error}",
+                path.display()
+            ))
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_request(path: &Path, request: &Value) -> io::Result<()> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    control::write_staged(path, &serde_json::to_vec_pretty(request)?)
+}
+
+fn request_intent(
+    role: &str,
+    parent: &str,
+    owner: Option<&str>,
+    base: Option<&str>,
+    profile: Option<&str>,
+    assignment: &Value,
+) -> io::Result<String> {
+    let assignment = serde_json::to_string(assignment)
+        .map_err(|error| invalid(format!("dispatch intent cannot be encoded: {error}")))?;
+    Ok(digest_id(
+        "req-",
+        &[
+            "dispatch-v1",
+            role,
+            parent,
+            owner.unwrap_or(""),
+            base.unwrap_or(""),
+            profile.unwrap_or(""),
+            &assignment,
+        ],
+    ))
+}
+
+fn request_id_for(provided: Option<&str>, intent: &str) -> io::Result<String> {
+    match provided {
+        Some(id) if valid_dispatch_request_id(id) => Ok(id.to_owned()),
+        Some(_) => Err(invalid(
+            "requestId must be 1-128 ASCII letters, digits, '-', '_' or '.'; nothing was allocated",
+        )),
+        None => Ok(intent.to_owned()),
+    }
+}
+
+fn request_process_live(request: &Value) -> bool {
+    let Some(pid) = request["process"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return false;
+    };
+    let Some(created) = request["process"]["created"].as_u64() else {
+        return false;
+    };
+    let Some(program) = request["process"]["program"].as_str().map(PathBuf::from) else {
+        return false;
+    };
+    let Ok(user) = harness_core::process_service::current_user() else {
+        return false;
+    };
+    matches!(
+        harness_core::process_service::ServiceProcess::inspect(
+            harness_core::process::ProcessIdentity {
+                pid,
+                creation_time: created,
+            },
+            &program,
+            &user,
+        ),
+        Ok(Some(_))
+    )
+}
+
+/// Count recorded child dispatches without allocating or reading native state.
+/// A dead preparation never reached a native start and is ignored; a dead
+/// starting/thread-started record remains visible as an uncertain reservation.
+fn active_requests(home: &Path) -> io::Result<Vec<ActiveRequest>> {
+    let root = requests_root(home);
+    let mut active = Vec::new();
+    let mut request_ids = BTreeSet::new();
+    if root.is_dir() {
+        for directory in fs::read_dir(&root)? {
+            let directory = directory?;
+            if !directory.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(directory.path())? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.ends_with(".json") {
+                    continue;
+                }
+                let Some(request) = read_request(&entry.path())? else {
+                    continue;
+                };
+                let status = request["status"].as_str().unwrap_or_default();
+                if status == "failed" {
+                    continue;
+                }
+                if status == "prepared" && !request_process_live(&request) {
+                    continue;
+                }
+                let (Some(parent), Some(role)) =
+                    (request["parentThreadId"].as_str(), request["role"].as_str())
+                else {
+                    continue;
+                };
+                let request_id = request["requestId"].as_str().map(str::to_owned);
+                if let Some(id) = &request_id {
+                    request_ids.insert(id.clone());
+                }
+                active.push(ActiveRequest {
+                    parent: parent.to_owned(),
+                    role: role.to_owned(),
+                });
+            }
+        }
+    }
+    for receipt in read_receipts(home)? {
+        if !receipt.value["release"].is_null() {
+            continue;
+        }
+        let parent = receipt.value["parentThreadId"]
+            .as_str()
+            .or_else(|| receipt.value["leadThreadId"].as_str());
+        let Some(parent) = parent else {
+            continue;
+        };
+        let role = receipt.value["role"].as_str().unwrap_or("executor");
+        let request_id = receipt.value["requestId"].as_str().map(str::to_owned);
+        if request_id
+            .as_ref()
+            .is_some_and(|id| request_ids.contains(id))
+        {
+            continue;
+        }
+        active.push(ActiveRequest {
+            parent: parent.to_owned(),
+            role: role.to_owned(),
+        });
+    }
+    Ok(active)
+}
+
+fn prepare_request(
+    home: &Path,
+    source: &Path,
+    parent: &str,
+    root: &str,
+    role: &str,
+    request_id: &str,
+    intent: &str,
+    owner: &str,
+) -> io::Result<RequestState> {
+    let path = request_path(home, parent, request_id)?;
+    let root_dir = requests_root(home);
+    fs::create_dir_all(root_dir.join(parent))?;
+    let Some(_global) = ExclusiveFileLock::try_acquire(&root_dir.join("admission.lock"))? else {
+        return Ok(RequestState::Busy { request: None });
+    };
+    let Some(_parent_lock) = ExclusiveFileLock::try_acquire(&path.with_extension("lock"))? else {
+        return Ok(RequestState::Busy {
+            request: read_request(&path)?,
+        });
+    };
+    if let Some(existing) = read_request(&path)? {
+        if existing["schema"].as_u64() != Some(REQUEST_SCHEMA as u64) {
+            return Err(invalid(
+                "the recorded dispatch request has an unsupported schema; refusing to reconcile it",
+            ));
+        }
+        if existing["parentThreadId"].as_str() != Some(parent)
+            || existing["role"].as_str() != Some(role)
+        {
+            return Err(invalid(
+                "the recorded dispatch request belongs to another parent or role; no allocation was made",
+            ));
+        }
+        if existing["intent"].as_str() != Some(intent) {
+            return Err(invalid(format!(
+                "requestId {request_id} was already used with different dispatch intent; no allocation was made - use a new requestId for a changed assignment"
+            )));
+        }
+        match existing["status"].as_str().unwrap_or_default() {
+            "started" => {
+                let receipt = existing["receipt"].as_str().map(PathBuf::from);
+                if let Some(receipt) = receipt
+                    && receipt.is_file()
+                {
+                    return Ok(RequestState::Started {
+                        receipt,
+                        request: existing,
+                    });
+                }
+                return Ok(RequestState::Uncertain { request: existing });
+            }
+            "thread-started" | "uncertain" => {
+                return Ok(RequestState::Uncertain { request: existing });
+            }
+            "starting" => {
+                return if request_process_live(&existing) {
+                    Ok(RequestState::Busy {
+                        request: Some(existing),
+                    })
+                } else {
+                    Ok(RequestState::Uncertain { request: existing })
+                };
+            }
+            "prepared" if request_process_live(&existing) => {
+                return Ok(RequestState::Busy {
+                    request: Some(existing),
+                });
+            }
+            "prepared" | "failed" => {}
+            other => {
+                return Err(invalid(format!(
+                    "the recorded dispatch request has unsupported status {other:?}; refusing to allocate a duplicate"
+                )));
+            }
+        }
+    }
+
+    let config = orchestration_config::load(source)?;
+    let active = active_requests(home)?;
+    let parent_count = active
+        .iter()
+        .filter(|request| request.parent == parent && request.role == role)
+        .count() as u32;
+    let global_count = active
+        .iter()
+        .filter(|request| request.role == "executor")
+        .count() as u32;
+    let (parent_limit, global_limit) = if role == "executor" && parent == root {
+        (
+            config.director_max_executors,
+            config.max_concurrent_executors,
+        )
+    } else if role == "executor" {
+        (config.lead_max_executors, config.max_concurrent_executors)
+    } else {
+        (config.director_max_leads, u32::MAX)
+    };
+    if parent_count >= parent_limit {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "the immediate-parent {role} limit is full: {parent_count} of {parent_limit} for {parent}; stop, wait for or release an existing child before dispatching another"
+            ),
+        ));
+    }
+    if role == "executor" && global_count >= global_limit {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "installation-wide executor admission is full: {global_count} of {global_limit} active Executors (max_concurrent_executors); no child was allocated"
+            ),
+        ));
+    }
+    let process = task_worktree::current_startup_reservation()?;
+    let request = json!({
+        "schema": REQUEST_SCHEMA,
+        "requestId": request_id,
+        "parentThreadId": parent,
+        "rootThreadId": root,
+        "role": role,
+        "intent": intent,
+        "owner": owner,
+        "status": "prepared",
+        "createdMs": u64::try_from(now_nanos() / 1_000_000).unwrap_or(u64::MAX),
+        "childThreadId": null,
+        "receipt": null,
+        "error": null,
+        "process": {
+            "pid": process.pid,
+            "created": process.created,
+            "program": process.program
+        }
+    });
+    write_request(&path, &request)?;
+    Ok(RequestState::New { path, request })
+}
+
+fn update_request(
+    path: &Path,
+    request: &mut Value,
+    status: &str,
+    child_thread: Option<&str>,
+    receipt: Option<&Path>,
+    error: Option<&str>,
+) -> io::Result<()> {
+    request["status"] = Value::String(status.to_owned());
+    request["updatedMs"] = Value::from(u64::try_from(now_nanos() / 1_000_000).unwrap_or(u64::MAX));
+    if let Some(child) = child_thread {
+        request["childThreadId"] = Value::String(child.to_owned());
+    }
+    if let Some(receipt) = receipt {
+        request["receipt"] = Value::String(receipt.display().to_string());
+    }
+    request["error"] = error
+        .map(|error| Value::String(excerpt(error, 400)))
+        .unwrap_or(Value::Null);
+    write_request(path, request)
+}
+
+fn started_request_result(receipt: &Path, request: &Value) -> io::Result<Value> {
+    let mut value: Value = serde_json::from_slice(&fs::read(receipt).map_err(|error| {
+        invalid(format!(
+            "the recorded dispatch receipt {} is unreadable: {error}",
+            receipt.display()
+        ))
+    })?)
+    .map_err(|error| invalid(format!("the recorded dispatch receipt is invalid: {error}")))?;
+    value["requestId"] = request["requestId"].clone();
+    value["reconciled"] = Value::Bool(true);
+    Ok(value)
+}
+
+fn uncertain_request_result(request: &Value) -> Value {
+    json!({
+        "error": "the dispatch request is unresolved; do not allocate a duplicate. Inspect or explicitly stop, resume or release the recorded child before retrying",
+        "state": "uncertain",
+        "requestId": request["requestId"],
+        "run": request["owner"],
+        "childThreadId": request["childThreadId"],
+        "receipt": request["receipt"],
+        "detail": request["error"]
+    })
+}
+
+fn busy_request_result(request_id: &str, request: Option<&Value>) -> Value {
+    json!({
+        "error": "another caller is preparing this dispatch request; retry after it settles",
+        "state": "busy",
+        "requestId": request_id,
+        "childThreadId": request.and_then(|request| request["childThreadId"].as_str()),
+        "owner": request.and_then(|request| request["owner"].as_str())
+    })
+}
+
 /// A thread-local executors server table with the role's tool allowlist.
 ///
 /// shortcut: Codex 0.164.0 rejects a leaf allowlist for a plugin-generated
@@ -534,6 +934,8 @@ fn verify_role_tools(
 #[serde(deny_unknown_fields)]
 struct DispatchArgs {
     owner: Option<String>,
+    #[serde(default, rename = "requestId")]
+    request_id: Option<String>,
     assignment: Value,
     #[serde(default)]
     base: Option<String>,
@@ -545,6 +947,8 @@ struct DispatchArgs {
 #[serde(deny_unknown_fields)]
 struct LeadDispatchArgs {
     owner: Option<String>,
+    #[serde(default, rename = "requestId")]
+    request_id: Option<String>,
     assignment: Value,
 }
 
@@ -757,7 +1161,10 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     let caller = caller_thread(&operation.metadata)?;
     let args: DispatchArgs = serde_json::from_value(operation.arguments.clone())
         .map_err(|error| invalid(format!("executor_dispatch arguments are invalid: {error}")))?;
-    let owner = args.owner.unwrap_or_else(|| generated_owner(&caller));
+    let requested_owner = args.owner.clone();
+    let owner = requested_owner
+        .clone()
+        .unwrap_or_else(|| generated_owner(&caller));
     let assignment_value = args.assignment.clone();
     let assignment = Assignment::from_value(args.assignment)?;
     let codex_home = native_launcher::codex_home()?;
@@ -767,6 +1174,15 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
             "the calling thread is a recorded executor and cannot dispatch descendants; no endpoint, lease, thread or model work was touched",
         ));
     }
+    let intent = request_intent(
+        "executor",
+        &caller,
+        requested_owner.as_deref(),
+        args.base.as_deref(),
+        args.profile.as_deref(),
+        &assignment_value,
+    )?;
+    let request_id = request_id_for(args.request_id.as_deref(), &intent)?;
     let endpoint = match control::registered_lead(&codex_home, &caller) {
         RegisteredLead::Live(endpoint) => endpoint,
         RegisteredLead::Unavailable(reason) => {
@@ -787,9 +1203,28 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     let cwd = lead_thread["cwd"]
         .as_str()
         .ok_or_else(|| invalid("the registered lead thread reports no working directory"))?;
-    let source = crate::executor_cli::executor_input::source(None, &codex_home)?;
     let repository = repository_root(Path::new(cwd))?;
-    let prepared = executor_cli::prepare_mcp_dispatch(
+    let source = crate::executor_cli::executor_input::source(None, &codex_home)?;
+    let (request_path, mut request_value) = match prepare_request(
+        &codex_home,
+        &source,
+        &caller,
+        &authority.root_thread,
+        "executor",
+        &request_id,
+        &intent,
+        &owner,
+    )? {
+        RequestState::Started { receipt, request } => {
+            return started_request_result(&receipt, &request);
+        }
+        RequestState::Uncertain { request } => return Ok(uncertain_request_result(&request)),
+        RequestState::Busy { request } => {
+            return Ok(busy_request_result(&request_id, request.as_ref()));
+        }
+        RequestState::New { path, request } => (path, request),
+    };
+    let prepared = match executor_cli::prepare_mcp_dispatch(
         &codex_home,
         &source,
         &repository,
@@ -797,7 +1232,20 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         args.profile.as_deref(),
         args.base.as_deref(),
         assignment,
-    )?;
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "failed",
+                None,
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(error);
+        }
+    };
 
     let mut overrides = parse_assignments(&prepared.profile_overrides)?;
     overrides.extend(parse_role_args(&prepared.role_args)?);
@@ -815,25 +1263,84 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     plan.overrides = overrides;
     let filter = match executors_tool_filter(&source, EXECUTOR_TOOLS) {
         Ok(filter) => filter,
-        Err(error) => return Err(prepared.release(error)),
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "failed",
+                None,
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(prepared.release(error));
+        }
     };
     plan.overrides.insert("mcp_servers".into(), filter);
     if let Some(sandbox) = lead_thread["sandbox"].as_str() {
         plan.sandbox = Some(sandbox.to_owned());
     }
 
+    if let Err(error) = update_request(
+        &request_path,
+        &mut request_value,
+        "starting",
+        None,
+        None,
+        None,
+    ) {
+        return Err(prepared.release(error));
+    }
     let mut conversation = match Conversation::start_on_endpoint(&endpoint, &plan) {
         Ok(conversation) => conversation,
-        Err(error) => return Err(prepared.release(error)),
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                None,
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; the native start outcome is uncertain and the pool claim is preserved; do not dispatch a duplicate"
+                ),
+            ));
+        }
     };
     let executor_thread = conversation.thread_id().to_owned();
+    if let Err(error) = update_request(
+        &request_path,
+        &mut request_value,
+        "thread-started",
+        Some(&executor_thread),
+        None,
+        None,
+    ) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "executor thread {executor_thread} was created but the dispatch request could not be recorded: {error}; the thread and pool claim are preserved"
+            ),
+        ));
+    }
     let thread = match conversation.read_thread_state(&executor_thread) {
         Ok(thread) => thread,
         Err(error) => {
-            return Err(prepared.release(io::Error::new(
+            let error = io::Error::new(
                 error.kind(),
                 format!("executor thread {executor_thread} could not be confirmed: {error}"),
-            )));
+            );
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                Some(&executor_thread),
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(error);
         }
     };
     let observed = match confirm_started(
@@ -844,9 +1351,27 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         &prepared.title,
     ) {
         Ok(status) => status,
-        Err(error) => return Err(prepared.release(error)),
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                Some(&executor_thread),
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(error);
+        }
     };
     if let Err(error) = verify_role_tools(&mut conversation, &executor_thread, EXECUTOR_TOOLS) {
+        let _ = update_request(
+            &request_path,
+            &mut request_value,
+            "uncertain",
+            Some(&executor_thread),
+            None,
+            Some(&error.to_string()),
+        );
         return Err(io::Error::new(
             error.kind(),
             format!(
@@ -857,6 +1382,14 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     let turn = match conversation.assign(&prepared.prompt) {
         Ok(turn) => turn,
         Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                Some(&executor_thread),
+                None,
+                Some(&error.to_string()),
+            );
             return Err(io::Error::new(
                 error.kind(),
                 format!(
@@ -876,6 +1409,7 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     let receipt = json!({
         "schema": 1,
         "run": prepared.owner,
+        "requestId": request_id,
         "role": "executor",
         "parentThreadId": caller,
         "rootThreadId": authority.root_thread,
@@ -916,11 +1450,34 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
             .map(|error| error.to_string());
     let mut result = receipt;
     result["receipt"] = json!(prepared.receipt);
+    result["requestId"] = Value::String(request_id.clone());
     if let Some(error) = receipt_error {
         result["receiptError"] = json!(error);
     }
     if let Some(error) = startup_release {
         result["startupReleaseError"] = json!(error);
+    }
+    let request_update = if result["receiptError"].is_null() {
+        update_request(
+            &request_path,
+            &mut request_value,
+            "started",
+            Some(&executor_thread),
+            Some(&prepared.receipt),
+            None,
+        )
+    } else {
+        update_request(
+            &request_path,
+            &mut request_value,
+            "thread-started",
+            Some(&executor_thread),
+            Some(&prepared.receipt),
+            result["receiptError"].as_str(),
+        )
+    };
+    if let Err(error) = request_update {
+        result["requestError"] = Value::String(error.to_string());
     }
     if result["receiptError"].is_null()
         && let Err(error) = verified_receipt(&codex_home, &prepared.receipt, &caller)
@@ -939,7 +1496,10 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     let caller = caller_thread(&operation.metadata)?;
     let args: LeadDispatchArgs = serde_json::from_value(operation.arguments.clone())
         .map_err(|error| invalid(format!("lead_dispatch arguments are invalid: {error}")))?;
-    let owner = args.owner.unwrap_or_else(|| generated_owner(&caller));
+    let requested_owner = args.owner.clone();
+    let owner = requested_owner
+        .clone()
+        .unwrap_or_else(|| generated_owner(&caller));
     let assignment_value = args.assignment.clone();
     let assignment = Assignment::from_value(args.assignment)?;
     let codex_home = native_launcher::codex_home()?;
@@ -984,14 +1544,55 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     };
     let evidence =
         crate::executor_assignment::validate_lead_assignment(&assignment, &context, &bd)?;
-    let prepared = executor_cli::prepare_mcp_lead_dispatch(
+    let intent = request_intent(
+        "lead",
+        &caller,
+        requested_owner.as_deref(),
+        None,
+        None,
+        &assignment_value,
+    )?;
+    let request_id = request_id_for(args.request_id.as_deref(), &intent)?;
+    let (request_path, mut request_value) = match prepare_request(
+        &codex_home,
+        &source,
+        &caller,
+        &caller,
+        "lead",
+        &request_id,
+        &intent,
+        &owner,
+    )? {
+        RequestState::Started { receipt, request } => {
+            return started_request_result(&receipt, &request);
+        }
+        RequestState::Uncertain { request } => return Ok(uncertain_request_result(&request)),
+        RequestState::Busy { request } => {
+            return Ok(busy_request_result(&request_id, request.as_ref()));
+        }
+        RequestState::New { path, request } => (path, request),
+    };
+    let prepared = match executor_cli::prepare_mcp_lead_dispatch(
         &codex_home,
         &source,
         &repository,
         &owner,
         assignment,
         evidence,
-    )?;
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "failed",
+                None,
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(error);
+        }
+    };
 
     let mut overrides = parse_assignments(&prepared.profile_overrides)?;
     overrides.extend(parse_role_args(&prepared.role_args)?);
@@ -1009,7 +1610,17 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     plan.overrides = overrides;
     let filter = match executors_tool_filter(&source, LEAD_TOOLS) {
         Ok(filter) => filter,
-        Err(error) => return Err(prepared.release(error)),
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "failed",
+                None,
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(prepared.release(error));
+        }
     };
     plan.overrides.insert("mcp_servers".into(), filter);
     plan.delegated_lead_session = true;
@@ -1017,18 +1628,67 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
         plan.sandbox = Some(sandbox.to_owned());
     }
 
+    if let Err(error) = update_request(
+        &request_path,
+        &mut request_value,
+        "starting",
+        None,
+        None,
+        None,
+    ) {
+        return Err(prepared.release(error));
+    }
     let mut conversation = match Conversation::start_on_endpoint(&endpoint, &plan) {
         Ok(conversation) => conversation,
-        Err(error) => return Err(prepared.release(error)),
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                None,
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; the native start outcome is uncertain and the pool claim is preserved; do not dispatch a duplicate"
+                ),
+            ));
+        }
     };
     let lead_thread = conversation.thread_id().to_owned();
+    if let Err(error) = update_request(
+        &request_path,
+        &mut request_value,
+        "thread-started",
+        Some(&lead_thread),
+        None,
+        None,
+    ) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "delegated Lead thread {lead_thread} was created but the dispatch request could not be recorded: {error}; the thread and pool claim are preserved"
+            ),
+        ));
+    }
     let thread = match conversation.read_thread_state(&lead_thread) {
         Ok(thread) => thread,
         Err(error) => {
-            return Err(prepared.release(io::Error::new(
+            let error = io::Error::new(
                 error.kind(),
                 format!("delegated Lead thread {lead_thread} could not be confirmed: {error}"),
-            )));
+            );
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                Some(&lead_thread),
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(error);
         }
     };
     let observed = match confirm_started(
@@ -1039,9 +1699,27 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
         &prepared.title,
     ) {
         Ok(status) => status,
-        Err(error) => return Err(prepared.release(error)),
+        Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                Some(&lead_thread),
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(error);
+        }
     };
     if let Err(error) = verify_role_tools(&mut conversation, &lead_thread, LEAD_TOOLS) {
+        let _ = update_request(
+            &request_path,
+            &mut request_value,
+            "uncertain",
+            Some(&lead_thread),
+            None,
+            Some(&error.to_string()),
+        );
         return Err(io::Error::new(
             error.kind(),
             format!(
@@ -1052,6 +1730,14 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     if let Err(error) =
         control::publish_lead_endpoint(&codex_home, &endpoint.for_thread(&lead_thread)?)
     {
+        let _ = update_request(
+            &request_path,
+            &mut request_value,
+            "uncertain",
+            Some(&lead_thread),
+            None,
+            Some(&error.to_string()),
+        );
         return Err(io::Error::new(
             error.kind(),
             format!(
@@ -1062,6 +1748,14 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     let turn = match conversation.assign(&prepared.prompt) {
         Ok(turn) => turn,
         Err(error) => {
+            let _ = update_request(
+                &request_path,
+                &mut request_value,
+                "uncertain",
+                Some(&lead_thread),
+                None,
+                Some(&error.to_string()),
+            );
             return Err(io::Error::new(
                 error.kind(),
                 format!(
@@ -1081,6 +1775,7 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     let receipt = json!({
         "schema": 1,
         "run": prepared.owner,
+        "requestId": request_id,
         "role": "lead",
         "parentThreadId": caller,
         "rootThreadId": caller,
@@ -1122,11 +1817,34 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
             .map(|error| error.to_string());
     let mut result = receipt;
     result["receipt"] = json!(prepared.receipt);
+    result["requestId"] = Value::String(request_id.clone());
     if let Some(error) = receipt_error {
         result["receiptError"] = json!(error);
     }
     if let Some(error) = startup_release {
         result["startupReleaseError"] = json!(error);
+    }
+    let request_update = if result["receiptError"].is_null() {
+        update_request(
+            &request_path,
+            &mut request_value,
+            "started",
+            Some(&lead_thread),
+            Some(&prepared.receipt),
+            None,
+        )
+    } else {
+        update_request(
+            &request_path,
+            &mut request_value,
+            "thread-started",
+            Some(&lead_thread),
+            Some(&prepared.receipt),
+            result["receiptError"].as_str(),
+        )
+    };
+    if let Err(error) = request_update {
+        result["requestError"] = Value::String(error.to_string());
     }
     Ok(result)
 }

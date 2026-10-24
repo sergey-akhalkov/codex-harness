@@ -1026,6 +1026,34 @@ fn prepared_repository(home: &Path, root: &Path, server: &Server) -> (PathBuf, S
     (repository, head, issue)
 }
 
+fn write_limits(root: &Path, limits: &str) {
+    fs::write(
+        root.join("kit/global/orchestration.toml"),
+        format!(
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\n{limits}\nworktree_pool_size = 6\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn prepared_lead_assignment(issue: &str, base: &str) -> Value {
+    json!({
+        "schema": 1,
+        "objective": "Lead the prepared sample change",
+        "inputs": [],
+        "outputs": [],
+        "invariants": ["Use the prepared change and its exact base."],
+        "acceptance": ["The change is accepted with checked evidence."],
+        "board_task": issue,
+        "lead_change": {
+            "planning_root": ".",
+            "base": base,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": ".", "base": base}]
+        }
+    })
+}
+
 struct ReleaseRun {
     _root: tempfile::TempDir,
     repository: PathBuf,
@@ -1787,6 +1815,7 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
         2,
         "lead_dispatch",
         json!({
+            "requestId": "lead-request-1",
             "assignment": {
                 "schema": 1,
                 "objective": "Lead the prepared sample change",
@@ -1821,10 +1850,45 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
         "the Lead endpoint was not published"
     );
 
-    let child = mcp.call(
+    let starts_before_retry = server.requests_for("thread/start").len();
+    let retried = mcp.call_tool(
         3,
+        "lead_dispatch",
+        json!({
+            "requestId": "lead-request-1",
+            "assignment": {
+                "schema": 1,
+                "objective": "Lead the prepared sample change",
+                "inputs": [],
+                "outputs": [],
+                "invariants": ["Use the prepared change and its exact base."],
+                "acceptance": ["The change is accepted with checked evidence."],
+                "board_task": issue,
+                "lead_change": {
+                    "planning_root": ".",
+                    "base": base,
+                    "directory": "openspec/changes/lead-sample",
+                    "repositories": [{"path": ".", "base": base}]
+                }
+            }
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let retried = result(&retried);
+    assert_eq!(retried["reconciled"], true, "{retried}");
+    assert_eq!(retried["requestId"], "lead-request-1", "{retried}");
+    assert_eq!(retried["executorThreadId"], lead_thread, "{retried}");
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts_before_retry,
+        "a repeated Lead request must not create another thread"
+    );
+
+    let child = mcp.call(
+        4,
         json!({
             "owner": "lead-child",
+            "requestId": "child-request-1",
             "base": base,
             "assignment": assignment("Dispatch one executor from the Lead")
         }),
@@ -1839,12 +1903,63 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
         child["executorThreadId"], lead["executorThreadId"],
         "{child}"
     );
+    let starts_before_child_retry = server.requests_for("thread/start").len();
+    let child_retry = mcp.call(
+        5,
+        json!({
+            "owner": "lead-child",
+            "requestId": "child-request-1",
+            "base": base,
+            "assignment": assignment("Dispatch one executor from the Lead")
+        }),
+        Some(json!({"threadId": lead_thread})),
+    );
+    let child_retry = result(&child_retry);
+    assert_eq!(child_retry["reconciled"], true, "{child_retry}");
+    assert_eq!(
+        child_retry["executorThreadId"], child["executorThreadId"],
+        "{child_retry}"
+    );
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts_before_child_retry,
+        "a repeated Executor request must not create another thread"
+    );
+
+    let conflict = mcp.call_tool(
+        6,
+        "lead_dispatch",
+        json!({
+            "requestId": "lead-request-1",
+            "assignment": {
+                "schema": 1,
+                "objective": "A different Lead objective",
+                "inputs": [],
+                "outputs": [],
+                "invariants": ["Different intent."],
+                "acceptance": ["Different intent."],
+                "board_task": issue,
+                "lead_change": {
+                    "planning_root": ".",
+                    "base": base,
+                    "directory": "openspec/changes/lead-sample",
+                    "repositories": [{"path": ".", "base": base}]
+                }
+            }
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&conflict).contains("different dispatch intent"),
+        "{conflict}"
+    );
 
     // A direct Director-to-Executor dispatch remains compatible.
     let direct = mcp.call(
-        4,
+        7,
         json!({
             "owner": "direct-child",
+            "requestId": "direct-request-1",
             "base": base,
             "assignment": assignment("Dispatch one direct executor")
         }),
@@ -1881,13 +1996,272 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
     // A vague Lead assignment is refused before any new thread.
     let starts_before = server.requests_for("thread/start").len();
     let refused = mcp.call_tool(
-        5,
+        8,
         "lead_dispatch",
         json!({"assignment": assignment("vague lead")}),
         Some(json!({"threadId": DIRECTOR})),
     );
     assert!(tool_error(&refused).contains("lead_change"), "{refused}");
     assert_eq!(server.requests_for("thread/start").len(), starts_before);
+
+    mcp.finish();
+}
+
+#[test]
+fn immediate_parent_limits_refuse_excess_children_without_stopping_admitted_work() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    write_limits(
+        root.path(),
+        "director_max_leads = 1\ndirector_max_executors = 4\nlead_max_executors = 1\nmax_concurrent_executors = 6",
+    );
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let lead = mcp.call_tool(
+        2,
+        "lead_dispatch",
+        json!({"requestId": "lead-limit-1", "assignment": prepared_lead_assignment(&issue, &base)}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let lead = result(&lead);
+    let lead_thread = lead["executorThreadId"].as_str().unwrap().to_owned();
+    let starts_before = server.requests_for("thread/start").len();
+    let second_lead = mcp.call_tool(
+        3,
+        "lead_dispatch",
+        json!({"requestId": "lead-limit-2", "assignment": prepared_lead_assignment(&issue, &base)}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&second_lead).contains("lead limit is full: 1 of 1"),
+        "{second_lead}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+
+    let child = mcp.call(
+        4,
+        json!({
+            "owner": "lead-child-1",
+            "requestId": "lead-child-1",
+            "base": base,
+            "assignment": assignment("first child")
+        }),
+        Some(json!({"threadId": lead_thread})),
+    );
+    let child = result(&child);
+    let child_thread = child["executorThreadId"].as_str().unwrap().to_owned();
+    let starts_before = server.requests_for("thread/start").len();
+    let second_child = mcp.call(
+        5,
+        json!({
+            "owner": "lead-child-2",
+            "requestId": "lead-child-2",
+            "base": base,
+            "assignment": assignment("second child")
+        }),
+        Some(json!({"threadId": lead_thread})),
+    );
+    assert!(
+        tool_error(&second_child).contains("executor limit is full: 1 of 1"),
+        "{second_child}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+    assert!(
+        child_thread != lead_thread,
+        "the admitted child remains distinct and preserved"
+    );
+
+    mcp.finish();
+}
+
+#[test]
+fn installation_wide_executor_limit_refuses_a_second_child() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    write_limits(
+        root.path(),
+        "director_max_leads = 2\ndirector_max_executors = 4\nlead_max_executors = 6\nmax_concurrent_executors = 1",
+    );
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let lead = mcp.call_tool(
+        2,
+        "lead_dispatch",
+        json!({"requestId": "global-lead-1", "assignment": prepared_lead_assignment(&issue, &base)}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let lead = result(&lead);
+    let lead_thread = lead["executorThreadId"].as_str().unwrap().to_owned();
+    let child = mcp.call(
+        3,
+        json!({
+            "owner": "global-child-1",
+            "requestId": "global-child-1",
+            "base": base,
+            "assignment": assignment("first global child")
+        }),
+        Some(json!({"threadId": lead_thread})),
+    );
+    assert_eq!(result(&child)["role"], "executor");
+    let starts_before = server.requests_for("thread/start").len();
+    let second = mcp.call(
+        4,
+        json!({
+            "owner": "global-child-2",
+            "requestId": "global-child-2",
+            "base": base,
+            "assignment": assignment("second global child")
+        }),
+        Some(json!({"threadId": lead_thread})),
+    );
+    assert!(
+        tool_error(&second).contains("installation-wide executor admission is full: 1 of 1"),
+        "{second}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+
+    mcp.finish();
+}
+
+#[test]
+fn director_executor_limit_refuses_a_second_direct_child() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    write_limits(
+        root.path(),
+        "director_max_leads = 2\ndirector_max_executors = 1\nlead_max_executors = 6\nmax_concurrent_executors = 6",
+    );
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, _issue) = prepared_repository(home.path(), root.path(), &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let first = mcp.call(
+        2,
+        json!({
+            "owner": "direct-limit-1",
+            "requestId": "direct-limit-1",
+            "base": base,
+            "assignment": assignment("first direct child")
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert_eq!(result(&first)["role"], "executor");
+    let starts_before = server.requests_for("thread/start").len();
+    let second = mcp.call(
+        3,
+        json!({
+            "owner": "direct-limit-2",
+            "requestId": "direct-limit-2",
+            "base": base,
+            "assignment": assignment("second direct child")
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&second).contains("executor limit is full: 1 of 1"),
+        "{second}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+
+    mcp.finish();
+}
+
+#[test]
+fn lowering_a_parent_limit_preserves_admitted_children_and_blocks_new_ones() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    write_limits(
+        root.path(),
+        "director_max_leads = 2\ndirector_max_executors = 2\nlead_max_executors = 6\nmax_concurrent_executors = 6",
+    );
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, _issue) = prepared_repository(home.path(), root.path(), &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let first = mcp.call(
+        2,
+        json!({
+            "owner": "reduce-child-1",
+            "requestId": "reduce-child-1",
+            "base": base,
+            "assignment": assignment("first admitted child")
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let first = result(&first);
+    let second = mcp.call(
+        3,
+        json!({
+            "owner": "reduce-child-2",
+            "requestId": "reduce-child-2",
+            "base": base,
+            "assignment": assignment("second admitted child")
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let second = result(&second);
+    write_limits(
+        root.path(),
+        "director_max_leads = 2\ndirector_max_executors = 1\nlead_max_executors = 6\nmax_concurrent_executors = 6",
+    );
+    let starts_before = server.requests_for("thread/start").len();
+    let third = mcp.call(
+        4,
+        json!({
+            "owner": "reduce-child-3",
+            "requestId": "reduce-child-3",
+            "base": base,
+            "assignment": assignment("third child after reduction")
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&third).contains("executor limit is full: 2 of 1"),
+        "{third}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+    assert!(first["executorThreadId"].as_str().is_some());
+    assert!(second["executorThreadId"].as_str().is_some());
 
     mcp.finish();
 }
@@ -1922,6 +2296,7 @@ fn a_missing_role_tool_catalogue_fails_before_the_turn() {
         2,
         json!({
             "owner": "unfiltered-child",
+            "requestId": "missing-catalogue-1",
             "base": base,
             "assignment": assignment("should not start a turn")
         }),
@@ -1933,6 +2308,23 @@ fn a_missing_role_tool_catalogue_fails_before_the_turn() {
     );
     assert_eq!(server.requests_for("thread/start").len(), starts + 1);
     assert_eq!(server.requests_for("turn/start").len(), turns);
+    let retried = mcp.call(
+        3,
+        json!({
+            "owner": "unfiltered-child",
+            "requestId": "missing-catalogue-1",
+            "base": base,
+            "assignment": assignment("should not start a turn")
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    let structured = structured(&retried);
+    assert_eq!(structured["state"], "uncertain", "{retried}");
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts + 1,
+        "an uncertain request must not allocate a duplicate child"
+    );
     mcp.finish();
 }
 

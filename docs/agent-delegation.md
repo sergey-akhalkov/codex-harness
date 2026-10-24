@@ -467,6 +467,33 @@ retains the predecessor and requires inspecting interrupted effects first. A
 stopped run is never restarted automatically. Release remains an explicit lead
 acceptance/discard decision, not a consequence of stop or completion.
 
+## Idempotent dispatch and admission
+
+`executor_dispatch` and `lead_dispatch` accept an optional `requestId`, scoped
+to the verified parent. When it is omitted, the id derives from the role,
+parent, supplied owner, base, profile and complete assignment. Repeating the
+same id with the same intent returns the original receipt with
+`reconciled: true` and never allocates another child. Reusing the id with a
+different intent fails before allocation; use a new id for a changed
+assignment.
+
+Preparation records live under
+`CODEX_HOME/harness/executor-pool/requests/<parent>/<requestId>.json`. A
+`prepared` record whose owning process is gone is retryable. `starting`,
+`thread-started` and `uncertain` records are preserved evidence: inspect or
+explicitly stop, resume or release the recorded child, and do not dispatch a
+duplicate. A lost start response therefore retains one child and its pool
+claim for reconciliation.
+
+Admission counts active preparation records and unreleased receipts by the
+immediate parent and role, including startup reservations, active turns and
+reply-waiting runs. `director_max_leads`, `director_max_executors` and
+`lead_max_executors` compose with the installation-wide
+`max_concurrent_executors` and the independent `worktree_pool_size`. A lower
+limit blocks new starts and leaves already admitted work running. Release
+remains the explicit reconciliation gate; a stopped or terminal run keeps its
+worktree until that release.
+
 ## Provider-neutral cache-loss protection and recovery
 
 An MCP executor run monitors its exact native conversation's per-response
