@@ -47,6 +47,25 @@ different code repository still records its assignment and feedback through the
 coordinating project's board; dispatch does not copy the tracker or invent
 another scope.
 
+## First use
+
+After installation or update, start a fresh Director session and verify both
+`lead_dispatch` and `executor_dispatch` are visible with `/agents`; a missing
+tool or view is a capability failure to report, not a reason to substitute a
+route. Commit the prepared OpenSpec change and record its board task, then call
+`lead_dispatch` with the exact base, applicable inputs, repositories,
+acceptance, consumer and board reference. Check the receipt against
+`executor_status` and the one native CLI's `/agents` view: run and role,
+`ds` = `deepseek`/`deepseek-flash`/`max`, parent/root/native-thread relation,
+checkout, slot, committed base and input revision, with no credentials in
+shared output. The delegated Lead uses `executor_dispatch` from exact committed
+inputs but cannot `lead_dispatch`; the Executor cannot dispatch descendants.
+Review the Lead's checked combined result and record acceptance before
+reporting upward. Receipt, review, acceptance, board closure and release stay
+distinct; release reviewed children before the Lead workspace. The detailed
+field checklist is in
+[agent delegation](../../../docs/agent-delegation.md#first-use-director-to-lead-to-executor).
+
 ## Operating objective
 
 Maximize delivery speed of the accepted result while minimizing avoidable lead

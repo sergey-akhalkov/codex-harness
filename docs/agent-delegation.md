@@ -4,11 +4,13 @@ Selection has two paths; never mix them. Ordinary in-session subagents take
 explicit `model` and supported `reasoning_effort` parameters per assignment;
 GPT-6 Astra at `xhigh` leads, and DeepSeek V4.1-Flash at `max` executes
 delegated work; xAI and Z.AI models are not used. Kit executor dispatch takes no
-per-assignment model or effort: it runs exactly the configured executor
-profiles, and the profile's configured model and reasoning effort are that
-assignment's complete explicit selection. The kit configures one executor,
-`ds`, binding DeepSeek V4.1-Flash (`deepseek-flash`) at `max`; one executor
-profile is normal full capacity, not a delegation limit. Choose from task
+per-assignment model, provider or effort: it runs exactly the configured
+executor profiles, and the profile's configured provider, model and reasoning
+effort are that assignment's complete explicit selection. The kit configures
+one executor, `ds`, binding DeepSeek V4.1-Flash (`deepseek-flash`) through
+provider `deepseek` at effort `max`; no other model, provider or billing route
+is a fallback. One executor profile is normal full capacity, not a delegation
+limit. Choose from task
 complexity, risk and the full cost of the accepted result; a separate TOML
 file per effort or activity is unnecessary. Supported efforts differ by
 model; verify the effective binding instead of assuming every level exists on
@@ -60,6 +62,45 @@ Identify non-Codex windows with list, title, bounds and state; keep screenshots
 for genuine visual questions about owned UI. If a required native view is
 unavailable, report that capability gap; `executor_status` and `executor_wait`
 remain the bounded state and result path.
+
+## First use: Director to Lead to Executor
+
+Use this sequence for the first prepared hierarchy after installation or update:
+
+1. Start a fresh Codex CLI session so the installed executors plugin, role
+   guidance and `/agents` view are loaded. A running session does not reload
+   them. The Director verifies that both `lead_dispatch` and
+   `executor_dispatch` are visible. A missing tool or view is a capability
+   failure with an installation/restoration action, not a reason to substitute
+   another runtime, model or tracker.
+2. Commit the prepared OpenSpec change in the selected repository and record
+   its existing board task. The Director calls `lead_dispatch` with the change,
+   exact base, applicable committed inputs, declared repositories, output,
+   acceptance, consumer and board reference. A title, board card or dirty
+   worktree is not a prepared change.
+3. Before relying on the run, verify the dispatch receipt, `executor_status` and
+   `/agents` agree on the run and role; profile `ds` with provider `deepseek`,
+   model `deepseek-flash` and effort `max`; immediate parent, root and native
+   thread; allocated checkout and slot; and exact committed base and input
+   revision. Keep credentials and raw runtime identifiers in private state,
+   not public prose.
+4. The delegated Lead has the executor dispatch/control tools and
+   `executor_ask_lead`, but no `lead_dispatch`. It calls `executor_dispatch`
+   for each owned slice from an exact committed input revision, then reviews the
+   returned diff and checks and accepts or returns it. An Executor has
+   `executor_status` and parent communication through
+   `executor_ask_lead`/`executor_message`, but cannot dispatch descendants.
+5. When the Lead reports the combined result, the Director reviews the
+   integrated revisions and check evidence before accepting and reporting
+   upward. Result delivery, review, acceptance, board closure and worktree
+   release remain distinct: accept after review, record the disposition, and
+   release reviewed children before the Lead workspace. Completion, a
+   completion message or `/agents` navigation establishes none of those steps.
+
+Keep one native CLI. `/agents` is the human view of the same app-server
+threads; `executor_status` and `executor_wait` are the bounded runtime views.
+MCP is transport, and the consuming project's board remains the durable
+assignment, feedback and acceptance record.
 
 ## Orchestration configuration
 
