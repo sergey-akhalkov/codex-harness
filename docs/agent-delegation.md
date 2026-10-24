@@ -441,6 +441,38 @@ unadopted, and a user-accepted trade-off remains a recorded decision rather than
 demonstrated improvement. The gate evaluates orchestration defaults; it is not
 the skill-evaluation contract for library mutations.
 
+## Specifications across repositories
+
+Choose one specification home for a change that crosses repositories: the
+repository holding the OpenSpec change, its tasks and the coordinating board
+record. Link the other selected code repositories from the assignment rather
+than copying the change or board. A repository not selected there is outside the
+assignment, even when it contains related code.
+
+Before dispatch, name the exact committed revision of every required input and
+the exact integration target in each repository. Children start from those
+commit snapshots and report the bases they actually used. Do not copy uncommitted
+parent files into a running checkout, substitute an unrelated default branch, or
+reset work when an input moves. If a required input changes, keep the running
+base and partial result until an explicit continuation or re-dispatch names the
+new committed input.
+
+Each selected repository gets its own distinct, owned integration and executor
+worktree. Keep those roots explicit in the assignment and board record; do not
+copy a checkout, create a nested repository, or write into another Lead's
+position. Two Leads may use one repository, but their worktrees, owners and
+concurrency remain independent under the shared pool. Acceptance records a
+revision vector for the selected repositories and states any repository left
+unintegrated. Exercise the combined user path from the integrated worktrees;
+a conflict-free merge does not prove that path.
+
+Preparation completes for every selected repository before model work starts. A
+failure identifies the repository, input or base that failed, the workspaces and
+reservations already prepared, and the action needed to retry; unused new
+reservations may be released, while pre-existing work and uncertain effects stay
+preserved. Do not start a partial model run, reset an occupied position, or
+describe a failed preparation as an empty assignment.
+
 ## Executor worktrees
 
 `executor_dispatch` and the ordinary `codex-harness worktree` operations allocate
