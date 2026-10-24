@@ -44,7 +44,22 @@ Observed through the installed app-server rather than a standalone client. A fre
 - `sleep(65)` returned `isError:false` with `sleptSeconds:65` after 65,004 ms.
 - `sleep(95)` returned `timed out awaiting tools/call after 90s` after 90,019 ms.
 
-This verifies >60-second plugin calls and that the plugin-declared value is the effective client boundary. For the 1,800,000 ms wait, the executor plugin must set `tool_timeout_sec` above the harness operation deadline; the 300-second default cannot cover it. The exact outer margin belongs to task 1.2, and a full 1,800-second installed wait remains task 3.3, not established by this probe.
+This verifies >60-second plugin calls and that the plugin-declared value is the effective client boundary. For the 1,800,000 ms wait, the executor plugin must set `tool_timeout_sec` above the harness operation deadline; the 300-second default cannot cover it. The exact outer margin belongs to task 1.2. On the user's direction, release keeps the 30-minute bound while installed acceptance uses a 120-second quiet wait rather than occupying 30 minutes of wall-clock time.
+
+### Installed acceptance evidence
+
+A fresh installed `codex-cli` 0.164.0 app-server outside the checkout discovered the enabled `executors@coding-agents-harness` plugin and the new `executor_wait` schema (`timeoutMs` default/max 1800000, `acknowledge` string array). The unrelated `nuphus` and `serena` registrations and the plugin enablement stayed intact.
+
+Through that installed app-server and installed plugin, using a model-free canned native endpoint as bounded fixture work:
+
+- One all-run call returned two ready results with distinct stable `resultId`s; next-call acknowledgement of both made the default all-run wait return `idle`; explicit `run` reread an acknowledged result.
+- Completion before the first call returned immediately; a result that appeared while a 30-second wait was pending woke the installed call in 1.0 second with the current `resultId`.
+- A pending question added to a second run while a 30-second wait was pending returned `state:"question"` after 1.1 seconds with that run and request identity, no result and no model renewal.
+- After a result-producing request whose client response was dropped, reconnecting the same app-server returned both results again, no acknowledgement existed before the retry, the next-call acknowledgement made all-run idle again, and the slot remained occupied until explicit discard release.
+- One installed quiet wait with `timeoutMs:120000` returned one compact `{"state":"timeout","timeoutMs":120000}` response after 120,411 ms, with one MCP request, no intermediate renewal and a released slot. Release remains configured at 1,800,000 ms with `tool_timeout_sec:1860`; the full 1,800-second installed wall-clock run was not repeated, per the user's direction.
+- The installed quiet timeout receipt is `{"state":"timeout","timeoutMs":N}`; measured serialized structured sizes were 16 bytes for idle and 35 bytes for a 200 ms timeout (44 bytes for the default bound).
+- Native checks: `cargo test --locked -p codex-harness --test executor_mcp --jobs 1 -- --test-threads=1` (47 passed), `cargo test --locked -p harness-core --lib mcp_session` (5 passed), the `mcp_stdio` integration target (12 passed, including cancellation, EOF and connection cleanup), `cargo fmt --all -- --check`, focused `cargo clippy ... --no-deps -- -D warnings`, `openspec validate long-poll-executor-wait --strict`, and `harness-source-check --root .` (0 findings).
+- Installed cancellation of a pending wait is covered by the native cancellation test; the installed path exercised transport disconnect/reconnect. Completion during waiting is covered by the native completion tests; installed event delivery is shown by the question-during-wait case.
 
 ### Read current state before sleeping
 
@@ -76,7 +91,7 @@ Update the tool schema/descriptions and existing guidance in [global lead role](
 
 ## Risks / Trade-offs
 
-- Plugin timeout support is verified for 0.164.0 through an isolated fixture; the full 1,800-second installed exercise remains task 3.3. The plugin entry must set `tool_timeout_sec` above the operation bound because the 300-second default is too short.
+- Plugin timeout support is verified for 0.164.0 through an isolated fixture and a 120-second installed quiet wait. The release configuration keeps the 1,800,000 ms bound and `tool_timeout_sec:1860`; the full 1,800-second wall-clock run was not repeated, on the user's direction. The plugin entry must set `tool_timeout_sec` above the operation bound because the 300-second default is too short.
 - A long operation can expose serialized connection starvation: exercise executor questions and cancellation through the actual installed communication path before delivery.
 - Delivery can be duplicated after a lost response: stable result identity and idempotent acknowledgement favor safe replay over loss. This is not exactly-once delivery.
 - Default scope, timeout and response shape change: update owned callers, fixtures and guidance together, preserving explicit run authority and existing terminal/error distinctions.
