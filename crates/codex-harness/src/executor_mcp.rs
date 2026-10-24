@@ -351,7 +351,7 @@ fn resume_tool_definition() -> Value {
 fn release_tool_definition() -> Value {
     json!({
         "name": RELEASE_TOOL,
-        "description": "Explicitly release one executor run owned by the verified calling lead after its active work has ended. Requires a merged or discarded disposition and a nonempty reason. Refuses an active turn, unresolved request, stale or foreign lease, or ambiguous target before effects. Reuses the existing pool release owner: a clean or explicitly discarded slot is reset to the selected base with eligible ignored caches retained; dirty work under a merged disposition is preserved. Native thread archive alone never frees a slot.",
+        "description": "Explicitly release one executor run owned by the verified calling lead after its active work has ended. Requires a merged or discarded disposition and a nonempty reason. Refuses an active turn, unresolved request, stale or foreign lease, or ambiguous target before effects. Reuses the existing pool release owner for every recorded repository workspace: the full set is preflighted before any reset, a clean or explicitly discarded workspace is reset to its exact base with eligible ignored caches retained, and dirty work under a merged disposition preserves every remaining workspace with per-workspace outcomes. Native thread archive alone never frees a slot.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -372,7 +372,7 @@ fn release_tool_definition() -> Value {
                 },
                 "base": {
                     "type": "string",
-                    "description": "Optional committed base selected in the repository. Omitted uses the repository's current committed HEAD."
+                    "description": "Optional committed base for a single recorded workspace. Omitted uses that repository's current committed HEAD. A multi-repository run always uses each workspace's exact recorded base and refuses this override."
                 }
             }
         }
@@ -2599,7 +2599,9 @@ fn verify_run_for(
         && exact_checkout
         && match record.state {
             SlotState::Released => {
-                record.owner.is_none() && value["release"]["slotFreed"].as_bool() == Some(true)
+                record.owner.is_none()
+                    && (value["release"]["slotFreed"].as_bool() == Some(true)
+                        || release_freed_workspace(&value["release"], slot, &checkout))
             }
             SlotState::AwaitingReview => exact_owner,
             _ => false,
@@ -2738,6 +2740,18 @@ fn verify_run_for(
         identity,
         endpoint,
         endpoint_unavailable,
+    })
+}
+
+fn release_freed_workspace(release: &Value, slot: u32, checkout: &Path) -> bool {
+    release["workspaces"].as_array().is_some_and(|workspaces| {
+        workspaces.iter().any(|workspace| {
+            workspace["slotFreed"].as_bool() == Some(true)
+                && workspace["slot"].as_u64() == Some(u64::from(slot))
+                && workspace["checkout"]
+                    .as_str()
+                    .is_some_and(|recorded| same_path(Path::new(recorded), checkout))
+        })
     })
 }
 
@@ -4126,32 +4140,14 @@ fn release(operation: &Operation) -> io::Result<Value> {
             )));
         }
     }
-    let previous = run.value["release"]
-        .as_object()
-        .map(|_| run.value["release"].clone());
-    if let Some(previous) = previous.as_ref() {
-        if previous["run"].as_str() != Some(run.run.as_str())
-            || previous["slot"].as_u64() != Some(u64::from(run.slot))
-        {
-            return Err(invalid(
-                "the run receipt carries a release record for another run or slot; refusing an ambiguous release",
-            ));
-        }
-        let recorded = previous["disposition"].as_str().ok_or_else(|| {
-            invalid("the run receipt's release record names no disposition; nothing was released")
-        })?;
-        let slot_released = previous["slotFreed"].as_bool() == Some(true)
-            || task_worktree::load_slot_record(&home, &run.repository, run.slot)?
-                .is_some_and(|record| record.state == SlotState::Released);
-        if slot_released {
-            if recorded != executor_cli::disposition_name(disposition) {
-                return Err(invalid(format!(
-                    "run {} was already released as {recorded}; a repeated release cannot change the disposition and nothing was reset",
-                    run.run
-                )));
-            }
-            return Ok(release_response(&run, previous, true));
-        }
+    let workspaces = release_workspaces(&run)?;
+    let previous = validated_previous_release(&run)?;
+    let previous_outcomes = release_previous_outcomes(&home, previous.as_ref(), &workspaces)?;
+    require_same_release_disposition(&run, previous.as_ref(), &previous_outcomes, disposition)?;
+    if previous_outcomes.iter().all(Option::is_some)
+        && let Some(previous) = previous.as_ref()
+    {
+        return Ok(release_response(&run, previous, true));
     }
     require_release_ready(&run)?;
     let requested_base = match base {
@@ -4163,10 +4159,11 @@ fn release(operation: &Operation) -> io::Result<Value> {
         Some(base) => Some(base.trim().to_owned()),
         None => None,
     };
-    let base = match requested_base.as_deref() {
-        Some(base) => base.to_owned(),
-        None => executor_cli::committed_head(&run.repository)?,
-    };
+    if workspaces.len() > 1 && requested_base.is_some() {
+        return Err(invalid(
+            "executor_release base applies only to a single recorded workspace; a multi-repository release uses each workspace's exact recorded base and nothing was released",
+        ));
+    }
 
     // Re-read the exact receipt and run state after the native check. A slot
     // or thread replaced during release preparation must not be reset by this
@@ -4180,57 +4177,108 @@ fn release(operation: &Operation) -> io::Result<Value> {
             "the exact run identity changed during release preparation; nothing was reset",
         ));
     }
+    let current_workspaces = release_workspaces(&current)?;
+    if current_workspaces != workspaces {
+        return Err(invalid(
+            "the recorded repository workspace set changed during release preparation; nothing was reset",
+        ));
+    }
     require_release_ready(&current)?;
+    let previous = validated_previous_release(&current)?;
+    let previous_outcomes = release_previous_outcomes(&home, previous.as_ref(), &workspaces)?;
+    require_same_release_disposition(&current, previous.as_ref(), &previous_outcomes, disposition)?;
+    if previous_outcomes.iter().all(Option::is_some)
+        && let Some(previous) = previous.as_ref()
+    {
+        return Ok(release_response(&current, previous, true));
+    }
     let pool_size = release_pool_size(&current)?;
-    let pool = task_worktree::pool(&current.repository, pool_size)?;
-    let slot = pool.slot(current.slot)?;
-    if !same_path(&slot.path, &current.checkout) {
-        return Err(invalid(format!(
-            "slot {} resolves to {} instead of the recorded checkout {}; nothing was reset",
-            current.slot,
-            slot.path.display(),
-            current.checkout.display()
-        )));
-    }
-    let record = task_worktree::load_slot_record(&home, &current.repository, current.slot)?
-        .ok_or_else(|| {
-            invalid(format!(
-                "slot {} has no recorded ownership; nothing was released",
-                current.slot
-            ))
-        })?;
-    if record.startup.is_some() {
-        return Err(invalid(format!(
-            "slot {} still carries an in-flight startup reservation; the slot was not reset",
-            current.slot
-        )));
-    }
-    if executor_cli::owner_live(&home, &current.repository, &current.run) {
-        return Err(invalid(format!(
-            "slot {} is still held by a live executor-session lease for run {}; stop it before release",
-            current.slot, current.run
-        )));
+    let multi_repository = workspaces.len() > 1;
+    let mut prepared: Vec<Option<PreparedReleaseWorkspace>> = Vec::with_capacity(workspaces.len());
+    for (index, workspace) in workspaces.iter().enumerate() {
+        if previous_outcomes[index].is_some() {
+            prepared.push(None);
+            continue;
+        }
+        let base = if multi_repository {
+            workspace.base.clone()
+        } else {
+            match requested_base.as_deref() {
+                Some(base) => base.to_owned(),
+                None => executor_cli::committed_head(&workspace.repository)?,
+            }
+        };
+        prepared.push(Some(prepare_release_workspace(
+            &home,
+            workspace,
+            index + 1,
+            base,
+            disposition,
+            pool_size,
+        )?));
     }
 
-    // A merged claim cannot justify deleting uncommitted or untracked work.
-    // Preserve it with an explicit outcome; discarded is the caller's explicit
-    // authorization for the existing pool owner to reset that work.
-    if disposition == SlotDisposition::Merged && checkout_dirty(&current.checkout)? {
-        let repeats = release_repeats(previous.as_ref());
+    // A merged claim cannot justify deleting uncommitted or untracked work
+    // from any repository. Preflight the complete set, then preserve every
+    // remaining workspace before any reset.
+    let dirty: Vec<usize> = prepared
+        .iter()
+        .enumerate()
+        .filter_map(|(index, workspace)| {
+            workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.dirty)
+                .then_some(index)
+        })
+        .collect();
+    if disposition == SlotDisposition::Merged && !dirty.is_empty() {
+        let dirty_paths: Vec<String> = dirty
+            .iter()
+            .map(|index| workspaces[*index].checkout.display().to_string())
+            .collect();
+        let mut outcomes = Vec::with_capacity(workspaces.len());
+        for (index, workspace) in workspaces.iter().enumerate() {
+            if let Some(previous) = previous_outcomes[index].as_ref() {
+                outcomes.push(previous.clone());
+                continue;
+            }
+            let prepared = prepared[index].as_ref().expect("prepared workspace");
+            let limitation = if prepared.dirty {
+                format!(
+                    "workspace {} ({}) slot {} checkout {} holds local or untracked changes; merged does not authorize deleting them and no workspace in this run was reset",
+                    index + 1,
+                    workspace.repository.display(),
+                    workspace.slot,
+                    workspace.checkout.display()
+                )
+            } else {
+                format!(
+                    "preserved because workspace {} is dirty; no workspace in this run was reset",
+                    dirty_paths.join(", ")
+                )
+            };
+            outcomes.push(workspace_release_outcome(
+                workspace,
+                &prepared.base,
+                "preserved",
+                "occupied",
+                Some(&limitation),
+            ));
+        }
+        let aggregate = release_aggregate(&outcomes, &current.base);
         let release = release_record(
             &current,
             ReleaseFacts {
                 disposition,
                 reason,
                 requested_base: requested_base.as_deref(),
-                base: &base,
-                outcome: "preserved",
-                slot_state: "occupied",
-                limitation: Some(
-                    "the checkout holds local or untracked changes; merged does not authorize deleting them. Commit or merge the intended work, or repeat with disposition=discarded to authorize deletion",
-                ),
+                base: &aggregate.base,
+                outcome: aggregate.outcome,
+                slot_state: aggregate.slot_state,
+                limitation: aggregate.limitation.as_deref(),
                 message_cleanup: None,
-                repeats,
+                repeats: release_repeats(previous.as_ref()),
+                workspaces: &outcomes,
             },
         );
         record_release_result(&current, &caller, release.clone())?;
@@ -4240,50 +4288,414 @@ fn release(operation: &Operation) -> io::Result<Value> {
     // The slot is still held here, so no later occupant can publish a new
     // canonical receipt while this run's own payload paths are removed.
     let message_cleanup = executor_input::cleanup_recorded_messages(&home, &current.receipt);
-    let is_live = |owner: &str| executor_cli::owner_live(&home, &current.repository, owner);
-    let released = match record.task.as_deref() {
-        Some(task) => task_worktree::release_task(
-            &home,
-            &current.repository,
-            task,
-            disposition,
-            reason,
-            &base,
-            record.handle.as_deref(),
-            &is_live,
-        )?,
-        None => task_worktree::release_slot(
-            &home,
-            &pool,
-            current.slot,
-            disposition,
-            reason,
-            &base,
-            &is_live,
-        )?,
-    };
-    let (outcome, slot_state, base, limitation) = match released {
-        LaneDisposition::Reused { base } => ("reused", "released", base, None),
-        LaneDisposition::Preserved { limitation } => {
-            ("preserved", "awaitingReview", base, Some(limitation))
+    let mut outcomes = Vec::with_capacity(workspaces.len());
+    for (index, workspace) in workspaces.iter().enumerate() {
+        if let Some(previous) = previous_outcomes[index].as_ref() {
+            outcomes.push(previous.clone());
+            continue;
         }
-    };
+        let prepared = prepared[index].as_ref().expect("prepared workspace");
+        let is_live =
+            |owner: &str| executor_cli::owner_live(&home, &prepared.workspace.repository, owner);
+        let released = release_prepared_workspace(&home, prepared, disposition, reason, &is_live)?;
+        let (outcome, slot_state, base, limitation) = match released {
+            LaneDisposition::Reused { base } => ("reused", "released", base, None),
+            LaneDisposition::Preserved { limitation } => (
+                "preserved",
+                "awaitingReview",
+                prepared.base.clone(),
+                Some(limitation),
+            ),
+        };
+        outcomes.push(workspace_release_outcome(
+            workspace,
+            &base,
+            outcome,
+            slot_state,
+            limitation.as_deref(),
+        ));
+    }
+    let aggregate = release_aggregate(&outcomes, &current.base);
     let release = release_record(
         &current,
         ReleaseFacts {
             disposition,
             reason,
             requested_base: requested_base.as_deref(),
-            base: &base,
-            outcome,
-            slot_state,
-            limitation: limitation.as_deref(),
+            base: &aggregate.base,
+            outcome: aggregate.outcome,
+            slot_state: aggregate.slot_state,
+            limitation: aggregate.limitation.as_deref(),
             message_cleanup: Some(&message_cleanup),
             repeats: release_repeats(previous.as_ref()),
+            workspaces: &outcomes,
         },
     );
     record_release_result(&current, &caller, release.clone())?;
     Ok(release_response(&current, &release, false))
+}
+
+fn release_workspaces(run: &VerifiedRun) -> io::Result<Vec<ReleaseWorkspace>> {
+    let Some(values) = run.value["workspaces"].as_array() else {
+        return Ok(vec![ReleaseWorkspace {
+            repository: run.repository.clone(),
+            slot: run.slot,
+            label: None,
+            checkout: run.checkout.clone(),
+            base: run.base.clone(),
+            owner: run.run.clone(),
+        }]);
+    };
+    if values.is_empty() {
+        return Err(invalid(
+            "the MCP run receipt records an empty repository workspace set; nothing was released",
+        ));
+    }
+    let mut workspaces = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let position = index + 1;
+        let parse = |field: &str| {
+            required_text(value, field).map_err(|error| {
+                invalid(format!(
+                    "recorded workspace {position} is invalid: {error}; nothing was released"
+                ))
+            })
+        };
+        let repository = PathBuf::from(parse("repository")?);
+        let checkout = PathBuf::from(parse("checkout")?);
+        let base = parse("base")?.to_owned();
+        let owner = parse("owner")?.to_owned();
+        let slot = value["slot"]
+            .as_u64()
+            .and_then(|slot| u32::try_from(slot).ok())
+            .filter(|slot| *slot > 0)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "recorded workspace {position} names no usable pool slot; nothing was released"
+                ))
+            })?;
+        if owner != run.run {
+            return Err(invalid(format!(
+                "recorded workspace {position} ({}) slot {slot} names owner {owner:?} instead of run {}; nothing was released",
+                repository.display(),
+                run.run
+            )));
+        }
+        if workspaces.iter().any(|existing: &ReleaseWorkspace| {
+            task_worktree::same_repository(&existing.repository, &repository)
+        }) {
+            return Err(invalid(format!(
+                "recorded workspace {position} repeats repository {}; nothing was released",
+                repository.display()
+            )));
+        }
+        workspaces.push(ReleaseWorkspace {
+            repository,
+            slot,
+            label: value["label"].as_str().map(str::to_owned),
+            checkout,
+            base,
+            owner,
+        });
+    }
+    let primary = &workspaces[0];
+    if primary.slot != run.slot
+        || !same_path(&primary.repository, &run.repository)
+        || !same_path(&primary.checkout, &run.checkout)
+    {
+        return Err(invalid(
+            "the first recorded repository workspace does not match the run receipt's primary repository, slot and checkout; nothing was released",
+        ));
+    }
+    Ok(workspaces)
+}
+
+fn validated_previous_release(run: &VerifiedRun) -> io::Result<Option<Value>> {
+    let Some(previous) = run.value["release"]
+        .as_object()
+        .map(|_| run.value["release"].clone())
+    else {
+        return Ok(None);
+    };
+    if previous["run"].as_str() != Some(run.run.as_str())
+        || previous["slot"].as_u64() != Some(u64::from(run.slot))
+    {
+        return Err(invalid(
+            "the run receipt carries a release record for another run or slot; refusing an ambiguous release",
+        ));
+    }
+    if previous["disposition"].as_str().is_none() {
+        return Err(invalid(
+            "the run receipt's release record names no disposition; nothing was released",
+        ));
+    }
+    Ok(Some(previous))
+}
+
+fn release_previous_outcomes(
+    home: &Path,
+    previous: Option<&Value>,
+    workspaces: &[ReleaseWorkspace],
+) -> io::Result<Vec<Option<Value>>> {
+    workspaces
+        .iter()
+        .map(|workspace| previous_release_outcome(home, previous, workspace))
+        .collect()
+}
+
+fn previous_release_outcome(
+    home: &Path,
+    previous: Option<&Value>,
+    workspace: &ReleaseWorkspace,
+) -> io::Result<Option<Value>> {
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    if let Some(outcomes) = previous["workspaces"].as_array() {
+        return Ok(outcomes
+            .iter()
+            .find(|outcome| {
+                outcome["slotFreed"].as_bool() == Some(true)
+                    && outcome["slot"].as_u64() == Some(u64::from(workspace.slot))
+                    && outcome["checkout"]
+                        .as_str()
+                        .is_some_and(|checkout| same_path(Path::new(checkout), &workspace.checkout))
+                    && outcome["repository"].as_str().is_none_or(|repository| {
+                        task_worktree::same_repository(Path::new(repository), &workspace.repository)
+                    })
+            })
+            .cloned());
+    }
+    let recorded_released = previous["slotFreed"].as_bool() == Some(true)
+        || task_worktree::load_slot_record(home, &workspace.repository, workspace.slot)?
+            .is_some_and(|record| record.state == SlotState::Released);
+    if !recorded_released
+        || previous["slot"].as_u64() != Some(u64::from(workspace.slot))
+        || !previous["checkout"]
+            .as_str()
+            .is_some_and(|checkout| same_path(Path::new(checkout), &workspace.checkout))
+    {
+        return Ok(None);
+    }
+    let base = previous["base"].as_str().unwrap_or(workspace.base.as_str());
+    Ok(Some(workspace_release_outcome(
+        workspace, base, "reused", "released", None,
+    )))
+}
+
+fn require_same_release_disposition(
+    run: &VerifiedRun,
+    previous: Option<&Value>,
+    previous_outcomes: &[Option<Value>],
+    disposition: SlotDisposition,
+) -> io::Result<()> {
+    if !previous_outcomes.iter().any(Option::is_some) {
+        return Ok(());
+    }
+    let recorded = previous
+        .and_then(|previous| previous["disposition"].as_str())
+        .ok_or_else(|| {
+            invalid("the run receipt's release record names no disposition; nothing was released")
+        })?;
+    if recorded != executor_cli::disposition_name(disposition) {
+        return Err(invalid(format!(
+            "run {} was already released as {recorded}; a repeated release cannot change the disposition and nothing was reset",
+            run.run
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_release_workspace(
+    home: &Path,
+    workspace: &ReleaseWorkspace,
+    position: usize,
+    base: String,
+    disposition: SlotDisposition,
+    pool_size: u32,
+) -> io::Result<PreparedReleaseWorkspace> {
+    let label = format!(
+        "workspace {position} ({}) slot {}, checkout {}",
+        workspace.repository.display(),
+        workspace.slot,
+        workspace.checkout.display()
+    );
+    let pool = task_worktree::pool(&workspace.repository, pool_size)
+        .map_err(|error| invalid(format!("{label}: {error}; nothing was released")))?;
+    let slot = pool
+        .slot(workspace.slot)
+        .map_err(|error| invalid(format!("{label}: {error}; nothing was released")))?;
+    if !same_path(&slot.path, &workspace.checkout) {
+        return Err(invalid(format!(
+            "{label} resolves to {} instead of the recorded checkout; nothing was released",
+            slot.path.display()
+        )));
+    }
+    let record = task_worktree::load_slot_record(home, &workspace.repository, workspace.slot)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "{label} has no recorded ownership; nothing was released"
+            ))
+        })?;
+    let recorded_owner = record.owner.as_deref().ok_or_else(|| {
+        invalid(format!(
+            "{label} has no recorded owner for run {}; nothing was released",
+            workspace.owner
+        ))
+    })?;
+    if recorded_owner != workspace.owner {
+        return Err(invalid(format!(
+            "{label} is owned by {recorded_owner:?}, not recorded owner {:?}; nothing was released",
+            workspace.owner
+        )));
+    }
+    if !matches!(
+        record.state,
+        SlotState::Occupied | SlotState::AwaitingReview
+    ) {
+        return Err(invalid(format!(
+            "{label} is {:?}, not an occupied or awaiting-review workspace; nothing was released",
+            record.state
+        )));
+    }
+    if record.startup.is_some() {
+        return Err(invalid(format!(
+            "{label} still carries an in-flight startup reservation; nothing was released"
+        )));
+    }
+    if executor_cli::owner_live(home, &workspace.repository, recorded_owner) {
+        return Err(invalid(format!(
+            "{label} is still held by a live executor-session lease for run {}; stop it before release",
+            workspace.owner
+        )));
+    }
+    let base = resolved_release_base(&workspace.checkout, &base).map_err(|error| {
+        invalid(format!(
+            "{label} cannot use recorded base {base:?}: {error}; nothing was released"
+        ))
+    })?;
+    let dirty = disposition == SlotDisposition::Merged && checkout_dirty(&workspace.checkout)?;
+    Ok(PreparedReleaseWorkspace {
+        workspace: workspace.clone(),
+        pool,
+        record,
+        base,
+        dirty,
+    })
+}
+
+fn resolved_release_base(checkout: &Path, base: &str) -> io::Result<String> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(checkout)
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{base}^{{commit}}"))
+        .output()
+        .map_err(|error| {
+            invalid(format!(
+                "the checkout {} could not resolve the release base: {error}",
+                checkout.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "the checkout {} could not resolve the release base: {}",
+            checkout.display(),
+            excerpt(&String::from_utf8_lossy(&output.stderr), 300)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn release_prepared_workspace(
+    home: &Path,
+    prepared: &PreparedReleaseWorkspace,
+    disposition: SlotDisposition,
+    reason: &str,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<LaneDisposition> {
+    match prepared.record.task.as_deref() {
+        Some(task) => task_worktree::release_task(
+            home,
+            &prepared.workspace.repository,
+            task,
+            disposition,
+            reason,
+            &prepared.base,
+            prepared.record.handle.as_deref(),
+            is_live,
+        ),
+        None => task_worktree::release_slot(
+            home,
+            &prepared.pool,
+            prepared.workspace.slot,
+            disposition,
+            reason,
+            &prepared.base,
+            is_live,
+        ),
+    }
+}
+
+fn workspace_release_outcome(
+    workspace: &ReleaseWorkspace,
+    base: &str,
+    outcome: &str,
+    slot_state: &str,
+    limitation: Option<&str>,
+) -> Value {
+    let slot_freed = outcome == "reused";
+    json!({
+        "repository": workspace.repository,
+        "slot": workspace.slot,
+        "label": workspace.label,
+        "checkout": workspace.checkout,
+        "owner": workspace.owner,
+        "base": base,
+        "outcome": outcome,
+        "slotFreed": slot_freed,
+        "slotState": slot_state,
+        "preserved": !slot_freed,
+        "limitation": limitation
+    })
+}
+
+fn release_aggregate(outcomes: &[Value], fallback_base: &str) -> ReleaseAggregate {
+    let slot_freed = !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|outcome| outcome["slotFreed"].as_bool() == Some(true));
+    let slot_state = if slot_freed {
+        "released"
+    } else if outcomes
+        .iter()
+        .any(|outcome| outcome["slotState"].as_str() == Some("awaitingReview"))
+    {
+        "awaitingReview"
+    } else {
+        "occupied"
+    };
+    let limitations: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome["limitation"].as_str())
+        .collect();
+    let limitation = if slot_freed {
+        None
+    } else if limitations.is_empty() {
+        Some("one or more workspaces remain preserved; inspect workspaces".to_owned())
+    } else {
+        Some(limitations.join("; "))
+    };
+    ReleaseAggregate {
+        outcome: if slot_freed { "reused" } else { "preserved" },
+        slot_state,
+        base: outcomes
+            .first()
+            .and_then(|outcome| outcome["base"].as_str())
+            .unwrap_or(fallback_base)
+            .to_owned(),
+        limitation,
+    }
 }
 
 fn release_receipt(home: &Path, caller: &str, selected: Option<&str>) -> io::Result<RunReceipt> {
@@ -4438,6 +4850,32 @@ struct ReleaseFacts<'a> {
     limitation: Option<&'a str>,
     message_cleanup: Option<&'a io::Result<usize>>,
     repeats: u64,
+    workspaces: &'a [Value],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleaseWorkspace {
+    repository: PathBuf,
+    slot: u32,
+    label: Option<String>,
+    checkout: PathBuf,
+    base: String,
+    owner: String,
+}
+
+struct PreparedReleaseWorkspace {
+    workspace: ReleaseWorkspace,
+    pool: task_worktree::Pool,
+    record: task_worktree::SlotRecord,
+    base: String,
+    dirty: bool,
+}
+
+struct ReleaseAggregate {
+    outcome: &'static str,
+    slot_state: &'static str,
+    base: String,
+    limitation: Option<String>,
 }
 
 fn release_record(run: &VerifiedRun, facts: ReleaseFacts<'_>) -> Value {
@@ -4466,7 +4904,8 @@ fn release_record(run: &VerifiedRun, facts: ReleaseFacts<'_>) -> Value {
         "messagePayloadsRemoved": removed,
         "messageCleanupError": cleanup_error,
         "repeats": facts.repeats,
-        "recordedMs": executor_message_now()
+        "recordedMs": executor_message_now(),
+        "workspaces": facts.workspaces
     })
 }
 
@@ -4509,6 +4948,7 @@ fn release_response(run: &VerifiedRun, release: &Value, idempotent: bool) -> Val
         "limitation": release["limitation"],
         "messagePayloadsRemoved": release["messagePayloadsRemoved"],
         "messageCleanupError": release["messageCleanupError"],
+        "workspaces": release["workspaces"],
         "release": release
     })
 }

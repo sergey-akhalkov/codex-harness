@@ -1305,6 +1305,177 @@ fn release_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Rele
     }
 }
 
+struct MultiReleaseWorkspace {
+    repository: PathBuf,
+    slot: u32,
+    checkout: PathBuf,
+    slot_state: PathBuf,
+    base: String,
+}
+
+struct MultiReleaseRun {
+    _root: tempfile::TempDir,
+    workspaces: Vec<MultiReleaseWorkspace>,
+    run: String,
+}
+
+fn release_run_with_two_repositories(
+    home: &Path,
+    lead: &str,
+    executor: &str,
+    server: &Server,
+) -> MultiReleaseRun {
+    endpoint(home, lead, lead, server.port, 0);
+    let endpoint_value: Value = serde_json::from_slice(
+        &fs::read(
+            home.join("harness/lead-endpoints")
+                .join(format!("{lead}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let primary_repository = root.path().join("primary");
+    let secondary_repository = root.path().join("secondary");
+    git_repo(&primary_repository);
+    fs::write(primary_repository.join(".gitignore"), "target/\n").unwrap();
+    fs::write(
+        primary_repository.join("primary.txt"),
+        "primary repository\n",
+    )
+    .unwrap();
+    let primary_base = commit_checkout(&primary_repository, "primary base");
+    git_repo(&secondary_repository);
+    fs::write(secondary_repository.join(".gitignore"), "target/\n").unwrap();
+    fs::write(
+        secondary_repository.join("secondary.txt"),
+        "secondary repository\n",
+    )
+    .unwrap();
+    let secondary_base = commit_checkout(&secondary_repository, "secondary base");
+    let run = format!("mcp-test-{executor}-workspaces");
+    let startup = task_worktree::current_startup_reservation().unwrap();
+    let requests = [
+        task_worktree::WorkspaceStartupRequest {
+            source: &primary_repository,
+            base: &primary_base,
+        },
+        task_worktree::WorkspaceStartupRequest {
+            source: &secondary_repository,
+            base: &secondary_base,
+        },
+    ];
+    let acquired = task_worktree::acquire_hierarchy_workspaces_for_startup(
+        home,
+        6,
+        &run,
+        task_worktree::HierarchyRole::Lead,
+        &requests,
+        &startup,
+        &|_| false,
+    )
+    .unwrap();
+    for workspace in &acquired {
+        task_worktree::release_startup_reservation(
+            home,
+            &workspace.repository,
+            workspace.slot.index,
+            &run,
+        )
+        .unwrap();
+    }
+    let primary = &acquired[0].slot;
+    let receipt = task_worktree::pool_state_dir(home, &primary_repository)
+        .unwrap()
+        .join(format!("mcp-{}.json", primary.index));
+    let workspace_values: Vec<Value> = acquired
+        .iter()
+        .map(|workspace| {
+            json!({
+                "repository": workspace.repository,
+                "slot": workspace.slot.index,
+                "label": workspace.slot.label,
+                "checkout": workspace.slot.path,
+                "base": workspace.slot.base,
+                "owner": run
+            })
+        })
+        .collect();
+    let value = json!({
+        "schema": 1,
+        "run": run,
+        "leadThreadId": lead,
+        "executorThreadId": executor,
+        "turnId": "initial-turn",
+        "role": "lead",
+        "parentThreadId": lead,
+        "rootThreadId": lead,
+        "runGeneration": run,
+        "assignment": {
+            "schema": 1,
+            "objective": "Release every recorded repository workspace",
+            "inputs": [],
+            "outputs": [],
+            "invariants": [],
+            "acceptance": ["Both workspaces are released together"]
+        },
+        "prompt": "Release every recorded repository workspace.",
+        "title": format!("executor {executor}"),
+        "slot": primary.index,
+        "slotLabel": primary.label,
+        "workspaces": workspace_values,
+        "source": primary_repository,
+        "repository": primary_repository,
+        "poolSize": 6,
+        "checkout": primary.path,
+        "base": primary_base,
+        "profile": {
+            "profile": "test",
+            "model": "test-model",
+            "modelProvider": "test-provider",
+            "reasoningEffort": "high"
+        },
+        "observedStatus": "idle",
+        "allowProviderModelFallback": false,
+        "startupReservationReleased": true,
+        "control": {
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "config": {"agents.enabled": false},
+            "roleArgs": [],
+            "profileOverrides": []
+        },
+        "lease": {
+            "slot": primary.index,
+            "owner": run,
+            "checkout": primary.path,
+            "appServer": endpoint_value["process"]
+        }
+    });
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let workspaces = acquired
+        .into_iter()
+        .map(|workspace| {
+            let repository = workspace.repository;
+            let slot = workspace.slot.index;
+            MultiReleaseWorkspace {
+                slot_state: task_worktree::pool_state_dir(home, &repository)
+                    .unwrap()
+                    .join(format!("slot-{slot}.json")),
+                repository,
+                slot,
+                checkout: workspace.slot.path,
+                base: workspace.slot.base.unwrap(),
+            }
+        })
+        .collect();
+    MultiReleaseRun {
+        _root: root,
+        workspaces,
+        run,
+    }
+}
+
 fn record_release_payload(home: &Path, run: &ReleaseRun, id: &str) -> (PathBuf, PathBuf) {
     let directory = fs::canonicalize(home).unwrap().join("harness/messages");
     fs::create_dir_all(&directory).unwrap();
@@ -7570,6 +7741,209 @@ fn merged_release_preserves_dirty_work_and_explicit_discard_resets_it() {
     let record = slot_record(&run);
     assert_eq!(record["state"], "released", "{record}");
     assert_eq!(record["disposition"], "discarded", "{record}");
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
+fn multi_repository_release_preflights_and_releases_every_workspace() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = release_run_with_two_repositories(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        &run.workspaces[0].checkout,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let dirty = run.workspaces[1].checkout.join("partial.txt");
+    fs::write(&dirty, "unreviewed secondary work\n").unwrap();
+    let mut mcp = Mcp::start(home.path());
+
+    let preserved = release_tool(
+        &mut mcp,
+        2,
+        LEAD,
+        Some(&run.run),
+        "merged",
+        "merge review with secondary work still local",
+    );
+    let preserved = result(&preserved);
+    assert_eq!(preserved["state"], "preserved", "{preserved}");
+    assert_eq!(preserved["released"], false, "{preserved}");
+    let outcomes = preserved["workspaces"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 2, "{preserved}");
+    assert!(
+        outcomes.iter().all(|outcome| outcome["slotFreed"] == false),
+        "{preserved}"
+    );
+    assert!(
+        preserved["limitation"]
+            .as_str()
+            .unwrap()
+            .contains(&run.workspaces[1].checkout.display().to_string()),
+        "{preserved}"
+    );
+    assert!(dirty.is_file(), "a dirty merged workspace was reset");
+    for workspace in &run.workspaces {
+        let record: Value =
+            serde_json::from_slice(&fs::read(&workspace.slot_state).unwrap()).unwrap();
+        assert_eq!(record["state"], "occupied", "{record}");
+    }
+
+    let mut foreign: Value =
+        serde_json::from_slice(&fs::read(&run.workspaces[1].slot_state).unwrap()).unwrap();
+    foreign["owner"] = json!("foreign-owner");
+    fs::write(
+        &run.workspaces[1].slot_state,
+        serde_json::to_vec_pretty(&foreign).unwrap(),
+    )
+    .unwrap();
+    let refused = release_tool(
+        &mut mcp,
+        3,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "discard after reviewing both workspaces",
+    );
+    let error = tool_error(&refused);
+    assert!(
+        error.contains(&run.workspaces[1].checkout.display().to_string())
+            && error.contains("foreign-owner"),
+        "{error}"
+    );
+    assert!(dirty.is_file(), "a foreign secondary owner was reset");
+    for workspace in &run.workspaces {
+        let record: Value =
+            serde_json::from_slice(&fs::read(&workspace.slot_state).unwrap()).unwrap();
+        assert_eq!(record["state"], "occupied", "{record}");
+    }
+
+    foreign["owner"] = json!(run.run);
+    fs::write(
+        &run.workspaces[1].slot_state,
+        serde_json::to_vec_pretty(&foreign).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&dirty).unwrap();
+    let released = release_tool(
+        &mut mcp,
+        4,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "explicitly discard both reviewed workspaces",
+    );
+    let released = result(&released);
+    assert_eq!(released["state"], "released", "{released}");
+    assert_eq!(released["released"], true, "{released}");
+    assert_eq!(released["disposition"], "discarded", "{released}");
+    let outcomes = released["workspaces"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 2, "{released}");
+    for (workspace, outcome) in run.workspaces.iter().zip(outcomes) {
+        assert_eq!(outcome["outcome"], "reused", "{outcome}");
+        assert_eq!(outcome["slotFreed"], true, "{outcome}");
+        assert_eq!(outcome["base"], workspace.base, "{outcome}");
+        let record: Value =
+            serde_json::from_slice(&fs::read(&workspace.slot_state).unwrap()).unwrap();
+        assert_eq!(record["state"], "released", "{record}");
+        assert_eq!(record["disposition"], "discarded", "{record}");
+        assert_eq!(git_head(&workspace.checkout), workspace.base);
+    }
+
+    let sentinels: Vec<PathBuf> = run
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.checkout.join("post-release.txt"))
+        .collect();
+    for sentinel in &sentinels {
+        fs::write(sentinel, "must survive a repeated release\n").unwrap();
+    }
+    let repeated = release_tool(
+        &mut mcp,
+        5,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "same accepted workspace set",
+    );
+    let repeated = result(&repeated);
+    assert_eq!(repeated["idempotent"], true, "{repeated}");
+    assert_eq!(repeated["released"], true, "{repeated}");
+    for sentinel in &sentinels {
+        assert!(sentinel.is_file(), "a repeated release reset a workspace");
+        fs::remove_file(sentinel).unwrap();
+    }
+
+    let mut receipt: Value = serde_json::from_slice(
+        &fs::read(
+            task_worktree::pool_state_dir(home.path(), &run.workspaces[0].repository)
+                .unwrap()
+                .join(format!("mcp-{}.json", run.workspaces[0].slot)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    receipt["release"]["slotFreed"] = json!(false);
+    receipt["release"]["outcome"] = json!("preserved");
+    fs::write(
+        task_worktree::pool_state_dir(home.path(), &run.workspaces[0].repository)
+            .unwrap()
+            .join(format!("mcp-{}.json", run.workspaces[0].slot)),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let status = mcp.call_tool(
+        6,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let status = result(&status);
+    assert_eq!(
+        status["runs"][0]["release"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{status}"
+    );
+
+    let startup = task_worktree::current_startup_reservation().unwrap();
+    let successor = task_worktree::acquire_hierarchy_task_for_startup(
+        home.path(),
+        &run.workspaces[0].repository,
+        6,
+        run.workspaces[0].slot,
+        "successor-owner",
+        Some(&run.workspaces[0].base),
+        &startup,
+        &|_| false,
+    )
+    .unwrap();
+    task_worktree::release_startup_reservation(
+        home.path(),
+        &run.workspaces[0].repository,
+        successor.index,
+        "successor-owner",
+    )
+    .unwrap();
+    let successor_file = run.workspaces[0].checkout.join("successor-work.txt");
+    fs::write(&successor_file, "later occupant work\n").unwrap();
+    let stale = release_tool(
+        &mut mcp,
+        7,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "stale two-repository release",
+    );
+    assert!(successor_file.is_file(), "a later occupant was reset");
+    assert!(tool_error(&stale).contains("recorded ownership"), "{stale}");
+    assert!(server.requests_for("thread/start").is_empty());
     mcp.finish();
     drop(run);
 }

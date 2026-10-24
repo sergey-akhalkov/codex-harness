@@ -523,7 +523,7 @@ Managed ordinary, lead and executor sessions suppress the competing native `code
 
 A fresh hierarchy dispatch claims the first free label in the caller's fixed range and binds it to the owner as a durable task with its exact committed base before the first model request; compatibility CLI and ordinary tasks continue to walk positions with legacy naming. The claim uses the refreshed upstream default branch by default, or the explicit `base` commit resolved locally without a fetch. The claim stays exclusively owned and a competing dispatch cannot reclaim the position or replace its pending assignment. Two free positions still start independently. Dispatch is also admitted against `max_concurrent_executors`, independently of the pool: free positions alone do not grant another active executor run, and a held or suspended task keeps its position without consuming concurrency. A confirmed-dead clean unused reservation can be recovered, but a durable task binding is never freed by process exit alone and a former owner cannot continue a reassigned task. Ad-hoc worktrees are refused, and a position holding unreviewed work is preserved rather than reset.
 
-A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. MCP completion does not release a slot. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through the owning pool lifecycle. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets only a clean, reviewed position and retains ignored caches. Generated `.serena/` project state is tool state: release preserves it and excludes it from the cleanliness decision, while any other local or untracked work still preserves the position. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason rather than reported free.
+A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. MCP completion does not release a slot. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through the owning pool lifecycle. `executor_release` preflights every repository workspace recorded in the run receipt before any reset, then releases each at its recorded repository, slot, checkout and exact base. The release record and response carry per-workspace outcomes; the aggregate is `released` only when every recorded workspace is free. One dirty workspace under `merged` preserves the whole remaining set, and a missing, foreign or live owner, startup reservation or mismatched slot/checkout refuses the set with the exact workspace. A multi-repository run uses each recorded base, while the optional `base` override remains available for a single workspace. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets only a clean, reviewed position and retains ignored caches. Generated `.serena/` project state is tool state: release preserves it and excludes it from the cleanliness decision, while any other local or untracked work still preserves the position. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason rather than reported free; repeating a release reuses already-freed workspace outcomes and never resets a later occupant.
 
 A missing host lease does not mean a position is free while its creator is
 starting. If a competing dispatch refuses, inspect its reported cause and
@@ -534,8 +534,9 @@ confirmed-dead, clean unused reservation can be recovered automatically.
 
 `executor_release` refuses a delegated Lead while any child run under it is
 unreleased, naming the remaining runs. Review and release each child through its
-own parent first, then release the Lead workspace. Acceptance, completion or a
-stopped parent never authorizes resetting a child's workspace.
+own parent first, then release the Lead's complete recorded workspace set.
+Acceptance, completion or a stopped parent never authorizes resetting a child's
+workspace.
 
 Ordinary tasks use the same pool without a conversation:
 
@@ -890,8 +891,8 @@ external consumer. Its coverage split is deliberate:
   generation.
 - `executor_mcp` exercises both dispatch routes, parent/root/role identity,
   per-role `enabled_tools`, the full admission topology, stop, exact/fresh
-  resume, release and reopen after disconnection with a deterministic
-  app-server.
+  resume, single- and two-repository release with per-workspace preservation and
+  idempotence, and reopen after disconnection with a deterministic app-server.
 - `executor_assignment` exercises specification-backed Lead admission, board
   ownership across repositories and multi-repository assignment inputs.
 - `worktree_pool` exercises shared pools, multi-repository workspace sets,
