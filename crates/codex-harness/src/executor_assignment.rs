@@ -676,7 +676,7 @@ pub fn framing_contract() -> String {
     );
     text.push_str(&format!(
         "- Required fields are \"schema\", \"objective\", \"inputs\", \"outputs\", \"invariants\", and \"acceptance\".\n\
-         - Optional fields are \"consumer\", \"purpose\", \"board_task\", and \"escalate\".\n\
+         - Optional fields are \"consumer\", \"purpose\", \"board_task\", \"escalate\", and the Lead-only \"lead_change\".\n\
          - The complete document must be at most {MAX_ASSIGNMENT_BYTES} bytes; the rendered assignment brief must be at most {MAX_BRIEF_BYTES} bytes.\n\
          - \"objective\" is a non-empty string of at most {MAX_OBJECTIVE_BYTES} bytes.\n\
          - \"inputs\" and \"outputs\" must be JSON arrays of plain checkout-relative path strings, never objects. Each array has at most {MAX_LIST_ITEMS} entries, each path is at most {MAX_RELATIVE_PATH_BYTES} bytes, and paths must not be rooted, traverse with \"..\", contain \":\", name an empty file or repeat within their array.\n\
@@ -719,6 +719,17 @@ fn render_brief(
     text.push_str(&format!("consumer: {consumer}\n"));
     if let Some(purpose) = purpose {
         text.push_str(&format!("purpose: {}\n", purpose.as_str()));
+    }
+    if let Some(change) = &assignment.lead_change {
+        text.push_str(&format!("lead change: {}\n", change.directory));
+        text.push_str(&format!("planning root: {}\n", change.planning_root));
+        text.push_str(&format!("planning base: {}\n", change.base));
+        for repository in &change.repositories {
+            text.push_str(&format!(
+                "repository: {} @ {}\n",
+                repository.path, repository.base
+            ));
+        }
     }
     push_list(
         &mut text,

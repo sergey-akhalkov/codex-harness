@@ -2,6 +2,8 @@
 
 #[path = "fixtures/control_endpoint.rs"]
 mod control_endpoint;
+#[path = "fixtures/synthetic_role_build.rs"]
+mod synthetic_role_build;
 
 use control_endpoint::{Answer, Bearer, Server};
 use harness_core::{process_service::ServiceProcess, task_worktree};
@@ -17,6 +19,7 @@ use std::{
 };
 
 const LEAD: &str = "01a00000-0000-7000-8000-000000000001";
+const DIRECTOR: &str = "01a00000-0000-7000-8000-00000000000d";
 const OTHER_LEAD: &str = "01a00000-0000-7000-8000-000000000002";
 const EXECUTOR: &str = "01a00000-0000-7000-8000-000000000003";
 const OTHER_EXECUTOR: &str = "01a00000-0000-7000-8000-000000000004";
@@ -284,6 +287,9 @@ struct SimThread {
     id: String,
     cwd: PathBuf,
     name: Option<String>,
+    model: String,
+    model_provider: String,
+    reasoning_effort: String,
     turns: Vec<Value>,
     next_turn: u64,
 }
@@ -294,6 +300,9 @@ impl SimThread {
             id: id.to_owned(),
             cwd: cwd.to_path_buf(),
             name: None,
+            model: "test-model".into(),
+            model_provider: "test-provider".into(),
+            reasoning_effort: "high".into(),
             turns: Vec::new(),
             next_turn: 1,
         }
@@ -304,6 +313,9 @@ impl SimThread {
             id: id.to_owned(),
             cwd: cwd.to_path_buf(),
             name: None,
+            model: "test-model".into(),
+            model_provider: "test-provider".into(),
+            reasoning_effort: "high".into(),
             turns: vec![json!({"id": turn, "status": "inProgress", "items": []})],
             next_turn: 2,
         }
@@ -323,9 +335,9 @@ impl SimThread {
             "status": {"type": self.state()},
             "cwd": self.cwd,
             "name": self.name,
-            "model": "test-model",
-            "modelProvider": "test-provider",
-            "reasoningEffort": "high",
+            "model": self.model,
+            "modelProvider": self.model_provider,
+            "reasoningEffort": self.reasoning_effort,
             "turns": self.turns
         })
     }
@@ -526,8 +538,18 @@ fn native_responder(
                 let id = format!("recovery-thread-{}", sim.next_thread);
                 sim.next_thread += 1;
                 let cwd = request["params"]["cwd"].as_str().unwrap_or_default();
-                sim.threads
-                    .insert(id.clone(), SimThread::idle(&id, Path::new(cwd)));
+                let mut thread = SimThread::idle(&id, Path::new(cwd));
+                if let Some(model) = request["params"]["model"].as_str() {
+                    thread.model = model.to_owned();
+                }
+                if let Some(provider) = request["params"]["modelProvider"].as_str() {
+                    thread.model_provider = provider.to_owned();
+                }
+                if let Some(effort) = request["params"]["config"]["model_reasoning_effort"].as_str()
+                {
+                    thread.reasoning_effort = effort.to_owned();
+                }
+                sim.threads.insert(id.clone(), thread);
                 Answer::Result(json!({
                     "thread": {"id": id},
                     "cwd": cwd,
@@ -727,6 +749,192 @@ fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Sy
         _checkout: checkout,
         receipt,
     }
+}
+
+fn install_kit(home: &Path, root: &Path) {
+    let kit = synthetic_role_build::kit_source(root);
+    fs::write(
+        kit.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 6\nworktree_pool_size = 6\n",
+    )
+    .unwrap();
+    fs::write(
+        home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    let build = synthetic_role_build::recorded_build(root, &kit);
+    synthetic_role_build::register(home, root, &build);
+    fs::create_dir_all(home.join("harness")).unwrap();
+    fs::write(
+        home.join("harness/installation.json"),
+        serde_json::to_vec(&json!({"settings": {"sourceRoot": kit}})).unwrap(),
+    )
+    .unwrap();
+}
+
+/// One recorded delegated Lead run in a shared repository. The same checkout
+/// is the Lead workspace and the repository whose pool the Lead dispatches
+/// into; its exact base is available for the child.
+fn delegated_lead_run(home: &Path, root: &Path, server: &Server) -> (PathBuf, Value) {
+    let repository = root.join("repo");
+    let base = git_repo(&repository);
+    endpoint(home, DIRECTOR, DIRECTOR, server.port, 0);
+    endpoint(home, LEAD, LEAD, server.port, 0);
+    let endpoint_value: Value = serde_json::from_slice(
+        &fs::read(
+            home.join("harness/lead-endpoints")
+                .join(format!("{DIRECTOR}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let state = task_worktree::pool_state_dir(home, &repository).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let run = "lead-run";
+    fs::write(
+        state.join("slot-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "ownershipSchema": 1,
+            "source": repository,
+            "index": 1,
+            "path": repository,
+            "state": "occupied",
+            "owner": run,
+            "task": run,
+            "handle": "lead-handle",
+            "base": base,
+            "disposition": null,
+            "reason": null,
+            "startup": null,
+            "assignment": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let receipt = state.join("mcp-1.json");
+    let value = json!({
+        "schema": 1,
+        "run": run,
+        "role": "lead",
+        "parentThreadId": DIRECTOR,
+        "rootThreadId": DIRECTOR,
+        "runGeneration": "lead-generation",
+        "leadThreadId": DIRECTOR,
+        "executorThreadId": LEAD,
+        "turnId": "lead-turn",
+        "assignment": {
+            "schema": 1,
+            "objective": "Lead one prepared change",
+            "inputs": [],
+            "outputs": [],
+            "invariants": [],
+            "acceptance": ["Return a bounded result"]
+        },
+        "prompt": "Lead one prepared change",
+        "title": "CLead (ds) - lead-run",
+        "slot": 1,
+        "source": repository,
+        "repository": repository,
+        "poolSize": 6,
+        "checkout": repository,
+        "base": base,
+        "profile": {
+            "profile": "ds",
+            "model": "deepseek-flash",
+            "modelProvider": "deepseek",
+            "reasoningEffort": "max"
+        },
+        "observedStatus": "idle",
+        "allowProviderModelFallback": false,
+        "control": {
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "config": {"agents.enabled": false},
+            "roleArgs": [],
+            "profileOverrides": []
+        },
+        "lease": {
+            "slot": 1,
+            "owner": run,
+            "checkout": repository,
+            "appServer": endpoint_value["process"]
+        }
+    });
+    fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    (repository, value)
+}
+
+fn bd_executable() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH");
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join("bd.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!("bd executable is not installed on PATH");
+}
+
+/// A committed prepared change plus a real board issue in one repository.
+fn prepared_repository(home: &Path, root: &Path, server: &Server) -> (PathBuf, String, String) {
+    let repository = root.join("repo");
+    git_repo(&repository);
+    let change = repository.join("openspec/changes/lead-sample");
+    fs::create_dir_all(change.join("specs/sample")).unwrap();
+    fs::write(change.join("proposal.md"), "# Proposal\n\nPrepared.\n").unwrap();
+    fs::write(change.join("tasks.md"), "- [ ] implement\n").unwrap();
+    fs::write(change.join("design.md"), "# Design\n\nPrepared.\n").unwrap();
+    fs::write(
+        change.join("specs/sample/spec.md"),
+        "## ADDED Requirements\n\n### Requirement: Sample\n\nThe system SHALL work.\n",
+    )
+    .unwrap();
+    let head = commit_checkout(&repository, "prepare the sample change");
+    let bin = home.join("harness/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::copy(bd_executable(), bin.join("bd.exe")).unwrap();
+    let bd = bin.join("bd.exe");
+    let init = Command::new(&bd)
+        .args([
+            "init",
+            "--skip-agents",
+            "--non-interactive",
+            "--quiet",
+            "--prefix",
+            "leadtest",
+        ])
+        .current_dir(&repository)
+        .env("BD_NON_INTERACTIVE", "1")
+        .env("BEADS_ACTOR", "executor-mcp-test")
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let created = Command::new(&bd)
+        .args(["create", "Prepared Lead change", "--type", "task", "--json"])
+        .current_dir(&repository)
+        .env("BD_NON_INTERACTIVE", "1")
+        .env("BEADS_ACTOR", "executor-mcp-test")
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let issue: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let issue = issue["id"].as_str().unwrap().to_owned();
+    endpoint(home, DIRECTOR, DIRECTOR, server.port, 0);
+    (repository, head, issue)
 }
 
 struct ReleaseRun {
@@ -1382,6 +1590,193 @@ fn status_keeps_a_released_run_readable_after_its_app_server_is_replaced() {
     );
 
     drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn delegated_lead_dispatches_an_executor_and_executor_cannot_dispatch() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, lead) = delegated_lead_run(home.path(), root.path(), &server);
+    let base = lead["base"].as_str().unwrap().to_owned();
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let starts_before = server.requests_for("thread/start").len();
+    let dispatched = mcp.call(
+        2,
+        json!({
+            "owner": "delegated-child",
+            "base": base,
+            "assignment": assignment("Dispatch one nested executor")
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    let dispatched = result(&dispatched);
+    assert_eq!(dispatched["role"], "executor", "{dispatched}");
+    assert_eq!(dispatched["parentThreadId"], LEAD, "{dispatched}");
+    assert_eq!(dispatched["rootThreadId"], DIRECTOR, "{dispatched}");
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts_before + 1,
+        "{dispatched}"
+    );
+    let child = dispatched["executorThreadId"].as_str().unwrap().to_owned();
+
+    let starts_before = server.requests_for("thread/start").len();
+    let refused = mcp.call_tool(
+        3,
+        "lead_dispatch",
+        json!({"assignment": assignment("nested lead")}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&refused).contains("only a verified Director"),
+        "{refused}"
+    );
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts_before,
+        "a delegated Lead must not create another Lead"
+    );
+
+    let refused = mcp.call(
+        4,
+        json!({
+            "owner": "nested-executor",
+            "base": base,
+            "assignment": assignment("nested executor")
+        }),
+        Some(json!({"threadId": child})),
+    );
+    assert!(
+        tool_error(&refused).contains("recorded executor"),
+        "{refused}"
+    );
+    let refused = mcp.call_tool(
+        5,
+        "lead_dispatch",
+        json!({"assignment": assignment("nested lead")}),
+        Some(json!({"threadId": child})),
+    );
+    assert!(
+        tool_error(&refused).contains("only a verified Director"),
+        "{refused}"
+    );
+
+    drop(lead);
+    mcp.finish();
+}
+
+#[test]
+fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let lead = mcp.call_tool(
+        2,
+        "lead_dispatch",
+        json!({
+            "assignment": {
+                "schema": 1,
+                "objective": "Lead the prepared sample change",
+                "inputs": [],
+                "outputs": [],
+                "invariants": ["Use the prepared change and its exact base."],
+                "acceptance": ["The change is accepted with checked evidence."],
+                "board_task": issue,
+                "lead_change": {
+                    "planning_root": ".",
+                    "base": base,
+                    "directory": "openspec/changes/lead-sample",
+                    "repositories": [{"path": ".", "base": base}]
+                }
+            }
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let lead = result(&lead);
+    assert_eq!(lead["role"], "lead", "{lead}");
+    assert_eq!(lead["parentThreadId"], DIRECTOR, "{lead}");
+    assert_eq!(lead["rootThreadId"], DIRECTOR, "{lead}");
+    assert_eq!(lead["leadChange"]["board_task"], issue, "{lead}");
+    assert_eq!(lead["profile"]["profile"], "ds", "{lead}");
+    let lead_thread = lead["executorThreadId"].as_str().unwrap().to_owned();
+    let endpoint_path = home
+        .path()
+        .join("harness/lead-endpoints")
+        .join(format!("{lead_thread}.json"));
+    assert!(
+        endpoint_path.is_file(),
+        "the Lead endpoint was not published"
+    );
+
+    let child = mcp.call(
+        3,
+        json!({
+            "owner": "lead-child",
+            "base": base,
+            "assignment": assignment("Dispatch one executor from the Lead")
+        }),
+        Some(json!({"threadId": lead_thread})),
+    );
+    let child = result(&child);
+    assert_eq!(child["role"], "executor", "{child}");
+    assert_eq!(child["parentThreadId"], lead_thread, "{child}");
+    assert_eq!(child["rootThreadId"], DIRECTOR, "{child}");
+    assert_eq!(child["base"], base, "{child}");
+    assert_ne!(
+        child["executorThreadId"], lead["executorThreadId"],
+        "{child}"
+    );
+
+    // A direct Director-to-Executor dispatch remains compatible.
+    let direct = mcp.call(
+        4,
+        json!({
+            "owner": "direct-child",
+            "base": base,
+            "assignment": assignment("Dispatch one direct executor")
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let direct = result(&direct);
+    assert_eq!(direct["role"], "executor", "{direct}");
+    assert_eq!(direct["parentThreadId"], DIRECTOR, "{direct}");
+    assert_eq!(direct["rootThreadId"], DIRECTOR, "{direct}");
+
+    // A vague Lead assignment is refused before any new thread.
+    let starts_before = server.requests_for("thread/start").len();
+    let refused = mcp.call_tool(
+        5,
+        "lead_dispatch",
+        json!({"assignment": assignment("vague lead")}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(tool_error(&refused).contains("lead_change"), "{refused}");
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+
     mcp.finish();
 }
 

@@ -2113,6 +2113,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
 pub(crate) struct McpDispatch {
     pub owner: String,
     pub title: String,
+    pub lead_change: Option<executor_assignment::LeadChangeEvidence>,
     pub slot: u32,
     pub source: PathBuf,
     pub repository: PathBuf,
@@ -2155,6 +2156,61 @@ pub(crate) fn prepare_mcp_dispatch(
     base: Option<&str>,
     assignment: executor_assignment::Assignment,
 ) -> io::Result<McpDispatch> {
+    prepare_mcp_dispatch_inner(
+        codex_home,
+        source,
+        repository,
+        owner,
+        profile,
+        base,
+        assignment,
+        Role::Executor,
+        None,
+    )
+}
+
+/// Prepares one Director-requested delegated Lead run. The assignment's
+/// change reference must already have been validated against the Director's
+/// repository; its exact repository base becomes the Lead workspace base.
+/// The profile is fixed to the configured delegated Lead route.
+pub(crate) fn prepare_mcp_lead_dispatch(
+    codex_home: &Path,
+    source: &Path,
+    repository: &Path,
+    owner: &str,
+    assignment: executor_assignment::Assignment,
+    evidence: executor_assignment::LeadChangeEvidence,
+) -> io::Result<McpDispatch> {
+    let base = evidence
+        .repositories
+        .first()
+        .map(|repository| repository.base.clone())
+        .unwrap_or_else(|| evidence.planning_base.clone());
+    prepare_mcp_dispatch_inner(
+        codex_home,
+        source,
+        repository,
+        owner,
+        None,
+        Some(&base),
+        assignment,
+        Role::DelegatedLead,
+        Some(evidence),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_mcp_dispatch_inner(
+    codex_home: &Path,
+    source: &Path,
+    repository: &Path,
+    owner: &str,
+    profile: Option<&str>,
+    base: Option<&str>,
+    assignment: executor_assignment::Assignment,
+    role: Role,
+    lead_change: Option<executor_assignment::LeadChangeEvidence>,
+) -> io::Result<McpDispatch> {
     let owner = owner.trim();
     if owner.is_empty()
         || owner.len() > 128
@@ -2167,7 +2223,15 @@ pub(crate) fn prepare_mcp_dispatch(
         ));
     }
     let config = load(source)?;
-    let profile = executor_profile(&config, profile)?;
+    let profile = match role {
+        Role::Executor => executor_profile(&config, profile)?.to_owned(),
+        Role::DelegatedLead => orchestration_config::delegated_lead_profile(&config)?,
+        Role::Lead | Role::ExecutorSelfReflection | Role::LeadSelfReflection => {
+            return Err(invalid(
+                "MCP dispatch accepts only executor or delegated Lead runs",
+            ));
+        }
+    };
     let pool_size = worktree_pool_size(&config);
     let inventory = task_worktree::task_inventory(codex_home, repository, pool_size)?;
     if inventory.iter().any(|slot| {
@@ -2182,7 +2246,13 @@ pub(crate) fn prepare_mcp_dispatch(
         source,
         repository,
         pool_size,
-        max_concurrency: config.max_concurrent_executors,
+        // Delegated Leads use the shared pool but not the Executor
+        // concurrency allowance; parent-scoped admission is a later task.
+        max_concurrency: if role == Role::Executor {
+            config.max_concurrent_executors
+        } else {
+            u32::MAX
+        },
         named_slot: None,
         owner,
         base,
@@ -2190,7 +2260,7 @@ pub(crate) fn prepare_mcp_dispatch(
         handle: None,
         profile: &profile,
         prompt: PromptSource::Structured(assignment),
-        role: Role::Executor,
+        role,
         mode: SpawnMode::Exec,
         resumed_session: None,
         terminal_profile: None,
@@ -2204,7 +2274,7 @@ pub(crate) fn prepare_mcp_dispatch(
             &prepared.binding.path,
             Some(&profile_config),
             &toml::Table::new(),
-            Role::Executor,
+            role,
         )?;
         Ok((
             role.args,
@@ -2225,7 +2295,12 @@ pub(crate) fn prepare_mcp_dispatch(
     };
     Ok(McpDispatch {
         owner: owner.to_owned(),
-        title: executor_title(&profile, owner),
+        title: match role {
+            Role::Executor => executor_title(&profile, owner),
+            Role::DelegatedLead => lead_dispatch_title(&profile, owner),
+            _ => unreachable!("MCP dispatch role checked above"),
+        },
+        lead_change,
         slot: prepared.binding.index,
         source: source.to_path_buf(),
         repository: repository.to_path_buf(),
@@ -3396,9 +3471,7 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
             match request.role {
                 Role::Executor => executor_assignment::brief(&effective, &context),
                 Role::Lead => executor_assignment::lead_brief(&effective, &context),
-                Role::DelegatedLead => Err(invalid(
-                    "delegated Lead structured assignments are owned by the Director dispatch path; no root Lead or Executor brief is substituted",
-                )),
+                Role::DelegatedLead => executor_assignment::lead_brief(&effective, &context),
                 Role::ExecutorSelfReflection | Role::LeadSelfReflection => Err(invalid(
                     "reflection roles are not executor or lead dispatches",
                 )),

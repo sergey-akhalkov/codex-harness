@@ -6,7 +6,7 @@
 //! binding.
 
 use crate::{
-    executor_assignment::Assignment,
+    executor_assignment::{Assignment, AssignmentContext},
     executor_cli::control::{
         self, BoundIdentity, ControlPaths, ControlPlan, Conversation, DEFAULT_BOUND, Endpoint,
         EndpointProcess, RegisteredLead, active_turn,
@@ -36,6 +36,7 @@ use std::{
 };
 
 const DISPATCH_TOOL: &str = "executor_dispatch";
+const LEAD_DISPATCH_TOOL: &str = "lead_dispatch";
 const STATUS_TOOL: &str = "executor_status";
 const WAIT_TOOL: &str = "executor_wait";
 const MESSAGE_TOOL: &str = "executor_message";
@@ -90,6 +91,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         "executors",
         vec![
             dispatch_tool_definition(),
+            lead_dispatch_tool_definition(),
             status_tool_definition(),
             wait_tool_definition(),
             message_tool_definition(),
@@ -149,6 +151,28 @@ fn dispatch_tool_definition() -> Value {
                         "board_task": {"type": "string"},
                         "escalate": {"type": "array", "items": {"type": "string"}}
                     }
+                }
+            }
+        }
+    })
+}
+
+fn lead_dispatch_tool_definition() -> Value {
+    json!({
+        "name": LEAD_DISPATCH_TOOL,
+        "description": "Director-only dispatch of one delegated Lead into a pooled workspace and a new thread on this Director's exact Codex app-server. The assignment must name a prepared OpenSpec change with its committed planning inputs, repositories, board task, objective and acceptance. No caller-supplied profile, model, parent, thread or endpoint is accepted.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["assignment"],
+            "properties": {
+                "owner": {
+                    "type": "string",
+                    "description": "Optional fresh run label (ASCII letters, digits, '-', '_' or '.', at most 128 characters). Omitted generates one from the caller suffix and a nanosecond timestamp."
+                },
+                "assignment": {
+                    "type": "object",
+                    "description": "Structured Lead assignment, schema 1. It must be a complete schema-1 Assignment (objective, inputs, outputs, invariants, acceptance, board_task) with lead_change naming the prepared OpenSpec change, planning root/base, directory and repository bases. The server validates it before any allocation or model work."
                 }
             }
         }
@@ -338,6 +362,7 @@ fn release_tool_definition() -> Value {
 fn perform(operation: &Operation) -> io::Result<Value> {
     match operation.name.as_str() {
         DISPATCH_TOOL => dispatch(operation),
+        LEAD_DISPATCH_TOOL => lead_dispatch(operation),
         STATUS_TOOL => status(operation),
         WAIT_TOOL => wait(operation),
         MESSAGE_TOOL => message(operation),
@@ -418,6 +443,13 @@ struct DispatchArgs {
     base: Option<String>,
     #[serde(default)]
     profile: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeadDispatchArgs {
+    owner: Option<String>,
+    assignment: Value,
 }
 
 #[derive(Deserialize)]
@@ -505,9 +537,87 @@ impl RunRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunSide {
+    Parent,
+    Child,
+}
+
 struct RunReceipt {
     path: PathBuf,
     value: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerRole {
+    Director,
+    DelegatedLead,
+    Executor,
+}
+
+struct CallerAuthority {
+    role: CallerRole,
+    root_thread: String,
+}
+
+/// Resolve the caller from Codex-injected identity and retained receipts. A
+/// recorded child is an Executor or delegated Lead; an unrecorded thread is a
+/// Director only when its registered root endpoint is live. The parent and
+/// root of a new child come from this authority, never from tool arguments.
+fn caller_authority(home: &Path, caller: &str) -> io::Result<CallerAuthority> {
+    let own: Vec<Value> = mcp_receipts(home)?
+        .into_iter()
+        .filter(|receipt| receipt["executorThreadId"].as_str() == Some(caller))
+        .collect();
+    if own.len() > 1 {
+        return Err(invalid(
+            "the calling thread is recorded as the child of more than one run; refusing an ambiguous hierarchy identity",
+        ));
+    }
+    if let Some(receipt) = own.first() {
+        if !receipt["release"].is_null() {
+            return Err(invalid(
+                "the calling run is released and cannot dispatch descendants; resume or dispatch a fresh run",
+            ));
+        }
+        return match receipt["role"].as_str().unwrap_or("executor") {
+            "lead" => {
+                let root = receipt["rootThreadId"]
+                    .as_str()
+                    .or_else(|| receipt["parentThreadId"].as_str())
+                    .or_else(|| receipt["leadThreadId"].as_str())
+                    .filter(|root| valid_thread_id(root))
+                    .ok_or_else(|| {
+                        invalid(
+                            "the recorded delegated Lead run has no usable root thread; refusing to guess the hierarchy",
+                        )
+                    })?;
+                Ok(CallerAuthority {
+                    role: CallerRole::DelegatedLead,
+                    root_thread: root.to_owned(),
+                })
+            }
+            "executor" => Ok(CallerAuthority {
+                role: CallerRole::Executor,
+                root_thread: receipt["rootThreadId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            }),
+            other => Err(invalid(format!(
+                "the recorded run has unsupported child role {other:?}; refusing to infer authority"
+            ))),
+        };
+    }
+    match control::registered_lead(home, caller) {
+        RegisteredLead::Live(_) => Ok(CallerAuthority {
+            role: CallerRole::Director,
+            root_thread: caller.to_owned(),
+        }),
+        RegisteredLead::Unavailable(reason) => Err(invalid(format!(
+            "{reason}; no app-server was contacted. Remedy: restart this lead through the installed codex-harness launcher so its native thread endpoint is registered, then retry"
+        ))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -523,9 +633,14 @@ struct VerifiedRun {
     receipt: PathBuf,
     value: Value,
     role: RunRole,
+    child_role: RunRole,
+    side: RunSide,
     run: String,
     lead_thread: String,
     executor_thread: String,
+    parent_thread: String,
+    root_thread: String,
+    generation: String,
     title: String,
     slot: u32,
     source: PathBuf,
@@ -548,10 +663,8 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     let assignment_value = args.assignment.clone();
     let assignment = Assignment::from_value(args.assignment)?;
     let codex_home = native_launcher::codex_home()?;
-    if mcp_receipts(&codex_home)?
-        .iter()
-        .any(|receipt| receipt["executorThreadId"].as_str() == Some(caller.as_str()))
-    {
+    let authority = caller_authority(&codex_home, &caller)?;
+    if authority.role == CallerRole::Executor {
         return Err(invalid(
             "the calling thread is a recorded executor and cannot dispatch descendants; no endpoint, lease, thread or model work was touched",
         ));
@@ -652,6 +765,10 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     let receipt = json!({
         "schema": 1,
         "run": prepared.owner,
+        "role": "executor",
+        "parentThreadId": caller,
+        "rootThreadId": authority.root_thread,
+        "runGeneration": prepared.owner,
         "leadThreadId": caller,
         "executorThreadId": executor_thread,
         "turnId": turn.turn_id,
@@ -699,6 +816,193 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
             .and_then(|run| ensure_cache_guard(&codex_home, &run))
     {
         result["cacheGuardError"] = json!(error.to_string());
+    }
+    Ok(result)
+}
+
+/// Director-only dispatch of one prepared OpenSpec change to a delegated Lead.
+/// The change is validated against the Director's repository before any slot
+/// claim or model effect; the Lead thread runs on the Director's app-server
+/// and its endpoint is registered so the Lead can dispatch Executors.
+fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
+    let caller = caller_thread(&operation.metadata)?;
+    let args: LeadDispatchArgs = serde_json::from_value(operation.arguments.clone())
+        .map_err(|error| invalid(format!("lead_dispatch arguments are invalid: {error}")))?;
+    let owner = args.owner.unwrap_or_else(|| generated_owner(&caller));
+    let assignment_value = args.assignment.clone();
+    let assignment = Assignment::from_value(args.assignment)?;
+    let codex_home = native_launcher::codex_home()?;
+    let authority = caller_authority(&codex_home, &caller)?;
+    if authority.role != CallerRole::Director {
+        return Err(invalid(
+            "only a verified Director may dispatch a Lead; a delegated Lead or Executor cannot create another Lead and no model work was touched",
+        ));
+    }
+    let endpoint = match control::registered_lead(&codex_home, &caller) {
+        RegisteredLead::Live(endpoint) => endpoint,
+        RegisteredLead::Unavailable(reason) => {
+            return Err(invalid(format!(
+                "{reason}; no app-server was contacted. Remedy: restart this Director through the installed codex-harness launcher, then retry lead_dispatch"
+            )));
+        }
+    };
+    let app_server = endpoint.process.clone().ok_or_else(|| {
+        invalid(
+            "the registered Director endpoint records no app-server process, so an exact run lease cannot be recorded; no thread was created",
+        )
+    })?;
+
+    let mut director = Conversation::attach(&endpoint, DEFAULT_BOUND)?;
+    let director_thread = director.read_thread_state(&caller)?;
+    require_loaded_lead(&director_thread, &caller)?;
+    let cwd = director_thread["cwd"]
+        .as_str()
+        .ok_or_else(|| invalid("the registered Director thread reports no working directory"))?;
+    let source = crate::executor_cli::executor_input::source(None, &codex_home)?;
+    let repository = repository_root(Path::new(cwd))?;
+    let bd = crate::feedback_cli::discover_bd_in(&codex_home).map_err(|error| {
+        invalid(format!(
+            "Lead dispatch requires the consumer board executable: {error}"
+        ))
+    })?;
+    let context = AssignmentContext {
+        checkout: &repository,
+        base: "",
+        owner: &owner,
+        source: &source,
+    };
+    let evidence =
+        crate::executor_assignment::validate_lead_assignment(&assignment, &context, &bd)?;
+    let prepared = executor_cli::prepare_mcp_lead_dispatch(
+        &codex_home,
+        &source,
+        &repository,
+        &owner,
+        assignment,
+        evidence,
+    )?;
+
+    let mut overrides = parse_assignments(&prepared.profile_overrides)?;
+    overrides.extend(parse_role_args(&prepared.role_args)?);
+    overrides.insert("agents.enabled".into(), json!(false));
+    let identity = BoundIdentity::resolve(&prepared.bound);
+    let mut plan = ControlPlan::new(
+        codex_home.join("harness/bin/codex.exe"),
+        &codex_home,
+        &prepared.checkout,
+        prepared.title.clone(),
+        identity.clone(),
+        ControlPaths::for_slot(&codex_home, &prepared.repository, prepared.slot)?,
+    );
+    plan.approval_policy = Some(APPROVAL_POLICY.into());
+    plan.overrides = overrides;
+    plan.delegated_lead_session = true;
+    if let Some(sandbox) = director_thread["sandbox"].as_str() {
+        plan.sandbox = Some(sandbox.to_owned());
+    }
+
+    let mut conversation = match Conversation::start_on_endpoint(&endpoint, &plan) {
+        Ok(conversation) => conversation,
+        Err(error) => return Err(prepared.release(error)),
+    };
+    let lead_thread = conversation.thread_id().to_owned();
+    let thread = match conversation.read_thread_state(&lead_thread) {
+        Ok(thread) => thread,
+        Err(error) => {
+            return Err(prepared.release(io::Error::new(
+                error.kind(),
+                format!("delegated Lead thread {lead_thread} could not be confirmed: {error}"),
+            )));
+        }
+    };
+    let observed = match confirm_started(
+        &thread,
+        &lead_thread,
+        &prepared.checkout,
+        &identity,
+        &prepared.title,
+    ) {
+        Ok(status) => status,
+        Err(error) => return Err(prepared.release(error)),
+    };
+    if let Err(error) =
+        control::publish_lead_endpoint(&codex_home, &endpoint.for_thread(&lead_thread)?)
+    {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "delegated Lead thread {lead_thread} was created but its endpoint could not be published: {error}; the run and pool claim are preserved"
+            ),
+        ));
+    }
+    let turn = match conversation.assign(&prepared.prompt) {
+        Ok(turn) => turn,
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; delegated Lead thread {lead_thread} was created and the pool claim is preserved because turn/start may have been accepted"
+                ),
+            ));
+        }
+    };
+    let startup_release = task_worktree::release_startup_reservation(
+        &codex_home,
+        &prepared.repository,
+        prepared.slot,
+        &prepared.owner,
+    )
+    .err()
+    .map(|error| error.to_string());
+    let receipt = json!({
+        "schema": 1,
+        "run": prepared.owner,
+        "role": "lead",
+        "parentThreadId": caller,
+        "rootThreadId": caller,
+        "runGeneration": prepared.owner,
+        "leadThreadId": caller,
+        "executorThreadId": lead_thread,
+        "turnId": turn.turn_id,
+        "assignment": assignment_value,
+        "leadChange": prepared.lead_change,
+        "prompt": prepared.prompt,
+        "title": prepared.title,
+        "slot": prepared.slot,
+        "source": prepared.source,
+        "repository": prepared.repository,
+        "poolSize": prepared.pool_size,
+        "checkout": prepared.checkout,
+        "base": prepared.base,
+        "profile": identity,
+        "observedStatus": observed,
+        "allowProviderModelFallback": false,
+        "control": {
+            "approvalPolicy": plan.approval_policy,
+            "sandbox": plan.sandbox,
+            "config": plan.overrides,
+            "roleArgs": prepared.role_args,
+            "profileOverrides": prepared.profile_overrides
+        },
+        "startupReservationReleased": startup_release.is_none(),
+        "lease": {
+            "slot": prepared.slot,
+            "owner": prepared.owner,
+            "checkout": prepared.checkout,
+            "appServer": app_server
+        }
+    });
+    let receipt_error =
+        control::write_staged(&prepared.receipt, &serde_json::to_vec_pretty(&receipt)?)
+            .err()
+            .map(|error| error.to_string());
+    let mut result = receipt;
+    result["receipt"] = json!(prepared.receipt);
+    if let Some(error) = receipt_error {
+        result["receiptError"] = json!(error);
+    }
+    if let Some(error) = startup_release {
+        result["startupReleaseError"] = json!(error);
     }
     Ok(result)
 }
@@ -769,6 +1073,28 @@ fn repository_root(cwd: &Path) -> io::Result<PathBuf> {
             "git reported repository root {} but it is not a directory",
             root.display()
         )));
+    }
+    // A delegated Lead runs in a linked worktree. Its pool is the repository's
+    // shared pool, so resolve the main worktree from the common Git directory
+    // instead of treating the child worktree as a separate repository.
+    let common = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--git-common-dir"])
+        .output();
+    if let Ok(common) = common
+        && common.status.success()
+        && let Ok(text) = std::str::from_utf8(&common.stdout)
+    {
+        let mut path = PathBuf::from(text.trim());
+        if path.is_relative() {
+            path = root.join(path);
+        }
+        if let Some(main) = path.parent()
+            && main.is_dir()
+        {
+            return main.canonicalize();
+        }
     }
     root.canonicalize()
 }
@@ -866,8 +1192,13 @@ fn matching_receipts(home: &Path, caller: &str) -> io::Result<Vec<RunReceipt>> {
     Ok(read_receipts(home)?
         .into_iter()
         .filter(|receipt| {
-            receipt.value["leadThreadId"].as_str() == Some(caller)
-                || receipt.value["executorThreadId"].as_str() == Some(caller)
+            let parent = receipt.value["parentThreadId"]
+                .as_str()
+                .or_else(|| receipt.value["leadThreadId"].as_str());
+            let child_role = receipt.value["role"].as_str().unwrap_or("executor");
+            parent == Some(caller)
+                || (child_role == "executor"
+                    && receipt.value["executorThreadId"].as_str() == Some(caller))
         })
         .collect())
 }
@@ -909,6 +1240,37 @@ fn verify_run_for(
             "the MCP run receipt records one thread as both lead and executor; refusing an ambiguous identity",
         ));
     }
+    let parent_thread = value["parentThreadId"]
+        .as_str()
+        .unwrap_or(&lead_thread)
+        .to_owned();
+    let root_thread = value["rootThreadId"]
+        .as_str()
+        .unwrap_or(&lead_thread)
+        .to_owned();
+    if !valid_thread_id(&parent_thread) || !valid_thread_id(&root_thread) {
+        return Err(invalid(
+            "the MCP run receipt records a malformed parent or root thread id",
+        ));
+    }
+    let child_role = match value["role"].as_str() {
+        None | Some("executor") => RunRole::Executor,
+        Some("lead") => RunRole::Lead,
+        Some(other) => {
+            return Err(invalid(format!(
+                "the MCP run receipt records unsupported child role {other:?}; no identity was accepted"
+            )));
+        }
+    };
+    let side = if caller == parent_thread {
+        RunSide::Parent
+    } else if caller == executor_thread {
+        RunSide::Child
+    } else {
+        return Err(invalid(
+            "the calling thread is not the recorded lead or executor of this run; no operation was performed",
+        ));
+    };
     let role = if caller == lead_thread {
         RunRole::Lead
     } else if caller == executor_thread {
@@ -1038,13 +1400,19 @@ fn verify_run_for(
             })?,
         )
     };
+    let generation = value["runGeneration"].as_str().unwrap_or(&run).to_owned();
     Ok(VerifiedRun {
         receipt: receipt.path,
         value: receipt.value,
         role,
+        child_role,
+        side,
         run,
         lead_thread,
         executor_thread,
+        parent_thread,
+        root_thread,
+        generation,
         title,
         slot,
         source,
@@ -1842,6 +2210,10 @@ fn run_summary(run: &VerifiedRun) -> Value {
     json!({
         "run": run.run,
         "role": run.role.as_str(),
+        "childRole": run.child_role.as_str(),
+        "parentThreadId": run.parent_thread,
+        "rootThreadId": run.root_thread,
+        "runGeneration": run.generation,
         "title": run.title,
         "leadThreadId": run.lead_thread,
         "executorThreadId": run.executor_thread,
@@ -1978,19 +2350,11 @@ fn status(operation: &Operation) -> io::Result<Value> {
             "detail": "no recorded MCP executor run is bound to this calling thread"
         }));
     }
+    let caller_role = caller_authority(&home, &caller)?;
     let truncated = receipts.len() > MAX_STATUS_RUNS;
-    let mut role = None;
     let mut runs = Vec::new();
     for receipt in receipts.into_iter().take(MAX_STATUS_RUNS) {
         let run = verify_run_for(&home, receipt, &caller, RunView::Status)?;
-        if let Some(previous) = role
-            && previous != run.role
-        {
-            return Err(invalid(
-                "the calling thread is recorded as both a lead and an executor; refusing an ambiguous status",
-            ));
-        }
-        role = Some(run.role);
         let released = !run.value["release"].is_null();
         let cache_guard_error = (!released)
             .then(|| ensure_cache_guard(&home, &run))
@@ -2009,9 +2373,9 @@ fn status(operation: &Operation) -> io::Result<Value> {
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (index, (run, _)) in runs.iter().enumerate() {
-            let caller_thread = match run.role {
-                RunRole::Lead => &run.lead_thread,
-                RunRole::Executor => &run.executor_thread,
+            let caller_thread = match run.side {
+                RunSide::Parent => &run.lead_thread,
+                RunSide::Child => &run.executor_thread,
             };
             let caller_id = caller_thread.clone();
             handles.push((
@@ -2022,12 +2386,12 @@ fn status(operation: &Operation) -> io::Result<Value> {
                     native_status_or_release(
                         run,
                         caller_thread,
-                        run.role == RunRole::Executor,
+                        run.side == RunSide::Child,
                         STATUS_NATIVE_READ_BOUND,
                     )
                 }),
             ));
-            if run.role == RunRole::Lead {
+            if run.side == RunSide::Parent {
                 let executor_id = run.executor_thread.clone();
                 handles.push((
                     index,
@@ -2059,7 +2423,7 @@ fn status(operation: &Operation) -> io::Result<Value> {
     let mut output = Vec::with_capacity(runs.len());
     for ((run, mut summary), native) in runs.into_iter().zip(natives) {
         summary["native"] = native[0].clone();
-        summary["executorNative"] = if run.role == RunRole::Lead {
+        summary["executorNative"] = if run.side == RunSide::Parent {
             native[1].clone()
         } else {
             Value::Null
@@ -2068,7 +2432,15 @@ fn status(operation: &Operation) -> io::Result<Value> {
     }
     Ok(json!({
         "callerThreadId": caller,
-        "role": role.map(RunRole::as_str),
+        "role": match caller_role.role {
+            CallerRole::Director | CallerRole::DelegatedLead => "lead",
+            CallerRole::Executor => "executor",
+        },
+        "callerRole": match caller_role.role {
+            CallerRole::Director => "director",
+            CallerRole::DelegatedLead => "lead",
+            CallerRole::Executor => "executor",
+        },
         "runs": output,
         "truncated": truncated,
         "state": "ok"

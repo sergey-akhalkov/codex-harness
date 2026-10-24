@@ -95,6 +95,8 @@ const TOKEN_BYTES: usize = 32;
 const SCHEMA: u32 = 1;
 /// Default bound for readiness, requests and response shaping.
 pub const DEFAULT_BOUND: Duration = Duration::from_secs(20);
+/// Environment marker for a delegated Lead conversation hosted by the CLI.
+pub const DELEGATED_LEAD_SESSION_ENV: &str = "HARNESS_DELEGATED_LEAD_SESSION";
 /// Default record-read timeout of [`Conversation::pump`].
 pub const DEFAULT_POLL: Duration = Duration::from_millis(200);
 /// Bounded wait used while draining records that are already arriving, so one
@@ -596,6 +598,10 @@ pub struct ControlPlan {
     /// conversations. Its own session marker, never the executor one, makes
     /// the kit's dispatch entries refuse inside its process tree.
     pub bounded_lead_session: bool,
+    /// Whether this plan serves a delegated Lead conversation. A delegated
+    /// Lead keeps the Executor dispatch surface but no native descendant
+    /// spawning; it is not a bounded decision participant.
+    pub delegated_lead_session: bool,
     /// Whether this plan serves a bounded, read-only self-reflection
     /// conversation. A reflection fork stays single-agent exactly like an
     /// executor, is refused every native agent tool, and carries its own
@@ -637,6 +643,7 @@ impl ControlPlan {
             env: BTreeMap::new(),
             executor_session: true,
             bounded_lead_session: false,
+            delegated_lead_session: false,
             reflection_session: false,
             developer_instructions: None,
             bound: DEFAULT_BOUND,
@@ -666,6 +673,11 @@ pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
         command
             .env
             .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
+    }
+    if plan.delegated_lead_session {
+        command
+            .env
+            .insert(DELEGATED_LEAD_SESSION_ENV.into(), Some("1".into()));
     }
     for (key, value) in &plan.env {
         command.env.insert(key.clone(), value.clone());
@@ -700,7 +712,11 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         OsString::from("--ws-token-file"),
         plan.paths.token.clone().into_os_string(),
     ];
-    if plan.executor_session || plan.bounded_lead_session || plan.reflection_session {
+    if plan.executor_session
+        || plan.bounded_lead_session
+        || plan.delegated_lead_session
+        || plan.reflection_session
+    {
         // A managed lead session keeps the native agent capability: neither
         // this override nor the session marker reaches its app-server child.
         // A bounded lead conversation is a bounded decision participant, not
