@@ -323,7 +323,7 @@ fn stop_tool_definition() -> Value {
 fn resume_tool_definition() -> Value {
     json!({
         "name": RESUME_TOOL,
-        "description": "Explicitly continue one stopped executor run owned by the verified calling lead. exact resumes the same thread with the preserved assignment and bounded progress, without resubmitting the assignment or resetting the pool. fresh starts a new thread on the same shared app-server with the preserved assignment, retains the predecessor, and asks the model to inspect interrupted effects. An explicit stop is never restarted automatically.",
+        "description": "Explicitly continue one stopped child run owned by the verified calling lead, including a delegated Lead. exact resumes the same thread with the preserved assignment and bounded progress, without resubmitting the assignment, changing the recorded hierarchy or repositories, or resetting the pool. fresh starts one new thread on the same shared app-server with the preserved assignment, role, parent, root, repository set and ds binding, retains the predecessor, and asks the model to inspect interrupted effects. Missing or stale authority is refused before native work, and an explicit stop is never restarted automatically.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -1135,8 +1135,9 @@ struct CallerAuthority {
 /// Director only when its registered root endpoint is live. The parent and
 /// root of a new child come from this authority, never from tool arguments.
 fn caller_authority(home: &Path, caller: &str) -> io::Result<CallerAuthority> {
-    let own: Vec<Value> = mcp_receipts(home)?
-        .into_iter()
+    let receipts = mcp_receipts(home)?;
+    let own: Vec<&Value> = receipts
+        .iter()
         .filter(|receipt| receipt["executorThreadId"].as_str() == Some(caller))
         .collect();
     if own.len() > 1 {
@@ -1178,6 +1179,14 @@ fn caller_authority(home: &Path, caller: &str) -> io::Result<CallerAuthority> {
                 "the recorded run has unsupported child role {other:?}; refusing to infer authority"
             ))),
         };
+    }
+    if receipts.iter().any(|receipt| {
+        receipt["predecessorThreadId"].as_str() == Some(caller)
+            || receipt["predecessor"]["threadId"].as_str() == Some(caller)
+    }) {
+        return Err(invalid(
+            "the calling thread is a retained continuation predecessor, not the recorded successor; no model or descendant authority was accepted",
+        ));
     }
     match control::registered_lead(home, caller) {
         RegisteredLead::Live(_) => Ok(CallerAuthority {
@@ -4126,6 +4135,7 @@ fn resume(operation: &Operation) -> io::Result<Value> {
         Some(run) => lead_run_by_id(&home, &caller, run)?,
         None => single_run(&home, &caller, RunRole::Lead)?,
     };
+    let workspace_roots = verify_continuation_authority(&home, &caller, &run, mode == "exact")?;
     let endpoint = run.endpoint.clone().ok_or_else(|| {
         invalid(format!(
             "the exact run's registered app-server endpoint is unavailable ({}); no model work was started",
@@ -4147,6 +4157,7 @@ fn resume(operation: &Operation) -> io::Result<Value> {
             let mut conversation = Conversation::attach(&endpoint, DEFAULT_BOUND)?;
             conversation.adopt_thread(&run.executor_thread)?;
             let thread = conversation.thread_state()?;
+            verify_continuation_thread(&run, &thread)?;
             let turns = thread["turns"]
                 .as_array()
                 .filter(|turns| !turns.is_empty())
@@ -4188,6 +4199,13 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "checkout": run.checkout,
                 "base": run.base,
                 "slot": run.slot,
+                "role": run.child_role.as_str(),
+                "parentThreadId": run.parent_thread,
+                "rootThreadId": run.root_thread,
+                "runGeneration": run.generation,
+                "profile": run.identity,
+                "workspaceRoots": workspace_roots,
+                "workspaces": run.value["workspaces"],
                 "receipt": run.receipt,
                 "workspace": evidence,
                 "detail": "resumed the exact native thread with the preserved assignment; the assignment was not resubmitted and the slot was not reset or reassigned"
@@ -4238,12 +4256,17 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 identity,
                 paths,
             );
+            plan.executor_session = run.child_role == RunRole::Executor;
+            plan.delegated_lead_session = run.child_role == RunRole::Lead;
             plan.approval_policy = run.value["control"]["approvalPolicy"]
                 .as_str()
                 .map(str::to_owned)
                 .or_else(|| Some(APPROVAL_POLICY.into()));
             plan.sandbox = run.value["control"]["sandbox"].as_str().map(str::to_owned);
             plan.overrides = overrides;
+            if !workspace_roots.is_empty() {
+                plan.declare_workspace_roots(workspace_roots.clone())?;
+            }
             let mut conversation = Conversation::start_on_endpoint(&endpoint, &plan)?;
             let new_thread = conversation.thread_id().to_owned();
             let thread = conversation.thread_state()?;
@@ -4254,9 +4277,40 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 run.identity.as_ref().expect("checked above"),
                 &run.title,
             )?;
+            let published_endpoint = if run.child_role == RunRole::Lead {
+                verify_role_tools(&mut conversation, &new_thread, LEAD_TOOLS)?;
+                Some(
+                    control::publish_lead_endpoint(&home, &endpoint.for_thread(&new_thread)?)
+                        .map_err(|error| {
+                            invalid(format!(
+                                "fresh Lead thread {new_thread} was created but its endpoint could not be published: {error}; no turn was started and the slot and predecessor remain preserved"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+            let retire_unrecorded = || {
+                published_endpoint.as_ref().map_or(Ok(()), |_| {
+                    control::retire_lead_endpoint(&home, &new_thread)
+                })
+            };
             let text = fresh_recovery_text(&prompt, progress, &evidence, &run.executor_thread);
-            let turn = conversation.assign(&text)?;
-            record_continuation(
+            let turn = match conversation.assign(&text) {
+                Ok(turn) => turn,
+                Err(error) => {
+                    return Err(match retire_unrecorded() {
+                        Ok(_) => error,
+                        Err(cleanup) => io::Error::new(
+                            error.kind(),
+                            format!(
+                                "{error}; the unrecorded fresh thread endpoint also could not be retired: {cleanup}"
+                            ),
+                        ),
+                    });
+                }
+            };
+            if let Err(error) = record_continuation(
                 &run,
                 "fresh",
                 &run.executor_thread,
@@ -4264,7 +4318,24 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 &new_thread,
                 &turn.turn_id,
                 progress.len(),
-            )?;
+            ) {
+                return Err(match retire_unrecorded() {
+                    Ok(_) => error,
+                    Err(cleanup) => io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; the unrecorded fresh thread endpoint also could not be retired: {cleanup}"
+                        ),
+                    ),
+                });
+            }
+            let endpoint_retire_error = if run.child_role == RunRole::Lead {
+                control::retire_lead_endpoint(&home, &run.executor_thread)
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                None
+            };
             let mut response = json!({
                 "mode": "fresh",
                 "run": run.run,
@@ -4277,10 +4348,20 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "checkout": run.checkout,
                 "base": run.base,
                 "slot": run.slot,
+                "role": run.child_role.as_str(),
+                "parentThreadId": run.parent_thread,
+                "rootThreadId": run.root_thread,
+                "runGeneration": run.generation,
+                "profile": run.identity,
+                "workspaceRoots": workspace_roots,
+                "workspaces": run.value["workspaces"],
                 "receipt": run.receipt,
                 "workspace": evidence,
                 "detail": "created one new bound thread on the same shared app-server; the predecessor thread remains retained, the slot stayed bound, and the preserved assignment was submitted once in the new thread"
             });
+            if let Some(error) = endpoint_retire_error {
+                response["predecessorEndpointRetireError"] = Value::String(error);
+            }
             if run.child_role == RunRole::Lead
                 && let Err(error) = clear_subtree_stop(&home, &run.executor_thread)
             {
@@ -4381,7 +4462,13 @@ fn record_continuation(
             "threadId": thread_id,
             "turnId": turn_id,
             "progressBytes": progress_bytes,
-            "recordedMs": now
+            "recordedMs": now,
+            "role": run.child_role.as_str(),
+            "parentThreadId": run.parent_thread,
+            "rootThreadId": run.root_thread,
+            "runGeneration": run.generation,
+            "profile": run.identity,
+            "workspaceRoots": run.value["workspaceRoots"]
         });
         if let Some(stop) = document["stop"].as_object_mut() {
             stop.insert("continuedMs".into(), Value::from(now));
@@ -4398,6 +4485,216 @@ fn record_continuation(
         }
         Ok(())
     })
+}
+
+fn continuation_workspace_roots(run: &VerifiedRun, exact: bool) -> io::Result<Vec<PathBuf>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(values) = run.value["workspaceRoots"].as_array() {
+        for value in values {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| invalid("the run receipt records a non-string workspace root"))?;
+            let root = PathBuf::from(raw);
+            if !root.is_absolute() {
+                return Err(invalid(format!(
+                    "the run receipt records relative workspace root {raw}"
+                )));
+            }
+            if !roots.iter().any(|known| same_path(known, &root)) {
+                roots.push(root);
+            }
+        }
+    }
+    if run.child_role == RunRole::Lead && roots.is_empty() {
+        if exact {
+            return Ok(roots);
+        }
+        return Err(invalid(
+            "the delegated Lead receipt records no workspace roots; fresh recovery cannot restore the repository set and no native effect was attempted",
+        ));
+    }
+    if !roots.is_empty() && !roots.iter().any(|root| same_path(root, &run.checkout)) {
+        return Err(invalid(format!(
+            "the recorded workspace roots omit the run checkout {}; refusing to retarget the repository set",
+            run.checkout.display()
+        )));
+    }
+    if !roots.is_empty() {
+        let workspaces = run.value["workspaces"].as_array();
+        if run.child_role == RunRole::Lead && workspaces.is_none() {
+            return Err(invalid(
+                "the delegated Lead receipt records no repository workspaces; fresh recovery cannot prove the recorded repository set",
+            ));
+        }
+        if let Some(workspaces) = workspaces {
+            let mut checkouts: Vec<PathBuf> = Vec::new();
+            for workspace in workspaces {
+                let checkout = workspace["checkout"].as_str().ok_or_else(|| {
+                    invalid("the run receipt records a workspace without a checkout")
+                })?;
+                let checkout = PathBuf::from(checkout);
+                if !roots.iter().any(|root| same_path(root, &checkout)) {
+                    return Err(invalid(format!(
+                        "workspace checkout {} is outside the recorded workspace roots; refusing a mismatched repository set",
+                        checkout.display()
+                    )));
+                }
+                if !checkouts.iter().any(|known| same_path(known, &checkout)) {
+                    checkouts.push(checkout);
+                }
+            }
+            if checkouts.len() != roots.len() {
+                return Err(invalid(format!(
+                    "the run receipt records {} workspace roots but {} repository workspaces; refusing an incomplete repository set",
+                    roots.len(),
+                    checkouts.len()
+                )));
+            }
+        }
+    }
+    Ok(roots)
+}
+
+fn verify_continuation_role_tools(run: &VerifiedRun, exact: bool) -> io::Result<()> {
+    if run.child_role != RunRole::Lead {
+        return Ok(());
+    }
+    let enabled = &run.value["control"]["config"]["mcp_servers"]["executors"]["enabled_tools"];
+    if enabled.is_null() {
+        if !exact {
+            return Err(invalid(
+                "the delegated Lead receipt records no role tool allowlist; refusing to infer the restored role",
+            ));
+        }
+        return Ok(());
+    }
+    let values = enabled
+        .as_array()
+        .ok_or_else(|| invalid("the run receipt records a non-array role tool allowlist"))?;
+    let actual: BTreeSet<&str> = values
+        .iter()
+        .map(|tool| {
+            tool.as_str()
+                .ok_or_else(|| invalid("the role tool allowlist records a non-string tool"))
+        })
+        .collect::<io::Result<_>>()?;
+    let expected: BTreeSet<&str> = LEAD_TOOLS.iter().copied().collect();
+    if actual != expected {
+        return Err(invalid(format!(
+            "the recorded role tool allowlist differs from the {} surface: expected [{}], observed [{}]; refusing to restore a different role",
+            run.child_role.as_str(),
+            expected.into_iter().collect::<Vec<_>>().join(", "),
+            actual.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn verify_continuation_authority(
+    home: &Path,
+    caller: &str,
+    run: &VerifiedRun,
+    exact: bool,
+) -> io::Result<Vec<PathBuf>> {
+    let authority = caller_authority(home, caller)?;
+    if authority.role == CallerRole::Executor {
+        return Err(invalid(
+            "the calling thread is a recorded executor and has no continuation authority",
+        ));
+    }
+    if run.lead_thread != caller || run.parent_thread != caller {
+        return Err(invalid(format!(
+            "run {} records parent {} instead of the calling conversation {caller}; refusing a retargeted hierarchy",
+            run.run, run.parent_thread
+        )));
+    }
+    if run.root_thread != authority.root_thread {
+        return Err(invalid(format!(
+            "run {} records root thread {} instead of the verifiable caller root {}; refusing stale hierarchy authority",
+            run.run, run.root_thread, authority.root_thread
+        )));
+    }
+    if authority.role == CallerRole::DelegatedLead && run.child_role != RunRole::Executor {
+        return Err(invalid(
+            "a delegated Lead can continue only its Executor children, never another Lead; no model work was started",
+        ));
+    }
+    if run.child_role == RunRole::Lead
+        && run.value["runGeneration"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(invalid(format!(
+            "run {} records no generation for its delegated Lead authority; refusing continuation",
+            run.run
+        )));
+    }
+    if run.child_role == RunRole::Lead && run.identity.is_none() {
+        return Err(invalid(
+            "the delegated Lead receipt records no exact profile binding; refusing continuation without its ds route",
+        ));
+    }
+    verify_continuation_role_tools(run, exact)?;
+    let roots = continuation_workspace_roots(run, exact)?;
+    if exact && run.child_role == RunRole::Lead {
+        let lease_app =
+            serde_json::from_value::<EndpointProcess>(run.value["lease"]["appServer"].clone())
+                .map_err(|error| {
+                    invalid(format!(
+                        "the delegated Lead receipt records no exact app-server lease: {error}"
+                    ))
+                })?;
+        match control::registered_lead(home, &run.executor_thread) {
+            RegisteredLead::Live(endpoint)
+                if endpoint.thread_id.as_deref() == Some(run.executor_thread.as_str())
+                    && endpoint.process.as_ref() == Some(&lease_app) => {}
+            RegisteredLead::Live(_) => {
+                return Err(invalid(format!(
+                    "the delegated Lead endpoint for thread {} no longer matches its exact lease; refusing exact continuation",
+                    run.executor_thread
+                )));
+            }
+            RegisteredLead::Unavailable(reason) => {
+                return Err(invalid(format!(
+                    "the delegated Lead endpoint for thread {} is unavailable: {reason}; exact continuation has no current hierarchy authority",
+                    run.executor_thread
+                )));
+            }
+        }
+    }
+    Ok(roots)
+}
+
+fn verify_continuation_thread(run: &VerifiedRun, thread: &Value) -> io::Result<()> {
+    if let Some(identity) = &run.identity
+        && let Err(mismatch) = identity.verify(thread)
+    {
+        return Err(invalid(format!(
+            "the continued thread does not preserve the recorded profile binding: {mismatch}; no turn was started"
+        )));
+    }
+    let cwd = thread["cwd"]
+        .as_str()
+        .ok_or_else(|| invalid("the continued thread reports no working directory"))?;
+    let actual = Path::new(cwd).canonicalize().map_err(|error| {
+        invalid(format!(
+            "the continued thread directory {cwd} cannot be resolved: {error}"
+        ))
+    })?;
+    let expected = run.checkout.canonicalize().map_err(|error| {
+        invalid(format!(
+            "the recorded checkout {} cannot be resolved: {error}",
+            run.checkout.display()
+        ))
+    })?;
+    if actual != expected {
+        return Err(invalid(format!(
+            "the continued thread runs in {} instead of the recorded checkout {}; no turn was started",
+            actual.display(),
+            expected.display()
+        )));
+    }
+    Ok(())
 }
 
 fn digest_id(prefix: &str, parts: &[&str]) -> String {

@@ -40,6 +40,18 @@ const ALL_TOOLS: [&str; 10] = [
     "executor_wait",
     "lead_dispatch",
 ];
+const EXECUTOR_ROLE_TOOLS: [&str; 3] = ["executor_ask_lead", "executor_message", "executor_status"];
+const LEAD_ROLE_TOOLS: [&str; 9] = [
+    "executor_ask_lead",
+    "executor_dispatch",
+    "executor_message",
+    "executor_release",
+    "executor_reply",
+    "executor_resume",
+    "executor_status",
+    "executor_stop",
+    "executor_wait",
+];
 
 struct Mcp {
     child: Child,
@@ -740,6 +752,88 @@ struct SyntheticRun {
     _repository: tempfile::TempDir,
     _checkout: tempfile::TempDir,
     receipt: PathBuf,
+}
+
+struct LeadContinuationRun {
+    run: SyntheticRun,
+    value: Value,
+    primary: PathBuf,
+    _secondary: tempfile::TempDir,
+    roots: Vec<PathBuf>,
+}
+
+fn delegated_lead_continuation_run(home: &Path, server: &Server) -> LeadContinuationRun {
+    let run = synthetic_run(home, DIRECTOR, LEAD, server);
+    endpoint(home, LEAD, LEAD, server.port, 0);
+    let primary = run._checkout.path().to_path_buf();
+    let secondary = tempfile::tempdir().unwrap();
+    let secondary_checkout = secondary.path().join("secondary");
+    let secondary_base = git_repo(&secondary_checkout);
+    let mut value: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    let run_id = value["run"].as_str().unwrap().to_owned();
+    let base = value["base"].as_str().unwrap().to_owned();
+    let repository = value["repository"].clone();
+    let title = "CLead (ds) - lead-continuation";
+    value["role"] = json!("lead");
+    value["parentThreadId"] = json!(DIRECTOR);
+    value["rootThreadId"] = json!(DIRECTOR);
+    value["runGeneration"] = json!(run_id);
+    value["title"] = json!(title);
+    value["profile"] = json!({
+        "profile": "ds",
+        "model": "deepseek-flash",
+        "modelProvider": "deepseek",
+        "reasoningEffort": "max"
+    });
+    value["workspaces"] = json!([
+        {
+            "repository": repository,
+            "slot": 1,
+            "checkout": primary,
+            "base": base,
+            "owner": run_id
+        },
+        {
+            "repository": secondary_checkout,
+            "slot": 1,
+            "checkout": secondary_checkout,
+            "base": secondary_base,
+            "owner": run_id
+        }
+    ]);
+    value["workspaceRoots"] = json!([primary, secondary_checkout]);
+    value["control"]["config"] = json!({
+        "agents.enabled": false,
+        "mcp_servers": {"executors": {"enabled_tools": LEAD_ROLE_TOOLS}}
+    });
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    LeadContinuationRun {
+        run,
+        value,
+        primary: primary.clone(),
+        _secondary: secondary,
+        roots: vec![primary, secondary_checkout],
+    }
+}
+
+fn recorded_lead_thread(title: &str, checkout: &Path, with_turn: bool) -> SimThread {
+    let mut thread = SimThread::idle(LEAD, checkout);
+    thread.name = Some(title.to_owned());
+    thread.model = "deepseek-flash".into();
+    thread.model_provider = "deepseek".into();
+    thread.reasoning_effort = "max".into();
+    thread.tools = LEAD_ROLE_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_owned())
+        .collect();
+    if with_turn {
+        thread.turns = vec![json!({
+            "id": "lead-turn",
+            "status": "completed",
+            "items": [{"id": "lead-message", "type": "agentMessage", "text": "partial result"}]
+        })];
+    }
+    thread
 }
 
 fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> SyntheticRun {
@@ -6035,6 +6129,307 @@ fn fresh_recovery_creates_one_new_thread_and_retains_the_predecessor() {
     assert_eq!(receipt["lease"], lease_before);
     mcp.finish();
     drop(run);
+}
+
+#[test]
+fn exact_lead_continuation_preserves_recorded_hierarchy_and_workspace_context() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let lead = delegated_lead_continuation_run(home.path(), &server);
+    let title = lead.value["title"].as_str().unwrap();
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &lead.primary, false, false);
+    sim.threads.insert(
+        LEAD.to_owned(),
+        recorded_lead_thread(title, &lead.primary, true),
+    );
+    server.answer_fn(native_responder(Arc::new(Mutex::new(sim))));
+    let partial = lead.primary.join("partial-work.txt");
+    fs::write(&partial, "interrupted executor output\n").unwrap();
+    let mut mcp = Mcp::start(home.path());
+
+    let starts_before = server.requests_for("thread/start").len();
+    let turns_before = server.requests_for("turn/start").len();
+    let resumed = mcp.call_tool(
+        2,
+        "executor_resume",
+        json!({
+            "run": lead.value["run"],
+            "mode": "exact",
+            "progress": "The recorded check was interrupted; keep the partial work."
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let resumed = result(&resumed);
+    assert_eq!(resumed["mode"], "exact", "{resumed}");
+    assert_eq!(resumed["threadId"], LEAD);
+    assert_eq!(resumed["role"], "lead", "{resumed}");
+    assert_eq!(resumed["parentThreadId"], DIRECTOR, "{resumed}");
+    assert_eq!(resumed["rootThreadId"], DIRECTOR, "{resumed}");
+    assert_eq!(resumed["profile"], lead.value["profile"], "{resumed}");
+    assert_eq!(
+        resumed["workspaceRoots"], lead.value["workspaceRoots"],
+        "{resumed}"
+    );
+    assert_eq!(resumed["workspaces"], lead.value["workspaces"], "{resumed}");
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+    assert_eq!(server.requests_for("turn/start").len(), turns_before + 1);
+    let turns = server.requests_for("turn/start");
+    let text = turns[0]["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("Original assignment:"), "{text}");
+    assert!(
+        text.contains("Do not replay or resubmit the assignment"),
+        "{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        "interrupted executor output\n"
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&lead.run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["role"], "lead", "{receipt}");
+    assert_eq!(receipt["parentThreadId"], DIRECTOR, "{receipt}");
+    assert_eq!(receipt["rootThreadId"], DIRECTOR, "{receipt}");
+    assert_eq!(receipt["workspaceRoots"], lead.value["workspaceRoots"]);
+    assert_eq!(receipt["workspaces"], lead.value["workspaces"]);
+    assert_eq!(receipt["continuation"]["mode"], "exact");
+    assert_eq!(receipt["continuation"]["role"], "lead");
+    assert_eq!(receipt["continuation"]["parentThreadId"], DIRECTOR);
+    assert_eq!(receipt["continuation"]["rootThreadId"], DIRECTOR);
+    mcp.finish();
+    drop(lead);
+}
+
+#[test]
+fn fresh_lead_recovery_restores_hierarchy_workspace_set_and_ds_binding() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let lead = delegated_lead_continuation_run(home.path(), &server);
+    let title = lead.value["title"].as_str().unwrap();
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &lead.primary, false, false);
+    sim.threads.insert(
+        LEAD.to_owned(),
+        recorded_lead_thread(title, &lead.primary, false),
+    );
+    server.answer_fn(native_responder(Arc::new(Mutex::new(sim))));
+    let partial = lead.primary.join("partial-work.txt");
+    fs::write(&partial, "uncommitted recovery input\n").unwrap();
+    let mut mcp = Mcp::start(home.path());
+    let old_endpoint = home
+        .path()
+        .join("harness/lead-endpoints")
+        .join(format!("{LEAD}.json"));
+    assert!(old_endpoint.is_file());
+
+    let starts_before = server.requests_for("thread/start").len();
+    let resumed = mcp.call_tool(
+        2,
+        "executor_resume",
+        json!({
+            "run": lead.value["run"],
+            "mode": "fresh",
+            "progress": "The recorded check was interrupted; do not assume it passed."
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let resumed = result(&resumed);
+    let new_thread = resumed["threadId"].as_str().unwrap();
+    assert_eq!(resumed["mode"], "fresh", "{resumed}");
+    assert_ne!(new_thread, LEAD);
+    assert_eq!(resumed["role"], "lead", "{resumed}");
+    assert_eq!(resumed["parentThreadId"], DIRECTOR, "{resumed}");
+    assert_eq!(resumed["rootThreadId"], DIRECTOR, "{resumed}");
+    assert_eq!(resumed["profile"], lead.value["profile"], "{resumed}");
+    assert_eq!(
+        resumed["workspaceRoots"], lead.value["workspaceRoots"],
+        "{resumed}"
+    );
+    assert_eq!(resumed["workspaces"], lead.value["workspaces"], "{resumed}");
+    assert_eq!(server.requests_for("thread/start").len(), starts_before + 1);
+    let starts = server.requests_for("thread/start");
+    let params = &starts[0]["params"];
+    assert_eq!(
+        params["runtimeWorkspaceRoots"],
+        serde_json::to_value(&lead.roots).unwrap(),
+        "{params}"
+    );
+    assert_eq!(params["model"], "deepseek-flash", "{params}");
+    assert_eq!(params["modelProvider"], "deepseek", "{params}");
+    assert_eq!(
+        params["config"]["model_reasoning_effort"], "max",
+        "{params}"
+    );
+    assert_eq!(
+        params["config"]["mcp_servers"]["executors"]["enabled_tools"],
+        json!(LEAD_ROLE_TOOLS),
+        "{params}"
+    );
+    let new_endpoint = home
+        .path()
+        .join("harness/lead-endpoints")
+        .join(format!("{new_thread}.json"));
+    let endpoint: Value = serde_json::from_slice(&fs::read(&new_endpoint).unwrap()).unwrap();
+    assert_eq!(endpoint["threadId"], new_thread, "{endpoint}");
+    assert!(
+        !old_endpoint.exists(),
+        "fresh recovery left the predecessor addressable as authority"
+    );
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        "uncommitted recovery input\n"
+    );
+    let turns = server.requests_for("turn/start");
+    let text = turns[0]["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Original assignment:"), "{text}");
+    assert!(
+        text.contains("do not assume a prior command completed"),
+        "{text}"
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&lead.run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt["executorThreadId"], new_thread, "{receipt}");
+    assert_eq!(receipt["predecessorThreadId"], LEAD, "{receipt}");
+    assert_eq!(receipt["role"], "lead", "{receipt}");
+    assert_eq!(receipt["parentThreadId"], DIRECTOR, "{receipt}");
+    assert_eq!(receipt["rootThreadId"], DIRECTOR, "{receipt}");
+    assert_eq!(receipt["profile"], lead.value["profile"]);
+    assert_eq!(receipt["workspaceRoots"], lead.value["workspaceRoots"]);
+    assert_eq!(receipt["workspaces"], lead.value["workspaces"]);
+    assert_eq!(receipt["continuation"]["role"], "lead");
+    assert_eq!(receipt["continuation"]["parentThreadId"], DIRECTOR);
+    assert_eq!(receipt["continuation"]["rootThreadId"], DIRECTOR);
+    mcp.finish();
+    drop(lead);
+}
+
+#[test]
+fn refused_fresh_lead_turn_leaves_no_unrecorded_endpoint_or_new_authority() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let lead = delegated_lead_continuation_run(home.path(), &server);
+    let title = lead.value["title"].as_str().unwrap();
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &lead.primary, false, false);
+    sim.threads.insert(
+        LEAD.to_owned(),
+        recorded_lead_thread(title, &lead.primary, false),
+    );
+    sim.refuse_turns = true;
+    server.answer_fn(native_responder(Arc::new(Mutex::new(sim))));
+    let partial = lead.primary.join("partial-work.txt");
+    fs::write(&partial, "keep the interrupted work\n").unwrap();
+    let slot_path = lead.run.receipt.parent().unwrap().join("slot-1.json");
+    let slot_before: Value = serde_json::from_slice(&fs::read(&slot_path).unwrap()).unwrap();
+    let mut mcp = Mcp::start(home.path());
+
+    let response = mcp.call_tool(
+        2,
+        "executor_resume",
+        json!({"run": lead.value["run"], "mode": "fresh"}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&response).contains("native refusal"),
+        "{response}"
+    );
+    let endpoints = fs::read_dir(home.path().join("harness/lead-endpoints"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(endpoints.len(), 2, "{endpoints:?}");
+    assert!(endpoints.contains(&format!("{LEAD}.json")), "{endpoints:?}");
+    assert!(
+        endpoints.contains(&format!("{DIRECTOR}.json")),
+        "{endpoints:?}"
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&lead.run.receipt).unwrap()).unwrap();
+    assert_eq!(receipt, lead.value, "failed recovery changed the receipt");
+    let slot: Value = serde_json::from_slice(&fs::read(&slot_path).unwrap()).unwrap();
+    assert_eq!(slot, slot_before, "failed recovery changed the lease");
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        "keep the interrupted work\n"
+    );
+    mcp.finish();
+    drop(lead);
+}
+
+#[test]
+fn stale_or_mismatched_lead_authority_fails_before_native_effects() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let lead = delegated_lead_continuation_run(home.path(), &server);
+    server.answer_fn(|_| Answer::Error(json!({"message": "no native effect is allowed"})));
+    let partial = lead.primary.join("partial-work.txt");
+    fs::write(&partial, "preserve this interrupted work\n").unwrap();
+    let slot_path = lead.run.receipt.parent().unwrap().join("slot-1.json");
+    let slot_before: Value = serde_json::from_slice(&fs::read(&slot_path).unwrap()).unwrap();
+    let mut mcp = Mcp::start(home.path());
+    let cases = [
+        ("exact", 0, "root thread"),
+        ("exact", 1, "generation"),
+        ("exact", 2, "profile binding"),
+        ("fresh", 3, "workspace"),
+        ("fresh", 4, "role tool"),
+        ("exact", 5, "Lead endpoint"),
+    ];
+    for (mode, case, expected) in cases {
+        let mut value = lead.value.clone();
+        match case {
+            0 => value["rootThreadId"] = json!(OTHER_LEAD),
+            1 => {
+                value.as_object_mut().unwrap().remove("runGeneration");
+            }
+            2 => {
+                value.as_object_mut().unwrap().remove("profile");
+            }
+            3 => {
+                value.as_object_mut().unwrap().remove("workspaceRoots");
+            }
+            4 => {
+                value["control"]["config"]["mcp_servers"]["executors"]["enabled_tools"] =
+                    json!(EXECUTOR_ROLE_TOOLS);
+            }
+            5 => endpoint(home.path(), LEAD, LEAD, server.port, 1),
+            _ => unreachable!(),
+        }
+        fs::write(
+            &lead.run.receipt,
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        let response = mcp.call_tool(
+            2,
+            "executor_resume",
+            json!({"run": lead.value["run"], "mode": mode}),
+            Some(json!({"threadId": DIRECTOR})),
+        );
+        let error = tool_error(&response);
+        assert!(
+            error.contains(expected),
+            "case {case} ({mode}): {error}\n{response}"
+        );
+        assert_eq!(
+            server.connections(),
+            0,
+            "case {case} ({mode}) contacted the app-server"
+        );
+        assert!(
+            server.requests_for("thread/start").is_empty(),
+            "case {case} ({mode}) started a thread"
+        );
+        assert!(
+            server.requests_for("turn/start").is_empty(),
+            "case {case} ({mode}) started model work"
+        );
+        let receipt: Value = serde_json::from_slice(&fs::read(&lead.run.receipt).unwrap()).unwrap();
+        assert_eq!(receipt, value, "case {case} ({mode}) changed its receipt");
+        let slot: Value = serde_json::from_slice(&fs::read(&slot_path).unwrap()).unwrap();
+        assert_eq!(slot, slot_before, "case {case} ({mode}) changed its lease");
+        assert_eq!(
+            fs::read_to_string(&partial).unwrap(),
+            "preserve this interrupted work\n",
+            "case {case} ({mode}) changed partial work"
+        );
+    }
+    mcp.finish();
+    drop(lead);
 }
 
 #[test]
