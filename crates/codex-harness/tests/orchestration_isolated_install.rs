@@ -1,7 +1,8 @@
-//! Isolated core/board install from this checkout, then an ordinary Codex
-//! start outside the checkout. Does not touch the live user home. The loop
-//! acceptance is included: guidance skills, orchestration configuration, the
-//! board tool with real board evidence, and rollback that removes the loop
+//! Isolated core/board install from this checkout, then ordinary, delegated
+//! Lead and Executor starts outside the checkout. Does not touch the live user
+//! home. The loop acceptance includes guidance skills, role catalogues,
+//! orchestration configuration, the installed executor MCP surface, the board
+//! with real evidence, two repository pools, explicit release and rollback
 //! without losing unrelated configuration or archived evidence.
 #![cfg(windows)]
 
@@ -12,9 +13,10 @@ use harness_core::{
 use std::{
     collections::BTreeMap,
     fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Output},
-    time::Duration,
+    process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 #[test]
@@ -31,7 +33,11 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     );
     let root = IsolatedRoot::new();
     let root_path = disk_path(root.path());
-    eprintln!("isolated orchestration evidence: {}", root_path.display());
+    eprintln!(
+        "isolated orchestration evidence: {} elevated={}",
+        root_path.display(),
+        harness_core::task_scheduler::is_elevated().unwrap()
+    );
     let build = root_path.join("build");
     let codex_home = root_path.join("codex");
     let user_home = root_path.join("user");
@@ -90,7 +96,11 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     fs::write(codex_home.join("auth.json"), b"unrelated-auth").unwrap();
     fs::write(
         codex_home.join("config.toml"),
-        b"model = 'unrelated-kept'\n",
+        b"model = 'unrelated-kept'\n\
+          model_provider = 'unrelated'\nmodel_reasoning_effort = 'high'\n\n\
+          [model_providers.unrelated]\nname = 'Unrelated'\n\
+          base_url = 'http://127.0.0.1:9/v1'\nwire_api = 'responses'\n\
+          requires_openai_auth = false\n",
     )
     .unwrap();
     let foreign = user_home.join(".agents/skills/foreign/SKILL.md");
@@ -203,7 +213,8 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     // profile files a real installation would have.
     fs::write(
         codex_home.join("ds.config.toml"),
-        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\n\n\
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\n\
+         model_reasoning_effort = 'max'\n\n\
          [model_providers.deepseek]\nname = 'DeepSeek'\n\
          base_url = 'http://127.0.0.1:9/v1'\nwire_api = 'responses'\n\
          requires_openai_auth = false\n",
@@ -440,7 +451,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     // context in the outside project through the installed launcher as well.
     let project_guidance = "Owned outside-project instruction marker";
     fs::write(workspace.join("AGENTS.md"), project_guidance).unwrap();
-    let context = outside_prompt(&codex_home, &user_home, &workspace, false);
+    let context = outside_prompt(&codex_home, &user_home, &workspace, None);
     for relative in ["global/principles-of-work.md", "global/roles/lead.md"] {
         let expected = fs::read_to_string(source.join(relative))
             .unwrap()
@@ -468,7 +479,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     // and declared executor profile select the executor role, so a second
     // fresh context must carry the shared core and executor fragment, omit
     // the lead-only fragment and keep the project guidance.
-    let executor_context = outside_prompt(&codex_home, &user_home, &workspace, true);
+    let executor_context = outside_prompt(&codex_home, &user_home, &workspace, Some("executor"));
     for relative in ["global/principles-of-work.md", "global/roles/executor.md"] {
         let expected = fs::read_to_string(source.join(relative))
             .unwrap()
@@ -488,6 +499,32 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert!(
         !executor_context.contains(lead_guidance.trim()),
         "executor loaded the lead role"
+    );
+
+    // The delegated Lead is a distinct bounded coordinator: the profile stays
+    // ds, the root-only lead guidance is not composed, and no executor marker
+    // or role is inherited from the calling session.
+    let delegated_context =
+        outside_prompt(&codex_home, &user_home, &workspace, Some("delegated-lead"));
+    let delegated_guidance = fs::read_to_string(source.join("global/roles/delegated-lead.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        delegated_context.contains(delegated_guidance.trim()),
+        "delegated lead context omits its role fragment"
+    );
+    for relative in ["global/roles/lead.md", "global/roles/executor.md"] {
+        let guidance = fs::read_to_string(source.join(relative))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            !delegated_context.contains(guidance.trim()),
+            "delegated lead loaded {relative}"
+        );
+    }
+    assert!(
+        delegated_context.contains(project_guidance),
+        "delegated lead project guidance is missing"
     );
 
     // The installed catalogue path resolves the same recorded source for
@@ -529,6 +566,13 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         )),
         "{executor_catalogue}"
     );
+    let delegated_catalogue = catalogue(&["--role", "delegated-lead", "--profile", "ds"]);
+    assert!(
+        delegated_catalogue.starts_with(&format!(
+            "role_context=role=delegated-lead;profile=ds;revision={delegated_lead_revision}\n"
+        )),
+        "{delegated_catalogue}"
+    );
     let enabled = |text: &str, name: &str, scope: &str| -> bool {
         let prefix = format!("name={name};scope={scope};");
         text.lines()
@@ -542,6 +586,9 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert!(!enabled(&executor_catalogue, "team-lead", "user"));
     assert!(enabled(&executor_catalogue, "board-workflow", "user"));
     assert!(enabled(&executor_catalogue, "foreign-project", "repo"));
+    assert!(!enabled(&delegated_catalogue, "team-lead", "user"));
+    assert!(enabled(&delegated_catalogue, "board-workflow", "user"));
+    assert!(enabled(&delegated_catalogue, "foreign-project", "repo"));
 
     // Reflection skills are delivered for their own lifecycle-selected roles.
     for reflection in ["executor-self-reflection", "lead-self-reflection"] {
@@ -594,6 +641,96 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         command.output().unwrap()
     };
 
+    // The installed plugin server is the actual route surface. Both dispatch
+    // tools are declared, and an absent or unregistered caller identity is
+    // refused before a pool position, receipt, endpoint or thread exists.
+    let mut mcp = InstalledMcp::start(
+        &installed_harness,
+        &codex_home,
+        &user_home,
+        &root_path.join("installed-mcp.stderr.txt"),
+    );
+    let listed = mcp.request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list"
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    for required in [
+        "lead_dispatch",
+        "executor_dispatch",
+        "executor_status",
+        "executor_wait",
+        "executor_resume",
+        "executor_release",
+    ] {
+        assert!(
+            names.contains(&required),
+            "installed tools omit {required}: {listed}"
+        );
+    }
+    let lead_dispatch = tools
+        .iter()
+        .find(|tool| tool["name"] == "lead_dispatch")
+        .unwrap();
+    assert!(
+        lead_dispatch["description"]
+            .as_str()
+            .unwrap()
+            .contains("Director-only"),
+        "{lead_dispatch}"
+    );
+    assert!(
+        lead_dispatch["inputSchema"]["properties"]["assignment"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("OpenSpec"),
+        "{lead_dispatch}"
+    );
+    let assignment = serde_json::json!({
+        "schema": 1,
+        "objective": "refuse an unregistered installed caller identity",
+        "inputs": [],
+        "outputs": [],
+        "invariants": [],
+        "acceptance": ["no pool, receipt, endpoint or thread is created"]
+    });
+    let missing = mcp.call_tool(
+        3,
+        "executor_dispatch",
+        serde_json::json!({"owner": "installed-identity", "assignment": assignment.clone()}),
+        None,
+    );
+    assert!(
+        mcp_error(&missing).contains("_meta.threadId"),
+        "absent identity was not refused: {missing}"
+    );
+    let forged = mcp.call_tool(
+        4,
+        "lead_dispatch",
+        serde_json::json!({"owner": "installed-forged", "assignment": assignment.clone()}),
+        Some(serde_json::json!({
+            "threadId": "01a00000-0000-7000-8000-000000000000"
+        })),
+    );
+    assert!(
+        mcp_error(&forged).contains("no lead endpoint is registered"),
+        "unregistered identity was not refused: {forged}"
+    );
+    for relative in ["harness/executor-pool", "harness/messages"] {
+        let path = codex_home.join(relative);
+        assert!(
+            !path.exists() || fs::read_dir(&path).unwrap().next().is_none(),
+            "a refused identity created state at {}",
+            path.display()
+        );
+    }
+    mcp.finish();
+
     let help = installed(&["executor", "accept", "--help"], None);
     assert!(
         help.status.success(),
@@ -609,10 +746,10 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     .collect::<Vec<_>>()
     .join(" ");
     for required in [
-        "Accept retained structured executor work as the live lead",
+        "Accept retained structured work as the live immediate parent",
         "TASK is the exact",
         "writes the acceptance binding through the board owner and closes",
-        "reports whether automatic reflection is eligible",
+        "Acceptance never releases a workspace",
         "Repeating the same accepted result is a no-op",
     ] {
         assert!(
@@ -656,6 +793,8 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert_eq!(orchestration["director_max_leads"], 2);
     assert_eq!(orchestration["director_max_executors"], 4);
     assert_eq!(orchestration["lead_max_executors"], 6);
+    assert_eq!(orchestration["max_concurrent_executors"], 16);
+    assert_eq!(orchestration["worktree_pool_size"], 18);
     assert_eq!(
         orchestration["director_executor_capacity"]["effective_limit"],
         4
@@ -910,7 +1049,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     );
     let pool_line = String::from_utf8_lossy(&acquired.stdout).into_owned();
     assert!(
-        pool_line.contains("capacity=4"),
+        pool_line.contains("capacity=18"),
         "the installed configuration supplies the explicit pool capacity: {pool_line}"
     );
     assert!(
@@ -923,6 +1062,130 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     fs::write(held.path.join("new.txt"), b"partial untracked work\n").unwrap();
     fs::create_dir_all(held.path.join("cache")).unwrap();
     fs::write(held.path.join("cache/ready"), b"prepared\n").unwrap();
+
+    // The board stays on the coordinating repository; the pinned installed
+    // board package cannot resolve that issue from an independent repository.
+    let foreign_board = run(&package, &task_repo, &["show", &item_id, "--json"]);
+    assert!(
+        !foreign_board.status.success(),
+        "an independent repository unexpectedly resolved the coordinating board: {}",
+        failed_output("foreign board show", &foreign_board)
+    );
+
+    // A second independent repository enters through the same installed pool
+    // owner. Its clean release returns the exact base and a stale generation
+    // handle cannot release whatever occupies the position later.
+    let consumer = root_path.join("integration-consumer");
+    fs::create_dir_all(&consumer).unwrap();
+    board_git(&consumer, &["init", "-q"]);
+    board_git(
+        &consumer,
+        &["config", "user.email", "consumer@example.test"],
+    );
+    board_git(&consumer, &["config", "user.name", "Consumer Fixture"]);
+    fs::write(consumer.join("consumer.txt"), b"consumer base\n").unwrap();
+    board_git(&consumer, &["add", "consumer.txt"]);
+    board_git(&consumer, &["commit", "-qm", "consumer base"]);
+    let consumer_base = git_head(&consumer);
+    let acquired = run(
+        &installed_harness,
+        &consumer,
+        &[
+            "worktree",
+            "acquire",
+            "--codex-home",
+            home_text,
+            "--repository",
+            consumer.to_str().unwrap(),
+            "--task",
+            "consumer-work",
+            "--base",
+            "HEAD",
+        ],
+    );
+    assert!(
+        acquired.status.success(),
+        "{}",
+        failed("second-repository worktree acquire", &acquired)
+    );
+    let consumer_holding =
+        task_worktree::continue_task(&codex_home, &consumer, "consumer-work", None).unwrap();
+    let consumer_handle = consumer_holding.handle.clone().unwrap();
+    let released = run(
+        &installed_harness,
+        &consumer,
+        &[
+            "worktree",
+            "release",
+            "--codex-home",
+            home_text,
+            "--repository",
+            consumer.to_str().unwrap(),
+            "--task",
+            "consumer-work",
+            "--handle",
+            &consumer_handle,
+            "--disposition",
+            "discarded",
+            "--reason",
+            "isolated installed acceptance",
+        ],
+    );
+    assert!(
+        released.status.success(),
+        "{}",
+        failed("second-repository worktree release", &released)
+    );
+    let release_text = String::from_utf8_lossy(&released.stdout).into_owned();
+    assert!(
+        release_text.contains("disposition=discarded released"),
+        "{release_text}"
+    );
+    assert!(
+        release_text.contains(&format!("reset to {consumer_base}")),
+        "{release_text}"
+    );
+    assert_eq!(
+        git_head(&consumer_holding.path),
+        consumer_base,
+        "the released second-repository slot returns to its committed base"
+    );
+    let stale = run(
+        &installed_harness,
+        &consumer,
+        &[
+            "worktree",
+            "release",
+            "--codex-home",
+            home_text,
+            "--repository",
+            consumer.to_str().unwrap(),
+            "--task",
+            "consumer-work",
+            "--handle",
+            &consumer_handle,
+            "--disposition",
+            "discarded",
+            "--reason",
+            "stale generation",
+        ],
+    );
+    assert_eq!(
+        stale.status.code(),
+        Some(2),
+        "{}",
+        failed("stale worktree release", &stale)
+    );
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&stale.stdout),
+            String::from_utf8_lossy(&stale.stderr)
+        )
+        .contains("nothing was released"),
+        "{}",
+        failed_output("stale worktree release", &stale)
+    );
 
     // An installed update while the task is held keeps the binding, its
     // partial work and its ignored cache; the retired skill stays absent.
@@ -1421,11 +1684,146 @@ fn tracked_executor_plugin_names_both_routes_and_preserves_the_server_command() 
     );
 }
 
+/// Minimal JSON-lines MCP client for the installed executors server. The server
+/// owns no app-server until a trusted caller identity arrives, so this client
+/// can verify the installed surface and refusal paths without model work.
+struct InstalledMcp {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    stderr_path: PathBuf,
+}
+
+impl InstalledMcp {
+    fn start(harness: &Path, codex_home: &Path, user_home: &Path, stderr_path: &Path) -> Self {
+        let stderr = fs::File::create(stderr_path).unwrap();
+        let mut child = Command::new(harness)
+            .args(["mcp", "executors"])
+            .env("CODEX_HOME", codex_home)
+            .env("USERPROFILE", user_home)
+            .env("HOME", user_home)
+            .env("APPDATA", user_home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", user_home.join("AppData/Local"))
+            .env("TEMP", user_home.join("AppData/Local/Temp"))
+            .env("TMP", user_home.join("AppData/Local/Temp"))
+            .env_remove("HARNESS_EXECUTOR_SESSION")
+            .env_remove("HARNESS_CONTEXT_ROLE")
+            .env_remove("HARNESS_REFLECTION_SESSION")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut server = Self {
+            child,
+            stdin,
+            stdout,
+            stderr_path: stderr_path.to_owned(),
+        };
+        let initialized = server.request(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "installed-acceptance", "version": "1"}
+            }
+        }));
+        assert_eq!(
+            initialized["result"]["serverInfo"]["name"], "executors",
+            "{initialized}"
+        );
+        server.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }));
+        server
+    }
+
+    fn send(&mut self, value: serde_json::Value) {
+        let mut line = serde_json::to_vec(&value).unwrap();
+        line.push(b'\n');
+        self.stdin.as_mut().unwrap().write_all(&line).unwrap();
+        self.stdin.as_mut().unwrap().flush().unwrap();
+    }
+
+    fn request(&mut self, value: serde_json::Value) -> serde_json::Value {
+        self.send(value);
+        let mut line = String::new();
+        if self.stdout.read_line(&mut line).unwrap() == 0 {
+            panic!(
+                "installed executors MCP exited before replying: {}",
+                self.stderr()
+            );
+        }
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn call_tool(
+        &mut self,
+        id: u64,
+        tool: &str,
+        arguments: serde_json::Value,
+        metadata: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({"name": tool, "arguments": arguments});
+        if let Some(metadata) = metadata {
+            params["_meta"] = metadata;
+        }
+        self.request(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": params
+        }))
+    }
+
+    fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
+    fn finish(mut self) {
+        drop(self.stdin.take());
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "installed executors MCP stderr: {}",
+                    self.stderr()
+                );
+                return;
+            }
+            if Instant::now() >= until {
+                let _ = self.child.kill();
+                panic!("installed executors MCP did not exit: {}", self.stderr());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+fn mcp_error(response: &serde_json::Value) -> String {
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    response["result"]["structuredContent"]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool error missing: {response}"))
+        .to_owned()
+}
+
 /// One fresh native context from the installed launcher outside the checkout:
-/// the ordinary lead session, or the executor session the dispatch marker and
-/// declared executor profile select. The marker is cleared explicitly first,
-/// so an ambient executor session cannot change which role is composed.
-fn outside_prompt(codex_home: &Path, user_home: &Path, workspace: &Path, executor: bool) -> String {
+/// the ordinary root session, a delegated Lead, or the Executor session that
+/// the dispatch marker selects. Ambient role markers are cleared first so the
+/// fixture, not the calling session, selects the composed role.
+fn outside_prompt(
+    codex_home: &Path,
+    user_home: &Path,
+    workspace: &Path,
+    role: Option<&str>,
+) -> String {
     let mut command = Command::new(codex_home.join("harness/bin/codex.exe"));
     command
         .current_dir(workspace)
@@ -1436,11 +1834,21 @@ fn outside_prompt(codex_home: &Path, user_home: &Path, workspace: &Path, executo
         .env("LOCALAPPDATA", user_home.join("AppData/Local"))
         .env("TEMP", user_home.join("AppData/Local/Temp"))
         .env("TMP", user_home.join("AppData/Local/Temp"))
-        .env_remove("HARNESS_EXECUTOR_SESSION");
-    if executor {
-        command
-            .env("HARNESS_EXECUTOR_SESSION", "1")
-            .args(["--profile", "ds"]);
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_CONTEXT_ROLE");
+    match role {
+        None => {}
+        Some("executor") => {
+            command
+                .env("HARNESS_EXECUTOR_SESSION", "1")
+                .args(["--profile", "ds"]);
+        }
+        Some("delegated-lead") => {
+            command
+                .env("HARNESS_CONTEXT_ROLE", "delegated-lead")
+                .args(["--profile", "ds"]);
+        }
+        Some(role) => panic!("unsupported fixture role {role}"),
     }
     let prompt = command.args(["debug", "prompt-input"]).output().unwrap();
     assert!(
@@ -1512,6 +1920,20 @@ fn board_git(cwd: &Path, args: &[&str]) {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn git_head(cwd: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
 fn disk_path(path: &Path) -> PathBuf {

@@ -769,6 +769,31 @@ checks the result independently, and separately checks Astra-level bindings. One
 short max consultation in it is a configuration check, not a production
 threshold. Private evidence stays in a temporary directory.
 
+### Installed orchestration acceptance
+
+Use the installed-lifecycle command in
+[installation](installation.md#installed-orchestration-acceptance) for a fresh
+external consumer. Its coverage split is deliberate:
+
+- `orchestration_isolated_install` exercises the installed launcher and MCP
+  server, the three role contexts and catalogues, both route tool declarations,
+  absent/forged caller refusal, the 2/4/6 configured limits with 16/18 shared
+  capacity, board scope, two repository pools and explicit release with a stale
+  generation.
+- `executor_mcp` exercises both dispatch routes, parent/root/role identity,
+  per-role `enabled_tools`, the full admission topology, stop, exact/fresh
+  resume, release and reopen after disconnection with a deterministic
+  app-server.
+- `executor_assignment` exercises specification-backed Lead admission, board
+  ownership across repositories and multi-repository assignment inputs.
+- `worktree_pool` exercises shared pools, multi-repository workspace sets,
+  concurrent admission and safe reset or preservation.
+
+The installed target starts no model turn. It therefore does not establish real
+`ds` delivery, live `/agents` conversations, or elevated Windows token state;
+those remain separate acceptance and must not be inferred from the isolated
+receipt.
+
 The native usage counter `codex-harness delegation-usage` takes explicit parent and
 child paths, keeps the last cumulative record of each thread for former
 consumers, and separately removes repeats by stable response ID. Inherited

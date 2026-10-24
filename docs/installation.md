@@ -328,6 +328,43 @@ its warning text and threshold evidence in receipt/status/wait, which the user
 accepted as the current limitation. `executor_status` and `executor_wait`
 remain the verified machine-readable state and result paths.
 
+#### Installed orchestration acceptance
+
+The fresh-consumer lifecycle is exercised by the ignored
+`orchestration_isolated_install` target. It copies the current workspace build,
+installs core, board and the executors plugin into temporary `CODEX_HOME` and
+user homes, starts the installed launcher from a consumer directory outside
+the checkout, and starts the installed `codex-harness mcp executors` server.
+No provider, credential or model request is involved.
+
+Point `HARNESS_CONTROL_CODEX_EXE` at the upstream native Codex executable - the
+registered executable, not the harness launcher - and run:
+
+```powershell
+$env:HARNESS_CONTROL_CODEX_EXE = "<native-codex.exe>"
+codex-harness heavy -- cargo test --locked -p codex-harness --test orchestration_isolated_install -- --ignored --test-threads=1
+```
+
+The target verifies fresh installation and prior-default compatibility, the
+Director/delegated-Lead/Executor native contexts and skill catalogue revisions,
+both dispatch tools on the shared installed MCP server, refusal of absent or
+unregistered caller identity before pool state, the configured 2/4/6 parent
+limits with 16 installation-wide Executor slots and 18 pool positions, board
+scope on the coordinating repository, two independent repository pools, and
+explicit release with stale-generation refusal. Set
+`HARNESS_KEEP_ISOLATED_EVIDENCE=1` to retain the temporary fixture and command
+output; otherwise the owned homes are removed after the run.
+
+Full dispatch, per-role `enabled_tools`, admission races, close/resume and
+release semantics need an app-server that accepts turns. Those paths are
+covered model-free by the deterministic `executor_mcp`, `executor_assignment`,
+`worktree_pool`, `executor_control` and `lead_message_native` targets, which
+use synthetic app-servers and owned targets. The isolated installed target does
+not open real child threads and does not exercise Windows High-integrity token
+or mandatory-label protection from an elevated process. Real `ds` model-backed
+delivery remains separate acceptance; a green isolated run does not establish
+it.
+
 ### Serena plugin lifecycle
 
 The released `serena@coding-agents-harness` plugin is the ordinary consumer
