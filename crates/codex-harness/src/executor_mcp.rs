@@ -4516,6 +4516,9 @@ fn attach_children_to_successor(
     let children: Vec<RunReceipt> = read_receipts(home)?
         .into_iter()
         .filter(|receipt| {
+            if !receipt.value["release"].is_null() {
+                return false;
+            }
             let parent = receipt.value["parentThreadId"]
                 .as_str()
                 .or_else(|| receipt.value["leadThreadId"].as_str());

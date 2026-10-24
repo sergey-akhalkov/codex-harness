@@ -837,7 +837,11 @@ fn recorded_lead_thread(title: &str, checkout: &Path, with_turn: bool) -> SimThr
 }
 
 fn recorded_executor_child(home: &Path, server: &Server) -> ReleaseRun {
-    let run = release_run(home, LEAD, EXECUTOR, server);
+    recorded_executor_child_for(home, server, EXECUTOR)
+}
+
+fn recorded_executor_child_for(home: &Path, server: &Server, executor: &str) -> ReleaseRun {
+    let run = release_run(home, LEAD, executor, server);
     let mut value: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
     let run_id = value["run"].as_str().unwrap().to_owned();
     value["role"] = json!("executor");
@@ -6318,6 +6322,21 @@ fn fresh_lead_recovery_reattaches_preexisting_children_to_the_successor() {
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
     let lead = delegated_lead_continuation_run(home.path(), &server);
     let child = recorded_executor_child(home.path(), &server);
+    let released_child = recorded_executor_child_for(home.path(), &server, OTHER_EXECUTOR);
+    let mut released_value: Value =
+        serde_json::from_slice(&fs::read(&released_child.receipt).unwrap()).unwrap();
+    released_value["release"] = json!({
+        "schema": 1,
+        "run": released_value["run"],
+        "slot": 1,
+        "disposition": "discarded",
+        "slotFreed": true
+    });
+    fs::write(
+        &released_child.receipt,
+        serde_json::to_vec_pretty(&released_value).unwrap(),
+    )
+    .unwrap();
     let title = lead.value["title"].as_str().unwrap();
     let mut sim = NativeSim::new(DIRECTOR, LEAD, &lead.primary, false, false);
     sim.threads.insert(
@@ -6365,6 +6384,12 @@ fn fresh_lead_recovery_reattaches_preexisting_children_to_the_successor() {
         child_value["successorAttachment"]["fromParentThreadId"], LEAD,
         "{child_value}"
     );
+    let released_after: Value =
+        serde_json::from_slice(&fs::read(&released_child.receipt).unwrap()).unwrap();
+    assert_eq!(
+        released_after, released_value,
+        "a released child is retained evidence and must not be rebound"
+    );
 
     let status = mcp.call_tool(
         3,
@@ -6401,7 +6426,7 @@ fn fresh_lead_recovery_reattaches_preexisting_children_to_the_successor() {
         Some(json!({"threadId": LEAD})),
     );
     assert!(
-        tool_error(&old_message).contains("not a recorded MCP executor lead"),
+        tool_error(&old_message).contains("no recorded MCP executor run"),
         "{old_message}"
     );
     let old_release = release_tool(
@@ -6476,6 +6501,7 @@ fn fresh_lead_recovery_reattaches_preexisting_children_to_the_successor() {
     assert_eq!(released["executorThreadId"], EXECUTOR, "{released}");
     assert_eq!(released["state"], "released", "{released}");
     mcp.finish();
+    drop(released_child);
     drop(child);
     drop(lead);
 }
