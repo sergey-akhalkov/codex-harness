@@ -6,6 +6,7 @@ use harness_core::{
     build_identity::hash_file,
     process::{Cancellation, Deadline},
     serena::{self, Launch, Session},
+    serena_acceptance,
 };
 use serde_json::{Value, json};
 use std::{
@@ -102,6 +103,65 @@ fn incompatible_status_is_rejected_before_child_start() {
     let registry = write_registry(root.path(), "missing", "1.7.0", &console);
     let error = serena::command(&owned_launch(root.path(), registry, console)).unwrap_err();
     assert!(error_text(&error).contains("explicit provisioning"));
+}
+
+#[test]
+fn semantic_acceptance_preflight_reports_mandatory_and_optional_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let console = dummy_console(root.path());
+    let missing = root.path().join("missing.exe");
+    let registry = root.path().join("code-tools.json");
+    fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&json!({
+            "mcp": [{"id": "serena", "paths": {"console_entrypoint": console}}],
+            "languages": [
+                {"id": "rust", "serena_id": "rust", "status": "adopted",
+                 "paths": {"executable": missing}},
+                {"id": "python", "serena_id": "python_basedpyright", "status": "adopted",
+                 "paths": {"node": missing, "entrypoint": missing}},
+                {"id": "cpp", "serena_id": "cpp", "status": "adopted",
+                 "paths": {"executable": missing}},
+                {"id": "cpp", "serena_id": "cpp", "status": "adopted",
+                 "paths": {"executable": missing}},
+                {"id": "csharp", "serena_id": "csharp", "status": "adopted",
+                 "version": "5.11.0",
+                 "paths": {"dotnet": missing, "entrypoint": missing,
+                           "runtime_root": root.path()}}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = serena_acceptance::verify(&repo(), &registry).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("semantic-not-ready"), "{text}");
+    assert!(!text.contains("\"status\":\"semantic-ready\""), "{text}");
+    for language in ["rust", "python", "cpp", "csharp", "pascal"] {
+        assert!(
+            text.contains(&format!("\"language\":\"{language}\"")),
+            "{language}: {text}"
+        );
+    }
+    assert!(
+        text.contains("missing adopted language server executable"),
+        "{text}"
+    );
+    assert!(text.contains("ambiguous: 2 registry records"), "{text}");
+    assert!(text.contains("no registry record"), "{text}");
+    let evidence = Path::new(text.rsplit_once("; evidence: ").unwrap().1)
+        .canonicalize()
+        .unwrap();
+    assert!(evidence.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert!(
+        evidence
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("harness-serena-check-")
+    );
+    fs::remove_dir_all(evidence).unwrap();
 }
 
 #[test]

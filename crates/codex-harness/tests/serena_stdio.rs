@@ -27,33 +27,215 @@ fn native_semantic_acceptance_checks_real_backends_and_edit_readback() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "semantic-ready");
-    // Pascal is exercised only where discovery adopted the shared pasls row.
     let inventory: Value =
         serde_json::from_slice(&fs::read(registry.as_os_str()).unwrap()).unwrap();
-    let pascal = inventory["languages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|row| row["id"] == "delphi" && row["status"] == "adopted");
-    let mut expected = vec!["rust", "python"];
-    if pascal {
-        expected.push("pascal");
+    assert_eq!(
+        report["checks"],
+        json!([
+            "symbol-overview",
+            "symbol-body",
+            "references",
+            "semantic-edit",
+            "semantic-readback",
+            "disk-readback"
+        ])
+    );
+    let results = report["results"].as_array().unwrap();
+    assert_eq!(results.len(), 5, "{report}");
+    let supported = [
+        ("rust", "rust", true),
+        ("python", "python", true),
+        ("cpp", "cpp", false),
+        ("csharp", "csharp", false),
+        ("pascal", "delphi", false),
+    ];
+    let mut ready = Vec::new();
+    for (language, registry_id, required) in supported {
+        let result = results
+            .iter()
+            .find(|result| result["language"] == language)
+            .unwrap_or_else(|| panic!("missing {language} result: {report}"));
+        assert_eq!(result["required"], required, "{result}");
+        let adopted = inventory["languages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| {
+                row["id"] == registry_id
+                    && matches!(
+                        row["status"].as_str(),
+                        Some("adopted" | "present" | "installed" | "ready" | "verified")
+                    )
+            });
+        if required || adopted {
+            assert_eq!(result["status"], "ready", "{result}");
+            assert_eq!(result["checks"], report["checks"], "{result}");
+            ready.push(language);
+        } else {
+            assert_ne!(result["status"], "ready", "{result}");
+            assert!(
+                result["detail"]
+                    .as_str()
+                    .is_some_and(|detail| !detail.is_empty()),
+                "{result}"
+            );
+        }
     }
-    if inventory["languages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|row| row["id"] == "cpp" && row["status"] == "adopted")
-    {
-        expected.push("cpp");
-    }
-    assert_eq!(report["languages"], json!(expected));
+    assert_eq!(report["languages"], json!(ready));
     assert_eq!(report["owned_state_removed"], true);
     assert_eq!(
         report["manager_sha256"],
         harness_core::build_identity::hash_file(Path::new(env!("CARGO_BIN_EXE_codex-harness")))
             .unwrap()
     );
+}
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn native_semantic_acceptance_reports_optional_failure_without_erasing_mandatory_results() {
+    let original = std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit registry");
+    let mut inventory: Value =
+        serde_json::from_slice(&fs::read(original.as_os_str()).unwrap()).unwrap();
+    let mut languages = inventory["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| matches!(row["id"].as_str(), Some("rust" | "python")))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(languages.len(), 2, "mandatory adopted backends required");
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    let dotnet = root.path().join("dotnet.exe");
+    let entrypoint = root.path().join("LanguageServer.dll");
+    fs::write(&dotnet, b"not an executable").unwrap();
+    fs::write(&entrypoint, b"not a managed assembly").unwrap();
+    languages.push(json!({
+        "id": "csharp",
+        "serena_id": "csharp",
+        "status": "adopted",
+        "version": "5.11.0",
+        "paths": {
+            "dotnet": dotnet,
+            "entrypoint": entrypoint,
+            "runtime_root": runtime,
+        }
+    }));
+    inventory["languages"] = json!(languages);
+    let registry = root.path().join("registry.json");
+    fs::write(&registry, serde_json::to_vec(&inventory).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["mcp", "serena-check", "--source"])
+        .arg(repo())
+        .arg("--registry")
+        .arg(&registry)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "semantic-ready", "{report}");
+    assert_eq!(report["languages"], json!(["rust", "python"]), "{report}");
+    assert_eq!(report["optional_failures"], json!(["csharp"]), "{report}");
+    let csharp = report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["language"] == "csharp")
+        .unwrap();
+    assert_eq!(csharp["status"], "failed", "{csharp}");
+    assert!(
+        csharp["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
+        "{csharp}"
+    );
+    assert_eq!(report["owned_state_removed"], true);
+}
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn native_semantic_acceptance_broken_mandatory_backend_is_not_ready() {
+    let original = std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit registry");
+    let mut inventory: Value =
+        serde_json::from_slice(&fs::read(original.as_os_str()).unwrap()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let broken = root.path().join("rust-analyzer.exe");
+    fs::write(&broken, b"not an executable").unwrap();
+    let mut languages = inventory["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| matches!(row["id"].as_str(), Some("rust" | "python")))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(languages.len(), 2, "mandatory adopted backends required");
+    let rust = languages
+        .iter_mut()
+        .find(|row| row["id"] == "rust")
+        .unwrap();
+    rust["paths"]["executable"] = json!(broken);
+    inventory["languages"] = json!(languages);
+    let registry = root.path().join("registry.json");
+    fs::write(&registry, serde_json::to_vec(&inventory).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["mcp", "serena-check", "--source"])
+        .arg(repo())
+        .arg("--registry")
+        .arg(&registry)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: Value = serde_json::from_str(
+        stderr
+            .split_once("not ready: ")
+            .and_then(|(_, tail)| tail.split_once("; cleanup: "))
+            .map(|(report, _)| report)
+            .unwrap_or_else(|| panic!("missing not-ready report: {stderr}")),
+    )
+    .unwrap();
+    assert_eq!(report["status"], "semantic-not-ready", "{report}");
+    assert_eq!(report["languages"], json!(["python"]), "{report}");
+    assert!(
+        !stderr.contains("\"status\":\"semantic-ready\""),
+        "{stderr}"
+    );
+    for (language, status) in [("rust", "failed"), ("python", "ready")] {
+        let result = report["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["language"] == language)
+            .unwrap();
+        assert_eq!(result["status"], status, "{result}");
+        if status == "failed" {
+            assert!(
+                result["detail"]
+                    .as_str()
+                    .is_some_and(|detail| !detail.is_empty()),
+                "{result}"
+            );
+        }
+    }
+    let evidence = Path::new(stderr.rsplit_once("; evidence: ").unwrap().1.trim())
+        .canonicalize()
+        .unwrap();
+    assert!(evidence.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert!(
+        evidence
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("harness-serena-check-")
+    );
+    fs::remove_dir_all(evidence).unwrap();
 }
 
 #[test]
