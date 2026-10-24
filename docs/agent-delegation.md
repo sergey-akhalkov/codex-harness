@@ -457,14 +457,17 @@ reset work when an input moves. If a required input changes, keep the running
 base and partial result until an explicit continuation or re-dispatch names the
 new committed input.
 
-Each selected repository gets its own distinct, owned integration and executor
-worktree. Keep those roots explicit in the assignment and board record; do not
-copy a checkout, create a nested repository, or write into another Lead's
-position. Two Leads may use one repository, but their worktrees, owners and
-concurrency remain independent under the shared pool. Acceptance records a
-revision vector for the selected repositories and states any repository left
-unintegrated. Exercise the combined user path from the integrated worktrees;
-a conflict-free merge does not prove that path.
+Each selected repository gets its own distinct, owned integration worktree, and
+a delegated Lead receives all selected roots. Keep those roots explicit in the
+assignment and board record; do not copy a checkout, create a nested
+repository, or write into another Lead's position. Executor dispatch still
+allocates one primary worktree for its child; an Executor that needs another
+selected repository must report the missing binding rather than writing into
+the Lead's workspace. Two Leads may use one repository, but their worktrees,
+owners and concurrency remain independent under the shared pool. Acceptance
+records a revision vector for the selected repositories and states any
+repository left unintegrated. Exercise the combined user path from the
+integrated worktrees; a conflict-free merge does not prove that path.
 
 Preparation completes for every selected repository before model work starts. A
 failure identifies the repository, input or base that failed, the workspaces and
