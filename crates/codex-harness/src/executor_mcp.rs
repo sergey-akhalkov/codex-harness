@@ -53,6 +53,7 @@ const DEFAULT_WAIT_MS: u64 = 1_800_000;
 const MAX_WAIT_MS: u64 = 1_800_000;
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const WAIT_POLL_MAX: Duration = Duration::from_secs(1);
+const STATUS_NATIVE_READ_BOUND: Duration = Duration::from_secs(1);
 const MAX_RESULT_ACKS: usize = 8;
 const MAX_WAIT_MESSAGE_BYTES: usize = 32 * 1024;
 const MAX_WAIT_TURN_PAGES: usize = 64;
@@ -1042,6 +1043,15 @@ fn verify_run_for(
 }
 
 fn native_thread(run: &VerifiedRun, thread_id: &str, executor_side: bool) -> io::Result<Value> {
+    native_thread_bounded(run, thread_id, executor_side, DEFAULT_BOUND)
+}
+
+fn native_thread_bounded(
+    run: &VerifiedRun,
+    thread_id: &str,
+    executor_side: bool,
+    bound: Duration,
+) -> io::Result<Value> {
     let endpoint = run
         .endpoint
         .as_ref()
@@ -1052,7 +1062,7 @@ fn native_thread(run: &VerifiedRun, thread_id: &str, executor_side: bool) -> io:
             ))
         })?
         .for_thread(thread_id)?;
-    let mut conversation = Conversation::attach(&endpoint, DEFAULT_BOUND)?;
+    let mut conversation = Conversation::attach(&endpoint, bound)?;
     let thread = conversation.thread_state()?;
     if thread["id"].as_str() != Some(thread_id) {
         return Err(invalid(format!(
@@ -1100,16 +1110,20 @@ fn native_status_or_release(
     run: &VerifiedRun,
     thread_id: &str,
     executor_side: bool,
-) -> io::Result<Value> {
-    match native_thread(run, thread_id, executor_side) {
-        Ok(native) => Ok(native),
-        Err(error) if !run.value["release"].is_null() => Ok(json!({
+    bound: Duration,
+) -> Value {
+    match native_thread_bounded(run, thread_id, executor_side, bound) {
+        Ok(native) => native,
+        Err(error) => json!({
             "threadId": thread_id,
             "status": "unavailable",
             "error": error.to_string(),
-            "detail": "the run's explicit release record remains authoritative; native archive or a missing thread does not reopen or refill the slot"
-        })),
-        Err(error) => Err(error),
+            "detail": if run.value["release"].is_null() {
+                "native status could not be read within the status bound; the run receipt and lease remain authoritative"
+            } else {
+                "the run's explicit release record remains authoritative; native archive or a missing thread does not reopen or refill the slot"
+            }
+        }),
     }
 }
 
@@ -1967,31 +1981,80 @@ fn status(operation: &Operation) -> io::Result<Value> {
             .then(|| ensure_cache_guard(&home, &run))
             .and_then(Result::err)
             .map(|error| error.to_string());
-        let caller_thread = match run.role {
-            RunRole::Lead => &run.lead_thread,
-            RunRole::Executor => &run.executor_thread,
-        };
-        let native = native_status_or_release(&run, caller_thread, run.role == RunRole::Executor)?;
-        let executor_native = if run.role == RunRole::Lead {
-            Some(native_status_or_release(&run, &run.executor_thread, true)?)
-        } else {
-            None
-        };
         let (pending, pending_truncated) = pending_requests(&run);
         let mut summary = run_summary(&run);
-        summary["native"] = native;
-        summary["executorNative"] = executor_native.unwrap_or(Value::Null);
         summary["pendingRequests"] = Value::Array(pending);
         summary["pendingRequestsTruncated"] = Value::Bool(pending_truncated);
         if let Some(error) = cache_guard_error {
             summary["cacheGuardError"] = Value::String(error);
         }
-        runs.push(summary);
+        runs.push((run, summary));
+    }
+    let mut natives = vec![vec![Value::Null, Value::Null]; runs.len()];
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (index, (run, _)) in runs.iter().enumerate() {
+            let caller_thread = match run.role {
+                RunRole::Lead => &run.lead_thread,
+                RunRole::Executor => &run.executor_thread,
+            };
+            let caller_id = caller_thread.clone();
+            handles.push((
+                index,
+                0,
+                caller_id,
+                scope.spawn(move || {
+                    native_status_or_release(
+                        run,
+                        caller_thread,
+                        run.role == RunRole::Executor,
+                        STATUS_NATIVE_READ_BOUND,
+                    )
+                }),
+            ));
+            if run.role == RunRole::Lead {
+                let executor_id = run.executor_thread.clone();
+                handles.push((
+                    index,
+                    1,
+                    executor_id,
+                    scope.spawn(move || {
+                        native_status_or_release(
+                            run,
+                            &run.executor_thread,
+                            true,
+                            STATUS_NATIVE_READ_BOUND,
+                        )
+                    }),
+                ));
+            }
+        }
+        for (index, slot, thread_id, handle) in handles {
+            let value = handle.join().unwrap_or_else(|_| {
+                json!({
+                    "threadId": thread_id,
+                    "status": "unavailable",
+                    "error": "native status worker panicked",
+                    "detail": "native status is unavailable; the run receipt and lease remain authoritative"
+                })
+            });
+            natives[index][slot] = value;
+        }
+    });
+    let mut output = Vec::with_capacity(runs.len());
+    for ((run, mut summary), native) in runs.into_iter().zip(natives) {
+        summary["native"] = native[0].clone();
+        summary["executorNative"] = if run.role == RunRole::Lead {
+            native[1].clone()
+        } else {
+            Value::Null
+        };
+        output.push(summary);
     }
     Ok(json!({
         "callerThreadId": caller,
         "role": role.map(RunRole::as_str),
-        "runs": runs,
+        "runs": output,
         "truncated": truncated,
         "state": "ok"
     }))

@@ -1301,6 +1301,41 @@ fn status_is_bounded_to_the_verified_calling_thread_and_rejects_forged_arguments
 }
 
 #[test]
+fn status_reports_unavailable_native_detail_without_blocking_on_silent_endpoint() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let first = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let second = synthetic_run(home.path(), LEAD, THIRD_EXECUTOR, &server);
+    server.answer_fn(|_| Answer::Silence);
+    let mut mcp = Mcp::start(home.path());
+
+    let started = Instant::now();
+    let response = mcp.call_tool(
+        2,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let elapsed = started.elapsed();
+    let status = result(&response);
+    assert_eq!(status["state"], "ok");
+    let runs = status["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    for run in runs {
+        assert_eq!(run["native"]["status"], "unavailable", "{run}");
+        assert_eq!(run["executorNative"]["status"], "unavailable", "{run}");
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "status took {elapsed:?} with a silent endpoint"
+    );
+
+    drop(first);
+    drop(second);
+    mcp.finish();
+}
+
+#[test]
 fn wait_returns_a_pending_question_and_a_terminal_result_separately() {
     let home = home();
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
