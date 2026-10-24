@@ -1004,11 +1004,26 @@ fn verify_run_for(
             if endpoint.thread_id.as_deref() != Some(lead_thread.as_str())
                 || endpoint.process.as_ref() != Some(&lease.app_server)
             {
-                return Err(invalid(
-                    "the registered lead endpoint no longer matches the exact run lease; the run was replaced, resumed elsewhere or is stale, and no operation was performed",
-                ));
+                // A released run keeps its receipt after the app-server that
+                // hosted it is replaced. Status and repeated release may still
+                // report that record; they must not reject it as a foreign live
+                // lease.
+                if view != RunView::Live && !value["release"].is_null() {
+                    (
+                        None,
+                        Some(
+                            "the registered lead endpoint no longer matches the released run lease; native status is unavailable"
+                                .to_owned(),
+                        ),
+                    )
+                } else {
+                    return Err(invalid(
+                        "the registered lead endpoint no longer matches the exact run lease; the run was replaced, resumed elsewhere or is stale, and no operation was performed",
+                    ));
+                }
+            } else {
+                (Some(*endpoint), None)
             }
-            (Some(*endpoint), None)
         }
         RegisteredLead::Unavailable(reason) => (None, Some(reason)),
     };
