@@ -3662,6 +3662,27 @@ fn release(operation: &Operation) -> io::Result<Value> {
     let home = native_launcher::codex_home()?;
     let receipt = release_receipt(&home, &caller, selected.as_deref())?;
     let run = verify_run_for(&home, receipt, &caller, RunView::Release)?;
+    if run.child_role == RunRole::Lead {
+        let children: Vec<String> = read_receipts(&home)?
+            .into_iter()
+            .filter(|receipt| {
+                receipt.value["parentThreadId"]
+                    .as_str()
+                    .or_else(|| receipt.value["leadThreadId"].as_str())
+                    == Some(run.executor_thread.as_str())
+                    && receipt.value["release"].is_null()
+            })
+            .filter_map(|receipt| receipt.value["run"].as_str().map(str::to_owned))
+            .take(MAX_STATUS_RUNS)
+            .collect();
+        if !children.is_empty() {
+            return Err(invalid(format!(
+                "run {} still has unreleased descendant run(s): {}; accept or discard and release those children before releasing the Lead workspace",
+                run.run,
+                children.join(", ")
+            )));
+        }
+    }
     let previous = run.value["release"]
         .as_object()
         .map(|_| run.value["release"].clone());

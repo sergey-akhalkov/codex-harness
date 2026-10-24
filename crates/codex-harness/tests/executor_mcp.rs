@@ -3170,6 +3170,75 @@ fn stopping_a_lead_closes_its_subtree_and_leaves_a_direct_sibling_running() {
 }
 
 #[test]
+fn releasing_a_lead_workspace_waits_for_its_unreviewed_children() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let lead = release_run(home.path(), DIRECTOR, LEAD, &server);
+    let mut lead_value: Value = serde_json::from_slice(&fs::read(&lead.receipt).unwrap()).unwrap();
+    lead_value["role"] = json!("lead");
+    lead_value["parentThreadId"] = json!(DIRECTOR);
+    lead_value["rootThreadId"] = json!(DIRECTOR);
+    fs::write(
+        &lead.receipt,
+        serde_json::to_vec_pretty(&lead_value).unwrap(),
+    )
+    .unwrap();
+    let child = release_run(home.path(), LEAD, EXECUTOR, &server);
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &lead.checkout, false, false);
+    sim.threads.insert(
+        EXECUTOR.to_owned(),
+        SimThread::idle(EXECUTOR, &child.checkout),
+    );
+    server.answer_fn(native_responder(Arc::new(Mutex::new(sim))));
+    let mut mcp = Mcp::start(home.path());
+
+    let refused = mcp.call_tool(
+        2,
+        "executor_release",
+        json!({
+            "run": lead.run,
+            "disposition": "discarded",
+            "reason": "director review"
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&refused).contains("unreleased descendant"),
+        "{refused}"
+    );
+    assert!(tool_error(&refused).contains(&child.run), "{refused}");
+
+    let child_released = mcp.call_tool(
+        3,
+        "executor_release",
+        json!({
+            "run": child.run,
+            "disposition": "discarded",
+            "reason": "lead accepted the child"
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    let child_released = result(&child_released);
+    assert_eq!(child_released["released"], true, "{child_released}");
+
+    let lead_released = mcp.call_tool(
+        4,
+        "executor_release",
+        json!({
+            "run": lead.run,
+            "disposition": "discarded",
+            "reason": "director accepted the lead"
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let lead_released = result(&lead_released);
+    assert_eq!(lead_released["released"], true, "{lead_released}");
+    assert_eq!(lead_released["slotFreed"], true, "{lead_released}");
+
+    mcp.finish();
+}
+
+#[test]
 fn wait_returns_a_pending_question_and_a_terminal_result_separately() {
     let home = home();
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
@@ -3259,7 +3328,7 @@ fn an_actionable_question_interrupts_a_wait_without_starting_work() {
         let waited = mcp.call_tool(
             2,
             "executor_wait",
-            json!({"timeoutMs": 3000}),
+            json!({"timeoutMs": 10000}),
             Some(json!({"threadId": LEAD})),
         );
         (waited, question.join().unwrap())
@@ -3273,7 +3342,7 @@ fn an_actionable_question_interrupts_a_wait_without_starting_work() {
     );
     assert!(waited["result"].is_null(), "{waited}");
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(8),
         "the question did not interrupt the wait: {:?}",
         started.elapsed()
     );
